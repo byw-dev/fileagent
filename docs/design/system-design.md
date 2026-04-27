@@ -135,13 +135,13 @@ v1.0  第一版共十章
 
 ## 1.3 系统边界与角色定义
 
-| 角色 | 描述 | 典型操作 |
-|------|------|----------|
-| **超级管理员** | 系统唯一最高权限用户 | 用户管理、采集器审批、系统配置 |
-| **普通管理员** | 操作采集器与文件规则 | 下发任务、查看日志、配置事件规则 |
-| **只读用户** | 查询和下载文件 | 文件搜索、预签名下载 |
+| 角色             | 描述            | 典型操作               |
+|----------------|---------------|--------------------|
+| **超级管理员**      | 系统唯一最高权限用户    | 用户管理、采集器审批、系统配置    |
+| **普通管理员**      | 操作采集器与文件规则    | 下发任务、查看日志、配置事件规则   |
+| **只读用户**       | 查询和下载文件       | 文件搜索、预签名下载         |
 | **Edge Agent** | 运行在边缘设备上的采集程序 | 接收指令、扫描文件、上传 MinIO |
-| **SDK 调用方** | 内部系统通过 SDK 接入 | 查询文件条目、获取下载链接 |
+| **SDK 调用方**    | 内部系统通过 SDK 接入 | 查询文件条目、获取下载链接      |
 
 ## 1.4 整体架构图
 
@@ -184,18 +184,18 @@ v1.0  第一版共十章
 
 ## 2.1 组件职责划分
 
-| 组件 | 技术选型 | 职责 |
-|------|----------|------|
-| **Control Plane** | Go (Gin) | 核心业务逻辑：Agent 管理、任务调度、文件索引、API、事件引擎 |
-| **Edge Agent** | Go (单二进制) | 文件采集、上传、本地任务队列、与 Control Plane 长连接 |
-| **MinIO** | MinIO MNMD | 对象存储：Bucket 管理、ACL、STS、事件通知 |
-| **PostgreSQL** | v15+ | 持久化：采集器、用户、文件索引、上传日志、事件规则 |
-| **Redis** | v7+ | Token 缓存、限流、短期状态、任务锁 |
-| **NATS** | v2.x JetStream | 事件总线：MinIO 事件消费、Webhook 分发、内部异步通信 |
-| **Nginx/Caddy** | Caddy v2 | TLS 终止、反向代理、自动证书（公网 Let's Encrypt / 内网 ACME CA） |
-| **Web UI** | React + AntD Pro | 管理后台、文件浏览器、事件规则配置 |
-| **Prometheus** | + Alertmanager | 指标采集与告警 |
-| **Grafana** | + Loki | 指标可视化、日志聚合与查询 |
+| 组件                | 技术选型             | 职责                                              |
+|-------------------|------------------|-------------------------------------------------|
+| **Control Plane** | Go (Gin)         | 核心业务逻辑：Agent 管理、任务调度、文件索引、API、事件引擎              |
+| **Edge Agent**    | Go (单二进制)        | 文件采集、上传、本地任务队列、与 Control Plane 长连接              |
+| **MinIO**         | MinIO MNMD       | 对象存储：Bucket 管理、ACL、STS、事件通知                     |
+| **PostgreSQL**    | v15+             | 持久化：采集器、用户、文件索引、上传日志、事件规则                       |
+| **Redis**         | v7+              | Token 缓存、限流、短期状态、任务锁                            |
+| **NATS**          | v2.x JetStream   | 事件总线：MinIO 事件消费、Webhook 分发、内部异步通信               |
+| **Nginx/Caddy**   | Caddy v2         | TLS 终止、反向代理、自动证书（公网 Let's Encrypt / 内网 ACME CA） |
+| **Web UI**        | React + AntD Pro | 管理后台、文件浏览器、事件规则配置                               |
+| **Prometheus**    | + Alertmanager   | 指标采集与告警                                         |
+| **Grafana**       | + Loki           | 指标可视化、日志聚合与查询                                   |
 
 ## 2.2 控制平面与数据平面分离
 
@@ -215,14 +215,14 @@ v1.0  第一版共十章
 
 ## 2.3 通信协议
 
-| 通信链路 | 协议 | 说明 |
-|----------|------|------|
-| Agent ↔ Control Plane 控制信道 | gRPC / HTTP2 / TLS | 双向流：服务端推送指令，Agent 上报状态和日志 |
-| Agent → MinIO 上传 | HTTPS (S3 API) | 分片上传，Agent 持有短期 STS 凭据，直传不中转 |
-| Web UI / SDK → Control Plane | HTTPS REST | JSON，JWT Bearer 认证 |
-| MinIO → NATS 事件 | Webhook (HTTP) | MinIO 将对象事件推送到 NATS HTTP 接入点 |
-| Control Plane → NATS | NATS Client | 发布 Agent 上下线等内部事件，触发事件规则 |
-| Agent 下载预签名 URL | HTTPS | Control Plane 生成 MinIO 预签名 URL，SDK/浏览器直接下载 |
+| 通信链路                         | 协议                 | 说明                                         |
+|------------------------------|--------------------|--------------------------------------------|
+| Agent ↔ Control Plane 控制信道   | gRPC / HTTP2 / TLS | 双向流：服务端推送指令，Agent 上报状态和日志                  |
+| Agent → MinIO 上传             | HTTPS (S3 API)     | 分片上传，Agent 持有短期 STS 凭据，直传不中转               |
+| Web UI / SDK → Control Plane | HTTPS REST         | JSON，JWT Bearer 认证                         |
+| MinIO → NATS 事件              | Webhook (HTTP)     | MinIO 将对象事件推送到 NATS HTTP 接入点               |
+| Control Plane → NATS         | NATS Client        | 发布 Agent 上下线等内部事件，触发事件规则                   |
+| Agent 下载预签名 URL              | HTTPS              | Control Plane 生成 MinIO 预签名 URL，SDK/浏览器直接下载 |
 
 **选用 gRPC 的核心原因：**
 
@@ -266,14 +266,14 @@ v1.0  第一版共十章
 
 系统设计遵循"单实例起步，平滑扩展"原则：
 
-| 组件 | 单实例（MVP） | HA 扩展方式 | 注意事项 |
-|------|-------------|------------|----------|
-| **Control Plane** | 1 实例 + systemd | 多实例 + HAProxy L4 | 需无状态设计，gRPC 会话状态存 Redis |
-| **PostgreSQL** | 单主实例 | 主从 + Patroni 自动故障转移 | 只读查询走从库 |
-| **Redis** | 单实例 | Redis Sentinel（3节点） | |
-| **MinIO** | 4节点 MNMD 起步 | 追加 Server Pool | Pool 内节点数固定，新 Pool 无缝追加 |
-| **NATS** | 单实例 | 3节点 JetStream Cluster | |
-| **Caddy** | 单实例 | DNS 轮询 + 多实例 | 证书需共享存储或集中管理 |
+| 组件                | 单实例（MVP）       | HA 扩展方式               | 注意事项                    |
+|-------------------|----------------|-----------------------|-------------------------|
+| **Control Plane** | 1 实例 + systemd | 多实例 + HAProxy L4      | 需无状态设计，gRPC 会话状态存 Redis |
+| **PostgreSQL**    | 单主实例           | 主从 + Patroni 自动故障转移   | 只读查询走从库                 |
+| **Redis**         | 单实例            | Redis Sentinel（3节点）   |                         |
+| **MinIO**         | 4节点 MNMD 起步    | 追加 Server Pool        | Pool 内节点数固定，新 Pool 无缝追加 |
+| **NATS**          | 单实例            | 3节点 JetStream Cluster |                         |
+| **Caddy**         | 单实例            | DNS 轮询 + 多实例          | 证书需共享存储或集中管理            |
 
 **Control Plane 无状态化设计要点：**
 
@@ -573,14 +573,14 @@ CREATE INDEX idx_event_deliveries_retry  ON event_deliveries (next_retry_at) WHE
 
 ## 3.5 Redis 数据结构设计
 
-| Key 模式 | 类型 | TTL | 用途 |
-|----------|------|-----|------|
-| `agent:{id}:online` | STRING | 心跳间隔×3 | Agent 在线状态，心跳刷新 |
-| `agent:{id}:sts` | HASH | STS 过期时间 | 当前下发的 STS 凭据摘要 |
-| `jwt:jti:{jti}` | STRING | Token 有效期 | 已吊销 Token 黑名单 |
-| `ratelimit:api:{user_id}` | STRING | 1 分钟 | API 限流计数 |
-| `lock:task:{rule_id}` | STRING | 任务超时时间 | 定时任务分布式锁 |
-| `session:{token}` | HASH | 30 分钟 | Web UI 用户会话（可选） |
+| Key 模式                    | 类型     | TTL       | 用途              |
+|---------------------------|--------|-----------|-----------------|
+| `agent:{id}:online`       | STRING | 心跳间隔×3    | Agent 在线状态，心跳刷新 |
+| `agent:{id}:sts`          | HASH   | STS 过期时间  | 当前下发的 STS 凭据摘要  |
+| `jwt:jti:{jti}`           | STRING | Token 有效期 | 已吊销 Token 黑名单   |
+| `ratelimit:api:{user_id}` | STRING | 1 分钟      | API 限流计数        |
+| `lock:task:{rule_id}`     | STRING | 任务超时时间    | 定时任务分布式锁        |
+| `session:{token}`         | HASH   | 30 分钟     | Web UI 用户会话（可选） |
 
 ---
 
@@ -624,17 +624,17 @@ Edge Agent 是运行在边缘设备上的单一可执行二进制文件，使用
 └─────────────────────────────────────────────────────────────┘
 ```
 
-| 模块 | 职责 |
-|------|------|
-| **gRPC Client** | 维护与 Control Plane 的长连接，处理心跳、断线重连、指令接收、状态上报 |
-| **File Watcher** | 基于 inotify(Linux) / ReadDirectoryChangesW(Windows) 监控目录变更，降级为轮询 |
-| **Scheduler** | 管理 Scheduled 模式的 cron 任务，到期触发目录扫描 |
-| **Task Executor** | 接收来自 Watcher/Scheduler/gRPC 的任务，路由到 Upload Engine，写入本地队列 |
-| **Upload Engine** | 文件分片、计算 hash、调用 MinIO S3 API 上传，支持断点续传，完成后上报 Control Plane |
-| **Local Queue** | SQLite 本地任务持久化队列，断网时缓冲待上传任务，恢复后自动补传 |
-| **Credential Mgr** | 管理 Auth Token 和 MinIO STS 凭据的本地存储、有效期检测与主动续期 |
-| **Config Manager** | 管理本地配置文件（TOML），以及从 Control Plane 下发的运行时规则配置 |
-| **Metrics Exporter** | 暴露 Prometheus /metrics 端点，上报本地队列深度、上传速率、连接状态等指标 |
+| 模块                   | 职责                                                              |
+|----------------------|-----------------------------------------------------------------|
+| **gRPC Client**      | 维护与 Control Plane 的长连接，处理心跳、断线重连、指令接收、状态上报                      |
+| **File Watcher**     | 基于 inotify(Linux) / ReadDirectoryChangesW(Windows) 监控目录变更，降级为轮询 |
+| **Scheduler**        | 管理 Scheduled 模式的 cron 任务，到期触发目录扫描                               |
+| **Task Executor**    | 接收来自 Watcher/Scheduler/gRPC 的任务，路由到 Upload Engine，写入本地队列        |
+| **Upload Engine**    | 文件分片、计算 hash、调用 MinIO S3 API 上传，支持断点续传，完成后上报 Control Plane      |
+| **Local Queue**      | SQLite 本地任务持久化队列，断网时缓冲待上传任务，恢复后自动补传                             |
+| **Credential Mgr**   | 管理 Auth Token 和 MinIO STS 凭据的本地存储、有效期检测与主动续期                    |
+| **Config Manager**   | 管理本地配置文件（TOML），以及从 Control Plane 下发的运行时规则配置                     |
+| **Metrics Exporter** | 暴露 Prometheus /metrics 端点，上报本地队列深度、上传速率、连接状态等指标                 |
 
 ## 4.2 生命周期状态机
 
@@ -917,11 +917,11 @@ Watch 模式执行流程：
 
 **跨平台文件系统事件适配：**
 
-| 平台 | 机制 | Go 库 | 挂载盘支持 |
-|------|------|-------|-----------|
-| Linux | inotify | fsnotify/fsnotify | 不支持（自动降级轮询） |
+| 平台      | 机制                    | Go 库              | 挂载盘支持       |
+|---------|-----------------------|-------------------|-------------|
+| Linux   | inotify               | fsnotify/fsnotify | 不支持（自动降级轮询） |
 | Windows | ReadDirectoryChangesW | fsnotify/fsnotify | 本地盘支持，网络盘降级 |
-| 降级轮询 | 定时 stat() 扫描 | 内部实现 | 全平台，所有挂载类型 |
+| 降级轮询    | 定时 stat() 扫描          | 内部实现              | 全平台，所有挂载类型  |
 
 ### 4.4.2 Scheduled 模式
 
@@ -942,11 +942,11 @@ Scheduled 模式执行流程：
 
 ### 4.4.3 追加写入文件处理（append_mode）
 
-| 模式 | 行为 | 适用场景 |
-|------|------|----------|
-| **overwrite** | 每次触发完整上传，覆盖存储端对象 | 文件较小（< 200MB），追加不频繁 |
-| **close_wait** | 等待文件句柄关闭（CLOSE_WRITE 事件）后上传 | 日志轮转类文件，写完即关闭 |
-| **tail** | 记录上次上传的文件 offset，仅上传新增字节，以追加分片存储 | 大文件持续追加（> 200MB），带宽敏感场景 |
+| 模式             | 行为                               | 适用场景                    |
+|----------------|----------------------------------|-------------------------|
+| **overwrite**  | 每次触发完整上传，覆盖存储端对象                 | 文件较小（< 200MB），追加不频繁     |
+| **close_wait** | 等待文件句柄关闭（CLOSE_WRITE 事件）后上传      | 日志轮转类文件，写完即关闭           |
+| **tail**       | 记录上次上传的文件 offset，仅上传新增字节，以追加分片存储 | 大文件持续追加（> 200MB），带宽敏感场景 |
 
 ## 4.5 文件上传流程
 
@@ -1045,15 +1045,15 @@ STS 凭据（MinIO 临时访问密钥）管理：
 
 ## 4.8 跨平台适配要点
 
-| 差异点 | Linux | Windows |
-|--------|-------|---------|
-| **路径分隔符** | / | \，代码统一用 `filepath.ToSlash()` 处理 |
-| **文件系统事件** | inotify | ReadDirectoryChangesW，通过 fsnotify 统一封装 |
-| **磁盘挂载枚举** | /proc/mounts 解析 | WMI Win32_LogicalDisk 查询 |
-| **服务安装** | systemd .service 文件 | Windows Service（golang.org/x/sys/windows/svc） |
-| **配置文件路径** | /etc/fileagent/ 或 ~/.fileagent/ | %PROGRAMDATA%\FileAgent\ |
-| **日志路径** | /var/log/fileagent/ | %PROGRAMDATA%\FileAgent\logs\ |
-| **SQLite 路径** | /var/lib/fileagent/queue.db | %PROGRAMDATA%\FileAgent\queue.db |
+| 差异点           | Linux                           | Windows                                       |
+|---------------|---------------------------------|-----------------------------------------------|
+| **路径分隔符**     | /                               | \，代码统一用 `filepath.ToSlash()` 处理               |
+| **文件系统事件**    | inotify                         | ReadDirectoryChangesW，通过 fsnotify 统一封装        |
+| **磁盘挂载枚举**    | /proc/mounts 解析                 | WMI Win32_LogicalDisk 查询                      |
+| **服务安装**      | systemd .service 文件             | Windows Service（golang.org/x/sys/windows/svc） |
+| **配置文件路径**    | /etc/fileagent/ 或 ~/.fileagent/ | %PROGRAMDATA%\FileAgent\                      |
+| **日志路径**      | /var/log/fileagent/             | %PROGRAMDATA%\FileAgent\logs\                 |
+| **SQLite 路径** | /var/lib/fileagent/queue.db     | %PROGRAMDATA%\FileAgent\queue.db              |
 
 **编译方式：**
 
@@ -1250,12 +1250,12 @@ func IsRevoked(jti string) bool {
 
 ### 5.3.2 认证接口
 
-| Method | Path | 说明 | 认证要求 |
-|--------|------|------|----------|
-| POST | /api/auth/login | 用户名密码登录，返回双 Token | 无 |
-| POST | /api/auth/refresh | 用 Refresh Token 换新 Access Token | Refresh Token |
-| POST | /api/auth/logout | 吊销当前 Token | Access Token |
-| GET | /api/auth/me | 返回当前用户信息 | Access Token |
+| Method | Path              | 说明                              | 认证要求          |
+|--------|-------------------|---------------------------------|---------------|
+| POST   | /api/auth/login   | 用户名密码登录，返回双 Token               | 无             |
+| POST   | /api/auth/refresh | 用 Refresh Token 换新 Access Token | Refresh Token |
+| POST   | /api/auth/logout  | 吊销当前 Token                      | Access Token  |
+| GET    | /api/auth/me      | 返回当前用户信息                        | Access Token  |
 
 ### 5.3.3 OIDC 扩展预留
 
@@ -1265,11 +1265,11 @@ func IsRevoked(jti string) bool {
 
 ## 5.4 用户与权限模型
 
-| 角色 | 第一版状态 | 多租户启用后 | 权限范围 |
-|------|-----------|------------|----------|
-| **super_admin** | 启用 | 不变 | 全系统所有资源 |
-| **org_admin** | 预留（不暴露） | 启用 | 本 org 内的采集器、bucket、文件、事件规则 |
-| **org_viewer** | 作为普通用户启用 | 不变 | 只读：查询文件、下载、查看采集器状态 |
+| 角色              | 第一版状态    | 多租户启用后 | 权限范围                       |
+|-----------------|----------|--------|----------------------------|
+| **super_admin** | 启用       | 不变     | 全系统所有资源                    |
+| **org_admin**   | 预留（不暴露）  | 启用     | 本 org 内的采集器、bucket、文件、事件规则 |
+| **org_viewer**  | 作为普通用户启用 | 不变     | 只读：查询文件、下载、查看采集器状态         |
 
 ```go
 func RequireRole(roles ...string) gin.HandlerFunc {
@@ -1392,62 +1392,62 @@ NATS 主题规划：
 
 ## 5.10 上传日志记录
 
-| Method | Path | 说明 | 过滤参数 |
-|--------|------|------|----------|
-| GET | /api/upload-logs | 查询上传日志列表 | agent_id, status, start_time, end_time, page, limit |
-| GET | /api/upload-logs/{id} | 查询单条日志详情 | - |
-| GET | /api/agents/{id}/upload-logs | 查询指定采集器的上传日志 | status, start_time, end_time |
+| Method | Path                         | 说明           | 过滤参数                                                |
+|--------|------------------------------|--------------|-----------------------------------------------------|
+| GET    | /api/upload-logs             | 查询上传日志列表     | agent_id, status, start_time, end_time, page, limit |
+| GET    | /api/upload-logs/{id}        | 查询单条日志详情     | -                                                   |
+| GET    | /api/agents/{id}/upload-logs | 查询指定采集器的上传日志 | status, start_time, end_time                        |
 
 ## 5.11 对外 REST API 设计
 
 ### 5.11.1 用户管理
 
-| Method | Path | 说明 |
-|--------|------|------|
-| GET | /api/v1/users | 列出用户（super_admin） |
-| POST | /api/v1/users | 创建用户（super_admin） |
-| PUT | /api/v1/users/{id} | 更新用户信息（super_admin） |
-| DELETE | /api/v1/users/{id} | 禁用用户（super_admin） |
-| PUT | /api/v1/users/{id}/password | 修改密码 |
+| Method | Path                        | 说明                  |
+|--------|-----------------------------|---------------------|
+| GET    | /api/v1/users               | 列出用户（super_admin）   |
+| POST   | /api/v1/users               | 创建用户（super_admin）   |
+| PUT    | /api/v1/users/{id}          | 更新用户信息（super_admin） |
+| DELETE | /api/v1/users/{id}          | 禁用用户（super_admin）   |
+| PUT    | /api/v1/users/{id}/password | 修改密码                |
 
 ### 5.11.2 采集器管理
 
-| Method | Path | 说明 |
-|--------|------|------|
-| GET | /api/v1/agents | 列出所有采集器 |
-| GET | /api/v1/agents/{id} | 获取采集器详情 |
-| POST | /api/v1/agents/{id}/approve | 审批通过（super_admin） |
-| POST | /api/v1/agents/{id}/revoke | 吊销采集器（super_admin） |
-| POST | /api/v1/agents/{id}/list-dir | 下发列目录指令 |
-| GET | /api/v1/agents/{id}/rules | 列出采集规则 |
-| POST | /api/v1/agents/{id}/rules | 创建并下发采集规则 |
-| PUT | /api/v1/agents/{id}/rules/{rid} | 更新采集规则 |
-| DELETE | /api/v1/agents/{id}/rules/{rid} | 取消采集规则 |
+| Method | Path                            | 说明                 |
+|--------|---------------------------------|--------------------|
+| GET    | /api/v1/agents                  | 列出所有采集器            |
+| GET    | /api/v1/agents/{id}             | 获取采集器详情            |
+| POST   | /api/v1/agents/{id}/approve     | 审批通过（super_admin）  |
+| POST   | /api/v1/agents/{id}/revoke      | 吊销采集器（super_admin） |
+| POST   | /api/v1/agents/{id}/list-dir    | 下发列目录指令            |
+| GET    | /api/v1/agents/{id}/rules       | 列出采集规则             |
+| POST   | /api/v1/agents/{id}/rules       | 创建并下发采集规则          |
+| PUT    | /api/v1/agents/{id}/rules/{rid} | 更新采集规则             |
+| DELETE | /api/v1/agents/{id}/rules/{rid} | 取消采集规则             |
 
 ### 5.11.3 文件管理
 
-| Method | Path | 说明 |
-|--------|------|------|
-| GET | /api/v1/files | 查询文件条目 |
-| GET | /api/v1/files/{id} | 获取文件详情 |
-| GET | /api/v1/files/{id}/download-url | 生成预签名下载 URL（TTL 15分钟） |
-| POST | /api/v1/files/batch-download-urls | 批量生成预签名 URL |
-| GET | /api/v1/file-types | 列出文件类型 |
-| POST | /api/v1/file-types | 创建文件类型 |
-| PUT | /api/v1/file-types/{id} | 更新文件类型 |
-| DELETE | /api/v1/file-types/{id} | 删除文件类型 |
+| Method | Path                              | 说明                    |
+|--------|-----------------------------------|-----------------------|
+| GET    | /api/v1/files                     | 查询文件条目                |
+| GET    | /api/v1/files/{id}                | 获取文件详情                |
+| GET    | /api/v1/files/{id}/download-url   | 生成预签名下载 URL（TTL 15分钟） |
+| POST   | /api/v1/files/batch-download-urls | 批量生成预签名 URL           |
+| GET    | /api/v1/file-types                | 列出文件类型                |
+| POST   | /api/v1/file-types                | 创建文件类型                |
+| PUT    | /api/v1/file-types/{id}           | 更新文件类型                |
+| DELETE | /api/v1/file-types/{id}           | 删除文件类型                |
 
 ### 5.11.4 Bucket 与事件规则
 
-| Method | Path | 说明 |
-|--------|------|------|
-| GET | /api/v1/buckets | 列出所有 Bucket |
-| POST | /api/v1/buckets | 创建 Bucket（super_admin） |
-| GET | /api/v1/event-rules | 列出事件规则 |
-| POST | /api/v1/event-rules | 创建事件规则 |
-| PUT | /api/v1/event-rules/{id} | 更新事件规则 |
-| DELETE | /api/v1/event-rules/{id} | 删除事件规则 |
-| GET | /api/v1/event-rules/{id}/deliveries | 查看事件投递历史 |
+| Method | Path                                | 说明                     |
+|--------|-------------------------------------|------------------------|
+| GET    | /api/v1/buckets                     | 列出所有 Bucket            |
+| POST   | /api/v1/buckets                     | 创建 Bucket（super_admin） |
+| GET    | /api/v1/event-rules                 | 列出事件规则                 |
+| POST   | /api/v1/event-rules                 | 创建事件规则                 |
+| PUT    | /api/v1/event-rules/{id}            | 更新事件规则                 |
+| DELETE | /api/v1/event-rules/{id}            | 删除事件规则                 |
+| GET    | /api/v1/event-rules/{id}/deliveries | 查看事件投递历史               |
 
 **统一错误响应格式：**
 
@@ -1527,12 +1527,12 @@ controlplane/
 
 ### 6.1.1 模式对比
 
-| 模式 | 单节点 SNSD | 多节点 MNMD（推荐） | 说明 |
-|------|------------|-------------------|------|
-| **数据冗余** | 无 | EC 纠删码 | MNMD 默认 EC:4，丢失 N/2 块仍可恢复 |
-| **水平扩容** | 不支持 | 追加 Server Pool | 新 Pool 无缝接入 |
-| **最小节点数** | 1 | 4（推荐） | 4节点起步满足生产可用性 |
-| **适用场景** | 开发/测试 | 生产环境 | |
+| 模式        | 单节点 SNSD | 多节点 MNMD（推荐）   | 说明                        |
+|-----------|----------|----------------|---------------------------|
+| **数据冗余**  | 无        | EC 纠删码         | MNMD 默认 EC:4，丢失 N/2 块仍可恢复 |
+| **水平扩容**  | 不支持      | 追加 Server Pool | 新 Pool 无缝接入               |
+| **最小节点数** | 1        | 4（推荐）          | 4节点起步满足生产可用性              |
+| **适用场景**  | 开发/测试    | 生产环境           |                           |
 
 ### 6.1.2 生产部署配置（4节点 MNMD）
 
@@ -1559,11 +1559,11 @@ MINIO_VOLUMES="https://minio{1...4}.internal:9000/data{1...4} \
 
 ## 6.2 Bucket 规划与命名约定
 
-| Bucket 名称模式 | 用途 | 备注 |
-|----------------|------|------|
-| `data-{domain}` | 业务数据采集 | 如 data-sensor、data-logs |
-| `archive-{year}` | 归档数据 | 冷数据，可配置 Lifecycle |
-| `tmp-uploads` | 临时上传暂存 | 配置 7 天 Lifecycle 自动清理 |
+| Bucket 名称模式      | 用途     | 备注                      |
+|------------------|--------|-------------------------|
+| `data-{domain}`  | 业务数据采集 | 如 data-sensor、data-logs |
+| `archive-{year}` | 归档数据   | 冷数据，可配置 Lifecycle       |
+| `tmp-uploads`    | 临时上传暂存 | 配置 7 天 Lifecycle 自动清理   |
 
 **对象键命名约定：**
 
@@ -1575,11 +1575,11 @@ MINIO_VOLUMES="https://minio{1...4}.internal:9000/data{1...4} \
 
 ## 6.3 ACL 与 Policy 设计
 
-| 账号类型 | 权限范围 | 用途 |
-|----------|----------|------|
-| **admin-sa** | 全部权限 | Control Plane 管理账号 |
-| **agent-role** | STS AssumeRole 角色 | Agent 临时扮演 |
-| **readonly-sa** | 所有 Bucket s3:GetObject | 预签名下载 URL |
+| 账号类型            | 权限范围                   | 用途                 |
+|-----------------|------------------------|--------------------|
+| **admin-sa**    | 全部权限                   | Control Plane 管理账号 |
+| **agent-role**  | STS AssumeRole 角色      | Agent 临时扮演         |
+| **readonly-sa** | 所有 Bucket s3:GetObject | 预签名下载 URL          |
 
 **STS Session Policy（动态生成）：**
 
@@ -1616,22 +1616,22 @@ mc event add myminio/data-sensor primary \
 
 ## 6.6 MinIO 管理功能在后台的集成
 
-| 功能 | 实现方式 | 触发时机 |
-|------|----------|----------|
-| **创建 Bucket** | madmin.MakeBucket() | POST /api/v1/buckets |
-| **设置 Policy** | madmin.SetBucketPolicy() | Bucket 创建后 |
-| **创建 ServiceAccount** | madmin.AddServiceAccount() | 系统初始化 |
-| **STS AssumeRole** | credentials.NewSTSAssumeRole() | Agent 连接时 |
-| **Bucket 存储用量** | madmin.BucketUsageInfo() | Dashboard，每 5 分钟缓存 |
-| **Lifecycle 规则** | s3.PutBucketLifecycleConfiguration() | tmp-uploads 7天清理 |
+| 功能                    | 实现方式                                 | 触发时机                 |
+|-----------------------|--------------------------------------|----------------------|
+| **创建 Bucket**         | madmin.MakeBucket()                  | POST /api/v1/buckets |
+| **设置 Policy**         | madmin.SetBucketPolicy()             | Bucket 创建后           |
+| **创建 ServiceAccount** | madmin.AddServiceAccount()           | 系统初始化                |
+| **STS AssumeRole**    | credentials.NewSTSAssumeRole()       | Agent 连接时            |
+| **Bucket 存储用量**       | madmin.BucketUsageInfo()             | Dashboard，每 5 分钟缓存   |
+| **Lifecycle 规则**      | s3.PutBucketLifecycleConfiguration() | tmp-uploads 7天清理     |
 
 ## 6.7 存储容量规划参考
 
-| 场景 | 文件频率 | 单文件大小 | 单采集器/天 | 50台/年 |
-|------|----------|-----------|------------|---------|
-| **高频小文件** | 每分钟1个 | 5 MB | 7.2 GB | ~130 TB |
-| **低频大文件** | 每小时1个 | 500 MB | 12 GB | ~219 TB |
-| **追加日志文件** | 每天1个 | 200 MB/天 | 200 MB | ~3.6 TB |
+| 场景         | 文件频率  | 单文件大小    | 单采集器/天 | 50台/年   |
+|------------|-------|----------|--------|---------|
+| **高频小文件**  | 每分钟1个 | 5 MB     | 7.2 GB | ~130 TB |
+| **低频大文件**  | 每小时1个 | 500 MB   | 12 GB  | ~219 TB |
+| **追加日志文件** | 每天1个  | 200 MB/天 | 200 MB | ~3.6 TB |
 
 *MinIO MNMD 纠删码开销：EC:4 配置下，实际可用容量约为原始容量的 50%。*
 
@@ -1641,15 +1641,15 @@ mc event add myminio/data-sensor primary \
 
 ## 7.1 技术选型
 
-| 层次 | 选型 | 说明 |
-|------|------|------|
-| **UI 框架** | React 18 | hooks 生态成熟 |
-| **组件库** | Ant Design 5 + ProComponents | ProTable、ProForm、ProLayout |
-| **路由** | React Router v6 | 嵌套路由，权限路由守卫 |
-| **状态管理** | Zustand | 轻量，全局 Token、用户信息 |
-| **HTTP 客户端** | Axios + SWR | Token 注入、401 刷新、数据缓存 |
-| **多文件下载** | StreamSaver.js | 浏览器端流式打包 zip |
-| **构建工具** | Vite | 开发热更新，生产静态文件 |
+| 层次           | 选型                           | 说明                         |
+|--------------|------------------------------|----------------------------|
+| **UI 框架**    | React 18                     | hooks 生态成熟                 |
+| **组件库**      | Ant Design 5 + ProComponents | ProTable、ProForm、ProLayout |
+| **路由**       | React Router v6              | 嵌套路由，权限路由守卫                |
+| **状态管理**     | Zustand                      | 轻量，全局 Token、用户信息           |
+| **HTTP 客户端** | Axios + SWR                  | Token 注入、401 刷新、数据缓存       |
+| **多文件下载**    | StreamSaver.js               | 浏览器端流式打包 zip               |
+| **构建工具**     | Vite                         | 开发热更新，生产静态文件               |
 
 ## 7.2 页面模块清单
 
@@ -1800,15 +1800,15 @@ webui/
 
 ## 8.1 SDK 功能范围
 
-| 功能模块 | 说明 | 对应 API |
-|----------|------|----------|
-| **认证** | 用户名密码登录，Token 自动刷新 | POST /auth/login, /auth/refresh |
-| **文件查询** | 按文件类型、时间范围等条件检索 | GET /files |
-| **文件下载** | 获取预签名 URL，支持直接写入本地 | GET /files/{id}/download-url |
-| **批量下载** | 批量获取预签名 URL | POST /files/batch-download-urls |
-| **文件类型查询** | 列出所有文件类型 | GET /file-types |
-| **采集器查询** | 查询采集器列表和状态（只读） | GET /agents |
-| **上传日志查询** | 查询上传历史记录 | GET /upload-logs |
+| 功能模块       | 说明                 | 对应 API                          |
+|------------|--------------------|---------------------------------|
+| **认证**     | 用户名密码登录，Token 自动刷新 | POST /auth/login, /auth/refresh |
+| **文件查询**   | 按文件类型、时间范围等条件检索    | GET /files                      |
+| **文件下载**   | 获取预签名 URL，支持直接写入本地 | GET /files/{id}/download-url    |
+| **批量下载**   | 批量获取预签名 URL        | POST /files/batch-download-urls |
+| **文件类型查询** | 列出所有文件类型           | GET /file-types                 |
+| **采集器查询**  | 查询采集器列表和状态（只读）     | GET /agents                     |
+| **上传日志查询** | 查询上传历史记录           | GET /upload-logs                |
 
 **设计原则：**
 
@@ -1951,13 +1951,13 @@ GET /api/v1/files?page_size=50&cursor=<opaque_string>
 
 ## 9.1 监控组件栈
 
-| 组件 | 版本 | 职责 |
-|------|------|------|
-| **Prometheus** | v2.x | 指标采集与存储，15天本地保留 |
-| **Grafana** | v10+ | 指标可视化 Dashboard |
-| **Loki** | v3.x | 日志聚合存储 |
-| **Promtail** | v3.x | 日志采集 Agent |
-| **Alertmanager** | v0.x | 告警路由与去重 |
+| 组件               | 版本   | 职责              |
+|------------------|------|-----------------|
+| **Prometheus**   | v2.x | 指标采集与存储，15天本地保留 |
+| **Grafana**      | v10+ | 指标可视化 Dashboard |
+| **Loki**         | v3.x | 日志聚合存储          |
+| **Promtail**     | v3.x | 日志采集 Agent      |
+| **Alertmanager** | v0.x | 告警路由与去重         |
 
 ## 9.2 各组件 Metrics 指标清单
 
@@ -2015,13 +2015,13 @@ groups:
 
 ## 9.5 Grafana Dashboard 规划
 
-| Dashboard | 核心面板 |
-|-----------|----------|
-| **系统总览** | 在线采集器数、今日上传量、存储用量、API QPS、错误率 |
-| **采集器详情** | 队列深度趋势、上传速率、磁盘剩余、历史在线状态 |
-| **存储层** | MinIO 各节点磁盘、入站/出站流量、S3 API QPS |
-| **事件系统** | Webhook 成功/失败率、重试队列深度 |
-| **数据库** | PostgreSQL 连接数、QPS、复制延迟 |
+| Dashboard | 核心面板                           |
+|-----------|--------------------------------|
+| **系统总览**  | 在线采集器数、今日上传量、存储用量、API QPS、错误率  |
+| **采集器详情** | 队列深度趋势、上传速率、磁盘剩余、历史在线状态        |
+| **存储层**   | MinIO 各节点磁盘、入站/出站流量、S3 API QPS |
+| **事件系统**  | Webhook 成功/失败率、重试队列深度          |
+| **数据库**   | PostgreSQL 连接数、QPS、复制延迟        |
 
 ---
 
@@ -2035,12 +2035,12 @@ groups:
 
 ## 10.2 生产最小化部署（节点规划）
 
-| 节点组 | 数量 | 配置 | 部署服务 |
-|--------|------|------|----------|
-| **应用节点** | 3台 | 4C 8G | Control Plane + Redis + NATS + Caddy |
-| **数据库节点** | 2台 | 4C 8G + 500G SSD | PostgreSQL 主从 + Patroni |
-| **存储节点** | 4台 | 4C 8G + 数据盘 | MinIO MNMD |
-| **监控节点** | 1台 | 4C 8G | Prometheus + Grafana + Loki |
+| 节点组       | 数量 | 配置               | 部署服务                                 |
+|-----------|----|------------------|--------------------------------------|
+| **应用节点**  | 3台 | 4C 8G            | Control Plane + Redis + NATS + Caddy |
+| **数据库节点** | 2台 | 4C 8G + 500G SSD | PostgreSQL 主从 + Patroni              |
+| **存储节点**  | 4台 | 4C 8G + 数据盘      | MinIO MNMD                           |
+| **监控节点**  | 1台 | 4C 8G            | Prometheus + Grafana + Loki          |
 
 ## 10.3 systemd Service 文件
 
@@ -2161,22 +2161,22 @@ migrations/
 
 # 附录 A 名词表
 
-| 术语 | 定义 |
-|------|------|
-| **Control Plane** | 控制平面，系统的中心服务器 |
-| **Data Plane** | 数据平面，Agent → MinIO 直传路径 |
-| **Edge Agent** | 边缘采集器，Go 单二进制程序 |
-| **STS** | Security Token Service，临时安全凭据服务 |
-| **Fingerprint** | 设备唯一标识符，Agent 首次启动时生成 |
-| **FileType** | 文件逻辑分类，通过路径 glob 规则自动匹配 |
-| **FileTypeRule** | 文件类型匹配规则，定义存储路径的 glob 模式 |
-| **Watch 模式** | 持续监控目录的采集模式 |
-| **Scheduled 模式** | 按 cron 表达式触发的定时采集模式 |
-| **append_mode** | 追加写入文件处理策略：overwrite / close_wait / tail |
-| **MNMD** | Multi-Node Multi-Drive，MinIO 分布式部署模式 |
-| **Presigned URL** | 预签名 URL，带时限的对象访问链接 |
-| **NATS JetStream** | NATS 消息系统的持久化消息流功能 |
-| **org_id** | 组织 ID，多租户预留字段 |
+| 术语                 | 定义                                       |
+|--------------------|------------------------------------------|
+| **Control Plane**  | 控制平面，系统的中心服务器                            |
+| **Data Plane**     | 数据平面，Agent → MinIO 直传路径                  |
+| **Edge Agent**     | 边缘采集器，Go 单二进制程序                          |
+| **STS**            | Security Token Service，临时安全凭据服务          |
+| **Fingerprint**    | 设备唯一标识符，Agent 首次启动时生成                    |
+| **FileType**       | 文件逻辑分类，通过路径 glob 规则自动匹配                  |
+| **FileTypeRule**   | 文件类型匹配规则，定义存储路径的 glob 模式                 |
+| **Watch 模式**       | 持续监控目录的采集模式                              |
+| **Scheduled 模式**   | 按 cron 表达式触发的定时采集模式                      |
+| **append_mode**    | 追加写入文件处理策略：overwrite / close_wait / tail |
+| **MNMD**           | Multi-Node Multi-Drive，MinIO 分布式部署模式     |
+| **Presigned URL**  | 预签名 URL，带时限的对象访问链接                       |
+| **NATS JetStream** | NATS 消息系统的持久化消息流功能                       |
+| **org_id**         | 组织 ID，多租户预留字段                            |
 
 ---
 
@@ -2184,51 +2184,51 @@ migrations/
 
 ## B.1 gRPC 接口汇总
 
-| RPC 方法 | 类型 | 说明 |
-|----------|------|------|
-| Register | Unary | Agent 注册申请 |
-| PollApproval | Unary | 轮询审批结果 |
-| Connect | Bidirectional Stream | 主控制通道 |
-| RefreshCredentials | Unary | 主动续期 STS 凭据 |
+| RPC 方法             | 类型                   | 说明          |
+|--------------------|----------------------|-------------|
+| Register           | Unary                | Agent 注册申请  |
+| PollApproval       | Unary                | 轮询审批结果      |
+| Connect            | Bidirectional Stream | 主控制通道       |
+| RefreshCredentials | Unary                | 主动续期 STS 凭据 |
 
 ## B.2 REST API 汇总
 
-| Method | Path | 说明 |
-|--------|------|------|
-| POST | /api/v1/auth/login | 登录 |
-| POST | /api/v1/auth/refresh | 刷新 Token |
-| POST | /api/v1/auth/logout | 登出 |
-| GET | /api/v1/auth/me | 当前用户信息 |
-| GET | /api/v1/users | 用户列表 |
-| POST | /api/v1/users | 创建用户 |
-| PUT | /api/v1/users/{id} | 更新用户 |
-| DELETE | /api/v1/users/{id} | 禁用用户 |
-| GET | /api/v1/agents | 采集器列表 |
-| GET | /api/v1/agents/{id} | 采集器详情 |
-| POST | /api/v1/agents/{id}/approve | 审批通过 |
-| POST | /api/v1/agents/{id}/revoke | 吊销采集器 |
-| POST | /api/v1/agents/{id}/list-dir | 下发列目录指令 |
-| GET | /api/v1/agents/{id}/rules | 采集规则列表 |
-| POST | /api/v1/agents/{id}/rules | 创建采集规则 |
-| PUT | /api/v1/agents/{id}/rules/{rid} | 更新采集规则 |
-| DELETE | /api/v1/agents/{id}/rules/{rid} | 删除采集规则 |
-| GET | /api/v1/files | 文件条目查询 |
-| GET | /api/v1/files/{id} | 文件详情 |
-| GET | /api/v1/files/{id}/download-url | 生成预签名下载 URL |
-| POST | /api/v1/files/batch-download-urls | 批量生成预签名 URL |
-| GET | /api/v1/file-types | 文件类型列表 |
-| POST | /api/v1/file-types | 创建文件类型 |
-| PUT | /api/v1/file-types/{id} | 更新文件类型 |
-| DELETE | /api/v1/file-types/{id} | 删除文件类型 |
-| GET | /api/v1/buckets | Bucket 列表 |
-| POST | /api/v1/buckets | 创建 Bucket |
-| GET | /api/v1/event-rules | 事件规则列表 |
-| POST | /api/v1/event-rules | 创建事件规则 |
-| PUT | /api/v1/event-rules/{id} | 更新事件规则 |
-| DELETE | /api/v1/event-rules/{id} | 删除事件规则 |
-| GET | /api/v1/event-rules/{id}/deliveries | 事件投递历史 |
-| GET | /api/v1/upload-logs | 上传日志查询 |
-| POST | /internal/minio-event | MinIO 事件回调（仅内部访问） |
+| Method | Path                                | 说明                |
+|--------|-------------------------------------|-------------------|
+| POST   | /api/v1/auth/login                  | 登录                |
+| POST   | /api/v1/auth/refresh                | 刷新 Token          |
+| POST   | /api/v1/auth/logout                 | 登出                |
+| GET    | /api/v1/auth/me                     | 当前用户信息            |
+| GET    | /api/v1/users                       | 用户列表              |
+| POST   | /api/v1/users                       | 创建用户              |
+| PUT    | /api/v1/users/{id}                  | 更新用户              |
+| DELETE | /api/v1/users/{id}                  | 禁用用户              |
+| GET    | /api/v1/agents                      | 采集器列表             |
+| GET    | /api/v1/agents/{id}                 | 采集器详情             |
+| POST   | /api/v1/agents/{id}/approve         | 审批通过              |
+| POST   | /api/v1/agents/{id}/revoke          | 吊销采集器             |
+| POST   | /api/v1/agents/{id}/list-dir        | 下发列目录指令           |
+| GET    | /api/v1/agents/{id}/rules           | 采集规则列表            |
+| POST   | /api/v1/agents/{id}/rules           | 创建采集规则            |
+| PUT    | /api/v1/agents/{id}/rules/{rid}     | 更新采集规则            |
+| DELETE | /api/v1/agents/{id}/rules/{rid}     | 删除采集规则            |
+| GET    | /api/v1/files                       | 文件条目查询            |
+| GET    | /api/v1/files/{id}                  | 文件详情              |
+| GET    | /api/v1/files/{id}/download-url     | 生成预签名下载 URL       |
+| POST   | /api/v1/files/batch-download-urls   | 批量生成预签名 URL       |
+| GET    | /api/v1/file-types                  | 文件类型列表            |
+| POST   | /api/v1/file-types                  | 创建文件类型            |
+| PUT    | /api/v1/file-types/{id}             | 更新文件类型            |
+| DELETE | /api/v1/file-types/{id}             | 删除文件类型            |
+| GET    | /api/v1/buckets                     | Bucket 列表         |
+| POST   | /api/v1/buckets                     | 创建 Bucket         |
+| GET    | /api/v1/event-rules                 | 事件规则列表            |
+| POST   | /api/v1/event-rules                 | 创建事件规则            |
+| PUT    | /api/v1/event-rules/{id}            | 更新事件规则            |
+| DELETE | /api/v1/event-rules/{id}            | 删除事件规则            |
+| GET    | /api/v1/event-rules/{id}/deliveries | 事件投递历史            |
+| GET    | /api/v1/upload-logs                 | 上传日志查询            |
+| POST   | /internal/minio-event               | MinIO 事件回调（仅内部访问） |
 
 ---
 
@@ -2301,27 +2301,27 @@ compress    = true
 
 ## D.1 第一版已知限制
 
-| 限制项 | 说明与临时方案 |
-|--------|--------------|
-| **多租户** | 第一版仅单组织，org_id 已预留 |
-| **LDAP/OIDC** | 仅内置账号，OIDC 接口返回 501 |
-| **Agent mTLS** | 仅 Bearer Token，无双向证书认证 |
-| **tail 增量上传** | 第一版建议使用 overwrite 或 close_wait |
-| **批量下载 Safari** | StreamSaver.js 不支持 Safari |
-| **文件删除** | 不支持通过管理后台删除 MinIO 对象 |
-| **Control Plane HA** | 第一版单实例 |
+| 限制项                  | 说明与临时方案                        |
+|----------------------|--------------------------------|
+| **多租户**              | 第一版仅单组织，org_id 已预留             |
+| **LDAP/OIDC**        | 仅内置账号，OIDC 接口返回 501            |
+| **Agent mTLS**       | 仅 Bearer Token，无双向证书认证         |
+| **tail 增量上传**        | 第一版建议使用 overwrite 或 close_wait |
+| **批量下载 Safari**      | StreamSaver.js 不支持 Safari      |
+| **文件删除**             | 不支持通过管理后台删除 MinIO 对象           |
+| **Control Plane HA** | 第一版单实例                         |
 
 ## D.2 后续迭代计划
 
-| 优先级 | 功能 | 说明 |
-|--------|------|------|
-| P1 | Control Plane HA | HAProxy L4 + 多实例 |
-| P1 | append_mode tail 实现 | 大文件增量上传 |
-| P1 | Agent 远程升级 | gRPC 指令推送新版本 |
-| P2 | 多租户支持 | 启用 org_id 隔离 |
-| P2 | OIDC/SSO 对接 | Keycloak 或企业 AD |
-| P2 | Agent mTLS | 双向证书认证 |
-| P3 | 文件管理功能 | 对象删除、移动、重命名 |
-| P3 | Go SDK | 补充 Go 语言 Client SDK |
-| P3 | Electron 下载工具 | 桌面端文件浏览器 |
-| P4 | 数据归档 | MinIO Lifecycle 规则 UI 配置 |
+| 优先级 | 功能                  | 说明                       |
+|-----|---------------------|--------------------------|
+| P1  | Control Plane HA    | HAProxy L4 + 多实例         |
+| P1  | append_mode tail 实现 | 大文件增量上传                  |
+| P1  | Agent 远程升级          | gRPC 指令推送新版本             |
+| P2  | 多租户支持               | 启用 org_id 隔离             |
+| P2  | OIDC/SSO 对接         | Keycloak 或企业 AD          |
+| P2  | Agent mTLS          | 双向证书认证                   |
+| P3  | 文件管理功能              | 对象删除、移动、重命名              |
+| P3  | Go SDK              | 补充 Go 语言 Client SDK      |
+| P3  | Electron 下载工具       | 桌面端文件浏览器                 |
+| P4  | 数据归档                | MinIO Lifecycle 规则 UI 配置 |
