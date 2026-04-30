@@ -42,13 +42,13 @@ Phase 4  完善与收尾（可并行）
   - [x] down.sql 能完整回滚
   - [x] 在本地 PostgreSQL 15 执行无错误
 
-### T0-3 Docker Compose 文件 ⬜
+### T0-3 Docker Compose 文件 ✅
 - **产出**：`deploy/docker-compose.dev.yml` / `deploy/docker-compose.test.yml`
 - **验收**：
-  - [ ] 包含：PostgreSQL 15 / Redis 7 / MinIO / NATS 2.x（JetStream 启用）
-  - [ ] 所有服务配置 healthcheck
-  - [ ] `docker compose up -d` 后全部 healthy
-  - [ ] 端口固定：PG=5432 / Redis=6379 / MinIO=9000,9001 / NATS=4222,8222
+  - [x] 包含：PostgreSQL 15 / Redis 7 / MinIO / NATS 2.x（JetStream 启用）
+  - [x] 所有服务配置 healthcheck
+  - [x] `docker compose up -d` 后全部 healthy
+  - [x] 端口固定：PG=5432 / Redis=6379 / MinIO=9000,9001 / NATS=4222,8222
 
 ### T0-4 MinIO 初始化脚本 ⬜
 - **产出**：`deploy/scripts/init-minio.sh`
@@ -196,7 +196,7 @@ Phase 4  完善与收尾（可并行）
 
 | Phase | 任务数 | 完成数 | 进度 |
 |-------|--------|--------|------|
-| Phase 0 | 5 | 2 | 40% |
+| Phase 0 | 5 | 3 | 60% |
 | Phase 1 | 14 | 0 | 0% |
 | Phase 2 | 17 | 0 | 0% |
 | Phase 3 | 3 | 0 | 0% |
