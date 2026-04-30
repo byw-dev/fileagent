@@ -107,9 +107,9 @@ Phase 4  完善与收尾（可并行）
 
 | 任务 | 产出 | 关键验收点 | 状态 |
 |------|------|-----------|------|
-| T1-D1 项目初始化 | `sdk/python/` | Poetry；包结构完整；install/pytest 可执行 | ⬜ |
-| T1-D2 异常类 + HTTP 层 | `sdk/python/fileagent/` | 所有异常类；httpx 封装+重试；错误码映射；respx mock 测试 | ⬜ |
-| T1-D3 TokenManager | `sdk/python/fileagent/auth.py` | 线程安全；<5min 自动刷新；Refresh 失效重登录；并发测试 | ⬜ |
+| T1-D1 项目初始化 | `sdk/python/` | Poetry；包结构完整；install/pytest 可执行 | ✅ |
+| T1-D2 异常类 + HTTP 层 | `sdk/python/fileagent/` | 所有异常类；httpx 封装+重试；错误码映射；respx mock 测试 | ✅ |
+| T1-D3 TokenManager | `sdk/python/fileagent/auth.py` | 线程安全；<5min 自动刷新；Refresh 失效重登录；并发测试 | ✅ |
 
 ---
 
