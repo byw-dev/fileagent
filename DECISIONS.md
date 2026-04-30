@@ -41,6 +41,43 @@
 
 ---
 
+## D-003 统一构建约定：Makefile + bin/ 输出目录
+
+**决策日期**：2026-04-30  
+**影响范围**：controlplane / agent / CI / 开发者工作流
+
+### 背景
+
+Go 编译产物在 Linux/macOS 上没有固定扩展名，仅靠 `.gitignore` 中的 `*.exe`
+等后缀规则无法拦截；历史上曾发生过将二进制直接提交进 git 的情况。
+
+### 决策
+
+1. **所有二进制输出统一写入项目根目录的 `bin/` 目录**。  
+   `.gitignore` 追加 `/bin/`，确保编译产物不进入版本控制。
+
+2. **根目录创建 `Makefile` 作为统一构建入口**，提供以下 target：
+
+   | target | 说明 |
+   |--------|------|
+   | `make build` | 构建全部二进制（controlplane + agent） |
+   | `make build-controlplane` | 仅构建 controlplane，输出 `bin/controlplane` |
+   | `make build-agent` | 仅构建 agent，输出 `bin/agent` |
+   | `make test` | 运行全部单元测试 |
+   | `make tidy` | 整理所有模块 `go.mod` / `go.sum` |
+   | `make clean` | 删除 `bin/` 目录 |
+
+3. **`cmd/` 目录结构保持不变**（`controlplane/cmd/server/`、`agent/cmd/agent/`）。  
+   这符合 Go 社区 [golang-standards/project-layout](https://github.com/golang-standards/project-layout) 的事实标准，
+   被 Kubernetes、Prometheus、etcd 等主流项目采用：每个子目录名即二进制名。
+
+### 备选方案（被否决）
+
+- **各模块目录内各自 `go build`，输出到模块自身目录**：产物位置分散，CI 脚本难以统一收集。
+- **根目录 `go build ./...`**：多模块 workspace 下行为不直观，无法控制各二进制输出名称。
+
+---
+
 ## D-002 依赖锚定机制（T0-5）
 
 **决策日期**：2026-04-30  
