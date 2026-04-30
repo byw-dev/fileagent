@@ -1,6 +1,6 @@
 # TASK_LIST.md — FileAgent 任务清单
 
-> 当前阶段：**Phase 0 — 契约定义**
+> 当前阶段：**Phase 1 — 基础骨架**（组 A 已完成，组 B/C/D 进行中）
 > 状态说明：⬜ 未开始 / 🔄 进行中 / ✅ 已完成 / ❌ 阻塞
 
 ---
@@ -77,11 +77,11 @@ Phase 4  完善与收尾（可并行）
 
 | 任务 | 产出 | 关键验收点 | 状态 |
 |------|------|-----------|------|
-| T1-A1 配置加载 | `controlplane/internal/config/` | 环境变量加载；缺必填项报错退出；单元测试 | ⬜ |
-| T1-A2 数据库连接层 | `controlplane/internal/db/` | 连接池；自动迁移；sqlc CRUD；集成测试 | ⬜ |
-| T1-A3 Redis 连接层 | `controlplane/internal/cache/` | Get/Set/Del/SetNX/Expire 封装；Key 常量；miniredis mock | ⬜ |
-| T1-A4 gRPC 服务端骨架 | `controlplane/internal/grpcserver/` | 实现 AgentService（Unimplemented 占位）；JWT 拦截器骨架 | ⬜ |
-| T1-A5 REST API 骨架 | `controlplane/internal/api/` | 所有路由注册（501 占位）；JWT 中间件；统一错误格式 | ⬜ |
+| T1-A1 配置加载 | `controlplane/internal/config/` | 环境变量加载；缺必填项报错退出；单元测试 | ✅ |
+| T1-A2 数据库连接层 | `controlplane/internal/db/` | 连接池；自动迁移；sqlc CRUD；集成测试 | ✅ |
+| T1-A3 Redis 连接层 | `controlplane/internal/cache/` | Get/Set/Del/SetNX/Expire 封装；Key 常量；miniredis mock | ✅ |
+| T1-A4 gRPC 服务端骨架 | `controlplane/internal/grpcserver/` | 实现 AgentService（Unimplemented 占位）；JWT 拦截器骨架 | ✅ |
+| T1-A5 REST API 骨架 | `controlplane/internal/api/` | 所有路由注册（501 占位）；JWT 中间件；统一错误格式 | ✅ |
 
 ### 组 B：Edge Agent 基础层
 > 依赖：T0-1 / T0-5
