@@ -208,7 +208,8 @@ func (q *Queue) UpdateStatus(id, status string) error {
 }
 
 // MarkFailed increments retry_count, records the last error message, and sets
-// the task status back to "pending" so it can be retried.
+// the task status to "failed". Call UpdateStatus with StatusPending to re-queue
+// the task for a subsequent retry attempt.
 func (q *Queue) MarkFailed(id, errMsg string) error {
 	res, err := q.db.Exec(`
         UPDATE upload_tasks

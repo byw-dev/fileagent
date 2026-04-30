@@ -120,12 +120,14 @@ func TestMarkFailed_IncrementRetryCount(t *testing.T) {
 
 	for i := 1; i <= 3; i++ {
 		require.NoError(t, q.MarkFailed("retry-task", "err"))
-		tasks, _ := q.ListByStatus(StatusFailed)
+		tasks, err := q.ListByStatus(StatusFailed)
+		require.NoError(t, err)
 		assert.Equal(t, i, tasks[0].RetryCount)
 		// Reset back to pending to allow re-failing.
 		require.NoError(t, q.UpdateStatus("retry-task", StatusPending))
 		// Re-dequeue so it's running again before marking failed.
-		dequeued, _ := q.DequeuePending(1)
+		dequeued, err := q.DequeuePending(1)
+		require.NoError(t, err)
 		require.Len(t, dequeued, 1)
 	}
 }

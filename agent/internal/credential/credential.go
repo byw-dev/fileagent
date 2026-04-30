@@ -236,8 +236,9 @@ func parseJWTTimes(token string) (exp, iat time.Time, err error) {
 		return time.Time{}, time.Time{}, errors.New("JWT missing exp claim")
 	}
 	if claims.Iat == 0 {
-		// Treat token issue time as the epoch if iat is absent.
-		claims.Iat = 0
+		// iat is absent; time.Unix(0,0) (epoch) is used as the issue time,
+		// so remaining/ttl will be compared against a very large TTL — the
+		// function will still return true/false based on exp alone.
 	}
 	return time.Unix(claims.Exp, 0), time.Unix(claims.Iat, 0), nil
 }
