@@ -88,10 +88,10 @@ Phase 4  完善与收尾（可并行）
 
 | 任务 | 产出 | 关键验收点 | 状态 |
 |------|------|-----------|------|
-| T1-B1 配置加载 | `agent/internal/config/` | TOML + 环境变量；`--config` 参数；单元测试 | ⬜ |
-| T1-B2 SQLite 本地队列 | `agent/internal/queue/` | 建表（3张）；入队/出队/更新状态；`:memory:` 单元测试 | ⬜ |
-| T1-B3 gRPC 客户端骨架 | `agent/internal/grpcclient/` | TLS 连接；指数退避重连；心跳 30s；grpc mock 单元测试 | ⬜ |
-| T1-B4 Credential Manager | `agent/internal/credential/` | AES-256-GCM 存储 Token；STS 内存存储；有效期检测；单元测试 | ⬜ |
+| T1-B1 配置加载 | `agent/internal/config/` | TOML + 环境变量；`--config` 参数；单元测试 | ✅ |
+| T1-B2 SQLite 本地队列 | `agent/internal/queue/` | 建表（3张）；入队/出队/更新状态；`:memory:` 单元测试 | ✅ |
+| T1-B3 gRPC 客户端骨架 | `agent/internal/grpcclient/` | TLS 连接；指数退避重连；心跳 30s；grpc mock 单元测试 | ✅ |
+| T1-B4 Credential Manager | `agent/internal/credential/` | AES-256-GCM 存储 Token；STS 内存存储；有效期检测；单元测试 | ✅ |
 
 ### 组 C：Web UI 基础骨架
 > 依赖：无
@@ -196,12 +196,12 @@ Phase 4  完善与收尾（可并行）
 
 | Phase | 任务数 | 完成数 | 进度 |
 |-------|--------|--------|------|
-| Phase 0 | 5 | 4 | 80% |
-| Phase 1 | 14 | 0 | 0% |
+| Phase 0 | 5 | 5 | 100% |
+| Phase 1 | 14 | 9 | 64% |
 | Phase 2 | 17 | 0 | 0% |
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **43** | **0** | **0%** |
+| **合计** | **43** | **14** | **33%** |
 
 ---
 

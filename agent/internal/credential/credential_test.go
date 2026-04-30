@@ -23,6 +23,14 @@ func makeJWT(exp, iat int64) string {
 	return strings.Join([]string{header, payload, "fakesig"}, ".")
 }
 
+// makeJWTNoIat builds a JWT that omits the "iat" claim entirely.
+func makeJWTNoIat(exp int64) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	claims, _ := json.Marshal(map[string]int64{"exp": exp})
+	payload := base64.RawURLEncoding.EncodeToString(claims)
+	return strings.Join([]string{header, payload, "fakesig"}, ".")
+}
+
 // tokenFile returns a temp file path for a token.
 func tokenFile(t *testing.T) string {
 	t.Helper()
@@ -151,6 +159,31 @@ func TestIsTokenValid_InvalidJWT(t *testing.T) {
 	mgr.mu.Lock()
 	mgr.token = "not.a.jwt.with.five.parts"
 	mgr.mu.Unlock()
+	assert.False(t, mgr.IsTokenValid(0.2))
+}
+
+func TestIsTokenValid_NoIat_NotExpired(t *testing.T) {
+	// JWT without iat: should be valid as long as exp is in the future.
+	now := time.Now()
+	jwt := makeJWTNoIat(now.Add(time.Hour).Unix())
+
+	mgr := NewTokenManager(tokenFile(t), "id")
+	mgr.mu.Lock()
+	mgr.token = jwt
+	mgr.mu.Unlock()
+
+	assert.True(t, mgr.IsTokenValid(0.2))
+}
+
+func TestIsTokenValid_NoIat_Expired(t *testing.T) {
+	now := time.Now()
+	jwt := makeJWTNoIat(now.Add(-time.Second).Unix())
+
+	mgr := NewTokenManager(tokenFile(t), "id")
+	mgr.mu.Lock()
+	mgr.token = jwt
+	mgr.mu.Unlock()
+
 	assert.False(t, mgr.IsTokenValid(0.2))
 }
 

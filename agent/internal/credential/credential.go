@@ -80,6 +80,7 @@ func (m *TokenManager) Token() string {
 // and the remaining lifetime represents more than renewThreshold of the total TTL.
 //
 // renewThreshold=0.2 means "renew when less than 20% of TTL remains".
+// When the JWT lacks an iat claim, only expiry is checked (threshold is ignored).
 func (m *TokenManager) IsTokenValid(renewThreshold float64) bool {
 	m.mu.RLock()
 	tok := m.token
@@ -88,13 +89,17 @@ func (m *TokenManager) IsTokenValid(renewThreshold float64) bool {
 	if tok == "" {
 		return false
 	}
-	exp, iat, err := parseJWTTimes(tok)
+	exp, iat, hasIat, err := parseJWTTimes(tok)
 	if err != nil {
 		return false
 	}
 	now := time.Now()
 	if now.After(exp) {
 		return false
+	}
+	if !hasIat {
+		// No iat claim — can only verify the token is not expired.
+		return true
 	}
 	ttl := exp.Sub(iat)
 	remaining := exp.Sub(now)
@@ -219,26 +224,22 @@ type jwtClaims struct {
 
 // parseJWTTimes base64-decodes the JWT payload section and extracts the
 // "exp" and "iat" fields without performing any signature verification.
-func parseJWTTimes(token string) (exp, iat time.Time, err error) {
+// hasIat is false when the "iat" claim is absent (zero value after unmarshal).
+func parseJWTTimes(token string) (exp, iat time.Time, hasIat bool, err error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return time.Time{}, time.Time{}, errors.New("invalid JWT format")
+		return time.Time{}, time.Time{}, false, errors.New("invalid JWT format")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("decode JWT payload: %w", err)
+		return time.Time{}, time.Time{}, false, fmt.Errorf("decode JWT payload: %w", err)
 	}
 	var claims jwtClaims
 	if err = json.Unmarshal(payload, &claims); err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("unmarshal JWT claims: %w", err)
+		return time.Time{}, time.Time{}, false, fmt.Errorf("unmarshal JWT claims: %w", err)
 	}
 	if claims.Exp == 0 {
-		return time.Time{}, time.Time{}, errors.New("JWT missing exp claim")
+		return time.Time{}, time.Time{}, false, errors.New("JWT missing exp claim")
 	}
-	if claims.Iat == 0 {
-		// iat is absent; time.Unix(0,0) (epoch) is used as the issue time,
-		// so remaining/ttl will be compared against a very large TTL — the
-		// function will still return true/false based on exp alone.
-	}
-	return time.Unix(claims.Exp, 0), time.Unix(claims.Iat, 0), nil
+	return time.Unix(claims.Exp, 0), time.Unix(claims.Iat, 0), claims.Iat != 0, nil
 }
