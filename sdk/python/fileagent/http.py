@@ -223,7 +223,8 @@ class HTTPClient:
             # Non-retryable error — raise immediately.
             raise error
 
-        assert last_exc is not None
+        if last_exc is None:
+            raise FileAgentError("Unexpected error: retry loop exited without exception")
         raise last_exc
 
     def close(self) -> None:
