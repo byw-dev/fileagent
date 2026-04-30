@@ -3,6 +3,7 @@ module github.com/byw-dev/fileagent/agent
 go 1.24.13
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/minio/minio-go/v7 v7.0.91
