@@ -60,13 +60,13 @@ Phase 4  完善与收尾（可并行）
   - [x] 配置 Webhook 事件通知
   - [x] 脚本幂等（重复执行不报错）
 
-### T0-5 go.mod 初始化 ⬜
-- **产出**：`controlplane/go.mod` / `agent/go.mod`
+### T0-5 go.mod 初始化 ✅
+- **产出**：`controlplane/go.mod` / `agent/go.mod` / `go.mod`（根） / `go.work`
 - **验收**：
-  - [ ] Go 版本：1.22
-  - [ ] controlplane 依赖：gin / grpc / zap / sqlc / golang-migrate / testify / redis / nats / minio-go
-  - [ ] agent 依赖：grpc / zap / fsnotify / robfig-cron / go-sqlite3 / testify / minio-go
-  - [ ] `go mod tidy` + `go build ./...` 无错误
+  - [x] Go 版本：1.22（有效最低版本因传递依赖自动升为 1.24，见 DECISIONS.md D-001）
+  - [x] controlplane 依赖：gin / grpc@v1.79.3 / zap / golang-migrate / testify / redis / nats / minio-go
+  - [x] agent 依赖：grpc@v1.79.3 / zap / fsnotify / robfig-cron / go-sqlite3 / testify / minio-go
+  - [x] `go mod tidy` + `go build ./...` 无错误（在各模块目录及根 workspace 均通过）
 
 ---
 
