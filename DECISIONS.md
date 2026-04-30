@@ -34,7 +34,18 @@
 - `github.com/jackc/pgx/v5@v5.9.0`：CVE 修复版本（内存安全）；需 Go 1.25，**暂未引入**。
   Phase 1 T1-A2 运行 sqlc 代码生成后，待确认 pgx 可用的兼容版本后再添加。
 
-### 备选方案（被否决）
+### 路径规则：go.work 与 go.mod 中只允许使用相对路径
+
+`go.work` 的 `use` 指令和 `go.mod` 的 `replace` 指令均支持绝对路径，但**本项目禁止使用绝对路径**：
+
+- 绝对路径与机器环境绑定，提交到仓库后任何其他开发者 clone 均会立即构建失败。
+- 相对路径相对于 `go.work` / `go.mod` 所在目录解析，在任意机器上都可重现。
+
+**强制规则**：
+- `go.work` 中的 `use` 指令只能写 `./子目录` 形式（如 `./agent`、`./controlplane`）。
+- 任何 `go.mod` 中若需要 `replace`，目标路径也必须是相对路径（如 `replace foo => ../foo`）。
+
+### 备选方案（被否决）——D-001
 
 - **单一根 go.mod**：会将 controlplane 和 agent 的依赖混在一起，不利于二进制隔离。
 - **offset 参数 -go=1.22 强制保留**：go mod tidy 会因传递依赖版本冲突而报错，无法满足验收标准。
