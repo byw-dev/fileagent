@@ -23,13 +23,13 @@ Phase 4  完善与收尾（可并行）
 
 ## Phase 0 — 契约定义（串行，必须人工审查通过后进入 Phase 1）
 
-### T0-1 proto 文件 ⬜
+### T0-1 proto 文件 ✅
 - **产出**：`proto/v1/agent.proto`
 - **来源**：`docs/design/system-design.md` 第 4.3 节（直接提取）
 - **验收**：
-  - [ ] `protoc --go_out=. --go-grpc_out=. proto/v1/agent.proto` 编译无错误
-  - [ ] 包含全部 4 个 RPC：Register / PollApproval / Connect / RefreshCredentials
-  - [ ] 包含全部消息类型及 oneof 分支
+  - [x] `protoc --go_out=. --go-grpc_out=. proto/v1/agent.proto` 编译无错误
+  - [x] 包含全部 4 个 RPC：Register / PollApproval / Connect / RefreshCredentials
+  - [x] 包含全部消息类型及 oneof 分支
 - **锁定规则**：生成后只能增字段，不能改字段编号
 
 ### T0-2 数据库迁移文件 ⬜
@@ -196,7 +196,7 @@ Phase 4  完善与收尾（可并行）
 
 | Phase | 任务数 | 完成数 | 进度 |
 |-------|--------|--------|------|
-| Phase 0 | 5 | 0 | 0% |
+| Phase 0 | 5 | 1 | 20% |
 | Phase 1 | 14 | 0 | 0% |
 | Phase 2 | 17 | 0 | 0% |
 | Phase 3 | 3 | 0 | 0% |

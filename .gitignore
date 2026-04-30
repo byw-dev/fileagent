@@ -149,3 +149,6 @@ dmypy.json
 .pyre/
 .pytype/
 cython_debug/
+
+# Go module cache (GOPATH)
+root/
