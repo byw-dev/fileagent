@@ -17,9 +17,10 @@ func zapNoopLogger() *zap.Logger {
 }
 
 func TestBuildSessionPolicy_SingleBucket(t *testing.T) {
-	policy := BuildSessionPolicy([]BucketAccess{
+	policy, err := BuildSessionPolicy([]BucketAccess{
 		{BucketName: "my-bucket", PathPrefix: "uploads/agent-1"},
 	})
+	require.NoError(t, err)
 	require.NotEmpty(t, policy)
 
 	var doc map[string]interface{}
@@ -41,16 +42,18 @@ func TestBuildSessionPolicy_SingleBucket(t *testing.T) {
 }
 
 func TestBuildSessionPolicy_NoBuckets(t *testing.T) {
-	policy := BuildSessionPolicy(nil)
+	policy, err := BuildSessionPolicy(nil)
+	require.NoError(t, err)
 	require.NotEmpty(t, policy)
 	assert.Contains(t, policy, "arn:aws:s3:::*")
 }
 
 func TestBuildSessionPolicy_MultipleBuckets(t *testing.T) {
-	policy := BuildSessionPolicy([]BucketAccess{
+	policy, err := BuildSessionPolicy([]BucketAccess{
 		{BucketName: "bucket-a", PathPrefix: ""},
 		{BucketName: "bucket-b", PathPrefix: "path/"},
 	})
+	require.NoError(t, err)
 
 	var doc map[string]interface{}
 	require.NoError(t, json.Unmarshal([]byte(policy), &doc))

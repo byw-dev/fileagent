@@ -35,7 +35,10 @@ func NewSTSManager(endpoint, accessKey, secretKey, roleARN string, useSSL bool, 
 
 // IssueCredentials obtains temporary STS credentials for an agent.
 func (m *STSManager) IssueCredentials(ctx context.Context, agentID string, buckets []BucketAccess) (*agentv1.CredentialsPayload, error) {
-	policyJSON := BuildSessionPolicy(buckets)
+	policyJSON, err := BuildSessionPolicy(buckets)
+	if err != nil {
+		return nil, err
+	}
 
 	scheme := "http"
 	if m.useSSL {

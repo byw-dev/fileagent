@@ -130,6 +130,9 @@ func (a *dbAdapter) UpdateEventDeliveryStatus(ctx context.Context, id string, st
 		ID:           parsed,
 		Status:       status,
 		ResponseCode: responseCode,
+		ResponseBody: sql.NullString{},
+		AttemptCount: 0,
 		NextRetryAt:  nextRetryAt,
+		DeliveredAt:  sql.NullTime{},
 	})
 }

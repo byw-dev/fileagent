@@ -27,7 +27,8 @@ type policyStatement struct {
 
 // BuildSessionPolicy creates an IAM-style policy JSON that grants PutObject,
 // GetObject and DeleteObject access to the specified buckets and path prefixes.
-func BuildSessionPolicy(buckets []BucketAccess) string {
+// Returns an empty string if JSON marshaling fails (should never happen given the fixed schema).
+func BuildSessionPolicy(buckets []BucketAccess) (string, error) {
 	var resources []string
 	for _, b := range buckets {
 		prefix := strings.TrimSuffix(b.PathPrefix, "/")
@@ -58,6 +59,9 @@ func BuildSessionPolicy(buckets []BucketAccess) string {
 		},
 	}
 
-	data, _ := json.Marshal(doc)
-	return string(data)
+	data, err := json.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("storage: marshal session policy: %w", err)
+	}
+	return string(data), nil
 }
