@@ -32,15 +32,15 @@ Phase 4  完善与收尾（可并行）
   - [x] 包含全部消息类型及 oneof 分支
 - **锁定规则**：生成后只能增字段，不能改字段编号
 
-### T0-2 数据库迁移文件 ⬜
+### T0-2 数据库迁移文件 ✅
 - **产出**：`controlplane/migrations/000001_init_schema.up.sql` + `down.sql`
 - **来源**：`docs/design/system-design.md` 第 3.3 节 + 第 3.4 节
 - **验收**：
-  - [ ] 包含全部 7 个枚举类型
-  - [ ] 包含全部 11 张表
-  - [ ] 包含全部索引（第 3.4 节）
-  - [ ] down.sql 能完整回滚
-  - [ ] 在本地 PostgreSQL 15 执行无错误
+  - [x] 包含全部 7 个枚举类型
+  - [x] 包含全部 12 张表（§3.3 DDL 实际定义 12 张，含 file_type_rules 与 event_deliveries）
+  - [x] 包含全部索引（第 3.4 节）
+  - [x] down.sql 能完整回滚
+  - [x] 在本地 PostgreSQL 15 执行无错误
 
 ### T0-3 Docker Compose 文件 ⬜
 - **产出**：`deploy/docker-compose.dev.yml` / `deploy/docker-compose.test.yml`
@@ -196,7 +196,7 @@ Phase 4  完善与收尾（可并行）
 
 | Phase | 任务数 | 完成数 | 进度 |
 |-------|--------|--------|------|
-| Phase 0 | 5 | 1 | 20% |
+| Phase 0 | 5 | 2 | 40% |
 | Phase 1 | 14 | 0 | 0% |
 | Phase 2 | 17 | 0 | 0% |
 | Phase 3 | 3 | 0 | 0% |
