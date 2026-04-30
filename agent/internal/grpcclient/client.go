@@ -1,0 +1,256 @@
+// Package grpcclient provides a gRPC client for the Edge Agent to communicate
+// with the Control Plane. It handles TLS configuration, automatic reconnection
+// with exponential backoff, and periodic heartbeat sending.
+package grpcclient
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"math"
+	"os"
+	"sync"
+	"time"
+
+	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"github.com/byw-dev/fileagent/agent/internal/config"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+)
+
+const (
+	heartbeatInterval = 30 * time.Second
+	backoffBase       = time.Second
+	backoffMax        = 60 * time.Second
+	backoffFactor     = 2.0
+)
+
+// Client manages a gRPC connection to the Control Plane and the long-lived
+// bidirectional Connect stream.
+type Client struct {
+	cfg    *config.Config
+	logger *zap.Logger
+
+	mu     sync.Mutex
+	conn   *grpc.ClientConn
+	svc    agentv1.AgentServiceClient
+	stream agentv1.AgentService_ConnectClient
+
+	// token is the Bearer JWT sent with each Connect call.
+	token string
+}
+
+// New constructs a Client. Call Connect to establish the connection.
+func New(cfg *config.Config, logger *zap.Logger) *Client {
+	return &Client{
+		cfg:    cfg,
+		logger: logger,
+	}
+}
+
+// SetToken stores the Bearer JWT that will be attached to outgoing RPCs.
+func (c *Client) SetToken(token string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.token = token
+}
+
+// Connect dials the Control Plane and opens the bidirectional Connect stream,
+// then starts a heartbeat goroutine. It blocks until ctx is cancelled,
+// reconnecting with exponential backoff on every failure.
+func (c *Client) Connect(ctx context.Context) error {
+	dialOpts, err := c.buildDialOpts()
+	if err != nil {
+		return fmt.Errorf("grpcclient: build dial options: %w", err)
+	}
+
+	conn, err := grpc.NewClient(c.cfg.Server.Endpoint, dialOpts...)
+	if err != nil {
+		return fmt.Errorf("grpcclient: dial %q: %w", c.cfg.Server.Endpoint, err)
+	}
+
+	c.mu.Lock()
+	c.conn = conn
+	c.svc = agentv1.NewAgentServiceClient(conn)
+	c.mu.Unlock()
+
+	go c.runLoop(ctx)
+	return nil
+}
+
+// Close tears down the gRPC connection.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	return nil
+}
+
+// SendHeartbeat writes a heartbeat AgentMessage to the current stream.
+// It returns an error when no stream is open.
+func (c *Client) SendHeartbeat(hb *agentv1.Heartbeat) error {
+	c.mu.Lock()
+	stream := c.stream
+	c.mu.Unlock()
+
+	if stream == nil {
+		return fmt.Errorf("grpcclient: no active stream")
+	}
+	msg := &agentv1.AgentMessage{
+		Payload: &agentv1.AgentMessage_Heartbeat{Heartbeat: hb},
+	}
+	if err := stream.Send(msg); err != nil {
+		return fmt.Errorf("grpcclient: send heartbeat: %w", err)
+	}
+	return nil
+}
+
+// runLoop maintains the Connect stream and heartbeat goroutine, reconnecting
+// with exponential backoff on failures until ctx is cancelled.
+func (c *Client) runLoop(ctx context.Context) {
+	attempt := 0
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		if attempt > 0 {
+			delay := backoffDelay(attempt)
+			c.logger.Info("grpcclient: reconnecting", zap.Int("attempt", attempt), zap.Duration("delay", delay))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+		}
+		attempt++
+
+		if err := c.openStream(ctx); err != nil {
+			c.logger.Warn("grpcclient: stream error", zap.Error(err))
+			continue
+		}
+
+		// Stream opened successfully — reset backoff counter.
+		attempt = 0
+
+		streamCtx, cancel := context.WithCancel(ctx)
+		go c.heartbeatLoop(streamCtx)
+		c.receiveLoop(streamCtx)
+		cancel()
+	}
+}
+
+// openStream calls Connect on the gRPC service and stores the resulting stream.
+func (c *Client) openStream(ctx context.Context) error {
+	c.mu.Lock()
+	svc := c.svc
+	tok := c.token
+	c.mu.Unlock()
+
+	if svc == nil {
+		return fmt.Errorf("grpcclient: service client not initialised")
+	}
+
+	outCtx := ctx
+	if tok != "" {
+		outCtx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+tok)
+	}
+
+	stream, err := svc.Connect(outCtx)
+	if err != nil {
+		return fmt.Errorf("grpcclient: open Connect stream: %w", err)
+	}
+
+	c.mu.Lock()
+	c.stream = stream
+	c.mu.Unlock()
+
+	c.logger.Info("grpcclient: stream established")
+	return nil
+}
+
+// receiveLoop reads server messages from the stream until it closes or errors.
+func (c *Client) receiveLoop(ctx context.Context) {
+	c.mu.Lock()
+	stream := c.stream
+	c.mu.Unlock()
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		_, err := stream.Recv()
+		if err != nil {
+			c.logger.Warn("grpcclient: stream recv error", zap.Error(err))
+			c.mu.Lock()
+			c.stream = nil
+			c.mu.Unlock()
+			return
+		}
+	}
+}
+
+// heartbeatLoop sends a heartbeat every heartbeatInterval until ctx is cancelled.
+func (c *Client) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			hb := &agentv1.Heartbeat{}
+			if err := c.SendHeartbeat(hb); err != nil {
+				c.logger.Warn("grpcclient: heartbeat failed", zap.Error(err))
+				return
+			}
+			c.logger.Debug("grpcclient: heartbeat sent")
+		}
+	}
+}
+
+// buildDialOpts constructs the gRPC dial options based on the configuration.
+// If TLSCACert is set, it loads the CA certificate for server verification;
+// otherwise, the system root CA pool is used. No mTLS in v1.
+func (c *Client) buildDialOpts() ([]grpc.DialOption, error) {
+	if c.cfg.Server.TLSCACert == "" {
+		// Use system cert pool with default TLS settings.
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))}, nil
+	}
+
+	pemData, err := os.ReadFile(c.cfg.Server.TLSCACert)
+	if err != nil {
+		return nil, fmt.Errorf("grpcclient: read CA cert %q: %w", c.cfg.Server.TLSCACert, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemData) {
+		return nil, fmt.Errorf("grpcclient: parse CA cert %q: no certificates found", c.cfg.Server.TLSCACert)
+	}
+	tlsCfg := &tls.Config{
+		RootCAs:    pool,
+		MinVersion: tls.VersionTLS12,
+	}
+	return []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))}, nil
+}
+
+// InsecureDialOpts returns dial options without TLS, intended for testing only.
+func InsecureDialOpts() []grpc.DialOption {
+	return []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+}
+
+// backoffDelay computes the exponential backoff delay for the nth attempt,
+// capped at backoffMax.
+func backoffDelay(attempt int) time.Duration {
+	d := float64(backoffBase) * math.Pow(backoffFactor, float64(attempt-1))
+	if d > float64(backoffMax) {
+		return backoffMax
+	}
+	return time.Duration(d)
+}
