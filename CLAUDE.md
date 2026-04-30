@@ -23,6 +23,9 @@ fileagent/                        # Monorepo 根目录
 ├── CLAUDE.md                     # 本文件（所有 Agent 必读）
 ├── TASK_LIST.md                  # 任务清单与进度
 ├── DECISIONS.md                  # 技术决策记录（修改前必读）
+├── Makefile                      # 统一构建入口（make build → bin/）
+│
+├── bin/                          # ⚠️ 编译产物（.gitignore 忽略，不提交）
 │
 ├── docs/
 │   └── design/
@@ -169,6 +172,9 @@ docker compose -f docker-compose.dev.yml up -d
 # 检查服务状态
 docker compose -f docker-compose.dev.yml ps
 
+# 构建所有二进制（输出到 bin/）
+make build
+
 # 初始化数据库（首次）
 cd controlplane
 migrate -database "$DATABASE_URL" -path ./migrations up
@@ -222,6 +228,7 @@ docker compose -f deploy/docker-compose.test.yml down -v
 | Agent 本地持久化 | SQLite，不用其他嵌入式 DB |
 | 多租户 | 第一版单组织，org_id 字段已预留 |
 | Control Plane HA | 第一版单实例，无状态设计为 HA 预留 |
+| 二进制构建与输出 | `make build` → `bin/`，禁止提交编译产物（见 D-003） |
 
 ---
 
