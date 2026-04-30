@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -31,10 +32,8 @@ var jwtExemptMethods = map[string]bool{
 }
 
 // jwtUnaryInterceptor is a gRPC unary server interceptor that validates the
-// Bearer JWT token in the request metadata. Phase 1 provides the skeleton;
-// actual token verification (secret lookup + blacklist check) is added in
-// Phase 2 (T2-A1).
-func jwtUnaryInterceptor(logger *zap.Logger) grpc.UnaryServerInterceptor {
+// Bearer JWT token in the request metadata.
+func jwtUnaryInterceptor(logger *zap.Logger, jwtSvc auth.Service) grpc.UnaryServerInterceptor {
 	return func(
 		ctx context.Context,
 		req interface{},
@@ -44,7 +43,7 @@ func jwtUnaryInterceptor(logger *zap.Logger) grpc.UnaryServerInterceptor {
 		if jwtExemptMethods[info.FullMethod] {
 			return handler(ctx, req)
 		}
-		ctx, err := authenticateGRPC(ctx, logger)
+		ctx, err := authenticateGRPC(ctx, logger, jwtSvc)
 		if err != nil {
 			return nil, err
 		}
@@ -54,7 +53,7 @@ func jwtUnaryInterceptor(logger *zap.Logger) grpc.UnaryServerInterceptor {
 
 // jwtStreamInterceptor is a gRPC stream server interceptor that validates the
 // Bearer JWT token in the stream metadata.
-func jwtStreamInterceptor(logger *zap.Logger) grpc.StreamServerInterceptor {
+func jwtStreamInterceptor(logger *zap.Logger, jwtSvc auth.Service) grpc.StreamServerInterceptor {
 	return func(
 		srv interface{},
 		stream grpc.ServerStream,
@@ -64,7 +63,7 @@ func jwtStreamInterceptor(logger *zap.Logger) grpc.StreamServerInterceptor {
 		if jwtExemptMethods[info.FullMethod] {
 			return handler(srv, stream)
 		}
-		ctx, err := authenticateGRPC(stream.Context(), logger)
+		ctx, err := authenticateGRPC(stream.Context(), logger, jwtSvc)
 		if err != nil {
 			return err
 		}
@@ -72,10 +71,10 @@ func jwtStreamInterceptor(logger *zap.Logger) grpc.StreamServerInterceptor {
 	}
 }
 
-// authenticateGRPC extracts and minimally validates the Bearer token from gRPC
-// metadata. Phase 1 only checks that the token is present and well-formed;
-// signature verification and blacklist lookup are added in Phase 2.
-func authenticateGRPC(ctx context.Context, logger *zap.Logger) (context.Context, error) {
+// authenticateGRPC extracts and validates the Bearer token from gRPC metadata.
+// When jwtSvc is nil, only token presence is verified (Phase 1 compatibility).
+// When jwtSvc is provided, the token is fully validated.
+func authenticateGRPC(ctx context.Context, logger *zap.Logger, jwtSvc auth.Service) (context.Context, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return ctx, status.Error(codes.Unauthenticated, "missing metadata")
@@ -91,15 +90,35 @@ func authenticateGRPC(ctx context.Context, logger *zap.Logger) (context.Context,
 		return ctx, status.Error(codes.Unauthenticated, "authorization header must use Bearer scheme")
 	}
 
-	token := strings.TrimPrefix(bearer, "Bearer ")
-	if token == "" {
+	tokenStr := strings.TrimPrefix(bearer, "Bearer ")
+	if tokenStr == "" {
 		return ctx, status.Error(codes.Unauthenticated, "empty token")
 	}
 
-	// TODO (Phase 2 T2-A1): verify JWT signature and check blacklist via Redis.
-	logger.Debug("jwt interceptor: token present (verification skipped in Phase 1)",
-		zap.Int("token_len", len(token)))
+	if jwtSvc == nil {
+		// Phase 1 fallback: accept any non-empty token.
+		logger.Debug("jwt interceptor: token present (verification skipped, no jwtSvc)",
+			zap.Int("token_len", len(tokenStr)))
+		return ctx, nil
+	}
 
+	claims, err := jwtSvc.ValidateToken(tokenStr)
+	if err != nil {
+		logger.Debug("jwt interceptor: invalid token", zap.Error(err))
+		return ctx, status.Error(codes.Unauthenticated, "invalid or expired token")
+	}
+
+	// Check blacklist.
+	revoked, err := jwtSvc.IsRevoked(ctx, claims.ID)
+	if err != nil {
+		logger.Error("jwt interceptor: revocation check failed", zap.Error(err))
+		return ctx, status.Error(codes.Internal, "internal error during token validation")
+	}
+	if revoked {
+		return ctx, status.Error(codes.Unauthenticated, "token has been revoked")
+	}
+
+	ctx = context.WithValue(ctx, claimsContextKey, claims)
 	return ctx, nil
 }
 

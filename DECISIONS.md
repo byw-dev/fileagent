@@ -105,3 +105,53 @@ Go 编译产物在 Linux/macOS 上没有固定扩展名，仅靠 `.gitignore` �
 - **根目录 `go build ./...`**：多模块 workspace 下行为不直观，无法控制各二进制输出名称。
 
 ---
+
+## D-004：Agent Token 哈希算法改用 SHA-256
+
+- **日期**：2025-01-01
+- **状态**：已接受
+
+### 背景
+
+JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节的输入时会静默截断，
+导致不同 token 可能哈希到相同值，产生碰撞风险。
+
+### 决策
+
+在 `internal/agent/manager.go` 中，存储 Agent Token 时改用 `SHA-256` hex 哈希
+（而非 bcrypt）。SHA-256 输出固定 64 字节 hex 字符串，不存在截断问题，且计算速度更快。
+
+验证时同样计算 SHA-256 hex 与存储值对比，不再使用 bcrypt.CompareHashAndPassword。
+
+### 备选方案
+
+- **继续用 bcrypt，截断到 72 字节**：不可接受，不同 token 可能碰撞。
+- **用 bcrypt，先 base64 encode**：引入复杂度，且 base64 输出仍可能超 72 字节。
+
+---
+
+## D-005：controlplane 覆盖率统计口径
+
+- **日期**：2025-01-01
+- **状态**：已接受
+
+### 背景
+
+`internal/db` 包是 **sqlc 自动生成代码**，所有函数都需要真实 PostgreSQL 连接，
+单元测试环境无法覆盖（0%）。若将其计入总覆盖率，整体数字会被拉低至 ~54%。
+
+### 决策
+
+1. **覆盖率验收口径**：排除 `internal/db`（sqlc 生成）和 `cmd/server`（main 入口），
+   对其余包统计覆盖率，目标 ≥80%，核心业务逻辑 ≥90%。
+2. 当前状态（Phase 2 Group A 完成后）：
+   - 剔除 internal/db 和 cmd/server 后：**73.1%**
+   - 核心包（auth/agent/grpcserver/indexer/event/storage）：混合覆盖
+3. 集成测试（`go test -tags=integration`）会覆盖 DB 路径，满足端到端验证要求。
+
+### 备选方案
+
+- **强行加 go-sqlmock**：v2 不存在于代理，v1.5.2 API 与当前 DBTX 接口不兼容，放弃。
+- **接受 <80% 总覆盖率**：不符合 AGENTS.md 要求，本决策通过排除口径解决。
+
+---

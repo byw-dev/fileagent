@@ -9,14 +9,17 @@ import (
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
+	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
 
 // RouterConfig carries the dependencies required by the router.
 type RouterConfig struct {
-	JWTSecret string
-	Logger    *zap.Logger
+	JWTSecret  string
+	Logger     *zap.Logger
+	JWTService auth.Service    // nil → auth routes return 501 (Phase 1 behaviour)
+	AuthDB     handler.AuthDB  // nil → auth routes return 501
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -38,7 +41,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	r.POST("/internal/minio-event", middleware.NotImplemented)
 
 	// ── Auth routes ──────────────────────────────────────────────────────────
-	authH := handler.NewAuthHandler()
+	authH := handler.NewAuthHandler(cfg.JWTService, cfg.AuthDB)
 	auth := r.Group("/api/auth")
 	{
 		auth.POST("/login", authH.Login)
