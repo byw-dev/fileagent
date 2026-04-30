@@ -155,3 +155,7 @@ root/
 
 # Go compiled binaries (output of make build)
 /bin/
+
+# Legacy binary paths (before Makefile was introduced)
+/agent/agent
+/controlplane/server

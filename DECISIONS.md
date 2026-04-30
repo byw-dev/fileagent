@@ -41,6 +41,23 @@
 
 ---
 
+## D-002 依赖锚定机制（T0-5）
+
+**决策日期**：2026-04-30  
+**影响范围**：controlplane / agent
+
+### 决策
+
+在 `controlplane/tools.go` 和 `agent/tools.go` 中使用 `//go:build tools` 构建标签
+对所有 Phase 1 将要用到的依赖进行空白导入（`_ "pkg"`）。
+
+此方式确保：
+- `go mod tidy` 不会删除这些依赖（tidy 会读取所有构建约束文件）。
+- 正常 `go build ./...` 不会编译这些占位文件（构建标签 `tools` 不在默认标签集内）。
+- Phase 1 开发者可以直接 `import` 相应包，无需再 `go get`。
+
+---
+
 ## D-003 统一构建约定：Makefile + bin/ 输出目录
 
 **决策日期**：2026-04-30  
@@ -75,22 +92,5 @@ Go 编译产物在 Linux/macOS 上没有固定扩展名，仅靠 `.gitignore` �
 
 - **各模块目录内各自 `go build`，输出到模块自身目录**：产物位置分散，CI 脚本难以统一收集。
 - **根目录 `go build ./...`**：多模块 workspace 下行为不直观，无法控制各二进制输出名称。
-
----
-
-## D-002 依赖锚定机制（T0-5）
-
-**决策日期**：2026-04-30  
-**影响范围**：controlplane / agent
-
-### 决策
-
-在 `controlplane/tools.go` 和 `agent/tools.go` 中使用 `//go:build tools` 构建标签
-对所有 Phase 1 将要用到的依赖进行空白导入（`_ "pkg"`）。
-
-此方式确保：
-- `go mod tidy` 不会删除这些依赖（tidy 会读取所有构建约束文件）。
-- 正常 `go build ./...` 不会编译这些占位文件（构建标签 `tools` 不在默认标签集内）。
-- Phase 1 开发者可以直接 `import` 相应包，无需再 `go get`。
 
 ---
