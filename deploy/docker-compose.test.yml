@@ -1,0 +1,69 @@
+# Integration test environment — ephemeral volumes, torn down after test runs
+# Usage:
+#   docker compose -f deploy/docker-compose.test.yml up -d
+#   # run tests ...
+#   docker compose -f deploy/docker-compose.test.yml down -v
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: fileagent-test-postgres
+    environment:
+      POSTGRES_USER: fileagent
+      POSTGRES_PASSWORD: fileagent
+      POSTGRES_DB: fileagent
+    ports:
+      - "5432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fileagent -d fileagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    container_name: fileagent-test-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 3s
+
+  minio:
+    image: minio/minio:latest
+    container_name: fileagent-test-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  nats:
+    image: nats:2-alpine
+    container_name: fileagent-test-nats
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 3s
