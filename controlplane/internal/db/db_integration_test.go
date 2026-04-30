@@ -105,4 +105,3 @@ func TestQueriesRoundtrip_Agent(t *testing.T) {
 	// Cleanup
 	require.NoError(t, q.DeleteAgent(ctx, agent.ID))
 }
-

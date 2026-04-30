@@ -39,4 +39,3 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 	s.logger.Debug("RefreshCredentials called (unimplemented)", zap.String("agent_id", req.GetAgentId()))
 	return nil, status.Error(codes.Unimplemented, "RefreshCredentials not yet implemented")
 }
-
