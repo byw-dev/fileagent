@@ -98,9 +98,9 @@ Phase 4  完善与收尾（可并行）
 
 | 任务 | 产出 | 关键验收点 | 状态 |
 |------|------|-----------|------|
-| T1-C1 项目初始化 | `webui/` | Vite+React18+TS；所有依赖安装；dev/build 无错误 | ⬜ |
-| T1-C2 基础布局与路由 | `webui/src/` | ProLayout；所有路由注册（占位）；登录页；权限守卫骨架 | ⬜ |
-| T1-C3 Axios + auth store | `webui/src/services/` `webui/src/store/` | Token 注入；401 自动刷新排队；Zustand store；Vitest 测试 | ⬜ |
+| T1-C1 项目初始化 | `webui/` | Vite+React18+TS；所有依赖安装；dev/build 无错误 | ✅ |
+| T1-C2 基础布局与路由 | `webui/src/` | ProLayout；所有路由注册（占位）；登录页；权限守卫骨架 | ✅ |
+| T1-C3 Axios + auth store | `webui/src/services/` `webui/src/store/` | Token 注入；401 自动刷新排队；Zustand store；Vitest 测试 | ✅ |
 
 ### 组 D：Python SDK 基础骨架
 > 依赖：无
@@ -197,11 +197,11 @@ Phase 4  完善与收尾（可并行）
 | Phase | 任务数 | 完成数 | 进度 |
 |-------|--------|--------|------|
 | Phase 0 | 5 | 5 | 100% |
-| Phase 1 | 14 | 9 | 64% |
+| Phase 1 | 14 | 12 | 86% |
 | Phase 2 | 17 | 0 | 0% |
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **43** | **14** | **33%** |
+| **合计** | **43** | **17** | **40%** |
 
 ---
 
