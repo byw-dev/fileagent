@@ -50,15 +50,15 @@ Phase 4  完善与收尾（可并行）
   - [x] `docker compose up -d` 后全部 healthy
   - [x] 端口固定：PG=5432 / Redis=6379 / MinIO=9000,9001 / NATS=4222,8222
 
-### T0-4 MinIO 初始化脚本 ⬜
+### T0-4 MinIO 初始化脚本 ✅
 - **产出**：`deploy/scripts/init-minio.sh`
 - **来源**：`docs/design/system-design.md` 第 6.6 节
 - **验收**：
-  - [ ] 创建 data-sensor 和 tmp-uploads Bucket
-  - [ ] 配置 tmp-uploads 7 天 Lifecycle
-  - [ ] 创建 controlplane-admin 服务账号
-  - [ ] 配置 Webhook 事件通知
-  - [ ] 脚本幂等（重复执行不报错）
+  - [x] 创建 data-sensor 和 tmp-uploads Bucket
+  - [x] 配置 tmp-uploads 7 天 Lifecycle
+  - [x] 创建 controlplane-admin 服务账号
+  - [x] 配置 Webhook 事件通知
+  - [x] 脚本幂等（重复执行不报错）
 
 ### T0-5 go.mod 初始化 ⬜
 - **产出**：`controlplane/go.mod` / `agent/go.mod`
@@ -196,7 +196,7 @@ Phase 4  完善与收尾（可并行）
 
 | Phase | 任务数 | 完成数 | 进度 |
 |-------|--------|--------|------|
-| Phase 0 | 5 | 3 | 60% |
+| Phase 0 | 5 | 4 | 80% |
 | Phase 1 | 14 | 0 | 0% |
 | Phase 2 | 17 | 0 | 0% |
 | Phase 3 | 3 | 0 | 0% |
