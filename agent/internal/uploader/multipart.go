@@ -19,7 +19,7 @@ type completedParts struct {
 
 // multipartUpload uploads a large file using MinIO multipart upload with
 // support for resuming interrupted transfers via the SQLite queue.
-func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, size int64, _ string) (*UploadResult, error) {
+func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, size int64) (*UploadResult, error) {
 	partSize := int64(u.cfg.PartSizeMB) * 1024 * 1024
 
 	uploadID := task.UploadID

@@ -1,6 +1,6 @@
 # TASK_LIST.md — FileAgent 任务清单
 
-> 当前阶段：**Phase 2 — 核心业务逻辑**（组 A 已完成，组 B/C/D 未开始）
+> 当前阶段：**Phase 2 — 核心业务逻辑**（组 A、B 已完成，组 C/D 未开始）
 > 状态说明：⬜ 未开始 / 🔄 进行中 / ✅ 已完成 / ❌ 阻塞
 
 ---
@@ -134,11 +134,11 @@ Phase 4  完善与收尾（可并行）
 
 | 任务 | 产出 | 关键验收点 | 状态 |
 |------|------|-----------|------|
-| T2-B1 注册审批流程 | `internal/grpcclient/` | fingerprint 生成持久化；状态机完整实现；单元测试 | ⬜ |
-| T2-B2 File Watcher | `internal/watcher/` | inotify+ReadDirectoryChangesW；降级轮询；glob 过滤；临时目录测试 | ⬜ |
-| T2-B3 Scheduler | `internal/scheduler/` | cron 解析；时间变量解析；run_once_on_start；单元测试 | ⬜ |
-| T2-B4 Upload Engine | `internal/uploader/` | 单次/分片上传；断点续传；SHA-256；集成测试连真实 MinIO | ⬜ |
-| T2-B5 Task Executor | `internal/executor/` | 去重（path+mtime+size）；Worker Pool（3个）；指数退避重试 | ⬜ |
+| T2-B1 注册审批流程 | `internal/grpcclient/` | fingerprint 生成持久化；状态机完整实现；单元测试 | ✅ |
+| T2-B2 File Watcher | `internal/watcher/` | inotify+ReadDirectoryChangesW；降级轮询；glob 过滤；临时目录测试 | ✅ |
+| T2-B3 Scheduler | `internal/scheduler/` | cron 解析；时间变量解析；run_once_on_start；单元测试 | ✅ |
+| T2-B4 Upload Engine | `internal/uploader/` | 单次/分片上传；断点续传；SHA-256；集成测试连真实 MinIO | ✅ |
+| T2-B5 Task Executor | `internal/executor/` | 去重（path+mtime+size）；Worker Pool（3个）；指数退避重试 | ✅ |
 
 ### 组 C：Web UI 核心页面
 > 依赖：Phase 1 组 C 完成 / T2-A8 完成
@@ -198,10 +198,10 @@ Phase 4  完善与收尾（可并行）
 |-------|--------|--------|------|
 | Phase 0 | 5 | 5 | 100% |
 | Phase 1 | 15 | 15 | 100% |
-| Phase 2 | 20 | 8 | 40% |
+| Phase 2 | 20 | 13 | 65% |
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **47** | **28** | **60%** |
+| **合计** | **47** | **33** | **70%** |
 
 ---
 

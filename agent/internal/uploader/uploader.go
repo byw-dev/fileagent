@@ -170,9 +170,9 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 	var result *UploadResult
 	threshold := int64(u.cfg.ThresholdMB) * 1024 * 1024
 	if size <= threshold {
-		result, err = u.singlePartUpload(ctx, task, size, sha)
+		result, err = u.singlePartUpload(ctx, task, size)
 	} else {
-		result, err = u.multipartUpload(ctx, task, size, sha)
+		result, err = u.multipartUpload(ctx, task, size)
 	}
 	if err != nil {
 		return nil, err
@@ -183,7 +183,7 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 }
 
 // singlePartUpload uploads a file using PutObject.
-func (u *Uploader) singlePartUpload(ctx context.Context, task *queue.UploadTask, size int64, _ string) (*UploadResult, error) {
+func (u *Uploader) singlePartUpload(ctx context.Context, task *queue.UploadTask, size int64) (*UploadResult, error) {
 	f, err := os.Open(task.LocalPath)
 	if err != nil {
 		return nil, fmt.Errorf("uploader: open %q: %w", task.LocalPath, err)

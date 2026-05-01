@@ -20,7 +20,7 @@ type UploadFunc func(ctx context.Context, task *queue.UploadTask) error
 
 // retryDelays defines the wait duration before each retry attempt (1-indexed).
 // Indices beyond the slice length use the last value.
-var retryDelays = []time.Duration{
+var defaultRetryDelays = []time.Duration{
 	1 * time.Minute,
 	5 * time.Minute,
 	15 * time.Minute,
@@ -32,15 +32,17 @@ const maxRetries = 10
 
 // Executor manages a pool of upload workers consuming from the queue.
 type Executor struct {
-	workers  int
-	queue    *queue.Queue
-	uploader UploadFunc
-	logger   *zap.Logger
+	workers     int
+	queue       *queue.Queue
+	uploader    UploadFunc
+	logger      *zap.Logger
+	retryDelays []time.Duration
 
 	mu      sync.Mutex
 	notify  chan struct{}
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
+	retryWg sync.WaitGroup
 }
 
 // New creates an Executor with the given number of worker goroutines.
@@ -49,12 +51,13 @@ func New(workers int, q *queue.Queue, uploader UploadFunc, logger *zap.Logger) *
 		workers = 1
 	}
 	return &Executor{
-		workers:  workers,
-		queue:    q,
-		uploader: uploader,
-		logger:   logger,
-		notify:   make(chan struct{}, 1),
-		stopCh:   make(chan struct{}),
+		workers:     workers,
+		queue:       q,
+		uploader:    uploader,
+		logger:      logger,
+		retryDelays: defaultRetryDelays,
+		notify:      make(chan struct{}, 1),
+		stopCh:      make(chan struct{}),
 	}
 }
 
@@ -85,10 +88,12 @@ func (e *Executor) Start(ctx context.Context) {
 	}
 }
 
-// Stop signals all workers to stop and waits for them to finish current tasks.
+// Stop signals all workers to stop and waits for them to finish current tasks,
+// including any pending retry goroutines.
 func (e *Executor) Stop() {
 	close(e.stopCh)
 	e.wg.Wait()
+	e.retryWg.Wait()
 }
 
 // runWorker is the main loop for a single worker goroutine.
@@ -180,7 +185,7 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 		return
 	}
 
-	delay := retryDelay(newRetry)
+	delay := e.retryDelay(newRetry)
 	e.logger.Info("executor: scheduling retry",
 		zap.String("task_id", task.ID),
 		zap.Int("attempt", newRetry),
@@ -188,6 +193,8 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 	)
 
 	go func() {
+		e.retryWg.Add(1)
+		defer e.retryWg.Done()
 		time.Sleep(delay)
 		// Re-queue by resetting status to pending.
 		if rerr := e.queue.UpdateStatus(task.ID, queue.StatusPending); rerr != nil {
@@ -202,10 +209,10 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 }
 
 // retryDelay returns the backoff duration for the nth retry attempt (1-indexed).
-func retryDelay(attempt int) time.Duration {
+func (e *Executor) retryDelay(attempt int) time.Duration {
 	idx := attempt - 1
-	if idx >= len(retryDelays) {
-		idx = len(retryDelays) - 1
+	if idx >= len(e.retryDelays) {
+		idx = len(e.retryDelays) - 1
 	}
-	return retryDelays[idx]
+	return e.retryDelays[idx]
 }

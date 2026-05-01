@@ -101,11 +101,12 @@ func TestExecutor_Dedup(t *testing.T) {
 }
 
 func TestExecutor_RetryDelay(t *testing.T) {
-	assert.Equal(t, 1*time.Minute, retryDelay(1))
-	assert.Equal(t, 5*time.Minute, retryDelay(2))
-	assert.Equal(t, 15*time.Minute, retryDelay(3))
-	assert.Equal(t, 60*time.Minute, retryDelay(4))
-	assert.Equal(t, 60*time.Minute, retryDelay(10), "should be capped at last delay")
+	e := New(1, nil, nil, zap.NewNop())
+	assert.Equal(t, 1*time.Minute, e.retryDelay(1))
+	assert.Equal(t, 5*time.Minute, e.retryDelay(2))
+	assert.Equal(t, 15*time.Minute, e.retryDelay(3))
+	assert.Equal(t, 60*time.Minute, e.retryDelay(4))
+	assert.Equal(t, 60*time.Minute, e.retryDelay(10), "should be capped at last delay")
 }
 
 func TestExecutor_GivenUpAfterMaxRetries(t *testing.T) {
@@ -214,11 +215,6 @@ func TestExecutor_SubmitAssignsID(t *testing.T) {
 func TestExecutor_RetryRequeues(t *testing.T) {
 	q := newTestQueue(t)
 
-	// Use short delays for testing.
-	origDelays := retryDelays
-	retryDelays = []time.Duration{50 * time.Millisecond, 50 * time.Millisecond}
-	defer func() { retryDelays = origDelays }()
-
 	var callCount atomic.Int32
 	uploader := func(_ context.Context, _ *queue.UploadTask) error {
 		n := callCount.Add(1)
@@ -229,6 +225,9 @@ func TestExecutor_RetryRequeues(t *testing.T) {
 	}
 
 	e := New(1, q, uploader, zap.NewNop())
+	// Use short delays so the test does not take minutes.
+	e.retryDelays = []time.Duration{50 * time.Millisecond, 50 * time.Millisecond}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	e.Start(ctx)
