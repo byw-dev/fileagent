@@ -24,8 +24,7 @@ func TestBuildSessionPolicy_SingleBucket(t *testing.T) {
 	require.NotEmpty(t, policy)
 
 	var doc map[string]interface{}
-	err := json.Unmarshal([]byte(policy), &doc)
-	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal([]byte(policy), &doc))
 
 	assert.Equal(t, "2012-10-17", doc["Version"])
 	stmts, ok := doc["Statement"].([]interface{})
