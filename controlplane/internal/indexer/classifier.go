@@ -11,18 +11,24 @@ import (
 // Classifier matches a file storage path against file_type_rules to determine
 // its file type.
 type Classifier struct {
-	db db.DBTX
+	store IndexerStore
 }
 
 // NewClassifier creates a new Classifier backed by the given DBTX.
 func NewClassifier(dbtx db.DBTX) *Classifier {
-	return &Classifier{db: dbtx}
+	return &Classifier{store: &dbtxIndexerStore{dbtx: dbtx}}
+}
+
+// NewClassifierWithStore creates a Classifier using an explicit IndexerStore.
+// This constructor is intended for unit tests where the DB layer is mocked.
+func NewClassifierWithStore(store IndexerStore) *Classifier {
+	return &Classifier{store: store}
 }
 
 // Classify returns the file_type_id for a given storage path by matching
 // file_type_rules in priority order. Returns uuid.Nil if no rule matches.
 func (c *Classifier) Classify(ctx context.Context, storagePath string) (uuid.UUID, error) {
-	rules, err := ListFileTypeRules(ctx, c.db)
+	rules, err := c.store.ListFileTypeRules(ctx)
 	if err != nil {
 		return uuid.Nil, err
 	}

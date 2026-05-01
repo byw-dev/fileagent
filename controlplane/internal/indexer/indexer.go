@@ -18,20 +18,68 @@ type NATSPublisher interface {
 	Publish(subject string, data []byte) error
 }
 
+// IndexerStore is the minimal database interface used by the Indexer. Using an
+// interface (rather than db.DBTX directly) makes the Indexer unit-testable
+// without a real database.
+type IndexerStore interface {
+	GetBucketByName(ctx context.Context, orgID uuid.UUID, name string) (*db.Bucket, error)
+	UpsertFileEntry(ctx context.Context, params UpsertFileEntryParams) (*db.FileEntry, error)
+	CreateUploadLog(ctx context.Context, params CreateUploadLogParams) (*db.UploadLog, error)
+	ListFileTypeRules(ctx context.Context) ([]*db.FileTypeRule, error)
+}
+
+// dbtxIndexerStore adapts db.DBTX to IndexerStore.
+type dbtxIndexerStore struct {
+	dbtx db.DBTX
+}
+
+// GetBucketByName delegates to the package-level function.
+func (d *dbtxIndexerStore) GetBucketByName(ctx context.Context, orgID uuid.UUID, name string) (*db.Bucket, error) {
+	return GetBucketByName(ctx, d.dbtx, orgID, name)
+}
+
+// UpsertFileEntry delegates to the package-level function.
+func (d *dbtxIndexerStore) UpsertFileEntry(ctx context.Context, params UpsertFileEntryParams) (*db.FileEntry, error) {
+	return UpsertFileEntry(ctx, d.dbtx, params)
+}
+
+// CreateUploadLog delegates to the package-level function.
+func (d *dbtxIndexerStore) CreateUploadLog(ctx context.Context, params CreateUploadLogParams) (*db.UploadLog, error) {
+	return CreateUploadLog(ctx, d.dbtx, params)
+}
+
+// ListFileTypeRules delegates to the package-level function.
+func (d *dbtxIndexerStore) ListFileTypeRules(ctx context.Context) ([]*db.FileTypeRule, error) {
+	return ListFileTypeRules(ctx, d.dbtx)
+}
+
 // Indexer processes upload results from agents and maintains the file index.
 type Indexer struct {
-	db         db.DBTX
+	store      IndexerStore
 	nats       NATSPublisher
 	classifier *Classifier
 	logger     *zap.Logger
 }
 
-// NewIndexer creates a new Indexer.
+// NewIndexer creates a new Indexer backed by a db.DBTX. This is the primary
+// constructor used in production; tests should use NewIndexerWithStore.
 func NewIndexer(dbtx db.DBTX, nats NATSPublisher, logger *zap.Logger) *Indexer {
+	store := &dbtxIndexerStore{dbtx: dbtx}
 	return &Indexer{
-		db:         dbtx,
+		store:      store,
 		nats:       nats,
-		classifier: NewClassifier(dbtx),
+		classifier: NewClassifierWithStore(store),
+		logger:     logger,
+	}
+}
+
+// NewIndexerWithStore creates an Indexer using an explicit IndexerStore. This
+// constructor is intended for unit tests where the DB layer is mocked.
+func NewIndexerWithStore(store IndexerStore, nats NATSPublisher, logger *zap.Logger) *Indexer {
+	return &Indexer{
+		store:      store,
+		nats:       nats,
+		classifier: NewClassifierWithStore(store),
 		logger:     logger,
 	}
 }
@@ -40,7 +88,7 @@ func NewIndexer(dbtx db.DBTX, nats NATSPublisher, logger *zap.Logger) *Indexer {
 // file index and emitting a NATS event.
 func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, orgID uuid.UUID, result *agentv1.UploadResult) error {
 	// Look up the bucket.
-	bucket, err := GetBucketByName(ctx, ix.db, orgID, result.GetBucket())
+	bucket, err := ix.store.GetBucketByName(ctx, orgID, result.GetBucket())
 	if err != nil {
 		return fmt.Errorf("indexer: get bucket %q: %w", result.GetBucket(), err)
 	}
@@ -79,7 +127,7 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 	}
 
 	// Upsert file entry.
-	fileEntry, err := UpsertFileEntry(ctx, ix.db, UpsertFileEntryParams{
+	fileEntry, err := ix.store.UpsertFileEntry(ctx, UpsertFileEntryParams{
 		OrgID:        orgID,
 		FileTypeID:   uuid.NullUUID{UUID: fileTypeID, Valid: fileTypeID != uuid.Nil},
 		AgentID:      uuid.NullUUID{UUID: agentID, Valid: true},
@@ -107,7 +155,7 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 		errMsg = sql.NullString{String: result.GetErrorMessage(), Valid: result.GetErrorMessage() != ""}
 	}
 
-	_, err = CreateUploadLog(ctx, ix.db, CreateUploadLogParams{
+	_, err = ix.store.CreateUploadLog(ctx, CreateUploadLogParams{
 		OrgID:            orgID,
 		AgentID:          agentID,
 		FileEntryID:      uuid.NullUUID{UUID: fileEntry.ID, Valid: true},

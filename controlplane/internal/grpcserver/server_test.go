@@ -108,3 +108,4 @@ func TestServer_RefreshCredentials_ReturnsUnimplemented(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, codes.Unimplemented, status.Code(err))
 }
+

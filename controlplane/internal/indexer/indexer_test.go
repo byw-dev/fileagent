@@ -30,26 +30,37 @@ func (m *mockNATS) Publish(subject string, data []byte) error {
 	return nil
 }
 
-// ── Mock DBTX ────────────────────────────────────────────────────────────────
+// ── Mock IndexerStore ────────────────────────────────────────────────────────
 
-// mockDBTX simulates basic DB operations needed for indexer tests.
-// For unit tests we test classifier and indexer logic without a real DB.
-type mockDBTX struct{}
-
-func (m *mockDBTX) ExecContext(_ context.Context, _ string, _ ...interface{}) (sql.Result, error) {
-	return nil, nil
-}
-func (m *mockDBTX) PrepareContext(_ context.Context, _ string) (*sql.Stmt, error) {
-	return nil, nil
-}
-func (m *mockDBTX) QueryContext(_ context.Context, _ string, _ ...interface{}) (*sql.Rows, error) {
-	return nil, nil
-}
-func (m *mockDBTX) QueryRowContext(_ context.Context, _ string, _ ...interface{}) *sql.Row {
-	return nil
+// mockIndexerStore fully implements IndexerStore with configurable responses.
+type mockIndexerStore struct {
+	bucket       *db.Bucket
+	bucketErr    error
+	fileEntry    *db.FileEntry
+	upsertErr    error
+	uploadLog    *db.UploadLog
+	uploadLogErr error
+	typeRules    []*db.FileTypeRule
+	typeRulesErr error
 }
 
-// ── Mock DBTX (error version) ────────────────────────────────────────────────
+func (m *mockIndexerStore) GetBucketByName(_ context.Context, _ uuid.UUID, _ string) (*db.Bucket, error) {
+	return m.bucket, m.bucketErr
+}
+
+func (m *mockIndexerStore) UpsertFileEntry(_ context.Context, _ UpsertFileEntryParams) (*db.FileEntry, error) {
+	return m.fileEntry, m.upsertErr
+}
+
+func (m *mockIndexerStore) CreateUploadLog(_ context.Context, _ CreateUploadLogParams) (*db.UploadLog, error) {
+	return m.uploadLog, m.uploadLogErr
+}
+
+func (m *mockIndexerStore) ListFileTypeRules(_ context.Context) ([]*db.FileTypeRule, error) {
+	return m.typeRules, m.typeRulesErr
+}
+
+// ── Legacy DBTX mock (kept for tests that use it directly) ──────────────────
 
 type errDBTX struct{ err error }
 
@@ -66,46 +77,114 @@ func (e *errDBTX) QueryRowContext(_ context.Context, _ string, _ ...interface{})
 	return nil
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+func newTestLogger() *zap.Logger {
+	l, _ := zap.NewDevelopment()
+	return l
+}
+
+func newBucket() *db.Bucket {
+	return &db.Bucket{
+		ID:    uuid.New(),
+		OrgID: uuid.New(),
+		Name:  "test-bucket",
+	}
+}
+
+func newFileEntry(bucketID uuid.UUID, storagePath string) *db.FileEntry {
+	return &db.FileEntry{
+		ID:          uuid.New(),
+		BucketID:    bucketID,
+		StoragePath: storagePath,
+		FileName:    fileNameFromPath(storagePath),
+		SizeBytes:   1024,
+		Status:      db.FileStatusCompleted,
+	}
+}
+
+func newUploadLog() *db.UploadLog {
+	return &db.UploadLog{ID: uuid.New()}
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+func TestNewClassifier_NotNil(t *testing.T) {
+	c := NewClassifierWithStore(&mockIndexerStore{})
+	require.NotNil(t, c)
+}
 
 func TestClassifier_DBError_ReturnsError(t *testing.T) {
-	c := NewClassifier(&errDBTX{err: assert.AnError})
+	c := NewClassifierWithStore(&mockIndexerStore{typeRulesErr: assert.AnError})
 	id, err := c.Classify(context.Background(), "uploads/test.log")
 	require.Error(t, err)
 	assert.Equal(t, uuid.Nil, id)
 }
 
-func TestNewClassifier_NotNil(t *testing.T) {
-	c := NewClassifier(&mockDBTX{})
-	require.NotNil(t, c)
+func TestClassifier_NoRules_ReturnsNil(t *testing.T) {
+	c := NewClassifierWithStore(&mockIndexerStore{typeRules: nil})
+	id, err := c.Classify(context.Background(), "uploads/test.log")
+	require.NoError(t, err)
+	assert.Equal(t, uuid.Nil, id)
 }
 
-func TestClassifier_NoRules_ReturnsNil(t *testing.T) {
-	// Classifier with no rules always returns uuid.Nil.
-	// We can't easily mock the SQL row scanner, so we test via the Classify
-	// function with a fresh NewClassifier that uses a nil DB — which returns
-	// an error from ListFileTypeRules. In that case Classify should return
-	// uuid.Nil with the error.
-	// Instead test the filepath matching logic by testing fileNameFromPath.
-	assert.Equal(t, "file.log", fileNameFromPath("/var/log/agent/file.log"))
-	assert.Equal(t, "data.csv", fileNameFromPath("data.csv"))
+func TestClassifier_MatchByStoragePath(t *testing.T) {
+	typeID := uuid.New()
+	rule := &db.FileTypeRule{
+		ID:          uuid.New(),
+		FileTypeID:  typeID,
+		PathPattern: "uploads/*.log",
+		Priority:    10,
+	}
+	c := NewClassifierWithStore(&mockIndexerStore{typeRules: []*db.FileTypeRule{rule}})
+	id, err := c.Classify(context.Background(), "uploads/test.log")
+	require.NoError(t, err)
+	assert.Equal(t, typeID, id)
+}
+
+func TestClassifier_MatchByFileName(t *testing.T) {
+	typeID := uuid.New()
+	rule := &db.FileTypeRule{
+		ID:          uuid.New(),
+		FileTypeID:  typeID,
+		PathPattern: "*.csv",
+		Priority:    5,
+	}
+	c := NewClassifierWithStore(&mockIndexerStore{typeRules: []*db.FileTypeRule{rule}})
+	id, err := c.Classify(context.Background(), "/var/data/report.csv")
+	require.NoError(t, err)
+	assert.Equal(t, typeID, id)
+}
+
+func TestClassifier_NoMatch_ReturnsNil(t *testing.T) {
+	rule := &db.FileTypeRule{
+		ID:          uuid.New(),
+		FileTypeID:  uuid.New(),
+		PathPattern: "*.xml",
+		Priority:    5,
+	}
+	c := NewClassifierWithStore(&mockIndexerStore{typeRules: []*db.FileTypeRule{rule}})
+	id, err := c.Classify(context.Background(), "/var/data/report.csv")
+	require.NoError(t, err)
+	assert.Equal(t, uuid.Nil, id)
 }
 
 func TestNewIndexer(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	nats := newMockNATS()
-	ix := NewIndexer(&mockDBTX{}, nats, logger)
+	ix := NewIndexerWithStore(&mockIndexerStore{}, newMockNATS(), newTestLogger())
 	require.NotNil(t, ix)
 }
 
-func TestHandleUploadResult_NoBucket(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
+func TestHandleUploadResult_Success(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/file.log")
+	store := &mockIndexerStore{
+		bucket:    bucket,
+		fileEntry: fe,
+		uploadLog: newUploadLog(),
+	}
 	nats := newMockNATS()
-	ix := NewIndexer(&mockDBTX{}, nats, logger)
+	ix := NewIndexerWithStore(store, nats, newTestLogger())
 
-	// With a mockDBTX that returns nil row, HandleUploadResult will panic/fail
-	// before doing meaningful work. We use recover to ensure the indexer
-	// doesn't panic, or accept a non-nil error.
 	result := &agentv1.UploadResult{
 		RuleId:      uuid.New().String(),
 		LocalPath:   "/data/file.log",
@@ -113,64 +192,221 @@ func TestHandleUploadResult_NoBucket(t *testing.T) {
 		Bucket:      "test-bucket",
 		SizeBytes:   1024,
 		Sha256:      "abc123",
+		Etag:        "etag1",
 		Success:     true,
 		UploadedAt:  timestamppb.New(time.Now()),
 	}
 
-	// The mockDBTX returns nil from QueryRowContext, so Scan will panic.
-	// We verify that HandleUploadResult returns an error or panics
-	// (neither should be a silent success).
-	func() {
-		defer func() {
-			// If it panics, that is a known limitation of the mock DBTX.
-			recover()
-		}()
-		// We only care that it does not succeed silently.
-		err := ix.HandleUploadResult(context.Background(), uuid.New(), uuid.New(), result)
-		// Either an error or panic is expected with this mock.
-		if err == nil {
-			t.Log("no error and no panic - unexpected with nil DB")
-		}
-	}()
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	require.NoError(t, err)
+
+	// Verify NATS event was published.
+	events, ok := nats.published["events.file.uploaded"]
+	require.True(t, ok)
+	require.Len(t, events, 1)
+}
+
+func TestHandleUploadResult_FailedUpload(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/bad.log")
+	store := &mockIndexerStore{
+		bucket:    bucket,
+		fileEntry: fe,
+		uploadLog: newUploadLog(),
+	}
+	nats := newMockNATS()
+	ix := NewIndexerWithStore(store, nats, newTestLogger())
+
+	result := &agentv1.UploadResult{
+		StoragePath:  "uploads/bad.log",
+		Bucket:       "test-bucket",
+		Success:      false,
+		ErrorMessage: "network error",
+	}
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	require.NoError(t, err)
+
+	// NATS event should NOT be published for failed uploads.
+	_, ok := nats.published["events.file.uploaded"]
+	assert.False(t, ok)
+}
+
+func TestHandleUploadResult_BucketNotFound(t *testing.T) {
+	store := &mockIndexerStore{bucketErr: assert.AnError}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	result := &agentv1.UploadResult{
+		StoragePath: "uploads/file.log",
+		Bucket:      "missing-bucket",
+		Success:     true,
+	}
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), uuid.New(), result)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing-bucket")
+}
+
+func TestHandleUploadResult_UpsertError(t *testing.T) {
+	bucket := newBucket()
+	store := &mockIndexerStore{
+		bucket:    bucket,
+		upsertErr: assert.AnError,
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	result := &agentv1.UploadResult{
+		StoragePath: "uploads/file.log",
+		Bucket:      "test-bucket",
+		Success:     true,
+	}
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "upsert file entry")
+}
+
+func TestHandleUploadResult_UploadLogError(t *testing.T) {
+	// Upload log error is a soft warning, not a hard failure.
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/file.log")
+	store := &mockIndexerStore{
+		bucket:       bucket,
+		fileEntry:    fe,
+		uploadLogErr: assert.AnError,
+	}
+	nats := newMockNATS()
+	ix := NewIndexerWithStore(store, nats, newTestLogger())
+
+	result := &agentv1.UploadResult{
+		StoragePath: "uploads/file.log",
+		Bucket:      "test-bucket",
+		Success:     true,
+	}
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	// Should not fail even if upload log creation fails.
+	require.NoError(t, err)
+}
+
+func TestHandleUploadResult_ClassifyError(t *testing.T) {
+	// Classify error is a soft warning; indexing continues.
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/file.log")
+	store := &mockIndexerStore{
+		bucket:       bucket,
+		fileEntry:    fe,
+		uploadLog:    newUploadLog(),
+		typeRulesErr: assert.AnError, // causes classify to fail
+	}
+	nats := newMockNATS()
+	ix := NewIndexerWithStore(store, nats, newTestLogger())
+
+	result := &agentv1.UploadResult{
+		StoragePath: "uploads/file.log",
+		Bucket:      "test-bucket",
+		Success:     true,
+	}
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	require.NoError(t, err)
+}
+
+func TestHandleUploadResult_WithRuleID(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/file.log")
+	store := &mockIndexerStore{
+		bucket:    bucket,
+		fileEntry: fe,
+		uploadLog: newUploadLog(),
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	ruleID := uuid.New()
+	result := &agentv1.UploadResult{
+		RuleId:      ruleID.String(),
+		StoragePath: "uploads/file.log",
+		Bucket:      "test-bucket",
+		Success:     true,
+	}
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	require.NoError(t, err)
+}
+
+func TestHandleUploadResult_WithFileMtime(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/file.log")
+	store := &mockIndexerStore{
+		bucket:    bucket,
+		fileEntry: fe,
+		uploadLog: newUploadLog(),
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	result := &agentv1.UploadResult{
+		StoragePath: "uploads/file.log",
+		Bucket:      "test-bucket",
+		Success:     true,
+		FileMtime:   timestamppb.New(time.Now().Add(-24 * time.Hour)),
+	}
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	require.NoError(t, err)
+}
+
+func TestPublishFileUploaded(t *testing.T) {
+	nats := newMockNATS()
+	ix := NewIndexerWithStore(&mockIndexerStore{}, nats, newTestLogger())
+
+	fe := &db.FileEntry{
+		ID:          uuid.New(),
+		BucketID:    uuid.New(),
+		StoragePath: "uploads/test.log",
+		FileName:    "test.log",
+		SizeBytes:   1024,
+	}
+	result := &agentv1.UploadResult{
+		Sha256: "deadbeef",
+	}
+	ix.publishFileUploaded(fe, uuid.New(), result)
+
+	events, ok := nats.published["events.file.uploaded"]
+	require.True(t, ok)
+	require.Len(t, events, 1)
 }
 
 func TestFileEntryParams_NullFields(t *testing.T) {
 	// Test that nullable fields are constructed correctly.
 	p := UpsertFileEntryParams{
-		OrgID:        uuid.New(),
-		BucketID:     uuid.New(),
-		StoragePath:  "bucket/path/file.log",
-		FileName:     "file.log",
-		SizeBytes:    2048,
-		Status:       db.FileStatusCompleted,
-		UploadedAt:   sql.NullTime{Time: time.Now(), Valid: true},
+		OrgID:       uuid.New(),
+		BucketID:    uuid.New(),
+		StoragePath: "bucket/path/file.log",
+		FileName:    "file.log",
+		SizeBytes:   2048,
+		Status:      db.FileStatusCompleted,
+		UploadedAt:  sql.NullTime{Time: time.Now(), Valid: true},
 	}
 	assert.Equal(t, "bucket/path/file.log", p.StoragePath)
 	assert.Equal(t, db.FileStatusCompleted, p.Status)
 }
 
-func TestPublishFileUploaded(t *testing.T) {
-logger, _ := zap.NewDevelopment()
-nats := newMockNATS()
-ix := NewIndexer(&mockDBTX{}, nats, logger)
-
-fe := &db.FileEntry{
-ID:          uuid.New(),
-BucketID:    uuid.New(),
-StoragePath: "uploads/test.log",
-FileName:    "test.log",
-SizeBytes:   1024,
-}
-result := &agentv1.UploadResult{
-Sha256: "deadbeef",
-}
-ix.publishFileUploaded(fe, uuid.New(), result)
-
-events, ok := nats.published["events.file.uploaded"]
-require.True(t, ok)
-require.Len(t, events, 1)
+func TestFileNameFromPath(t *testing.T) {
+	assert.Equal(t, "file.log", fileNameFromPath("/var/log/agent/file.log"))
+	assert.Equal(t, "data.csv", fileNameFromPath("data.csv"))
+	assert.Equal(t, "report.pdf", fileNameFromPath("path/to/report.pdf"))
 }
 
-func TestHandleUploadResult_InvalidRuleID(t *testing.T) {
-	t.Skip("requires real DB - GetBucketByName needs real QueryRowContext")
+// TestNewIndexer_DBBacked tests the production constructor that wraps db.DBTX.
+func TestNewIndexer_DBBacked(t *testing.T) {
+// Use the errDBTX to satisfy the db.DBTX interface for construction.
+// We only verify the constructor doesn't panic and returns non-nil.
+ix := NewIndexer(&errDBTX{err: nil}, newMockNATS(), newTestLogger())
+require.NotNil(t, ix)
+}
+
+// TestNewClassifier_DBBacked tests the production constructor.
+func TestNewClassifier_DBBacked(t *testing.T) {
+c := NewClassifier(&errDBTX{err: nil})
+require.NotNil(t, c)
 }
