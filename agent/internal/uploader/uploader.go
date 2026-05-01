@@ -1,0 +1,218 @@
+// Package uploader uploads files to MinIO using either single-part or
+// multipart uploads depending on file size. It integrates with the SQLite
+// queue to support resume after agent restart.
+package uploader
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
+
+	"github.com/byw-dev/fileagent/agent/internal/queue"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"go.uber.org/zap"
+)
+
+const (
+	// defaultSinglePartThresholdMB is the default maximum file size (in MiB)
+	// for single-part uploads. Files larger than this use multipart upload.
+	defaultSinglePartThresholdMB = 64
+)
+
+// Config holds the configuration for the MinIO client.
+type Config struct {
+	// Endpoint is the MinIO server address (host:port).
+	Endpoint string
+	// AccessKey is the access key ID.
+	AccessKey string
+	// SecretKey is the secret access key.
+	SecretKey string
+	// SessionToken is an optional STS session token.
+	SessionToken string
+	// UseSSL enables TLS when connecting to MinIO.
+	UseSSL bool
+	// PartSizeMB is the multipart upload part size in mebibytes (default 64).
+	PartSizeMB int
+	// ThresholdMB is the file size threshold in mebibytes below which single-part
+	// upload is used (default 64). Set lower in tests to avoid large file I/O.
+	ThresholdMB int
+	// Concurrency is the number of concurrent part uploads (handled by executor).
+	Concurrency int
+}
+
+// UploadResult carries metadata about a completed upload.
+type UploadResult struct {
+	// StoragePath is the object key in the bucket.
+	StoragePath string
+	// Bucket is the target bucket name.
+	Bucket string
+	// SHA256 is the hex-encoded SHA-256 digest of the uploaded file.
+	SHA256 string
+	// ETag is the ETag returned by MinIO after the upload.
+	ETag string
+	// SizeBytes is the file size in bytes.
+	SizeBytes int64
+}
+
+// ObjectStore abstracts the MinIO client to allow unit-testing without a real
+// MinIO server.
+type ObjectStore interface {
+	// PutObject uploads a complete object from r and returns the upload info.
+	PutObject(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
+	// NewMultipartUpload starts a new multipart upload and returns the upload ID.
+	NewMultipartUpload(ctx context.Context, bucket, object string, opts minio.PutObjectOptions) (string, error)
+	// PutObjectPart uploads a single part of a multipart upload.
+	PutObjectPart(ctx context.Context, bucket, object, uploadID string, partNumber int, r io.Reader, size int64, opts minio.PutObjectPartOptions) (minio.ObjectPart, error)
+	// ListObjectParts lists the parts already uploaded for a multipart upload.
+	ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumber, maxParts int) (minio.ListObjectPartsResult, error)
+	// CompleteMultipartUpload finalises a multipart upload.
+	CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, parts []minio.CompletePart, opts minio.PutObjectOptions) (minio.UploadInfo, error)
+}
+
+// minioAdapter wraps *minio.Core to satisfy the ObjectStore interface.
+// minio.Core embeds *minio.Client and exposes the low-level multipart API.
+type minioAdapter struct {
+	c *minio.Core
+}
+
+func (a *minioAdapter) PutObject(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+	return a.c.Client.PutObject(ctx, bucket, object, r, size, opts)
+}
+
+func (a *minioAdapter) NewMultipartUpload(ctx context.Context, bucket, object string, opts minio.PutObjectOptions) (string, error) {
+	return a.c.NewMultipartUpload(ctx, bucket, object, opts)
+}
+
+func (a *minioAdapter) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partNumber int, r io.Reader, size int64, opts minio.PutObjectPartOptions) (minio.ObjectPart, error) {
+	return a.c.PutObjectPart(ctx, bucket, object, uploadID, partNumber, r, size, opts)
+}
+
+func (a *minioAdapter) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumber, maxParts int) (minio.ListObjectPartsResult, error) {
+	return a.c.ListObjectParts(ctx, bucket, object, uploadID, partNumber, maxParts)
+}
+
+func (a *minioAdapter) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, parts []minio.CompletePart, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+	return a.c.CompleteMultipartUpload(ctx, bucket, object, uploadID, parts, opts)
+}
+
+// Uploader uploads files to MinIO and integrates with the local queue.
+type Uploader struct {
+	store  ObjectStore
+	queue  *queue.Queue
+	cfg    Config
+	logger *zap.Logger
+}
+
+// New creates an Uploader backed by a real MinIO client (via minio.Core).
+func New(cfg Config, q *queue.Queue, logger *zap.Logger) (*Uploader, error) {
+	normalise(&cfg)
+	mc, err := minio.NewCore(cfg.Endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, cfg.SessionToken),
+		Secure: cfg.UseSSL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("uploader: create minio client: %w", err)
+	}
+	return &Uploader{
+		store:  &minioAdapter{c: mc},
+		queue:  q,
+		cfg:    cfg,
+		logger: logger,
+	}, nil
+}
+
+// newWithStore creates an Uploader using a provided ObjectStore (for testing).
+func newWithStore(store ObjectStore, cfg Config, q *queue.Queue, logger *zap.Logger) *Uploader {
+	normalise(&cfg)
+	return &Uploader{
+		store:  store,
+		queue:  q,
+		cfg:    cfg,
+		logger: logger,
+	}
+}
+
+// normalise applies defaults to cfg fields that were left at zero.
+func normalise(cfg *Config) {
+	if cfg.PartSizeMB <= 0 {
+		cfg.PartSizeMB = defaultSinglePartThresholdMB
+	}
+	if cfg.ThresholdMB <= 0 {
+		cfg.ThresholdMB = defaultSinglePartThresholdMB
+	}
+}
+
+// UploadFile uploads the file described by task to MinIO. It chooses between
+// single-part and multipart strategies based on file size, and honours any
+// partially-uploaded state stored in the queue.
+func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*UploadResult, error) {
+	info, err := os.Stat(task.LocalPath)
+	if err != nil {
+		return nil, fmt.Errorf("uploader: stat %q: %w", task.LocalPath, err)
+	}
+	size := info.Size()
+
+	sha, err := fileSHA256(task.LocalPath)
+	if err != nil {
+		return nil, fmt.Errorf("uploader: sha256 %q: %w", task.LocalPath, err)
+	}
+
+	u.logger.Info("uploader: uploading file",
+		zap.String("path", task.LocalPath),
+		zap.Int64("size", size),
+		zap.String("bucket", task.Bucket),
+	)
+
+	var result *UploadResult
+	threshold := int64(u.cfg.ThresholdMB) * 1024 * 1024
+	if size <= threshold {
+		result, err = u.singlePartUpload(ctx, task, size)
+	} else {
+		result, err = u.multipartUpload(ctx, task, size)
+	}
+	if err != nil {
+		return nil, err
+	}
+	result.SHA256 = sha
+	result.SizeBytes = size
+	return result, nil
+}
+
+// singlePartUpload uploads a file using PutObject.
+func (u *Uploader) singlePartUpload(ctx context.Context, task *queue.UploadTask, size int64) (*UploadResult, error) {
+	f, err := os.Open(task.LocalPath)
+	if err != nil {
+		return nil, fmt.Errorf("uploader: open %q: %w", task.LocalPath, err)
+	}
+	defer f.Close()
+
+	info, err := u.store.PutObject(ctx, task.Bucket, task.StoragePath, f, size, minio.PutObjectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("uploader: put object: %w", err)
+	}
+
+	return &UploadResult{
+		StoragePath: task.StoragePath,
+		Bucket:      task.Bucket,
+		ETag:        info.ETag,
+	}, nil
+}
+
+// fileSHA256 calculates the SHA-256 hash of the file at path.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
