@@ -4,14 +4,35 @@
 package grpcserver
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
+
+// CacheClient is the cache interface required by the gRPC server.
+type CacheClient interface {
+	Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error
+	Del(ctx context.Context, keys ...string) error
+}
+
+// NATSPublisher is the messaging interface required by the gRPC server.
+type NATSPublisher interface {
+	Publish(subject string, data []byte) error
+}
+
+// AgentManager is the interface used by gRPC handlers to delegate agent
+// lifecycle operations.
+type AgentManager interface {
+	Register(ctx context.Context, req *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error)
+	PollApproval(ctx context.Context, req *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error)
+}
 
 // Server holds dependencies shared by all gRPC handlers.
 type Server struct {
@@ -19,13 +40,34 @@ type Server struct {
 	// the proto does not break compilation.
 	agentv1.UnimplementedAgentServiceServer
 
-	logger *zap.Logger
-	// Additional dependencies (cache, db, etc.) are added in Phase 2.
+	logger   *zap.Logger
+	registry *AgentRegistry
+	cache    CacheClient
+	jwtSvc   auth.Service
+	nats     NATSPublisher
+	agentMgr AgentManager
 }
 
-// New creates a new gRPC Server with the provided dependencies.
+// New creates a new gRPC Server with the provided logger. Additional
+// dependencies can be injected via WithDeps.
 func New(logger *zap.Logger) *Server {
 	return &Server{logger: logger}
+}
+
+// WithDeps injects optional dependencies into the server.
+func (s *Server) WithDeps(
+	registry *AgentRegistry,
+	cache CacheClient,
+	jwtSvc auth.Service,
+	nats NATSPublisher,
+	agentMgr AgentManager,
+) *Server {
+	s.registry = registry
+	s.cache = cache
+	s.jwtSvc = jwtSvc
+	s.nats = nats
+	s.agentMgr = agentMgr
+	return s
 }
 
 // Run creates a TCP listener on the given port, registers the AgentService,
@@ -40,11 +82,11 @@ func (s *Server) Run(port int) error {
 	grpcSrv := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			loggingUnaryInterceptor(s.logger),
-			jwtUnaryInterceptor(s.logger),
+			jwtUnaryInterceptor(s.logger, s.jwtSvc),
 		),
 		grpc.ChainStreamInterceptor(
 			loggingStreamInterceptor(s.logger),
-			jwtStreamInterceptor(s.logger),
+			jwtStreamInterceptor(s.logger, s.jwtSvc),
 		),
 	)
 
@@ -62,11 +104,11 @@ func (s *Server) GRPCServer() *grpc.Server {
 	grpcSrv := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			loggingUnaryInterceptor(s.logger),
-			jwtUnaryInterceptor(s.logger),
+			jwtUnaryInterceptor(s.logger, s.jwtSvc),
 		),
 		grpc.ChainStreamInterceptor(
 			loggingStreamInterceptor(s.logger),
-			jwtStreamInterceptor(s.logger),
+			jwtStreamInterceptor(s.logger, s.jwtSvc),
 		),
 	)
 	agentv1.RegisterAgentServiceServer(grpcSrv, s)

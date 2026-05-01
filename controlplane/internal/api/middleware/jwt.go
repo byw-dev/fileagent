@@ -17,9 +17,10 @@ const claimsKey = "jwt_claims"
 // Plane. This struct mirrors system-design.md §5.3.1.
 type Claims struct {
 	jwt.RegisteredClaims
-	OrgID    string `json:"org_id"`
-	Role     string `json:"role"`
-	Username string `json:"username"`
+	OrgID     string `json:"org_id"`
+	Role      string `json:"role"`
+	Username  string `json:"username"`
+	TokenType string `json:"token_type,omitempty"`
 }
 
 // JWT returns a Gin middleware that validates the Bearer JWT token in the
@@ -116,4 +117,11 @@ func errorBody(code, message string, detail interface{}) map[string]interface{} 
 		body["detail"] = detail
 	}
 	return body
+}
+
+// NewErrorBody builds the "error" sub-object used in all API error responses
+// (system-design.md §5.11). It is exported so that handlers in sibling
+// packages can produce consistent error responses.
+func NewErrorBody(code, message string, detail interface{}) map[string]interface{} {
+	return errorBody(code, message, detail)
 }

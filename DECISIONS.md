@@ -105,3 +105,57 @@ Go 编译产物在 Linux/macOS 上没有固定扩展名，仅靠 `.gitignore` �
 - **根目录 `go build ./...`**：多模块 workspace 下行为不直观，无法控制各二进制输出名称。
 
 ---
+
+## D-004：Agent Token 哈希算法改用 SHA-256
+
+- **日期**：2026-04-30
+- **状态**：已接受
+
+### 背景
+
+JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节的输入时会静默截断，
+导致不同 token 可能哈希到相同值，产生碰撞风险。
+
+### 决策
+
+在 `internal/agent/manager.go` 中，存储 Agent Token 时改用 `SHA-256` hex 哈希
+（而非 bcrypt）。SHA-256 输出固定 64 字节 hex 字符串，不存在截断问题，且计算速度更快。
+
+验证时同样计算 SHA-256 hex 与存储值对比，不再使用 bcrypt.CompareHashAndPassword。
+
+### 备选方案
+
+- **继续用 bcrypt，截断到 72 字节**：不可接受，不同 token 可能碰撞。
+- **用 bcrypt，先 base64 encode**：引入复杂度，且 base64 输出仍可能超 72 字节。
+
+---
+
+## D-005：controlplane 覆盖率统计口径
+
+- **日期**：2026-04-30
+- **状态**：已接受（修订于 2026-05-01）
+
+### 背景
+
+`internal/db` 包是 **sqlc 自动生成代码**，所有函数都需要真实 PostgreSQL 连接，
+单元测试环境无法覆盖（原始状态 0%）。若将其计入总覆盖率，整体数字会被拉低至 ~54%。
+
+### 决策
+
+1. 采用 `go-sqlmock v1.5.2` 为 sqlc 生成的 query 函数编写单元测试（使用 `sqlmock.New()` 返回
+   实现了 `database/sql` 标准接口的 mock DB，与 sqlc 生成代码的 `DBTX` 接口完全兼容）。
+2. 同步对 `internal/event`、`internal/indexer` 等包抽象 `EngineStore` / `IndexerStore` 接口，
+   通过 mock 实现完成业务逻辑单元测试覆盖。
+3. 当前状态（Phase 2 Group A 完成后，含 go-sqlmock 测试）：
+   - 总覆盖率（含 `internal/db`）：**81.2%**（≥ 80% 阈值 ✓）
+   - `internal/db`：80.8%，`internal/indexer`：91.4%，`internal/event`：87.5%
+   - `internal/grpcserver`：87.0%，核心业务包均 ≥ 80%
+4. 集成测试（`go test -tags=integration`）覆盖真实 DB 路径，满足端到端验证要求。
+
+### 备选方案
+
+- **排除 `internal/db` 统计**：考虑过但未采纳；通过 go-sqlmock 实现了包含 DB 层的完整覆盖。
+- **使用 `go-sqlmock/v2`**：v2 不存在于代理缓存中，改用 v1.5.2（API 稳定，无已知 CVE）。
+- **接受 <80% 总覆盖率**：不符合 AGENTS.md 要求，已通过 sqlmock 测试解决。
+
+---

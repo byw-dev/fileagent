@@ -1,6 +1,6 @@
 # TASK_LIST.md — FileAgent 任务清单
 
-> 当前阶段：**Phase 1 — 基础骨架**（组 A 已完成，组 B/C/D 进行中）
+> 当前阶段：**Phase 2 — 核心业务逻辑**（组 A 已完成，组 B/C/D 未开始）
 > 状态说明：⬜ 未开始 / 🔄 进行中 / ✅ 已完成 / ❌ 阻塞
 
 ---
@@ -120,14 +120,14 @@ Phase 4  完善与收尾（可并行）
 
 | 任务 | 产出 | 关键验收点 | 状态 |
 |------|------|-----------|------|
-| T2-A1 JWT 认证模块 | `internal/auth/jwt.go` | 生成/验证/吊销 Token；覆盖过期/篡改/黑名单测试 | ⬜ |
-| T2-A2 Agent 注册审批 | `internal/agent/` | Register/PollApproval RPC；approve/revoke REST；错误场景测试 | ⬜ |
-| T2-A3 Agent 连接注册表 | `internal/grpcserver/registry.go` | AgentRegistry；Connect RPC；心跳刷新 Redis；断连触发 NATS | ⬜ |
-| T2-A4 文件索引引擎 | `internal/indexer/` | 幂等 upsert；glob 匹配 file_type；发布 NATS 事件 | ⬜ |
-| T2-A5 STS 凭据管理 | `internal/storage/sts.go` | 动态 Session Policy；MinIO STS；集成测试验证凭据可用 | ⬜ |
-| T2-A6 任务调度下发 | `internal/agent/dispatch.go` | 在线立即下发；离线暂存+重连同步；Redis 分布式锁 | ⬜ |
-| T2-A7 事件规则引擎 | `internal/event/` | 订阅 NATS；规则过滤；Webhook 投递+重试；Background Worker | ⬜ |
-| T2-A8 用户认证接口 | `internal/api/handler/auth.go` | login/refresh/logout/me 完整实现；所有错误场景测试 | ⬜ |
+| T2-A1 JWT 认证模块 | `internal/auth/jwt.go` | 生成/验证/吊销 Token；覆盖过期/篡改/黑名单测试 | ✅ |
+| T2-A2 Agent 注册审批 | `internal/agent/` | Register/PollApproval RPC；approve/revoke REST；错误场景测试 | ✅ |
+| T2-A3 Agent 连接注册表 | `internal/grpcserver/registry.go` | AgentRegistry；Connect RPC；心跳刷新 Redis；断连触发 NATS | ✅ |
+| T2-A4 文件索引引擎 | `internal/indexer/` | 幂等 upsert；glob 匹配 file_type；发布 NATS 事件 | ✅ |
+| T2-A5 STS 凭据管理 | `internal/storage/sts.go` | 动态 Session Policy；MinIO STS；集成测试验证凭据可用 | ✅ |
+| T2-A6 任务调度下发 | `internal/agent/dispatch.go` | 在线立即下发；离线暂存+重连同步；Redis 分布式锁 | ✅ |
+| T2-A7 事件规则引擎 | `internal/event/` | 订阅 NATS；规则过滤；Webhook 投递+重试；Background Worker | ✅ |
+| T2-A8 用户认证接口 | `internal/api/handler/auth.go` | login/refresh/logout/me 完整实现；所有错误场景测试 | ✅ |
 
 ### 组 B：Edge Agent 核心功能
 > 依赖：Phase 1 组 B 全部完成
@@ -198,10 +198,10 @@ Phase 4  完善与收尾（可并行）
 |-------|--------|--------|------|
 | Phase 0 | 5 | 5 | 100% |
 | Phase 1 | 15 | 15 | 100% |
-| Phase 2 | 20 | 0 | 0% |
+| Phase 2 | 20 | 8 | 40% |
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **47** | **20** | **43%** |
+| **合计** | **47** | **28** | **60%** |
 
 ---
 
