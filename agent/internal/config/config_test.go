@@ -147,3 +147,81 @@ level = "verbose"
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "log.level")
 }
+
+func TestApplyEnvOverrides_AllVars(t *testing.T) {
+	t.Setenv("AGENT_SERVER_TLS_CA_CERT", "/certs/ca.pem")
+	t.Setenv("AGENT_FINGERPRINT_FILE", "/data/fp.txt")
+	t.Setenv("AGENT_TOKEN_FILE", "/data/tok.enc")
+	t.Setenv("AGENT_DATA_DIR", "/data/agent")
+	t.Setenv("AGENT_UPLOAD_PART_SIZE_MB", "128")
+	t.Setenv("AGENT_UPLOAD_QUEUE_MAX_SIZE", "5000")
+	t.Setenv("AGENT_UPLOAD_RETRY_MAX", "5")
+	t.Setenv("AGENT_METRICS_ENABLED", "true")
+	t.Setenv("AGENT_LOG_OUTPUT", "/var/log/agent.log")
+	t.Setenv("AGENT_LOG_MAX_SIZE_MB", "200")
+	t.Setenv("AGENT_LOG_MAX_BACKUPS", "14")
+	t.Setenv("AGENT_SERVER_ENDPOINT", "ep:9090")
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+
+	assert.Equal(t, "/certs/ca.pem", cfg.Server.TLSCACert)
+	assert.Equal(t, "/data/fp.txt", cfg.Agent.FingerprintFile)
+	assert.Equal(t, "/data/tok.enc", cfg.Agent.TokenFile)
+	assert.Equal(t, "/data/agent", cfg.Agent.DataDir)
+	assert.Equal(t, 128, cfg.Upload.PartSizeMB)
+	assert.Equal(t, 5000, cfg.Upload.QueueMaxSize)
+	assert.Equal(t, 5, cfg.Upload.RetryMax)
+	assert.True(t, cfg.Metrics.Enabled)
+	assert.Equal(t, "/var/log/agent.log", cfg.Log.Output)
+	assert.Equal(t, 200, cfg.Log.MaxSizeMB)
+	assert.Equal(t, 14, cfg.Log.MaxBackups)
+}
+
+func TestApplyEnvOverrides_MetricsDisabled(t *testing.T) {
+	t.Setenv("AGENT_SERVER_ENDPOINT", "ep:9090")
+	t.Setenv("AGENT_METRICS_ENABLED", "false")
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+	assert.False(t, cfg.Metrics.Enabled)
+}
+
+func TestApplyEnvOverrides_InvalidNumbers(t *testing.T) {
+	t.Setenv("AGENT_SERVER_ENDPOINT", "ep:9090")
+	// Non-numeric values should be silently ignored (env override skipped).
+	t.Setenv("AGENT_UPLOAD_CONCURRENCY", "not-a-number")
+	t.Setenv("AGENT_UPLOAD_PART_SIZE_MB", "bad")
+	t.Setenv("AGENT_UPLOAD_QUEUE_MAX_SIZE", "bad")
+	t.Setenv("AGENT_UPLOAD_RETRY_MAX", "bad")
+	t.Setenv("AGENT_METRICS_PORT", "bad")
+	t.Setenv("AGENT_LOG_MAX_SIZE_MB", "bad")
+	t.Setenv("AGENT_LOG_MAX_BACKUPS", "bad")
+
+	cfg, err := Load("")
+	require.NoError(t, err)
+	// Defaults are used because env vars were invalid.
+	assert.Equal(t, 3, cfg.Upload.Concurrency)
+}
+
+func TestValidate_MultipleErrors(t *testing.T) {
+	p := writeTOML(t, `
+[server]
+endpoint = ""
+
+[upload]
+concurrency = -1
+part_size_mb = -1
+queue_max_size = -1
+retry_max = -1
+
+[metrics]
+port = 99999
+
+[log]
+level = "bad"
+`)
+	_, err := Load(p)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "server.endpoint is required")
+}
