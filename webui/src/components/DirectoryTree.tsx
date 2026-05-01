@@ -72,9 +72,13 @@ function DirectoryTree({ entries, currentPath, onNavigate }: DirectoryTreeProps)
     },
   ]
 
+  const normalizedPath = currentPath.endsWith('/') && currentPath !== '/'
+    ? currentPath.slice(0, -1)
+    : currentPath
+
   const parentPath =
-    currentPath !== '/'
-      ? currentPath.substring(0, currentPath.lastIndexOf('/')) || '/'
+    normalizedPath !== '/'
+      ? normalizedPath.substring(0, normalizedPath.lastIndexOf('/')) || '/'
       : null
 
   return (
