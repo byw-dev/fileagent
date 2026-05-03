@@ -1,6 +1,6 @@
 # TASK_LIST.md — FileAgent 任务清单
 
-> 当前阶段：**Phase 3 — 集成联调**（Phase 2 全部完成）
+> 当前阶段：**Phase 2 遗留扫除**（T2-X1~X8 需在进入 Phase 3 前完成，详见 [docs/PHASE2_REMEDIATION.md](docs/PHASE2_REMEDIATION.md)）
 > 状态说明：⬜ 未开始 / 🔄 进行中 / ✅ 已完成 / ❌ 阻塞
 
 ---
@@ -161,6 +161,24 @@ Phase 4  完善与收尾（可并行）
 
 ---
 
+### 集成测试前遗留工作扫除（必须在进入 Phase 3 之前完成）
+
+> 代码审计（2026-05-03）发现 Phase 2 存在大量"包逻辑写完即打 ✅、但组装层/REST Handler/WebUI 页面从未实现"的遗留问题。
+> 完整缺陷列表、根本原因分析和修复优先级见：**[docs/PHASE2_REMEDIATION.md](../docs/PHASE2_REMEDIATION.md)**
+
+| 任务 | 内容摘要 | 状态 |
+|------|---------|------|
+| T2-X1 DB 查询层补全 | file_entries/upload_logs/file_types/buckets/event_rules/event_deliveries/users 读写查询 | ⬜ |
+| T2-X2 Controlplane 组件接线 | RefreshCredentials RPC、Indexer 接入 handleUploadResult、Dispatcher 接入 Connect、Event Engine Start+NATS 订阅+Retry Worker、JWT 中间件黑名单检查 | ⬜ |
+| T2-X3 离线规则暂存 | DispatchRule 离线时持久化暂存，重连后补发（T2-A6 遗漏） | ⬜ |
+| T2-X4 REST Handler 实现 | AgentsHandler(10) / FilesHandler(4) / FileTypesHandler(4) / BucketsHandler(2) / EventRulesHandler(5) / UploadLogsHandler(2) / UsersHandler(5) / minio-event(1) 共 33 个端点 | ⬜ |
+| T2-X5 Agent main.go 组装 | 将 watcher/scheduler/executor/uploader/grpcclient 组装为可运行 Agent 进程 | ⬜ |
+| T2-X6 Agent RefreshCredentials 调用 | grpcclient 添加 RefreshCredentials；后台定时刷新 STS 凭据 | ⬜ |
+| T2-X7 Web UI 未实现页面 | FileTypes/Events/Buckets/AgentRules/AgentLogs/Logs/Files·Detail/Settings·Users/Settings·Profile 共 13 个 placeholder 页面 | ⬜ |
+| T2-X8 集成测试补建 | STS 集成测试（controlplane）+ Upload Engine 集成测试（agent）| ⬜ |
+
+---
+
 ## Phase 3 — 集成联调（串行，依赖 Phase 2 全部完成）
 
 ### T3-1 Control Plane + Agent 端到端联调 ⬜
@@ -198,10 +216,11 @@ Phase 4  完善与收尾（可并行）
 |-------|--------|--------|------|
 | Phase 0 | 5 | 5 | 100% |
 | Phase 1 | 15 | 15 | 100% |
-| Phase 2 | 20 | 20 | 100% |
+| Phase 2 核心 | 20 | 20 | 100%（含组件包逻辑）|
+| Phase 2 遗留（T2-X） | 8 | 0 | 0%（见 PHASE2_REMEDIATION.md）|
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **47** | **40** | **85%** |
+| **合计** | **55** | **40** | **73%** |
 
 ---
 
