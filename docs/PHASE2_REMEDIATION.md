@@ -6,6 +6,9 @@
 > 本文档记录在代码审计（2026-05-03）中发现的所有 Phase 0/1/2 验收点偏差，
 > 分析根本原因，并给出逐条遗留工作。
 > 所有条目解决后方可进入 Phase 3。
+>
+> **2026-05-04 二次审计更新**：经对代码库的深度再审计，T2-X 所有 8 项仍全部处于 ⬜ 未开始状态。
+> 本文档同步修正了若干描述偏差（详见各节）。完整遗留任务清单另见 `docs/PHASE3_READINESS.md`。
 
 ---
 
@@ -22,7 +25,7 @@
 ## Control Plane — 组件接线（Wiring Layer）
 
 ### CP-W1 gRPC `RefreshCredentials` RPC 未实现
-- **现状**：`handler.go:105` 直接返回 `codes.Unimplemented`；`stsMgr` 在 `main.go` 中被 `_ = stsMgr` 丢弃
+- **现状**：`controlplane/internal/grpcserver/handler.go:104` 直接返回 `codes.Unimplemented`；`stsMgr` 在 `controlplane/cmd/server/main.go` 中被 `_ = stsMgr` 丢弃
 - **对应任务**：T2-A5（STS 凭据管理）验收点遗漏
 - **修复**：
   1. 在 `grpcserver.Server` 中注入 `STSManager` 接口
@@ -30,12 +33,12 @@
   3. `main.go` 传入 `stsMgr` 而不是 `_ = stsMgr`
 
 ### CP-W2 `handleUploadResult` 未调用 Indexer
-- **现状**：只打日志；`ix` 在 `main.go` 中被 `_ = ix` 丢弃
+- **现状**：只打日志；`ix` 在 `controlplane/cmd/server/main.go` 中被 `_ = ix` 丢弃
 - **对应任务**：T2-A4（文件索引引擎）验收点遗漏
 - **修复**：
   1. 在 `grpcserver.Server` 中注入 `Indexer` 接口
   2. `handleUploadResult` 调用 `ix.IndexUpload(ctx, agentID, result)` 完成文件归类、写库、发布 NATS 事件
-  3. `main.go` 传入 `ix`
+  3. `controlplane/cmd/server/main.go` 传入 `ix`（当前为 `_ = ix`）
 
 ### CP-W3 Dispatcher 未接入 gRPC Server
 - **现状**：`dispatcher` 在 `main.go` 中被 `_ = dispatcher`；`Connect` 时从不调用 `SyncRulesOnConnect`
@@ -45,11 +48,13 @@
   2. Agent `Connect` 成功后调用 `dispatcher.SyncRulesOnConnect(ctx, agentID)`
   3. `main.go` 传入 `dispatcher`
 
-### CP-W4 离线规则暂存未实现
-- **现状**：`DispatchRule` 离线时 `return nil`，没有持久化到任何队列
-- **对应任务**：T2-A6 验收点"离线暂存+重连同步"未落地
-- **修复**：
-  - 离线时将规则写入 DB `pending_dispatch` 记录（或复用 collection_rules 加字段），重连后由 `SyncRulesOnConnect` 补发
+### CP-W4 离线规则暂存——描述修正
+- **二次审计修正**：原描述"没有持久化到任何队列"有误。
+  `DispatchRule` 离线时 `return nil` 是正确设计——规则已持久化在 `collection_rules` 表中；
+  `SyncRulesOnConnect()` 重连时会从 DB 读取所有 active 规则并补发。
+  因此 **CP-W4 不是独立问题**，它是 CP-W3 未接线的自然结果。
+- **实际状态**：CP-W3（Connect 时调用 SyncRulesOnConnect）一旦完成，CP-W4 自动解决，无需新增 pending_dispatch 表。
+- **修复**：已归并至 CP-W3（见下），本条可视为 CP-W3 的验收要求之一。
 
 ### CP-W5 Event Engine 未启动 / 无 NATS 订阅
 - **现状**：`eventEngine` 在 `main.go` 中被 `_ = eventEngine`；Engine 没有 `Start()` / NATS subscriber 方法
@@ -124,8 +129,8 @@ List / Create / Update / Delete / UpdatePassword
 | `upload_logs` | ListUploadLogs（cursor + agent_id 筛选）、GetUploadLogByID |
 | `file_types` | ListFileTypes、CreateFileType、UpdateFileType、DeleteFileType |
 | `buckets` | ListBuckets、CreateBucket |
-| `event_rules` | ListEventRules、CreateEventRule、UpdateEventRule、DeleteEventRule |
-| `event_deliveries` | ListDeliveriesByRule（cursor）|
+| `event_rules` | ListEventRules（全量，供管理接口用）、CreateEventRule、UpdateEventRule、DeleteEventRule；注意：`ListEnabledEventRules` 已在 `indexer/queries.go:216` 实现（内部用），不可复用于 REST |
+| `event_deliveries` | ListDeliveriesByRule（cursor，按规则 ID 分页）；注意：`ListPendingEventDeliveries`（全局重试用）已在 `indexer/queries.go:356` 实现 |
 | `users` | UpdateUser、DeleteUser（UpdateActive 已有）|
 
 > 注意：indexer/queries.go 中已有写路径（UpsertFileEntry、CreateUploadLog 等），
@@ -146,7 +151,7 @@ List / Create / Update / Delete / UpdatePassword
 ## Edge Agent — 组装层
 
 ### AG-W1 agent main.go 是空壳（完全缺失的任务）
-- **现状**：`agent/cmd/agent/main.go` 仅 `fmt.Println("fileagent agent")`
+- **现状**：`agent/cmd/agent/main.go` 仍仅 `fmt.Println("fileagent agent")`，2026-05-04 二次审计确认未变化
 - **修复**：将以下组件组装为完整 Agent 进程：
   1. 加载配置（`config.Load()`）
   2. 初始化日志（zap）
@@ -219,7 +224,7 @@ List / Create / Update / Delete / UpdatePassword
 - [ ] **REM-CP4** `Connect` 调用 `SyncRulesOnConnect`（CP-W3）
 - [ ] **REM-CP5** Event Engine 添加 NATS 订阅 + Start()（CP-W5）
 - [ ] **REM-CP6** Event Engine 添加后台 Retry Worker（CP-W5）
-- [ ] **REM-CP7** 离线规则暂存（CP-W4）
+- [x] **REM-CP7** ~~离线规则暂存（CP-W4）~~ **已归并至 REM-CP4**：`SyncRulesOnConnect` 已覆盖重连同步，无需独立暂存队列；完成 REM-CP4 后本项自动满足
 
 ### 第三优先级：REST Handler 实现（依赖 DB 查询层）
 - [ ] **REM-H1** AgentsHandler 全部 10 端点

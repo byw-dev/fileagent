@@ -43,3 +43,15 @@ UPDATE users
 SET last_login_at = NOW(),
     updated_at = NOW()
 WHERE id = $1;
+
+-- name: UpdateUser :one
+UPDATE users
+SET username   = $2,
+    email      = $3,
+    role       = $4,
+    updated_at = NOW()
+WHERE id = $1
+RETURNING id, org_id, username, email, password_hash, role, is_active, last_login_at, created_at, updated_at;
+
+-- name: DeleteUser :exec
+DELETE FROM users WHERE id = $1;

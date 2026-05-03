@@ -168,7 +168,7 @@ Phase 4  完善与收尾（可并行）
 
 | 任务 | 内容摘要 | 状态 |
 |------|---------|------|
-| T2-X1 DB 查询层补全 | file_entries/upload_logs/file_types/buckets/event_rules/event_deliveries/users 读写查询 | ⬜ |
+| T2-X1 DB 查询层补全 | file_entries/upload_logs/file_types/buckets/event_rules/event_deliveries/users 读写查询 | ✅ |
 | T2-X2 Controlplane 组件接线 | RefreshCredentials RPC、Indexer 接入 handleUploadResult、Dispatcher 接入 Connect、Event Engine Start+NATS 订阅+Retry Worker、JWT 中间件黑名单检查 | ⬜ |
 | T2-X3 离线规则暂存 | DispatchRule 离线时持久化暂存，重连后补发（T2-A6 遗漏） | ⬜ |
 | T2-X4 REST Handler 实现 | AgentsHandler(10) / FilesHandler(4) / FileTypesHandler(4) / BucketsHandler(2) / EventRulesHandler(5) / UploadLogsHandler(2) / UsersHandler(5) / minio-event(1) 共 33 个端点 | ⬜ |
