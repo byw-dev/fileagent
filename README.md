@@ -91,7 +91,7 @@ React 管理后台，供管理员操作。
 | 采集规则 | 3 步表单创建；Watch/Scheduled 模式切换；cron 实时预览 |
 | 文件浏览器 | 多维筛选、单文件下载、StreamSaver 批量下载 |
 
-技术栈：Vite / React 18 / TypeScript / Ant Design 5 + ProComponents / Zustand / Axios + SWR / Vitest
+技术栈：Vite / React 19 / TypeScript / Ant Design 5 + ProComponents / Zustand / Axios + SWR / Vitest
 
 ### Python SDK（`sdk/python/`）
 
@@ -169,8 +169,8 @@ fileagent/
 ### 前置依赖
 
 - Docker & Docker Compose v2
-- Go 1.22+
-- Node.js 20 LTS + pnpm
+- Go 1.24+
+- Node.js 24 LTS (krypton) + pnpm 11（通过 Corepack 管理）
 - Python 3.10+ + Poetry（仅 SDK 开发）
 - [golang-migrate](https://github.com/golang-migrate/migrate) CLI（数据库迁移）
 
@@ -285,10 +285,13 @@ docker compose -f deploy/docker-compose.test.yml down -v
 ### Web UI 开发
 
 ```bash
+# 首次使用：启用 Corepack（Node.js 内置，一次性操作）
+corepack enable
+
 cd webui
-pnpm install
-pnpm dev      # 启动开发服务器
-pnpm build    # 生产构建
+pnpm install     # Corepack 自动使用 pnpm@11.0.4
+pnpm dev         # 启动开发服务器
+pnpm build       # 生产构建
 ```
 
 ### 整理依赖

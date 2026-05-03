@@ -159,3 +159,62 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 - **接受 <80% 总覆盖率**：不符合 AGENTS.md 要求，已通过 sqlmock 测试解决。
 
 ---
+
+## D-006：Web UI 运行时版本选型（Node.js + pnpm）
+
+- **日期**：2026-05-03
+- **状态**：已接受
+
+### 背景
+
+项目初始时使用 Node.js 20 LTS（Iron）+ pnpm 9，但 Node.js 20 LTS 的 EOL 已于
+2026 年 4 月到来，继续使用会失去安全维护。同时评估了是否直接跳至最新版本。
+
+### 决策
+
+| 工具 | 版本 | 说明 |
+|------|------|------|
+| Node.js | **24.15.0 (LTS krypton)** | 当前活跃 LTS，EOL ≈ 2030 年 4 月，提供最长支持窗口 |
+| pnpm | **11.0.4** | 与 Node.js 24 一同发布的最新稳定版，lockfile 格式（v9.0）与 pnpm 9.x 兼容，无破坏性迁移 |
+| Corepack | 内置于 Node.js 16.9+ | 通过 `package.json` 的 `packageManager` 字段强制版本一致性 |
+
+版本通过 `webui/package.json` 的以下字段锁定，Corepack 会在执行 `pnpm install` 时
+自动检测并强制使用 `pnpm@11.0.4`：
+
+```json
+{
+  "packageManager": "pnpm@11.0.4",
+  "engines": {
+    "node": ">=24.0.0 <25.0.0",
+    "pnpm": ">=11.0.0 <12.0.0"
+  }
+}
+```
+
+### 升级可行性评估
+
+**优势：**
+- Node.js 24 LTS 支持周期到 2030 年，比 Node.js 20（已 EOL）或 22（2027 年）更长
+- V8 12.4 引擎提升：原生 `fetch`、更好的 ESM 模块支持、内存性能改善
+- Node.js 24 开始默认启用 Corepack，`corepack enable` 后无需额外安装 pnpm
+- pnpm 11 改进了 workspace 协议处理和 peer deps 解析
+- 当前所有依赖（Vite 8、React 19、TypeScript 6）均明确支持 Node.js 24
+
+**无副作用确认：**
+- pnpm 11 的 lockfile 格式（`lockfileVersion: '9.0'`）与 pnpm 9.x 相同，无迁移成本
+- `pnpm install --frozen-lockfile`、`pnpm build`、`pnpm test`（48/48）全部通过
+- 无任何依赖兼容性错误或警告
+
+### 开发者一致性机制
+
+1. 运行 `corepack enable`（一次性操作，或通过 CI 脚本自动完成）
+2. `pnpm install` — Corepack 自动匹配并使用 `pnpm@11.0.4`，无需手动安装 pnpm
+3. CI 中使用 `pnpm install --frozen-lockfile` 防止 lockfile 意外变更
+
+### 备选方案（被否决）
+
+- **继续用 Node.js 20 + pnpm 9**：Node 20 已 EOL，无安全更新，不可接受。
+- **升级到 Node.js 22 LTS（Jod）**：支持到 2027 年 4 月，比 Node 24 短 3 年；既然升级，直接到更长生命周期版本更合理。
+- **使用 node-version-file（.nvmrc / .node-version）**：与 `packageManager` + Corepack 方案相比，需要额外工具（nvm/fnm），且对 pnpm 版本无约束力。
+
+---
