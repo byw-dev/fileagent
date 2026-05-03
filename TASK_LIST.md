@@ -1,6 +1,6 @@
 # TASK_LIST.md — FileAgent 任务清单
 
-> 当前阶段：**Phase 2 — 核心业务逻辑**（组 A、B、C 已完成，组 D 未开始）
+> 当前阶段：**Phase 3 — 集成联调**（Phase 2 全部完成）
 > 状态说明：⬜ 未开始 / 🔄 进行中 / ✅ 已完成 / ❌ 阻塞
 
 ---
@@ -156,8 +156,8 @@ Phase 4  完善与收尾（可并行）
 
 | 任务 | 关键验收点 | 状态 |
 |------|-----------|------|
-| T2-D1 FilesResource | list/iter/get/download/stream/batch；分页迭代器；respx mock 测试 | ⬜ |
-| T2-D2 其他 Resource | FileTypes / Agents / UploadLogs；单元测试 | ⬜ |
+| T2-D1 FilesResource | list/iter/get/download/stream/batch；分页迭代器；respx mock 测试 | ✅ |
+| T2-D2 其他 Resource | FileTypes / Agents / UploadLogs；单元测试 | ✅ |
 
 ---
 
@@ -198,10 +198,10 @@ Phase 4  完善与收尾（可并行）
 |-------|--------|--------|------|
 | Phase 0 | 5 | 5 | 100% |
 | Phase 1 | 15 | 15 | 100% |
-| Phase 2 | 20 | 18 | 90% |
+| Phase 2 | 20 | 20 | 100% |
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **47** | **38** | **81%** |
+| **合计** | **47** | **40** | **85%** |
 
 ---
 

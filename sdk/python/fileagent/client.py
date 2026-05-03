@@ -7,6 +7,10 @@ from __future__ import annotations
 
 from fileagent.auth import TokenManager
 from fileagent.http import HTTPClient
+from fileagent.resources.agents import AgentsResource
+from fileagent.resources.file_types import FileTypesResource
+from fileagent.resources.files import FilesResource
+from fileagent.resources.upload_logs import UploadLogsResource
 
 
 class FileAgentClient:
@@ -17,8 +21,7 @@ class FileAgentClient:
     every request automatically carries a valid Bearer token.
 
     Resource accessors (``files``, ``file_types``, ``agents``,
-    ``upload_logs``) will be populated in Phase 2.  They are exposed as
-    properties here to keep the public API stable.
+    ``upload_logs``) provide typed access to all API domains.
 
     Args:
         base_url: Base URL of the FileAgent control plane
@@ -35,6 +38,8 @@ class FileAgentClient:
         ...     username="api-user",
         ...     password="secret",
         ... )
+        >>> for entry in client.files.iter():
+        ...     print(entry.file_name)
     """
 
     def __init__(
@@ -70,45 +75,51 @@ class FileAgentClient:
         # Wire the token callback so every request gets a fresh token.
         self._http.get_access_token = self._token_manager.get_access_token
 
+        # Instantiate resource accessors.
+        self._files = FilesResource(self._http, verify_ssl=verify_ssl)
+        self._file_types = FileTypesResource(self._http)
+        self._agents = AgentsResource(self._http)
+        self._upload_logs = UploadLogsResource(self._http)
+
     # ------------------------------------------------------------------
-    # Resource accessors (stubs — implemented in Phase 2)
+    # Resource accessors
     # ------------------------------------------------------------------
 
     @property
-    def files(self):  # type: ignore[return]
+    def files(self) -> FilesResource:
         """Resource accessor for file entries.
 
         Returns:
-            FilesResource instance (Phase 2).
+            :class:`~fileagent.resources.files.FilesResource` instance.
         """
-        return None  # TODO: Phase 2 T2-D1
+        return self._files
 
     @property
-    def file_types(self):  # type: ignore[return]
+    def file_types(self) -> FileTypesResource:
         """Resource accessor for file types.
 
         Returns:
-            FileTypesResource instance (Phase 2).
+            :class:`~fileagent.resources.file_types.FileTypesResource` instance.
         """
-        return None  # TODO: Phase 2 T2-D2
+        return self._file_types
 
     @property
-    def agents(self):  # type: ignore[return]
+    def agents(self) -> AgentsResource:
         """Resource accessor for agent records.
 
         Returns:
-            AgentsResource instance (Phase 2).
+            :class:`~fileagent.resources.agents.AgentsResource` instance.
         """
-        return None  # TODO: Phase 2 T2-D2
+        return self._agents
 
     @property
-    def upload_logs(self):  # type: ignore[return]
+    def upload_logs(self) -> UploadLogsResource:
         """Resource accessor for upload logs.
 
         Returns:
-            UploadLogsResource instance (Phase 2).
+            :class:`~fileagent.resources.upload_logs.UploadLogsResource` instance.
         """
-        return None  # TODO: Phase 2 T2-D2
+        return self._upload_logs
 
     def close(self) -> None:
         """Close the underlying HTTP client and release resources."""
