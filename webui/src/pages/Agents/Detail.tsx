@@ -1,15 +1,408 @@
-import { Typography } from 'antd'
-import { useParams } from 'react-router-dom'
+import { useState, useEffect } from 'react'
+import {
+  Typography,
+  Tabs,
+  Descriptions,
+  Button,
+  Space,
+  Modal,
+  message,
+  Table,
+  Tag,
+  Spin,
+  Switch,
+  Card,
+} from 'antd'
+import {
+  CheckCircleOutlined,
+  StopOutlined,
+  PlusOutlined,
+  DeleteOutlined,
+  FolderOutlined,
+} from '@ant-design/icons'
+import type { ColumnsType } from 'antd/es/table'
+import { useParams, useNavigate } from 'react-router-dom'
+import {
+  getAgent,
+  approveAgent,
+  revokeAgent,
+  listRules,
+  deleteRule,
+  listDir,
+  listAgentUploadLogs,
+} from '../../services/agents'
+import type { Agent, CollectionRule } from '../../services/agents'
+import AgentStatusBadge from '../../components/AgentStatusBadge'
+import DirectoryTree from '../../components/DirectoryTree'
+import type { DirEntry } from '../../components/DirectoryTree'
+
+const { Title } = Typography
+
+/** Format bytes to human-readable size */
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(1024))
+  return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
+}
+
+type UploadLogRow = {
+  id: string
+  filename: string
+  size: number
+  status: string
+  uploaded_at: string
+}
 
 /**
- * Agent detail page (placeholder).
+ * Agent detail page — shows 4 tabs: basic info, collection rules, upload logs,
+ * and a directory browser backed by the list-dir API.
  */
 function AgentDetailPage() {
   const { id } = useParams<{ id: string }>()
+  const navigate = useNavigate()
+
+  const [agent, setAgent] = useState<Agent | null>(null)
+  const [loadingAgent, setLoadingAgent] = useState(true)
+
+  const [rules, setRules] = useState<CollectionRule[]>([])
+  const [loadingRules, setLoadingRules] = useState(false)
+
+  const [logs, setLogs] = useState<UploadLogRow[]>([])
+  const [loadingLogs, setLoadingLogs] = useState(false)
+
+  const [dirPath, setDirPath] = useState('/')
+  const [dirEntries, setDirEntries] = useState<DirEntry[]>([])
+  const [loadingDir, setLoadingDir] = useState(false)
+  const [dirModalOpen, setDirModalOpen] = useState(false)
+
+  const [activeTab, setActiveTab] = useState('info')
+
+  useEffect(() => {
+    if (!id) return
+    setLoadingAgent(true)
+    getAgent(id)
+      .then(setAgent)
+      .catch(() => message.error('获取采集器信息失败'))
+      .finally(() => setLoadingAgent(false))
+  }, [id])
+
+  useEffect(() => {
+    if (activeTab === 'rules' && id) {
+      setLoadingRules(true)
+      listRules(id)
+        .then((data) => setRules(data.items))
+        .catch(() => message.error('获取规则列表失败'))
+        .finally(() => setLoadingRules(false))
+    }
+    if (activeTab === 'logs' && id) {
+      setLoadingLogs(true)
+      listAgentUploadLogs(id, { limit: 50 })
+        .then((data) => setLogs(data.items))
+        .catch(() => message.error('获取上传日志失败'))
+        .finally(() => setLoadingLogs(false))
+    }
+  }, [activeTab, id])
+
+  const loadDir = async (path: string) => {
+    if (!id) return
+    setLoadingDir(true)
+    setDirPath(path)
+    try {
+      const entries = await listDir(id, path)
+      setDirEntries(entries as DirEntry[])
+    } catch {
+      message.error('获取目录列表失败')
+      setDirEntries([])
+    } finally {
+      setLoadingDir(false)
+    }
+  }
+
+  const handleApprove = () => {
+    if (!agent) return
+    Modal.confirm({
+      title: `审批采集器：${agent.name}`,
+      content: '确认批准该采集器连接系统？',
+      onOk: async () => {
+        try {
+          const updated = await approveAgent(agent.id)
+          setAgent(updated)
+          message.success('审批成功')
+        } catch {
+          message.error('审批失败')
+        }
+      },
+    })
+  }
+
+  const handleRevoke = () => {
+    if (!agent) return
+    Modal.confirm({
+      title: `吊销采集器：${agent.name}`,
+      content: '吊销后该采集器将无法连接，确认操作？',
+      okType: 'danger',
+      onOk: async () => {
+        try {
+          const updated = await revokeAgent(agent.id)
+          setAgent(updated)
+          message.success('吊销成功')
+        } catch {
+          message.error('吊销失败')
+        }
+      },
+    })
+  }
+
+  const handleDeleteRule = (rule: CollectionRule) => {
+    if (!id) return
+    Modal.confirm({
+      title: `删除规则：${rule.name}`,
+      content: '确认删除该采集规则？',
+      okType: 'danger',
+      onOk: async () => {
+        try {
+          await deleteRule(id, rule.id)
+          message.success('规则已删除')
+          setRules((prev) => prev.filter((r) => r.id !== rule.id))
+        } catch {
+          message.error('删除规则失败')
+        }
+      },
+    })
+  }
+
+  const ruleColumns: ColumnsType<CollectionRule> = [
+    { title: '名称', dataIndex: 'name', key: 'name' },
+    {
+      title: '模式',
+      dataIndex: 'mode',
+      key: 'mode',
+      width: 100,
+      render: (mode: string) => (
+        <Tag color={mode === 'WATCH' ? 'blue' : 'purple'}>{mode}</Tag>
+      ),
+    },
+    { title: '源路径', dataIndex: 'source_path', key: 'source_path', ellipsis: true },
+    { title: '文件过滤', dataIndex: 'file_pattern', key: 'file_pattern', width: 130 },
+    {
+      title: 'Cron',
+      dataIndex: 'cron_expr',
+      key: 'cron_expr',
+      width: 140,
+      render: (v: string | null) => v ?? '-',
+    },
+    {
+      title: '状态',
+      dataIndex: 'is_active',
+      key: 'is_active',
+      width: 80,
+      render: (v: boolean) => <Switch checked={v} size="small" disabled />,
+    },
+    {
+      title: '操作',
+      key: 'action',
+      width: 120,
+      render: (_, rule) => (
+        <Space>
+          <Button
+            size="small"
+            danger
+            icon={<DeleteOutlined />}
+            onClick={() => handleDeleteRule(rule)}
+          >
+            删除
+          </Button>
+        </Space>
+      ),
+    },
+  ]
+
+  const logColumns: ColumnsType<UploadLogRow> = [
+    { title: '文件名', dataIndex: 'filename', key: 'filename', ellipsis: true },
+    {
+      title: '大小',
+      dataIndex: 'size',
+      key: 'size',
+      width: 100,
+      render: (_, row) => formatBytes(row.size),
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      key: 'status',
+      width: 90,
+      render: (_, row) => {
+        const colorMap: Record<string, string> = {
+          SUCCESS: 'green',
+          FAILED: 'red',
+          PENDING: 'gold',
+        }
+        return <Tag color={colorMap[row.status] ?? 'default'}>{row.status}</Tag>
+      },
+    },
+    {
+      title: '上传时间',
+      dataIndex: 'uploaded_at',
+      key: 'uploaded_at',
+      width: 170,
+      render: (_, row) => new Date(row.uploaded_at).toLocaleString('zh-CN'),
+    },
+  ]
+
+  if (loadingAgent) {
+    return (
+      <Spin
+        size="large"
+        style={{ display: 'block', textAlign: 'center', marginTop: 80 }}
+      />
+    )
+  }
+
+  if (!agent) {
+    return <Typography.Text type="danger">采集器不存在或加载失败</Typography.Text>
+  }
+
+  const canApprove = agent.status === 'PENDING'
+  const canRevoke = ['RUNNING', 'APPROVED', 'OFFLINE'].includes(agent.status)
+
+  const tabs = [
+    {
+      key: 'info',
+      label: '基本信息',
+      children: (
+        <Card>
+          <Descriptions column={2} bordered>
+            <Descriptions.Item label="ID">{agent.id}</Descriptions.Item>
+            <Descriptions.Item label="名称">{agent.name}</Descriptions.Item>
+            <Descriptions.Item label="主机名">{agent.hostname}</Descriptions.Item>
+            <Descriptions.Item label="IP 地址">{agent.ip_address}</Descriptions.Item>
+            <Descriptions.Item label="操作系统">{agent.os}</Descriptions.Item>
+            <Descriptions.Item label="版本">{agent.version}</Descriptions.Item>
+            <Descriptions.Item label="状态">
+              <AgentStatusBadge status={agent.status} />
+            </Descriptions.Item>
+            <Descriptions.Item label="最后心跳">
+              {agent.last_heartbeat_at
+                ? new Date(agent.last_heartbeat_at).toLocaleString('zh-CN')
+                : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="注册时间">
+              {new Date(agent.registered_at).toLocaleString('zh-CN')}
+            </Descriptions.Item>
+          </Descriptions>
+        </Card>
+      ),
+    },
+    {
+      key: 'rules',
+      label: '采集规则',
+      children: (
+        <div>
+          <div style={{ marginBottom: 12 }}>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={() => navigate(`/agents/${id}/rules/create`)}
+            >
+              新建规则
+            </Button>
+          </div>
+          <Table
+            dataSource={rules}
+            columns={ruleColumns}
+            rowKey="id"
+            loading={loadingRules}
+            pagination={{ pageSize: 10 }}
+            locale={{ emptyText: '暂无采集规则' }}
+          />
+        </div>
+      ),
+    },
+    {
+      key: 'logs',
+      label: '上传日志',
+      children: (
+        <Table
+          dataSource={logs}
+          columns={logColumns}
+          rowKey="id"
+          loading={loadingLogs}
+          pagination={{ pageSize: 20 }}
+          locale={{ emptyText: '暂无上传记录' }}
+        />
+      ),
+    },
+    {
+      key: 'dir',
+      label: '目录浏览',
+      children: (
+        <Card>
+          <Space style={{ marginBottom: 12 }}>
+            <Button
+              icon={<FolderOutlined />}
+              onClick={() => {
+                setDirModalOpen(true)
+                loadDir('/')
+              }}
+            >
+              浏览目录
+            </Button>
+            <Typography.Text type="secondary">当前路径：{dirPath}</Typography.Text>
+          </Space>
+
+          <Modal
+            title="目录浏览"
+            open={dirModalOpen}
+            onCancel={() => setDirModalOpen(false)}
+            footer={null}
+            width={640}
+          >
+            <Spin spinning={loadingDir}>
+              <DirectoryTree
+                entries={dirEntries}
+                currentPath={dirPath}
+                onNavigate={loadDir}
+              />
+            </Spin>
+          </Modal>
+        </Card>
+      ),
+    },
+  ]
+
   return (
     <div>
-      <Typography.Title level={3}>采集器详情</Typography.Title>
-      <Typography.Text type="secondary">ID: {id}（页面开发中 Phase 2）</Typography.Text>
+      <Space
+        style={{ marginBottom: 16, justifyContent: 'space-between', width: '100%' }}
+        wrap
+      >
+        <Space>
+          <Button onClick={() => navigate('/agents')}>← 返回列表</Button>
+          <Title level={4} style={{ margin: 0 }}>
+            {agent.name}
+          </Title>
+          <AgentStatusBadge status={agent.status} />
+        </Space>
+        <Space>
+          {canApprove && (
+            <Button
+              type="primary"
+              icon={<CheckCircleOutlined />}
+              onClick={handleApprove}
+            >
+              审批
+            </Button>
+          )}
+          {canRevoke && (
+            <Button danger icon={<StopOutlined />} onClick={handleRevoke}>
+              吊销
+            </Button>
+          )}
+        </Space>
+      </Space>
+
+      <Tabs activeKey={activeTab} onChange={setActiveTab} items={tabs} />
     </div>
   )
 }
