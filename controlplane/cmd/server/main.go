@@ -34,6 +34,21 @@ func (n *natsPublisher) Publish(subject string, data []byte) error {
 	return n.conn.Publish(subject, data)
 }
 
+// natsListener wraps a NATS connection to satisfy the event.NATSListener interface.
+type natsListener struct {
+	conn *natsgo.Conn
+}
+
+func (n *natsListener) Subscribe(subject string, cb func(data []byte)) (func(), error) {
+	sub, err := n.conn.Subscribe(subject, func(msg *natsgo.Msg) {
+		cb(msg.Data)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return func() { _ = sub.Unsubscribe() }, nil
+}
+
 func main() {
 	// ── Load configuration ───────────────────────────────────────────────────
 	cfg, err := config.Load()
@@ -60,7 +75,9 @@ func main() {
 	}
 
 	// ── Connect to database ──────────────────────────────────────────────────
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	database, err := db.Open(ctx, cfg.DatabaseURL, logger)
 	if err != nil {
 		logger.Fatal("database connection failed", zap.Error(err))
@@ -81,6 +98,7 @@ func main() {
 	}
 	defer natsConn.Close()
 	nats := &natsPublisher{conn: natsConn}
+	listener := &natsListener{conn: natsConn}
 
 	// ── Build core services ──────────────────────────────────────────────────
 	authSvc := auth.New(cfg.JWTSecret, redisClient)
@@ -90,10 +108,8 @@ func main() {
 
 	registry := grpcserver.NewAgentRegistry()
 	dispatcher := agent.NewDispatcher(queries, redisClient, registry, logger)
-	_ = dispatcher // used on connect via gRPC server; available for future use
 
 	ix := indexer.NewIndexer(database, nats, logger)
-	_ = ix // indexer receives UploadResult via gRPC server
 
 	stsMgr := storage.NewSTSManager(
 		cfg.MinIOEndpoint,
@@ -103,15 +119,15 @@ func main() {
 		cfg.MinIOUseSSL,
 		logger,
 	)
-	_ = stsMgr
 
 	webhookSender := event.NewWebhookSender(event.NewDBAdapter(database), logger)
 	eventEngine := event.NewEngine(database, webhookSender, logger)
-	_ = eventEngine
+	eventEngine.Start(ctx, listener)
 
 	// ── Start gRPC server (background goroutine) ─────────────────────────────
 	grpcSrv := grpcserver.New(logger)
 	grpcSrv.WithDeps(registry, redisClient, authSvc, nats, agentMgr)
+	grpcSrv.WithExtraDeps(dispatcher, ix, stsMgr, queries)
 	go func() {
 		if err := grpcSrv.Run(cfg.GRPCPort); err != nil {
 			logger.Fatal("gRPC server error", zap.Error(err))
@@ -136,9 +152,6 @@ func main() {
 	}
 
 	// ── Graceful shutdown ────────────────────────────────────────────────────
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
 		logger.Info("HTTP server starting", zap.Int("port", cfg.HTTPPort))
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -146,7 +159,7 @@ func main() {
 		}
 	}()
 
-	<-quit
+	<-ctx.Done()
 	logger.Info("shutdown signal received, stopping…")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -173,4 +186,3 @@ func buildLogger(level string) (*zap.Logger, error) {
 	cfg.Level = atomicLevel
 	return cfg.Build()
 }
-

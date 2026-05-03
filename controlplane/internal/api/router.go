@@ -52,7 +52,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// ── Authenticated API v1 routes ──────────────────────────────────────────
-	jwtMW := middleware.JWT(cfg.JWTSecret, cfg.Logger)
+	jwtMW := middleware.JWT(cfg.JWTService, cfg.Logger)
 
 	v1 := r.Group("/api/v1", jwtMW)
 

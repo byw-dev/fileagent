@@ -2,34 +2,25 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
+	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 )
 
 // claimsKey is the Gin context key for the parsed JWT claims.
 const claimsKey = "jwt_claims"
 
-// Claims holds the custom claims stored in every JWT issued by the Control
-// Plane. This struct mirrors system-design.md §5.3.1.
-type Claims struct {
-	jwt.RegisteredClaims
-	OrgID     string `json:"org_id"`
-	Role      string `json:"role"`
-	Username  string `json:"username"`
-	TokenType string `json:"token_type,omitempty"`
-}
-
 // JWT returns a Gin middleware that validates the Bearer JWT token in the
-// Authorization header.  On success the parsed *Claims are stored in the Gin
-// context under claimsKey so downstream handlers can retrieve them via
+// Authorization header. On success the parsed *auth.Claims are stored in the
+// Gin context under claimsKey so downstream handlers can retrieve them via
 // GetClaims(c).
 //
-// The secret parameter is the HMAC-SHA256 signing secret.
-func JWT(secret string, logger *zap.Logger) gin.HandlerFunc {
+// Token revocation is checked against the Redis blacklist via jwtSvc.IsRevoked.
+func JWT(jwtSvc auth.Service, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		raw := c.GetHeader("Authorization")
 		if raw == "" {
@@ -54,14 +45,8 @@ func JWT(secret string, logger *zap.Logger) gin.HandlerFunc {
 			return
 		}
 
-		claims := &Claims{}
-		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (interface{}, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, jwt.ErrSignatureInvalid
-			}
-			return []byte(secret), nil
-		})
-		if err != nil || !token.Valid {
+		claims, err := jwtSvc.ValidateToken(tokenStr)
+		if err != nil {
 			logger.Debug("jwt middleware: invalid token", zap.Error(err))
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"error": errorBody("INVALID_TOKEN", "Token is invalid or expired", nil),
@@ -69,7 +54,19 @@ func JWT(secret string, logger *zap.Logger) gin.HandlerFunc {
 			return
 		}
 
-		// TODO (Phase 2 T2-A1): check jti against Redis blacklist.
+		// Check Redis blacklist — covers logged-out tokens and revoked agents.
+		if claims.ID != "" {
+			revoked, err := jwtSvc.IsRevoked(context.Background(), claims.ID)
+			if err != nil {
+				logger.Warn("jwt middleware: blacklist check error", zap.Error(err))
+				// Fail open on transient Redis errors to avoid locking users out.
+			} else if revoked {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+					"error": errorBody("TOKEN_REVOKED", "Token has been revoked", nil),
+				})
+				return
+			}
+		}
 
 		c.Set(claimsKey, claims)
 		c.Next()
@@ -78,12 +75,12 @@ func JWT(secret string, logger *zap.Logger) gin.HandlerFunc {
 
 // GetClaims retrieves the parsed JWT claims from the Gin context. It returns
 // nil if the JWT middleware has not run or if the claims are not present.
-func GetClaims(c *gin.Context) *Claims {
+func GetClaims(c *gin.Context) *auth.Claims {
 	v, exists := c.Get(claimsKey)
 	if !exists {
 		return nil
 	}
-	claims, _ := v.(*Claims)
+	claims, _ := v.(*auth.Claims)
 	return claims
 }
 

@@ -20,10 +20,15 @@ import (
 // ── Mock EngineStore ──────────────────────────────────────────────────────────
 
 type mockEngineStore struct {
-	rules        []*db.EventRule
-	listErr      error
-	delivery     *db.EventDelivery
-	createDelErr error
+	rules            []*db.EventRule
+	listErr          error
+	delivery         *db.EventDelivery
+	createDelErr     error
+	pendingDeliveries []*db.EventDelivery
+	pendingErr       error
+	updateErr        error
+	ruleByID         *db.EventRule
+	ruleByIDErr      error
 }
 
 func (m *mockEngineStore) ListEnabledEventRules(_ context.Context, _ uuid.UUID, _ db.EventType) ([]*db.EventRule, error) {
@@ -38,6 +43,18 @@ func (m *mockEngineStore) CreateEventDelivery(_ context.Context, _ indexer.Creat
 		return m.delivery, nil
 	}
 	return &db.EventDelivery{ID: uuid.New()}, nil
+}
+
+func (m *mockEngineStore) ListPendingDeliveries(_ context.Context) ([]*db.EventDelivery, error) {
+	return m.pendingDeliveries, m.pendingErr
+}
+
+func (m *mockEngineStore) UpdateDelivery(_ context.Context, _ indexer.UpdateEventDeliveryParams) error {
+	return m.updateErr
+}
+
+func (m *mockEngineStore) GetEventRuleByID(_ context.Context, _ uuid.UUID) (*db.EventRule, error) {
+	return m.ruleByID, m.ruleByIDErr
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
