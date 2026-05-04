@@ -26,7 +26,7 @@ func setupHandlerRouter(t *testing.T) (*httptest.Server, *gin.Engine) {
 
 func TestAgentsHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewAgentsHandler()
+	h := handler.NewAgentsHandler(nil, nil, nil, nil, newTestLogger())
 	r.GET("/agents", h.List)
 	r.GET("/agents/:id", h.Get)
 	r.POST("/agents/:id/approve", h.Approve)

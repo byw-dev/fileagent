@@ -27,6 +27,10 @@ type RouterConfig struct {
 	BucketsDB     handler.BucketsDB
 	EventRulesDB  handler.EventRulesDB
 	UploadLogsDB  handler.UploadLogsDB
+	AgentsDB      handler.AgentsDB
+	AgentMgr      handler.AgentManager
+	Dispatcher    handler.RuleDispatcher
+	Registry      handler.AgentRegistryClient
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -76,7 +80,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Agents
-	agentsH := handler.NewAgentsHandler()
+	agentsH := handler.NewAgentsHandler(cfg.AgentsDB, cfg.AgentMgr, cfg.Dispatcher, cfg.Registry, cfg.Logger)
 	agents := v1.Group("/agents")
 	{
 		agents.GET("", agentsH.List)
