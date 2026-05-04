@@ -68,7 +68,7 @@ func TestAgentsHandler_AllReturn501(t *testing.T) {
 
 func TestFilesHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewFilesHandler()
+	h := handler.NewFilesHandler(nil, nil, newTestLogger())
 	r.GET("/files", h.List)
 	r.GET("/files/:id", h.Get)
 	r.GET("/files/:id/download-url", h.DownloadURL)
@@ -98,7 +98,7 @@ func TestFilesHandler_AllReturn501(t *testing.T) {
 
 func TestFileTypesHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewFileTypesHandler()
+	h := handler.NewFileTypesHandler(nil, newTestLogger())
 	r.GET("/file-types", h.List)
 	r.POST("/file-types", h.Create)
 	r.PUT("/file-types/:id", h.Update)

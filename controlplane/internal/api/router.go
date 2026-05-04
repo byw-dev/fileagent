@@ -20,7 +20,10 @@ type RouterConfig struct {
 	Logger     *zap.Logger
 	JWTService auth.Service   // nil → auth routes return 501 (Phase 1 behaviour)
 	AuthDB     handler.AuthDB // nil → auth routes return 501
-	UsersDB    handler.UsersDB
+	UsersDB     handler.UsersDB
+	FileTypesDB handler.FileTypesDB
+	FilesDB     handler.FilesDB
+	MinIOSigner handler.MinIOPresigner
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -86,8 +89,8 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Files and file types
-	filesH := handler.NewFilesHandler()
-	fileTypesH := handler.NewFileTypesHandler()
+	filesH := handler.NewFilesHandler(cfg.FilesDB, cfg.MinIOSigner, cfg.Logger)
+	fileTypesH := handler.NewFileTypesHandler(cfg.FileTypesDB, cfg.Logger)
 
 	files := v1.Group("/files")
 	{
