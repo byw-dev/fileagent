@@ -533,3 +533,65 @@ func (h *UploadLogsHandler) Get(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, toUploadLogResponse(log))
 }
+
+// ── MinioEventHandler ────────────────────────────────────────────────────────
+
+// MinioEventHandler handles POST /internal/minio-event — the MinIO S3 event
+// webhook endpoint. This serves as an alternate indexing path for file events
+// that arrive directly from MinIO rather than through an agent.
+type MinioEventHandler struct {
+	logger *zap.Logger
+}
+
+// NewMinioEventHandler returns a new MinioEventHandler.
+func NewMinioEventHandler(logger *zap.Logger) *MinioEventHandler {
+	return &MinioEventHandler{logger: logger}
+}
+
+// minioS3Event is the top-level MinIO S3 event notification payload.
+type minioS3Event struct {
+	EventName string              `json:"EventName"`
+	Key       string              `json:"Key"`
+	Records   []minioEventRecord  `json:"Records"`
+}
+
+type minioEventRecord struct {
+	EventName string            `json:"eventName"`
+	S3        minioS3            `json:"s3"`
+}
+
+type minioS3 struct {
+	Bucket minioS3Bucket `json:"bucket"`
+	Object minioS3Object `json:"object"`
+}
+
+type minioS3Bucket struct {
+	Name string `json:"name"`
+}
+
+type minioS3Object struct {
+	Key  string `json:"key"`
+	Size int64  `json:"size"`
+	ETag string `json:"eTag"`
+}
+
+// Handle handles POST /internal/minio-event.
+func (h *MinioEventHandler) Handle(c *gin.Context) {
+	var payload minioS3Event
+	if err := c.ShouldBindJSON(&payload); err != nil {
+		// MinIO may send different payload shapes; accept any JSON and log.
+		h.logger.Warn("minio event: failed to parse payload", zap.Error(err))
+		c.Status(http.StatusOK)
+		return
+	}
+
+	for _, rec := range payload.Records {
+		h.logger.Info("minio event received",
+			zap.String("event", rec.EventName),
+			zap.String("bucket", rec.S3.Bucket.Name),
+			zap.String("key", rec.S3.Object.Key),
+			zap.Int64("size", rec.S3.Object.Size),
+		)
+	}
+	c.Status(http.StatusOK)
+}

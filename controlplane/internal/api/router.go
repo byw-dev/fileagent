@@ -49,7 +49,8 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	})
 
 	// ── Internal MinIO event webhook (no auth, secured by shared secret) ────
-	r.POST("/internal/minio-event", middleware.NotImplemented)
+	minioH := handler.NewMinioEventHandler(cfg.Logger)
+	r.POST("/internal/minio-event", minioH.Handle)
 
 	// ── Auth routes ──────────────────────────────────────────────────────────
 	authH := handler.NewAuthHandler(cfg.JWTService, cfg.AuthDB)

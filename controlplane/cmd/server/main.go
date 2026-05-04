@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"net/url"
+
 	"github.com/byw-dev/fileagent/controlplane/internal/agent"
 	"github.com/byw-dev/fileagent/controlplane/internal/api"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
@@ -21,9 +23,24 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/grpcserver"
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
+	miniogo "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	natsgo "github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
+
+// minioPresigner wraps minio.Client to satisfy handler.MinIOPresigner.
+type minioPresigner struct {
+	client *miniogo.Client
+}
+
+func (m *minioPresigner) PresignedGetObject(ctx context.Context, bucketName, objectName string, expiry time.Duration) (string, error) {
+	u, err := m.client.PresignedGetObject(ctx, bucketName, objectName, expiry, url.Values{})
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
 
 // natsPublisher wraps a NATS connection to satisfy the NATSPublisher interface.
 type natsPublisher struct {
@@ -120,6 +137,15 @@ func main() {
 		logger,
 	)
 
+	// ── Build MinIO client for presigned URLs ────────────────────────────────
+	minioClient, err := miniogo.New(cfg.MinIOEndpoint, &miniogo.Options{
+		Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
+		Secure: cfg.MinIOUseSSL,
+	})
+	if err != nil {
+		logger.Fatal("minio client init failed", zap.Error(err))
+	}
+
 	webhookSender := event.NewWebhookSender(event.NewDBAdapter(database), logger)
 	eventEngine := event.NewEngine(database, webhookSender, logger)
 	eventEngine.Start(ctx, listener)
@@ -137,10 +163,21 @@ func main() {
 
 	// ── Build HTTP router ────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
-		JWTSecret:  cfg.JWTSecret,
-		Logger:     logger,
-		JWTService: authSvc,
-		AuthDB:     handler.NewQueriesAuthDB(queries),
+		JWTSecret:    cfg.JWTSecret,
+		Logger:       logger,
+		JWTService:   authSvc,
+		AuthDB:       handler.NewQueriesAuthDB(queries),
+		UsersDB:      queries,
+		FileTypesDB:  queries,
+		FilesDB:      queries,
+		MinIOSigner:  &minioPresigner{client: minioClient},
+		BucketsDB:    queries,
+		EventRulesDB: queries,
+		UploadLogsDB: queries,
+		AgentsDB:     queries,
+		AgentMgr:     agentMgr,
+		Dispatcher:   dispatcher,
+		Registry:     registry,
 	})
 
 	httpSrv := &http.Server{
