@@ -18,8 +18,9 @@ import (
 type RouterConfig struct {
 	JWTSecret  string
 	Logger     *zap.Logger
-	JWTService auth.Service    // nil → auth routes return 501 (Phase 1 behaviour)
-	AuthDB     handler.AuthDB  // nil → auth routes return 501
+	JWTService auth.Service   // nil → auth routes return 501 (Phase 1 behaviour)
+	AuthDB     handler.AuthDB // nil → auth routes return 501
+	UsersDB    handler.UsersDB
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -57,7 +58,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	v1 := r.Group("/api/v1", jwtMW)
 
 	// Users (super_admin only)
-	usersH := handler.NewUsersHandler()
+	usersH := handler.NewUsersHandler(cfg.UsersDB, cfg.Logger)
 	superAdmin := middleware.RequireRole("super_admin")
 	users := v1.Group("/users")
 	{

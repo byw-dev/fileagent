@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	_ "go.uber.org/zap" // indirect — newTestLogger defined in users_test.go
 )
 
 func init() {
@@ -211,7 +212,7 @@ func TestUploadLogsHandler_AllReturn501(t *testing.T) {
 
 func TestUsersHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewUsersHandler()
+	h := handler.NewUsersHandler(nil, newTestLogger()) // nil db → 501 for all methods
 	r.GET("/users", h.List)
 	r.POST("/users", h.Create)
 	r.PUT("/users/:id", h.Update)
