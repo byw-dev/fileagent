@@ -1,6 +1,6 @@
 # TASK_LIST.md — FileAgent 任务清单
 
-> 当前阶段：**Phase 2 遗留扫除**（T2-X1~X8 需在进入 Phase 3 前完成，详见 [docs/PHASE2_REMEDIATION.md](docs/PHASE2_REMEDIATION.md)）
+> 当前阶段：**Phase 2 遗留扫除**（T2-X1~X8 需在进入 Phase 3 前完成，详见下方 **T2-X 遗留工作详细规格**）
 > 状态说明：⬜ 未开始 / 🔄 进行中 / ✅ 已完成 / ❌ 阻塞
 
 ---
@@ -164,18 +164,156 @@ Phase 4  完善与收尾（可并行）
 ### 集成测试前遗留工作扫除（必须在进入 Phase 3 之前完成）
 
 > 代码审计（2026-05-03）发现 Phase 2 存在大量"包逻辑写完即打 ✅、但组装层/REST Handler/WebUI 页面从未实现"的遗留问题。
-> 完整缺陷列表、根本原因分析和修复优先级见：**[docs/PHASE2_REMEDIATION.md](../docs/PHASE2_REMEDIATION.md)**
+> 根本原因和各任务实现规格见下方 **T2-X 遗留工作详细规格**。
 
 | 任务 | 内容摘要 | 状态 |
 |------|---------|------|
 | T2-X1 DB 查询层补全 | file_entries/upload_logs/file_types/buckets/event_rules/event_deliveries/users 读写查询 | ✅ |
 | T2-X2 Controlplane 组件接线 | RefreshCredentials RPC、Indexer 接入 handleUploadResult、Dispatcher 接入 Connect、Event Engine Start+NATS 订阅+Retry Worker、JWT 中间件黑名单检查 | ✅ |
-| T2-X3 离线规则暂存 | DispatchRule 离线时持久化暂存，重连后补发（T2-A6 遗漏） | ⬜ |
+| T2-X3 离线规则暂存 | DispatchRule 离线时持久化暂存，重连后补发（T2-A6 遗漏） | ✅（已归并至 T2-X2：SyncRulesOnConnect 从 DB 全量补发，无需独立暂存队列） |
 | T2-X4 REST Handler 实现 | AgentsHandler(10) / FilesHandler(4) / FileTypesHandler(4) / BucketsHandler(2) / EventRulesHandler(5) / UploadLogsHandler(2) / UsersHandler(5) / minio-event(1) 共 33 个端点 | ⬜ |
 | T2-X5 Agent main.go 组装 | 将 watcher/scheduler/executor/uploader/grpcclient 组装为可运行 Agent 进程 | ⬜ |
 | T2-X6 Agent RefreshCredentials 调用 | grpcclient 添加 RefreshCredentials；后台定时刷新 STS 凭据 | ⬜ |
 | T2-X7 Web UI 未实现页面 | FileTypes/Events/Buckets/AgentRules/AgentLogs/Logs/Files·Detail/Settings·Users/Settings·Profile 共 13 个 placeholder 页面 | ⬜ |
 | T2-X8 集成测试补建 | STS 集成测试（controlplane）+ Upload Engine 集成测试（agent）| ⬜ |
+
+---
+
+### T2-X 遗留工作详细规格
+
+#### 根本原因分析
+
+| 类型 | 描述 |
+|------|------|
+| **验收点过粗** | Task 的验收点只写"包要实现"，没有写"组件要接入 server/binary"，执行时把包逻辑写完就打 ✅ |
+| **任务拆分遗漏** | REST handler 实现、controlplane 组装、agent main.go 组装、多个 WebUI 页面均无对应任务编号 |
+| **测试声称但未建** | T2-A5 / T2-B4 写了"集成测试"验收点，但实际无 `-tags=integration` 文件 |
+
+#### T2-X4 REST Handler 实现规格（33 端点）
+
+> 目标目录：`controlplane/internal/api/handler/`，所有 Handler 当前均为 `middleware.NotImplemented(c)` 占位
+
+**AgentsHandler（`handler/agents.go`，10 端点）**
+
+| 端点 | 关键依赖 |
+|------|---------|
+| GET `/api/v1/agents` | DB: `ListAgents`（已有） |
+| GET `/api/v1/agents/:id` | DB: `GetAgentByID`（已有） |
+| POST `/api/v1/agents/:id/approve` | `agentMgr.Approve`（已有） |
+| POST `/api/v1/agents/:id/revoke` | `agentMgr.Revoke`（已有） |
+| POST `/api/v1/agents/:id/list-dir` | gRPC 向在线 agent 发 ListDir 命令 |
+| GET `/api/v1/agents/:id/rules` | DB: `ListCollectionRulesByAgent`（已有） |
+| POST `/api/v1/agents/:id/rules` | DB: `CreateCollectionRule`（已有）→ `dispatcher.DispatchRule` |
+| PUT `/api/v1/agents/:id/rules/:rid` | DB: `UpdateCollectionRuleStatus` + `dispatcher.DispatchRule` |
+| DELETE `/api/v1/agents/:id/rules/:rid` | DB: `DeleteCollectionRule`（已有）→ `dispatcher.DispatchRuleCancel` |
+| GET `/api/v1/agents/:id/upload-logs` | DB: `ListUploadLogs`（T2-X1 DB-2） |
+
+**FilesHandler（`handler/files.go`，4 端点）**
+
+| 端点 | 关键依赖 |
+|------|---------|
+| GET `/api/v1/files` | DB: `ListFileEntries`（T2-X1 DB-1） |
+| GET `/api/v1/files/:id` | DB: `GetFileEntryByID`（T2-X1 DB-1） |
+| GET `/api/v1/files/:id/download-url` | MinIO presigned URL（5 min 有效期） |
+| POST `/api/v1/files/batch-download-urls` | MinIO 批量 presigned |
+
+**FileTypesHandler（`handler/file_types.go`，4 端点）**
+
+| 端点 | 关键依赖 |
+|------|---------|
+| GET `/api/v1/file-types` | DB: `ListFileTypes`（T2-X1 DB-3） |
+| POST `/api/v1/file-types` | DB: `CreateFileType`（T2-X1 DB-3） |
+| PUT `/api/v1/file-types/:id` | DB: `UpdateFileType`（T2-X1 DB-3） |
+| DELETE `/api/v1/file-types/:id` | DB: `DeleteFileType`（T2-X1 DB-3） |
+
+**BucketsHandler（`handler/events.go`，2 端点）**
+
+| 端点 | 关键依赖 |
+|------|---------|
+| GET `/api/v1/buckets` | DB: `ListBuckets`（T2-X1 DB-4） |
+| POST `/api/v1/buckets` | DB: `CreateBucket`（T2-X1 DB-4）+ MinIO Admin API 创建 bucket |
+
+**EventRulesHandler（`handler/events.go`，5 端点）**
+
+| 端点 | 关键依赖 |
+|------|---------|
+| GET `/api/v1/event-rules` | DB: `ListEventRules`（T2-X1 DB-5） |
+| POST `/api/v1/event-rules` | DB: `CreateEventRule`（T2-X1 DB-5） |
+| PUT `/api/v1/event-rules/:id` | DB: `UpdateEventRule`（T2-X1 DB-5） |
+| DELETE `/api/v1/event-rules/:id` | DB: `DeleteEventRule`（T2-X1 DB-5） |
+| GET `/api/v1/event-rules/:id/deliveries` | DB: `ListDeliveriesByRule`（T2-X1 DB-6） |
+
+**UploadLogsHandler（`handler/events.go`，2 端点）**
+
+| 端点 | 关键依赖 |
+|------|---------|
+| GET `/api/v1/upload-logs` | DB: `ListUploadLogs`（T2-X1 DB-2） |
+| GET `/api/v1/upload-logs/:id` | DB: `GetUploadLogByID`（T2-X1 DB-2） |
+
+**UsersHandler（`handler/users.go`，5 端点）**
+
+| 端点 | 关键依赖 |
+|------|---------|
+| GET `/api/v1/users` | DB: `ListUsers`（已有） |
+| POST `/api/v1/users` | DB: `CreateUser`（已有）；密码 bcrypt hash |
+| PUT `/api/v1/users/:id` | DB: `UpdateUser`（T2-X1 DB-7） |
+| DELETE `/api/v1/users/:id` | DB: `DeleteUser`（T2-X1 DB-7） |
+| POST `/api/v1/users/:id/password` | DB: `UpdateUserPassword`（已有） |
+
+**MinIO Event Webhook（`handler/events.go`，1 端点）**
+
+| 端点 | 关键依赖 |
+|------|---------|
+| POST `/internal/minio-event` | 解析 MinIO Webhook 事件 → 调用 `ix.IndexUpload`（备选链路） |
+
+#### T2-X5 Agent main.go 组装规格（`agent/cmd/agent/main.go`）
+
+当前文件仅 `fmt.Println("fileagent agent")`，需实现 10 步完整进程组装：
+
+1. `config.Load()` — 加载配置
+2. 初始化 zap logger
+3. `queue.New()` — SQLite 队列
+4. `credential.NewTokenManager()` + `STSManager` — 凭据管理
+5. `grpcclient.New()` — gRPC 客户端（TLS + 指数退避）
+6. `Lifecycle.Run()` — 注册审批生命周期，阻塞直到 APPROVED
+7. `executor.New()` + `Start()` — Worker Pool（3 个）
+8. 启动 gRPC `Connect` 流，处理 `ServerMessage`（PushRule → Watcher/Scheduler；RevokeME → 清除 Token；ListDir → 响应）
+9. 后台 STS 刷新 goroutine（距到期 10 min 调用 T2-X6）
+10. `signal.NotifyContext(SIGINT/SIGTERM)` 优雅退出
+
+#### T2-X6 Agent RefreshCredentials 规格（`agent/internal/grpcclient/client.go`）
+
+在已有 `Connect()` / `SendHeartbeat()` 的 `Client` 中添加：
+
+```go
+// RefreshCredentials calls the Control Plane to obtain fresh STS credentials.
+func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPayload, error)
+```
+
+#### T2-X7 Web UI 未实现页面规格（`webui/src/pages/`）
+
+| 编号 | 文件 | 所需功能摘要 |
+|------|------|------------|
+| UI-1 | `FileTypes/index.tsx` | ProTable 列表 + 创建入口（GET /api/v1/file-types） |
+| UI-2 | `FileTypes/Create.tsx` | 表单（name / glob_patterns / description）+ 提交 |
+| UI-3 | `FileTypes/Detail.tsx` | 详情展示 + 编辑 + 删除 |
+| UI-4 | `Events/index.tsx` | ProTable 事件规则列表 |
+| UI-5 | `Events/Create.tsx` | 表单（event_type / webhook_url / 过滤条件） |
+| UI-6 | `Events/Deliveries.tsx` | 按规则查询投递记录（GET /api/v1/event-rules/:id/deliveries） |
+| UI-7 | `Buckets/index.tsx` | Bucket 列表 + super_admin 创建 |
+| UI-8 | `Agents/Rules.tsx` | 采集器规则子页，ProTable + 创建/编辑/删除 |
+| UI-9 | `Agents/Logs.tsx` | 采集器上传日志子页（GET /api/v1/agents/:id/upload-logs） |
+| UI-10 | `Logs/index.tsx` | 全局上传日志（GET /api/v1/upload-logs） |
+| UI-11 | `Files/Detail.tsx` | 文件元数据详情 + 预签名下载链接 |
+| UI-12 | `Settings/Users.tsx` | 用户列表 + 创建/编辑/删除/改密 |
+| UI-13 | `Settings/Profile.tsx` | 当前用户信息展示 + 改密 |
+
+#### T2-X8 集成测试补建规格
+
+| 编号 | 文件 | Build Tag | 测试内容 |
+|------|------|-----------|---------|
+| IT-1 | `controlplane/internal/storage/sts_integration_test.go` | `//go:build integration` | 连接 `deploy/docker-compose.test.yml` MinIO，验证 `IssueCredentials` 返回可用凭据，STS AssumeRole 能实际读写 bucket |
+| IT-2 | `agent/internal/uploader/uploader_integration_test.go` | `//go:build integration` | 连接真实 MinIO，验证单次上传（<5 MB）和分片上传（>5 MB）均成功，SHA-256 校验一致，断点续传能续传 |
 
 ---
 
@@ -217,7 +355,7 @@ Phase 4  完善与收尾（可并行）
 | Phase 0 | 5 | 5 | 100% |
 | Phase 1 | 15 | 15 | 100% |
 | Phase 2 核心 | 20 | 20 | 100%（含组件包逻辑）|
-| Phase 2 遗留（T2-X） | 8 | 0 | 0%（见 PHASE2_REMEDIATION.md）|
+| Phase 2 遗留（T2-X） | 8 | 3（X1/X2/X3） | 38% |
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
 | **合计** | **55** | **40** | **73%** |
