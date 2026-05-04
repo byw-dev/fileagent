@@ -128,7 +128,7 @@ func TestFileTypesHandler_AllReturn501(t *testing.T) {
 
 func TestBucketsHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewBucketsHandler()
+	h := handler.NewBucketsHandler(nil, newTestLogger())
 	r.GET("/buckets", h.List)
 	r.POST("/buckets", h.Create)
 
@@ -154,7 +154,7 @@ func TestBucketsHandler_AllReturn501(t *testing.T) {
 
 func TestEventRulesHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewEventRulesHandler()
+	h := handler.NewEventRulesHandler(nil, newTestLogger())
 	r.GET("/event-rules", h.List)
 	r.POST("/event-rules", h.Create)
 	r.PUT("/event-rules/:id", h.Update)
@@ -186,7 +186,7 @@ func TestEventRulesHandler_AllReturn501(t *testing.T) {
 
 func TestUploadLogsHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewUploadLogsHandler()
+	h := handler.NewUploadLogsHandler(nil, newTestLogger())
 	r.GET("/upload-logs", h.List)
 	r.GET("/upload-logs/:id", h.Get)
 

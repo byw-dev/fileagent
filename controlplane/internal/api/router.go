@@ -22,8 +22,11 @@ type RouterConfig struct {
 	AuthDB     handler.AuthDB // nil → auth routes return 501
 	UsersDB     handler.UsersDB
 	FileTypesDB handler.FileTypesDB
-	FilesDB     handler.FilesDB
-	MinIOSigner handler.MinIOPresigner
+	FilesDB       handler.FilesDB
+	MinIOSigner   handler.MinIOPresigner
+	BucketsDB     handler.BucketsDB
+	EventRulesDB  handler.EventRulesDB
+	UploadLogsDB  handler.UploadLogsDB
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -109,7 +112,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Buckets
-	bucketsH := handler.NewBucketsHandler()
+	bucketsH := handler.NewBucketsHandler(cfg.BucketsDB, cfg.Logger)
 	buckets := v1.Group("/buckets")
 	{
 		buckets.GET("", bucketsH.List)
@@ -117,7 +120,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Event rules
-	eventRulesH := handler.NewEventRulesHandler()
+	eventRulesH := handler.NewEventRulesHandler(cfg.EventRulesDB, cfg.Logger)
 	eventRules := v1.Group("/event-rules")
 	{
 		eventRules.GET("", eventRulesH.List)
@@ -128,7 +131,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Upload logs
-	uploadLogsH := handler.NewUploadLogsHandler()
+	uploadLogsH := handler.NewUploadLogsHandler(cfg.UploadLogsDB, cfg.Logger)
 	uploadLogs := v1.Group("/upload-logs")
 	{
 		uploadLogs.GET("", uploadLogsH.List)
