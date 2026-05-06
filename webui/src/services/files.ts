@@ -62,7 +62,7 @@ export async function getFile(id: string): Promise<FileEntry> {
  */
 export async function getFileDownloadUrl(id: string): Promise<{ url: string }> {
   const response = await apiClient.get<{ url: string }>(
-    `/api/v1/files/${id}/download`
+    `/api/v1/files/${id}/download-url`
   )
   return response.data
 }

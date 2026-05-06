@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"net/url"
+
 	"github.com/byw-dev/fileagent/controlplane/internal/agent"
 	"github.com/byw-dev/fileagent/controlplane/internal/api"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
@@ -21,9 +23,24 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/grpcserver"
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
+	miniogo "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	natsgo "github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
+
+// minioPresigner wraps minio.Client to satisfy handler.MinIOPresigner.
+type minioPresigner struct {
+	client *miniogo.Client
+}
+
+func (m *minioPresigner) PresignedGetObject(ctx context.Context, bucketName, objectName string, expiry time.Duration) (string, error) {
+	u, err := m.client.PresignedGetObject(ctx, bucketName, objectName, expiry, url.Values{})
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
 
 // natsPublisher wraps a NATS connection to satisfy the NATSPublisher interface.
 type natsPublisher struct {
@@ -32,6 +49,21 @@ type natsPublisher struct {
 
 func (n *natsPublisher) Publish(subject string, data []byte) error {
 	return n.conn.Publish(subject, data)
+}
+
+// natsListener wraps a NATS connection to satisfy the event.NATSListener interface.
+type natsListener struct {
+	conn *natsgo.Conn
+}
+
+func (n *natsListener) Subscribe(subject string, cb func(data []byte)) (func(), error) {
+	sub, err := n.conn.Subscribe(subject, func(msg *natsgo.Msg) {
+		cb(msg.Data)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return func() { _ = sub.Unsubscribe() }, nil
 }
 
 func main() {
@@ -60,7 +92,9 @@ func main() {
 	}
 
 	// ── Connect to database ──────────────────────────────────────────────────
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	database, err := db.Open(ctx, cfg.DatabaseURL, logger)
 	if err != nil {
 		logger.Fatal("database connection failed", zap.Error(err))
@@ -81,6 +115,7 @@ func main() {
 	}
 	defer natsConn.Close()
 	nats := &natsPublisher{conn: natsConn}
+	listener := &natsListener{conn: natsConn}
 
 	// ── Build core services ──────────────────────────────────────────────────
 	authSvc := auth.New(cfg.JWTSecret, redisClient)
@@ -90,10 +125,8 @@ func main() {
 
 	registry := grpcserver.NewAgentRegistry()
 	dispatcher := agent.NewDispatcher(queries, redisClient, registry, logger)
-	_ = dispatcher // used on connect via gRPC server; available for future use
 
 	ix := indexer.NewIndexer(database, nats, logger)
-	_ = ix // indexer receives UploadResult via gRPC server
 
 	stsMgr := storage.NewSTSManager(
 		cfg.MinIOEndpoint,
@@ -103,15 +136,24 @@ func main() {
 		cfg.MinIOUseSSL,
 		logger,
 	)
-	_ = stsMgr
+
+	// ── Build MinIO client for presigned URLs ────────────────────────────────
+	minioClient, err := miniogo.New(cfg.MinIOEndpoint, &miniogo.Options{
+		Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
+		Secure: cfg.MinIOUseSSL,
+	})
+	if err != nil {
+		logger.Fatal("minio client init failed", zap.Error(err))
+	}
 
 	webhookSender := event.NewWebhookSender(event.NewDBAdapter(database), logger)
 	eventEngine := event.NewEngine(database, webhookSender, logger)
-	_ = eventEngine
+	eventEngine.Start(ctx, listener)
 
 	// ── Start gRPC server (background goroutine) ─────────────────────────────
 	grpcSrv := grpcserver.New(logger)
 	grpcSrv.WithDeps(registry, redisClient, authSvc, nats, agentMgr)
+	grpcSrv.WithExtraDeps(dispatcher, ix, stsMgr, queries)
 	go func() {
 		if err := grpcSrv.Run(cfg.GRPCPort); err != nil {
 			logger.Fatal("gRPC server error", zap.Error(err))
@@ -121,10 +163,21 @@ func main() {
 
 	// ── Build HTTP router ────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
-		JWTSecret:  cfg.JWTSecret,
-		Logger:     logger,
-		JWTService: authSvc,
-		AuthDB:     handler.NewQueriesAuthDB(queries),
+		JWTSecret:    cfg.JWTSecret,
+		Logger:       logger,
+		JWTService:   authSvc,
+		AuthDB:       handler.NewQueriesAuthDB(queries),
+		UsersDB:      queries,
+		FileTypesDB:  queries,
+		FilesDB:      queries,
+		MinIOSigner:  &minioPresigner{client: minioClient},
+		BucketsDB:    queries,
+		EventRulesDB: queries,
+		UploadLogsDB: queries,
+		AgentsDB:     queries,
+		AgentMgr:     agentMgr,
+		Dispatcher:   dispatcher,
+		Registry:     registry,
 	})
 
 	httpSrv := &http.Server{
@@ -136,9 +189,6 @@ func main() {
 	}
 
 	// ── Graceful shutdown ────────────────────────────────────────────────────
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
 		logger.Info("HTTP server starting", zap.Int("port", cfg.HTTPPort))
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -146,7 +196,7 @@ func main() {
 		}
 	}()
 
-	<-quit
+	<-ctx.Done()
 	logger.Info("shutdown signal received, stopping…")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -173,4 +223,3 @@ func buildLogger(level string) (*zap.Logger, error) {
 	cfg.Level = atomicLevel
 	return cfg.Build()
 }
-

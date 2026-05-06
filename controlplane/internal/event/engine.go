@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
@@ -18,12 +19,22 @@ type WebhookActionConfig struct {
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
+// NATSListener is the minimal NATS interface needed to subscribe to event subjects.
+type NATSListener interface {
+	// Subscribe registers a callback for messages on subject. The returned
+	// cancel func unsubscribes when called.
+	Subscribe(subject string, cb func(data []byte)) (cancel func(), err error)
+}
+
 // EngineStore is the minimal database interface used by the Engine. Using an
 // interface (rather than db.DBTX directly) makes the Engine unit-testable
 // without a real database.
 type EngineStore interface {
 	ListEnabledEventRules(ctx context.Context, orgID uuid.UUID, eventType db.EventType) ([]*db.EventRule, error)
 	CreateEventDelivery(ctx context.Context, params indexer.CreateEventDeliveryParams) (*db.EventDelivery, error)
+	ListPendingDeliveries(ctx context.Context) ([]*db.EventDelivery, error)
+	UpdateDelivery(ctx context.Context, params indexer.UpdateEventDeliveryParams) error
+	GetEventRuleByID(ctx context.Context, id uuid.UUID) (*db.EventRule, error)
 }
 
 // dbtxEngineStore adapts db.DBTX to the EngineStore interface.
@@ -39,6 +50,22 @@ func (d *dbtxEngineStore) ListEnabledEventRules(ctx context.Context, orgID uuid.
 // CreateEventDelivery delegates to the indexer package function.
 func (d *dbtxEngineStore) CreateEventDelivery(ctx context.Context, params indexer.CreateEventDeliveryParams) (*db.EventDelivery, error) {
 	return indexer.CreateEventDelivery(ctx, d.dbtx, params)
+}
+
+// ListPendingDeliveries returns deliveries due for retry.
+func (d *dbtxEngineStore) ListPendingDeliveries(ctx context.Context) ([]*db.EventDelivery, error) {
+	return indexer.ListPendingEventDeliveries(ctx, d.dbtx)
+}
+
+// UpdateDelivery updates a delivery's status and retry metadata.
+func (d *dbtxEngineStore) UpdateDelivery(ctx context.Context, params indexer.UpdateEventDeliveryParams) error {
+	return indexer.UpdateEventDelivery(ctx, d.dbtx, params)
+}
+
+// GetEventRuleByID looks up an event rule by its ID.
+func (d *dbtxEngineStore) GetEventRuleByID(ctx context.Context, id uuid.UUID) (*db.EventRule, error) {
+	q := db.New(d.dbtx)
+	return q.GetEventRuleByID(ctx, id)
 }
 
 // Engine routes inbound NATS events to the appropriate rules and creates
@@ -63,6 +90,150 @@ func NewEngine(dbtx db.DBTX, sender *WebhookSender, logger *zap.Logger) *Engine 
 // constructor is intended for unit tests where the DB layer is mocked.
 func NewEngineWithStore(store EngineStore, sender *WebhookSender, logger *zap.Logger) *Engine {
 	return &Engine{store: store, sender: sender, logger: logger}
+}
+
+// Start subscribes to relevant NATS subjects and launches the retry worker.
+// It returns immediately; all processing happens in background goroutines.
+// Call-site is responsible for cancelling ctx to stop all goroutines.
+func (e *Engine) Start(ctx context.Context, nats NATSListener) {
+	type sub struct {
+		subject   string
+		eventType db.EventType
+	}
+	subscriptions := []sub{
+		{"events.file.uploaded", db.EventTypeFileUploaded},
+		{"events.file.deleted", db.EventTypeFileDeleted},
+		{"events.agent.online", db.EventTypeAgentOnline},
+		{"events.agent.offline", db.EventTypeAgentOffline},
+		{"events.agent.approved", db.EventTypeAgentApproved},
+		{"events.agent.revoked", db.EventTypeAgentRevoked},
+	}
+
+	for _, s := range subscriptions {
+		s := s // capture loop variable
+		cancel, err := nats.Subscribe(s.subject, func(data []byte) {
+			e.handleNATSMessage(ctx, s.subject, s.eventType, data)
+		})
+		if err != nil {
+			e.logger.Error("engine: NATS subscribe failed",
+				zap.String("subject", s.subject),
+				zap.Error(err),
+			)
+			continue
+		}
+		// Unsubscribe when the context is cancelled.
+		go func() {
+			<-ctx.Done()
+			cancel()
+		}()
+	}
+
+	go e.retryWorker(ctx)
+	e.logger.Info("event engine started")
+}
+
+// handleNATSMessage processes an inbound NATS message for the given event type.
+func (e *Engine) handleNATSMessage(ctx context.Context, subject string, eventType db.EventType, data []byte) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		e.logger.Error("engine: unmarshal NATS message",
+			zap.String("subject", subject),
+			zap.Error(err),
+		)
+		return
+	}
+
+	// Phase 1 is single-org; use the default org ID.
+	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+
+	if err := e.HandleEvent(ctx, orgID, eventType, payload); err != nil {
+		e.logger.Error("engine: handle event",
+			zap.String("subject", subject),
+			zap.Error(err),
+		)
+	}
+}
+
+// retryWorker periodically retries pending/failed event deliveries.
+func (e *Engine) retryWorker(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.processRetries(ctx)
+		}
+	}
+}
+
+func (e *Engine) processRetries(ctx context.Context) {
+	deliveries, err := e.store.ListPendingDeliveries(ctx)
+	if err != nil {
+		e.logger.Error("engine: list pending deliveries", zap.Error(err))
+		return
+	}
+	for _, d := range deliveries {
+		if err := e.retryDelivery(ctx, d); err != nil {
+			e.logger.Warn("engine: retry delivery failed",
+				zap.String("delivery_id", d.ID.String()),
+				zap.Error(err),
+			)
+		}
+	}
+}
+
+func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
+	rule, err := e.store.GetEventRuleByID(ctx, d.EventRuleID)
+	if err != nil {
+		return fmt.Errorf("retry: get rule %s: %w", d.EventRuleID, err)
+	}
+	if rule.ActionType != db.ActionTypeWebhook {
+		return nil
+	}
+
+	var cfg WebhookActionConfig
+	if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
+		return fmt.Errorf("retry: parse webhook config: %w", err)
+	}
+
+	rec := DeliveryRecord{
+		ID:        d.ID.String(),
+		URL:       cfg.URL,
+		Payload:   d.Payload,
+		AttemptNo: int(d.AttemptCount),
+	}
+
+	newAttemptCount := d.AttemptCount + 1
+	sendErr := e.sender.Send(ctx, rec)
+
+	var newStatus string
+	var respCode sql.NullInt32
+	var deliveredAt sql.NullTime
+	var nextRetryAt sql.NullTime
+
+	if sendErr != nil {
+		newStatus = "failed"
+		// Exponential backoff: 30s * 2^(attemptCount-1), capped at 1h.
+		backoff := time.Duration(30<<uint(newAttemptCount-1)) * time.Second
+		if backoff > time.Hour {
+			backoff = time.Hour
+		}
+		nextRetryAt = sql.NullTime{Time: time.Now().Add(backoff), Valid: true}
+	} else {
+		newStatus = "delivered"
+		deliveredAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+	}
+
+	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
+		ID:           d.ID,
+		Status:       newStatus,
+		ResponseCode: respCode,
+		AttemptCount: newAttemptCount,
+		NextRetryAt:  nextRetryAt,
+		DeliveredAt:  deliveredAt,
+	})
 }
 
 // HandleEvent processes an event of the given type for an organisation, looks up
