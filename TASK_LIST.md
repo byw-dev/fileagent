@@ -179,69 +179,282 @@ Phase 4  完善与收尾（可并行）
 
 ---
 
-### Phase 2 完成验证：进入 Phase 3 前的质量关卡（代码审计 2026-05-06）
+### Phase 2 完成验证：进入 Phase 3 前的质量关卡（审计 2026-05-06，修订 2026-05-06）
 
-> 代码审计（2026-05-06）发现 T2-X 全部完成后，仍有以下质量问题需修复。
-> 这些任务未对应任何 T2-X 编号，故单独列出。所有项目均须完成才能进入 Phase 3。
+> T2-X 全部完成后，代码审计发现以下问题。分为两类：
+> **功能缺口**（会直接导致集成测试失败）和**测试质量**（覆盖率不达标）。
+> **所有 P3-P 任务须完成后方可进入 Phase 3**，详见 `docs/reports/phase3-readiness-audit.md`。
 
-| 任务 | 内容摘要 | 优先级 | 状态 |
-|------|---------|--------|------|
-| P3-P1 DB 集成测试环境修复 | `fileagent_test` 数据库不存在，`go test -tags=integration ./internal/db/` 中 3 个测试失败 | 阻塞 | ⬜ |
-| P3-P2 grpcclient 覆盖率补全 | 当前 61.5%（要求≥80%）；T2-X6 新增的 `SetToken/SetAgentID/SetMessageHandler/SendMessage/ServiceClient/RefreshCredentials` 和 `buildDialOpts` 均在 0% | 阻塞 | ⬜ |
-| P3-P3 event 包覆盖率补全 | 当前 62.7%（要求≥80%）；`processRetries/retryDelivery/DBAdapter` 接口方法和 `NewEngine` 均在 0% | 阻塞 | ⬜ |
-| P3-P4 REST handler 覆盖率补全 | `files.DownloadURL` 47.6%、`events.Delete` 58.3%、`agents.DeleteRule` 62.5%、`MinioEventHandler.Handle` 0%、`authdb` 全部 0%；多个 handler 在 60-75% 区间 | 高 | ⬜ |
-| P3-P5 queue 包覆盖率补全 | 当前 79.5%（要求≥80%）；`Open` 函数 62.5%（模式匹配 WAL 参数路径未测） | 中 | ⬜ |
+#### 汇总表
 
-#### P3-P1 详细规格：DB 集成测试环境
+| 任务 | 内容摘要 | 类型 | 优先级 | 状态 |
+|------|---------|------|--------|------|
+| P3-P1 DB 集成测试环境修复 | `fileagent_test` DB 不存在，3 个集成测试常态失败 | 测试环境 | 🔴 阻塞 | ⬜ |
+| P3-P2 DownloadURL bucket 名 Bug 修复 | `DownloadURL`/`BatchDownloadURLs` 用 UUID 而非 bucket 名调用 MinIO；TTL 5min → 15min | 🔴 功能 Bug | 🔴 阻塞 | ⬜ |
+| P3-P3 BucketsCreate 调用 MinIO Admin API | `POST /api/v1/buckets` 缺少 `madmin.MakeBucket()` 调用，MinIO 中无物理 Bucket | 🔴 功能缺口 | 🔴 阻塞 | ⬜ |
+| P3-P4 append_mode tail/close_wait 实现 | watcher/executor 均未处理 `tail`（offset 增量上传）和 `close_wait`（CLOSE_WRITE 触发）逻辑 | 🔴 功能缺口 | 🔴 阻塞 | ⬜ |
+| P3-P5 grpcclient 覆盖率补全 | 当前 61.5%（要求≥80%）；T2-X6 全部新增方法均在 0% | 测试覆盖 | 🔴 阻塞 | ⬜ |
+| P3-P6 event 包覆盖率补全 | 当前 62.7%（要求≥80%）；`processRetries/retryDelivery/DBAdapter/NewEngine` 均在 0% | 测试覆盖 | 🔴 阻塞 | ⬜ |
+| P3-P7 事件重试逻辑对齐设计 §5.9 | 退避表错误（30s×2^n 而非 30s→2min→10min→30min→2h）；无最多5次限制；上限1h非2h | 🟡 设计偏差 | 🟡 高 | ⬜ |
+| P3-P8 MinioEventHandler 调用 Indexer | `Handle` 只打日志，未调用 Indexer，MinIO Webhook 备用采集链路失效 | 🟡 功能缺口 | 🟡 高 | ⬜ |
+| P3-P9 REST handler 覆盖率补全 | `DownloadURL` 47.6%、`events.Delete` 58.3%、`MinioEventHandler.Handle` 0%、`authdb` 全部 0% | 测试覆盖 | 🟡 高 | ⬜ |
+| P3-P10 queue 包覆盖率补全 | 当前 79.5%（要求≥80%）；`Open` 错误路径 62.5% | 测试覆盖 | 🟢 中 | ⬜ |
 
-问题根因：`db_integration_test.go` 连接 `fileagent_test` 数据库，但 `docker-compose.test.yml`
-的 PostgreSQL 实例未创建该数据库。
+---
 
-修复方案（二选一）：
-- **方案 A（推荐）**：在 `docker-compose.test.yml` 的 postgres service 中添加环境变量
-  `POSTGRES_DB: fileagent_test`，并在 CI 中加入 `migrate up` 步骤。
-- **方案 B**：在 `db_integration_test.go` 的 `TestMain` 中自动创建数据库（连接 `postgres`
-  默认库后执行 `CREATE DATABASE fileagent_test`）。
+#### P3-P1 详细规格：DB 集成测试环境修复
 
-#### P3-P2 详细规格：grpcclient 单元测试补建
+**问题根因**：`db_integration_test.go` 默认连接 `fileagent_test` 数据库：
+```go
+dsn = "postgres://fileagent:fileagent@localhost:5432/fileagent_test?sslmode=disable"
+```
+但 `deploy/docker-compose.test.yml` 的 postgres service 设置 `POSTGRES_DB: fileagent`（非 `fileagent_test`），导致 3 个集成测试 `TestNew_ConnectsSuccessfully`、`TestMigrate_IdempotentOnCleanDB`、`TestQueriesRoundtrip_Agent` 常态失败。
 
-需在 `agent/internal/grpcclient/client_test.go` 中新增以下测试：
+**修复方案（单行变更）**：修改 `deploy/docker-compose.test.yml`：
+```yaml
+# 将 POSTGRES_DB: fileagent 改为：
+POSTGRES_DB: fileagent_test
+```
+修改后重建容器（`docker compose -f deploy/docker-compose.test.yml up -d --force-recreate`），
+然后对测试 DB 执行迁移：`migrate -database "postgres://fileagent:fileagent@localhost:5432/fileagent_test?sslmode=disable" -path ./migrations up`
 
-| 函数 | 当前覆盖率 | 测试内容 |
-|------|-----------|---------|
-| `SetToken` | 0% | 设置后通过 `SendHeartbeat` 或 mock 验证 token 被附加到出站 metadata |
-| `SetAgentID` | 0% | 设置后通过 `RefreshCredentials` mock 验证 agentID 出现在请求中 |
-| `SetMessageHandler` | 0% | 设置 handler 后 mock server 发送消息，验证 handler 被调用 |
-| `SendMessage` | 0% | 有 stream 时成功发送；无 stream 时返回错误 |
-| `ServiceClient` | 0% | Connect 前返回 nil；Connect 后返回非 nil |
-| `RefreshCredentials` | 0% | 使用 mock gRPC server 验证返回 CredentialsPayload；svc==nil 时返回错误 |
-| `buildDialOpts` | 0% | UseSSL=false 时返回 insecure option；UseSSL=true 时返回 TLS option |
+---
 
-#### P3-P3 详细规格：event 包覆盖率补建
+#### P3-P2 详细规格：DownloadURL bucket 名 Bug + TTL 修复
 
-需调查 `engine_extra_test.go` / `engine_start_test.go` 为何未覆盖以下函数：
+**Bug 1（致命）**：`handler/files.go:216` 和 `:265`：
+```go
+// 当前（错误）
+h.minio.PresignedGetObject(ctx, entry.BucketID.String(), entry.StoragePath, 5*time.Minute)
+// 修复后
+h.minio.PresignedGetObject(ctx, bucket.Name, entry.StoragePath, 15*time.Minute)
+```
 
-| 函数 | 当前覆盖率 | 说明 |
-|------|-----------|------|
-| `NewEngine` | 0% | 疑似测试使用内嵌构造而非公开函数 |
-| `DBAdapter` 接口方法（5个）| 0% | `NewDBAdapter` 未在测试中调用，测试直接 mock |
-| `processRetries` | 0% | `Start()` 内部 goroutine，测试可能在 goroutine 启动前退出 |
-| `retryDelivery` | 0% | 同上 |
+**Bug 2**：TTL 5min → 15min（设计 §5.11.3），`expires_in` 响应字段 300 → 900。
 
-修复思路：在 `engine_start_test.go` 中同步调用 `processRetries`，并补建 `DBAdapter` 的直通测试。
+**修复步骤**：
+1. `FilesDB` 接口（`handler/files.go`）增加方法：
+   ```go
+   GetBucketByID(ctx context.Context, id uuid.UUID) (*db.Bucket, error)
+   ```
+   （`db.Queries` 已有 `GetBucketByID` 实现，直接满足接口）
+2. `DownloadURL` 和 `BatchDownloadURLs` 在 `GetFileEntryByID` 之后调用 `GetBucketByID(entry.BucketID)` 取 `bucket.Name`
+3. 将两处 `5*time.Minute` 改为 `15*time.Minute`，`expires_in: 300` 改为 `expires_in: 900`
+4. 更新 `stubs_test.go` 的 `mockFilesDB` 增加 `GetBucketByID` stub
+5. 补充 `files_test.go` 中 presign 路径的测试用例
 
-#### P3-P4 详细规格：REST handler 覆盖率补建
+---
 
-需在各 `*_test.go` 中补建以下测试：
+#### P3-P3 详细规格：BucketsCreate 调用 MinIO Admin API
 
-| 端点/函数 | 当前覆盖率 | 缺失测试场景 |
-|----------|-----------|------------|
-| `files.DownloadURL` | 47.6% | DB 错误路径；文件 bucket/key 为空路径；presign 失败路径 |
-| `events.Delete` (EventRule) | 58.3% | DB 错误路径；ID 解析失败；成功路径 |
-| `agents.DeleteRule` | 62.5% | dispatcher 调用失败路径 |
-| `MinioEventHandler.Handle` | 0% | MinIO Webhook 解析正常路径；无 `Records` 字段路径 |
-| `authdb.GetUserByUsername` | 0% | 直通 DB 查询测试 |
-| `authdb.UpdateUserLastLogin` | 0% | 直通 DB 查询测试 |
+**问题**：`BucketsHandler.Create`（`events.go:87`）只调用 `db.CreateBucket()`，不创建 MinIO 物理 Bucket，导致 Agent 上传文件时 `s3: The specified bucket does not exist`。
+
+**修复步骤**：
+1. 新增接口到 `handler/events.go`：
+   ```go
+   // MinioAdmin is the minimal MinIO admin interface needed to create buckets.
+   type MinioAdmin interface {
+       MakeBucket(ctx context.Context, bucketName, location string) error
+   }
+   ```
+2. `BucketsHandler` 增加 `admin MinioAdmin` 字段；`NewBucketsHandler` 增加 `admin MinioAdmin` 参数
+3. `Create` 方法在 DB 写入成功后调用 `h.admin.MakeBucket(ctx, req.Name, "")`；若 MinIO 失败，回滚 DB（或返回 500，由业务决定是否幂等重试）
+4. `RouterConfig` 增加 `MinioAdmin MinioAdmin` 字段；`controlplane/cmd/server/main.go` 中用 `madmin.New(...)` 创建 `madmin.Client` 并注入
+5. 补充 `events_test.go` 的 `BucketsHandler.Create` 测试：正常路径（MinIO OK）、MinIO 失败路径
+
+**注意**：`github.com/minio/madmin-go/v3` 已在 controlplane 依赖中（`go.mod` 需确认），`madmin.Client.MakeBucket` 签名为 `MakeBucket(ctx, bucketName string) error`（v3 API 不需要 location 参数）。
+
+---
+
+#### P3-P4 详细规格：append_mode tail/close_wait 实现
+
+**问题**：`proto/v1/agent.proto:140` 定义了 `append_mode` 字段，`agent/cmd/agent/main.go:315` 透传给 `scheduler.Rule.AppendMode`，但 watcher 和 executor 中完全无此字段的处理分支。
+
+设计 §4.4.3 定义三种模式：
+| 模式 | 实现位置 | 行为 |
+|------|---------|------|
+| `overwrite`（默认）| 已实现 | 每次触发完整上传 |
+| `close_wait` | **待实现**：watcher | 等待 `inotify.CLOSE_WRITE` 事件而非 `WRITE` 事件触发上传 |
+| `tail` | **待实现**：queue + executor | 记录上次上传的文件 offset，仅上传新增字节，以追加分片存储 |
+
+**close_wait 修复**（`agent/internal/watcher/watcher.go`）：
+- Watch 模式下，区分 `rule.AppendMode == "close_wait"` 和其他模式
+- `close_wait` 时：只在 `fsnotify.CloseWrite`（等同 `inotify IN_CLOSE_WRITE`）事件触发时提交任务；忽略 `Write` 事件
+- 需确认 `fsnotify.CloseWrite` 是否已在当前 fsnotify 版本（v1.8.0）中可用（Go 1.20+ 支持 `IN_CLOSE_WRITE`）
+
+**tail 修复**（`agent/internal/queue` + `agent/internal/executor` + `agent/internal/uploader`）：
+1. `queue.UploadTask` 增加 `FileOffset int64` 字段（对应 `upload_tasks` 表新增列 `file_offset INTEGER NOT NULL DEFAULT 0`）
+2. `executor.processTask` 在 `tail` 模式时：读取 `task.FileOffset`，计算当前文件大小与 offset 的差值，调用 `uploader.AppendFile(ctx, task, offset)` 而非 `UploadFile`
+3. `uploader` 增加 `AppendFile` 方法：以追加分片（multipart append）方式上传 `[offset, size)` 区间字节；完成后更新 `task.FileOffset = newSize`
+4. 迁移文件：`controlplane/migrations/000002_add_file_offset_to_upload_tasks.up.sql`（仅 agent 的 SQLite 无需 migration，直接修改 schema const）
+
+---
+
+#### P3-P5 详细规格：grpcclient 单元测试补建
+
+文件：`agent/internal/grpcclient/client_test.go`（当前 191 行，5 个测试）
+已有基础设施：`fakeAgentServer`（in-process gRPC server）、`setupTest()` 帮助函数
+
+需新增以下测试（目标：覆盖率 ≥ 80%）：
+
+| 测试函数 | 覆盖目标 | 实现方式 |
+|---------|---------|---------|
+| `TestClient_SetToken_AttachedToMetadata` | `SetToken` | `SetToken("tok")` 后 `SendHeartbeat`；`fakeAgentServer` 从 `metadata.FromIncomingContext` 验证 `authorization: Bearer tok` |
+| `TestClient_SetAgentID` | `SetAgentID` | `SetAgentID("ag-1")` 后调用 `RefreshCredentials`；fake server 验证 `RefreshCredentialsRequest.AgentId == "ag-1"` |
+| `TestClient_SetMessageHandler_Dispatches` | `SetMessageHandler` | 注册 handler；`fakeAgentServer.Connect` 主动 `Send` 一条 `ServerMessage`；等待 handler 被调用（`chan struct{}` + timeout） |
+| `TestClient_SendMessage_WithStream` | `SendMessage` | connect 后调用 `SendMessage(&agentv1.AgentMessage{...})`；验证无 error |
+| `TestClient_SendMessage_NoStream` | `SendMessage` error path | 不 connect，直接 `SendMessage`；验证返回 `"no active stream"` 错误 |
+| `TestClient_ServiceClient_BeforeConnect` | `ServiceClient` returns nil | `New()` 后直接 `ServiceClient()`；验证返回 nil |
+| `TestClient_RefreshCredentials_Success` | `RefreshCredentials` | `fake server` `RefreshCredentials` RPC 返回 `CredentialsPayload`；验证返回值字段正确 |
+| `TestClient_RefreshCredentials_NoSvc` | `RefreshCredentials` no-svc error | 不 connect，调用 `RefreshCredentials`；验证返回 "not initialised" 错误 |
+| `TestBuildDialOpts_Insecure` | `buildDialOpts` insecure | `cfg.UseSSL=false`；验证 dial options 包含 `insecure.NewCredentials()` |
+| `TestBuildDialOpts_TLS` | `buildDialOpts` TLS | `cfg.UseSSL=true, cfg.CACertFile=""`；验证使用系统 CA |
+
+**fakeAgentServer 需新增**：
+- `RefreshCredentials` RPC 实现（接收请求，返回固定 `CredentialsPayload`）
+- `serverMessages chan *agentv1.ServerMessage` 字段，`Connect` 中 range 发送
+
+---
+
+#### P3-P6 详细规格：event 包覆盖率补建
+
+**根因分析**：
+- `NewEngine` 0%：`engine_extra_test.go:75` 的 `TestNewEngine` 调用了 `NewEngine`，但测试传入的 `db` 参数类型导致 coverage 工具将其统计到接口调用方，而非 `engine.go` 本身的构造函数行（待验证）
+- `DBAdapter` 方法 0%：`TestNewDBAdapter`（`engine_extra_test.go:255`）只断言 `adapter != nil`，**从未调用接口方法**，5 个 wrapper 方法全部未覆盖
+- `processRetries`/`retryDelivery` 0%：`retryWorker` 内用 `time.NewTicker(30*time.Second)` 异步触发，测试 goroutine 在 ticker 首次触发前即退出
+
+**修复方案**：
+
+1. **DBAdapter 直通测试**（新建 `engine_db_test.go`）：
+   ```go
+   // 对每个接口方法用 mock DB 做正常路径 + 错误路径各一个测试
+   func TestDBAdapter_ListEnabledEventRules(t *testing.T) { ... }
+   func TestDBAdapter_CreateEventDelivery(t *testing.T) { ... }
+   // ... 5个方法共 10 个用例
+   ```
+
+2. **processRetries/retryDelivery 直接调用**：
+   - `Engine` 结构体的 `processRetries` 和 `retryDelivery` 均为包级私有方法，测试文件与源文件同包（`package event`），**可直接调用**
+   - 在 `engine_start_test.go` 中补充：
+   ```go
+   func TestProcessRetries_DirectCall(t *testing.T) {
+       // 构造 Engine，mock store 返回 1 个 pending delivery
+       // 直接调用 e.processRetries(ctx)，验证 retryDelivery 被调用
+   }
+   ```
+
+3. **NewEngine 覆盖确认**：运行 `go tool cover -html` 确认是否真的 0%；如确实 0%，在 `TestNewEngine` 中断言 `engine.db != nil`（触发函数体执行）
+
+---
+
+#### P3-P7 详细规格：事件重试逻辑对齐设计 §5.9
+
+**问题**：`event/engine.go:218-221` 当前退避计算：
+```go
+backoff := time.Duration(30<<uint(newAttemptCount-1)) * time.Second  // 30s,60s,120s,240s,480s
+if backoff > time.Hour { backoff = time.Hour }
+```
+
+设计 §5.9 要求：**30s → 2min → 10min → 30min → 2h，最多 5 次，上限 2h**。
+
+**修复方案**：
+```go
+var retrySchedule = []time.Duration{
+    30 * time.Second,
+    2 * time.Minute,
+    10 * time.Minute,
+    30 * time.Minute,
+    2 * time.Hour,
+}
+
+func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
+    // ...
+    newAttemptCount := d.AttemptCount + 1
+
+    // 达到最大重试次数：标记为 exhausted，不再重试
+    if int(d.AttemptCount) >= len(retrySchedule) {
+        return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
+            ID: d.ID, Status: "exhausted", AttemptCount: newAttemptCount,
+        })
+    }
+
+    sendErr := e.sender.Send(ctx, rec)
+    if sendErr != nil {
+        idx := int(d.AttemptCount)  // 0-indexed，对应下一次重试的等待时间
+        if idx >= len(retrySchedule) { idx = len(retrySchedule) - 1 }
+        nextRetryAt = sql.NullTime{Time: time.Now().Add(retrySchedule[idx]), Valid: true}
+    }
+    // ...
+}
+```
+
+**注意**：DB schema 的 `event_deliveries.status` 枚举需增加 `exhausted` 值，或复用 `failed` 并用 `next_retry_at IS NULL` 区分"永久失败"。建议新增 migration（`000003_add_exhausted_delivery_status.up.sql`）或在 `ListPendingDeliveries` 查询中增加 `attempt_count < 5` 过滤条件（无需改 schema）。
+
+**推荐最小改动**：`processRetries` 时 `ListPendingDeliveries` 已过滤 `next_retry_at <= now()`，只需在 `retryDelivery` 开头加：
+```go
+if d.AttemptCount >= 5 {
+    return nil  // 已超过最大重试次数，跳过（next_retry_at 不再更新）
+}
+```
+并修正退避表。补充 `TestRetryDelivery_ExhaustedAfter5Attempts` 测试。
+
+---
+
+#### P3-P8 详细规格：MinioEventHandler 调用 Indexer
+
+**问题**：`handler/events.go:578` 的 `Handle` 方法只打日志，`MinioEventHandler` 无 Indexer 字段。
+
+**修复步骤**：
+1. `MinioEventHandler` 增加字段：
+   ```go
+   type MinioEventHandler struct {
+       logger  *zap.Logger
+       indexer IndexerClient  // 新增
+   }
+   // IndexerClient is the minimal Indexer interface needed by MinioEventHandler.
+   type IndexerClient interface {
+       IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string) error
+   }
+   ```
+2. `indexer.Indexer` 需实现 `IndexUpload(ctx, bucketName, objectKey string, sizeBytes int64, etag string) error`（当前 `IndexUpload` 参数为 `IndexUploadParams`，可增加该签名或修改接口）
+3. `NewMinioEventHandler` 增加 `indexer IndexerClient` 参数；`RouterConfig` 增加 `MinioIndexer IndexerClient`；`main.go` 中注入 `ix`
+4. `Handle` 在解析 Records 后调用 `h.indexer.IndexUpload(...)`；失败只记录 warn（非阻塞）
+5. 补充 `events_test.go` 中 `TestMinioEventHandler_Handle_*` 测试
+
+---
+
+#### P3-P9 详细规格：REST handler 覆盖率补全
+
+目标：`internal/api/handler` 整体 ≥ 80%。
+
+| 文件 | 函数 | 当前 | 补充测试场景 |
+|------|------|------|------------|
+| `files_test.go` | `DownloadURL` | 47.6% | 1. file not found；2. DB error；3. presign 失败；4. 正常（用 P3-P2 修复后的 bucket 查询 mock） |
+| `events_test.go` | `EventRulesHandler.Delete` | 58.3% | 1. ID 解析失败；2. DB error；3. 成功 |
+| `agents_test.go` | `AgentsHandler.DeleteRule` | 62.5% | 1. dispatcher.DispatchRuleCancel 失败（仅 warn）；2. DeleteRule DB error |
+| `events_test.go` | `MinioEventHandler.Handle` | 0% | 1. 正常多 Record；2. JSON 解析失败（status 200）；3. 空 Records |
+| `handler/authdb_test.go`（新建）| `GetUserByUsername`/`UpdateUserLastLogin` | 0% | 用 `sqlmock` 或内存 DB 做直通测试 |
+| `helpers_test.go` | `encodeCursor` / `parseLimitParam` | 0%/45% | 补充 cursor encode/decode roundtrip；limit 边界值 |
+
+---
+
+#### P3-P10 详细规格：queue 包覆盖率补全
+
+目标：`agent/internal/queue` ≥ 80%（当前 79.5%）。
+
+缺失：`queue.Open` 62.5%——当前测试只测试成功路径，未测试以下错误路径：
+1. 无效 DSN（触发 `sql.Open` 报错）——需传入非 `sqlite3://` 协议的字符串
+2. Schema 执行失败（传入只读目录下的 DB 路径）——可用 chmod 模拟
+
+最小补充（`queue_test.go` 新增）：
+```go
+func TestOpen_InvalidDSN(t *testing.T) {
+    // 传入无效驱动名触发 sql.Open 错误
+    _, err := queue.Open("invalid_driver://foo")
+    require.Error(t, err)
+    assert.Contains(t, err.Error(), "queue: open")
+}
+```
 
 ---
 
@@ -422,10 +635,10 @@ func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPa
 | Phase 1 | 15 | 15 | 100% |
 | Phase 2 核心 | 20 | 20 | 100%（含组件包逻辑）|
 | Phase 2 遗留（T2-X） | 8 | 8（全部完成）| 100% |
-| Phase 3 前质量关卡（P3-P） | 5 | 0 | 0% |
+| Phase 3 前质量关卡（P3-P） | 10 | 0 | 0% |
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **60** | **44** | **73%** |
+| **合计** | **65** | **44** | **68%** |
 
 ---
 
