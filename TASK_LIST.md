@@ -1,6 +1,6 @@
 # TASK_LIST.md — FileAgent 任务清单
 
-> 当前阶段：**Phase 2 遗留扫除**（T2-X1~X8 需在进入 Phase 3 前完成，详见下方 **T2-X 遗留工作详细规格**）
+> 当前阶段：**Phase 3 — 集成联调**（Phase 2 及全部 T2-X 遗留工作已完成，详见下方 **T2-X 遗留工作详细规格**）
 > 状态说明：⬜ 未开始 / 🔄 进行中 / ✅ 已完成 / ❌ 阻塞
 
 ---
@@ -175,7 +175,7 @@ Phase 4  完善与收尾（可并行）
 | T2-X5 Agent main.go 组装 | 将 watcher/scheduler/executor/uploader/grpcclient 组装为可运行 Agent 进程 | ✅ |
 | T2-X6 Agent RefreshCredentials 调用 | grpcclient 添加 RefreshCredentials；后台定时刷新 STS 凭据 | ✅ |
 | T2-X7 Web UI 未实现页面 | FileTypes/Events/Buckets/AgentRules/AgentLogs/Logs/Files·Detail/Settings·Users/Settings·Profile 共 13 个 placeholder 页面 | ✅ |
-| T2-X8 集成测试补建 | STS 集成测试（controlplane）+ Upload Engine 集成测试（agent）| ⬜ |
+| T2-X8 集成测试补建 | STS 集成测试（controlplane）+ Upload Engine 集成测试（agent）| ✅ |
 
 ---
 
@@ -355,10 +355,10 @@ func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPa
 | Phase 0 | 5 | 5 | 100% |
 | Phase 1 | 15 | 15 | 100% |
 | Phase 2 核心 | 20 | 20 | 100%（含组件包逻辑）|
-| Phase 2 遗留（T2-X） | 8 | 7（X1/X2/X3/X4/X5/X6/X7） | 88% |
+| Phase 2 遗留（T2-X） | 8 | 8（X1/X2/X3/X4/X5/X6/X7/X8） | 100% |
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **55** | **43** | **78%** |
+| **合计** | **55** | **44** | **80%** |
 
 ---
 
