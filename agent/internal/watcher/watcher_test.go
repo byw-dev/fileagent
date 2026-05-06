@@ -389,3 +389,176 @@ fe, err := w.buildEvent(path, "create")
 require.NoError(t, err)
 assert.Equal(t, int64(0), fe.FileOffset, "no-append mode: offset should always be 0")
 }
+
+// ── Direct runCloseWait / runFsnotify unit tests ──────────────────────────────
+
+func TestRunCloseWait_ContextCancel_ReturnsError(t *testing.T) {
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+defer fw.Close()
+
+w := &Watcher{
+fileGlob:    "*.txt",
+appendMode:  AppendModeCloseWait,
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+events := make(chan FileEvent, 4)
+ctx, cancel := context.WithCancel(context.Background())
+cancel() // cancel immediately
+
+err = w.runCloseWait(ctx, events, fw)
+require.Error(t, err)
+}
+
+func TestRunCloseWait_RemoveEvent_EmittedImmediately(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "app.log")
+require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+defer fw.Close()
+require.NoError(t, fw.Add(dir))
+
+w := &Watcher{
+fileGlob:    "*.log",
+appendMode:  AppendModeCloseWait,
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+
+events := make(chan FileEvent, 4)
+ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+defer cancel()
+
+go func() { _ = w.runCloseWait(ctx, events, fw) }()
+
+// Trigger Remove event.
+require.NoError(t, os.Remove(path))
+
+select {
+case fe := <-events:
+assert.Equal(t, "remove", fe.Op)
+case <-time.After(2 * time.Second):
+t.Fatal("no remove event received")
+}
+}
+
+func TestRunCloseWait_WriteEvent_DebounceEmits(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "app.log")
+
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+defer fw.Close()
+require.NoError(t, fw.Add(dir))
+
+w := &Watcher{
+fileGlob:    "*.log",
+appendMode:  AppendModeCloseWait,
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+
+events := make(chan FileEvent, 4)
+ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+defer cancel()
+
+go func() { _ = w.runCloseWait(ctx, events, fw) }()
+
+// Trigger a Create/Write event.
+require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+select {
+case fe := <-events:
+assert.NotEmpty(t, fe.Op)
+assert.Equal(t, path, fe.Path)
+case <-time.After(2 * time.Second):
+t.Fatal("no write event received after debounce")
+}
+}
+
+func TestRunCloseWait_NonMatchingGlob_Ignored(t *testing.T) {
+dir := t.TempDir()
+
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+defer fw.Close()
+require.NoError(t, fw.Add(dir))
+
+w := &Watcher{
+fileGlob:    "*.txt",
+appendMode:  AppendModeCloseWait,
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+
+events := make(chan FileEvent, 4)
+ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+defer cancel()
+
+go func() { _ = w.runCloseWait(ctx, events, fw) }()
+
+// Create a .log file (doesn't match *.txt)
+require.NoError(t, os.WriteFile(filepath.Join(dir, "test.log"), []byte("x"), 0o644))
+
+<-ctx.Done()
+assert.Empty(t, events)
+}
+
+func TestRunFsnotify_EventsChannelClosed_ReturnsNil(t *testing.T) {
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+
+w := &Watcher{
+fileGlob:    "*.txt",
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+events := make(chan FileEvent, 4)
+ctx := context.Background()
+
+done := make(chan error, 1)
+go func() { done <- w.runFsnotify(ctx, events, fw) }()
+
+// Closing the watcher will close the fw.Events channel.
+fw.Close()
+
+select {
+case err := <-done:
+assert.NoError(t, err)
+case <-time.After(2 * time.Second):
+t.Fatal("runFsnotify did not return after channel close")
+}
+}
+
+func TestRunFsnotify_RemoveEvent_Emitted(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "data.txt")
+require.NoError(t, os.WriteFile(path, []byte("x"), 0o644))
+
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+defer fw.Close()
+require.NoError(t, fw.Add(dir))
+
+w := &Watcher{
+fileGlob:    "*.txt",
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+events := make(chan FileEvent, 4)
+ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+defer cancel()
+
+go func() { _ = w.runFsnotify(ctx, events, fw) }()
+require.NoError(t, os.Remove(path))
+
+select {
+case fe := <-events:
+assert.Equal(t, "remove", fe.Op)
+case <-time.After(2 * time.Second):
+t.Fatal("no remove event received")
+}
+}

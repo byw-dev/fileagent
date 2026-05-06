@@ -365,3 +365,77 @@ func TestAgentsHandler_ListUploadLogs_InvalidID(t *testing.T) {
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
+
+// ── Missing error path tests ──────────────────────────────────────────────────
+
+func TestAgentsHandler_Get_InvalidID(t *testing.T) {
+h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/not-a-uuid", nil)
+testAgentsRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestAgentsHandler_Get_DBError(t *testing.T) {
+h := handler.NewAgentsHandler(&mockAgentsDB{getErr: assert.AnError}, nil, nil, nil, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String(), nil)
+testAgentsRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestAgentsHandler_Revoke_InvalidID(t *testing.T) {
+h := handler.NewAgentsHandler(nil, &mockAgentMgr{}, nil, nil, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/not-a-uuid/revoke", nil)
+testAgentsRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestAgentsHandler_Revoke_Error(t *testing.T) {
+h := handler.NewAgentsHandler(nil, &mockAgentMgr{revokeErr: assert.AnError}, nil, nil, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/revoke", nil)
+testAgentsRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestAgentsHandler_ListRules_InvalidAgentID(t *testing.T) {
+h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/bad-id/rules", nil)
+testAgentsRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestAgentsHandler_ListRules_DBError(t *testing.T) {
+h := handler.NewAgentsHandler(&mockAgentsDB{rulesErr: assert.AnError}, nil, nil, nil, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/rules", nil)
+testAgentsRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestAgentsHandler_DeleteRule_InvalidID(t *testing.T) {
+h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/bad-id/rules/"+uuid.New().String(), nil)
+testAgentsRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestAgentsHandler_DeleteRule_DBError(t *testing.T) {
+h := handler.NewAgentsHandler(&mockAgentsDB{deleteErr: assert.AnError}, nil, nil, nil, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/"+uuid.New().String()+"/rules/"+uuid.New().String(), nil)
+testAgentsRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestAgentsHandler_ListUploadLogs_DBError(t *testing.T) {
+h := handler.NewAgentsHandler(&mockAgentsDB{logsErr: assert.AnError}, nil, nil, nil, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/upload-logs", nil)
+testAgentsRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusInternalServerError, w.Code)
+}

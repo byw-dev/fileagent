@@ -317,3 +317,60 @@ res, err := u.UploadFile(context.Background(), task)
 require.NoError(t, err)
 assert.Equal(t, int64(0), res.SizeBytes)
 }
+
+func TestUploadFile_SinglePart_SeekError(t *testing.T) {
+// Create a tiny file (1 byte) and try to seek to offset 5 — stat says size 1
+// so offset 5 >= size 1 so this becomes a no-op (no bytes to upload).
+dir := t.TempDir()
+path := filepath.Join(dir, "small.txt")
+require.NoError(t, os.WriteFile(path, []byte("x"), 0o644))
+
+store := &mockStore{}
+q, _ := queue.Open(":memory:")
+defer q.Close()
+
+u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
+task := &queue.UploadTask{
+ID: "s1", LocalPath: path, StoragePath: "obj", Bucket: "b",
+FileOffset: 100, AppendMode: "tail",
+}
+// Offset >= file size: should return SizeBytes=0 without error.
+res, err := u.UploadFile(context.Background(), task)
+require.NoError(t, err)
+assert.Equal(t, int64(0), res.SizeBytes)
+}
+
+func TestNewSectionReader_InvalidPath(t *testing.T) {
+_, err := newSectionReader("/nonexistent/path.dat", 0, 10)
+require.Error(t, err)
+}
+
+func TestNewSectionReader_ZeroSize(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "data.bin")
+require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+sr, err := newSectionReader(path, 2, 3)
+require.NoError(t, err)
+defer sr.f.Close()
+
+data, err := io.ReadAll(sr)
+require.NoError(t, err)
+assert.Len(t, data, 3)
+}
+
+// TestNew_ValidEndpoint verifies that New creates an Uploader without requiring
+// an actual MinIO connection (minio.NewCore is lazy).
+func TestNew_ValidEndpoint(t *testing.T) {
+q, _ := queue.Open(":memory:")
+defer q.Close()
+
+u, err := New(Config{
+Endpoint:  "localhost:9000",
+AccessKey: "minioadmin",
+SecretKey: "minioadmin",
+UseSSL:    false,
+}, q, zap.NewNop())
+require.NoError(t, err)
+assert.NotNil(t, u)
+}
