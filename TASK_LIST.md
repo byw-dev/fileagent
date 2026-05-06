@@ -175,7 +175,73 @@ Phase 4  完善与收尾（可并行）
 | T2-X5 Agent main.go 组装 | 将 watcher/scheduler/executor/uploader/grpcclient 组装为可运行 Agent 进程 | ✅ |
 | T2-X6 Agent RefreshCredentials 调用 | grpcclient 添加 RefreshCredentials；后台定时刷新 STS 凭据 | ✅ |
 | T2-X7 Web UI 未实现页面 | FileTypes/Events/Buckets/AgentRules/AgentLogs/Logs/Files·Detail/Settings·Users/Settings·Profile 共 13 个 placeholder 页面 | ✅ |
-| T2-X8 集成测试补建 | STS 集成测试（controlplane）+ Upload Engine 集成测试（agent）| ⬜ |
+| T2-X8 集成测试补建 | STS 集成测试（controlplane）+ Upload Engine 集成测试（agent）| ✅ |
+
+---
+
+### Phase 2 完成验证：进入 Phase 3 前的质量关卡（代码审计 2026-05-06）
+
+> 代码审计（2026-05-06）发现 T2-X 全部完成后，仍有以下质量问题需修复。
+> 这些任务未对应任何 T2-X 编号，故单独列出。所有项目均须完成才能进入 Phase 3。
+
+| 任务 | 内容摘要 | 优先级 | 状态 |
+|------|---------|--------|------|
+| P3-P1 DB 集成测试环境修复 | `fileagent_test` 数据库不存在，`go test -tags=integration ./internal/db/` 中 3 个测试失败 | 阻塞 | ⬜ |
+| P3-P2 grpcclient 覆盖率补全 | 当前 61.5%（要求≥80%）；T2-X6 新增的 `SetToken/SetAgentID/SetMessageHandler/SendMessage/ServiceClient/RefreshCredentials` 和 `buildDialOpts` 均在 0% | 阻塞 | ⬜ |
+| P3-P3 event 包覆盖率补全 | 当前 62.7%（要求≥80%）；`processRetries/retryDelivery/DBAdapter` 接口方法和 `NewEngine` 均在 0% | 阻塞 | ⬜ |
+| P3-P4 REST handler 覆盖率补全 | `files.DownloadURL` 47.6%、`events.Delete` 58.3%、`agents.DeleteRule` 62.5%、`MinioEventHandler.Handle` 0%、`authdb` 全部 0%；多个 handler 在 60-75% 区间 | 高 | ⬜ |
+| P3-P5 queue 包覆盖率补全 | 当前 79.5%（要求≥80%）；`Open` 函数 62.5%（模式匹配 WAL 参数路径未测） | 中 | ⬜ |
+
+#### P3-P1 详细规格：DB 集成测试环境
+
+问题根因：`db_integration_test.go` 连接 `fileagent_test` 数据库，但 `docker-compose.test.yml`
+的 PostgreSQL 实例未创建该数据库。
+
+修复方案（二选一）：
+- **方案 A（推荐）**：在 `docker-compose.test.yml` 的 postgres service 中添加环境变量
+  `POSTGRES_DB: fileagent_test`，并在 CI 中加入 `migrate up` 步骤。
+- **方案 B**：在 `db_integration_test.go` 的 `TestMain` 中自动创建数据库（连接 `postgres`
+  默认库后执行 `CREATE DATABASE fileagent_test`）。
+
+#### P3-P2 详细规格：grpcclient 单元测试补建
+
+需在 `agent/internal/grpcclient/client_test.go` 中新增以下测试：
+
+| 函数 | 当前覆盖率 | 测试内容 |
+|------|-----------|---------|
+| `SetToken` | 0% | 设置后通过 `SendHeartbeat` 或 mock 验证 token 被附加到出站 metadata |
+| `SetAgentID` | 0% | 设置后通过 `RefreshCredentials` mock 验证 agentID 出现在请求中 |
+| `SetMessageHandler` | 0% | 设置 handler 后 mock server 发送消息，验证 handler 被调用 |
+| `SendMessage` | 0% | 有 stream 时成功发送；无 stream 时返回错误 |
+| `ServiceClient` | 0% | Connect 前返回 nil；Connect 后返回非 nil |
+| `RefreshCredentials` | 0% | 使用 mock gRPC server 验证返回 CredentialsPayload；svc==nil 时返回错误 |
+| `buildDialOpts` | 0% | UseSSL=false 时返回 insecure option；UseSSL=true 时返回 TLS option |
+
+#### P3-P3 详细规格：event 包覆盖率补建
+
+需调查 `engine_extra_test.go` / `engine_start_test.go` 为何未覆盖以下函数：
+
+| 函数 | 当前覆盖率 | 说明 |
+|------|-----------|------|
+| `NewEngine` | 0% | 疑似测试使用内嵌构造而非公开函数 |
+| `DBAdapter` 接口方法（5个）| 0% | `NewDBAdapter` 未在测试中调用，测试直接 mock |
+| `processRetries` | 0% | `Start()` 内部 goroutine，测试可能在 goroutine 启动前退出 |
+| `retryDelivery` | 0% | 同上 |
+
+修复思路：在 `engine_start_test.go` 中同步调用 `processRetries`，并补建 `DBAdapter` 的直通测试。
+
+#### P3-P4 详细规格：REST handler 覆盖率补建
+
+需在各 `*_test.go` 中补建以下测试：
+
+| 端点/函数 | 当前覆盖率 | 缺失测试场景 |
+|----------|-----------|------------|
+| `files.DownloadURL` | 47.6% | DB 错误路径；文件 bucket/key 为空路径；presign 失败路径 |
+| `events.Delete` (EventRule) | 58.3% | DB 错误路径；ID 解析失败；成功路径 |
+| `agents.DeleteRule` | 62.5% | dispatcher 调用失败路径 |
+| `MinioEventHandler.Handle` | 0% | MinIO Webhook 解析正常路径；无 `Records` 字段路径 |
+| `authdb.GetUserByUsername` | 0% | 直通 DB 查询测试 |
+| `authdb.UpdateUserLastLogin` | 0% | 直通 DB 查询测试 |
 
 ---
 
@@ -355,10 +421,11 @@ func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPa
 | Phase 0 | 5 | 5 | 100% |
 | Phase 1 | 15 | 15 | 100% |
 | Phase 2 核心 | 20 | 20 | 100%（含组件包逻辑）|
-| Phase 2 遗留（T2-X） | 8 | 7（X1/X2/X3/X4/X5/X6/X7） | 88% |
+| Phase 2 遗留（T2-X） | 8 | 8（全部完成）| 100% |
+| Phase 3 前质量关卡（P3-P） | 5 | 0 | 0% |
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **55** | **43** | **78%** |
+| **合计** | **60** | **44** | **73%** |
 
 ---
 
