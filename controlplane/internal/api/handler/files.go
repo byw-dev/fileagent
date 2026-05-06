@@ -18,6 +18,8 @@ import (
 type FilesDB interface {
 	ListFileEntries(ctx context.Context, arg db.ListFileEntriesParams) ([]*db.FileEntry, error)
 	GetFileEntryByID(ctx context.Context, id uuid.UUID) (*db.FileEntry, error)
+	// GetBucketByID is used to resolve a bucket UUID to its MinIO bucket name.
+	GetBucketByID(ctx context.Context, id uuid.UUID) (*db.Bucket, error)
 }
 
 // MinIOPresigner generates presigned download URLs for stored objects.
@@ -213,7 +215,17 @@ func (h *FilesHandler) DownloadURL(c *gin.Context) {
 		return
 	}
 
-	url, err := h.minio.PresignedGetObject(c.Request.Context(), entry.BucketID.String(), entry.StoragePath, 5*time.Minute)
+	bucket, err := h.db.GetBucketByID(c.Request.Context(), entry.BucketID)
+	if err != nil {
+		h.logger.Error("get bucket for download", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to resolve bucket", nil),
+		})
+		return
+	}
+
+	const presignTTL = 15 * time.Minute
+	url, err := h.minio.PresignedGetObject(c.Request.Context(), bucket.Name, entry.StoragePath, presignTTL)
 	if err != nil {
 		h.logger.Error("presign url", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -221,7 +233,7 @@ func (h *FilesHandler) DownloadURL(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"url": url, "expires_in": 300})
+	c.JSON(http.StatusOK, gin.H{"url": url, "expires_in": int(presignTTL.Seconds())})
 }
 
 // batchDownloadRequest is the body expected by POST /api/v1/files/batch-download-urls.
@@ -262,7 +274,14 @@ func (h *FilesHandler) BatchDownloadURLs(c *gin.Context) {
 			result = append(result, urlItem{ID: rawID, Err: "not found"})
 			continue
 		}
-		url, err := h.minio.PresignedGetObject(c.Request.Context(), entry.BucketID.String(), entry.StoragePath, 5*time.Minute)
+		bucket, err := h.db.GetBucketByID(c.Request.Context(), entry.BucketID)
+		if err != nil {
+			h.logger.Error("get bucket for batch download", zap.String("id", rawID), zap.Error(err))
+			result = append(result, urlItem{ID: rawID, Err: "bucket not found"})
+			continue
+		}
+		const presignTTL = 15 * time.Minute
+		url, err := h.minio.PresignedGetObject(c.Request.Context(), bucket.Name, entry.StoragePath, presignTTL)
 		if err != nil {
 			h.logger.Error("presign batch url", zap.String("id", rawID), zap.Error(err))
 			result = append(result, urlItem{ID: rawID, Err: "presign failed"})

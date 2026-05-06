@@ -11,13 +11,13 @@ services:
     environment:
       POSTGRES_USER: fileagent
       POSTGRES_PASSWORD: fileagent
-      POSTGRES_DB: fileagent
+      POSTGRES_DB: fileagent_test
     ports:
       - "5432:5432"
     tmpfs:
       - /var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fileagent -d fileagent"]
+      test: ["CMD-SHELL", "pg_isready -U fileagent -d fileagent_test"]
       interval: 5s
       timeout: 5s
       retries: 10

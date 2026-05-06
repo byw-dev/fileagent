@@ -161,7 +161,7 @@ func TestBucketsHandler_List_Success(t *testing.T) {
 	mockDB := &mockBucketsDB{buckets: []*db.Bucket{
 		{ID: uuid.New(), OrgID: uuid.New(), Name: "data-sensor", CreatedAt: time.Now()},
 	}}
-	h := handler.NewBucketsHandler(mockDB, newTestLogger())
+	h := handler.NewBucketsHandler(mockDB, nil, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/buckets", nil)
 	testBucketsRouter(h).ServeHTTP(w, req)
@@ -172,7 +172,7 @@ func TestBucketsHandler_List_Success(t *testing.T) {
 }
 
 func TestBucketsHandler_List_NilDB_Returns501(t *testing.T) {
-	h := handler.NewBucketsHandler(nil, newTestLogger())
+	h := handler.NewBucketsHandler(nil, nil, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/buckets", nil)
 	testBucketsRouter(h).ServeHTTP(w, req)
@@ -180,7 +180,7 @@ func TestBucketsHandler_List_NilDB_Returns501(t *testing.T) {
 }
 
 func TestBucketsHandler_Create_Success(t *testing.T) {
-	h := handler.NewBucketsHandler(&mockBucketsDB{}, newTestLogger())
+	h := handler.NewBucketsHandler(&mockBucketsDB{}, nil, newTestLogger())
 	body := `{"name":"new-bucket","description":"test bucket"}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/buckets", bytes.NewBufferString(body))
@@ -190,13 +190,64 @@ func TestBucketsHandler_Create_Success(t *testing.T) {
 }
 
 func TestBucketsHandler_Create_MissingName(t *testing.T) {
-	h := handler.NewBucketsHandler(&mockBucketsDB{}, newTestLogger())
+	h := handler.NewBucketsHandler(&mockBucketsDB{}, nil, newTestLogger())
 	body := `{"description":"no name"}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/buckets", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	testBucketsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestBucketsHandler_Create_CallsMakeBucket(t *testing.T) {
+	makeBucketCalled := false
+	minio := &mockMinioBucketMaker{makeFn: func(name string) error {
+		makeBucketCalled = true
+		assert.Equal(t, "new-bucket", name)
+		return nil
+	}}
+	h := handler.NewBucketsHandler(&mockBucketsDB{}, minio, newTestLogger())
+	body := `{"name":"new-bucket"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/buckets", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testBucketsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusCreated, w.Code)
+	assert.True(t, makeBucketCalled, "MakeBucket should have been called")
+}
+
+func TestBucketsHandler_Create_MinioError_StillReturns201(t *testing.T) {
+	// Even when MinIO fails, the DB record is created and 201 returned.
+	minio := &mockMinioBucketMaker{makeFn: func(_ string) error { return assert.AnError }}
+	h := handler.NewBucketsHandler(&mockBucketsDB{}, minio, newTestLogger())
+	body := `{"name":"new-bucket"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/buckets", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testBucketsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusCreated, w.Code)
+}
+
+func TestBucketsHandler_Create_DBError(t *testing.T) {
+	h := handler.NewBucketsHandler(&mockBucketsDB{createErr: assert.AnError}, nil, newTestLogger())
+	body := `{"name":"new-bucket"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/buckets", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testBucketsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+// mockMinioBucketMaker is a test double for handler.MinioBucketMaker.
+type mockMinioBucketMaker struct {
+	makeFn func(name string) error
+}
+
+func (m *mockMinioBucketMaker) MakeBucket(_ context.Context, name string) error {
+	if m.makeFn != nil {
+		return m.makeFn(name)
+	}
+	return nil
 }
 
 // ── EventRulesHandler tests ───────────────────────────────────────────────────

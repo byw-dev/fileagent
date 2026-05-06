@@ -59,10 +59,12 @@ func (m *mockFileTypesDB) DeleteFileType(_ context.Context, _ uuid.UUID) error {
 // ── mock FilesDB ──────────────────────────────────────────────────────────────
 
 type mockFilesDB struct {
-	entries []*db.FileEntry
-	listErr error
-	entry   *db.FileEntry
-	getErr  error
+	entries   []*db.FileEntry
+	listErr   error
+	entry     *db.FileEntry
+	getErr    error
+	bucket    *db.Bucket
+	bucketErr error
 }
 
 func (m *mockFilesDB) ListFileEntries(_ context.Context, _ db.ListFileEntriesParams) ([]*db.FileEntry, error) {
@@ -70,6 +72,15 @@ func (m *mockFilesDB) ListFileEntries(_ context.Context, _ db.ListFileEntriesPar
 }
 func (m *mockFilesDB) GetFileEntryByID(_ context.Context, _ uuid.UUID) (*db.FileEntry, error) {
 	return m.entry, m.getErr
+}
+func (m *mockFilesDB) GetBucketByID(_ context.Context, _ uuid.UUID) (*db.Bucket, error) {
+	if m.bucketErr != nil {
+		return nil, m.bucketErr
+	}
+	if m.bucket != nil {
+		return m.bucket, nil
+	}
+	return &db.Bucket{ID: uuid.New(), Name: "data-sensor"}, nil
 }
 
 // ── mock MinIOPresigner ───────────────────────────────────────────────────────
@@ -344,4 +355,75 @@ func TestFilesHandler_BatchDownloadURLs_InvalidID(t *testing.T) {
 	items := resp["data"].([]interface{})
 	item := items[0].(map[string]interface{})
 	assert.Equal(t, "invalid id", item["error"])
+}
+
+func TestFilesHandler_DownloadURL_BucketNotFound(t *testing.T) {
+	entry := newSampleEntry()
+	mockDB := &mockFilesDB{entry: entry, bucketErr: assert.AnError}
+	presigner := &mockPresigner{url: "https://minio/presigned"}
+	h := handler.NewFilesHandler(mockDB, presigner, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files/"+entry.ID.String()+"/download-url", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestFilesHandler_DownloadURL_UsesBucketName(t *testing.T) {
+	entry := newSampleEntry()
+	bucketName := "my-real-bucket"
+	var capturedBucket string
+	mockDB := &mockFilesDB{
+		entry:  entry,
+		bucket: &db.Bucket{ID: entry.BucketID, Name: bucketName},
+	}
+	capturePresigner := &capturingPresigner{url: "https://minio/presigned"}
+	h := handler.NewFilesHandler(mockDB, capturePresigner, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files/"+entry.ID.String()+"/download-url", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	capturedBucket = capturePresigner.lastBucket
+	assert.Equal(t, bucketName, capturedBucket)
+	// expires_in should be 900 (15 minutes).
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, float64(900), body["expires_in"])
+}
+
+func TestFilesHandler_DownloadURL_PresignError(t *testing.T) {
+	entry := newSampleEntry()
+	mockDB := &mockFilesDB{entry: entry}
+	h := handler.NewFilesHandler(mockDB, &mockPresigner{err: assert.AnError}, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files/"+entry.ID.String()+"/download-url", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestFilesHandler_BatchDownloadURLs_BucketNotFound(t *testing.T) {
+	entry := newSampleEntry()
+	mockDB := &mockFilesDB{entry: entry, bucketErr: assert.AnError}
+	presigner := &mockPresigner{url: "https://minio/presigned"}
+	h := handler.NewFilesHandler(mockDB, presigner, newTestLogger())
+	body := `{"ids":["` + entry.ID.String() + `"]}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/files/batch-download-urls", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	items := resp["data"].([]interface{})
+	assert.Equal(t, "bucket not found", items[0].(map[string]interface{})["error"])
+}
+
+// capturingPresigner records the bucket name used in the last presign call.
+type capturingPresigner struct {
+	url        string
+	lastBucket string
+}
+
+func (m *capturingPresigner) PresignedGetObject(_ context.Context, bucket, _ string, _ time.Duration) (string, error) {
+	m.lastBucket = bucket
+	return m.url, nil
 }

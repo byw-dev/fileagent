@@ -30,10 +30,14 @@ type mockStore struct {
 	completeErr   error
 	uploadID      string
 	parts         []minio.ObjectPart
+	putFn         func(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
 }
 
-func (m *mockStore) PutObject(_ context.Context, _, _ string, r io.Reader, _ int64, _ minio.PutObjectOptions) (minio.UploadInfo, error) {
+func (m *mockStore) PutObject(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
 	m.putCalls++
+	if m.putFn != nil {
+		return m.putFn(ctx, bucket, object, r, size, opts)
+	}
 	if m.putErr != nil {
 		return minio.UploadInfo{}, m.putErr
 	}
@@ -252,4 +256,64 @@ func TestNewWithStore_DefaultPartSize(t *testing.T) {
 	u := newWithStore(&mockStore{}, Config{PartSizeMB: 0}, nil, zap.NewNop())
 	assert.Equal(t, 64, u.cfg.PartSizeMB)
 	assert.Equal(t, 64, u.cfg.ThresholdMB)
+}
+
+func TestUploadFile_TailMode_UploadsTailOnly(t *testing.T) {
+// Create a file with 10 bytes total.
+dir := t.TempDir()
+path := filepath.Join(dir, "data.txt")
+require.NoError(t, os.WriteFile(path, []byte("0123456789"), 0o644))
+
+var received []byte
+store := &mockStore{
+putFn: func(_ context.Context, _, _ string, r io.Reader, _ int64, _ minio.PutObjectOptions) (minio.UploadInfo, error) {
+b, err := io.ReadAll(r)
+if err != nil {
+return minio.UploadInfo{}, err
+}
+received = b
+return minio.UploadInfo{ETag: "etag-tail"}, nil
+},
+}
+q, _ := queue.Open(":memory:")
+defer q.Close()
+
+u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
+task := &queue.UploadTask{
+ID:          "t1",
+LocalPath:   path,
+StoragePath: "obj",
+Bucket:      "b",
+FileOffset:  5,
+AppendMode:  "tail",
+}
+
+res, err := u.UploadFile(context.Background(), task)
+require.NoError(t, err)
+assert.Equal(t, int64(5), res.SizeBytes)
+assert.Equal(t, []byte("56789"), received)
+}
+
+func TestUploadFile_TailMode_OffsetBeyondEnd_NoOp(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "data.txt")
+require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+store := &mockStore{}
+q, _ := queue.Open(":memory:")
+defer q.Close()
+
+u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
+task := &queue.UploadTask{
+ID:          "t2",
+LocalPath:   path,
+StoragePath: "obj",
+Bucket:      "b",
+FileOffset:  10, // beyond file end
+AppendMode:  "tail",
+}
+
+res, err := u.UploadFile(context.Background(), task)
+require.NoError(t, err)
+assert.Equal(t, int64(0), res.SizeBytes)
 }

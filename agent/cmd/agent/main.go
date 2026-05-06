@@ -320,7 +320,7 @@ func protoToSchedulerRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 // runWatcher starts a file-system watcher for the given watch-mode rule and
 // submits upload tasks to the executor for every create/write event.
 func runWatcher(ctx context.Context, rule scheduler.CollectionRule, exec *executor.Executor, q *queue.Queue, logger *zap.Logger) {
-	w, err := watcher.New(rule.SourcePathTemplate, rule.FileGlob, rule.WatchRecursive, 0, logger)
+	w, err := watcher.New(rule.SourcePathTemplate, rule.FileGlob, rule.WatchRecursive, 0, rule.AppendMode, logger)
 	if err != nil {
 		logger.Warn("agent: watcher init failed",
 			zap.String("rule_id", rule.RuleID), zap.Error(err))
@@ -344,7 +344,7 @@ func runWatcher(ctx context.Context, rule scheduler.CollectionRule, exec *execut
 			if ev.Op == "remove" {
 				continue
 			}
-			submitFile(exec, q, rule, ev.Path, ev.Size, ev.ModTime, logger)
+			submitFile(exec, q, rule, ev.Path, ev.Size, ev.ModTime, ev.FileOffset, rule.AppendMode, logger)
 		}
 	}
 }
@@ -364,7 +364,7 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 		if err != nil {
 			return nil
 		}
-		submitFile(exec, q, rule, path, info.Size(), info.ModTime(), logger)
+		submitFile(exec, q, rule, path, info.Size(), info.ModTime(), 0, "", logger)
 		return nil
 	})
 	if err != nil && ctx.Err() == nil {
@@ -374,7 +374,7 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 }
 
 // submitFile checks deduplication and enqueues an upload task.
-func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, logger *zap.Logger) {
+func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, logger *zap.Logger) {
 	done, err := q.IsProcessed(rule.RuleID, localPath)
 	if err != nil {
 		logger.Warn("agent: check processed failed", zap.String("path", localPath), zap.Error(err))

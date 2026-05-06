@@ -128,7 +128,7 @@ func TestFileTypesHandler_AllReturn501(t *testing.T) {
 
 func TestBucketsHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewBucketsHandler(nil, newTestLogger())
+	h := handler.NewBucketsHandler(nil, nil, newTestLogger())
 	r.GET("/buckets", h.List)
 	r.POST("/buckets", h.Create)
 

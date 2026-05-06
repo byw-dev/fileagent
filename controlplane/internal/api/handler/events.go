@@ -23,15 +23,22 @@ type BucketsDB interface {
 	CreateBucket(ctx context.Context, arg db.CreateBucketParams) (*db.Bucket, error)
 }
 
+// MinioBucketMaker creates physical buckets in MinIO.
+type MinioBucketMaker interface {
+	MakeBucket(ctx context.Context, bucketName string) error
+}
+
 // BucketsHandler groups the Bucket management handlers.
 type BucketsHandler struct {
 	db     BucketsDB
+	minio  MinioBucketMaker
 	logger *zap.Logger
 }
 
 // NewBucketsHandler returns a new BucketsHandler.
-func NewBucketsHandler(bucketsDB BucketsDB, logger *zap.Logger) *BucketsHandler {
-	return &BucketsHandler{db: bucketsDB, logger: logger}
+// minio may be nil; when nil, bucket creation will succeed in DB only.
+func NewBucketsHandler(bucketsDB BucketsDB, minio MinioBucketMaker, logger *zap.Logger) *BucketsHandler {
+	return &BucketsHandler{db: bucketsDB, minio: minio, logger: logger}
 }
 
 // bucketResponse is the outbound JSON shape for a bucket.
@@ -116,6 +123,20 @@ func (h *BucketsHandler) Create(c *gin.Context) {
 		})
 		return
 	}
+
+	// Create the physical bucket in MinIO. If MinIO is unavailable, the DB
+	// record is still returned but the bucket won't exist yet — an operator
+	// can re-create it manually. We log the error but don't roll back the
+	// DB record because the naming allocation is idempotent.
+	if h.minio != nil {
+		if mkErr := h.minio.MakeBucket(c.Request.Context(), bucket.Name); mkErr != nil {
+			h.logger.Error("create minio bucket",
+				zap.String("bucket", bucket.Name),
+				zap.Error(mkErr),
+			)
+		}
+	}
+
 	c.JSON(http.StatusCreated, toBucketResponse(bucket))
 }
 

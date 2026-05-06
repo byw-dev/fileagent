@@ -1,10 +1,12 @@
 package event
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
@@ -168,6 +170,26 @@ func (e *Engine) retryWorker(ctx context.Context) {
 	}
 }
 
+// retryBackoffSchedule defines the wait duration before each retry attempt
+// (indexed by attempt number, 1-based). Matches the design spec §5.9.
+var retryBackoffSchedule = []time.Duration{
+	30 * time.Second,  // attempt 1
+	2 * time.Minute,   // attempt 2
+	10 * time.Minute,  // attempt 3
+	30 * time.Minute,  // attempt 4
+	2 * time.Hour,     // attempt 5 — final
+}
+
+// maxRetryAttempts is the maximum number of retry attempts before giving up.
+const maxRetryAttempts = 5
+
+// ProcessRetries is the exported entry point for the retry worker logic.
+// It is called periodically by the retryWorker ticker, and may also be
+// invoked directly in tests.
+func (e *Engine) ProcessRetries(ctx context.Context) {
+	e.processRetries(ctx)
+}
+
 func (e *Engine) processRetries(ctx context.Context) {
 	deliveries, err := e.store.ListPendingDeliveries(ctx)
 	if err != nil {
@@ -198,15 +220,8 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 		return fmt.Errorf("retry: parse webhook config: %w", err)
 	}
 
-	rec := DeliveryRecord{
-		ID:        d.ID.String(),
-		URL:       cfg.URL,
-		Payload:   d.Payload,
-		AttemptNo: int(d.AttemptCount),
-	}
-
 	newAttemptCount := d.AttemptCount + 1
-	sendErr := e.sender.Send(ctx, rec)
+	sendErr := postWebhook(ctx, cfg.URL, d.Payload)
 
 	var newStatus string
 	var respCode sql.NullInt32
@@ -214,17 +229,27 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 	var nextRetryAt sql.NullTime
 
 	if sendErr != nil {
-		newStatus = "failed"
-		// Exponential backoff: 30s * 2^(attemptCount-1), capped at 1h.
-		backoff := time.Duration(30<<uint(newAttemptCount-1)) * time.Second
-		if backoff > time.Hour {
-			backoff = time.Hour
+		if int(newAttemptCount) >= maxRetryAttempts {
+			// Exceeded maximum retries — mark permanently failed.
+			newStatus = "failed"
+		} else {
+			newStatus = "failed"
+			idx := int(newAttemptCount) - 1
+			if idx >= len(retryBackoffSchedule) {
+				idx = len(retryBackoffSchedule) - 1
+			}
+			nextRetryAt = sql.NullTime{Time: time.Now().Add(retryBackoffSchedule[idx]), Valid: true}
 		}
-		nextRetryAt = sql.NullTime{Time: time.Now().Add(backoff), Valid: true}
 	} else {
 		newStatus = "delivered"
 		deliveredAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
 	}
+
+	e.logger.Debug("engine: retry delivery complete",
+		zap.String("delivery_id", d.ID.String()),
+		zap.String("status", newStatus),
+		zap.Int32("attempt", newAttemptCount),
+	)
 
 	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
 		ID:           d.ID,
@@ -309,6 +334,29 @@ func (e *Engine) dispatchWebhook(ctx context.Context, rule *db.EventRule, eventT
 			zap.String("delivery_id", rec.ID),
 			zap.Error(err),
 		)
+	}
+	return nil
+}
+
+// postWebhook makes a simple HTTP POST to url with the given payload and
+// returns an error if the request fails or the server returns a non-2xx status.
+// Unlike WebhookSender.Send, this function does not touch the database; the
+// caller is responsible for updating the delivery status.
+func postWebhook(ctx context.Context, url string, payload []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("retry: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("retry: non-2xx status %d", resp.StatusCode)
 	}
 	return nil
 }

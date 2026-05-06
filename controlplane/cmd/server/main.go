@@ -42,6 +42,16 @@ func (m *minioPresigner) PresignedGetObject(ctx context.Context, bucketName, obj
 	return u.String(), nil
 }
 
+// minioBucketMaker wraps minio.Client to satisfy handler.MinioBucketMaker.
+type minioBucketMaker struct {
+	client *miniogo.Client
+}
+
+// MakeBucket creates a bucket with the given name using the default region.
+func (m *minioBucketMaker) MakeBucket(ctx context.Context, bucketName string) error {
+	return m.client.MakeBucket(ctx, bucketName, miniogo.MakeBucketOptions{})
+}
+
 // natsPublisher wraps a NATS connection to satisfy the NATSPublisher interface.
 type natsPublisher struct {
 	conn *natsgo.Conn
@@ -172,6 +182,7 @@ func main() {
 		FilesDB:      queries,
 		MinIOSigner:  &minioPresigner{client: minioClient},
 		BucketsDB:    queries,
+		MinIOAdmin:   &minioBucketMaker{client: minioClient},
 		EventRulesDB: queries,
 		UploadLogsDB: queries,
 		AgentsDB:     queries,

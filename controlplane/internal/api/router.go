@@ -20,11 +20,12 @@ type RouterConfig struct {
 	Logger     *zap.Logger
 	JWTService auth.Service   // nil → auth routes return 501 (Phase 1 behaviour)
 	AuthDB     handler.AuthDB // nil → auth routes return 501
-	UsersDB     handler.UsersDB
-	FileTypesDB handler.FileTypesDB
+	UsersDB       handler.UsersDB
+	FileTypesDB   handler.FileTypesDB
 	FilesDB       handler.FilesDB
 	MinIOSigner   handler.MinIOPresigner
 	BucketsDB     handler.BucketsDB
+	MinIOAdmin    handler.MinioBucketMaker // nil → bucket creation skips MinIO call
 	EventRulesDB  handler.EventRulesDB
 	UploadLogsDB  handler.UploadLogsDB
 	AgentsDB      handler.AgentsDB
@@ -117,7 +118,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Buckets
-	bucketsH := handler.NewBucketsHandler(cfg.BucketsDB, cfg.Logger)
+	bucketsH := handler.NewBucketsHandler(cfg.BucketsDB, cfg.MinIOAdmin, cfg.Logger)
 	buckets := v1.Group("/buckets")
 	{
 		buckets.GET("", bucketsH.List)
