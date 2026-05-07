@@ -71,6 +71,24 @@ func newTestAuthSvc(t *testing.T) auth.Service {
 	return auth.New("test-secret-at-least-32-bytes!!", nil)
 }
 
+type loginRespBody struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	User         struct {
+		ID       string `json:"id"`
+		Username string `json:"username"`
+		Role     string `json:"role"`
+		OrgID    string `json:"org_id"`
+	} `json:"user"`
+}
+
+type meRespBody struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	OrgID    string `json:"org_id"`
+}
+
 // ── Tests: Login ──────────────────────────────────────────────────────────────
 
 func TestLogin_NilAuthSvc_Returns501(t *testing.T) {
@@ -96,10 +114,14 @@ func TestLogin_Success(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
-	var resp map[string]interface{}
+	var resp loginRespBody
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	assert.NotEmpty(t, resp["access_token"])
-	assert.NotEmpty(t, resp["refresh_token"])
+	assert.NotEmpty(t, resp.AccessToken)
+	assert.NotEmpty(t, resp.RefreshToken)
+	assert.Equal(t, user.ID.String(), resp.User.ID)
+	assert.Equal(t, user.Username, resp.User.Username)
+	assert.Equal(t, string(user.Role), resp.User.Role)
+	assert.Equal(t, user.OrgID.String(), resp.User.OrgID)
 }
 
 func TestLogin_WrongPassword(t *testing.T) {
@@ -305,9 +327,12 @@ func TestMe_WithValidAccessToken(t *testing.T) {
 	r.ServeHTTP(w2, req2)
 	require.Equal(t, http.StatusOK, w2.Code)
 
-	var meResp map[string]interface{}
+	var meResp meRespBody
 	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &meResp))
-	assert.Equal(t, "alice", meResp["username"])
+	assert.Equal(t, user.ID.String(), meResp.ID)
+	assert.Equal(t, "alice", meResp.Username)
+	assert.Equal(t, string(user.Role), meResp.Role)
+	assert.Equal(t, user.OrgID.String(), meResp.OrgID)
 }
 
 func TestMe_InvalidToken(t *testing.T) {
