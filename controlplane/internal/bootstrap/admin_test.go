@@ -94,3 +94,110 @@ func TestEnsureAdminAccount_ForceResetMissingAdminReturnsError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
 }
+
+// ── Validation errors ─────────────────────────────────────────────────────────
+
+func TestEnsureAdminAccount_EmptyUsernameReturnsError(t *testing.T) {
+	_, err := EnsureAdminAccount(context.Background(), &fakeUsersStore{}, "", "", false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "username cannot be empty")
+}
+
+func TestEnsureAdminAccount_ForceResetEmptyPasswordReturnsError(t *testing.T) {
+	_, err := EnsureAdminAccount(context.Background(), &fakeUsersStore{}, "admin", "", true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "password is required")
+}
+
+func TestEnsureAdminAccount_TooShortPasswordReturnsError(t *testing.T) {
+	_, err := EnsureAdminAccount(context.Background(), &fakeUsersStore{}, "admin", "short", false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least 8 characters")
+}
+
+// ── CountUsers error ──────────────────────────────────────────────────────────
+
+func TestEnsureAdminAccount_CountUsersErrorPropagated(t *testing.T) {
+	store := &fakeUsersStore{countUsersErr: assert.AnError}
+	_, err := EnsureAdminAccount(context.Background(), store, "admin", "", false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "count users")
+}
+
+// ── CreateUser error ──────────────────────────────────────────────────────────
+
+func TestEnsureAdminAccount_CreateUserErrorPropagated(t *testing.T) {
+	store := &fakeUsersStore{countUsersResp: 0, createUserErr: assert.AnError}
+	_, err := EnsureAdminAccount(context.Background(), store, "admin", "Pass1234!", false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "create user")
+}
+
+// ── GetUserByUsername non-ErrNoRows error ────────────────────────────────────
+
+func TestEnsureAdminAccount_GetUserByUsernameErrorPropagated(t *testing.T) {
+	store := &fakeUsersStore{countUsersResp: 1, getUserErr: assert.AnError}
+	_, err := EnsureAdminAccount(context.Background(), store, "admin", "Pass1234!", true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "get user by username")
+}
+
+// ── UpdateUserPassword error ─────────────────────────────────────────────────
+
+func TestEnsureAdminAccount_UpdatePasswordErrorPropagated(t *testing.T) {
+	store := &fakeUsersStore{
+		countUsersResp:    1,
+		getUserResp:       &db.User{ID: uuid.New(), Username: "admin"},
+		updatePasswordErr: assert.AnError,
+	}
+	_, err := EnsureAdminAccount(context.Background(), store, "admin", "Pass1234!", true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "update user password")
+}
+
+// ── No-op when users exist and forceReset is false ───────────────────────────
+
+func TestEnsureAdminAccount_NoOpWhenUsersExist(t *testing.T) {
+	store := &fakeUsersStore{countUsersResp: 5}
+	res, err := EnsureAdminAccount(context.Background(), store, "admin", "", false)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.False(t, res.Created)
+	assert.False(t, res.Reset)
+	assert.False(t, store.createUserCalled)
+	assert.False(t, store.updateCalled)
+}
+
+// ── generatePassword ─────────────────────────────────────────────────────────
+
+func TestGeneratePassword_ZeroLengthReturnsError(t *testing.T) {
+	_, err := generatePassword(0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "length must be greater than 0")
+}
+
+func TestGeneratePassword_NegativeLengthReturnsError(t *testing.T) {
+	_, err := generatePassword(-1)
+	require.Error(t, err)
+}
+
+func TestGeneratePassword_ReturnsCorrectLength(t *testing.T) {
+	for _, n := range []int{1, 8, 16, 32} {
+		pw, err := generatePassword(n)
+		require.NoError(t, err)
+		assert.Len(t, pw, n)
+	}
+}
+
+func TestGeneratePassword_ContainsOnlyAlphabetChars(t *testing.T) {
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*()-_=+"
+	allowed := make(map[rune]bool, len(alphabet))
+	for _, ch := range alphabet {
+		allowed[ch] = true
+	}
+	pw, err := generatePassword(64)
+	require.NoError(t, err)
+	for _, ch := range pw {
+		assert.True(t, allowed[ch], "unexpected char %q in generated password", ch)
+	}
+}
