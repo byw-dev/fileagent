@@ -34,6 +34,11 @@ type ruleHandle struct {
 	cancel context.CancelFunc
 }
 
+// grpcClientTokenSetter captures the gRPC client behavior needed by revoke handling.
+type grpcClientTokenSetter interface {
+	SetToken(token string)
+}
+
 func main() {
 	// ── 1. Load configuration ────────────────────────────────────────────────
 	configFlag := flag.String("config", "", "Path to agent TOML config file (precedence: --config > AGENT_CONFIG > ./config.toml)")
@@ -214,9 +219,7 @@ func main() {
 			stopRule(ruleID)
 
 		case *agentv1.ServerMessage_Revoke:
-			logger.Warn("agent: token revoked by Control Plane",
-				zap.String("reason", p.Revoke.GetReason()))
-			stop() // trigger graceful shutdown
+			handleRevokeCommand(tokenMgr, stsMgr, grpcClient, stop, logger, p.Revoke.GetReason())
 
 		case *agentv1.ServerMessage_ListDirectory:
 			go handleListDir(p.ListDirectory, grpcClient, logger)
@@ -284,6 +287,19 @@ func main() {
 
 	<-ctx.Done()
 	logger.Info("agent: shutdown signal received, stopping…")
+}
+
+// handleRevokeCommand clears local credentials and triggers graceful shutdown.
+func handleRevokeCommand(tokenMgr *credential.TokenManager, stsMgr *credential.STSManager, client grpcClientTokenSetter, stop context.CancelFunc, logger *zap.Logger, reason string) {
+	logger.Warn("agent: token revoked by Control Plane", zap.String("reason", reason))
+	if err := tokenMgr.Clear(); err != nil {
+		logger.Warn("agent: clear token failed", zap.Error(err))
+	}
+	stsMgr.Clear()
+	if client != nil {
+		client.SetToken("")
+	}
+	stop()
 }
 
 // buildLogger creates a zap logger configured for the given level string.

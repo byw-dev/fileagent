@@ -107,6 +107,25 @@ func TestTokenManager_Save_WrongKeyOnLoad(t *testing.T) {
 	assert.Contains(t, err.Error(), "decrypt token")
 }
 
+func TestTokenManager_Clear(t *testing.T) {
+	path := tokenFile(t)
+	mgr := NewTokenManager(path, "machine-A")
+	require.NoError(t, mgr.Save("my-token"))
+
+	require.NoError(t, mgr.Clear())
+
+	_, err := os.Stat(path)
+	require.Error(t, err)
+	assert.True(t, os.IsNotExist(err))
+	assert.Equal(t, "", mgr.Token())
+}
+
+func TestTokenManager_Clear_MissingFile(t *testing.T) {
+	path := tokenFile(t)
+	mgr := NewTokenManager(path, "machine-A")
+	require.NoError(t, mgr.Clear())
+}
+
 // ── IsTokenValid ──────────────────────────────────────────────────────────────
 
 func TestIsTokenValid_Valid(t *testing.T) {
@@ -226,4 +245,13 @@ func TestSTSManager_IsSTSValid_Expired(t *testing.T) {
 func TestSTSManager_IsSTSValid_NoCredentials(t *testing.T) {
 	mgr := NewSTSManager()
 	assert.False(t, mgr.IsSTSValid())
+}
+
+func TestSTSManager_Clear(t *testing.T) {
+	mgr := NewSTSManager()
+	mgr.SetSTS(&STSCredentials{Expiry: time.Now().Add(time.Hour)})
+	require.NotNil(t, mgr.GetSTS())
+
+	mgr.Clear()
+	assert.Nil(t, mgr.GetSTS())
 }

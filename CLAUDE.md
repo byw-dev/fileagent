@@ -234,7 +234,8 @@ docker compose -f deploy/docker-compose.test.yml down -v
 
 ## 当前阶段
 
-查看 `TASK_LIST.md` 了解当前任务和进度。
+当前为 **Phase 3 — 集成联调**（`T3-1` 已完成，`T3-2`/`T3-3` 待完成）。
+详细任务与状态以 `TASK_LIST.md` 为准。
 
 **开始任务前必须确认：**
 1. 当前处于哪个 Phase？

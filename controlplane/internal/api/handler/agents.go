@@ -196,6 +196,13 @@ func (h *AgentsHandler) Revoke(c *gin.Context) {
 		})
 		return
 	}
+	if h.registry != nil && h.registry.IsOnline(id.String()) {
+		h.registry.Send(id.String(), &agentv1.ServerMessage{
+			Payload: &agentv1.ServerMessage_Revoke{
+				Revoke: &agentv1.RevokeCommand{Reason: "revoked_by_admin"},
+			},
+		})
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "agent revoked"})
 }
 
