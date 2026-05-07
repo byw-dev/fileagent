@@ -138,6 +138,9 @@ func (m *Manager) Register(ctx context.Context, req *agentv1.RegisterRequest) (*
 }
 
 // PollApproval returns the current approval status for an agent.
+// When the agent has been approved and a JWT service is configured, it issues a
+// fresh auth token so the agent can begin using the Connect RPC. The raw token
+// is never persisted; the agent must save it locally upon receipt.
 func (m *Manager) PollApproval(ctx context.Context, req *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error) {
 	agentID, err := uuid.Parse(req.GetAgentId())
 	if err != nil {
@@ -147,10 +150,34 @@ func (m *Manager) PollApproval(ctx context.Context, req *agentv1.PollApprovalReq
 	if err != nil {
 		return nil, fmt.Errorf("poll_approval: get agent: %w", err)
 	}
-	return &agentv1.PollApprovalResponse{
+	resp := &agentv1.PollApprovalResponse{
 		Status:  string(agent.Status),
 		Message: statusMessage(agent.Status),
-	}, nil
+	}
+	if agent.Status == db.AgentStatusApproved && m.jwtSvc != nil {
+		rawToken, err := m.jwtSvc.GenerateAccessToken(
+			agentID.String(),
+			agent.OrgID.String(),
+			"agent",
+			agent.Name,
+			m.accessTTL,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("poll_approval: generate token: %w", err)
+		}
+		// Update the stored hash so revocation tracking stays current.
+		sum := sha256.Sum256([]byte(rawToken))
+		hash := hex.EncodeToString(sum[:])
+		expiresAt := time.Now().Add(m.accessTTL)
+		if _, err = m.db.UpdateAgentAuthToken(ctx, agentID,
+			sql.NullString{String: hash, Valid: true},
+			sql.NullTime{Time: expiresAt, Valid: true},
+		); err != nil {
+			return nil, fmt.Errorf("poll_approval: update token record: %w", err)
+		}
+		resp.AuthToken = rawToken
+	}
+	return resp, nil
 }
 
 // ApproveAgent approves an agent, generates its auth token, and returns the
