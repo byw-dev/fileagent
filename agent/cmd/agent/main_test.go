@@ -146,7 +146,7 @@ func TestSubmitFile_SubmitsNewFile(t *testing.T) {
 	submitFile(exec, q, rule, "/tmp/f.txt", 100, time.Now(), 0, "", zap.NewNop())
 
 	// Allow time for async worker to process.
-	require.Eventually(t, func() bool { return submitted }, 3*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return submitted }, 1*time.Second, 10*time.Millisecond)
 }
 
 func TestSubmitFile_SkipsDuplicate(t *testing.T) {
@@ -194,7 +194,7 @@ func TestWalkAndSubmit_SubmitsMatchingFiles(t *testing.T) {
 	rule := scheduler.CollectionRule{RuleID: "r2", FileGlob: "*.log", UploadBucket: "bkt", UploadPathTemplate: "logs"}
 	walkAndSubmit(context.Background(), exec, q, rule, dir, zap.NewNop())
 
-	require.Eventually(t, func() bool { return len(submitted) == 1 }, 3*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return len(submitted) == 1 }, 1*time.Second, 10*time.Millisecond)
 	assert.Contains(t, submitted[0], "a.log")
 }
 
