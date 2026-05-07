@@ -25,10 +25,14 @@ const (
 
 // jwtExemptMethods lists gRPC full method names that do not require a JWT.
 // Register and PollApproval are exempted because they are called before the
-// Agent has been issued a token.
+// Agent has been issued a token. The reflection endpoints are exempted so that
+// standard tooling (grpcurl, grpc_cli) can discover service descriptors without
+// a token — required before any method call can be made.
 var jwtExemptMethods = map[string]bool{
-	"/fileagent.v1.AgentService/Register":    true,
-	"/fileagent.v1.AgentService/PollApproval": true,
+	"/fileagent.v1.AgentService/Register":                           true,
+	"/fileagent.v1.AgentService/PollApproval":                       true,
+	"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo":     true,
+	"/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo": true,
 }
 
 // jwtUnaryInterceptor is a gRPC unary server interceptor that validates the
