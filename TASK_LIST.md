@@ -189,16 +189,16 @@ Phase 4  完善与收尾（可并行）
 
 | 任务 | 内容摘要 | 类型 | 优先级 | 状态 |
 |------|---------|------|--------|------|
-| P3-P1 DB 集成测试环境修复 | `fileagent_test` DB 不存在，3 个集成测试常态失败 | 测试环境 | 🔴 阻塞 | ⬜ |
-| P3-P2 DownloadURL bucket 名 Bug 修复 | `DownloadURL`/`BatchDownloadURLs` 用 UUID 而非 bucket 名调用 MinIO；TTL 5min → 15min | 🔴 功能 Bug | 🔴 阻塞 | ⬜ |
-| P3-P3 BucketsCreate 调用 MinIO Admin API | `POST /api/v1/buckets` 缺少 `madmin.MakeBucket()` 调用，MinIO 中无物理 Bucket | 🔴 功能缺口 | 🔴 阻塞 | ⬜ |
-| P3-P4 append_mode tail/close_wait 实现 | watcher/executor 均未处理 `tail`（offset 增量上传）和 `close_wait`（CLOSE_WRITE 触发）逻辑 | 🔴 功能缺口 | 🔴 阻塞 | ⬜ |
-| P3-P5 grpcclient 覆盖率补全 | 当前 61.5%（要求≥80%）；T2-X6 全部新增方法均在 0% | 测试覆盖 | 🔴 阻塞 | ⬜ |
-| P3-P6 event 包覆盖率补全 | 当前 62.7%（要求≥80%）；`processRetries/retryDelivery/DBAdapter/NewEngine` 均在 0% | 测试覆盖 | 🔴 阻塞 | ⬜ |
-| P3-P7 事件重试逻辑对齐设计 §5.9 | 退避表错误（30s×2^n 而非 30s→2min→10min→30min→2h）；无最多5次限制；上限1h非2h | 🟡 设计偏差 | 🟡 高 | ⬜ |
-| P3-P8 MinioEventHandler 调用 Indexer | `Handle` 只打日志，未调用 Indexer，MinIO Webhook 备用采集链路失效 | 🟡 功能缺口 | 🟡 高 | ⬜ |
-| P3-P9 REST handler 覆盖率补全 | `DownloadURL` 47.6%、`events.Delete` 58.3%、`MinioEventHandler.Handle` 0%、`authdb` 全部 0% | 测试覆盖 | 🟡 高 | ⬜ |
-| P3-P10 queue 包覆盖率补全 | 当前 79.5%（要求≥80%）；`Open` 错误路径 62.5% | 测试覆盖 | 🟢 中 | ⬜ |
+| P3-P1 DB 集成测试环境修复 | `fileagent_test` DB 不存在，3 个集成测试常态失败 | 测试环境 | 🔴 阻塞 | ✅ |
+| P3-P2 DownloadURL bucket 名 Bug 修复 | `DownloadURL`/`BatchDownloadURLs` 用 UUID 而非 bucket 名调用 MinIO；TTL 5min → 15min | 🔴 功能 Bug | 🔴 阻塞 | ✅ |
+| P3-P3 BucketsCreate 调用 MinIO Admin API | `POST /api/v1/buckets` 缺少 `madmin.MakeBucket()` 调用，MinIO 中无物理 Bucket | 🔴 功能缺口 | 🔴 阻塞 | ✅ |
+| P3-P4 append_mode tail/close_wait 实现 | watcher/executor 均未处理 `tail`（offset 增量上传）和 `close_wait`（CLOSE_WRITE 触发）逻辑 | 🔴 功能缺口 | 🔴 阻塞 | ✅ |
+| P3-P5 grpcclient 覆盖率补全 | 当前 61.5%（要求≥80%）；T2-X6 全部新增方法均在 0% | 测试覆盖 | 🔴 阻塞 | ✅ |
+| P3-P6 event 包覆盖率补全 | 当前 62.7%（要求≥80%）；`processRetries/retryDelivery/DBAdapter/NewEngine` 均在 0% | 测试覆盖 | 🔴 阻塞 | ✅ |
+| P3-P7 事件重试逻辑对齐设计 §5.9 | 退避表错误（30s×2^n 而非 30s→2min→10min→30min→2h）；无最多5次限制；上限1h非2h | 🟡 设计偏差 | 🟡 高 | ✅ |
+| P3-P8 MinioEventHandler 调用 Indexer | `Handle` 只打日志，未调用 Indexer，MinIO Webhook 备用采集链路失效 | 🟡 功能缺口 | 🟡 高 | ✅ |
+| P3-P9 REST handler 覆盖率补全 | `DownloadURL` 47.6%、`events.Delete` 58.3%、`MinioEventHandler.Handle` 0%、`authdb` 全部 0% | 测试覆盖 | 🟡 高 | ✅ |
+| P3-P10 queue 包覆盖率补全 | 当前 79.5%（要求≥80%）；`Open` 错误路径 62.5% | 测试覆盖 | 🟢 中 | ✅ |
 
 ---
 
