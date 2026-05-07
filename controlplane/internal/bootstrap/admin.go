@@ -13,8 +13,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// defaultOrgID matches the seeded default organization in migration
-// 000001_init_schema.up.sql for single-org deployments.
+// defaultOrgID must match the organization ID seeded in
+// controlplane/migrations/000001_init_schema.up.sql for single-org deployments.
 var defaultOrgID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
 
 const generatedPasswordLength = 16
@@ -123,13 +123,20 @@ func generatePassword(length int) (string, error) {
 	if length <= 0 {
 		return "", errors.New("password length must be greater than 0")
 	}
-	buf := make([]byte, length)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
 	out := make([]byte, length)
-	for i, b := range buf {
-		out[i] = alphabet[int(b)%len(alphabet)]
+	maxValidByte := byte(256 - (256 % len(alphabet)))
+	for i := range out {
+		for {
+			var rb [1]byte
+			if _, err := rand.Read(rb[:]); err != nil {
+				return "", err
+			}
+			if rb[0] >= maxValidByte {
+				continue
+			}
+			out[i] = alphabet[int(rb[0])%len(alphabet)]
+			break
+		}
 	}
 	return string(out), nil
 }
