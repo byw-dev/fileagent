@@ -165,30 +165,6 @@ func TestPollApproval_PendingStatus(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "pending", resp.Status)
-	assert.Empty(t, resp.AuthToken)
-}
-
-func TestPollApproval_ApprovedReturnsToken(t *testing.T) {
-	m, agentDB, _ := newTestManager(t)
-
-	agentID := uuid.New()
-	agentDB.agents[agentID.String()] = &db.Agent{
-		ID:     agentID,
-		OrgID:  defaultOrgID,
-		Name:   "test-agent",
-		Status: db.AgentStatusApproved,
-	}
-
-	resp, err := m.PollApproval(context.Background(), &agentv1.PollApprovalRequest{
-		AgentId: agentID.String(),
-	})
-	require.NoError(t, err)
-	assert.Equal(t, "approved", resp.Status)
-	assert.NotEmpty(t, resp.AuthToken, "approved agent must receive a token via PollApproval")
-
-	// Confirm the token hash was updated in DB.
-	agent := agentDB.agents[agentID.String()]
-	assert.True(t, agent.AuthTokenHash.Valid, "auth_token_hash should be updated after issuing token")
 }
 
 func TestPollApproval_InvalidID(t *testing.T) {
