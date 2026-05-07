@@ -635,10 +635,10 @@ func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPa
 | Phase 1 | 15 | 15 | 100% |
 | Phase 2 核心 | 20 | 20 | 100%（含组件包逻辑）|
 | Phase 2 遗留（T2-X） | 8 | 8（全部完成）| 100% |
-| Phase 3 前质量关卡（P3-P） | 10 | 0 | 0% |
+| Phase 3 前质量关卡（P3-P） | 10 | 10 | 100% |
 | Phase 3 | 3 | 0 | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **65** | **44** | **68%** |
+| **合计** | **65** | **54** | **83%** |
 
 ---
 
