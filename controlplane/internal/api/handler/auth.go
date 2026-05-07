@@ -43,12 +43,21 @@ type loginRequest struct {
 	Password string `json:"password" binding:"required"`
 }
 
+// userInfo is the user object embedded in auth responses.
+type userInfo struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	OrgID    string `json:"org_id"`
+}
+
 // loginResponse is returned by POST /api/auth/login on success.
 type loginResponse struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int    `json:"expires_in"`
-	TokenType    string `json:"token_type"`
+	AccessToken  string    `json:"access_token"`
+	RefreshToken string    `json:"refresh_token"`
+	ExpiresIn    int       `json:"expires_in"`
+	TokenType    string    `json:"token_type"`
+	User         *userInfo `json:"user,omitempty"`
 }
 
 // Login handles POST /api/auth/login.
@@ -128,6 +137,12 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		RefreshToken: refreshToken,
 		ExpiresIn:    int(accessTTL.Seconds()),
 		TokenType:    "Bearer",
+		User: &userInfo{
+			ID:       user.ID.String(),
+			Username: user.Username,
+			Role:     string(user.Role),
+			OrgID:    user.OrgID.String(),
+		},
 	})
 }
 
@@ -248,7 +263,7 @@ func (h *AuthHandler) Me(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"user_id":  claims.Subject,
+		"id":       claims.Subject,
 		"username": claims.Username,
 		"role":     claims.Role,
 		"org_id":   claims.OrgID,
@@ -261,4 +276,3 @@ func (h *AuthHandler) Me(c *gin.Context) {
 func (h *AuthHandler) OIDCCallback(c *gin.Context) {
 	middleware.NotImplemented(c)
 }
-
