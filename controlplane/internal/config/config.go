@@ -59,6 +59,16 @@ type Config struct {
 	// InternalWebhookSecret is the shared secret for MinIO → Control Plane events.
 	// Optional; if empty, the internal webhook endpoint is unauthenticated.
 	InternalWebhookSecret string
+
+	// BootstrapAdminUsername is the username used for first-start admin creation.
+	// Default: "admin".
+	BootstrapAdminUsername string
+	// BootstrapAdminPassword optionally sets the bootstrap admin password.
+	// If empty and first-start bootstrap is needed, a random password is generated.
+	BootstrapAdminPassword string
+	// BootstrapAdminForceReset forces resetting the bootstrap admin password on
+	// startup when BootstrapAdminPassword is set.
+	BootstrapAdminForceReset bool
 }
 
 // Load reads configuration from environment variables and returns a validated
@@ -119,6 +129,9 @@ func Load() (*Config, error) {
 	// ── misc ─────────────────────────────────────────────────────────────────
 	cfg.LogLevel = envString("LOG_LEVEL", "info")
 	cfg.InternalWebhookSecret = os.Getenv("INTERNAL_WEBHOOK_SECRET")
+	cfg.BootstrapAdminUsername = envString("BOOTSTRAP_ADMIN_USERNAME", "admin")
+	cfg.BootstrapAdminPassword = os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
+	cfg.BootstrapAdminForceReset = envBool("BOOTSTRAP_ADMIN_FORCE_RESET", false)
 
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required environment variables: %s",
@@ -148,6 +161,12 @@ func (c *Config) Validate() error {
 	validLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
 	if !validLevels[c.LogLevel] {
 		return fmt.Errorf("LOG_LEVEL must be one of debug/info/warn/error, got %q", c.LogLevel)
+	}
+	if c.BootstrapAdminUsername == "" {
+		return errors.New("BOOTSTRAP_ADMIN_USERNAME cannot be empty")
+	}
+	if c.BootstrapAdminForceReset && c.BootstrapAdminPassword == "" {
+		return errors.New("BOOTSTRAP_ADMIN_PASSWORD is required when BOOTSTRAP_ADMIN_FORCE_RESET=true")
 	}
 	return nil
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/api"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
+	"github.com/byw-dev/fileagent/controlplane/internal/bootstrap"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/config"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
@@ -131,6 +132,30 @@ func main() {
 	authSvc := auth.New(cfg.JWTSecret, redisClient)
 
 	queries := db.New(database)
+	bootstrapResult, err := bootstrap.EnsureAdminAccount(
+		ctx,
+		queries,
+		cfg.BootstrapAdminUsername,
+		cfg.BootstrapAdminPassword,
+		cfg.BootstrapAdminForceReset,
+	)
+	if err != nil {
+		logger.Fatal("bootstrap admin failed", zap.Error(err))
+	}
+	if bootstrapResult.Created {
+		logger.Warn("bootstrap admin user created",
+			zap.String("username", bootstrapResult.Username),
+			zap.String("password", bootstrapResult.Password),
+			zap.String("action", "please login and change password immediately"),
+		)
+	}
+	if bootstrapResult.Reset {
+		logger.Warn("bootstrap admin password reset by configuration",
+			zap.String("username", bootstrapResult.Username),
+			zap.String("password", bootstrapResult.Password),
+			zap.String("action", "disable BOOTSTRAP_ADMIN_FORCE_RESET after recovery"),
+		)
+	}
 	agentMgr := agent.NewManager(queries, redisClient, authSvc, nats, logger, cfg.JWTAccessTokenTTL)
 
 	registry := grpcserver.NewAgentRegistry()

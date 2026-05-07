@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/fs"
 	"os"
@@ -35,7 +36,13 @@ type ruleHandle struct {
 
 func main() {
 	// ── 1. Load configuration ────────────────────────────────────────────────
-	cfgPath := os.Getenv("AGENT_CONFIG")
+	configFlag := flag.String("config", "", "Path to agent TOML configuration file")
+	flag.Parse()
+
+	cfgPath := *configFlag
+	if cfgPath == "" {
+		cfgPath = os.Getenv("AGENT_CONFIG")
+	}
 	if cfgPath == "" {
 		cfgPath = "config.toml"
 	}

@@ -28,13 +28,13 @@ func setEnv(t *testing.T, pairs map[string]string) {
 // successful Load().
 func validEnv() map[string]string {
 	return map[string]string{
-		"DATABASE_URL":    "postgres://user:pass@localhost:5432/fileagent?sslmode=disable",
-		"REDIS_URL":       "redis://localhost:6379/0",
-		"JWT_SECRET":      "supersecret",
-		"MINIO_ENDPOINT":  "localhost:9000",
+		"DATABASE_URL":     "postgres://user:pass@localhost:5432/fileagent?sslmode=disable",
+		"REDIS_URL":        "redis://localhost:6379/0",
+		"JWT_SECRET":       "supersecret",
+		"MINIO_ENDPOINT":   "localhost:9000",
 		"MINIO_ACCESS_KEY": "minioadmin",
 		"MINIO_SECRET_KEY": "minioadmin",
-		"NATS_URL":        "nats://localhost:4222",
+		"NATS_URL":         "nats://localhost:4222",
 	}
 }
 
@@ -67,6 +67,9 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, "migrations", cfg.MigrationsPath)
 	assert.False(t, cfg.MinIOUseSSL)
 	assert.Equal(t, "arn:aws:iam:::role/agent-role", cfg.MinIORoleARN)
+	assert.Equal(t, "admin", cfg.BootstrapAdminUsername)
+	assert.Equal(t, "", cfg.BootstrapAdminPassword)
+	assert.False(t, cfg.BootstrapAdminForceReset)
 }
 
 func TestLoad_CustomPorts(t *testing.T) {
@@ -172,6 +175,18 @@ func TestValidate_ValidConfig(t *testing.T) {
 	cfg, err := Load()
 	require.NoError(t, err)
 	assert.NoError(t, cfg.Validate())
+}
+
+func TestValidate_BootstrapForceResetRequiresPassword(t *testing.T) {
+	setEnv(t, validEnv())
+	setEnv(t, map[string]string{
+		"BOOTSTRAP_ADMIN_FORCE_RESET": "true",
+	})
+	os.Unsetenv("BOOTSTRAP_ADMIN_PASSWORD")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Error(t, cfg.Validate())
 }
 
 func TestValidate_InvalidPort(t *testing.T) {
