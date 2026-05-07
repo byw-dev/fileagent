@@ -25,6 +25,17 @@ import (
 
 const integrationDefaultOrgID = "00000000-0000-0000-0000-000000000001"
 
+type integrationLoginRespBody struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	User         struct {
+		ID       string `json:"id"`
+		Username string `json:"username"`
+		Role     string `json:"role"`
+		OrgID    string `json:"org_id"`
+	} `json:"user"`
+}
+
 func integrationTestDSN(t *testing.T) string {
 	t.Helper()
 	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
@@ -33,7 +44,7 @@ func integrationTestDSN(t *testing.T) string {
 	return "postgres://fileagent:fileagent@localhost:5432/fileagent_test?sslmode=disable"
 }
 
-func setupIntegrationAuthRouter(t *testing.T) (*controlplanedb.DB, *controlplanedb.Queries, *gin.Engine) {
+func setupIntegrationTestRouter(t *testing.T) (*controlplanedb.DB, *controlplanedb.Queries, *gin.Engine) {
 	t.Helper()
 
 	logger := zap.NewNop()
@@ -70,7 +81,7 @@ func createIntegrationAuthUser(t *testing.T, q *controlplanedb.Queries) *control
 }
 
 func TestLogin_Integration_IncludesUserPayload(t *testing.T) {
-	_, queries, router := setupIntegrationAuthRouter(t)
+	_, queries, router := setupIntegrationTestRouter(t)
 	user := createIntegrationAuthUser(t, queries)
 
 	body := `{"username":"` + user.Username + `","password":"testpass"}`
@@ -81,7 +92,7 @@ func TestLogin_Integration_IncludesUserPayload(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, w.Code)
 
-	var resp loginRespBody
+	var resp integrationLoginRespBody
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.NotEmpty(t, resp.AccessToken)
 	assert.NotEmpty(t, resp.RefreshToken)
@@ -92,7 +103,7 @@ func TestLogin_Integration_IncludesUserPayload(t *testing.T) {
 }
 
 func TestMe_Integration_ReturnsIDField(t *testing.T) {
-	_, queries, router := setupIntegrationAuthRouter(t)
+	_, queries, router := setupIntegrationTestRouter(t)
 	user := createIntegrationAuthUser(t, queries)
 
 	loginBody := `{"username":"` + user.Username + `","password":"testpass"}`
@@ -102,7 +113,7 @@ func TestMe_Integration_ReturnsIDField(t *testing.T) {
 	router.ServeHTTP(loginResp, loginReq)
 	require.Equal(t, http.StatusOK, loginResp.Code)
 
-	var authResp loginRespBody
+	var authResp integrationLoginRespBody
 	require.NoError(t, json.Unmarshal(loginResp.Body.Bytes(), &authResp))
 
 	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
