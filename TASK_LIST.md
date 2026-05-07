@@ -598,11 +598,24 @@ func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPa
 
 ## Phase 3 — 集成联调（串行，依赖 Phase 2 全部完成）
 
-### T3-1 Control Plane + Agent 端到端联调 ✅
-- [x] Agent 注册 → 审批 → 建立 gRPC 连接
-- [x] 下发采集规则 → Watch 模式 → 文件上传 MinIO → file_entries 写入
-- [x] 模拟网络中断 → OFFLINE → 本地队列工作 → 重连后补传
-- [x] 吊销 Agent → 收到 RevokeCommand → 清除 Token
+### T3-1 Control Plane + Agent 端到端联调 ⚠️ 部分完成（CP 侧已验收，Agent 侧存在缺陷）
+
+> **2026-05-07 审计结论：虚假验收，须补充 T3-1-FIX。**
+> T3-1 仅完成了 Control Plane gRPC 服务器的孤立单元测试（via bufconn 内存连接 + insecure 凭据 + Mock AgentManager），
+> 从未验证真实 Agent 二进制 → TLS → Control Plane 的端到端链路。
+> 真实部署时 Agent 首次启动即 fatal 退出，根本无法进入注册审批流程。
+> 详见下方 T3-1-FIX。
+
+- [x] CP 侧：Register / PollApproval / Connect 处理器逻辑（via bufconn 集成测试）
+- [x] CP 侧：规则下发（SyncRulesOnConnect → PushRuleCommand）
+- [x] CP 侧：断流重连后规则重新同步 + UploadResult 索引
+- [x] CP 侧：RevokeCommand 下发，Agent 连接侧收到吊销指令
+- [x] CP 侧：`POST /api/v1/agents/:id/revoke` 在线下发 RevokeCommand
+- [x] Agent 侧：收到 RevokeCommand 后清理 Token/STS 并优雅退出
+- [ ] **Agent 侧：首次启动无 Token 时应等待审批，而非 fatal 退出**（缺陷，T3-1-FIX 修复）
+- [ ] **Agent 侧：Register 失败时应重试，而非立即返回错误**（缺陷，T3-1-FIX 修复）
+- [ ] **Agent 侧：Connect runLoop 应在 Token 就绪后才启动**（架构缺陷，T3-1-FIX 修复）
+- [ ] **真实 TLS 路径的端到端集成测试**（T3-1-FIX 补充）
 
 #### T3-1 实施规格（2026-05-07）
 
@@ -614,6 +627,329 @@ func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPa
 6. **功能补全**：
    - Control Plane：`POST /api/v1/agents/:id/revoke` 在 Agent 在线时主动下发 `RevokeCommand`。
    - Agent：收到 `RevokeCommand` 后清理本地 Token 文件与内存 STS，并触发优雅退出。
+
+---
+
+### T3-1-FIX Agent 生命周期健壮性修复 ⬜
+
+> **前置依赖：无（可立即开始）**
+> 
+> **问题背景**：真实部署中，Agent 首次启动时没有本地 Token，需要先向 Control Plane 注册、
+> 等待管理员审批，再获得 JWT Token，最后才建立 Connect 长连接。
+> 设计文档 §4.2 明确描述了这个状态机：`INIT → PENDING → APPROVED → RUNNING`。
+> 但当前实现存在三个缺陷，导致 Agent 在正常的首次注册场景下就会 fatal 退出。
+
+#### 缺陷根因分析
+
+**缺陷 A — Register 无重试，失败即 fatal**
+
+`Lifecycle.Start()` 中：
+```go
+agentID, err := Register(ctx, svc, cfg, fp, logger)
+if err != nil {
+    return fmt.Errorf("lifecycle: register: %w", err)  // 直接返回错误，无重试
+}
+```
+`main.go` 对此直接调用 `logger.Fatal()`。
+任何暂时性网络错误（连接超时、服务未就绪、TLS 握手抖动）都会导致进程退出。
+按设计，Register 是 INIT 阶段的首步，应使用指数退避重试，直到 ctx 取消或被明确拒绝。
+
+**缺陷 B — Connect runLoop 在 Token 就绪前启动**
+
+`main.go` 的调用顺序：
+```
+grpcClient.Connect(ctx)   // 启动 runLoop goroutine，立即尝试打开 Connect 流
+↓
+lc.Start(ctx, ...)        // 注册 + 等待审批（可能耗时数分钟到数小时）
+↓
+grpcClient.SetToken(...)  // Token 此时才就绪
+```
+`runLoop` 在获得 Token 之前就开始调用 Connect RPC：
+- Token 为空时，`openStream` 不携带 Authorization header
+- 服务端 JWT 拦截器拒绝（`Unauthenticated: missing authorization header`）
+- runLoop 进入退避等待后重试，产生持续的错误日志噪音
+- 设计文档 §5.5 序列图明确：Connect RPC 应在 `PollApproval(approved + token)` **之后**发起
+
+**缺陷 C — main.go Fatal 退出**
+
+```go
+if err := lc.Start(ctx, grpcClient.ServiceClient(), cfg, logger); err != nil {
+    logger.Fatal("lifecycle start failed", zap.Error(err))
+}
+```
+`logger.Fatal` → `os.Exit(1)`，没有任何重试或优雅降级。
+这将暂时性错误（网络问题）与永久性错误（配置错误、被明确拒绝）等同处理，全部导致进程退出。
+
+#### T3-1-FIX 实施规格
+
+**FIX-1：Register 加指数退避重试（`agent/internal/grpcclient/registration.go`）**
+
+在 `Lifecycle.Start()` 中，为 `Register` 调用添加重试循环：
+- 初始等待：5s，指数增长，上限 60s
+- 只有以下情况才停止重试并向上层返回错误：
+  - `ctx` 已取消（`ctx.Err() != nil`）
+  - 服务端明确返回 `status.Code == codes.PermissionDenied`（被拒绝）
+  - 服务端明确返回 `status.Code == codes.AlreadyExists`（已注册）
+- 其他所有错误（网络、TLS、超时、`Unavailable`）均重试，记录 WARN 日志
+
+**FIX-2：Connect runLoop 延后启动（`agent/cmd/agent/main.go`）**
+
+将 `grpcClient.Connect(ctx)` 移到 `lc.Start()` 之后：
+```go
+// 先完成注册审批，获取 Token
+lc := grpcclient.NewLifecycle(tokenMgr, stsMgr)
+if err := lc.Start(ctx, ...); err != nil { ... }
+
+// Token 就绪后再启动 gRPC 连接
+grpcClient.SetToken(lc.TokenManager.Token())
+grpcClient.SetAgentID(lc.AgentID)
+if err := grpcClient.Connect(ctx); err != nil { ... }
+```
+或者：将 `grpcClient.Connect(ctx)` 拆分为 `Dial()`（仅建立连接，不启动 runLoop）和 `Run(ctx)`（启动 runLoop），在 Token 就绪后才调用 `Run(ctx)`。
+
+**FIX-3：lc.Start() 失败不 Fatal，只对 Fatal 类错误退出**
+
+`lc.Start()` 内部已处理重试（FIX-1 修复后），只在以下情况返回错误：
+- `ctx.Err()` — 用户主动中断
+- 明确被拒绝
+
+`main.go` 中的处理改为：
+```go
+if err := lc.Start(ctx, ...); err != nil {
+    if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+        logger.Info("agent: shutdown during registration", zap.Error(err))
+    } else {
+        logger.Error("agent: registration failed, exiting", zap.Error(err))
+    }
+    return  // 用 return 代替 Fatal，让 defer 能正常执行
+}
+```
+
+**FIX-4：补充 Agent 侧生命周期单元测试（`agent/internal/grpcclient/registration_test.go`）**
+
+新增以下测试场景：
+- `TestRegister_RetryOnTransientError`：模拟前 N 次 Register 返回 `Unavailable`，第 N+1 次成功，断言重试逻辑正确
+- `TestRegister_StopOnRejected`：模拟 Register 返回 `rejected`，断言不重试直接返回错误
+- `TestRegister_StopOnContextCancel`：模拟 Register 持续失败，ctx 取消后断言立即退出
+- `TestLifecycle_Start_TokenAlreadyExists`：本地 Token 有效时，断言跳过 Register 和 PollApproval
+
+**FIX-5：补充端到端 TLS 路径集成测试（`agent/internal/grpcclient/`）**
+
+新增 `//go:build integration` 测试文件 `e2e_tls_integration_test.go`：
+- 用 `net/http/httptest` 或 `google.golang.org/grpc/credentials` 启动带自签名证书的真实 gRPC 服务器
+- 验证 Agent 用自定义 CA（`tls_ca_cert`）能建立连接
+- 验证 Agent 用系统 CA 能连接到使用受信任证书的服务器
+- 验证 Agent 在 TLS 握手失败时能重试而非立即退出
+
+#### T3-1-FIX 验收标准
+
+1. `go test ./agent/... -run TestRegister_Retry` 全部通过
+2. 启动 Agent（无本地 Token），进程**不退出**，日志显示 `lifecycle: registering... waiting for approval`
+3. 管理员在 Web UI 或 API 审批 Agent 后，Agent 自动建立 Connect 连接并输出 `agent: running`
+4. 断开网络 → Agent 日志显示重试，恢复网络后 → 自动重连，无需人工干预
+5. TLS 握手失败时，Agent 日志输出明确的错误描述和重试信息，而非立即 fatal
+
+---
+
+### T3-1-BUGFIX gRPC 注册链路三个关键 Bug 修复 ⬜
+
+> **前置依赖：T3-1-FIX（可并行，但建议先完成 FIX）**
+>
+> **背景**：2026-05-07 通过 `grpcurl` 端到端验证发现三个独立 Bug，导致 Agent 首次注册
+> 完整链路（Register → PollApproval → Connect）全部失败。以下逐一说明根因、精确代码位置、
+> 修复方案和验收标准。
+
+---
+
+#### Bug A — `Register` 对 `ErrNoRows` 的判断逻辑颠倒，导致首次注册返回零 UUID
+
+**严重程度**：🔴 P0，首次注册必然失败
+
+**根因**
+
+`GetAgentByFingerprint` 由 sqlc 自动生成（`controlplane/internal/db/agents.sql.go:85-108`），
+返回签名为 `(*Agent, error)`。当数据库中不存在对应 fingerprint 时，它返回：
+
+```go
+return &i, err  // &i 是零值 Agent，err == sql.ErrNoRows
+```
+
+注意：**指针永远非 nil**（指向局部变量 `i` 的地址），即使没有查到任何行也是如此。
+
+`Register`（`controlplane/internal/agent/manager.go:78-93`）的判断逻辑：
+
+```go
+existing, err := m.db.GetAgentByFingerprint(ctx, req.GetFingerprint())
+if err != nil && err != sql.ErrNoRows {
+    return nil, ...   // 只过滤非 ErrNoRows 的错误
+}
+if existing != nil {  // ← BUG：永远为 true！
+    // 进入此分支，将 existing.ID.String() = "00000000-..." 返回
+    return &agentv1.RegisterResponse{AgentId: existing.ID.String(), ...}, nil
+}
+```
+
+由于 `existing` 永不为 `nil`，代码总是走"已注册"分支，`agent_id` 返回全零 UUID，
+实际注册逻辑（`CreateAgent`）从不执行。
+
+**为什么测试没有捕获**
+
+测试 Mock（`manager_test.go:44-49`）在未找到时正确返回 `nil, sql.ErrNoRows`：
+```go
+return nil, sql.ErrNoRows  // mock 返回 nil 指针
+```
+而真实的 sqlc 实现返回 `&i, sql.ErrNoRows`（非 nil 指针）。
+Mock 与真实实现的行为不一致，使单元测试无法覆盖这个 Bug。
+
+**修复方案**
+
+文件：`controlplane/internal/agent/manager.go`
+
+将判断逻辑改为先检查 error：
+```go
+existing, err := m.db.GetAgentByFingerprint(ctx, req.GetFingerprint())
+if err != nil && !errors.Is(err, sql.ErrNoRows) {
+    return nil, fmt.Errorf("register: lookup fingerprint: %w", err)
+}
+if err == nil {   // err == nil 才说明真正查到了记录
+    // 处理已注册情况
+    resp := &agentv1.RegisterResponse{...}
+    ...
+    return resp, nil
+}
+// err == sql.ErrNoRows，走新注册流程
+```
+
+同时修复 Mock 与真实实现的行为一致性：`mockAgentDB.GetAgentByFingerprint` 在未找到时
+应返回 `&db.Agent{}, sql.ErrNoRows`（与 sqlc 实现保持一致），以暴露此类 Bug。
+
+**受影响文件**
+
+- `controlplane/internal/agent/manager.go`（主要修复，1 处逻辑变更）
+- `controlplane/internal/agent/manager_test.go`（修复 mock + 补充回归测试）
+
+**验收标准**
+
+1. `grpcurl Register`（fingerprint 未注册）→ 返回真实 UUID（非全零），`status: "pending"`
+2. `grpcurl Register`（相同 fingerprint 再次调用）→ 返回同一 UUID，`message: "Agent already registered"`
+3. 新增测试 `TestRegister_FirstTime_ReturnsRealUUID`：mock 返回 `&db.Agent{}, sql.ErrNoRows`，断言响应 UUID 非零
+4. 新增测试 `TestRegister_ExistingAgent_ReturnsSameUUID`：mock 返回已存在的 Agent，断言同一 UUID
+5. `go test ./controlplane/internal/agent/... -count=1` 全部通过
+
+---
+
+#### Bug B — `PollApproval` 审批通过后从不返回 `auth_token`，Agent 拿到空 Token
+
+**严重程度**：🔴 P0，注册完成也无法建立 Connect 连接
+
+**根因**
+
+`PollApproval`（`controlplane/internal/agent/manager.go:140-154`）始终只返回 `status` 和 `message`，
+`auth_token` 字段永远为空字符串：
+
+```go
+return &agentv1.PollApprovalResponse{
+    Status:  string(agent.Status),
+    Message: statusMessage(agent.Status),
+    // auth_token 字段缺失
+}, nil
+```
+
+Agent 的轮询逻辑（`agent/internal/grpcclient/registration.go:226-229`）：
+
+```go
+case "approved":
+    return resp.GetAuthToken(), nil  // 取到空字符串 ""
+```
+
+空 Token 被 `TokenManager.Save()` 持久化，后续 `grpcClient.SetToken("")`，
+Connect RPC 携带空 Authorization header，JWT 拦截器拒绝（`Unauthenticated: empty token`）。
+
+**相关设计**
+
+根据设计文档 §5.5 序列图，审批通过时 Control Plane 应在 `PollApprovalResponse.auth_token`
+中返回 JWT，Agent 将其保存后才建立 Connect。目前 `ApproveAgent`（`manager.go:158-205`）
+已正确生成 Token 并将 SHA-256 hash 存入 DB，但 `PollApproval` 没有读取并返回 Token。
+
+**两种可行修复方案（二选一）**
+
+方案 1（推荐）：`PollApproval` 中当 `status == approved` 时，调用 `jwtSvc.GenerateAccessToken`
+生成新 Token 并返回，同时更新 DB 中的 `auth_token_hash`。
+
+方案 2：`ApproveAgent` 将明文 Token 额外存入 DB 的某个临时字段（如 `metadata`），
+`PollApproval` 读出后返回并清除。但此方案引入明文 Token 持久化，有安全风险，**不推荐**。
+
+**受影响文件**
+
+- `controlplane/internal/agent/manager.go`（`PollApproval` 函数，约 20 行增量）
+- `controlplane/internal/agent/manager_test.go`（补充 approved 场景测试）
+
+**验收标准**
+
+1. Agent 审批通过后，`PollApproval` 响应的 `auth_token` 字段非空
+2. 返回的 Token 能通过 `jwtSvc.ValidateToken` 验证，且 `claims.Role == "agent"`
+3. Token 的 SHA-256 hash 已更新至 DB `agents.auth_token_hash`（以便吊销链路生效）
+4. 新增测试 `TestPollApproval_ApprovedReturnsToken`：mock 中 agent `status = approved`，
+   断言 `resp.AuthToken` 非空且可验证
+5. 新增测试 `TestPollApproval_PendingReturnsNoToken`：`status = pending`，断言 `resp.AuthToken == ""`
+6. `go test ./controlplane/internal/agent/... -count=1` 全部通过
+
+---
+
+#### Bug C — gRPC 反射服务未豁免 JWT 认证，`grpcurl` 无法解析服务描述符
+
+**严重程度**：🟡 P1，工具链与开发调试受阻（不影响真实 Agent 二进制）
+
+**根因**
+
+`grpcurl`（及所有基于 gRPC 反射的工具）在发起目标 RPC 前，必须先调用反射 API
+`/grpc.reflection.v1.ServerReflection/ServerReflectionInfo` 来解析 proto 描述符。
+该端点未在 `jwtExemptMethods`（`controlplane/internal/grpcserver/interceptor.go:31-36`）
+中豁免，导致即使使用 `-proto` 本地文件的 `grpcurl` 也因为反射握手被 JWT 拦截器拦截
+而收到 `Unauthenticated: missing authorization header`。
+
+**已经存在的豁免列表**（当前代码，已在上一个 commit `1094e66` 中修复）：
+
+```go
+var jwtExemptMethods = map[string]bool{
+    "/fileagent.v1.AgentService/Register":                            true,
+    "/fileagent.v1.AgentService/PollApproval":                       true,
+    "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo":     true,  // 已添加
+    "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo": true,  // 已添加
+}
+```
+
+**注意**：此 Bug 已在 commit `1094e66` 中修复。但对应的单元测试尚不完整：
+`interceptor_test.go` 中缺少对反射端点豁免的专项测试用例。
+
+**受影响文件**
+
+- `controlplane/internal/grpcserver/interceptor.go`（已修复）
+- `controlplane/internal/grpcserver/interceptor_test.go`（需补充测试用例）
+
+**验收标准**
+
+1. `grpcurl -plaintext localhost:9090 list` 能返回服务列表，无需携带 Authorization header
+2. `grpcurl -plaintext localhost:9090 fileagent.v1.AgentService/Register -d '{...}'` 能正常执行
+3. 新增测试 `TestJWTInterceptor_ReflectionEndpointsAreExempt`：分别对
+   `/grpc.reflection.v1.ServerReflection/ServerReflectionInfo` 和
+   `/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo` 发起无 token 请求，
+   断言拦截器放行（不返回 `Unauthenticated`）
+4. `go test ./controlplane/internal/grpcserver/... -count=1` 全部通过
+
+---
+
+#### 三个 Bug 的修复顺序建议
+
+```
+Bug A（Register 判断逻辑）→ 是 Bug B、C 的前提
+Bug B（PollApproval auth_token）→ Register 正常后才能验证
+Bug C（反射豁免）→ 独立，但须补充测试
+```
+
+建议实施顺序：Bug A → Bug B → Bug C（补测试）
+
+---
 
 ### T3-2 Web UI + Control Plane 联调 ⬜
 - [ ] 登录 → 仪表盘数据正确
@@ -647,9 +983,9 @@ func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPa
 | Phase 2 核心 | 20 | 20 | 100%（含组件包逻辑）|
 | Phase 2 遗留（T2-X） | 8 | 8（全部完成）| 100% |
 | Phase 3 前质量关卡（P3-P） | 10 | 10 | 100% |
-| Phase 3 | 3 | 1 | 33% |
+| Phase 3 | 5 | 0（T3-1 部分完成已降级；T3-1-FIX、T3-1-BUGFIX 待完成） | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **65** | **55** | **85%** |
+| **合计** | **67** | **55** | **82%** |
 
 ---
 
