@@ -951,7 +951,519 @@ Bug C（反射豁免）→ 独立，但须补充测试
 
 ---
 
+### T3-2-FIX Web UI 采集器页面 API 契约对齐 ⬜
+
+> **前置依赖：无（与 T3-1-FIX / T3-1-BUGFIX 并行可行）**
+>
+> **问题背景（2026-05-07 现场验证发现）**：
+> 通过 grpcurl 注册 Agent 成功，数据库中有正确记录，REST API `GET /api/v1/agents` 返回数据正确，
+> 但 WebUI「采集器」页面**表格始终为空**，详情页所有字段空白，状态徽章色彩错误，审批/吊销按钮消失。
+>
+> 根本原因是 T2-C3（采集器列表与详情）和 T2-X4（REST Handler 实现）被分别独立验收：
+> T2-X4 只检查 HTTP 状态码和基本业务逻辑，T2-C3 只检查页面结构是否存在，
+> **两者均未核实前后端 JSON 契约是否匹配**，导致四类契约错位同时存在但均未被发现。
+> 这是"验收标准不够清晰"的典型案例：T2-C3 和 T2-X4 的验收指标应该包含端到端数据流测试，
+> 但实际上只做了孤立的单元测试（Mock 数据 / 结构存在即通过）。
+
+---
+
+#### 契约错位根因分析
+
+**错位 1（致命）：响应信封不匹配 — 直接导致表格永远为空**
+
+| 层 | 实现位置 | 实际值 | 前端期望值 |
+|----|---------|--------|-----------|
+| Backend `List` 响应体 | `agents.go:120` | `{"data":[...]}` | `{"items":[...],"total":N,"next_cursor":null}` |
+
+`listAgents()` 函数（`services/agents.ts:45`）把 Axios 的 `response.data` 当作 `PaginatedResponse<Agent>` 使用，
+实际上 `response.data` 是 `{"data":[...]}` 对象，因此 `data.items` 是 `undefined`。
+`index.tsx:198` 返回 `{ data: undefined, success: true }` 给 ProTable，ProTable 渲染空行。
+设计文档 §8.5 明确规定响应格式为 `{"items":[...],"total":N,"next_cursor":"...","has_more":true}`，
+后端实现未遵守。
+
+**错位 2（功能缺陷）：状态枚举大小写不一致 — 导致审批/吊销按钮永远不显示**
+
+| 层 | 实现位置 | 实际值 | 前端期望值 |
+|----|---------|--------|-----------|
+| DB 枚举（`models.go:64-68`） | `AgentStatusPending = "pending"` 等 | 全小写 `pending/approved/online/offline/revoked` | 前端 `AgentStatus` 类型全大写 `PENDING/APPROVED/RUNNING/OFFLINE/REVOKED` |
+| 额外差异 | `db.AgentStatusOnline = "online"` | `"online"` | 前端用 `'RUNNING'`（无 `'ONLINE'`） |
+
+`agentResponse.Status = string(a.Status)` 原样透传小写枚举值。
+`index.tsx:141` 的 `agent.status === 'PENDING'` 永远为 false（实际是 `"pending"`），
+审批按钮永远不显示。Tab 过滤发送 `status=PENDING` 但 DB 查询需要 `"pending"`，过滤无效。
+`AgentStatusBadge` STATUS_CONFIG 以大写为 key，全部 fallback 到 `{ color:'default', label:原始字符串 }`，色彩全错。
+
+**错位 3（字段映射）：Agent 实体字段名不一致 — 导致详情页字段全为空/NaN**
+
+| 前端字段名 | 前端使用位置 | 后端返回字段 | 备注 |
+|-----------|------------|------------|------|
+| `hostname` | `index.tsx:86`, `Detail.tsx:279` | `os_info.hostname`（嵌套） | 取不到，显示空 |
+| `os` | `index.tsx:97`, `Detail.tsx:281` | `os_info.os_type`（嵌套） | 取不到，显示空 |
+| `version` | `index.tsx:104` | `os_info.agent_version`（嵌套） | 取不到，显示空 |
+| `last_heartbeat_at` | `index.tsx:118`, `Detail.tsx:286` | `last_seen_at` | 取不到，显示 `-` |
+| `registered_at` | `index.tsx:127`, `Detail.tsx:290` | `created_at` | 取不到，`new Date(undefined)` = `Invalid Date` |
+
+后端 `agentResponse` 的 `OsInfo json.RawMessage` 是一个不透明 JSON blob（`agents.go:77`），
+未展开为顶层字段。前端 `Agent` 接口要求平铺字段，而不是 `os_info` 嵌套对象。
+
+**错位 4（字段映射）：CollectionRule 实体字段名不一致 — 导致详情页规则 Tab 数据错乱**
+
+| 前端字段名 | 后端返回字段 |
+|-----------|------------|
+| `source_path` | `source_path_template` |
+| `file_pattern` | `file_glob` |
+| `dest_bucket_id` | `bucket_id` |
+| `dest_path_template` | `upload_path_template` |
+| `is_active`（boolean） | `status`（string: `"active"`/`"inactive"`） |
+| `run_once_on_start` | 后端响应体中缺失此字段 |
+| `listRules` 响应信封 | `{"data":[...]}` vs 前端 `PaginatedResponse.items` |
+| `listAgentUploadLogs` 响应信封 | 同上 |
+
+**错位 5（功能缺口）：`List` 端点不支持 `status`/`cursor`/`limit` 查询参数**
+
+`AgentsHandler.List`（`agents.go:102-121`）只调用 `db.ListAgents(ctx, orgID)`，
+完全忽略 `status`、`cursor`、`limit` 查询参数。
+前端发送 `GET /api/v1/agents?limit=100` 或 `?status=PENDING&limit=100` 均无效。
+DB 层已有 `ListAgentsByStatus(orgID, status)` 可用但未接入。
+`listRules` 同样忽略 `cursor`/`limit`。
+
+---
+
+#### 修复策略
+
+> **策略选择**：以设计文档 §8.5 定义的 `{"items":[...],"total":N,"next_cursor":"..."}` 为准，
+> 后端修改响应格式；前端同步对齐字段名和状态枚举。两侧改动均须补测试。
+
+---
+
+#### T3-2-FIX-A 后端：`GET /api/v1/agents` 响应格式与参数对齐
+
+**文件**：`controlplane/internal/api/handler/agents.go` + `agents_test.go`
+
+**修改要点**：
+
+1. **响应信封改为 `{items, total, next_cursor}`**（对齐 §8.5）：
+   ```go
+   // 改前
+   c.JSON(http.StatusOK, gin.H{"data": resp})
+   // 改后
+   c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nil})
+   ```
+   （第一版不实现真正的 cursor 分页，total = len(resp)，next_cursor = null）
+
+2. **支持 `status` 查询参数**：读取 `c.Query("status")`，非空时调用 `db.ListAgentsByStatus(ctx, orgID, db.AgentStatus(status))`
+
+3. **支持 `limit` 查询参数**：使用已有的 `parseLimitParam(c)` 在 DB 层截断（或在返回前 slice）
+
+4. **`agentResponse` 展开 `os_info` 字段**：
+   ```go
+   type agentResponse struct {
+       ID          string `json:"id"`
+       OrgID       string `json:"org_id"`
+       Name        string `json:"name"`
+       Status      string `json:"status"`
+       IpAddress   string `json:"ip_address,omitempty"`
+       Hostname    string `json:"hostname,omitempty"`
+       OsType      string `json:"os_type,omitempty"`
+       OsVersion   string `json:"os_version,omitempty"`
+       AgentVersion string `json:"agent_version,omitempty"`
+       LastSeenAt  string `json:"last_seen_at,omitempty"`
+       CreatedAt   string `json:"created_at,omitempty"`
+   }
+   ```
+   `toAgentResponse` 中解析 `a.OsInfo`（`[]byte`）为 map 并展开各字段
+
+5. **状态值大小写**：前端期望大写，DB 存小写，有两种处理方式；
+   推荐在 `toAgentResponse` 中 `strings.ToUpper(string(a.Status))` 转换，
+   同时 `status` 查询参数接受时做 `strings.ToLower` 转换后查 DB
+
+6. **`db.AgentStatusOnline` 特殊处理**：DB 用 `"online"` 而前端用 `"RUNNING"`；
+   在 `toAgentResponse` 中将 `"online"` 映射为 `"RUNNING"`（或更新前端接受 `"ONLINE"`，两者选一须在 DECISIONS.md 记录）
+
+**验收标准**：
+- `GET /api/v1/agents` 返回 `{"items":[...],"total":N,"next_cursor":null}`
+- `GET /api/v1/agents?status=PENDING` 只返回 pending 状态的 agent
+- 每个 agent 对象包含顶层 `hostname`、`os_type`、`agent_version` 字段（非嵌套 `os_info`）
+- 每个 agent 对象的 `status` 值为大写（`"PENDING"` 等）
+- `agents_test.go` 的 `List` 相关测试用例覆盖：全量、按状态过滤、按 limit 截断
+
+---
+
+#### T3-2-FIX-B 后端：`GET /api/v1/agents/:id/rules` 与上传日志端点信封对齐
+
+**文件**：`controlplane/internal/api/handler/agents.go` + `agents_test.go`
+
+**修改要点**：
+
+1. **`ListRules` 响应信封**（`agents.go:332`）：
+   ```go
+   // 改前
+   c.JSON(http.StatusOK, gin.H{"data": resp})
+   // 改后
+   c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nil})
+   ```
+
+2. **`collectionRuleResponse` 字段对齐前端 `CollectionRule` 接口**：
+   | 改前 | 改后 |
+   |------|------|
+   | `source_path_template` | `source_path`（或前端改字段名） |
+   | `file_glob` | `file_pattern` |
+   | `bucket_id` | `dest_bucket_id` |
+   | `upload_path_template` | `dest_path_template` |
+   | `status` string | `is_active` bool（`"active"` → `true`） |
+   | 缺失 | `run_once_on_start` bool |
+
+   > **决策说明**：字段重命名应在 DECISIONS.md 中记录，选择"前端字段名作为 API 规范"。
+
+3. **`ListUploadLogs`（`agents.go:580`）** 同样改为 `items`/`total`/`next_cursor` 信封
+
+**验收标准**：
+- `GET /api/v1/agents/:id/rules` 返回 `{"items":[...],"total":N,"next_cursor":null}`
+- 每条规则包含 `source_path`、`file_pattern`、`dest_bucket_id`、`dest_path_template`、`is_active`（bool）、`run_once_on_start`（bool）
+- `agents_test.go` 补充 `ListRules` 响应形状断言
+
+---
+
+#### T3-2-FIX-C 前端：`Agent` 接口与 `AgentStatus` 对齐
+
+**文件**：`webui/src/services/agents.ts` + `webui/src/components/AgentStatusBadge.tsx` + `webui/src/pages/Agents/index.tsx` + `webui/src/pages/Agents/Detail.tsx` + `webui/src/pages/Agents/Pending.tsx`
+
+**修改要点**：
+
+1. **`AgentStatus` 改为大写**（对齐修复后的后端）：保留现有值 `'PENDING' | 'APPROVED' | 'RUNNING' | 'OFFLINE' | 'REVOKED'`，确认后端 `"online"` 映射为 `"RUNNING"`
+
+2. **`Agent` 接口字段对齐后端新响应**：
+   ```typescript
+   export interface Agent {
+     id: string
+     org_id: string
+     name: string
+     hostname: string          // 来自后端顶层 hostname 字段
+     ip_address: string
+     os_type: string           // 改名：原 os → os_type（与后端对齐）
+     os_version: string
+     agent_version: string     // 改名：原 version → agent_version
+     status: AgentStatus
+     last_seen_at: string | null   // 改名：原 last_heartbeat_at → last_seen_at
+     created_at: string            // 改名：原 registered_at → created_at
+   }
+   ```
+
+3. **更新所有引用字段的列定义**：`index.tsx`、`Detail.tsx`、`Pending.tsx` 中使用 `dataIndex: 'hostname'`、`dataIndex: 'os_type'`、`dataIndex: 'agent_version'`、`render` 中 `agent.last_seen_at`、`agent.created_at`
+
+4. **`listAgents` 返回类型**：确认 `PaginatedResponse<Agent>` 的 `items` 字段对应后端改后的 `items` key（已正确）
+
+**验收标准**：
+- 浏览器打开采集器列表页，表格显示 agent 行（不再为空）
+- 每行正确显示主机名、IP、操作系统、版本、状态徽章（颜色正确）
+- 待审批 Tab 过滤出 pending agent，审批/吊销按钮正常显示
+- 详情页基本信息 Tab 显示完整字段（无空值、无 Invalid Date）
+- `pnpm test` 相关用例通过
+
+---
+
+#### T3-2-FIX-D 前端：`CollectionRule` 接口字段对齐
+
+**文件**：`webui/src/services/agents.ts` + `webui/src/pages/Agents/Detail.tsx` + `webui/src/pages/Agents/Rules.tsx` + `webui/src/pages/Agents/RuleForm.tsx`
+
+**修改要点**：
+
+1. **`CollectionRule` 接口字段重命名**（与 T3-2-FIX-B 后端改动保持一致）：
+   ```typescript
+   export interface CollectionRule {
+     id: string
+     agent_id: string
+     dest_bucket_id: string     // 来自后端 dest_bucket_id
+     name: string
+     mode: CollectionMode
+     source_path: string        // 来自后端 source_path
+     file_pattern: string       // 来自后端 file_pattern
+     cron_expr: string | null
+     run_once_on_start: boolean // 来自后端 run_once_on_start
+     dest_path_template: string // 来自后端 dest_path_template
+     is_active: boolean         // 来自后端 is_active
+     created_at: string
+     updated_at: string
+   }
+   ```
+
+2. **`listRules` 返回 `PaginatedResponse<CollectionRule>`**：已正确，后端改后 `items` 信封对应
+
+3. **`Detail.tsx` 规则 Tab 列定义**：`source_path`、`file_pattern`、`is_active`（bool → Switch 组件已用 `v` 参数）对应字段已存在，仅需确认字段名正确
+
+**验收标准**：
+- 详情页规则 Tab 正确显示规则列表（源路径、文件过滤、cron 表达式、激活状态）
+- `pnpm test` 相关用例通过
+
+---
+
+#### T3-2-FIX-E 后端：`GET /api/v1/files` 响应格式与字段名对齐 ⬜
+
+> **严重程度**：🔴 P0 — 文件浏览器页面永远为空，仪表盘「总文件数」永远为 0
+
+**根因**
+
+文件列表端点（`files.go:157`）返回：
+```json
+{"data": [...], "next_cursor": ""}
+```
+而前端 `listFiles()`（`services/files.ts:44`）把 `response.data` 整体当作
+`PaginatedResponse<FileEntry>` 处理，实际上 `response.data.items` 是 `undefined`。
+
+同时，响应体中每个 `fileEntryResponse` 的字段名与前端 `FileEntry` 接口存在 5 处不匹配：
+
+| 后端 JSON tag | 前端 `FileEntry` 字段 | 影响 |
+|--------------|----------------------|------|
+| `file_name` | `filename` | 列表文件名列空白；详情页标题/下载文件名空 |
+| `size_bytes` | `size` | `formatBytes(undefined)` → 全显示 "0 B" |
+| `content_type` | `mime_type` | MIME 类型列为空 |
+| `storage_path` | `storage_key` | 详情页存储路径为空 |
+| `status` 小写（`"indexed"`） | 大写枚举（`'INDEXED'`） | 状态徽章色彩 fallback；过滤无效 |
+
+另有两个前端字段在后端响应中不存在：`indexed_at`、`metadata`。
+
+**修复方案（后端）**
+
+文件：`controlplane/internal/api/handler/files.go`
+
+1. **响应信封**改为 `{items, total, next_cursor}`（对齐 §8.5）
+2. **`fileEntryResponse` 字段重命名**（JSON tag），使 tag 与前端接口对齐：
+   - `file_name` → `filename`
+   - `size_bytes` → `size`
+   - `content_type` → `mime_type`
+   - `storage_path` → `storage_key`
+3. **状态值大写**：`Status: strings.ToUpper(string(e.Status))`
+4. `total`：第一版返回 `len(entries)`；`next_cursor`：已有逻辑，保留
+
+**验收标准**
+
+- `GET /api/v1/files` 返回 `{"items":[...],"total":N,"next_cursor":null或字符串}`
+- 每条文件记录含顶层 `filename`、`size`（整数，bytes）、`mime_type`、`storage_key`、`status`（大写）
+- `Files/index.tsx` 文件列表正确显示文件名、大小、状态（非空）
+- `go test ./controlplane/internal/api/handler/... -count=1` 全部通过
+
+---
+
+#### T3-2-FIX-F 前端：`FileEntry` 接口字段对齐 ⬜
+
+> **前置依赖：T3-2-FIX-E（后端字段重命名先完成）**
+
+**修改要点**（`webui/src/services/files.ts`、`webui/src/pages/Files/index.tsx`、`webui/src/pages/Files/Detail.tsx`）
+
+1. 确认 `FileEntry` 接口字段与 T3-2-FIX-E 后端改动一致（字段名已统一后可直接使用）
+2. 移除不存在于后端的字段 `indexed_at`、`metadata`（或标记为可选 `string | null` 并在 UI 降级显示 `'—'`）
+3. `Files/Detail.tsx:135` 的「索引时间」改为显示 `'—'`（后端无此字段）
+4. `Files/Detail.tsx:122-123` 的 `file.size` / `file.mime_type` / `file.storage_key` 确认与新接口字段一致
+
+**验收标准**
+
+- 浏览器打开文件列表 → 能看到文件行，文件名、大小、MIME 类型、状态正确
+- 点击文件 → 详情页显示完整元数据（不出现空白或 `Invalid Date`）
+- 「获取下载链接」 → 能弹出预签名 URL
+- `pnpm test` 相关用例通过
+
+---
+
+#### T3-2-FIX-G 后端：`GET /api/v1/upload-logs` 与 `GET /api/v1/agents/:id/upload-logs` 响应格式与字段对齐 ⬜
+
+> **严重程度**：🔴 P0 — 全局上传日志页、采集器日志 Tab、仪表盘近期日志全部为空，仪表盘所有统计卡片数据错误
+
+**根因**
+
+两个端点均返回 `{"data":[...],"next_cursor":""}` 信封，而前端 `listUploadLogs()` 和
+`listAgentUploadLogs()` 均期望 `PaginatedResponse.items`。
+
+同时，`uploadLogResponse`（`events.go:450`）字段名与前端 `UploadLog` 接口有多处不匹配：
+
+| 后端 JSON tag | 前端 `UploadLog` 字段 | 类型/问题 |
+|--------------|----------------------|---------|
+| `file_entry_id` | `file_id` | 字段名不同 |
+| `size_bytes` | `size` | 字段名不同 |
+| `created_at` | `uploaded_at` | 字段名不同；前端显示"上传时间" |
+| 无 | `agent_name` | 后端不返回；需要 JOIN 或前端改逻辑 |
+| 无 | `filename` | 后端无此字段；实际有 `storage_path` |
+| `status` | `status` | 需确认 DB 值大小写（参见验收标准） |
+
+**修复方案（后端）**
+
+文件：`controlplane/internal/api/handler/events.go`（全局日志）和 `agents.go`（按采集器日志）
+
+1. **响应信封**改为 `{items, total, next_cursor}`
+2. **`uploadLogResponse` 字段重命名**（JSON tag）：
+   - `file_entry_id` → `file_id`
+   - `size_bytes` → `size`
+   - `created_at` → `uploaded_at`
+3. **`filename` 字段**：从 `storage_path` 中提取最后一个路径段（`path.Base(l.StoragePath)`）作为 `filename` 返回；同时保留 `storage_path` 字段供调试
+4. **`agent_name` 字段**：两种方案二选一：
+   - 方案 A（推荐，最小改动）：不返回 `agent_name`，前端改为不依赖此字段
+   - 方案 B：`ListUploadLogs` DB 查询改为 JOIN `agents` 表，增加 `agent_name` 字段
+   - 建议选方案 A，在 DECISIONS.md 中记录
+5. **状态值**：DB `upload_logs.status` 存储的实际值需确认（`success`/`failed`/`pending` 还是大写）；
+   若为小写则在响应中 `strings.ToUpper(l.Status)`
+
+**验收标准**
+
+- `GET /api/v1/upload-logs` 返回 `{"items":[...],"total":N,"next_cursor":null或字符串}`
+- 每条记录含 `id`、`agent_id`、`file_id`、`filename`（从路径提取）、`size`（整数）、`status`（大写）、`error_message`、`uploaded_at`
+- `GET /api/v1/agents/:id/upload-logs` 同样格式
+- `Logs/index.tsx` 能显示日志行，上传时间非 `Invalid Date`，大小非 `0 B`
+- 仪表盘近期日志 Table 能显示最新 20 条
+- `go test ./controlplane/internal/api/handler/... -count=1` 全部通过
+
+---
+
+#### T3-2-FIX-H 前端：`UploadLog` 接口字段对齐 ⬜
+
+> **前置依赖：T3-2-FIX-G（后端字段重命名先完成）**
+
+**修改要点**（`webui/src/services/upload-logs.ts`、`webui/src/pages/Logs/index.tsx`、`webui/src/pages/Agents/Logs.tsx`、`webui/src/pages/Dashboard/index.tsx`）
+
+1. **`UploadLog` 接口更新**：
+   ```typescript
+   export interface UploadLog {
+     id: string
+     agent_id: string
+     file_id: string | null        // 改名：原 file_id（已对齐）
+     filename: string              // 来自后端 filename（从 storage_path 提取）
+     size: number                  // 来自后端 size（已对齐）
+     status: 'SUCCESS' | 'FAILED' | 'PENDING'
+     error_message: string | null
+     uploaded_at: string           // 来自后端 uploaded_at（已对齐）
+     // 移除：agent_name（方案 A：后端不返回）
+   }
+   ```
+2. **`Logs/index.tsx`**：移除 `agent_name` 列或改为显示 `agent_id`（缩短 UUID）
+3. **`Agents/Logs.tsx`**：`UploadLogRow` 内联类型改为与服务层 `UploadLog` 一致
+4. **`Dashboard/index.tsx`**：`uploadLogColumns` 中 `agent_name` 列改为显示 `agent_id` 或删除
+5. **`agents.ts` `listAgentUploadLogs()` 返回类型**：改为 `PaginatedResponse<UploadLog>`（不再用内联匿名类型）
+
+**验收标准**
+
+- 全局日志页正确显示文件名、大小、状态、上传时间
+- 采集器详情日志 Tab 和独立日志页显示正确
+- 仪表盘「今日上传」统计卡数值正确（非 0）；「近7日趋势」图表显示实际数据
+- `pnpm test` 相关用例通过
+
+---
+
+#### T3-2-FIX-I 后端：非分页列表端点统一为 `{items, total}` 信封 ⬜
+
+> **严重程度**：🟡 P1 — 页面当前功能正常（service 层手动适配），但与 §8.5 规范不一致，
+> 未来若前端 service 重构或 SDK 使用这些端点会静默失败
+
+**根因与现状**
+
+以下 4 个端点返回 `{"data":[...]}` 信封，但各自的前端 service 函数都手动提取 `.data.data`：
+
+| 端点 | 后端信封 | 前端 service 代码 | 当前行为 |
+|------|---------|-----------------|---------|
+| `GET /api/v1/buckets` | `{"data":[...]}` | `response.data.data` | ✅ 功能正常 |
+| `GET /api/v1/file-types` | `{"data":[...]}` | `response.data.data` | ✅ 功能正常 |
+| `GET /api/v1/event-rules` | `{"data":[...]}` | `response.data.data` | ✅ 功能正常 |
+| `GET /api/v1/users` | `{"data":[...]}` | `response.data.data` | ✅ 功能正常 |
+
+这是一种"双重 `.data`"适配（Axios 已展开一层，service 再展开一层），脆弱且违反约定。
+
+另外，`GET /api/v1/event-rules/:id/deliveries` 返回 `{"data":[...],"next_cursor":""}` 信封，
+前端 `DeliveriesResponse` 接口使用 `data` 字段（非 `items`），二者内部一致但违反 §8.5 规范。
+
+**修复方案（后端 + 前端同步改）**
+
+1. **后端**（`events.go`、`files.go`、`users.go`）：
+   - 上述 4 个非分页列表端点改为 `{"items": [...], "total": N}`（无 `next_cursor`，它们是全量列表）
+   - `GET /api/v1/event-rules/:id/deliveries`：改为 `{"items":[...],"total":N,"next_cursor":"..."}`
+
+2. **前端 service 层**（`buckets.ts`、`file-types.ts`、`events.ts`、`users.ts`）：
+   - 移除手动 `.data.data` 适配；
+   - `listBuckets()` 等函数改为接收 `{items: T[], total: number}` 并返回 `items`（保持调用方 API 不变）
+   - `listRuleDeliveries()` 的 `DeliveriesResponse` 改为 `{items: EventDelivery[], total: number, next_cursor: string | null}`；更新 `Deliveries.tsx:29` 的 `res.data` → `res.items`
+
+**验收标准**
+
+- `GET /api/v1/buckets` 返回 `{"items":[...],"total":N}`
+- `GET /api/v1/file-types` 返回 `{"items":[...],"total":N}`
+- `GET /api/v1/event-rules` 返回 `{"items":[...],"total":N}`
+- `GET /api/v1/users` 返回 `{"items":[...],"total":N}`
+- `GET /api/v1/event-rules/:id/deliveries` 返回 `{"items":[...],"total":N,"next_cursor":...}`
+- Buckets/FileTypes/Events/Users/Deliveries 页面功能不受影响，数据正常显示
+- `go test ./controlplane/internal/api/handler/... -count=1` 全部通过
+- `pnpm test` 全部通过
+
+---
+
+#### T3-2-FIX 整体验收标准（Smoke Test）
+
+1. 启动本地 `deploy/docker-compose.dev.yml` + controlplane + webui
+2. 通过 grpcurl 注册一个 agent
+3. 打开浏览器 → 采集器列表 → **能看到该 agent 的行**，主机名、IP、状态徽章颜色正确
+4. 切换到「待审批」Tab → agent 仍可见，「审批」按钮出现
+5. 点击审批 → 弹窗确认 → agent 状态更新为 APPROVED（或根据 online 心跳为 RUNNING）
+6. 点击 agent 名称 → 进入详情页 → 基本信息 Tab 所有字段有值（不显示 `Invalid Date` 或空）
+7. 规则 Tab 创建一条规则 → 规则出现在列表中
+8. 上传一个文件到 MinIO（通过 agent 或 grpcurl 模拟）→ 文件浏览器页面**能看到该文件行**
+9. 全局上传日志页**能显示上传记录**，时间、大小、状态字段均正确
+10. 仪表盘「总文件数」> 0，「近期日志」Table 有数据
+11. Bucket 列表、文件类型列表、事件规则列表、用户列表各页面正常显示数据
+12. `go test ./controlplane/internal/api/handler/... -count=1` 全部通过
+13. `pnpm test` 全部通过（或 skip 无关测试）
+
+---
+
+#### 修复顺序建议
+
+```
+T3-2-FIX-A（后端 agents List 响应格式）        ← P0 优先
+T3-2-FIX-B（后端 rules/upload-logs 响应格式）  ← P0，与 A 可并行
+T3-2-FIX-E（后端 files 响应格式+字段名）        ← P0，与 A/B 可并行
+T3-2-FIX-G（后端 upload-logs 响应格式+字段名） ← P0，与 A/B/E 可并行
+    ↓（后端 P0 全部完成）
+T3-2-FIX-C（前端 Agent 接口对齐）              ← 依赖 A
+T3-2-FIX-D（前端 CollectionRule 接口对齐）     ← 依赖 B，与 C 可并行
+T3-2-FIX-F（前端 FileEntry 接口对齐）          ← 依赖 E，与 C/D 可并行
+T3-2-FIX-H（前端 UploadLog 接口对齐）          ← 依赖 G，与 C/D/F 可并行
+    ↓（前端 P0 全部完成）
+T3-2-FIX-I（非分页列表信封统一）               ← P1，可最后做
+    ↓
+整体 Smoke Test 验收
+```
+
+---
+
+#### 附：虚假验收根因分析（覆盖所有受影响任务）
+
+**受影响任务**：T2-C1（文件浏览器）、T2-C2（Bucket/FileType/Events）、T2-C3（采集器）、T2-C4（仪表盘）、T2-X4（REST Handler 实现）
+
+**根本原因一：验收标准不包含 JSON schema 契约校验**
+> T2-X4 验收点只检查 HTTP 状态码和业务逻辑（approve/revoke 成功），
+> 不要求"响应体 JSON key 与前端 TypeScript 接口完全一致"。
+
+**根本原因二：前端 Mock 与后端真实实现双轨并行，从未端到端联测**
+> 所有 Web UI 任务（T2-C1~C4）的测试都基于 ProTable `request` 函数的孤立测试或视觉截图，
+> 从未用真实 Axios 调用验证响应解析链路。
+
+**建议**：后续 Phase 任务的验收标准应强制包含：
+- REST Handler：响应体 JSON schema 与前端 TypeScript 接口字段逐一核对（字段名、字段类型、枚举大小写、信封结构）
+- Web UI 页面：MSW（Mock Service Worker）拦截并返回与真实后端格式完全一致的 JSON，断言 Table 行数 > 0
+
+---
+
+#### 附：T2-C3 / T2-X4 验收标准缺陷分析
+
+> **根本原因**：T2-C3 验收点只有"ProTable + Tab 过滤；审批/吊销；详情页4个Tab；列目录弹窗"，
+> 这是**纯结构性检查**（页面存在 + 组件挂载），不包含任何 API 数据流验证。
+>
+> T2-X4 验收点只有 HTTP 状态码和业务逻辑（approve/revoke 成功），
+> 不包含对响应体 JSON 格式是否满足前端接口的检查。
+>
+> 建议：Phase 2 Web UI 任务的验收标准应强制包含"对接真实后端（或 MSW mock）渲染正确数据"，
+> Phase 2 REST Handler 任务的验收标准应强制包含"响应体 JSON schema 与前端 TypeScript 接口一致"。
+
+---
+
 ### T3-2 Web UI + Control Plane 联调 ⬜
+
+> **前置依赖：T3-1-FIX、T3-1-BUGFIX、T3-2-FIX 全部完成**
+
 - [ ] 登录 → 仪表盘数据正确
 - [ ] 审批采集器 → 采集器状态更新
 - [ ] 创建采集规则 → 规则下发到 Agent
@@ -983,9 +1495,9 @@ Bug C（反射豁免）→ 独立，但须补充测试
 | Phase 2 核心 | 20 | 20 | 100%（含组件包逻辑）|
 | Phase 2 遗留（T2-X） | 8 | 8（全部完成）| 100% |
 | Phase 3 前质量关卡（P3-P） | 10 | 10 | 100% |
-| Phase 3 | 5 | 0（T3-1 部分完成已降级；T3-1-FIX、T3-1-BUGFIX 待完成） | 0% |
+| Phase 3 | 12 | 0（T3-1 部分完成已降级；T3-1-FIX、T3-1-BUGFIX、T3-2-FIX A~I 均待完成） | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **67** | **55** | **82%** |
+| **合计** | **74** | **55** | **74%** |
 
 ---
 
