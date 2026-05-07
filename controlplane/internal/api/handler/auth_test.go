@@ -5,14 +5,17 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,6 +39,49 @@ func (m *mockAuthDB) GetUserByUsername(_ context.Context, _ string) (*db.User, e
 
 func (m *mockAuthDB) UpdateUserLastLogin(_ context.Context, _ uuid.UUID) error {
 	return nil
+}
+
+type mockAuthService struct {
+	generateAccessTokenFunc  func(subject, orgID, role, username string, ttl time.Duration) (string, error)
+	generateRefreshTokenFunc func(subject, orgID, role, username string, ttl time.Duration) (string, error)
+	validateTokenFunc        func(tokenStr string) (*auth.Claims, error)
+	revokeTokenFunc          func(ctx context.Context, tokenStr string) error
+	isRevokedFunc            func(ctx context.Context, jti string) (bool, error)
+}
+
+func (m *mockAuthService) GenerateAccessToken(subject, orgID, role, username string, ttl time.Duration) (string, error) {
+	if m.generateAccessTokenFunc != nil {
+		return m.generateAccessTokenFunc(subject, orgID, role, username, ttl)
+	}
+	return "", nil
+}
+
+func (m *mockAuthService) GenerateRefreshToken(subject, orgID, role, username string, ttl time.Duration) (string, error) {
+	if m.generateRefreshTokenFunc != nil {
+		return m.generateRefreshTokenFunc(subject, orgID, role, username, ttl)
+	}
+	return "", nil
+}
+
+func (m *mockAuthService) ValidateToken(tokenStr string) (*auth.Claims, error) {
+	if m.validateTokenFunc != nil {
+		return m.validateTokenFunc(tokenStr)
+	}
+	return nil, nil
+}
+
+func (m *mockAuthService) RevokeToken(ctx context.Context, tokenStr string) error {
+	if m.revokeTokenFunc != nil {
+		return m.revokeTokenFunc(ctx, tokenStr)
+	}
+	return nil
+}
+
+func (m *mockAuthService) IsRevoked(ctx context.Context, jti string) (bool, error) {
+	if m.isRevokedFunc != nil {
+		return m.isRevokedFunc(ctx, jti)
+	}
+	return false, nil
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -151,6 +197,20 @@ func TestLogin_UserNotFound(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
+func TestLogin_DBError(t *testing.T) {
+	authSvc := newTestAuthSvc(t)
+	dbMock := &mockAuthDB{err: assert.AnError}
+	r := setupTestRouter(t, authSvc, dbMock)
+
+	body := `{"username":"alice","password":"testpass"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
 func TestLogin_DisabledUser(t *testing.T) {
 	user := newTestAuthUser(t)
 	user.IsActive = false
@@ -177,6 +237,45 @@ func TestLogin_MissingFields(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestLogin_AccessTokenGenerationError(t *testing.T) {
+	user := newTestAuthUser(t)
+	authSvc := &mockAuthService{
+		generateAccessTokenFunc: func(subject, orgID, role, username string, ttl time.Duration) (string, error) {
+			return "", errors.New("sign access token")
+		},
+	}
+	r := setupTestRouter(t, authSvc, &mockAuthDB{user: user})
+
+	body := `{"username":"alice","password":"testpass"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestLogin_RefreshTokenGenerationError(t *testing.T) {
+	user := newTestAuthUser(t)
+	authSvc := &mockAuthService{
+		generateAccessTokenFunc: func(subject, orgID, role, username string, ttl time.Duration) (string, error) {
+			return "access-token", nil
+		},
+		generateRefreshTokenFunc: func(subject, orgID, role, username string, ttl time.Duration) (string, error) {
+			return "", errors.New("sign refresh token")
+		},
+	}
+	r := setupTestRouter(t, authSvc, &mockAuthDB{user: user})
+
+	body := `{"username":"alice","password":"testpass"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 // ── Tests: Refresh ────────────────────────────────────────────────────────────
@@ -251,6 +350,56 @@ func TestRefresh_WithAccessToken_Rejected(t *testing.T) {
 	w2 := httptest.NewRecorder()
 	r.ServeHTTP(w2, req2)
 	assert.Equal(t, http.StatusUnauthorized, w2.Code)
+}
+
+func TestRefresh_RevokedToken_Rejected(t *testing.T) {
+	authSvc := &mockAuthService{
+		validateTokenFunc: func(tokenStr string) (*auth.Claims, error) {
+			return &auth.Claims{
+				RegisteredClaims: jwt.RegisteredClaims{ID: uuid.NewString()},
+				TokenType:        "refresh",
+				OrgID:            uuid.NewString(),
+				Role:             string(db.UserRoleSuperAdmin),
+				Username:         "alice",
+			}, nil
+		},
+		isRevokedFunc: func(ctx context.Context, jti string) (bool, error) {
+			return true, nil
+		},
+	}
+	r := setupTestRouter(t, authSvc, &mockAuthDB{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", nil)
+	req.Header.Set("Authorization", "Bearer refresh-token")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestRefresh_GenerateAccessTokenError(t *testing.T) {
+	authSvc := &mockAuthService{
+		validateTokenFunc: func(tokenStr string) (*auth.Claims, error) {
+			return &auth.Claims{
+				RegisteredClaims: jwt.RegisteredClaims{Subject: uuid.NewString()},
+				OrgID:            uuid.NewString(),
+				Role:             string(db.UserRoleSuperAdmin),
+				Username:         "alice",
+				TokenType:        "refresh",
+			}, nil
+		},
+		generateAccessTokenFunc: func(subject, orgID, role, username string, ttl time.Duration) (string, error) {
+			return "", errors.New("sign access token")
+		},
+	}
+	r := setupTestRouter(t, authSvc, &mockAuthDB{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", nil)
+	req.Header.Set("Authorization", "Bearer refresh-token")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 // ── Tests: Logout ─────────────────────────────────────────────────────────────
@@ -342,6 +491,34 @@ func TestMe_InvalidToken(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer invalid-token-here")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestMe_RevokedToken(t *testing.T) {
+	authSvc := &mockAuthService{
+		validateTokenFunc: func(tokenStr string) (*auth.Claims, error) {
+			return &auth.Claims{
+				RegisteredClaims: jwt.RegisteredClaims{
+					Subject: uuid.NewString(),
+					ID:      uuid.NewString(),
+				},
+				OrgID:     uuid.NewString(),
+				Role:      string(db.UserRoleSuperAdmin),
+				Username:  "alice",
+				TokenType: "access",
+			}, nil
+		},
+		isRevokedFunc: func(ctx context.Context, jti string) (bool, error) {
+			return true, nil
+		},
+	}
+	r := setupTestRouter(t, authSvc, &mockAuthDB{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	req.Header.Set("Authorization", "Bearer revoked-token")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
