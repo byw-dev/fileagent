@@ -143,16 +143,30 @@ func main() {
 		logger.Fatal("bootstrap admin failed", zap.Error(err))
 	}
 	if bootstrapResult.Created {
+		if err := writeBootstrapCredentials(
+			cfg.BootstrapAdminCredentialsFile,
+			bootstrapResult.Username,
+			bootstrapResult.Password,
+		); err != nil {
+			logger.Fatal("write bootstrap admin credentials file failed", zap.Error(err))
+		}
 		logger.Warn("bootstrap admin user created",
 			zap.String("username", bootstrapResult.Username),
-			zap.String("password", bootstrapResult.Password),
+			zap.String("credentials_file", cfg.BootstrapAdminCredentialsFile),
 			zap.String("action", "please login and change password immediately"),
 		)
 	}
 	if bootstrapResult.Reset {
+		if err := writeBootstrapCredentials(
+			cfg.BootstrapAdminCredentialsFile,
+			bootstrapResult.Username,
+			bootstrapResult.Password,
+		); err != nil {
+			logger.Fatal("write bootstrap admin credentials file failed", zap.Error(err))
+		}
 		logger.Warn("bootstrap admin password reset by configuration",
 			zap.String("username", bootstrapResult.Username),
-			zap.String("password", bootstrapResult.Password),
+			zap.String("credentials_file", cfg.BootstrapAdminCredentialsFile),
 			zap.String("action", "disable BOOTSTRAP_ADMIN_FORCE_RESET after recovery"),
 		)
 	}
@@ -259,4 +273,10 @@ func buildLogger(level string) (*zap.Logger, error) {
 	}
 	cfg.Level = atomicLevel
 	return cfg.Build()
+}
+
+// writeBootstrapCredentials writes temporary bootstrap credentials to a local file.
+func writeBootstrapCredentials(path, username, password string) error {
+	content := fmt.Sprintf("username=%s\npassword=%s\n", username, password)
+	return os.WriteFile(path, []byte(content), 0o600)
 }

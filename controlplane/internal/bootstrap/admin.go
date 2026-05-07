@@ -113,6 +113,8 @@ func EnsureAdminAccount(
 
 // generatePassword returns a cryptographically random password.
 func generatePassword(length int) (string, error) {
+	// Excludes ambiguous characters (I, O, 0, 1, l) to reduce operator mistakes
+	// when credentials are copied from bootstrap output.
 	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*()-_=+"
 	if length <= 0 {
 		return "", errors.New("password length must be greater than 0")

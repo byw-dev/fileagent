@@ -241,7 +241,7 @@ cp agent/config.toml.example agent/config.toml
 ./bin/agent --config /path/to/agent.toml
 ```
 
-首次启动时，如果数据库中没有用户，controlplane 会自动创建 `admin` 超级管理员并在日志输出一次性密码。  
+首次启动时，如果数据库中没有用户，controlplane 会自动创建 `admin` 超级管理员，并将一次性凭据写入 `BOOTSTRAP_ADMIN_CREDENTIALS_FILE`。  
 如发生管理员密码丢失，可设置 `BOOTSTRAP_ADMIN_PASSWORD` + `BOOTSTRAP_ADMIN_FORCE_RESET=true` 临时重置，恢复后请立即关闭该开关。
 
 ---

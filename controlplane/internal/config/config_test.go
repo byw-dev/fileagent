@@ -70,6 +70,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, "admin", cfg.BootstrapAdminUsername)
 	assert.Equal(t, "", cfg.BootstrapAdminPassword)
 	assert.False(t, cfg.BootstrapAdminForceReset)
+	assert.Equal(t, "bootstrap_admin_credentials.txt", cfg.BootstrapAdminCredentialsFile)
 }
 
 func TestLoad_CustomPorts(t *testing.T) {
@@ -179,10 +180,8 @@ func TestValidate_ValidConfig(t *testing.T) {
 
 func TestValidate_BootstrapForceResetRequiresPassword(t *testing.T) {
 	setEnv(t, validEnv())
-	setEnv(t, map[string]string{
-		"BOOTSTRAP_ADMIN_FORCE_RESET": "true",
-	})
-	os.Unsetenv("BOOTSTRAP_ADMIN_PASSWORD")
+	t.Setenv("BOOTSTRAP_ADMIN_FORCE_RESET", "true")
+	t.Setenv("BOOTSTRAP_ADMIN_PASSWORD", "")
 
 	cfg, err := Load()
 	require.NoError(t, err)

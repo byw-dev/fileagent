@@ -69,6 +69,9 @@ type Config struct {
 	// BootstrapAdminForceReset forces resetting the bootstrap admin password on
 	// startup when BootstrapAdminPassword is set.
 	BootstrapAdminForceReset bool
+	// BootstrapAdminCredentialsFile is the file path where first-start generated
+	// admin credentials are written with 0600 permissions.
+	BootstrapAdminCredentialsFile string
 }
 
 // Load reads configuration from environment variables and returns a validated
@@ -132,6 +135,7 @@ func Load() (*Config, error) {
 	cfg.BootstrapAdminUsername = envString("BOOTSTRAP_ADMIN_USERNAME", "admin")
 	cfg.BootstrapAdminPassword = os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
 	cfg.BootstrapAdminForceReset = envBool("BOOTSTRAP_ADMIN_FORCE_RESET", false)
+	cfg.BootstrapAdminCredentialsFile = envString("BOOTSTRAP_ADMIN_CREDENTIALS_FILE", "bootstrap_admin_credentials.txt")
 
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required environment variables: %s",
@@ -167,6 +171,9 @@ func (c *Config) Validate() error {
 	}
 	if c.BootstrapAdminForceReset && c.BootstrapAdminPassword == "" {
 		return errors.New("BOOTSTRAP_ADMIN_PASSWORD is required when BOOTSTRAP_ADMIN_FORCE_RESET=true")
+	}
+	if c.BootstrapAdminCredentialsFile == "" {
+		return errors.New("BOOTSTRAP_ADMIN_CREDENTIALS_FILE cannot be empty")
 	}
 	return nil
 }
