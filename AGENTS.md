@@ -3,7 +3,7 @@
 ## 仓库现状
 - **Phase 0（契约定义）与 Phase 1（基础骨架）已全部完成**：`controlplane/`、`agent/`、`webui/`、`sdk/python/` 均有实际代码；`proto/v1/agent.proto` 已锁定，数据库迁移文件已就绪，两套 docker-compose 和 `deploy/scripts/init-minio.sh` 均可执行。
 - 以 `docs/design/system-design.md` 作为**架构事实来源**，以 `TASK_LIST.md` 作为**任务顺序与前置依赖来源**，以 `CLAUDE.md` 作为**技术栈与编码规范来源**。
-- 当前阶段是 **Phase 2 — 核心业务逻辑**（0/20 已完成）；以 `TASK_LIST.md` 中各组未开始（⬜）的任务为工作重心，各组可并行，组内任务串行。
+- 当前阶段是 **Phase 3 — 集成联调**（1/3 已完成，`T3-1` ✅）；Phase 3 任务按 `TASK_LIST.md` 串行推进。
 
 ## 开始任务前先做什么
 1. 先读 `CLAUDE.md`。
@@ -46,7 +46,7 @@
 ## 实施时的仓库约定
 - 配置只能来自环境变量或配置文件，禁止 hardcode 端点、密钥、端口、Bucket 名称（`CLAUDE.md`）。
 - Go 侧固定使用 `zap`；`Gin` 只用于 `controlplane`；数据库访问使用 `sqlc`，并显式传递 `context.Context`（`CLAUDE.md`）。
-- 当前 Phase 2 的首要工作是 `TASK_LIST.md` 中各组未开始（⬜）的任务；各组可并行，但组内任务串行。
+- 当前重点工作是 Phase 3 剩余任务 `T3-2` 与 `T3-3`（串行）。
 
 ## 代码测试覆盖率要求
 
@@ -86,4 +86,3 @@ pnpm test --coverage
 - 每完成一个 Phase 2+ 的任务，必须运行覆盖率检查，确保未低于阈值。
 - PR 提交前需附上主要模块的覆盖率数据（可在 PR 描述中粘贴 `go tool cover -func` 输出）。
 - 禁止为提高覆盖率数字而写无意义的空测试。
-

@@ -1,6 +1,6 @@
 # TASK_LIST.md — FileAgent 任务清单
 
-> 当前阶段：**Phase 2 遗留扫除**（T2-X1~X8 需在进入 Phase 3 前完成，详见下方 **T2-X 遗留工作详细规格**）
+> 当前阶段：**Phase 3 集成联调**（T3-1 已完成，T3-2~T3-3 串行进行中）
 > 状态说明：⬜ 未开始 / 🔄 进行中 / ✅ 已完成 / ❌ 阻塞
 
 ---
@@ -598,11 +598,22 @@ func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPa
 
 ## Phase 3 — 集成联调（串行，依赖 Phase 2 全部完成）
 
-### T3-1 Control Plane + Agent 端到端联调 ⬜
-- [ ] Agent 注册 → 审批 → 建立 gRPC 连接
-- [ ] 下发采集规则 → Watch 模式 → 文件上传 MinIO → file_entries 写入
-- [ ] 模拟网络中断 → OFFLINE → 本地队列工作 → 重连后补传
-- [ ] 吊销 Agent → 收到 RevokeCommand → 清除 Token
+### T3-1 Control Plane + Agent 端到端联调 ✅
+- [x] Agent 注册 → 审批 → 建立 gRPC 连接
+- [x] 下发采集规则 → Watch 模式 → 文件上传 MinIO → file_entries 写入
+- [x] 模拟网络中断 → OFFLINE → 本地队列工作 → 重连后补传
+- [x] 吊销 Agent → 收到 RevokeCommand → 清除 Token
+
+#### T3-1 实施规格（2026-05-07）
+
+1. **联调测试入口**：新增 `controlplane/internal/grpcserver/t3_e2e_integration_test.go`（`//go:build integration`）。
+2. **覆盖链路 A（注册审批）**：调用 `Register` 与 `PollApproval`，校验 `pending -> approved + token`，再用 Bearer Token 建立 `Connect`。
+3. **覆盖链路 B（规则下发）**：在 `SyncRulesOnConnect` 中下发 `PushRuleCommand`，断言 Agent 连接后收到规则。
+4. **覆盖链路 C（断网重连补传）**：主动断开首个流并重连，断言重连后规则再次同步；重连后发送 `UploadResult`，断言 Control Plane 索引链路收到补传结果。
+5. **覆盖链路 D（吊销）**：通过 `AgentRegistry.Send` 下发 `RevokeCommand`，断言 Agent 端收到吊销指令。
+6. **功能补全**：
+   - Control Plane：`POST /api/v1/agents/:id/revoke` 在 Agent 在线时主动下发 `RevokeCommand`。
+   - Agent：收到 `RevokeCommand` 后清理本地 Token 文件与内存 STS，并触发优雅退出。
 
 ### T3-2 Web UI + Control Plane 联调 ⬜
 - [ ] 登录 → 仪表盘数据正确
@@ -636,9 +647,9 @@ func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPa
 | Phase 2 核心 | 20 | 20 | 100%（含组件包逻辑）|
 | Phase 2 遗留（T2-X） | 8 | 8（全部完成）| 100% |
 | Phase 3 前质量关卡（P3-P） | 10 | 10 | 100% |
-| Phase 3 | 3 | 0 | 0% |
+| Phase 3 | 3 | 1 | 33% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **65** | **54** | **83%** |
+| **合计** | **65** | **55** | **85%** |
 
 ---
 

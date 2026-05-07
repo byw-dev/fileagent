@@ -69,6 +69,18 @@ func (m *TokenManager) Load() error {
 	return nil
 }
 
+// Clear removes the persisted token file (if present) and clears the cached
+// plaintext token from memory.
+func (m *TokenManager) Clear() error {
+	if err := os.Remove(m.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("credential: remove token file %q: %w", m.path, err)
+	}
+	m.mu.Lock()
+	m.token = ""
+	m.mu.Unlock()
+	return nil
+}
+
 // Token returns the cached plaintext JWT or an empty string if none is loaded.
 func (m *TokenManager) Token() string {
 	m.mu.RLock()
@@ -142,6 +154,13 @@ func (s *STSManager) GetSTS() *STSCredentials {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.cred
+}
+
+// Clear removes any in-memory STS credentials.
+func (s *STSManager) Clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cred = nil
 }
 
 // IsSTSValid returns true if STS credentials are set and will not expire

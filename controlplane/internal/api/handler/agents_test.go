@@ -114,12 +114,18 @@ func (m *mockDispatcher) DispatchRuleCancel(_ context.Context, _, _ string) erro
 }
 
 type mockAgentRegistry struct {
-	online  bool
-	sendOK  bool
+	online   bool
+	sendOK   bool
+	sentTo   string
+	lastSent *agentv1.ServerMessage
 }
 
-func (m *mockAgentRegistry) Send(_ string, _ *agentv1.ServerMessage) bool { return m.sendOK }
-func (m *mockAgentRegistry) IsOnline(_ string) bool                       { return m.online }
+func (m *mockAgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
+	m.sentTo = agentID
+	m.lastSent = msg
+	return m.sendOK
+}
+func (m *mockAgentRegistry) IsOnline(_ string) bool { return m.online }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -234,6 +240,38 @@ func TestAgentsHandler_Revoke_Success(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/revoke", nil)
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestAgentsHandler_Revoke_SendsRevokeCommandWhenOnline(t *testing.T) {
+	mgr := &mockAgentMgr{}
+	registry := &mockAgentRegistry{online: true, sendOK: true}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, mgr, nil, registry, newTestLogger())
+	agentID := uuid.New().String()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+agentID+"/revoke", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NotNil(t, registry.lastSent)
+	assert.Equal(t, agentID, registry.sentTo)
+	revoke := registry.lastSent.GetRevoke()
+	require.NotNil(t, revoke)
+	assert.Equal(t, "revoked_by_admin", revoke.GetReason())
+}
+
+func TestAgentsHandler_Revoke_DoesNotSendCommandWhenOffline(t *testing.T) {
+	mgr := &mockAgentMgr{}
+	registry := &mockAgentRegistry{online: false, sendOK: true}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, mgr, nil, registry, newTestLogger())
+	agentID := uuid.New().String()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+agentID+"/revoke", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Nil(t, registry.lastSent)
 }
 
 // ── ListDir ───────────────────────────────────────────────────────────────────
