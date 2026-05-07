@@ -174,7 +174,10 @@ func (l *Lifecycle) registerWithRetry(ctx context.Context, svc agentv1.AgentServ
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
-				<-timer.C
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
 			return "", ctx.Err()
 		case <-timer.C:
