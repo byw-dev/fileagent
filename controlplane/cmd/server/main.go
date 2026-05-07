@@ -173,6 +173,10 @@ func main() {
 			zap.String("action", "disable BOOTSTRAP_ADMIN_FORCE_RESET after recovery"),
 		)
 	}
+	if err := bootstrap.EnsureDefaultBuckets(ctx, queries, bootstrap.DefaultOrgID); err != nil {
+		logger.Fatal("bootstrap default buckets failed", zap.Error(err))
+	}
+
 	agentMgr := agent.NewManager(queries, redisClient, authSvc, nats, logger, cfg.JWTAccessTokenTTL)
 
 	registry := grpcserver.NewAgentRegistry()
