@@ -206,3 +206,43 @@ func (ix *Indexer) publishFileUploaded(fe *db.FileEntry, agentID uuid.UUID, resu
 		ix.logger.Error("indexer: publish file uploaded event", zap.Error(err))
 	}
 }
+
+// IndexUpload records a file upload event that arrived via the MinIO webhook
+// path (i.e., not via an agent UploadResult). It looks up the bucket by name
+// within the default org scope, upserts a file entry, and publishes a NATS
+// event. This method implements handler.IndexerClient.
+func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string) error {
+	// GetBucketByName requires an orgID; pass uuid.Nil for the single-org MVP.
+	bucket, err := ix.store.GetBucketByName(ctx, uuid.Nil, bucketName)
+	if err != nil {
+		return fmt.Errorf("indexer: get bucket %q for minio event: %w", bucketName, err)
+	}
+
+	fileTypeID, err := ix.classifier.Classify(ctx, objectKey)
+	if err != nil {
+		ix.logger.Warn("indexer: classify file failed", zap.Error(err))
+		fileTypeID = uuid.Nil
+	}
+
+	fileEntry, err := ix.store.UpsertFileEntry(ctx, UpsertFileEntryParams{
+		OrgID:       uuid.Nil,
+		FileTypeID:  uuid.NullUUID{UUID: fileTypeID, Valid: fileTypeID != uuid.Nil},
+		BucketID:    bucket.ID,
+		StoragePath: objectKey,
+		FileName:    fileNameFromPath(objectKey),
+		SizeBytes:   sizeBytes,
+		Etag:        sql.NullString{String: etag, Valid: etag != ""},
+		Status:      db.FileStatusCompleted,
+		UploadedAt:  sql.NullTime{Time: time.Now().UTC(), Valid: true},
+	})
+	if err != nil {
+		return fmt.Errorf("indexer: upsert file entry for minio event: %w", err)
+	}
+
+	ix.logger.Info("minio event indexed",
+		zap.String("file_entry_id", fileEntry.ID.String()),
+		zap.String("bucket", bucketName),
+		zap.String("key", objectKey),
+	)
+	return nil
+}

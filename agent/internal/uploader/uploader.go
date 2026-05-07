@@ -149,12 +149,33 @@ func normalise(cfg *Config) {
 // UploadFile uploads the file described by task to MinIO. It chooses between
 // single-part and multipart strategies based on file size, and honours any
 // partially-uploaded state stored in the queue.
+//
+// When task.AppendMode is "tail" and task.FileOffset > 0, only the bytes
+// starting from FileOffset are uploaded (i.e., the tail appended since the
+// last upload). The object key is the same (task.StoragePath), so the
+// caller must ensure unique keys per chunk if full history is required.
 func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*UploadResult, error) {
 	info, err := os.Stat(task.LocalPath)
 	if err != nil {
 		return nil, fmt.Errorf("uploader: stat %q: %w", task.LocalPath, err)
 	}
-	size := info.Size()
+	fileSize := info.Size()
+
+	// For tail mode, only upload the new bytes since the last upload.
+	offset := task.FileOffset
+	if task.AppendMode == "tail" && offset > 0 {
+		if offset >= fileSize {
+			// No new bytes — nothing to upload.
+			return &UploadResult{
+				StoragePath: task.StoragePath,
+				Bucket:      task.Bucket,
+				SizeBytes:   0,
+			}, nil
+		}
+	} else {
+		offset = 0
+	}
+	uploadSize := fileSize - offset
 
 	sha, err := fileSHA256(task.LocalPath)
 	if err != nil {
@@ -163,32 +184,42 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 
 	u.logger.Info("uploader: uploading file",
 		zap.String("path", task.LocalPath),
-		zap.Int64("size", size),
+		zap.Int64("size", uploadSize),
+		zap.Int64("offset", offset),
 		zap.String("bucket", task.Bucket),
 	)
 
 	var result *UploadResult
 	threshold := int64(u.cfg.ThresholdMB) * 1024 * 1024
-	if size <= threshold {
-		result, err = u.singlePartUpload(ctx, task, size)
+	if uploadSize <= threshold {
+		result, err = u.singlePartUpload(ctx, task, offset, uploadSize)
 	} else {
-		result, err = u.multipartUpload(ctx, task, size)
+		result, err = u.multipartUpload(ctx, task, fileSize)
 	}
 	if err != nil {
 		return nil, err
 	}
 	result.SHA256 = sha
-	result.SizeBytes = size
+	result.SizeBytes = uploadSize
 	return result, nil
 }
 
-// singlePartUpload uploads a file using PutObject.
-func (u *Uploader) singlePartUpload(ctx context.Context, task *queue.UploadTask, size int64) (*UploadResult, error) {
+// singlePartUpload uploads a file (or a portion of it) using PutObject.
+// offset is the byte position to start reading from; size is the number of
+// bytes to upload. When offset is 0 and size equals the full file size, the
+// entire file is uploaded.
+func (u *Uploader) singlePartUpload(ctx context.Context, task *queue.UploadTask, offset, size int64) (*UploadResult, error) {
 	f, err := os.Open(task.LocalPath)
 	if err != nil {
 		return nil, fmt.Errorf("uploader: open %q: %w", task.LocalPath, err)
 	}
 	defer f.Close()
+
+	if offset > 0 {
+		if _, err = f.Seek(offset, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("uploader: seek %q to %d: %w", task.LocalPath, offset, err)
+		}
+	}
 
 	info, err := u.store.PutObject(ctx, task.Bucket, task.StoragePath, f, size, minio.PutObjectOptions{})
 	if err != nil {

@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -29,7 +30,9 @@ CREATE TABLE IF NOT EXISTS upload_tasks (
     retry_count    INTEGER NOT NULL DEFAULT 0,
     last_error     TEXT,
     created_at     INTEGER NOT NULL,
-    updated_at     INTEGER NOT NULL
+    updated_at     INTEGER NOT NULL,
+    file_offset    INTEGER NOT NULL DEFAULT 0,
+    append_mode    TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS processed_files (
@@ -56,6 +59,15 @@ CREATE INDEX IF NOT EXISTS idx_processed_files_rule
     ON processed_files (rule_id, local_path);
 `
 
+// schemaMigrations runs DDL statements that add columns to existing tables
+// that may have been created before the current schema version. SQLite does
+// not support ADD COLUMN IF NOT EXISTS, so we attempt each migration and
+// silently ignore "duplicate column name" errors.
+var schemaMigrations = []string{
+	`ALTER TABLE upload_tasks ADD COLUMN file_offset INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE upload_tasks ADD COLUMN append_mode TEXT NOT NULL DEFAULT ''`,
+}
+
 // Status values for upload tasks.
 const (
 	StatusPending   = "pending"
@@ -81,6 +93,11 @@ type UploadTask struct {
 	LastError      string
 	CreatedAt      int64
 	UpdatedAt      int64
+	// FileOffset is the byte offset from which to begin uploading in tail mode.
+	// Zero means upload from the beginning of the file.
+	FileOffset int64
+	// AppendMode is "tail", "close_wait", or "" (full-file upload).
+	AppendMode string
 }
 
 // ProcessedFile represents a row in the processed_files table.
@@ -118,6 +135,16 @@ func Open(dsn string) (*Queue, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("queue: apply schema: %w", err)
 	}
+	// Run column-addition migrations on existing databases (ignore duplicate-column errors).
+	for _, stmt := range schemaMigrations {
+		if _, merr := db.Exec(stmt); merr != nil {
+			// "duplicate column name" is expected when the column already exists.
+			if !isDuplicateColumnError(merr) {
+				_ = db.Close()
+				return nil, fmt.Errorf("queue: schema migration %q: %w", stmt, merr)
+			}
+		}
+	}
 	return &Queue{db: db}, nil
 }
 
@@ -144,12 +171,12 @@ func (q *Queue) Enqueue(task *UploadTask) error {
         INSERT INTO upload_tasks
             (id, rule_id, local_path, storage_path, bucket, upload_id,
              completed_parts, file_size, file_mtime, sha256, status,
-             retry_count, last_error, created_at, updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             retry_count, last_error, created_at, updated_at, file_offset, append_mode)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		task.ID, task.RuleID, task.LocalPath, task.StoragePath, task.Bucket,
 		task.UploadID, task.CompletedParts, task.FileSize, task.FileMtime,
 		task.SHA256, task.Status, task.RetryCount, task.LastError,
-		task.CreatedAt, task.UpdatedAt,
+		task.CreatedAt, task.UpdatedAt, task.FileOffset, task.AppendMode,
 	)
 	if err != nil {
 		return fmt.Errorf("queue: enqueue task %q: %w", task.ID, err)
@@ -163,7 +190,8 @@ func (q *Queue) DequeuePending(limit int) ([]*UploadTask, error) {
 	rows, err := q.db.Query(`
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
-               retry_count, last_error, created_at, updated_at
+               retry_count, last_error, created_at, updated_at,
+               file_offset, append_mode
         FROM upload_tasks
         WHERE status = ?
         ORDER BY created_at ASC
@@ -231,7 +259,8 @@ func (q *Queue) ListByStatus(status string) ([]*UploadTask, error) {
 	rows, err := q.db.Query(`
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
-               retry_count, last_error, created_at, updated_at
+               retry_count, last_error, created_at, updated_at,
+               file_offset, append_mode
         FROM upload_tasks
         WHERE status = ?
         ORDER BY created_at ASC`, status)
@@ -314,8 +343,13 @@ func (q *Queue) GetRule(id string) (*Rule, error) {
 	return r, nil
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// isDuplicateColumnError returns true for SQLite "duplicate column name" errors
+// that arise when running ADD COLUMN on an already-migrated database.
+func isDuplicateColumnError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate column name")
+}
 
+// scanTasks scans a rows result set into a slice of UploadTask.
 func scanTasks(rows *sql.Rows) ([]*UploadTask, error) {
 	var tasks []*UploadTask
 	for rows.Next() {
@@ -325,6 +359,7 @@ func scanTasks(rows *sql.Rows) ([]*UploadTask, error) {
 			&t.UploadID, &t.CompletedParts, &t.FileSize, &t.FileMtime,
 			&t.SHA256, &t.Status, &t.RetryCount, &t.LastError,
 			&t.CreatedAt, &t.UpdatedAt,
+			&t.FileOffset, &t.AppendMode,
 		); err != nil {
 			return nil, fmt.Errorf("queue: scan task: %w", err)
 		}

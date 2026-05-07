@@ -1,83 +1,61 @@
 import apiClient from './api'
 
-/** Event rule entity */
+/** Event rule entity matching the backend /api/v1/event-rules response */
 export interface EventRule {
   id: string
+  org_id: string
   name: string
-  description: string
   event_type: string
-  filter_conditions: Record<string, unknown>
-  webhook_url: string
-  webhook_secret: string | null
-  is_active: boolean
+  filter: Record<string, unknown>
+  action_type: string
+  action_config: Record<string, unknown>
+  enabled: boolean
   created_at: string
-  updated_at: string
 }
 
 /** Event delivery record */
 export interface EventDelivery {
   id: string
   event_rule_id: string
-  event_type: string
-  payload: Record<string, unknown>
-  status: 'PENDING' | 'SUCCESS' | 'FAILED'
+  status: string
   attempt_count: number
-  last_attempted_at: string | null
-  next_retry_at: string | null
-  response_code: number | null
-  response_body: string | null
   created_at: string
 }
 
-/** Query parameters for listing event rules */
-export interface ListEventRulesParams {
-  cursor?: string
-  limit?: number
-}
-
-/** Query parameters for listing deliveries */
-export interface ListDeliveriesParams {
-  event_rule_id?: string
-  status?: string
-  cursor?: string
-  limit?: number
-}
-
-/** Paginated list response */
-export interface PaginatedResponse<T> {
-  items: T[]
-  total: number
+/** Paginated deliveries response */
+export interface DeliveriesResponse {
+  data: EventDelivery[]
   next_cursor: string | null
 }
 
 /**
- * List event rules.
+ * List all event rules in the organisation.
  */
-export async function listEventRules(
-  params?: ListEventRulesParams
-): Promise<PaginatedResponse<EventRule>> {
-  const response = await apiClient.get<PaginatedResponse<EventRule>>(
-    '/api/v1/events',
-    { params }
-  )
-  return response.data
+export async function listEventRules(): Promise<EventRule[]> {
+  const response = await apiClient.get<{ data: EventRule[] }>('/api/v1/event-rules')
+  return response.data.data
 }
 
 /**
  * Get a single event rule by ID.
  */
 export async function getEventRule(id: string): Promise<EventRule> {
-  const response = await apiClient.get<EventRule>(`/api/v1/events/${id}`)
+  const response = await apiClient.get<EventRule>(`/api/v1/event-rules/${id}`)
   return response.data
 }
 
 /**
  * Create a new event rule.
  */
-export async function createEventRule(
-  data: Omit<EventRule, 'id' | 'created_at' | 'updated_at'>
-): Promise<EventRule> {
-  const response = await apiClient.post<EventRule>('/api/v1/events', data)
+export async function createEventRule(data: {
+  name: string
+  event_type: string
+  filter?: Record<string, unknown>
+  action_type: string
+  action_config: Record<string, unknown>
+  enabled: boolean
+}): Promise<EventRule> {
+  const response = await apiClient.post<EventRule>('/api/v1/event-rules', data)
   return response.data
 }
 
@@ -86,9 +64,16 @@ export async function createEventRule(
  */
 export async function updateEventRule(
   id: string,
-  data: Partial<EventRule>
+  data: {
+    name: string
+    event_type: string
+    filter?: Record<string, unknown>
+    action_type: string
+    action_config: Record<string, unknown>
+    enabled: boolean
+  }
 ): Promise<EventRule> {
-  const response = await apiClient.put<EventRule>(`/api/v1/events/${id}`, data)
+  const response = await apiClient.put<EventRule>(`/api/v1/event-rules/${id}`, data)
   return response.data
 }
 
@@ -96,17 +81,18 @@ export async function updateEventRule(
  * Delete an event rule.
  */
 export async function deleteEventRule(id: string): Promise<void> {
-  await apiClient.delete(`/api/v1/events/${id}`)
+  await apiClient.delete(`/api/v1/event-rules/${id}`)
 }
 
 /**
- * List event deliveries.
+ * List delivery records for a specific event rule.
  */
-export async function listEventDeliveries(
-  params?: ListDeliveriesParams
-): Promise<PaginatedResponse<EventDelivery>> {
-  const response = await apiClient.get<PaginatedResponse<EventDelivery>>(
-    '/api/v1/event-deliveries',
+export async function listRuleDeliveries(
+  ruleId: string,
+  params?: { cursor?: string; limit?: number }
+): Promise<DeliveriesResponse> {
+  const response = await apiClient.get<DeliveriesResponse>(
+    `/api/v1/event-rules/${ruleId}/deliveries`,
     { params }
   )
   return response.data

@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	_ "go.uber.org/zap" // indirect — newTestLogger defined in users_test.go
 )
 
 func init() {
@@ -25,7 +26,7 @@ func setupHandlerRouter(t *testing.T) (*httptest.Server, *gin.Engine) {
 
 func TestAgentsHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewAgentsHandler()
+	h := handler.NewAgentsHandler(nil, nil, nil, nil, newTestLogger())
 	r.GET("/agents", h.List)
 	r.GET("/agents/:id", h.Get)
 	r.POST("/agents/:id/approve", h.Approve)
@@ -67,7 +68,7 @@ func TestAgentsHandler_AllReturn501(t *testing.T) {
 
 func TestFilesHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewFilesHandler()
+	h := handler.NewFilesHandler(nil, nil, newTestLogger())
 	r.GET("/files", h.List)
 	r.GET("/files/:id", h.Get)
 	r.GET("/files/:id/download-url", h.DownloadURL)
@@ -97,7 +98,7 @@ func TestFilesHandler_AllReturn501(t *testing.T) {
 
 func TestFileTypesHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewFileTypesHandler()
+	h := handler.NewFileTypesHandler(nil, newTestLogger())
 	r.GET("/file-types", h.List)
 	r.POST("/file-types", h.Create)
 	r.PUT("/file-types/:id", h.Update)
@@ -127,7 +128,7 @@ func TestFileTypesHandler_AllReturn501(t *testing.T) {
 
 func TestBucketsHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewBucketsHandler()
+	h := handler.NewBucketsHandler(nil, nil, newTestLogger())
 	r.GET("/buckets", h.List)
 	r.POST("/buckets", h.Create)
 
@@ -153,7 +154,7 @@ func TestBucketsHandler_AllReturn501(t *testing.T) {
 
 func TestEventRulesHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewEventRulesHandler()
+	h := handler.NewEventRulesHandler(nil, newTestLogger())
 	r.GET("/event-rules", h.List)
 	r.POST("/event-rules", h.Create)
 	r.PUT("/event-rules/:id", h.Update)
@@ -185,7 +186,7 @@ func TestEventRulesHandler_AllReturn501(t *testing.T) {
 
 func TestUploadLogsHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewUploadLogsHandler()
+	h := handler.NewUploadLogsHandler(nil, newTestLogger())
 	r.GET("/upload-logs", h.List)
 	r.GET("/upload-logs/:id", h.Get)
 
@@ -211,7 +212,7 @@ func TestUploadLogsHandler_AllReturn501(t *testing.T) {
 
 func TestUsersHandler_AllReturn501(t *testing.T) {
 	r := gin.New()
-	h := handler.NewUsersHandler()
+	h := handler.NewUsersHandler(nil, newTestLogger()) // nil db → 501 for all methods
 	r.GET("/users", h.List)
 	r.POST("/users", h.Create)
 	r.PUT("/users/:id", h.Update)

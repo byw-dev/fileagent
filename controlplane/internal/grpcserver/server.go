@@ -11,6 +11,9 @@ import (
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
+	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/storage"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -34,27 +37,53 @@ type AgentManager interface {
 	PollApproval(ctx context.Context, req *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error)
 }
 
+// DispatcherClient is the interface used by Connect to sync rules on reconnect.
+type DispatcherClient interface {
+	SyncRulesOnConnect(ctx context.Context, agentID string) error
+}
+
+// IndexerClient is the interface used by handleUploadResult.
+type IndexerClient interface {
+	HandleUploadResult(ctx context.Context, agentID uuid.UUID, orgID uuid.UUID, result *agentv1.UploadResult) error
+}
+
+// STSManagerClient is the interface used by RefreshCredentials.
+type STSManagerClient interface {
+	IssueCredentials(ctx context.Context, agentID string, buckets []storage.BucketAccess) (*agentv1.CredentialsPayload, error)
+}
+
+// CredentialDB is the minimal DB interface used by RefreshCredentials to look
+// up rule and bucket details.
+type CredentialDB interface {
+	GetCollectionRuleByID(ctx context.Context, id uuid.UUID) (*db.CollectionRule, error)
+	GetBucketByID(ctx context.Context, id uuid.UUID) (*db.Bucket, error)
+}
+
 // Server holds dependencies shared by all gRPC handlers.
 type Server struct {
 	// Embed the generated Unimplemented guard so that adding new RPC methods to
 	// the proto does not break compilation.
 	agentv1.UnimplementedAgentServiceServer
 
-	logger   *zap.Logger
-	registry *AgentRegistry
-	cache    CacheClient
-	jwtSvc   auth.Service
-	nats     NATSPublisher
-	agentMgr AgentManager
+	logger     *zap.Logger
+	registry   *AgentRegistry
+	cache      CacheClient
+	jwtSvc     auth.Service
+	nats       NATSPublisher
+	agentMgr   AgentManager
+	dispatcher DispatcherClient
+	indexer    IndexerClient
+	stsMgr     STSManagerClient
+	credDB     CredentialDB
 }
 
 // New creates a new gRPC Server with the provided logger. Additional
-// dependencies can be injected via WithDeps.
+// dependencies can be injected via WithDeps / WithExtraDeps.
 func New(logger *zap.Logger) *Server {
 	return &Server{logger: logger}
 }
 
-// WithDeps injects optional dependencies into the server.
+// WithDeps injects the core dependencies into the server.
 func (s *Server) WithDeps(
 	registry *AgentRegistry,
 	cache CacheClient,
@@ -67,6 +96,20 @@ func (s *Server) WithDeps(
 	s.jwtSvc = jwtSvc
 	s.nats = nats
 	s.agentMgr = agentMgr
+	return s
+}
+
+// WithExtraDeps injects the Phase-2 business-logic dependencies.
+func (s *Server) WithExtraDeps(
+	dispatcher DispatcherClient,
+	ix IndexerClient,
+	stsMgr STSManagerClient,
+	credDB CredentialDB,
+) *Server {
+	s.dispatcher = dispatcher
+	s.indexer = ix
+	s.stsMgr = stsMgr
+	s.credDB = credDB
 	return s
 }
 

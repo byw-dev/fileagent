@@ -23,6 +23,9 @@ type FileEvent struct {
 	Size int64
 	// Op describes the operation: "create", "write", or "remove".
 	Op string
+	// FileOffset is the byte offset from which new content starts. Non-zero
+	// only in "tail" append mode. Zero means upload from the beginning.
+	FileOffset int64
 }
 
 // Watcher monitors a directory and emits FileEvents on a channel.
@@ -31,14 +34,33 @@ type Watcher struct {
 	fileGlob     string
 	recursive    bool
 	pollInterval time.Duration
+	appendMode   string // "" | "tail" | "close_wait"
 	logger       *zap.Logger
+
+	// tailOffsets tracks the last known byte offset per file for tail mode.
+	tailOffsets map[string]int64
 }
+
+// AppendModeNone means upload the full file on each change.
+const AppendModeNone = ""
+
+// AppendModeTail tracks the byte offset of each file and uploads only the
+// bytes added since the last successful upload.
+const AppendModeTail = "tail"
+
+// AppendModeCloseWait debounces Write/Create events by waiting a short idle
+// period before emitting, approximating "file was closed after writing".
+const AppendModeCloseWait = "close_wait"
+
+// closeWaitDebounce is the idle period used in close_wait mode.
+const closeWaitDebounce = 500 * time.Millisecond
 
 // New creates a Watcher for the given source directory.
 // fileGlob is matched against file base names (e.g. "*.log").
 // If recursive is true, subdirectories are watched as well.
 // pollInterval controls the fallback polling cadence (default 30 s when 0).
-func New(sourcePath, fileGlob string, recursive bool, pollInterval time.Duration, logger *zap.Logger) (*Watcher, error) {
+// appendMode controls append-mode behaviour: "", "tail", or "close_wait".
+func New(sourcePath, fileGlob string, recursive bool, pollInterval time.Duration, appendMode string, logger *zap.Logger) (*Watcher, error) {
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
 	}
@@ -47,7 +69,9 @@ func New(sourcePath, fileGlob string, recursive bool, pollInterval time.Duration
 		fileGlob:     fileGlob,
 		recursive:    recursive,
 		pollInterval: pollInterval,
+		appendMode:   appendMode,
 		logger:       logger,
+		tailOffsets:  make(map[string]int64),
 	}, nil
 }
 
@@ -69,6 +93,9 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 	}
 
 	w.logger.Info("watcher: fsnotify started", zap.String("path", w.sourcePath))
+	if w.appendMode == AppendModeCloseWait {
+		return w.runCloseWait(ctx, events, fw)
+	}
 	return w.runFsnotify(ctx, events, fw)
 }
 
@@ -87,6 +114,77 @@ func (w *Watcher) addWatchPaths(fw *fsnotify.Watcher) error {
 		}
 		return nil
 	})
+}
+
+// runCloseWait drives the fsnotify event loop in close_wait mode. Write and
+// Create events are debounced: a per-file timer is reset on every event, and
+// the FileEvent is emitted only once the timer fires (i.e., once writes stop
+// for at least closeWaitDebounce). This approximates "file closed after write"
+// on platforms that do not expose a native close-write notification.
+func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher) error {
+	type pendingEntry struct {
+		timer *time.Timer
+		op    string
+	}
+	pending := make(map[string]*pendingEntry)
+
+	flush := func(path, op string) {
+		fe, err := w.buildEvent(path, op)
+		if err != nil {
+			return
+		}
+		w.emit(ctx, events, fe)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Cancel all pending timers before returning.
+			for _, p := range pending {
+				p.timer.Stop()
+			}
+			return ctx.Err()
+		case ev, ok := <-fw.Events:
+			if !ok {
+				return nil
+			}
+			if ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename) {
+				if w.matchGlob(ev.Name) {
+					// Remove events are immediate (no debounce needed).
+					if p, ok := pending[ev.Name]; ok {
+						p.timer.Stop()
+						delete(pending, ev.Name)
+					}
+					w.emit(ctx, events, FileEvent{Path: ev.Name, Op: "remove"})
+				}
+				continue
+			}
+			if !ev.Has(fsnotify.Create) && !ev.Has(fsnotify.Write) {
+				continue
+			}
+			if !w.matchGlob(ev.Name) {
+				continue
+			}
+			op := opString(ev)
+			if p, ok := pending[ev.Name]; ok {
+				// Reset existing timer.
+				p.timer.Reset(closeWaitDebounce)
+				p.op = op
+			} else {
+				path := ev.Name // capture for closure
+				p := &pendingEntry{op: op}
+				p.timer = time.AfterFunc(closeWaitDebounce, func() {
+					flush(path, p.op)
+				})
+				pending[path] = p
+			}
+		case err, ok := <-fw.Errors:
+			if !ok {
+				return nil
+			}
+			w.logger.Warn("watcher: fsnotify error", zap.Error(err))
+		}
+	}
 }
 
 // runFsnotify drives the fsnotify event loop, translating raw events into
@@ -159,11 +257,19 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 				op = "create"
 			}
 			seen[path] = info.ModTime()
+
+			var offset int64
+			if w.appendMode == AppendModeTail {
+				offset = w.tailOffsets[path]
+				w.tailOffsets[path] = info.Size()
+			}
+
 			fe := FileEvent{
-				Path:    path,
-				ModTime: info.ModTime(),
-				Size:    info.Size(),
-				Op:      op,
+				Path:       path,
+				ModTime:    info.ModTime(),
+				Size:       info.Size(),
+				Op:         op,
+				FileOffset: offset,
 			}
 			w.emit(ctx, events, fe)
 		}
@@ -189,6 +295,8 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 
 // buildEvent constructs a FileEvent for the file at path using its current
 // metadata. Returns an error if the file does not exist or is a directory.
+// In tail mode, FileOffset is set to the previous file size so the consumer
+// knows from where to start uploading new content.
 func (w *Watcher) buildEvent(path, op string) (FileEvent, error) {
 	if !w.matchGlob(path) {
 		return FileEvent{}, errSkipped
@@ -200,11 +308,19 @@ func (w *Watcher) buildEvent(path, op string) (FileEvent, error) {
 	if info.IsDir() {
 		return FileEvent{}, errSkipped
 	}
+
+	var offset int64
+	if w.appendMode == AppendModeTail {
+		offset = w.tailOffsets[path]
+		w.tailOffsets[path] = info.Size()
+	}
+
 	return FileEvent{
-		Path:    path,
-		ModTime: info.ModTime(),
-		Size:    info.Size(),
-		Op:      op,
+		Path:       path,
+		ModTime:    info.ModTime(),
+		Size:       info.Size(),
+		Op:         op,
+		FileOffset: offset,
 	}, nil
 }
 

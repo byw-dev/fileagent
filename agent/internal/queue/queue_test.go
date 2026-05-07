@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -227,4 +228,72 @@ func TestRules_NotFound(t *testing.T) {
 	_, err := q.GetRule("missing")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, sql.ErrNoRows))
+}
+
+func TestQueue_AppendModeFields_PersistAndLoad(t *testing.T) {
+q, err := Open(":memory:")
+require.NoError(t, err)
+defer q.Close()
+
+task := &UploadTask{
+ID:          "task-tail",
+RuleID:      "rule-1",
+LocalPath:   "/data/file.log",
+StoragePath: "logs/file.log",
+Bucket:      "my-bucket",
+FileSize:    1024,
+FileMtime:   time.Now().Unix(),
+FileOffset:  512,
+AppendMode:  "tail",
+}
+require.NoError(t, q.Enqueue(task))
+
+tasks, err := q.DequeuePending(10)
+require.NoError(t, err)
+require.Len(t, tasks, 1)
+assert.Equal(t, int64(512), tasks[0].FileOffset)
+assert.Equal(t, "tail", tasks[0].AppendMode)
+}
+
+func TestQueue_Open_ExistingDB_MigratesNewColumns(t *testing.T) {
+// Simulate a pre-existing DB that doesn't have file_offset/append_mode columns.
+// Opening it again should run the ALTER TABLE migrations without error.
+dir := t.TempDir()
+dsn := filepath.Join(dir, "test.db")
+
+// Create a DB without file_offset/append_mode.
+db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL")
+require.NoError(t, err)
+_, err = db.Exec(`
+CREATE TABLE IF NOT EXISTS upload_tasks (
+id TEXT PRIMARY KEY, rule_id TEXT NOT NULL, local_path TEXT NOT NULL,
+storage_path TEXT NOT NULL, bucket TEXT NOT NULL, upload_id TEXT,
+completed_parts TEXT, file_size INTEGER NOT NULL DEFAULT 0,
+file_mtime INTEGER NOT NULL DEFAULT 0, sha256 TEXT,
+status TEXT NOT NULL DEFAULT 'pending', retry_count INTEGER NOT NULL DEFAULT 0,
+last_error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS processed_files (
+id TEXT PRIMARY KEY, rule_id TEXT NOT NULL, local_path TEXT NOT NULL,
+file_size INTEGER NOT NULL, file_mtime INTEGER NOT NULL, sha256 TEXT,
+uploaded_at INTEGER NOT NULL, UNIQUE (rule_id, local_path)
+);
+CREATE TABLE IF NOT EXISTS rules (
+id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL
+);
+`)
+require.NoError(t, err)
+db.Close()
+
+// Re-open with Queue.Open — migration should succeed.
+q, err := Open(dsn)
+require.NoError(t, err)
+defer q.Close()
+
+// Should be able to enqueue with the new fields.
+task := &UploadTask{
+ID: "m1", RuleID: "r1", LocalPath: "/f", StoragePath: "s",
+Bucket: "b", FileSize: 1, FileMtime: 1, FileOffset: 100, AppendMode: "close_wait",
+}
+require.NoError(t, q.Enqueue(task))
 }

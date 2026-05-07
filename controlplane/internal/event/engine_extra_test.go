@@ -20,10 +20,16 @@ import (
 // ── Mock EngineStore ──────────────────────────────────────────────────────────
 
 type mockEngineStore struct {
-	rules        []*db.EventRule
-	listErr      error
-	delivery     *db.EventDelivery
-	createDelErr error
+	rules            []*db.EventRule
+	listErr          error
+	delivery         *db.EventDelivery
+	createDelErr     error
+	pendingDeliveries []*db.EventDelivery
+	pendingErr       error
+	updateErr        error
+	updateCalled     bool
+	ruleByID         *db.EventRule
+	ruleByIDErr      error
 }
 
 func (m *mockEngineStore) ListEnabledEventRules(_ context.Context, _ uuid.UUID, _ db.EventType) ([]*db.EventRule, error) {
@@ -38,6 +44,19 @@ func (m *mockEngineStore) CreateEventDelivery(_ context.Context, _ indexer.Creat
 		return m.delivery, nil
 	}
 	return &db.EventDelivery{ID: uuid.New()}, nil
+}
+
+func (m *mockEngineStore) ListPendingDeliveries(_ context.Context) ([]*db.EventDelivery, error) {
+	return m.pendingDeliveries, m.pendingErr
+}
+
+func (m *mockEngineStore) UpdateDelivery(_ context.Context, _ indexer.UpdateEventDeliveryParams) error {
+	m.updateCalled = true
+	return m.updateErr
+}
+
+func (m *mockEngineStore) GetEventRuleByID(_ context.Context, _ uuid.UUID) (*db.EventRule, error) {
+	return m.ruleByID, m.ruleByIDErr
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -59,6 +78,14 @@ func TestNewEngine(t *testing.T) {
 	logger := newTestLogger()
 	sender := event.NewWebhookSender(&dummyDeliveryDB{}, logger)
 	engine := event.NewEngineWithStore(&mockEngineStore{}, sender, logger)
+	require.NotNil(t, engine)
+}
+
+func TestNewEngine_ProductionConstructor(t *testing.T) {
+	// Covers event.NewEngine (the production db.DBTX-based constructor).
+	logger := newTestLogger()
+	sender := event.NewWebhookSender(&dummyDeliveryDB{}, logger)
+	engine := event.NewEngine(&nilDBTX{}, sender, logger)
 	require.NotNil(t, engine)
 }
 

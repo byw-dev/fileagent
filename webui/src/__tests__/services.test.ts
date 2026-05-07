@@ -165,11 +165,11 @@ describe('services/files – extended coverage', () => {
     expect(result.total).toBe(0)
   })
 
-  it('getFileDownloadUrl calls GET /api/v1/files/:id/download', async () => {
+  it('getFileDownloadUrl calls GET /api/v1/files/:id/download-url', async () => {
     mockGet.mockResolvedValue({ data: { url: 'https://example.com/file' } })
     const { getFileDownloadUrl } = await import('../services/files')
     const result = await getFileDownloadUrl('file-1')
-    expect(mockGet).toHaveBeenCalledWith('/api/v1/files/file-1/download')
+    expect(mockGet).toHaveBeenCalledWith('/api/v1/files/file-1/download-url')
     expect(result.url).toBe('https://example.com/file')
   })
 })

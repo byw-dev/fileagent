@@ -30,10 +30,14 @@ type mockStore struct {
 	completeErr   error
 	uploadID      string
 	parts         []minio.ObjectPart
+	putFn         func(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
 }
 
-func (m *mockStore) PutObject(_ context.Context, _, _ string, r io.Reader, _ int64, _ minio.PutObjectOptions) (minio.UploadInfo, error) {
+func (m *mockStore) PutObject(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
 	m.putCalls++
+	if m.putFn != nil {
+		return m.putFn(ctx, bucket, object, r, size, opts)
+	}
 	if m.putErr != nil {
 		return minio.UploadInfo{}, m.putErr
 	}
@@ -252,4 +256,121 @@ func TestNewWithStore_DefaultPartSize(t *testing.T) {
 	u := newWithStore(&mockStore{}, Config{PartSizeMB: 0}, nil, zap.NewNop())
 	assert.Equal(t, 64, u.cfg.PartSizeMB)
 	assert.Equal(t, 64, u.cfg.ThresholdMB)
+}
+
+func TestUploadFile_TailMode_UploadsTailOnly(t *testing.T) {
+// Create a file with 10 bytes total.
+dir := t.TempDir()
+path := filepath.Join(dir, "data.txt")
+require.NoError(t, os.WriteFile(path, []byte("0123456789"), 0o644))
+
+var received []byte
+store := &mockStore{
+putFn: func(_ context.Context, _, _ string, r io.Reader, _ int64, _ minio.PutObjectOptions) (minio.UploadInfo, error) {
+b, err := io.ReadAll(r)
+if err != nil {
+return minio.UploadInfo{}, err
+}
+received = b
+return minio.UploadInfo{ETag: "etag-tail"}, nil
+},
+}
+q, _ := queue.Open(":memory:")
+defer q.Close()
+
+u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
+task := &queue.UploadTask{
+ID:          "t1",
+LocalPath:   path,
+StoragePath: "obj",
+Bucket:      "b",
+FileOffset:  5,
+AppendMode:  "tail",
+}
+
+res, err := u.UploadFile(context.Background(), task)
+require.NoError(t, err)
+assert.Equal(t, int64(5), res.SizeBytes)
+assert.Equal(t, []byte("56789"), received)
+}
+
+func TestUploadFile_TailMode_OffsetBeyondEnd_NoOp(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "data.txt")
+require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+store := &mockStore{}
+q, _ := queue.Open(":memory:")
+defer q.Close()
+
+u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
+task := &queue.UploadTask{
+ID:          "t2",
+LocalPath:   path,
+StoragePath: "obj",
+Bucket:      "b",
+FileOffset:  10, // beyond file end
+AppendMode:  "tail",
+}
+
+res, err := u.UploadFile(context.Background(), task)
+require.NoError(t, err)
+assert.Equal(t, int64(0), res.SizeBytes)
+}
+
+func TestUploadFile_SinglePart_SeekError(t *testing.T) {
+// Create a tiny file (1 byte) and try to seek to offset 5 — stat says size 1
+// so offset 5 >= size 1 so this becomes a no-op (no bytes to upload).
+dir := t.TempDir()
+path := filepath.Join(dir, "small.txt")
+require.NoError(t, os.WriteFile(path, []byte("x"), 0o644))
+
+store := &mockStore{}
+q, _ := queue.Open(":memory:")
+defer q.Close()
+
+u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
+task := &queue.UploadTask{
+ID: "s1", LocalPath: path, StoragePath: "obj", Bucket: "b",
+FileOffset: 100, AppendMode: "tail",
+}
+// Offset >= file size: should return SizeBytes=0 without error.
+res, err := u.UploadFile(context.Background(), task)
+require.NoError(t, err)
+assert.Equal(t, int64(0), res.SizeBytes)
+}
+
+func TestNewSectionReader_InvalidPath(t *testing.T) {
+_, err := newSectionReader("/nonexistent/path.dat", 0, 10)
+require.Error(t, err)
+}
+
+func TestNewSectionReader_ZeroSize(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "data.bin")
+require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+sr, err := newSectionReader(path, 2, 3)
+require.NoError(t, err)
+defer sr.f.Close()
+
+data, err := io.ReadAll(sr)
+require.NoError(t, err)
+assert.Len(t, data, 3)
+}
+
+// TestNew_ValidEndpoint verifies that New creates an Uploader without requiring
+// an actual MinIO connection (minio.NewCore is lazy).
+func TestNew_ValidEndpoint(t *testing.T) {
+q, _ := queue.Open(":memory:")
+defer q.Close()
+
+u, err := New(Config{
+Endpoint:  "localhost:9000",
+AccessKey: "minioadmin",
+SecretKey: "minioadmin",
+UseSSL:    false,
+}, q, zap.NewNop())
+require.NoError(t, err)
+assert.NotNil(t, u)
 }

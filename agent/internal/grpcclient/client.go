@@ -35,13 +35,13 @@ type Client struct {
 	cfg    *config.Config
 	logger *zap.Logger
 
-	mu     sync.Mutex
-	conn   *grpc.ClientConn
-	svc    agentv1.AgentServiceClient
-	stream agentv1.AgentService_ConnectClient
-
-	// token is the Bearer JWT sent with each Connect call.
-	token string
+	mu         sync.Mutex
+	conn       *grpc.ClientConn
+	svc        agentv1.AgentServiceClient
+	stream     agentv1.AgentService_ConnectClient
+	token      string
+	agentID    string
+	msgHandler func(*agentv1.ServerMessage)
 }
 
 // New constructs a Client. Call Connect to establish the connection.
@@ -57,6 +57,69 @@ func (c *Client) SetToken(token string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.token = token
+}
+
+// SetAgentID stores the agent identifier used in outgoing RPCs such as RefreshCredentials.
+func (c *Client) SetAgentID(id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.agentID = id
+}
+
+// SetMessageHandler registers a callback invoked for every ServerMessage received
+// from the Control Plane. The handler is called synchronously in the receive loop,
+// so heavy work should be dispatched to a goroutine.
+func (c *Client) SetMessageHandler(h func(*agentv1.ServerMessage)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msgHandler = h
+}
+
+// ServiceClient returns the underlying AgentServiceClient after Connect has been called.
+func (c *Client) ServiceClient() agentv1.AgentServiceClient {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.svc
+}
+
+// SendMessage writes an AgentMessage to the current stream.
+func (c *Client) SendMessage(msg *agentv1.AgentMessage) error {
+	c.mu.Lock()
+	stream := c.stream
+	c.mu.Unlock()
+	if stream == nil {
+		return fmt.Errorf("grpcclient: no active stream")
+	}
+	if err := stream.Send(msg); err != nil {
+		return fmt.Errorf("grpcclient: send message: %w", err)
+	}
+	return nil
+}
+
+// RefreshCredentials calls the Control Plane to obtain fresh STS credentials.
+func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPayload, error) {
+	c.mu.Lock()
+	svc := c.svc
+	tok := c.token
+	id := c.agentID
+	c.mu.Unlock()
+
+	if svc == nil {
+		return nil, fmt.Errorf("grpcclient: service client not initialised")
+	}
+
+	outCtx := ctx
+	if tok != "" {
+		outCtx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+tok)
+	}
+
+	resp, err := svc.RefreshCredentials(outCtx, &agentv1.RefreshCredentialsRequest{
+		AgentId: id,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("grpcclient: refresh credentials: %w", err)
+	}
+	return resp.GetCredentials(), nil
 }
 
 // Connect dials the Control Plane and opens the bidirectional Connect stream,
@@ -175,7 +238,8 @@ func (c *Client) openStream(ctx context.Context) error {
 	return nil
 }
 
-// receiveLoop reads server messages from the stream until it closes or errors.
+// receiveLoop reads server messages from the stream until it closes or errors,
+// dispatching each message to the registered handler (if any).
 func (c *Client) receiveLoop(ctx context.Context) {
 	c.mu.Lock()
 	stream := c.stream
@@ -185,13 +249,19 @@ func (c *Client) receiveLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		_, err := stream.Recv()
+		msg, err := stream.Recv()
 		if err != nil {
 			c.logger.Warn("grpcclient: stream recv error", zap.Error(err))
 			c.mu.Lock()
 			c.stream = nil
 			c.mu.Unlock()
 			return
+		}
+		c.mu.Lock()
+		h := c.msgHandler
+		c.mu.Unlock()
+		if h != nil {
+			h(msg)
 		}
 	}
 }

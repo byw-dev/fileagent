@@ -87,3 +87,13 @@ func TestSTSManager_IssueCredentials_ReturnsError(t *testing.T) {
 	})
 	require.Error(t, err)
 }
+
+func TestSTSManager_IssueCredentials_UseSSL_ReturnsError(t *testing.T) {
+	// Exercises the useSSL=true code path (scheme="https").
+	// No real MinIO — should still fail at credential exchange.
+	mgr := NewSTSManager("127.0.0.1:19999", "access", "secret", "arn:minio:sts:::role", true, zapNoopLogger())
+	_, err := mgr.IssueCredentials(context.Background(), "agent-ssl", []BucketAccess{
+		{BucketName: "test", PathPrefix: "uploads/"},
+	})
+	require.Error(t, err)
+}

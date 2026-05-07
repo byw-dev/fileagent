@@ -2,11 +2,14 @@ package grpcserver
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
+	"github.com/byw-dev/fileagent/controlplane/internal/storage"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -67,6 +70,13 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	s.publishEvent("events.agent.online", agentID)
 	s.logger.Info("agent connected", zap.String("agent_id", agentID))
 
+	// Sync all active rules to the freshly connected agent (CP-W3 / CP-W4).
+	if s.dispatcher != nil {
+		if err := s.dispatcher.SyncRulesOnConnect(ctx, agentID); err != nil {
+			s.logger.Warn("connect: sync rules failed", zap.String("agent_id", agentID), zap.Error(err))
+		}
+	}
+
 	// Start send goroutine.
 	sendErr := make(chan error, 1)
 	go func() {
@@ -100,10 +110,50 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	}
 }
 
-// RefreshCredentials allows an Agent to request new STS credentials.
+// RefreshCredentials allows an Agent to request new STS credentials for a
+// specific collection rule.
 func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCredentialsRequest) (*agentv1.RefreshCredentialsResponse, error) {
-	s.logger.Debug("RefreshCredentials called (unimplemented)", zap.String("agent_id", req.GetAgentId()))
-	return nil, status.Error(codes.Unimplemented, "RefreshCredentials not yet implemented")
+	if s.stsMgr == nil || s.credDB == nil {
+		s.logger.Debug("RefreshCredentials called (stsMgr/credDB not wired)",
+			zap.String("agent_id", req.GetAgentId()))
+		return nil, status.Error(codes.Unimplemented, "RefreshCredentials not yet implemented")
+	}
+
+	agentID := req.GetAgentId()
+	ruleID := req.GetRuleId()
+
+	// Look up collection rule to find the target bucket.
+	parsedRuleID, err := uuid.Parse(ruleID)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid rule_id: %v", err)
+	}
+
+	rule, err := s.credDB.GetCollectionRuleByID(ctx, parsedRuleID)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "collection rule not found: %v", err)
+	}
+
+	bucket, err := s.credDB.GetBucketByID(ctx, rule.BucketID)
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "bucket not found: %v", err)
+	}
+
+	creds, err := s.stsMgr.IssueCredentials(ctx, agentID, []storage.BucketAccess{
+		{BucketName: bucket.Name, PathPrefix: fmt.Sprintf("agents/%s/", agentID)},
+	})
+	if err != nil {
+		s.logger.Error("refresh_credentials: issue STS failed",
+			zap.String("agent_id", agentID),
+			zap.Error(err),
+		)
+		return nil, status.Errorf(codes.Internal, "failed to issue credentials: %v", err)
+	}
+
+	s.logger.Info("credentials refreshed",
+		zap.String("agent_id", agentID),
+		zap.String("bucket", bucket.Name),
+	)
+	return &agentv1.RefreshCredentialsResponse{Credentials: creds}, nil
 }
 
 // handleAgentMessage processes a single incoming message from an agent.
@@ -133,12 +183,35 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 	)
 }
 
+// handleUploadResult forwards the upload result to the Indexer for file entry
+// creation, upload log recording, and NATS event publishing (CP-W2).
 func (s *Server) handleUploadResult(ctx context.Context, agentID string, result *agentv1.UploadResult) {
 	s.logger.Info("upload result received",
 		zap.String("agent_id", agentID),
 		zap.String("storage_path", result.GetStoragePath()),
 		zap.Bool("success", result.GetSuccess()),
 	)
+
+	if s.indexer == nil {
+		return
+	}
+
+	agentUUID, err := uuid.Parse(agentID)
+	if err != nil {
+		s.logger.Error("handleUploadResult: invalid agent_id", zap.String("agent_id", agentID), zap.Error(err))
+		return
+	}
+
+	// Extract orgID from JWT claims in context; fall back to default org for
+	// single-org deployments.
+	orgID := extractOrgID(ctx)
+
+	if err := s.indexer.HandleUploadResult(ctx, agentUUID, orgID, result); err != nil {
+		s.logger.Error("handleUploadResult: indexer failed",
+			zap.String("agent_id", agentID),
+			zap.Error(err),
+		)
+	}
 }
 
 func (s *Server) publishEvent(subject, agentID string) {
@@ -166,4 +239,25 @@ func extractAgentID(ctx context.Context) string {
 		return ""
 	}
 	return claims.Subject
+}
+
+// defaultOrgID is the single-org UUID used in Phase 1 deployments.
+var defaultOrgID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
+
+// extractOrgID reads the org_id from JWT claims in context, falling back to
+// the default org for single-org deployments.
+func extractOrgID(ctx context.Context) uuid.UUID {
+	v := ctx.Value(claimsContextKey)
+	if v == nil {
+		return defaultOrgID
+	}
+	claims, ok := v.(*auth.Claims)
+	if !ok || claims == nil || claims.OrgID == "" {
+		return defaultOrgID
+	}
+	id, err := uuid.Parse(claims.OrgID)
+	if err != nil {
+		return defaultOrgID
+	}
+	return id
 }

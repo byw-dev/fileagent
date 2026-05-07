@@ -18,8 +18,21 @@ import (
 type RouterConfig struct {
 	JWTSecret  string
 	Logger     *zap.Logger
-	JWTService auth.Service    // nil → auth routes return 501 (Phase 1 behaviour)
-	AuthDB     handler.AuthDB  // nil → auth routes return 501
+	JWTService auth.Service   // nil → auth routes return 501 (Phase 1 behaviour)
+	AuthDB     handler.AuthDB // nil → auth routes return 501
+	UsersDB       handler.UsersDB
+	FileTypesDB   handler.FileTypesDB
+	FilesDB       handler.FilesDB
+	MinIOSigner   handler.MinIOPresigner
+	BucketsDB     handler.BucketsDB
+	MinIOAdmin    handler.MinioBucketMaker // nil → bucket creation skips MinIO call
+	EventRulesDB  handler.EventRulesDB
+	UploadLogsDB  handler.UploadLogsDB
+	AgentsDB      handler.AgentsDB
+	AgentMgr      handler.AgentManager
+	Dispatcher    handler.RuleDispatcher
+	Registry      handler.AgentRegistryClient
+	MinioIndexer  handler.IndexerClient // nil → minio webhook events are only logged
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -38,7 +51,8 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	})
 
 	// ── Internal MinIO event webhook (no auth, secured by shared secret) ────
-	r.POST("/internal/minio-event", middleware.NotImplemented)
+	minioH := handler.NewMinioEventHandler(cfg.MinioIndexer, cfg.Logger)
+	r.POST("/internal/minio-event", minioH.Handle)
 
 	// ── Auth routes ──────────────────────────────────────────────────────────
 	authH := handler.NewAuthHandler(cfg.JWTService, cfg.AuthDB)
@@ -52,12 +66,12 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// ── Authenticated API v1 routes ──────────────────────────────────────────
-	jwtMW := middleware.JWT(cfg.JWTSecret, cfg.Logger)
+	jwtMW := middleware.JWT(cfg.JWTService, cfg.Logger)
 
 	v1 := r.Group("/api/v1", jwtMW)
 
 	// Users (super_admin only)
-	usersH := handler.NewUsersHandler()
+	usersH := handler.NewUsersHandler(cfg.UsersDB, cfg.Logger)
 	superAdmin := middleware.RequireRole("super_admin")
 	users := v1.Group("/users")
 	{
@@ -69,7 +83,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Agents
-	agentsH := handler.NewAgentsHandler()
+	agentsH := handler.NewAgentsHandler(cfg.AgentsDB, cfg.AgentMgr, cfg.Dispatcher, cfg.Registry, cfg.Logger)
 	agents := v1.Group("/agents")
 	{
 		agents.GET("", agentsH.List)
@@ -85,8 +99,8 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Files and file types
-	filesH := handler.NewFilesHandler()
-	fileTypesH := handler.NewFileTypesHandler()
+	filesH := handler.NewFilesHandler(cfg.FilesDB, cfg.MinIOSigner, cfg.Logger)
+	fileTypesH := handler.NewFileTypesHandler(cfg.FileTypesDB, cfg.Logger)
 
 	files := v1.Group("/files")
 	{
@@ -105,7 +119,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Buckets
-	bucketsH := handler.NewBucketsHandler()
+	bucketsH := handler.NewBucketsHandler(cfg.BucketsDB, cfg.MinIOAdmin, cfg.Logger)
 	buckets := v1.Group("/buckets")
 	{
 		buckets.GET("", bucketsH.List)
@@ -113,7 +127,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Event rules
-	eventRulesH := handler.NewEventRulesHandler()
+	eventRulesH := handler.NewEventRulesHandler(cfg.EventRulesDB, cfg.Logger)
 	eventRules := v1.Group("/event-rules")
 	{
 		eventRules.GET("", eventRulesH.List)
@@ -124,7 +138,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Upload logs
-	uploadLogsH := handler.NewUploadLogsHandler()
+	uploadLogsH := handler.NewUploadLogsHandler(cfg.UploadLogsDB, cfg.Logger)
 	uploadLogs := v1.Group("/upload-logs")
 	{
 		uploadLogs.GET("", uploadLogsH.List)

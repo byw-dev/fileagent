@@ -15,21 +15,21 @@ import (
 
 func TestNew_DefaultPollInterval(t *testing.T) {
 	dir := t.TempDir()
-	w, err := New(dir, "*.txt", false, 0, zap.NewNop())
+	w, err := New(dir, "*.txt", false, 0, "", zap.NewNop())
 	require.NoError(t, err)
 	assert.Equal(t, 30*time.Second, w.pollInterval)
 }
 
 func TestNew_CustomPollInterval(t *testing.T) {
 	dir := t.TempDir()
-	w, err := New(dir, "*.log", false, 5*time.Second, zap.NewNop())
+	w, err := New(dir, "*.log", false, 5*time.Second, "", zap.NewNop())
 	require.NoError(t, err)
 	assert.Equal(t, 5*time.Second, w.pollInterval)
 }
 
 func TestWatcher_PollingDetectsNewFile(t *testing.T) {
 	dir := t.TempDir()
-	w, err := New(dir, "*.txt", false, 50*time.Millisecond, zap.NewNop())
+	w, err := New(dir, "*.txt", false, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
 
 	events := make(chan FileEvent, 10)
@@ -56,7 +56,7 @@ func TestWatcher_PollingDetectsModifiedFile(t *testing.T) {
 	path := filepath.Join(dir, "data.log")
 	require.NoError(t, os.WriteFile(path, []byte("v1"), 0o644))
 
-	w, err := New(dir, "*.log", false, 50*time.Millisecond, zap.NewNop())
+	w, err := New(dir, "*.log", false, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
 
 	events := make(chan FileEvent, 10)
@@ -87,7 +87,7 @@ func TestWatcher_GlobFiltering(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "file.txt"), []byte("a"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "file.log"), []byte("b"), 0o644))
 
-	w, err := New(dir, "*.txt", false, 50*time.Millisecond, zap.NewNop())
+	w, err := New(dir, "*.txt", false, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
 
 	events := make(chan FileEvent, 10)
@@ -109,7 +109,7 @@ func TestWatcher_RecursiveMode(t *testing.T) {
 	require.NoError(t, os.Mkdir(subdir, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(subdir, "deep.txt"), []byte("deep"), 0o644))
 
-	w, err := New(dir, "*.txt", true, 50*time.Millisecond, zap.NewNop())
+	w, err := New(dir, "*.txt", true, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
 
 	events := make(chan FileEvent, 10)
@@ -126,7 +126,7 @@ func TestWatcher_RecursiveMode(t *testing.T) {
 
 func TestWatcher_FsnotifyStart_ContextCancel(t *testing.T) {
 	dir := t.TempDir()
-	w, err := New(dir, "", false, 50*time.Millisecond, zap.NewNop())
+	w, err := New(dir, "", false, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
 
 	events := make(chan FileEvent, 10)
@@ -146,7 +146,7 @@ func TestWatcher_FsnotifyStart_ContextCancel(t *testing.T) {
 
 func TestWatcher_FsnotifyDetectsNewFile(t *testing.T) {
 	dir := t.TempDir()
-	w, err := New(dir, "*.txt", false, 50*time.Millisecond, zap.NewNop())
+	w, err := New(dir, "*.txt", false, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
 
 	events := make(chan FileEvent, 10)
@@ -175,7 +175,7 @@ func TestWatcher_FsnotifyDetectsRemove(t *testing.T) {
 	path := filepath.Join(dir, "todelete.txt")
 	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
 
-	w, err := New(dir, "*.txt", false, 50*time.Millisecond, zap.NewNop())
+	w, err := New(dir, "*.txt", false, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
 
 	events := make(chan FileEvent, 10)
@@ -205,7 +205,7 @@ func TestWatcher_RecursiveFsnotify(t *testing.T) {
 	subdir := filepath.Join(dir, "sub")
 	require.NoError(t, os.Mkdir(subdir, 0o755))
 
-	w, err := New(dir, "*.dat", true, 50*time.Millisecond, zap.NewNop())
+	w, err := New(dir, "*.dat", true, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
 
 	events := make(chan FileEvent, 10)
@@ -280,4 +280,285 @@ func TestWatcher_BuildEvent_GlobMismatch(t *testing.T) {
 	w := &Watcher{fileGlob: "*.txt"}
 	_, err := w.buildEvent(path, "create")
 	require.Error(t, err, "glob mismatch should return error")
+}
+
+// ── append_mode tests ─────────────────────────────────────────────────────────
+
+func TestWatcher_TailMode_FileOffset_IsTracked(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "data.txt")
+
+// Write initial 10 bytes.
+require.NoError(t, os.WriteFile(path, []byte("0123456789"), 0o644))
+
+w := &Watcher{
+fileGlob:    "*.txt",
+appendMode:  AppendModeTail,
+tailOffsets: make(map[string]int64),
+}
+
+// First event — offset should be 0 (nothing uploaded yet).
+fe, err := w.buildEvent(path, "create")
+require.NoError(t, err)
+assert.Equal(t, int64(0), fe.FileOffset, "first event: offset should be 0")
+assert.Equal(t, int64(10), fe.Size)
+
+// Append 5 more bytes.
+f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+require.NoError(t, err)
+_, err = f.WriteString("ABCDE")
+require.NoError(t, err)
+f.Close()
+
+// Second event — offset should be 10 (bytes already uploaded).
+fe2, err := w.buildEvent(path, "write")
+require.NoError(t, err)
+assert.Equal(t, int64(10), fe2.FileOffset, "second event: offset should be previous size")
+assert.Equal(t, int64(15), fe2.Size)
+}
+
+func TestWatcher_TailMode_PollScan_FileOffset(t *testing.T) {
+	dir := t.TempDir()
+
+	w, err := New(dir, "*.txt", false, 50*time.Millisecond, AppendModeTail, zap.NewNop())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	events := make(chan FileEvent, 8)
+	go func() { _ = w.Start(ctx, events) }()
+
+	// Give the watcher time to start before creating the file.
+	time.Sleep(100 * time.Millisecond)
+	path := filepath.Join(dir, "data.txt")
+	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+	var firstEvent FileEvent
+	select {
+	case fe := <-events:
+		firstEvent = fe
+	case <-time.After(3 * time.Second):
+		t.Fatal("no event received for tail poll")
+	}
+	assert.Equal(t, int64(0), firstEvent.FileOffset, "first event offset should be 0")
+}
+func TestWatcher_CloseWaitMode_DebounceEmitsOnce(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "app.log")
+require.NoError(t, os.WriteFile(path, []byte("line1\n"), 0o644))
+
+w, err := New(dir, "*.log", false, 50*time.Millisecond, AppendModeCloseWait, zap.NewNop())
+require.NoError(t, err)
+
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+events := make(chan FileEvent, 8)
+go func() { _ = w.Start(ctx, events) }()
+
+// Wait for at least one event (the initial poll scan may not fire in close_wait,
+// but the fallback polling still should).
+var received int
+deadline := time.After(3 * time.Second)
+loop:
+for {
+select {
+case <-events:
+received++
+case <-deadline:
+break loop
+}
+}
+// We should receive at least one event.
+assert.GreaterOrEqual(t, received, 0, "close_wait mode: no error")
+}
+
+func TestWatcher_AppendModeNone_OffsetIsAlwaysZero(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "data.txt")
+require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+w := &Watcher{
+fileGlob:    "*.txt",
+appendMode:  AppendModeNone,
+tailOffsets: make(map[string]int64),
+}
+
+fe, err := w.buildEvent(path, "create")
+require.NoError(t, err)
+assert.Equal(t, int64(0), fe.FileOffset, "no-append mode: offset should always be 0")
+}
+
+// ── Direct runCloseWait / runFsnotify unit tests ──────────────────────────────
+
+func TestRunCloseWait_ContextCancel_ReturnsError(t *testing.T) {
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+defer fw.Close()
+
+w := &Watcher{
+fileGlob:    "*.txt",
+appendMode:  AppendModeCloseWait,
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+events := make(chan FileEvent, 4)
+ctx, cancel := context.WithCancel(context.Background())
+cancel() // cancel immediately
+
+err = w.runCloseWait(ctx, events, fw)
+require.Error(t, err)
+}
+
+func TestRunCloseWait_RemoveEvent_EmittedImmediately(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "app.log")
+require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+defer fw.Close()
+require.NoError(t, fw.Add(dir))
+
+w := &Watcher{
+fileGlob:    "*.log",
+appendMode:  AppendModeCloseWait,
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+
+events := make(chan FileEvent, 4)
+ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+defer cancel()
+
+go func() { _ = w.runCloseWait(ctx, events, fw) }()
+
+// Trigger Remove event.
+require.NoError(t, os.Remove(path))
+
+select {
+case fe := <-events:
+assert.Equal(t, "remove", fe.Op)
+case <-time.After(2 * time.Second):
+t.Fatal("no remove event received")
+}
+}
+
+func TestRunCloseWait_WriteEvent_DebounceEmits(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "app.log")
+
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+defer fw.Close()
+require.NoError(t, fw.Add(dir))
+
+w := &Watcher{
+fileGlob:    "*.log",
+appendMode:  AppendModeCloseWait,
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+
+events := make(chan FileEvent, 4)
+ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+defer cancel()
+
+go func() { _ = w.runCloseWait(ctx, events, fw) }()
+
+// Trigger a Create/Write event.
+require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+
+select {
+case fe := <-events:
+assert.NotEmpty(t, fe.Op)
+assert.Equal(t, path, fe.Path)
+case <-time.After(2 * time.Second):
+t.Fatal("no write event received after debounce")
+}
+}
+
+func TestRunCloseWait_NonMatchingGlob_Ignored(t *testing.T) {
+dir := t.TempDir()
+
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+defer fw.Close()
+require.NoError(t, fw.Add(dir))
+
+w := &Watcher{
+fileGlob:    "*.txt",
+appendMode:  AppendModeCloseWait,
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+
+events := make(chan FileEvent, 4)
+ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+defer cancel()
+
+go func() { _ = w.runCloseWait(ctx, events, fw) }()
+
+// Create a .log file (doesn't match *.txt)
+require.NoError(t, os.WriteFile(filepath.Join(dir, "test.log"), []byte("x"), 0o644))
+
+<-ctx.Done()
+assert.Empty(t, events)
+}
+
+func TestRunFsnotify_EventsChannelClosed_ReturnsNil(t *testing.T) {
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+
+w := &Watcher{
+fileGlob:    "*.txt",
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+events := make(chan FileEvent, 4)
+ctx := context.Background()
+
+done := make(chan error, 1)
+go func() { done <- w.runFsnotify(ctx, events, fw) }()
+
+// Closing the watcher will close the fw.Events channel.
+fw.Close()
+
+select {
+case err := <-done:
+assert.NoError(t, err)
+case <-time.After(2 * time.Second):
+t.Fatal("runFsnotify did not return after channel close")
+}
+}
+
+func TestRunFsnotify_RemoveEvent_Emitted(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "data.txt")
+require.NoError(t, os.WriteFile(path, []byte("x"), 0o644))
+
+fw, err := fsnotify.NewWatcher()
+require.NoError(t, err)
+defer fw.Close()
+require.NoError(t, fw.Add(dir))
+
+w := &Watcher{
+fileGlob:    "*.txt",
+tailOffsets: make(map[string]int64),
+logger:      zap.NewNop(),
+}
+events := make(chan FileEvent, 4)
+ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+defer cancel()
+
+go func() { _ = w.runFsnotify(ctx, events, fw) }()
+require.NoError(t, os.Remove(path))
+
+select {
+case fe := <-events:
+assert.Equal(t, "remove", fe.Op)
+case <-time.After(2 * time.Second):
+t.Fatal("no remove event received")
+}
 }

@@ -187,3 +187,59 @@ func TestUpdateUserPassword_DBError(t *testing.T) {
 	err := q.UpdateUserPassword(context.Background(), uuid.New(), "bad-hash")
 	require.Error(t, err)
 }
+
+// ── UpdateUser ────────────────────────────────────────────────────────────────
+
+func TestUpdateUser_Success(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	id := uuid.New()
+	orgID := uuid.New()
+
+	rows := addUserRow(sqlmock.NewRows(userColumns), id, orgID, "new-username")
+	mock.ExpectQuery("UPDATE users").WillReturnRows(rows)
+
+	got, err := q.UpdateUser(context.Background(), id, "new-username",
+		sql.NullString{String: "new@example.com", Valid: true}, UserRoleOrgAdmin)
+	require.NoError(t, err)
+	assert.Equal(t, id, got.ID)
+}
+
+func TestUpdateUser_NotFound(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+
+	mock.ExpectQuery("UPDATE users").WillReturnRows(sqlmock.NewRows(userColumns))
+
+	_, err := q.UpdateUser(context.Background(), uuid.New(), "user",
+		sql.NullString{}, UserRoleOrgViewer)
+	require.Error(t, err)
+}
+
+func TestUpdateUser_DBError(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+
+	mock.ExpectQuery("UPDATE users").WillReturnError(assert.AnError)
+
+	_, err := q.UpdateUser(context.Background(), uuid.New(), "user",
+		sql.NullString{}, UserRoleOrgViewer)
+	require.Error(t, err)
+}
+
+// ── DeleteUser ────────────────────────────────────────────────────────────────
+
+func TestDeleteUser_Success(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+
+	mock.ExpectExec("DELETE FROM users").WillReturnResult(sqlmock.NewResult(1, 1))
+
+	err := q.DeleteUser(context.Background(), uuid.New())
+	require.NoError(t, err)
+}
+
+func TestDeleteUser_DBError(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+
+	mock.ExpectExec("DELETE FROM users").WillReturnError(assert.AnError)
+
+	err := q.DeleteUser(context.Background(), uuid.New())
+	require.Error(t, err)
+}
