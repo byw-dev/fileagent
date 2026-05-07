@@ -179,6 +179,28 @@ func TestBucketsHandler_List_NilDB_Returns501(t *testing.T) {
 	assert.Equal(t, http.StatusNotImplemented, w.Code)
 }
 
+func TestBucketsHandler_List_EmptyDB_ReturnsEmptyDataArray(t *testing.T) {
+	// DB has no records: expect 200 with {"data": []}, not an error.
+	h := handler.NewBucketsHandler(&mockBucketsDB{buckets: []*db.Bucket{}}, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/buckets", nil)
+	testBucketsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	data, ok := body["data"].([]interface{})
+	require.True(t, ok, "data field should be an array")
+	assert.Empty(t, data, "data array should be empty when DB has no bucket records")
+}
+
+func TestBucketsHandler_List_DBError_Returns500(t *testing.T) {
+	h := handler.NewBucketsHandler(&mockBucketsDB{listErr: assert.AnError}, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/buckets", nil)
+	testBucketsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
 func TestBucketsHandler_Create_Success(t *testing.T) {
 	h := handler.NewBucketsHandler(&mockBucketsDB{}, nil, newTestLogger())
 	body := `{"name":"new-bucket","description":"test bucket"}`

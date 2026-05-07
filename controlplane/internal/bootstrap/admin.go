@@ -13,9 +13,12 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// defaultOrgID must match the organization ID seeded in
-// controlplane/migrations/000001_init_schema.up.sql for single-org deployments.
-var defaultOrgID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
+// DefaultOrgID is the well-known organisation UUID for single-org deployments.
+// It must match the seed value in controlplane/migrations/000001_init_schema.up.sql.
+var DefaultOrgID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
+
+// defaultOrgID is an unexported alias kept for backward-compatibility within this file.
+var defaultOrgID = DefaultOrgID
 
 const generatedPasswordLength = 16
 
