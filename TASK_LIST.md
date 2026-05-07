@@ -751,6 +751,206 @@ if err := lc.Start(ctx, ...); err != nil {
 
 ---
 
+### T3-1-BUGFIX gRPC 注册链路三个关键 Bug 修复 ⬜
+
+> **前置依赖：T3-1-FIX（可并行，但建议先完成 FIX）**
+>
+> **背景**：2026-05-07 通过 `grpcurl` 端到端验证发现三个独立 Bug，导致 Agent 首次注册
+> 完整链路（Register → PollApproval → Connect）全部失败。以下逐一说明根因、精确代码位置、
+> 修复方案和验收标准。
+
+---
+
+#### Bug A — `Register` 对 `ErrNoRows` 的判断逻辑颠倒，导致首次注册返回零 UUID
+
+**严重程度**：🔴 P0，首次注册必然失败
+
+**根因**
+
+`GetAgentByFingerprint` 由 sqlc 自动生成（`controlplane/internal/db/agents.sql.go:85-108`），
+返回签名为 `(*Agent, error)`。当数据库中不存在对应 fingerprint 时，它返回：
+
+```go
+return &i, err  // &i 是零值 Agent，err == sql.ErrNoRows
+```
+
+注意：**指针永远非 nil**（指向局部变量 `i` 的地址），即使没有查到任何行也是如此。
+
+`Register`（`controlplane/internal/agent/manager.go:78-93`）的判断逻辑：
+
+```go
+existing, err := m.db.GetAgentByFingerprint(ctx, req.GetFingerprint())
+if err != nil && err != sql.ErrNoRows {
+    return nil, ...   // 只过滤非 ErrNoRows 的错误
+}
+if existing != nil {  // ← BUG：永远为 true！
+    // 进入此分支，将 existing.ID.String() = "00000000-..." 返回
+    return &agentv1.RegisterResponse{AgentId: existing.ID.String(), ...}, nil
+}
+```
+
+由于 `existing` 永不为 `nil`，代码总是走"已注册"分支，`agent_id` 返回全零 UUID，
+实际注册逻辑（`CreateAgent`）从不执行。
+
+**为什么测试没有捕获**
+
+测试 Mock（`manager_test.go:44-49`）在未找到时正确返回 `nil, sql.ErrNoRows`：
+```go
+return nil, sql.ErrNoRows  // mock 返回 nil 指针
+```
+而真实的 sqlc 实现返回 `&i, sql.ErrNoRows`（非 nil 指针）。
+Mock 与真实实现的行为不一致，使单元测试无法覆盖这个 Bug。
+
+**修复方案**
+
+文件：`controlplane/internal/agent/manager.go`
+
+将判断逻辑改为先检查 error：
+```go
+existing, err := m.db.GetAgentByFingerprint(ctx, req.GetFingerprint())
+if err != nil && !errors.Is(err, sql.ErrNoRows) {
+    return nil, fmt.Errorf("register: lookup fingerprint: %w", err)
+}
+if err == nil {   // err == nil 才说明真正查到了记录
+    // 处理已注册情况
+    resp := &agentv1.RegisterResponse{...}
+    ...
+    return resp, nil
+}
+// err == sql.ErrNoRows，走新注册流程
+```
+
+同时修复 Mock 与真实实现的行为一致性：`mockAgentDB.GetAgentByFingerprint` 在未找到时
+应返回 `&db.Agent{}, sql.ErrNoRows`（与 sqlc 实现保持一致），以暴露此类 Bug。
+
+**受影响文件**
+
+- `controlplane/internal/agent/manager.go`（主要修复，1 处逻辑变更）
+- `controlplane/internal/agent/manager_test.go`（修复 mock + 补充回归测试）
+
+**验收标准**
+
+1. `grpcurl Register`（fingerprint 未注册）→ 返回真实 UUID（非全零），`status: "pending"`
+2. `grpcurl Register`（相同 fingerprint 再次调用）→ 返回同一 UUID，`message: "Agent already registered"`
+3. 新增测试 `TestRegister_FirstTime_ReturnsRealUUID`：mock 返回 `&db.Agent{}, sql.ErrNoRows`，断言响应 UUID 非零
+4. 新增测试 `TestRegister_ExistingAgent_ReturnsSameUUID`：mock 返回已存在的 Agent，断言同一 UUID
+5. `go test ./controlplane/internal/agent/... -count=1` 全部通过
+
+---
+
+#### Bug B — `PollApproval` 审批通过后从不返回 `auth_token`，Agent 拿到空 Token
+
+**严重程度**：🔴 P0，注册完成也无法建立 Connect 连接
+
+**根因**
+
+`PollApproval`（`controlplane/internal/agent/manager.go:140-154`）始终只返回 `status` 和 `message`，
+`auth_token` 字段永远为空字符串：
+
+```go
+return &agentv1.PollApprovalResponse{
+    Status:  string(agent.Status),
+    Message: statusMessage(agent.Status),
+    // auth_token 字段缺失
+}, nil
+```
+
+Agent 的轮询逻辑（`agent/internal/grpcclient/registration.go:226-229`）：
+
+```go
+case "approved":
+    return resp.GetAuthToken(), nil  // 取到空字符串 ""
+```
+
+空 Token 被 `TokenManager.Save()` 持久化，后续 `grpcClient.SetToken("")`，
+Connect RPC 携带空 Authorization header，JWT 拦截器拒绝（`Unauthenticated: empty token`）。
+
+**相关设计**
+
+根据设计文档 §5.5 序列图，审批通过时 Control Plane 应在 `PollApprovalResponse.auth_token`
+中返回 JWT，Agent 将其保存后才建立 Connect。目前 `ApproveAgent`（`manager.go:158-205`）
+已正确生成 Token 并将 SHA-256 hash 存入 DB，但 `PollApproval` 没有读取并返回 Token。
+
+**两种可行修复方案（二选一）**
+
+方案 1（推荐）：`PollApproval` 中当 `status == approved` 时，调用 `jwtSvc.GenerateAccessToken`
+生成新 Token 并返回，同时更新 DB 中的 `auth_token_hash`。
+
+方案 2：`ApproveAgent` 将明文 Token 额外存入 DB 的某个临时字段（如 `metadata`），
+`PollApproval` 读出后返回并清除。但此方案引入明文 Token 持久化，有安全风险，**不推荐**。
+
+**受影响文件**
+
+- `controlplane/internal/agent/manager.go`（`PollApproval` 函数，约 20 行增量）
+- `controlplane/internal/agent/manager_test.go`（补充 approved 场景测试）
+
+**验收标准**
+
+1. Agent 审批通过后，`PollApproval` 响应的 `auth_token` 字段非空
+2. 返回的 Token 能通过 `jwtSvc.ValidateToken` 验证，且 `claims.Role == "agent"`
+3. Token 的 SHA-256 hash 已更新至 DB `agents.auth_token_hash`（以便吊销链路生效）
+4. 新增测试 `TestPollApproval_ApprovedReturnsToken`：mock 中 agent `status = approved`，
+   断言 `resp.AuthToken` 非空且可验证
+5. 新增测试 `TestPollApproval_PendingReturnsNoToken`：`status = pending`，断言 `resp.AuthToken == ""`
+6. `go test ./controlplane/internal/agent/... -count=1` 全部通过
+
+---
+
+#### Bug C — gRPC 反射服务未豁免 JWT 认证，`grpcurl` 无法解析服务描述符
+
+**严重程度**：🟡 P1，工具链与开发调试受阻（不影响真实 Agent 二进制）
+
+**根因**
+
+`grpcurl`（及所有基于 gRPC 反射的工具）在发起目标 RPC 前，必须先调用反射 API
+`/grpc.reflection.v1.ServerReflection/ServerReflectionInfo` 来解析 proto 描述符。
+该端点未在 `jwtExemptMethods`（`controlplane/internal/grpcserver/interceptor.go:31-36`）
+中豁免，导致即使使用 `-proto` 本地文件的 `grpcurl` 也因为反射握手被 JWT 拦截器拦截
+而收到 `Unauthenticated: missing authorization header`。
+
+**已经存在的豁免列表**（当前代码，已在上一个 commit `1094e66` 中修复）：
+
+```go
+var jwtExemptMethods = map[string]bool{
+    "/fileagent.v1.AgentService/Register":                            true,
+    "/fileagent.v1.AgentService/PollApproval":                       true,
+    "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo":     true,  // 已添加
+    "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo": true,  // 已添加
+}
+```
+
+**注意**：此 Bug 已在 commit `1094e66` 中修复。但对应的单元测试尚不完整：
+`interceptor_test.go` 中缺少对反射端点豁免的专项测试用例。
+
+**受影响文件**
+
+- `controlplane/internal/grpcserver/interceptor.go`（已修复）
+- `controlplane/internal/grpcserver/interceptor_test.go`（需补充测试用例）
+
+**验收标准**
+
+1. `grpcurl -plaintext localhost:9090 list` 能返回服务列表，无需携带 Authorization header
+2. `grpcurl -plaintext localhost:9090 fileagent.v1.AgentService/Register -d '{...}'` 能正常执行
+3. 新增测试 `TestJWTInterceptor_ReflectionEndpointsAreExempt`：分别对
+   `/grpc.reflection.v1.ServerReflection/ServerReflectionInfo` 和
+   `/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo` 发起无 token 请求，
+   断言拦截器放行（不返回 `Unauthenticated`）
+4. `go test ./controlplane/internal/grpcserver/... -count=1` 全部通过
+
+---
+
+#### 三个 Bug 的修复顺序建议
+
+```
+Bug A（Register 判断逻辑）→ 是 Bug B、C 的前提
+Bug B（PollApproval auth_token）→ Register 正常后才能验证
+Bug C（反射豁免）→ 独立，但须补充测试
+```
+
+建议实施顺序：Bug A → Bug B → Bug C（补测试）
+
+---
+
 ### T3-2 Web UI + Control Plane 联调 ⬜
 - [ ] 登录 → 仪表盘数据正确
 - [ ] 审批采集器 → 采集器状态更新
@@ -783,9 +983,9 @@ if err := lc.Start(ctx, ...); err != nil {
 | Phase 2 核心 | 20 | 20 | 100%（含组件包逻辑）|
 | Phase 2 遗留（T2-X） | 8 | 8（全部完成）| 100% |
 | Phase 3 前质量关卡（P3-P） | 10 | 10 | 100% |
-| Phase 3 | 4 | 0（T3-1 部分完成但已降级，T3-1-FIX 待完成） | 0% |
+| Phase 3 | 5 | 0（T3-1 部分完成已降级；T3-1-FIX、T3-1-BUGFIX 待完成） | 0% |
 | Phase 4 | 4 | 0 | 0% |
-| **合计** | **66** | **55** | **83%** |
+| **合计** | **67** | **55** | **82%** |
 
 ---
 
