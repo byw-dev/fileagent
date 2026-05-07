@@ -36,7 +36,7 @@ type ruleHandle struct {
 
 func main() {
 	// ── 1. Load configuration ────────────────────────────────────────────────
-	configFlag := flag.String("config", "", "Path to agent TOML configuration file (defaults to AGENT_CONFIG, then config.toml)")
+	configFlag := flag.String("config", "", "Path to agent TOML config file (precedence: --config > AGENT_CONFIG > ./config.toml)")
 	flag.Parse()
 
 	cfgPath := *configFlag

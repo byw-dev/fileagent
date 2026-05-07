@@ -13,6 +13,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// defaultOrgID matches the seeded default organization in migration
+// 000001_init_schema.up.sql for single-org deployments.
 var defaultOrgID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
 
 const generatedPasswordLength = 16
@@ -115,6 +117,8 @@ func EnsureAdminAccount(
 func generatePassword(length int) (string, error) {
 	// Excludes ambiguous characters (I, O, 0, 1, l) to reduce operator mistakes
 	// when credentials are copied from bootstrap output.
+	// Entropy: alphabet size is 79 and default length is 16, yielding roughly
+	// 16*log2(79) ≈ 100 bits of entropy.
 	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*()-_=+"
 	if length <= 0 {
 		return "", errors.New("password length must be greater than 0")

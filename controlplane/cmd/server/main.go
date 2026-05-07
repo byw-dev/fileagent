@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -143,30 +144,32 @@ func main() {
 		logger.Fatal("bootstrap admin failed", zap.Error(err))
 	}
 	if bootstrapResult.Created {
-		if err := writeBootstrapCredentials(
+		credentialsPath, err := writeBootstrapCredentials(
 			cfg.BootstrapAdminCredentialsFile,
 			bootstrapResult.Username,
 			bootstrapResult.Password,
-		); err != nil {
+		)
+		if err != nil {
 			logger.Fatal("write bootstrap admin credentials file failed", zap.Error(err))
 		}
 		logger.Warn("bootstrap admin user created",
 			zap.String("username", bootstrapResult.Username),
-			zap.String("credentials_file", cfg.BootstrapAdminCredentialsFile),
+			zap.String("credentials_file", credentialsPath),
 			zap.String("action", "please login and change password immediately"),
 		)
 	}
 	if bootstrapResult.Reset {
-		if err := writeBootstrapCredentials(
+		credentialsPath, err := writeBootstrapCredentials(
 			cfg.BootstrapAdminCredentialsFile,
 			bootstrapResult.Username,
 			bootstrapResult.Password,
-		); err != nil {
+		)
+		if err != nil {
 			logger.Fatal("write bootstrap admin credentials file failed", zap.Error(err))
 		}
 		logger.Warn("bootstrap admin password reset by configuration",
 			zap.String("username", bootstrapResult.Username),
-			zap.String("credentials_file", cfg.BootstrapAdminCredentialsFile),
+			zap.String("credentials_file", credentialsPath),
 			zap.String("action", "disable BOOTSTRAP_ADMIN_FORCE_RESET after recovery"),
 		)
 	}
@@ -276,7 +279,21 @@ func buildLogger(level string) (*zap.Logger, error) {
 }
 
 // writeBootstrapCredentials writes temporary bootstrap credentials to a local file.
-func writeBootstrapCredentials(path, username, password string) error {
+func writeBootstrapCredentials(path, username, password string) (string, error) {
+	targetPath := path
+	if _, err := os.Stat(targetPath); err == nil {
+		targetPath = fmt.Sprintf("%s.%d", targetPath, time.Now().UTC().Unix())
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	if dir := filepath.Dir(targetPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+	}
 	content := fmt.Sprintf("username=%s\npassword=%s\n", username, password)
-	return os.WriteFile(path, []byte(content), 0o600)
+	if err := os.WriteFile(targetPath, []byte(content), 0o600); err != nil {
+		return "", err
+	}
+	return targetPath, nil
 }
