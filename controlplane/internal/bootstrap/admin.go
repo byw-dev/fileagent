@@ -17,9 +17,6 @@ import (
 // It must match the seed value in controlplane/migrations/000001_init_schema.up.sql.
 var DefaultOrgID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
 
-// defaultOrgID is an unexported alias kept for backward-compatibility within this file.
-var defaultOrgID = DefaultOrgID
-
 const generatedPasswordLength = 16
 
 // UsersStore defines the database methods required by admin bootstrap logic.
@@ -75,7 +72,7 @@ func EnsureAdminAccount(
 			return nil, fmt.Errorf("bootstrap admin: hash password: %w", err)
 		}
 		_, err = store.CreateUser(ctx, db.CreateUserParams{
-			OrgID:        defaultOrgID,
+			OrgID:        DefaultOrgID,
 			Username:     username,
 			PasswordHash: string(hash),
 			Role:         db.UserRoleSuperAdmin,
