@@ -10,15 +10,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
 
 // ── mock JWT service ──────────────────────────────────────────────────────────
 
 type mockJWTSvc struct {
-	claims   *auth.Claims
-	err      error
-	revoked  bool
+	claims    *auth.Claims
+	err       error
+	revoked   bool
 	revokeErr error
 }
 
@@ -154,4 +155,60 @@ func TestWrappedStream_ContextIsInjected(t *testing.T) {
 	customCtx := context.WithValue(context.Background(), ctxKey("test"), "value")
 	ws := &wrappedStream{ServerStream: &fakeStream{}, ctx: customCtx}
 	assert.Equal(t, customCtx, ws.Context())
+}
+
+func TestJWTInterceptor_ReflectionEndpointsAreExempt(t *testing.T) {
+	logger := zap.NewNop()
+	svc := &mockJWTSvc{err: assert.AnError}
+	unary := jwtUnaryInterceptor(logger, svc)
+
+	methods := []string{
+		"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+		"/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo",
+	}
+
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			called := false
+			_, err := unary(
+				context.Background(),
+				nil,
+				&grpc.UnaryServerInfo{FullMethod: method},
+				func(ctx context.Context, req interface{}) (interface{}, error) {
+					called = true
+					return "ok", nil
+				},
+			)
+			require.NoError(t, err)
+			assert.True(t, called)
+		})
+	}
+}
+
+func TestJWTStreamInterceptor_ReflectionEndpointsAreExempt(t *testing.T) {
+	logger := zap.NewNop()
+	svc := &mockJWTSvc{err: assert.AnError}
+	streamInterceptor := jwtStreamInterceptor(logger, svc)
+
+	methods := []string{
+		"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+		"/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo",
+	}
+
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			called := false
+			err := streamInterceptor(
+				nil,
+				&fakeStream{},
+				&grpc.StreamServerInfo{FullMethod: method},
+				func(srv interface{}, stream grpc.ServerStream) error {
+					called = true
+					return nil
+				},
+			)
+			require.NoError(t, err)
+			assert.True(t, called)
+		})
+	}
 }
