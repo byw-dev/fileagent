@@ -557,16 +557,27 @@ func (h *UploadLogsHandler) Get(c *gin.Context) {
 
 // ── MinioEventHandler ────────────────────────────────────────────────────────
 
+// IndexerClient is the minimal interface needed by MinioEventHandler to
+// index uploads that arrive through the MinIO webhook path.
+type IndexerClient interface {
+	// IndexUpload records an upload event from MinIO in the file index.
+	// It is called in a best-effort, non-blocking fashion; errors are only
+	// logged (warn level) and do not affect the HTTP response.
+	IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string) error
+}
+
 // MinioEventHandler handles POST /internal/minio-event — the MinIO S3 event
 // webhook endpoint. This serves as an alternate indexing path for file events
 // that arrive directly from MinIO rather than through an agent.
 type MinioEventHandler struct {
-	logger *zap.Logger
+	logger  *zap.Logger
+	indexer IndexerClient // optional; nil disables indexing
 }
 
 // NewMinioEventHandler returns a new MinioEventHandler.
-func NewMinioEventHandler(logger *zap.Logger) *MinioEventHandler {
-	return &MinioEventHandler{logger: logger}
+// indexer may be nil, in which case upload events are only logged.
+func NewMinioEventHandler(indexer IndexerClient, logger *zap.Logger) *MinioEventHandler {
+	return &MinioEventHandler{logger: logger, indexer: indexer}
 }
 
 // minioS3Event is the top-level MinIO S3 event notification payload.
@@ -613,6 +624,21 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 			zap.String("key", rec.S3.Object.Key),
 			zap.Int64("size", rec.S3.Object.Size),
 		)
+		if h.indexer != nil {
+			if err := h.indexer.IndexUpload(
+				c.Request.Context(),
+				rec.S3.Bucket.Name,
+				rec.S3.Object.Key,
+				rec.S3.Object.Size,
+				rec.S3.Object.ETag,
+			); err != nil {
+				h.logger.Warn("minio event: index upload failed",
+					zap.String("bucket", rec.S3.Bucket.Name),
+					zap.String("key", rec.S3.Object.Key),
+					zap.Error(err),
+				)
+			}
+		}
 	}
 	c.Status(http.StatusOK)
 }

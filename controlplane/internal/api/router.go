@@ -32,6 +32,7 @@ type RouterConfig struct {
 	AgentMgr      handler.AgentManager
 	Dispatcher    handler.RuleDispatcher
 	Registry      handler.AgentRegistryClient
+	MinioIndexer  handler.IndexerClient // nil → minio webhook events are only logged
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -50,7 +51,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	})
 
 	// ── Internal MinIO event webhook (no auth, secured by shared secret) ────
-	minioH := handler.NewMinioEventHandler(cfg.Logger)
+	minioH := handler.NewMinioEventHandler(cfg.MinioIndexer, cfg.Logger)
 	r.POST("/internal/minio-event", minioH.Handle)
 
 	// ── Auth routes ──────────────────────────────────────────────────────────

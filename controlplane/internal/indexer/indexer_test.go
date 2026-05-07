@@ -410,3 +410,50 @@ func TestNewClassifier_DBBacked(t *testing.T) {
 c := NewClassifier(&errDBTX{err: nil})
 require.NotNil(t, c)
 }
+
+// ── IndexUpload ───────────────────────────────────────────────────────────────
+
+func newSampleBucket() *db.Bucket {
+return &db.Bucket{ID: uuid.New(), OrgID: uuid.New(), Name: "data-sensor"}
+}
+
+func newSampleFileEntry() *db.FileEntry {
+return &db.FileEntry{
+ID:          uuid.New(),
+OrgID:       uuid.New(),
+BucketID:    uuid.New(),
+StoragePath: "uploads/file.csv",
+FileName:    "file.csv",
+SizeBytes:   1024,
+Status:      db.FileStatusCompleted,
+}
+}
+
+func TestIndexUpload_Success(t *testing.T) {
+store := &mockIndexerStore{
+bucket:    newSampleBucket(),
+fileEntry: newSampleFileEntry(),
+}
+ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+err := ix.IndexUpload(context.Background(), "data-sensor", "uploads/file.csv", 1024, "abc123")
+require.NoError(t, err)
+}
+
+func TestIndexUpload_BucketNotFound(t *testing.T) {
+store := &mockIndexerStore{bucketErr: assert.AnError}
+ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+err := ix.IndexUpload(context.Background(), "missing-bucket", "key.csv", 0, "")
+require.Error(t, err)
+assert.Contains(t, err.Error(), "get bucket")
+}
+
+func TestIndexUpload_UpsertError(t *testing.T) {
+store := &mockIndexerStore{
+bucket:    newSampleBucket(),
+upsertErr: assert.AnError,
+}
+ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+err := ix.IndexUpload(context.Background(), "data-sensor", "key.csv", 100, "")
+require.Error(t, err)
+assert.Contains(t, err.Error(), "upsert file entry")
+}

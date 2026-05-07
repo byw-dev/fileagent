@@ -416,12 +416,13 @@ testAgentsRouter(h).ServeHTTP(w, req)
 assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
-func TestAgentsHandler_DeleteRule_InvalidID(t *testing.T) {
-h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/bad-id/rules/"+uuid.New().String(), nil)
-testAgentsRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusBadRequest, w.Code)
+func TestAgentsHandler_DeleteRule_InvalidRuleID(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	// The handler only validates the rule ID (rid), not the agent ID.
+	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/"+uuid.New().String()+"/rules/not-a-uuid", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestAgentsHandler_DeleteRule_DBError(t *testing.T) {

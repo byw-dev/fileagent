@@ -189,6 +189,7 @@ func main() {
 		AgentMgr:     agentMgr,
 		Dispatcher:   dispatcher,
 		Registry:     registry,
+		MinioIndexer: ix,
 	})
 
 	httpSrv := &http.Server{

@@ -425,3 +425,116 @@ func TestUploadLogsHandler_Get_InvalidID(t *testing.T) {
 	testUploadLogsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
+
+// ── EventRulesHandler missing error path tests ────────────────────────────────
+
+func TestEventRulesHandler_Delete_InvalidID(t *testing.T) {
+h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodDelete, "/api/v1/event-rules/not-a-uuid", nil)
+testEventRulesRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestEventRulesHandler_Delete_DBError(t *testing.T) {
+h := handler.NewEventRulesHandler(&mockEventRulesDB{deleteErr: assert.AnError}, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodDelete, "/api/v1/event-rules/"+uuid.New().String(), nil)
+testEventRulesRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+// ── MinioEventHandler tests ───────────────────────────────────────────────────
+
+// mockIndexerClient is a test double for handler.IndexerClient.
+type mockIndexerClient struct {
+err     error
+called  bool
+lastBucket string
+lastKey    string
+}
+
+func (m *mockIndexerClient) IndexUpload(_ context.Context, bucketName, objectKey string, _ int64, _ string) error {
+m.called = true
+m.lastBucket = bucketName
+m.lastKey = objectKey
+return m.err
+}
+
+func testMinioEventRouter(h *handler.MinioEventHandler) *gin.Engine {
+gin.SetMode(gin.TestMode)
+r := gin.New()
+r.POST("/internal/minio-event", h.Handle)
+return r
+}
+
+func TestMinioEventHandler_Handle_Success_WithRecords(t *testing.T) {
+ix := &mockIndexerClient{}
+h := handler.NewMinioEventHandler(ix, newTestLogger())
+body := `{
+"EventName": "s3:ObjectCreated:Put",
+"Key": "data-sensor/file.csv",
+"Records": [{
+"eventName": "s3:ObjectCreated:Put",
+"s3": {
+"bucket": {"name": "data-sensor"},
+"object": {"key": "uploads/file.csv", "size": 1024, "eTag": "abc123"}
+}
+}]
+}`
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+req.Header.Set("Content-Type", "application/json")
+testMinioEventRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusOK, w.Code)
+assert.True(t, ix.called, "IndexUpload should have been called")
+assert.Equal(t, "data-sensor", ix.lastBucket)
+assert.Equal(t, "uploads/file.csv", ix.lastKey)
+}
+
+func TestMinioEventHandler_Handle_EmptyRecords(t *testing.T) {
+ix := &mockIndexerClient{}
+h := handler.NewMinioEventHandler(ix, newTestLogger())
+body := `{"EventName":"s3:ObjectCreated:Put","Key":"","Records":[]}`
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+req.Header.Set("Content-Type", "application/json")
+testMinioEventRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusOK, w.Code)
+assert.False(t, ix.called, "IndexUpload should not be called for empty records")
+}
+
+func TestMinioEventHandler_Handle_InvalidJSON(t *testing.T) {
+ix := &mockIndexerClient{}
+h := handler.NewMinioEventHandler(ix, newTestLogger())
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString("not-json"))
+req.Header.Set("Content-Type", "application/json")
+testMinioEventRouter(h).ServeHTTP(w, req)
+// Non-fatal: still returns 200 OK.
+assert.Equal(t, http.StatusOK, w.Code)
+assert.False(t, ix.called)
+}
+
+func TestMinioEventHandler_Handle_NilIndexer(t *testing.T) {
+h := handler.NewMinioEventHandler(nil, newTestLogger())
+body := `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1}}}]}`
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+req.Header.Set("Content-Type", "application/json")
+testMinioEventRouter(h).ServeHTTP(w, req)
+assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestMinioEventHandler_Handle_IndexerError_StillReturns200(t *testing.T) {
+ix := &mockIndexerClient{err: assert.AnError}
+h := handler.NewMinioEventHandler(ix, newTestLogger())
+body := `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1}}}]}`
+w := httptest.NewRecorder()
+req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+req.Header.Set("Content-Type", "application/json")
+testMinioEventRouter(h).ServeHTTP(w, req)
+// Indexer error is non-fatal; still 200.
+assert.Equal(t, http.StatusOK, w.Code)
+assert.True(t, ix.called)
+}
