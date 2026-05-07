@@ -34,8 +34,8 @@ type ruleHandle struct {
 	cancel context.CancelFunc
 }
 
-// tokenSetter captures the gRPC client behavior needed by revoke handling.
-type tokenSetter interface {
+// grpcClientTokenSetter captures the gRPC client behavior needed by revoke handling.
+type grpcClientTokenSetter interface {
 	SetToken(token string)
 }
 
@@ -290,7 +290,7 @@ func main() {
 }
 
 // handleRevokeCommand clears local credentials and triggers graceful shutdown.
-func handleRevokeCommand(tokenMgr *credential.TokenManager, stsMgr *credential.STSManager, client tokenSetter, stop context.CancelFunc, logger *zap.Logger, reason string) {
+func handleRevokeCommand(tokenMgr *credential.TokenManager, stsMgr *credential.STSManager, client grpcClientTokenSetter, stop context.CancelFunc, logger *zap.Logger, reason string) {
 	logger.Warn("agent: token revoked by Control Plane", zap.String("reason", reason))
 	if err := tokenMgr.Clear(); err != nil {
 		logger.Warn("agent: clear token failed", zap.Error(err))

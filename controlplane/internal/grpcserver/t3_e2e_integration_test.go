@@ -23,22 +23,22 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 )
 
-type t3AgentManager struct {
+type integrationTestMockAgentManager struct {
 	mu     sync.Mutex
 	status map[string]string
 	token  map[string]string
 	jwtSvc auth.Service
 }
 
-func newT3AgentManager(jwtSvc auth.Service) *t3AgentManager {
-	return &t3AgentManager{
+func newIntegrationTestMockAgentManager(jwtSvc auth.Service) *integrationTestMockAgentManager {
+	return &integrationTestMockAgentManager{
 		status: map[string]string{},
 		token:  map[string]string{},
 		jwtSvc: jwtSvc,
 	}
 }
 
-func (m *t3AgentManager) Register(_ context.Context, _ *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
+func (m *integrationTestMockAgentManager) Register(_ context.Context, _ *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	id := uuid.New().String()
@@ -50,7 +50,7 @@ func (m *t3AgentManager) Register(_ context.Context, _ *agentv1.RegisterRequest)
 	}, nil
 }
 
-func (m *t3AgentManager) PollApproval(_ context.Context, req *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error) {
+func (m *integrationTestMockAgentManager) PollApproval(_ context.Context, req *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	state := m.status[req.GetAgentId()]
@@ -64,7 +64,7 @@ func (m *t3AgentManager) PollApproval(_ context.Context, req *agentv1.PollApprov
 	return resp, nil
 }
 
-func (m *t3AgentManager) approve(t *testing.T, agentID string) string {
+func (m *integrationTestMockAgentManager) approve(t *testing.T, agentID string) string {
 	t.Helper()
 	token, err := m.jwtSvc.GenerateAccessToken(
 		agentID,
@@ -81,11 +81,11 @@ func (m *t3AgentManager) approve(t *testing.T, agentID string) string {
 	return token
 }
 
-type t3Dispatcher struct {
+type integrationTestMockDispatcher struct {
 	registry *AgentRegistry
 }
 
-func (d *t3Dispatcher) SyncRulesOnConnect(_ context.Context, agentID string) error {
+func (d *integrationTestMockDispatcher) SyncRulesOnConnect(_ context.Context, agentID string) error {
 	d.registry.Send(agentID, &agentv1.ServerMessage{
 		Payload: &agentv1.ServerMessage_PushRule{
 			PushRule: &agentv1.PushRuleCommand{
@@ -104,25 +104,25 @@ func (d *t3Dispatcher) SyncRulesOnConnect(_ context.Context, agentID string) err
 	return nil
 }
 
-type t3Indexer struct {
+type integrationTestMockIndexer struct {
 	mu      sync.Mutex
 	uploads []*agentv1.UploadResult
 }
 
-func (i *t3Indexer) HandleUploadResult(_ context.Context, _ uuid.UUID, _ uuid.UUID, result *agentv1.UploadResult) error {
+func (i *integrationTestMockIndexer) HandleUploadResult(_ context.Context, _ uuid.UUID, _ uuid.UUID, result *agentv1.UploadResult) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.uploads = append(i.uploads, result)
 	return nil
 }
 
-func (i *t3Indexer) count() int {
+func (i *integrationTestMockIndexer) count() int {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return len(i.uploads)
 }
 
-func TestT31_ControlPlaneAgent_EndToEnd(t *testing.T) {
+func TestControlPlaneAgent_EndToEnd_Integration(t *testing.T) {
 	miniRedis, err := miniredis.Run()
 	require.NoError(t, err)
 	defer miniRedis.Close()
@@ -132,10 +132,10 @@ func TestT31_ControlPlaneAgent_EndToEnd(t *testing.T) {
 	defer func() { _ = redisClient.Close() }()
 
 	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
-	manager := newT3AgentManager(jwtSvc)
+	manager := newIntegrationTestMockAgentManager(jwtSvc)
 	registry := NewAgentRegistry()
-	indexer := &t3Indexer{}
-	dispatcher := &t3Dispatcher{registry: registry}
+	indexer := &integrationTestMockIndexer{}
+	dispatcher := &integrationTestMockDispatcher{registry: registry}
 
 	srv := New(zap.NewNop())
 	srv.WithDeps(registry, redisClient, jwtSvc, &mockNATS{}, manager)
@@ -213,7 +213,7 @@ func TestT31_ControlPlaneAgent_EndToEnd(t *testing.T) {
 		Payload: &agentv1.AgentMessage_UploadResult{
 			UploadResult: &agentv1.UploadResult{
 				RuleId:      "rule-e2e-1",
-				BucketName:  "data-sensor",
+				Bucket:      "data-sensor",
 				StoragePath: "agents/replay.log",
 				SizeBytes:   123,
 				Sha256:      "abc123",
