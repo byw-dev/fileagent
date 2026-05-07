@@ -13,15 +13,22 @@ import (
 	"strings"
 	"time"
 
-	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/agent/internal/config"
 	"github.com/byw-dev/fileagent/agent/internal/credential"
+	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // AgentVersion is the current version string embedded at build time.
 const AgentVersion = "0.1.0"
+
+var (
+	registerRetryInitialDelay = 5 * time.Second
+	registerRetryMaxDelay     = 60 * time.Second
+)
 
 // State represents the lifecycle state of the Edge Agent.
 type State int
@@ -120,12 +127,13 @@ func (l *Lifecycle) Start(ctx context.Context, svc agentv1.AgentServiceClient, c
 
 	_ = l.StateMachine.Transition(StateInit)
 
-	agentID, err := Register(ctx, svc, cfg, fp, logger)
+	agentID, err := l.registerWithRetry(ctx, svc, cfg, fp, logger)
 	if err != nil {
 		return fmt.Errorf("lifecycle: register: %w", err)
 	}
 	l.AgentID = agentID
 	_ = l.StateMachine.Transition(StatePending)
+	logger.Info("lifecycle: registering... waiting for approval", zap.String("agent_id", agentID))
 
 	token, err := PollApproval(ctx, svc, agentID, fp, 30*time.Second, logger)
 	if err != nil {
@@ -137,6 +145,49 @@ func (l *Lifecycle) Start(ctx context.Context, svc agentv1.AgentServiceClient, c
 	}
 	_ = l.StateMachine.Transition(StateApproved)
 	return nil
+}
+
+// registerWithRetry repeatedly attempts Register with exponential backoff until
+// success, context cancellation, or a permanent server rejection is observed.
+func (l *Lifecycle) registerWithRetry(ctx context.Context, svc agentv1.AgentServiceClient, cfg *config.Config, fingerprint string, logger *zap.Logger) (string, error) {
+	delay := registerRetryInitialDelay
+	for {
+		agentID, err := Register(ctx, svc, cfg, fingerprint, logger)
+		if err == nil {
+			return agentID, nil
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+
+		code := status.Code(err)
+		if code == codes.PermissionDenied || code == codes.AlreadyExists {
+			return "", err
+		}
+
+		logger.Warn("lifecycle: register failed, retrying",
+			zap.Error(err),
+			zap.Duration("retry_in", delay),
+		)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+
+		delay *= 2
+		if delay > registerRetryMaxDelay {
+			delay = registerRetryMaxDelay
+		}
+	}
 }
 
 // LoadOrCreateFingerprint reads the machine fingerprint from path, or generates
@@ -193,7 +244,7 @@ func Register(ctx context.Context, svc agentv1.AgentServiceClient, cfg *config.C
 	}
 
 	if resp.GetStatus() == "rejected" {
-		return "", fmt.Errorf("grpcclient: registration rejected: %s", resp.GetMessage())
+		return "", status.Errorf(codes.PermissionDenied, "grpcclient: registration rejected: %s", resp.GetMessage())
 	}
 
 	logger.Info("grpcclient: registration submitted",

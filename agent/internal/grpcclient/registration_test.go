@@ -10,13 +10,15 @@ import (
 	"testing"
 	"time"
 
-	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/agent/internal/config"
 	"github.com/byw-dev/fileagent/agent/internal/credential"
+	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ── fake server helpers ───────────────────────────────────────────────────────
@@ -61,6 +63,18 @@ func startRegistrationServer(t *testing.T, srv *fakeRegistrationServer) (agentv1
 		grpcSrv.Stop()
 	}
 	return client, cleanup
+}
+
+func setRegisterRetryDelays(t *testing.T, initial, max time.Duration) {
+	t.Helper()
+	prevInitial := registerRetryInitialDelay
+	prevMax := registerRetryMaxDelay
+	registerRetryInitialDelay = initial
+	registerRetryMaxDelay = max
+	t.Cleanup(func() {
+		registerRetryInitialDelay = prevInitial
+		registerRetryMaxDelay = prevMax
+	})
 }
 
 // ── LoadOrCreateFingerprint tests ─────────────────────────────────────────────
@@ -236,7 +250,7 @@ func TestState_String(t *testing.T) {
 
 // ── Lifecycle tests ───────────────────────────────────────────────────────────
 
-func TestLifecycle_Start_ExistingToken(t *testing.T) {
+func TestLifecycle_Start_TokenAlreadyExists(t *testing.T) {
 	dir := t.TempDir()
 	fpFile := filepath.Join(dir, "fp.txt")
 	tokFile := filepath.Join(dir, "token.enc")
@@ -307,4 +321,86 @@ func TestLifecycle_Start_HappyPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StateApproved, lc.StateMachine.Current())
 	assert.Equal(t, "lc-agent-1", lc.AgentID)
+}
+
+func TestRegister_RetryOnTransientError(t *testing.T) {
+	setRegisterRetryDelays(t, 10*time.Millisecond, 20*time.Millisecond)
+
+	dir := t.TempDir()
+	fpFile := filepath.Join(dir, "fp.txt")
+	tokFile := filepath.Join(dir, "token.enc")
+	attempt := 0
+
+	srv := &fakeRegistrationServer{
+		registerFn: func(_ *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
+			attempt++
+			if attempt < 3 {
+				return nil, status.Error(codes.Unavailable, "temporary unavailable")
+			}
+			return &agentv1.RegisterResponse{AgentId: "retry-agent", Status: "pending"}, nil
+		},
+		pollApprovalFn: func(_ *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error) {
+			return &agentv1.PollApprovalResponse{Status: "approved", AuthToken: "retry-token"}, nil
+		},
+	}
+	svc, cleanup := startRegistrationServer(t, srv)
+	defer cleanup()
+
+	lc := NewLifecycle(credential.NewTokenManager(tokFile, "machine-id"), credential.NewSTSManager())
+	cfg := &config.Config{Agent: config.AgentConfig{FingerprintFile: fpFile, TokenFile: tokFile}}
+
+	err := lc.Start(context.Background(), svc, cfg, zap.NewNop())
+	require.NoError(t, err)
+	assert.Equal(t, 3, attempt)
+	assert.Equal(t, "retry-agent", lc.AgentID)
+}
+
+func TestRegister_StopOnRejected(t *testing.T) {
+	setRegisterRetryDelays(t, 10*time.Millisecond, 20*time.Millisecond)
+
+	dir := t.TempDir()
+	fpFile := filepath.Join(dir, "fp.txt")
+	tokFile := filepath.Join(dir, "token.enc")
+	attempt := 0
+
+	srv := &fakeRegistrationServer{
+		registerFn: func(_ *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
+			attempt++
+			return nil, status.Error(codes.PermissionDenied, "agent rejected")
+		},
+	}
+	svc, cleanup := startRegistrationServer(t, srv)
+	defer cleanup()
+
+	lc := NewLifecycle(credential.NewTokenManager(tokFile, "machine-id"), credential.NewSTSManager())
+	cfg := &config.Config{Agent: config.AgentConfig{FingerprintFile: fpFile, TokenFile: tokFile}}
+
+	err := lc.Start(context.Background(), svc, cfg, zap.NewNop())
+	require.Error(t, err)
+	assert.Equal(t, 1, attempt)
+}
+
+func TestRegister_StopOnContextCancel(t *testing.T) {
+	setRegisterRetryDelays(t, 10*time.Millisecond, 20*time.Millisecond)
+
+	dir := t.TempDir()
+	fpFile := filepath.Join(dir, "fp.txt")
+	tokFile := filepath.Join(dir, "token.enc")
+
+	srv := &fakeRegistrationServer{
+		registerFn: func(_ *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
+			return nil, status.Error(codes.Unavailable, "temporary unavailable")
+		},
+	}
+	svc, cleanup := startRegistrationServer(t, srv)
+	defer cleanup()
+
+	lc := NewLifecycle(credential.NewTokenManager(tokFile, "machine-id"), credential.NewSTSManager())
+	cfg := &config.Config{Agent: config.AgentConfig{FingerprintFile: fpFile, TokenFile: tokFile}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := lc.Start(ctx, svc, cfg, zap.NewNop())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }

@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/agent/internal/config"
+	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -126,6 +126,22 @@ func (c *Client) RefreshCredentials(ctx context.Context) (*agentv1.CredentialsPa
 // then starts a heartbeat goroutine. It blocks until ctx is cancelled,
 // reconnecting with exponential backoff on every failure.
 func (c *Client) Connect(ctx context.Context) error {
+	c.mu.Lock()
+	hasSvc := c.svc != nil
+	c.mu.Unlock()
+	if !hasSvc {
+		if err := c.Dial(); err != nil {
+			return err
+		}
+	}
+
+	go c.runLoop(ctx)
+	return nil
+}
+
+// Dial initialises the underlying gRPC connection and service client without
+// starting the long-lived Connect stream loop.
+func (c *Client) Dial() error {
 	dialOpts, err := c.buildDialOpts()
 	if err != nil {
 		return fmt.Errorf("grpcclient: build dial options: %w", err)
@@ -141,7 +157,6 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.svc = agentv1.NewAgentServiceClient(conn)
 	c.mu.Unlock()
 
-	go c.runLoop(ctx)
 	return nil
 }
 

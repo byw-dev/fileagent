@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -45,7 +47,7 @@ func (m *mockAgentDB) GetAgentByFingerprint(_ context.Context, fingerprint strin
 	if a, ok := m.agents["fp:"+fingerprint]; ok {
 		return a, nil
 	}
-	return nil, sql.ErrNoRows
+	return &db.Agent{}, sql.ErrNoRows
 }
 
 func (m *mockAgentDB) GetAgentByID(_ context.Context, id uuid.UUID) (*db.Agent, error) {
@@ -100,7 +102,7 @@ func newTestManager(t *testing.T) (*Manager, *mockAgentDB, *mockNATS) {
 	return m, agentDB, nats
 }
 
-func TestRegister_NewAgent(t *testing.T) {
+func TestRegister_FirstTime_ReturnsRealUUID(t *testing.T) {
 	agentDB := newMockAgentDB()
 	nats := &mockNATS{}
 	logger, _ := zap.NewDevelopment()
@@ -118,11 +120,12 @@ func TestRegister_NewAgent(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.NotEmpty(t, resp.AgentId)
+	assert.NotEqual(t, uuid.Nil.String(), resp.AgentId)
 	assert.Equal(t, "pending", resp.Status)
 	assert.Contains(t, resp.Message, "Awaiting approval")
 }
 
-func TestRegister_ExistingAgent(t *testing.T) {
+func TestRegister_ExistingAgent_ReturnsSameUUID(t *testing.T) {
 	agentDB := newMockAgentDB()
 	logger, _ := zap.NewDevelopment()
 
@@ -165,6 +168,34 @@ func TestPollApproval_PendingStatus(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "pending", resp.Status)
+	assert.Empty(t, resp.AuthToken)
+}
+
+func TestPollApproval_ApprovedReturnsToken(t *testing.T) {
+	m, agentDB, _ := newTestManager(t)
+
+	agentID := uuid.New()
+	agentDB.agents[agentID.String()] = &db.Agent{
+		ID:     agentID,
+		OrgID:  defaultOrgID,
+		Name:   "approved-agent",
+		Status: db.AgentStatusApproved,
+	}
+
+	resp, err := m.PollApproval(context.Background(), &agentv1.PollApprovalRequest{
+		AgentId: agentID.String(),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "approved", resp.Status)
+	assert.NotEmpty(t, resp.AuthToken)
+
+	claims, err := m.jwtSvc.ValidateToken(resp.AuthToken)
+	require.NoError(t, err)
+	assert.Equal(t, "agent", claims.Role)
+
+	sum := sha256.Sum256([]byte(resp.AuthToken))
+	expectedHash := hex.EncodeToString(sum[:])
+	assert.Equal(t, expectedHash, agentDB.agents[agentID.String()].AuthTokenHash.String)
 }
 
 func TestPollApproval_InvalidID(t *testing.T) {
@@ -220,22 +251,22 @@ func TestApproveAgent_GeneratesToken(t *testing.T) {
 }
 
 func TestStatusMessage_AllStatuses(t *testing.T) {
-cases := []struct {
-status db.AgentStatus
-want   string
-}{
-{db.AgentStatusPending, "Awaiting approval"},
-{db.AgentStatusApproved, "Approved"},
-{db.AgentStatusOnline, "Online"},
-{db.AgentStatusOffline, "Offline"},
-{db.AgentStatusRevoked, "Revoked"},
-{db.AgentStatus("unknown_status"), "unknown_status"},
-}
-for _, tc := range cases {
-t.Run(string(tc.status), func(t *testing.T) {
-assert.Equal(t, tc.want, statusMessage(tc.status))
-})
-}
+	cases := []struct {
+		status db.AgentStatus
+		want   string
+	}{
+		{db.AgentStatusPending, "Awaiting approval"},
+		{db.AgentStatusApproved, "Approved"},
+		{db.AgentStatusOnline, "Online"},
+		{db.AgentStatusOffline, "Offline"},
+		{db.AgentStatusRevoked, "Revoked"},
+		{db.AgentStatus("unknown_status"), "unknown_status"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.status), func(t *testing.T) {
+			assert.Equal(t, tc.want, statusMessage(tc.status))
+		})
+	}
 }
 
 type errNATS struct{ err error }
@@ -243,24 +274,24 @@ type errNATS struct{ err error }
 func (e *errNATS) Publish(_ string, _ []byte) error { return e.err }
 
 func TestPublishEvent_NATSError(t *testing.T) {
-logger, _ := zap.NewDevelopment()
-agentDB := newMockAgentDB()
-jwtSvc := auth.New("test-secret", nil)
-m := NewManager(agentDB, &mockCache{}, jwtSvc, &errNATS{err: assert.AnError}, logger, 24*time.Hour)
+	logger, _ := zap.NewDevelopment()
+	agentDB := newMockAgentDB()
+	jwtSvc := auth.New("test-secret", nil)
+	m := NewManager(agentDB, &mockCache{}, jwtSvc, &errNATS{err: assert.AnError}, logger, 24*time.Hour)
 
-// Should not panic even when NATS returns an error
-assert.NotPanics(t, func() {
-m.publishEvent("events.agent.test", map[string]string{"key": "value"})
-})
+	// Should not panic even when NATS returns an error
+	assert.NotPanics(t, func() {
+		m.publishEvent("events.agent.test", map[string]string{"key": "value"})
+	})
 }
 
 func TestPublishEvent_NilNATS(t *testing.T) {
-logger, _ := zap.NewDevelopment()
-agentDB := newMockAgentDB()
-jwtSvc := auth.New("test-secret", nil)
-m := NewManager(agentDB, &mockCache{}, jwtSvc, nil, logger, 24*time.Hour)
+	logger, _ := zap.NewDevelopment()
+	agentDB := newMockAgentDB()
+	jwtSvc := auth.New("test-secret", nil)
+	m := NewManager(agentDB, &mockCache{}, jwtSvc, nil, logger, 24*time.Hour)
 
-assert.NotPanics(t, func() {
-m.publishEvent("events.agent.test", map[string]string{"key": "value"})
-})
+	assert.NotPanics(t, func() {
+		m.publishEvent("events.agent.test", map[string]string{"key": "value"})
+	})
 }

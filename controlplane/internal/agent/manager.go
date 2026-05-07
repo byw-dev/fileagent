@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -76,10 +77,10 @@ func NewManager(
 // Register handles agent self-registration.
 func (m *Manager) Register(ctx context.Context, req *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
 	existing, err := m.db.GetAgentByFingerprint(ctx, req.GetFingerprint())
-	if err != nil && err != sql.ErrNoRows {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("register: lookup fingerprint: %w", err)
 	}
-	if existing != nil {
+	if err == nil {
 		resp := &agentv1.RegisterResponse{
 			AgentId: existing.ID.String(),
 			Status:  string(existing.Status),
@@ -147,10 +148,42 @@ func (m *Manager) PollApproval(ctx context.Context, req *agentv1.PollApprovalReq
 	if err != nil {
 		return nil, fmt.Errorf("poll_approval: get agent: %w", err)
 	}
-	return &agentv1.PollApprovalResponse{
+	resp := &agentv1.PollApprovalResponse{
 		Status:  string(agent.Status),
 		Message: statusMessage(agent.Status),
-	}, nil
+	}
+	if agent.Status != db.AgentStatusApproved {
+		return resp, nil
+	}
+	if m.jwtSvc == nil {
+		return nil, fmt.Errorf("poll_approval: jwt service not configured")
+	}
+
+	rawToken, err := m.jwtSvc.GenerateAccessToken(
+		agent.ID.String(),
+		agent.OrgID.String(),
+		"agent",
+		agent.Name,
+		m.accessTTL,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("poll_approval: generate token: %w", err)
+	}
+
+	sum := sha256.Sum256([]byte(rawToken))
+	hash := hex.EncodeToString(sum[:])
+	expiresAt := time.Now().Add(m.accessTTL)
+	if _, err = m.db.UpdateAgentAuthToken(
+		ctx,
+		agent.ID,
+		sql.NullString{String: hash, Valid: true},
+		sql.NullTime{Time: expiresAt, Valid: true},
+	); err != nil {
+		return nil, fmt.Errorf("poll_approval: update auth token: %w", err)
+	}
+
+	resp.AuthToken = rawToken
+	return resp, nil
 }
 
 // ApproveAgent approves an agent, generates its auth token, and returns the
@@ -192,9 +225,9 @@ func (m *Manager) ApproveAgent(ctx context.Context, agentID uuid.UUID, approvedB
 	}
 
 	m.publishEvent("events.agent.approved", map[string]string{
-		"agent_id":       agentID.String(),
-		"approved_by":    approvedByUserID.String(),
-		"agent_name":     agent.Name,
+		"agent_id":    agentID.String(),
+		"approved_by": approvedByUserID.String(),
+		"agent_name":  agent.Name,
 	})
 
 	m.logger.Info("agent approved",
@@ -222,9 +255,9 @@ func (m *Manager) RevokeAgent(ctx context.Context, agentID uuid.UUID, revokedByU
 	}
 
 	m.publishEvent("events.agent.revoked", map[string]string{
-		"agent_id":    agentID.String(),
-		"revoked_by":  revokedByUserID.String(),
-		"agent_name":  agent.Name,
+		"agent_id":   agentID.String(),
+		"revoked_by": revokedByUserID.String(),
+		"agent_name": agent.Name,
 	})
 
 	m.logger.Info("agent revoked",

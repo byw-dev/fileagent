@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -201,6 +202,11 @@ func main() {
 
 	// ── 5. gRPC client ───────────────────────────────────────────────────────
 	grpcClient := grpcclient.New(cfg, logger)
+	if err := grpcClient.Dial(); err != nil {
+		logger.Error("grpc dial failed", zap.Error(err))
+		return
+	}
+	defer grpcClient.Close()
 
 	// ── 8. Register ServerMessage handler ────────────────────────────────────
 	grpcClient.SetMessageHandler(func(msg *agentv1.ServerMessage) {
@@ -237,19 +243,24 @@ func main() {
 		}
 	})
 
-	if err := grpcClient.Connect(ctx); err != nil {
-		logger.Fatal("grpc connect failed", zap.Error(err))
-	}
-	defer grpcClient.Close()
-
 	// ── 6. Registration / approval lifecycle (blocks until APPROVED) ─────────
 	lc := grpcclient.NewLifecycle(tokenMgr, stsMgr)
 	if err := lc.Start(ctx, grpcClient.ServiceClient(), cfg, logger); err != nil {
-		logger.Fatal("lifecycle start failed", zap.Error(err))
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			logger.Info("agent: shutdown during registration", zap.Error(err))
+		} else {
+			logger.Error("agent: registration failed, exiting", zap.Error(err))
+		}
+		return
 	}
 	grpcClient.SetToken(lc.TokenManager.Token())
 	grpcClient.SetAgentID(lc.AgentID)
 	logger.Info("agent: approved, starting normal operation", zap.String("agent_id", lc.AgentID))
+
+	if err := grpcClient.Connect(ctx); err != nil {
+		logger.Error("grpc connect failed", zap.Error(err))
+		return
+	}
 
 	// ── Start scheduler and executor ─────────────────────────────────────────
 	sched.Start()
