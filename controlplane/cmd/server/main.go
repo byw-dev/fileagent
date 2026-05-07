@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/api"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
+	"github.com/byw-dev/fileagent/controlplane/internal/bootstrap"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/config"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
@@ -131,6 +133,46 @@ func main() {
 	authSvc := auth.New(cfg.JWTSecret, redisClient)
 
 	queries := db.New(database)
+	bootstrapResult, err := bootstrap.EnsureAdminAccount(
+		ctx,
+		queries,
+		cfg.BootstrapAdminUsername,
+		cfg.BootstrapAdminPassword,
+		cfg.BootstrapAdminForceReset,
+	)
+	if err != nil {
+		logger.Fatal("bootstrap admin failed", zap.Error(err))
+	}
+	if bootstrapResult.Created {
+		credentialsPath, err := writeBootstrapCredentials(
+			cfg.BootstrapAdminCredentialsFile,
+			bootstrapResult.Username,
+			bootstrapResult.Password,
+		)
+		if err != nil {
+			logger.Fatal("write bootstrap admin credentials file failed", zap.Error(err))
+		}
+		logger.Warn("bootstrap admin user created",
+			zap.String("username", bootstrapResult.Username),
+			zap.String("credentials_file", credentialsPath),
+			zap.String("action", "please login and change password immediately"),
+		)
+	}
+	if bootstrapResult.Reset {
+		credentialsPath, err := writeBootstrapCredentials(
+			cfg.BootstrapAdminCredentialsFile,
+			bootstrapResult.Username,
+			bootstrapResult.Password,
+		)
+		if err != nil {
+			logger.Fatal("write bootstrap admin credentials file failed", zap.Error(err))
+		}
+		logger.Warn("bootstrap admin password reset by configuration",
+			zap.String("username", bootstrapResult.Username),
+			zap.String("credentials_file", credentialsPath),
+			zap.String("action", "disable BOOTSTRAP_ADMIN_FORCE_RESET after recovery"),
+		)
+	}
 	agentMgr := agent.NewManager(queries, redisClient, authSvc, nats, logger, cfg.JWTAccessTokenTTL)
 
 	registry := grpcserver.NewAgentRegistry()
@@ -234,4 +276,24 @@ func buildLogger(level string) (*zap.Logger, error) {
 	}
 	cfg.Level = atomicLevel
 	return cfg.Build()
+}
+
+// writeBootstrapCredentials writes temporary bootstrap credentials to a local file.
+func writeBootstrapCredentials(path, username, password string) (string, error) {
+	targetPath := path
+	if _, err := os.Stat(targetPath); err == nil {
+		targetPath = fmt.Sprintf("%s.%d", targetPath, time.Now().UTC().Unix())
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	if dir := filepath.Dir(targetPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+	}
+	content := fmt.Sprintf("username=%s\npassword=%s\n", username, password)
+	if err := os.WriteFile(targetPath, []byte(content), 0o600); err != nil {
+		return "", err
+	}
+	return targetPath, nil
 }

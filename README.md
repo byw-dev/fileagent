@@ -197,6 +197,10 @@ docker compose -f docker-compose.dev.yml ps
 
 ### 2. 初始化数据库
 
+> 说明：这一步是**可选**的。`controlplane` 启动时会自动执行数据库迁移（`db.Migrate`）。
+> 仅当你希望手动提前迁移，或单独排查迁移问题时，才需要执行下面命令。
+> 若依赖自动迁移，请确保运行环境能访问 `MIGRATIONS_PATH` 指向的 SQL 脚本目录（默认 `./migrations`）。
+
 ```bash
 export DATABASE_URL="postgres://fileagent:fileagent@localhost:5432/fileagent?sslmode=disable"
 
@@ -226,12 +230,19 @@ make build-agent
 ### 5. 启动服务
 
 ```bash
-# Control Plane（需先配置环境变量，参考 controlplane/internal/config/）
+# Control Plane（推荐从示例文件复制后集中维护环境变量）
+cp controlplane/.env.example controlplane/.env
+set -a && source controlplane/.env && set +a
 ./bin/controlplane
 
 # Edge Agent（需先准备 TOML 配置文件）
+# 支持 --config 参数，也支持 AGENT_CONFIG 环境变量
+cp agent/config.toml.example agent/config.toml
 ./bin/agent --config /path/to/agent.toml
 ```
+
+首次启动时，如果数据库中没有用户，controlplane 会自动创建 `admin` 超级管理员，并将一次性凭据写入 `BOOTSTRAP_ADMIN_CREDENTIALS_FILE`。  
+如发生管理员密码丢失，可设置 `BOOTSTRAP_ADMIN_PASSWORD` + `BOOTSTRAP_ADMIN_FORCE_RESET=true` 临时重置，恢复后请立即关闭该开关。
 
 ---
 

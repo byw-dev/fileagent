@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/fs"
 	"os"
@@ -14,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/agent/internal/config"
 	"github.com/byw-dev/fileagent/agent/internal/credential"
 	"github.com/byw-dev/fileagent/agent/internal/executor"
@@ -23,6 +23,7 @@ import (
 	"github.com/byw-dev/fileagent/agent/internal/scheduler"
 	"github.com/byw-dev/fileagent/agent/internal/uploader"
 	"github.com/byw-dev/fileagent/agent/internal/watcher"
+	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -35,7 +36,13 @@ type ruleHandle struct {
 
 func main() {
 	// ── 1. Load configuration ────────────────────────────────────────────────
-	cfgPath := os.Getenv("AGENT_CONFIG")
+	configFlag := flag.String("config", "", "Path to agent TOML config file (precedence: --config > AGENT_CONFIG > ./config.toml)")
+	flag.Parse()
+
+	cfgPath := *configFlag
+	if cfgPath == "" {
+		cfgPath = os.Getenv("AGENT_CONFIG")
+	}
 	if cfgPath == "" {
 		cfgPath = "config.toml"
 	}
@@ -92,13 +99,13 @@ func main() {
 
 		uploaderCfgMu.Lock()
 		currentUploaderCfg = &uploader.Config{
-			Endpoint:    cred.GetEndpoint(),
-			AccessKey:   cred.GetAccessKey(),
-			SecretKey:   cred.GetSecretKey(),
+			Endpoint:     cred.GetEndpoint(),
+			AccessKey:    cred.GetAccessKey(),
+			SecretKey:    cred.GetSecretKey(),
 			SessionToken: cred.GetSessionToken(),
-			UseSSL:      cred.GetUseSsl(),
-			PartSizeMB:  cfg.Upload.PartSizeMB,
-			Concurrency: cfg.Upload.Concurrency,
+			UseSSL:       cred.GetUseSsl(),
+			PartSizeMB:   cfg.Upload.PartSizeMB,
+			Concurrency:  cfg.Upload.Concurrency,
 		}
 		uploaderCfgMu.Unlock()
 
