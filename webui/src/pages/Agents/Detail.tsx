@@ -32,6 +32,7 @@ import {
   listAgentUploadLogs,
 } from '../../services/agents'
 import type { Agent, CollectionRule } from '../../services/agents'
+import type { UploadLog } from '../../services/upload-logs'
 import AgentStatusBadge from '../../components/AgentStatusBadge'
 import DirectoryTree from '../../components/DirectoryTree'
 import type { DirEntry } from '../../components/DirectoryTree'
@@ -44,14 +45,6 @@ function formatBytes(bytes: number): string {
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   const i = Math.floor(Math.log(bytes) / Math.log(1024))
   return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
-}
-
-type UploadLogRow = {
-  id: string
-  filename: string
-  size: number
-  status: string
-  uploaded_at: string
 }
 
 /**
@@ -68,7 +61,7 @@ function AgentDetailPage() {
   const [rules, setRules] = useState<CollectionRule[]>([])
   const [loadingRules, setLoadingRules] = useState(false)
 
-  const [logs, setLogs] = useState<UploadLogRow[]>([])
+  const [logs, setLogs] = useState<UploadLog[]>([])
   const [loadingLogs, setLoadingLogs] = useState(false)
 
   const [dirPath, setDirPath] = useState('/')
@@ -218,7 +211,7 @@ function AgentDetailPage() {
     },
   ]
 
-  const logColumns: ColumnsType<UploadLogRow> = [
+  const logColumns: ColumnsType<UploadLog> = [
     { title: '文件名', dataIndex: 'filename', key: 'filename', ellipsis: true },
     {
       title: '大小',
@@ -277,18 +270,18 @@ function AgentDetailPage() {
             <Descriptions.Item label="名称">{agent.name}</Descriptions.Item>
             <Descriptions.Item label="主机名">{agent.hostname}</Descriptions.Item>
             <Descriptions.Item label="IP 地址">{agent.ip_address}</Descriptions.Item>
-            <Descriptions.Item label="操作系统">{agent.os}</Descriptions.Item>
-            <Descriptions.Item label="版本">{agent.version}</Descriptions.Item>
+            <Descriptions.Item label="操作系统">{agent.os_type}</Descriptions.Item>
+            <Descriptions.Item label="版本">{agent.agent_version}</Descriptions.Item>
             <Descriptions.Item label="状态">
               <AgentStatusBadge status={agent.status} />
             </Descriptions.Item>
             <Descriptions.Item label="最后心跳">
-              {agent.last_heartbeat_at
-                ? new Date(agent.last_heartbeat_at).toLocaleString('zh-CN')
+              {agent.last_seen_at
+                ? new Date(agent.last_seen_at).toLocaleString('zh-CN')
                 : '-'}
             </Descriptions.Item>
             <Descriptions.Item label="注册时间">
-              {new Date(agent.registered_at).toLocaleString('zh-CN')}
+              {new Date(agent.created_at).toLocaleString('zh-CN')}
             </Descriptions.Item>
           </Descriptions>
         </Card>

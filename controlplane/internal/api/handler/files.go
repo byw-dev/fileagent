@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
@@ -47,12 +48,12 @@ type fileEntryResponse struct {
 	AgentID      string `json:"agent_id,omitempty"`
 	BucketID     string `json:"bucket_id"`
 	FileTypeID   string `json:"file_type_id,omitempty"`
-	StoragePath  string `json:"storage_path"`
+	StorageKey   string `json:"storage_key"`
 	OriginalPath string `json:"original_path,omitempty"`
-	FileName     string `json:"file_name"`
-	SizeBytes    int64  `json:"size_bytes"`
+	Filename     string `json:"filename"`
+	Size         int64  `json:"size"`
 	SHA256       string `json:"sha256,omitempty"`
-	ContentType  string `json:"content_type,omitempty"`
+	MimeType     string `json:"mime_type,omitempty"`
 	Status       string `json:"status"`
 	UploadedAt   string `json:"uploaded_at,omitempty"`
 	CreatedAt    string `json:"created_at"`
@@ -60,14 +61,14 @@ type fileEntryResponse struct {
 
 func toFileEntryResponse(e *db.FileEntry) fileEntryResponse {
 	r := fileEntryResponse{
-		ID:          e.ID.String(),
-		OrgID:       e.OrgID.String(),
-		BucketID:    e.BucketID.String(),
-		StoragePath: e.StoragePath,
-		FileName:    e.FileName,
-		SizeBytes:   e.SizeBytes,
-		Status:      string(e.Status),
-		CreatedAt:   e.CreatedAt.UTC().Format(time.RFC3339),
+		ID:        e.ID.String(),
+		OrgID:     e.OrgID.String(),
+		BucketID:  e.BucketID.String(),
+		StorageKey: e.StoragePath,
+		Filename:  e.FileName,
+		Size:      e.SizeBytes,
+		Status:    strings.ToUpper(string(e.Status)),
+		CreatedAt: e.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if e.AgentID.Valid {
 		r.AgentID = e.AgentID.UUID.String()
@@ -82,7 +83,7 @@ func toFileEntryResponse(e *db.FileEntry) fileEntryResponse {
 		r.SHA256 = e.Sha256.String
 	}
 	if e.ContentType.Valid {
-		r.ContentType = e.ContentType.String
+		r.MimeType = e.ContentType.String
 	}
 	if e.UploadedAt.Valid {
 		r.UploadedAt = e.UploadedAt.Time.UTC().Format(time.RFC3339)
@@ -154,7 +155,7 @@ func (h *FilesHandler) List(c *gin.Context) {
 		last := entries[len(entries)-1]
 		nextCursor = encodeCursor(last.CreatedAt, last.ID)
 	}
-	c.JSON(http.StatusOK, gin.H{"data": resp, "next_cursor": nextCursor})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nextCursor})
 }
 
 // Get handles GET /api/v1/files/:id.
@@ -355,7 +356,7 @@ func (h *FileTypesHandler) List(c *gin.Context) {
 	for _, ft := range types {
 		resp = append(resp, toFileTypeResponse(ft))
 	}
-	c.JSON(http.StatusOK, gin.H{"data": resp})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp)})
 }
 
 // createFileTypeRequest is the body expected by POST /api/v1/file-types.

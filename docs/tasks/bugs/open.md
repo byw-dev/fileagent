@@ -9,15 +9,15 @@
 
 | ID | 标题 | 严重程度 | 状态 | 前置依赖 |
 |----|------|---------|------|---------|
-| T3-2-FIX-A | 后端：`GET /api/v1/agents` 响应格式与参数对齐 | 🔴 P0 | ⬜ | — |
-| T3-2-FIX-B | 后端：`GET /api/v1/agents/:id/rules` 与上传日志端点信封对齐 | 🔴 P0 | ⬜ | — |
-| T3-2-FIX-C | 前端：`Agent` 接口与 `AgentStatus` 对齐 | 🔴 P0 | ⬜ | T3-2-FIX-A |
-| T3-2-FIX-D | 前端：`CollectionRule` 接口字段对齐 | 🔴 P0 | ⬜ | T3-2-FIX-B |
-| T3-2-FIX-E | 后端：`GET /api/v1/files` 响应格式与字段名对齐 | 🔴 P0 | ⬜ | — |
-| T3-2-FIX-F | 前端：`FileEntry` 接口字段对齐 | 🔴 P0 | ⬜ | T3-2-FIX-E |
-| T3-2-FIX-G | 后端：upload-logs 端点响应格式与字段对齐 | 🔴 P0 | ⬜ | — |
-| T3-2-FIX-H | 前端：`UploadLog` 接口字段对齐 | 🔴 P0 | ⬜ | T3-2-FIX-G |
-| T3-2-FIX-I | 后端+前端：非分页列表端点统一为 `{items, total}` 信封 | 🟡 P1 | ⬜ | T3-2-FIX-A~H |
+| T3-2-FIX-A | 后端：`GET /api/v1/agents` 响应格式与参数对齐 | 🔴 P0 | ✅ | — |
+| T3-2-FIX-B | 后端：`GET /api/v1/agents/:id/rules` 与上传日志端点信封对齐 | 🔴 P0 | ✅ | — |
+| T3-2-FIX-C | 前端：`Agent` 接口与 `AgentStatus` 对齐 | 🔴 P0 | ✅ | T3-2-FIX-A |
+| T3-2-FIX-D | 前端：`CollectionRule` 接口字段对齐 | 🔴 P0 | ✅ | T3-2-FIX-B |
+| T3-2-FIX-E | 后端：`GET /api/v1/files` 响应格式与字段名对齐 | 🔴 P0 | ✅ | — |
+| T3-2-FIX-F | 前端：`FileEntry` 接口字段对齐 | 🔴 P0 | ✅ | T3-2-FIX-E |
+| T3-2-FIX-G | 后端：upload-logs 端点响应格式与字段对齐 | 🔴 P0 | ✅ | — |
+| T3-2-FIX-H | 前端：`UploadLog` 接口字段对齐 | 🔴 P0 | ✅ | T3-2-FIX-G |
+| T3-2-FIX-I | 后端+前端：非分页列表端点统一为 `{items, total}` 信封 | 🟡 P1 | ✅ | T3-2-FIX-A~H |
 
 **修复顺序建议**：
 ```

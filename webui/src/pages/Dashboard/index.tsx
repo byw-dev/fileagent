@@ -51,13 +51,6 @@ const uploadLogColumns: ColumnsType<UploadLog> = [
     ellipsis: true,
   },
   {
-    title: '采集器',
-    dataIndex: 'agent_name',
-    key: 'agent_name',
-    width: 140,
-    render: (name: string | null) => name ?? '-',
-  },
-  {
     title: '大小',
     dataIndex: 'size',
     key: 'size',

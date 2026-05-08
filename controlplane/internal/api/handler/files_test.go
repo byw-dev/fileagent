@@ -127,7 +127,7 @@ func TestFileTypesHandler_List_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	data := body["data"].([]interface{})
+	data := body["items"].([]interface{})
 	assert.Len(t, data, 1)
 }
 

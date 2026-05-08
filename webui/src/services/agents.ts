@@ -1,4 +1,5 @@
 import apiClient from './api'
+import type { UploadLog, PaginatedResponse as UploadLogPaginatedResponse } from './upload-logs'
 
 /** Agent status values matching the backend enum */
 export type AgentStatus =
@@ -15,10 +16,11 @@ export interface Agent {
   hostname: string
   ip_address: string
   status: AgentStatus
-  version: string
-  os: string
-  last_heartbeat_at: string | null
-  registered_at: string
+  os_type: string
+  os_version: string
+  agent_version: string
+  last_seen_at: string | null
+  created_at: string
   org_id: string
 }
 
@@ -190,8 +192,8 @@ export async function listDir(agentId: string, path: string): Promise<DirEntry[]
 export async function listAgentUploadLogs(
   agentId: string,
   params?: { cursor?: string; limit?: number; status?: string }
-): Promise<PaginatedResponse<{ id: string; filename: string; size: number; status: string; uploaded_at: string }>> {
-  const response = await apiClient.get(
+): Promise<UploadLogPaginatedResponse<UploadLog>> {
+  const response = await apiClient.get<UploadLogPaginatedResponse<UploadLog>>(
     `/api/v1/agents/${agentId}/upload-logs`,
     { params }
   )

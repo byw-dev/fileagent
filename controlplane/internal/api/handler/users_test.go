@@ -123,7 +123,7 @@ func TestUsersHandler_List_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	data, ok := body["data"].([]interface{})
+	data, ok := body["items"].([]interface{})
 	require.True(t, ok)
 	assert.Len(t, data, 1)
 }

@@ -168,7 +168,7 @@ func TestBucketsHandler_List_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	assert.Len(t, body["data"].([]interface{}), 1)
+	assert.Len(t, body["items"].([]interface{}), 1)
 }
 
 func TestBucketsHandler_List_NilDB_Returns501(t *testing.T) {
@@ -188,9 +188,9 @@ func TestBucketsHandler_List_EmptyDB_ReturnsEmptyDataArray(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	data, ok := body["data"].([]interface{})
-	require.True(t, ok, "data field should be an array")
-	assert.Empty(t, data, "data array should be empty when DB has no bucket records")
+	data, ok := body["items"].([]interface{})
+	require.True(t, ok, "items field should be an array")
+	assert.Empty(t, data, "items array should be empty when DB has no bucket records")
 }
 
 func TestBucketsHandler_List_DBError_Returns500(t *testing.T) {
@@ -412,7 +412,7 @@ func TestUploadLogsHandler_List_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	assert.Len(t, body["data"].([]interface{}), 1)
+	assert.Len(t, body["items"].([]interface{}), 1)
 }
 
 func TestUploadLogsHandler_List_NilDB_Returns501(t *testing.T) {

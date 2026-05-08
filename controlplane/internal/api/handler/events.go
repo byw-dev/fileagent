@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
@@ -82,7 +84,7 @@ func (h *BucketsHandler) List(c *gin.Context) {
 	for _, b := range buckets {
 		resp = append(resp, toBucketResponse(b))
 	}
-	c.JSON(http.StatusOK, gin.H{"data": resp})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp)})
 }
 
 // createBucketRequest is the body expected by POST /api/v1/buckets.
@@ -209,7 +211,7 @@ func (h *EventRulesHandler) List(c *gin.Context) {
 	for _, r := range rules {
 		resp = append(resp, toEventRuleResponse(r))
 	}
-	c.JSON(http.StatusOK, gin.H{"data": resp})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp)})
 }
 
 // createEventRuleRequest is the body expected by POST /api/v1/event-rules.
@@ -424,7 +426,7 @@ func (h *EventRulesHandler) ListDeliveries(c *gin.Context) {
 		last := deliveries[len(deliveries)-1]
 		nextCursor = encodeCursor(last.CreatedAt, last.ID)
 	}
-	c.JSON(http.StatusOK, gin.H{"data": resp, "next_cursor": nextCursor})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nextCursor})
 }
 
 // ── UploadLogsHandler ────────────────────────────���────────────────────────────
@@ -450,25 +452,27 @@ func NewUploadLogsHandler(logsDB UploadLogsDB, logger *zap.Logger) *UploadLogsHa
 type uploadLogResponse struct {
 	ID           string `json:"id"`
 	AgentID      string `json:"agent_id"`
-	FileEntryID  string `json:"file_entry_id,omitempty"`
+	FileID       string `json:"file_id,omitempty"`
+	Filename     string `json:"filename"`
 	StoragePath  string `json:"storage_path"`
 	Status       string `json:"status"`
-	SizeBytes    int64  `json:"size_bytes"`
+	Size         int64  `json:"size"`
 	ErrorMessage string `json:"error_message,omitempty"`
-	CreatedAt    string `json:"created_at"`
+	UploadedAt   string `json:"uploaded_at"`
 }
 
 func toUploadLogResponse(l *db.UploadLog) uploadLogResponse {
 	r := uploadLogResponse{
 		ID:          l.ID.String(),
 		AgentID:     l.AgentID.String(),
+		Filename:    path.Base(l.StoragePath),
 		StoragePath: l.StoragePath,
-		Status:      l.Status,
-		SizeBytes:   l.SizeBytes,
-		CreatedAt:   l.CreatedAt.UTC().Format(time.RFC3339),
+		Status:      strings.ToUpper(l.Status),
+		Size:        l.SizeBytes,
+		UploadedAt:  l.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if l.FileEntryID.Valid {
-		r.FileEntryID = l.FileEntryID.UUID.String()
+		r.FileID = l.FileEntryID.UUID.String()
 	}
 	if l.ErrorMessage.Valid {
 		r.ErrorMessage = l.ErrorMessage.String
@@ -522,7 +526,7 @@ func (h *UploadLogsHandler) List(c *gin.Context) {
 		last := logs[len(logs)-1]
 		nextCursor = encodeCursor(last.CreatedAt, last.ID)
 	}
-	c.JSON(http.StatusOK, gin.H{"data": resp, "next_cursor": nextCursor})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nextCursor})
 }
 
 // Get handles GET /api/v1/upload-logs/:id.

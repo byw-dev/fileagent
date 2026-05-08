@@ -218,3 +218,23 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 - **使用 node-version-file（.nvmrc / .node-version）**：与 `packageManager` + Corepack 方案相比，需要额外工具（nvm/fnm），且对 pnpm 版本无约束力。
 
 ---
+
+## D-006 upload-log 响应不返回 agent_name 字段（T3-2-FIX-G）
+
+**决策日期**：2026-05-08
+**影响范围**：controlplane API、Web UI
+
+### 决策
+
+`GET /api/v1/upload-logs` 和 `GET /api/v1/agents/:id/upload-logs` 响应的每条上传日志记录**不返回 `agent_name` 字段**。
+
+### 原因
+
+1. 上传日志 DB 表（`upload_logs`）仅存储 `agent_id`，不冗余存储 `agent_name`；
+2. 在 API 层 JOIN agents 表会带来额外的查询开销，且与最小改动原则不符；
+3. 前端可通过已有的 `agent_id` 字段（缩短 UUID 显示）满足展示需求，无需完整名称。
+
+### 替代方案（被否决）
+
+- **方案 B（JOIN agents 表）**：额外 JOIN，增加查询复杂度，也不符合 sqlc 生成代码的范式。
+- **方案 C（前端额外请求 `/api/v1/agents/:id`）**：列表页需多次请求，性能差。

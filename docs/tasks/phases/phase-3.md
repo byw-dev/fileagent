@@ -31,8 +31,7 @@ T3-3 Python SDK + Control Plane 联调
 
 ## 当前优先：T3-2-FIX API 契约对齐
 
-**状态**：⬜（A~I 共 9 项待完成）  
-**阻塞原因**：前后端 JSON 契约错位导致采集器列表、文件浏览器、上传日志页面为空。
+**状态**：✅（A~I 共 9 项已全部完成）
 
 详细规格与逐项验收：`docs/tasks/bugs/open.md`
 

@@ -13,8 +13,8 @@ export interface Bucket {
  * List all buckets in the current organisation.
  */
 export async function listBuckets(): Promise<Bucket[]> {
-  const response = await apiClient.get<{ data: Bucket[] }>('/api/v1/buckets')
-  return response.data.data
+  const response = await apiClient.get<{ items: Bucket[]; total: number }>('/api/v1/buckets')
+  return response.data.items
 }
 
 /**

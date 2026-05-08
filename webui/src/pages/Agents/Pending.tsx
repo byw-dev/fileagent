@@ -54,16 +54,16 @@ function AgentsPendingPage() {
     },
     {
       title: '操作系统',
-      dataIndex: 'os',
-      key: 'os',
+      dataIndex: 'os_type',
+      key: 'os_type',
       width: 100,
     },
     {
       title: '注册时间',
-      dataIndex: 'registered_at',
-      key: 'registered_at',
+      dataIndex: 'created_at',
+      key: 'created_at',
       width: 170,
-      render: (_, agent) => new Date(agent.registered_at).toLocaleString('zh-CN'),
+      render: (_, agent) => new Date(agent.created_at).toLocaleString('zh-CN'),
     },
     {
       title: '操作',

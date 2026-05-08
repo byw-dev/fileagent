@@ -44,11 +44,11 @@ function LogsPage() {
       ellipsis: true,
     },
     {
-      title: '采集器',
-      dataIndex: 'agent_name',
-      key: 'agent_name',
+      title: '采集器 ID',
+      dataIndex: 'agent_id',
+      key: 'agent_id',
       width: 140,
-      render: (_, log) => log.agent_name ?? <Tag color="default">未知</Tag>,
+      render: (_, log) => log.agent_id.slice(0, 8) + '…',
     },
     {
       title: '大小',

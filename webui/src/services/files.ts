@@ -14,8 +14,8 @@ export interface FileEntry {
   mime_type: string
   status: 'PENDING' | 'INDEXED' | 'ERROR'
   uploaded_at: string
-  indexed_at: string | null
-  metadata: Record<string, string>
+  indexed_at?: string | null
+  metadata?: Record<string, string>
 }
 
 /** Query parameters for listing files */

@@ -24,7 +24,8 @@ export interface EventDelivery {
 
 /** Paginated deliveries response */
 export interface DeliveriesResponse {
-  data: EventDelivery[]
+  items: EventDelivery[]
+  total: number
   next_cursor: string | null
 }
 
@@ -32,8 +33,8 @@ export interface DeliveriesResponse {
  * List all event rules in the organisation.
  */
 export async function listEventRules(): Promise<EventRule[]> {
-  const response = await apiClient.get<{ data: EventRule[] }>('/api/v1/event-rules')
-  return response.data.data
+  const response = await apiClient.get<{ items: EventRule[]; total: number }>('/api/v1/event-rules')
+  return response.data.items
 }
 
 /**

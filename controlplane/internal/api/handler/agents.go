@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
@@ -19,6 +20,7 @@ import (
 // AgentsDB is the minimal database interface needed by AgentsHandler.
 type AgentsDB interface {
 	ListAgents(ctx context.Context, orgID uuid.UUID) ([]*db.Agent, error)
+	ListAgentsByStatus(ctx context.Context, orgID uuid.UUID, status db.AgentStatus) ([]*db.Agent, error)
 	GetAgentByID(ctx context.Context, id uuid.UUID) (*db.Agent, error)
 	ListCollectionRulesByAgent(ctx context.Context, agentID uuid.UUID) ([]*db.CollectionRule, error)
 	GetCollectionRuleByID(ctx context.Context, id uuid.UUID) (*db.CollectionRule, error)
@@ -69,31 +71,53 @@ func NewAgentsHandler(agentsDB AgentsDB, agentMgr AgentManager, dispatcher RuleD
 
 // agentResponse is the outbound JSON shape for an agent.
 type agentResponse struct {
-	ID        string          `json:"id"`
-	OrgID     string          `json:"org_id"`
-	Name      string          `json:"name"`
-	Status    string          `json:"status"`
-	IpAddress string          `json:"ip_address,omitempty"`
-	OsInfo    json.RawMessage `json:"os_info,omitempty"`
-	LastSeen  string          `json:"last_seen_at,omitempty"`
-	CreatedAt string          `json:"created_at,omitempty"`
+	ID           string `json:"id"`
+	OrgID        string `json:"org_id"`
+	Name         string `json:"name"`
+	Status       string `json:"status"`
+	IpAddress    string `json:"ip_address,omitempty"`
+	Hostname     string `json:"hostname,omitempty"`
+	OsType       string `json:"os_type,omitempty"`
+	OsVersion    string `json:"os_version,omitempty"`
+	AgentVersion string `json:"agent_version,omitempty"`
+	LastSeenAt   string `json:"last_seen_at,omitempty"`
+	CreatedAt    string `json:"created_at,omitempty"`
 }
 
 func toAgentResponse(a *db.Agent) agentResponse {
+	status := strings.ToUpper(string(a.Status))
+	if status == "ONLINE" {
+		status = "RUNNING"
+	}
 	r := agentResponse{
-		ID:     a.ID.String(),
-		OrgID:  a.OrgID.String(),
-		Name:   a.Name,
-		Status: string(a.Status),
+		ID:        a.ID.String(),
+		OrgID:     a.OrgID.String(),
+		Name:      a.Name,
+		Status:    status,
+		CreatedAt: a.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if a.IpAddress.Valid {
 		r.IpAddress = a.IpAddress.IPNet.IP.String()
 	}
 	if len(a.OsInfo) > 0 {
-		r.OsInfo = a.OsInfo
+		var osInfo map[string]interface{}
+		if json.Unmarshal(a.OsInfo, &osInfo) == nil {
+			if v, ok := osInfo["hostname"].(string); ok {
+				r.Hostname = v
+			}
+			if v, ok := osInfo["os_type"].(string); ok {
+				r.OsType = v
+			}
+			if v, ok := osInfo["os_version"].(string); ok {
+				r.OsVersion = v
+			}
+			if v, ok := osInfo["agent_version"].(string); ok {
+				r.AgentVersion = v
+			}
+		}
 	}
 	if a.LastSeenAt.Valid {
-		r.LastSeen = a.LastSeenAt.Time.UTC().Format(time.RFC3339)
+		r.LastSeenAt = a.LastSeenAt.Time.UTC().Format(time.RFC3339)
 	}
 	return r
 }
@@ -105,7 +129,21 @@ func (h *AgentsHandler) List(c *gin.Context) {
 		return
 	}
 	orgID := orgIDFromClaims(c)
-	agents, err := h.db.ListAgents(c.Request.Context(), orgID)
+
+	var agents []*db.Agent
+	var err error
+
+	if statusParam := c.Query("status"); statusParam != "" {
+		// Accept uppercase (frontend) and map to DB lowercase values.
+		// "RUNNING" maps to the DB "online" status.
+		dbStatusStr := strings.ToLower(statusParam)
+		if dbStatusStr == "running" {
+			dbStatusStr = "online"
+		}
+		agents, err = h.db.ListAgentsByStatus(c.Request.Context(), orgID, db.AgentStatus(dbStatusStr))
+	} else {
+		agents, err = h.db.ListAgents(c.Request.Context(), orgID)
+	}
 	if err != nil {
 		h.logger.Error("list agents", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -113,11 +151,17 @@ func (h *AgentsHandler) List(c *gin.Context) {
 		})
 		return
 	}
+
+	limit := parseLimitParam(c)
+	if int(limit) < len(agents) {
+		agents = agents[:limit]
+	}
+
 	resp := make([]agentResponse, 0, len(agents))
 	for _, a := range agents {
 		resp = append(resp, toAgentResponse(a))
 	}
-	c.JSON(http.StatusOK, gin.H{"data": resp})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nil})
 }
 
 // Get handles GET /api/v1/agents/:id.
@@ -266,40 +310,38 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 
 // collectionRuleResponse is the outbound JSON shape for a collection rule.
 type collectionRuleResponse struct {
-	ID                 string          `json:"id"`
-	AgentID            string          `json:"agent_id"`
-	BucketID           string          `json:"bucket_id"`
-	Name               string          `json:"name"`
-	Mode               string          `json:"mode"`
-	Status             string          `json:"status"`
-	SourcePathTemplate string          `json:"source_path_template"`
-	FileGlob           string          `json:"file_glob"`
-	UploadPathTemplate string          `json:"upload_path_template"`
-	WatchRecursive     bool            `json:"watch_recursive"`
-	CronExpr           string          `json:"cron_expr,omitempty"`
-	Metadata           json.RawMessage `json:"metadata,omitempty"`
-	CreatedAt          string          `json:"created_at"`
+	ID                 string `json:"id"`
+	AgentID            string `json:"agent_id"`
+	DestBucketID       string `json:"dest_bucket_id"`
+	Name               string `json:"name"`
+	Mode               string `json:"mode"`
+	IsActive           bool   `json:"is_active"`
+	RunOnceOnStart     bool   `json:"run_once_on_start"`
+	SourcePath         string `json:"source_path"`
+	FilePattern        string `json:"file_pattern"`
+	DestPathTemplate   string `json:"dest_path_template"`
+	WatchRecursive     bool   `json:"watch_recursive"`
+	CronExpr           string `json:"cron_expr,omitempty"`
+	CreatedAt          string `json:"created_at"`
 }
 
 func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 	resp := collectionRuleResponse{
-		ID:                 r.ID.String(),
-		AgentID:            r.AgentID.String(),
-		BucketID:           r.BucketID.String(),
-		Name:               r.Name,
-		Mode:               string(r.Mode),
-		Status:             string(r.Status),
-		SourcePathTemplate: r.SourcePathTemplate,
-		FileGlob:           r.FileGlob,
-		UploadPathTemplate: r.UploadPathTemplate,
-		WatchRecursive:     r.WatchRecursive,
-		CreatedAt:          r.CreatedAt.UTC().Format(time.RFC3339),
+		ID:               r.ID.String(),
+		AgentID:          r.AgentID.String(),
+		DestBucketID:     r.BucketID.String(),
+		Name:             r.Name,
+		Mode:             string(r.Mode),
+		IsActive:         r.Status == db.RuleStatusActive,
+		RunOnceOnStart:   r.RunOnceOnStart,
+		SourcePath:       r.SourcePathTemplate,
+		FilePattern:      r.FileGlob,
+		DestPathTemplate: r.UploadPathTemplate,
+		WatchRecursive:   r.WatchRecursive,
+		CreatedAt:        r.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if r.CronExpr.Valid {
 		resp.CronExpr = r.CronExpr.String
-	}
-	if len(r.Metadata) > 0 {
-		resp.Metadata = r.Metadata
 	}
 	return resp
 }
@@ -329,7 +371,7 @@ func (h *AgentsHandler) ListRules(c *gin.Context) {
 	for _, r := range rules {
 		resp = append(resp, toRuleResponse(r))
 	}
-	c.JSON(http.StatusOK, gin.H{"data": resp})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nil})
 }
 
 // createRuleRequest is the body expected by POST /api/v1/agents/:id/rules.
@@ -577,5 +619,5 @@ func (h *AgentsHandler) ListUploadLogs(c *gin.Context) {
 		last := logs[len(logs)-1]
 		nextCursor = encodeCursor(last.CreatedAt, last.ID)
 	}
-	c.JSON(http.StatusOK, gin.H{"data": resp, "next_cursor": nextCursor})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nextCursor})
 }

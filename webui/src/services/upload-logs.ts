@@ -4,7 +4,6 @@ import apiClient from './api'
 export interface UploadLog {
   id: string
   agent_id: string
-  agent_name: string | null
   file_id: string | null
   filename: string
   size: number

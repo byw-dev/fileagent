@@ -92,14 +92,14 @@ function AgentsPage() {
     },
     {
       title: '操作系统',
-      dataIndex: 'os',
-      key: 'os',
+      dataIndex: 'os_type',
+      key: 'os_type',
       width: 100,
     },
     {
       title: '版本',
-      dataIndex: 'version',
-      key: 'version',
+      dataIndex: 'agent_version',
+      key: 'agent_version',
       width: 90,
     },
     {
@@ -111,20 +111,20 @@ function AgentsPage() {
     },
     {
       title: '最后心跳',
-      dataIndex: 'last_heartbeat_at',
-      key: 'last_heartbeat_at',
+      dataIndex: 'last_seen_at',
+      key: 'last_seen_at',
       width: 170,
       render: (_, agent) =>
-        agent.last_heartbeat_at
-          ? new Date(agent.last_heartbeat_at).toLocaleString('zh-CN')
+        agent.last_seen_at
+          ? new Date(agent.last_seen_at).toLocaleString('zh-CN')
           : '-',
     },
     {
       title: '注册时间',
-      dataIndex: 'registered_at',
-      key: 'registered_at',
+      dataIndex: 'created_at',
+      key: 'created_at',
       width: 170,
-      render: (_, agent) => new Date(agent.registered_at).toLocaleString('zh-CN'),
+      render: (_, agent) => new Date(agent.created_at).toLocaleString('zh-CN'),
     },
     {
       title: '操作',

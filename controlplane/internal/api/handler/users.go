@@ -82,7 +82,7 @@ func (h *UsersHandler) List(c *gin.Context) {
 	for _, u := range users {
 		resp = append(resp, toUserResponse(u))
 	}
-	c.JSON(http.StatusOK, gin.H{"data": resp})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp)})
 }
 
 // createUserRequest is the body expected by POST /api/v1/users.
