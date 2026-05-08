@@ -101,7 +101,13 @@ func toAgentResponse(a *db.Agent) agentResponse {
 	}
 	if len(a.OsInfo) > 0 {
 		var osInfo map[string]interface{}
-		if json.Unmarshal(a.OsInfo, &osInfo) == nil {
+		if err := json.Unmarshal(a.OsInfo, &osInfo); err != nil {
+			// Log at debug level; os_info fields will remain empty for this agent.
+			zap.L().Debug("failed to unmarshal agent os_info",
+				zap.String("agent_id", a.ID.String()),
+				zap.Error(err),
+			)
+		} else {
 			if v, ok := osInfo["hostname"].(string); ok {
 				r.Hostname = v
 			}

@@ -465,11 +465,13 @@ func toUploadLogResponse(l *db.UploadLog) uploadLogResponse {
 	r := uploadLogResponse{
 		ID:          l.ID.String(),
 		AgentID:     l.AgentID.String(),
-		Filename:    path.Base(l.StoragePath),
 		StoragePath: l.StoragePath,
 		Status:      strings.ToUpper(l.Status),
 		Size:        l.SizeBytes,
 		UploadedAt:  l.CreatedAt.UTC().Format(time.RFC3339),
+	}
+	if l.StoragePath != "" {
+		r.Filename = path.Base(l.StoragePath)
 	}
 	if l.FileEntryID.Valid {
 		r.FileID = l.FileEntryID.UUID.String()

@@ -48,7 +48,7 @@ function LogsPage() {
       dataIndex: 'agent_id',
       key: 'agent_id',
       width: 140,
-      render: (_, log) => log.agent_id.slice(0, 8) + '…',
+      render: (_, log) => (log.agent_id ?? '').slice(0, 8) + '…',
     },
     {
       title: '大小',
