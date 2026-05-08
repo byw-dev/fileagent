@@ -34,9 +34,12 @@ fileagent/                        # Monorepo 根目录
 │   ├── reports/                  # 审计报告（已归档）
 │   └── tasks/                    # 任务管理（详见 TASK_LIST.md 导航）
 │       ├── SCHEMA.md             # 字段定义与状态枚举
-│       ├── active.md             # ⭐ 当前 sprint 任务（Agent 主要读取）
+│       ├── active.md             # ⭐ 当前执行入口（轻量）
+│       ├── phases/
+│       │   └── phase-3.md        # 当前 Phase 主线（完整依赖与验收）
 │       ├── backlog.md            # 待规划任务
-│       ├── changelog.md          # 历史完成记录
+│       ├── changelog.md          # 历史记录索引（兼容入口）
+│       ├── archive/              # 按 Phase 归档的历史完成记录
 │       └── bugs/
 │           ├── open.md           # 未解决 Bug（Agent 可直接消费）
 │           └── closed.md         # 已关闭 Bug 归档
@@ -244,9 +247,10 @@ docker compose -f deploy/docker-compose.test.yml down -v
 ## 当前阶段
 
 当前为 **Phase 3 — 集成联调**（T3-1 ✅，T3-1-FIX ✅，T3-1-BUGFIX ✅，T3-2-FIX 进行中）。
-详细任务与状态以 `docs/tasks/active.md` 为准；`TASK_LIST.md` 提供各阶段总览。
+详细任务与状态以 `docs/tasks/active.md` + `docs/tasks/phases/phase-3.md` 为准；`TASK_LIST.md` 提供总索引。
 
 **开始任务前必须确认：**
 1. 读 `docs/tasks/active.md` 确认当前 Phase 和前置依赖。
-2. 若涉及 Bug 修复，读 `docs/tasks/bugs/open.md`。
-3. 本任务会修改哪些契约文件？如果会，先在 DECISIONS.md 记录。
+2. 读 `docs/tasks/phases/phase-3.md` 获取当前 Phase 主线与验收标准。
+3. 若涉及 Bug 修复，读 `docs/tasks/bugs/open.md`。
+4. 本任务会修改哪些契约文件？如果会，先在 DECISIONS.md 记录。

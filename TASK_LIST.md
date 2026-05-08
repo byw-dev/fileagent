@@ -14,10 +14,12 @@
 | 文件 | 用途 | 读者 |
 |------|------|------|
 | [`docs/tasks/active.md`](docs/tasks/active.md) | 当前 sprint 活跃任务 | **Agent 主要输入** |
+| [`docs/tasks/phases/phase-3.md`](docs/tasks/phases/phase-3.md) | 当前 Phase 主线（依赖与验收） | Agent / 人工 |
 | [`docs/tasks/bugs/open.md`](docs/tasks/bugs/open.md) | 未解决 Bug（含完整修复规格） | Agent |
 | [`docs/tasks/bugs/closed.md`](docs/tasks/bugs/closed.md) | 已关闭 Bug 归档 | 人工查阅 |
 | [`docs/tasks/backlog.md`](docs/tasks/backlog.md) | 待规划任务（Phase 4 等） | 人工规划 |
-| [`docs/tasks/changelog.md`](docs/tasks/changelog.md) | 历史完成记录 | 人工查阅 |
+| [`docs/tasks/archive/`](docs/tasks/archive/) | 按 Phase 归档的历史完成记录 | 人工查阅 |
+| [`docs/tasks/changelog.md`](docs/tasks/changelog.md) | 历史记录索引（兼容入口） | 人工查阅 |
 | [`docs/tasks/SCHEMA.md`](docs/tasks/SCHEMA.md) | 字段定义、状态枚举、命名约定 | 人工维护 |
 
 ---

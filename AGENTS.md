@@ -2,15 +2,16 @@
 
 ## 仓库现状
 - **Phase 0~2 均已全部完成**：`controlplane/`、`agent/`、`webui/`、`sdk/python/` 均有实际代码；`proto/v1/agent.proto` 已锁定，数据库迁移文件已就绪，两套 docker-compose 和 `deploy/scripts/init-minio.sh` 均可执行。
-- 以 `docs/design/system-design.md` 作为**架构事实来源**，以 `docs/tasks/active.md` 作为**当前任务与前置依赖来源**，以 `CLAUDE.md` 作为**技术栈与编码规范来源**。
+- 以 `docs/design/system-design.md` 作为**架构事实来源**，以 `docs/tasks/active.md` + `docs/tasks/phases/phase-3.md` 作为**当前任务与前置依赖来源**，以 `CLAUDE.md` 作为**技术栈与编码规范来源**。
 - 当前阶段是 **Phase 3 — 集成联调**（T3-1 ✅，T3-1-FIX ✅，T3-1-BUGFIX ✅，T3-2-FIX 进行中）；`TASK_LIST.md` 是总索引，详细任务在 `docs/tasks/` 下。
 
 ## 开始任务前先做什么
 1. 先读 `CLAUDE.md`。
 2. 再看 `docs/tasks/active.md`，确认当前 Phase、前置依赖和验收标准。
-3. 若任务涉及 Bug 修复，读 `docs/tasks/bugs/open.md`。
-4. 然后阅读 `docs/design/system-design.md` 对应章节。
-5. 若要改共享契约，先在 `DECISIONS.md` 中记录决策；该文件已存在于根目录。
+3. 再看 `docs/tasks/phases/phase-3.md`，确认当前 Phase 主线与验收标准。
+4. 若任务涉及 Bug 修复，读 `docs/tasks/bugs/open.md`。
+5. 然后阅读 `docs/design/system-design.md` 对应章节。
+6. 若要改共享契约，先在 `DECISIONS.md` 中记录决策；该文件已存在于根目录。
 
 ## 架构总览
 - 系统明确分为**控制平面**和**数据平面**（`system-design.md` §§1.4, 2.2）。
