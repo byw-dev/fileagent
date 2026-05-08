@@ -18,6 +18,7 @@ import (
 // FilesDB is the minimal database interface needed by FilesHandler.
 type FilesDB interface {
 	ListFileEntries(ctx context.Context, arg db.ListFileEntriesParams) ([]*db.FileEntry, error)
+	CountFileEntries(ctx context.Context, f db.CountFileEntriesFilter) (int64, error)
 	GetFileEntryByID(ctx context.Context, id uuid.UUID) (*db.FileEntry, error)
 	// GetBucketByID is used to resolve a bucket UUID to its MinIO bucket name.
 	GetBucketByID(ctx context.Context, id uuid.UUID) (*db.Bucket, error)
@@ -108,32 +109,41 @@ func (h *FilesHandler) List(c *gin.Context) {
 		return
 	}
 
+	// Collect optional filters for both list and count.
+	filter := db.CountFileEntriesFilter{OrgID: orgID}
 	params := db.ListFileEntriesParams{
 		OrgID:           orgID,
 		CursorCreatedAt: cursorCreatedAt,
 		CursorID:        cursorID,
-		Limit:           limit,
+		Limit:           limit + 1, // fetch one extra to detect has_more
 	}
 
-	// Optional filters.
 	if v := c.Query("agent_id"); v != "" {
 		if id, err := uuid.Parse(v); err == nil {
-			params.AgentID = uuid.NullUUID{UUID: id, Valid: true}
+			nid := uuid.NullUUID{UUID: id, Valid: true}
+			params.AgentID = nid
+			filter.AgentID = nid
 		}
 	}
 	if v := c.Query("bucket_id"); v != "" {
 		if id, err := uuid.Parse(v); err == nil {
-			params.BucketID = uuid.NullUUID{UUID: id, Valid: true}
+			nid := uuid.NullUUID{UUID: id, Valid: true}
+			params.BucketID = nid
+			filter.BucketID = nid
 		}
 	}
 	if v := c.Query("file_type_id"); v != "" {
 		if id, err := uuid.Parse(v); err == nil {
-			params.FileTypeID = uuid.NullUUID{UUID: id, Valid: true}
+			nid := uuid.NullUUID{UUID: id, Valid: true}
+			params.FileTypeID = nid
+			filter.FileTypeID = nid
 		}
 	}
 	if v := c.Query("status"); v != "" {
 		s := db.FileStatus(v)
-		params.Status = db.NullFileStatus{FileStatus: s, Valid: true}
+		ns := db.NullFileStatus{FileStatus: s, Valid: true}
+		params.Status = ns
+		filter.Status = ns
 	}
 
 	entries, err := h.db.ListFileEntries(c.Request.Context(), params)
@@ -145,17 +155,36 @@ func (h *FilesHandler) List(c *gin.Context) {
 		return
 	}
 
+	hasMore := len(entries) > int(limit)
+	if hasMore {
+		entries = entries[:limit]
+	}
+
+	total, err := h.db.CountFileEntries(c.Request.Context(), filter)
+	if err != nil {
+		h.logger.Error("count file entries", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to count files", nil),
+		})
+		return
+	}
+
 	resp := make([]fileEntryResponse, 0, len(entries))
 	for _, e := range entries {
 		resp = append(resp, toFileEntryResponse(e))
 	}
 
 	var nextCursor string
-	if len(entries) == int(limit) {
+	if hasMore {
 		last := entries[len(entries)-1]
 		nextCursor = encodeCursor(last.CreatedAt, last.ID)
 	}
-	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nextCursor})
+	c.JSON(http.StatusOK, gin.H{
+		"items":       resp,
+		"total":       total,
+		"has_more":    hasMore,
+		"next_cursor": nextCursor,
+	})
 }
 
 // Get handles GET /api/v1/files/:id.

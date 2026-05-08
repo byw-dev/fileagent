@@ -59,16 +59,21 @@ func (m *mockFileTypesDB) DeleteFileType(_ context.Context, _ uuid.UUID) error {
 // ── mock FilesDB ──────────────────────────────────────────────────────────────
 
 type mockFilesDB struct {
-	entries   []*db.FileEntry
-	listErr   error
-	entry     *db.FileEntry
-	getErr    error
-	bucket    *db.Bucket
-	bucketErr error
+	entries    []*db.FileEntry
+	listErr    error
+	countTotal int64
+	countErr   error
+	entry      *db.FileEntry
+	getErr     error
+	bucket     *db.Bucket
+	bucketErr  error
 }
 
 func (m *mockFilesDB) ListFileEntries(_ context.Context, _ db.ListFileEntriesParams) ([]*db.FileEntry, error) {
 	return m.entries, m.listErr
+}
+func (m *mockFilesDB) CountFileEntries(_ context.Context, _ db.CountFileEntriesFilter) (int64, error) {
+	return m.countTotal, m.countErr
 }
 func (m *mockFilesDB) GetFileEntryByID(_ context.Context, _ uuid.UUID) (*db.FileEntry, error) {
 	return m.entry, m.getErr
@@ -265,12 +270,44 @@ func newSampleEntry() *db.FileEntry {
 }
 
 func TestFilesHandler_List_Success(t *testing.T) {
-	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}}
+	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countTotal: 1}
 	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files", nil)
 	testFilesRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, float64(1), body["total"])
+	assert.Equal(t, false, body["has_more"])
+	assert.Len(t, body["items"].([]interface{}), 1)
+}
+
+func TestFilesHandler_List_HasMore(t *testing.T) {
+	// Simulate limit=1 and 2 entries returned (limit+1), so has_more=true.
+	entries := []*db.FileEntry{newSampleEntry(), newSampleEntry()}
+	mockDB := &mockFilesDB{entries: entries, countTotal: 5}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	// limit=1 → fetch 2, detect has_more
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files?limit=1", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, true, body["has_more"])
+	assert.Equal(t, float64(5), body["total"])
+	assert.NotEmpty(t, body["next_cursor"])
+	assert.Len(t, body["items"].([]interface{}), 1)
+}
+
+func TestFilesHandler_List_CountDBError(t *testing.T) {
+	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countErr: assert.AnError}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 func TestFilesHandler_List_NilDB_Returns501(t *testing.T) {

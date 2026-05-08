@@ -23,19 +23,21 @@ import (
 // ── mocks ─────────────────────────────────────────────────────────────────────
 
 type mockAgentsDB struct {
-	agents     []*db.Agent
-	listErr    error
-	agent      *db.Agent
-	getErr     error
-	rules      []*db.CollectionRule
-	rulesErr   error
-	rule       *db.CollectionRule
-	ruleGetErr error
-	createErr  error
-	updateErr  error
-	deleteErr  error
-	logs       []*db.UploadLog
-	logsErr    error
+	agents        []*db.Agent
+	listErr       error
+	agent         *db.Agent
+	getErr        error
+	rules         []*db.CollectionRule
+	rulesErr      error
+	rule          *db.CollectionRule
+	ruleGetErr    error
+	createErr     error
+	updateErr     error
+	deleteErr     error
+	logs          []*db.UploadLog
+	logsErr       error
+	logsCount     int64
+	countLogsErr  error
 }
 
 func (m *mockAgentsDB) ListAgents(_ context.Context, _ uuid.UUID) ([]*db.Agent, error) {
@@ -89,6 +91,9 @@ func (m *mockAgentsDB) UpdateCollectionRuleStatus(_ context.Context, id uuid.UUI
 func (m *mockAgentsDB) DeleteCollectionRule(_ context.Context, _ uuid.UUID) error { return m.deleteErr }
 func (m *mockAgentsDB) ListUploadLogs(_ context.Context, _ db.ListUploadLogsParams) ([]*db.UploadLog, error) {
 	return m.logs, m.logsErr
+}
+func (m *mockAgentsDB) CountUploadLogs(_ context.Context, _ db.CountUploadLogsFilter) (int64, error) {
+	return m.logsCount, m.countLogsErr
 }
 
 type mockAgentMgr struct {

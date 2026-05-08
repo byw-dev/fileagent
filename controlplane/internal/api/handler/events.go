@@ -152,6 +152,7 @@ type EventRulesDB interface {
 	UpdateEventRule(ctx context.Context, arg db.UpdateEventRuleParams) (*db.EventRule, error)
 	DeleteEventRule(ctx context.Context, id uuid.UUID) error
 	ListDeliveriesByRule(ctx context.Context, arg db.ListDeliveriesByRuleParams) ([]*db.EventDelivery, error)
+	CountDeliveriesByRule(ctx context.Context, eventRuleID uuid.UUID) (int64, error)
 }
 
 // EventRulesHandler groups the event-rule management handlers.
@@ -406,7 +407,7 @@ func (h *EventRulesHandler) ListDeliveries(c *gin.Context) {
 		EventRuleID:     id,
 		CursorCreatedAt: cursorCreatedAt,
 		CursorID:        cursorID,
-		Limit:           limit,
+		Limit:           limit + 1, // fetch one extra to detect has_more
 	}
 	deliveries, err := h.db.ListDeliveriesByRule(c.Request.Context(), params)
 	if err != nil {
@@ -417,16 +418,35 @@ func (h *EventRulesHandler) ListDeliveries(c *gin.Context) {
 		return
 	}
 
+	hasMore := len(deliveries) > int(limit)
+	if hasMore {
+		deliveries = deliveries[:limit]
+	}
+
+	total, err := h.db.CountDeliveriesByRule(c.Request.Context(), id)
+	if err != nil {
+		h.logger.Error("count deliveries", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to count deliveries", nil),
+		})
+		return
+	}
+
 	resp := make([]eventDeliveryResponse, 0, len(deliveries))
 	for _, d := range deliveries {
 		resp = append(resp, toEventDeliveryResponse(d))
 	}
 	var nextCursor string
-	if len(deliveries) == int(limit) {
+	if hasMore {
 		last := deliveries[len(deliveries)-1]
 		nextCursor = encodeCursor(last.CreatedAt, last.ID)
 	}
-	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nextCursor})
+	c.JSON(http.StatusOK, gin.H{
+		"items":       resp,
+		"total":       total,
+		"has_more":    hasMore,
+		"next_cursor": nextCursor,
+	})
 }
 
 // ── UploadLogsHandler ────────────────────────────���────────────────────────────
@@ -434,6 +454,7 @@ func (h *EventRulesHandler) ListDeliveries(c *gin.Context) {
 // UploadLogsDB is the minimal database interface needed by UploadLogsHandler.
 type UploadLogsDB interface {
 	ListUploadLogs(ctx context.Context, arg db.ListUploadLogsParams) ([]*db.UploadLog, error)
+	CountUploadLogs(ctx context.Context, f db.CountUploadLogsFilter) (int64, error)
 	GetUploadLogByID(ctx context.Context, id uuid.UUID) (*db.UploadLog, error)
 }
 
@@ -498,15 +519,18 @@ func (h *UploadLogsHandler) List(c *gin.Context) {
 	}
 
 	orgID := orgIDFromClaims(c)
+	filter := db.CountUploadLogsFilter{OrgID: orgID}
 	params := db.ListUploadLogsParams{
 		OrgID:           orgID,
 		CursorCreatedAt: cursorCreatedAt,
 		CursorID:        cursorID,
-		Limit:           limit,
+		Limit:           limit + 1, // fetch one extra to detect has_more
 	}
 	if v := c.Query("agent_id"); v != "" {
 		if id, err := uuid.Parse(v); err == nil {
-			params.AgentID = uuid.NullUUID{UUID: id, Valid: true}
+			nid := uuid.NullUUID{UUID: id, Valid: true}
+			params.AgentID = nid
+			filter.AgentID = nid
 		}
 	}
 
@@ -519,16 +543,35 @@ func (h *UploadLogsHandler) List(c *gin.Context) {
 		return
 	}
 
+	hasMore := len(logs) > int(limit)
+	if hasMore {
+		logs = logs[:limit]
+	}
+
+	total, err := h.db.CountUploadLogs(c.Request.Context(), filter)
+	if err != nil {
+		h.logger.Error("count upload logs", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to count upload logs", nil),
+		})
+		return
+	}
+
 	resp := make([]uploadLogResponse, 0, len(logs))
 	for _, l := range logs {
 		resp = append(resp, toUploadLogResponse(l))
 	}
 	var nextCursor string
-	if len(logs) == int(limit) {
+	if hasMore {
 		last := logs[len(logs)-1]
 		nextCursor = encodeCursor(last.CreatedAt, last.ID)
 	}
-	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nextCursor})
+	c.JSON(http.StatusOK, gin.H{
+		"items":       resp,
+		"total":       total,
+		"has_more":    hasMore,
+		"next_cursor": nextCursor,
+	})
 }
 
 // Get handles GET /api/v1/upload-logs/:id.

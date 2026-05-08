@@ -28,6 +28,7 @@ type AgentsDB interface {
 	UpdateCollectionRuleStatus(ctx context.Context, iD uuid.UUID, status db.RuleStatus) (*db.CollectionRule, error)
 	DeleteCollectionRule(ctx context.Context, id uuid.UUID) error
 	ListUploadLogs(ctx context.Context, arg db.ListUploadLogsParams) ([]*db.UploadLog, error)
+	CountUploadLogs(ctx context.Context, f db.CountUploadLogsFilter) (int64, error)
 }
 
 // AgentManager manages agent approval/revocation lifecycle.
@@ -600,12 +601,13 @@ func (h *AgentsHandler) ListUploadLogs(c *gin.Context) {
 		return
 	}
 
+	agentNullUUID := uuid.NullUUID{UUID: agentID, Valid: true}
 	params := db.ListUploadLogsParams{
 		OrgID:           orgID,
-		AgentID:         uuid.NullUUID{UUID: agentID, Valid: true},
+		AgentID:         agentNullUUID,
 		CursorCreatedAt: cursorCreatedAt,
 		CursorID:        cursorID,
-		Limit:           limit,
+		Limit:           limit + 1, // fetch one extra to detect has_more
 	}
 	logs, err := h.db.ListUploadLogs(c.Request.Context(), params)
 	if err != nil {
@@ -616,14 +618,36 @@ func (h *AgentsHandler) ListUploadLogs(c *gin.Context) {
 		return
 	}
 
+	hasMore := len(logs) > int(limit)
+	if hasMore {
+		logs = logs[:limit]
+	}
+
+	total, err := h.db.CountUploadLogs(c.Request.Context(), db.CountUploadLogsFilter{
+		OrgID:   orgID,
+		AgentID: agentNullUUID,
+	})
+	if err != nil {
+		h.logger.Error("count upload logs for agent", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to count upload logs", nil),
+		})
+		return
+	}
+
 	resp := make([]uploadLogResponse, 0, len(logs))
 	for _, l := range logs {
 		resp = append(resp, toUploadLogResponse(l))
 	}
 	var nextCursor string
-	if len(logs) == int(limit) {
+	if hasMore {
 		last := logs[len(logs)-1]
 		nextCursor = encodeCursor(last.CreatedAt, last.ID)
 	}
-	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nextCursor})
+	c.JSON(http.StatusOK, gin.H{
+		"items":       resp,
+		"total":       total,
+		"has_more":    hasMore,
+		"next_cursor": nextCursor,
+	})
 }
