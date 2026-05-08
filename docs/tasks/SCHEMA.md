@@ -9,12 +9,18 @@
 ```
 docs/tasks/
 ├── SCHEMA.md          # 字段定义、状态枚举、优先级说明（本文件，人工维护）
-├── backlog.md         # 待规划任务（粗粒度，无需 Agent 读取）
 ├── active.md          # 当前 sprint 的活跃任务（Agent 的主要输入）
+├── backlog.md         # 待规划任务（粗粒度，无需 Agent 读取）
+├── changelog.md       # 历史记录索引（兼容入口，纯人类阅读）
 ├── bugs/
 │   ├── open.md        # 未解决 BUG（结构化，Agent 可直接消费）
 │   └── closed.md      # 已关闭 BUG（归档，Agent 不读）
-└── changelog.md       # 历史记录（纯人类阅读）
+├── phases/
+│   └── phase-3.md     # 当前 Phase 主线（完整依赖与验收标准）
+└── archive/           # 按 Phase 归档的历史完成记录
+    ├── phase-0.md
+    ├── phase-1.md
+    └── phase-2.md
 ```
 
 > Agent 每次开始任务前，应按以下顺序阅读：
