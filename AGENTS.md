@@ -1,15 +1,16 @@
 # AGENTS.md
 
 ## 仓库现状
-- **Phase 0（契约定义）与 Phase 1（基础骨架）已全部完成**：`controlplane/`、`agent/`、`webui/`、`sdk/python/` 均有实际代码；`proto/v1/agent.proto` 已锁定，数据库迁移文件已就绪，两套 docker-compose 和 `deploy/scripts/init-minio.sh` 均可执行。
-- 以 `docs/design/system-design.md` 作为**架构事实来源**，以 `TASK_LIST.md` 作为**任务顺序与前置依赖来源**，以 `CLAUDE.md` 作为**技术栈与编码规范来源**。
-- 当前阶段是 **Phase 3 — 集成联调**（1/3 已完成，`T3-1` ✅）；Phase 3 任务按 `TASK_LIST.md` 串行推进。
+- **Phase 0~2 均已全部完成**：`controlplane/`、`agent/`、`webui/`、`sdk/python/` 均有实际代码；`proto/v1/agent.proto` 已锁定，数据库迁移文件已就绪，两套 docker-compose 和 `deploy/scripts/init-minio.sh` 均可执行。
+- 以 `docs/design/system-design.md` 作为**架构事实来源**，以 `docs/tasks/active.md` 作为**当前任务与前置依赖来源**，以 `CLAUDE.md` 作为**技术栈与编码规范来源**。
+- 当前阶段是 **Phase 3 — 集成联调**（T3-1 ✅，T3-1-FIX ✅，T3-1-BUGFIX ✅，T3-2-FIX 进行中）；`TASK_LIST.md` 是总索引，详细任务在 `docs/tasks/` 下。
 
 ## 开始任务前先做什么
 1. 先读 `CLAUDE.md`。
-2. 再看 `TASK_LIST.md`，确认当前 Phase、前置依赖和验收标准。
-3. 然后阅读 `docs/design/system-design.md` 对应章节。
-4. 若要改共享契约，先在 `DECISIONS.md` 中记录决策；该文件已存在于根目录。
+2. 再看 `docs/tasks/active.md`，确认当前 Phase、前置依赖和验收标准。
+3. 若任务涉及 Bug 修复，读 `docs/tasks/bugs/open.md`。
+4. 然后阅读 `docs/design/system-design.md` 对应章节。
+5. 若要改共享契约，先在 `DECISIONS.md` 中记录决策；该文件已存在于根目录。
 
 ## 架构总览
 - 系统明确分为**控制平面**和**数据平面**（`system-design.md` §§1.4, 2.2）。
@@ -24,9 +25,9 @@
 - `sdk/python/`：Python SDK，核心是 `auth.py`、`http.py`、各资源模块（`system-design.md` §8.2）。
 
 ## 必须保护的契约
-- `proto/v1/agent.proto` 是 `agent` 与 `controlplane` 的共享契约：**只能增字段，不能改字段编号**（`TASK_LIST.md` T0-1）。
+- `proto/v1/agent.proto` 是 `agent` 与 `controlplane` 的共享契约：**只能增字段，不能改字段编号**（见 `docs/tasks/changelog.md` T0-1 记录）。
 - `controlplane/migrations/` 迁移文件是 **append-only**，不要改历史迁移（`CLAUDE.md`）。
-- `deploy/docker-compose.test.yml` 的端口是共享契约：PostgreSQL `5432`、Redis `6379`、MinIO `9000/9001`、NATS `4222/8222`（`TASK_LIST.md` T0-3）。
+- `deploy/docker-compose.test.yml` 的端口是共享契约：PostgreSQL `5432`、Redis `6379`、MinIO `9000/9001`、NATS `4222/8222`（见 `docs/tasks/changelog.md` T0-3 记录）。
 - 资源类 REST 接口主要在 `/api/v1/...`；认证接口设计为 `/api/auth/*`，不要混写成单一路径规则（`system-design.md` §§5.3, 5.11）。
 - 文件查询分页是 **cursor-based**，不是 offset-based（`system-design.md` §8.5）。
 
@@ -46,7 +47,7 @@
 ## 实施时的仓库约定
 - 配置只能来自环境变量或配置文件，禁止 hardcode 端点、密钥、端口、Bucket 名称（`CLAUDE.md`）。
 - Go 侧固定使用 `zap`；`Gin` 只用于 `controlplane`；数据库访问使用 `sqlc`，并显式传递 `context.Context`（`CLAUDE.md`）。
-- 当前重点工作是 Phase 3 剩余任务 `T3-2` 与 `T3-3`（串行）。
+- 当前重点工作是 `docs/tasks/active.md` 中的 T3-2-FIX 系列，完成后依次推进 T3-2 与 T3-3（串行）。
 
 ## 代码测试覆盖率要求
 
