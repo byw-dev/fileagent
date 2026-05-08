@@ -103,8 +103,8 @@ fileagent/                        # Monorepo 根目录
 - 每个导出函数必须有 godoc 注释
 
 ### React（webui）
-- Node 版本：**20 LTS**
-- 包管理器：**pnpm**
+- Node 版本：**24**（`>=24.0.0 <25.0.0`）
+- 包管理器：**pnpm 11**（`pnpm@11.0.4`，`>=11.0.0 <12.0.0`）
 - UI 组件：**Ant Design 5 + ProComponents**
 - 状态管理：**Zustand**
 - HTTP：**Axios + SWR**
