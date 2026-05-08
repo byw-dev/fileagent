@@ -16,6 +16,15 @@ SDK 供内部系统集成。
 
 ---
 
+## 架构总览
+
+- 系统明确分为**控制平面**和**数据平面**（`system-design.md` §§1.4, 2.2）。
+- 控制平面：`Agent <-> Control Plane` 走 **gRPC/TLS**；`Web UI / SDK -> Control Plane` 走 **HTTPS REST**。
+- 数据平面：`Agent -> MinIO` 走 **S3 API/TLS**，使用短期 **STS 凭据**，文件内容**不经过** Control Plane。
+- 固定基础设施：**PostgreSQL**（持久化）、**Redis**（TTL/锁/在线状态）、**NATS JetStream**（事件总线）、**MinIO**（对象存储）。
+
+---
+
 ## 仓库结构
 
 ```
@@ -67,6 +76,15 @@ fileagent/                        # Monorepo 根目录
 
 ---
 
+## 模块边界（已落地）
+
+- `agent/`：Go 单二进制，包含 watcher / scheduler / executor / uploader / SQLite 队列 / credential manager（`system-design.md` §§4.1, 4.9）。
+- `controlplane/`：Go 服务，包含 gRPC 服务端、REST API、agent manager、indexer、STS manager、后台 worker（`system-design.md` §§5.1, 5.12）。
+- `webui/`：Vite + React + Ant Design Pro，按 `pages/`、`services/`、`store/` 组织（`system-design.md` §7.5）。
+- `sdk/python/`：Python SDK，核心是 `auth.py`、`http.py`、各资源模块（`system-design.md` §8.2）。
+
+---
+
 ## 技术栈约定
 
 ### 通用
@@ -115,8 +133,21 @@ fileagent/                        # Monorepo 根目录
 | 文件 | 影响范围 | 修改规则 |
 |------|----------|----------|
 | `proto/v1/agent.proto` | controlplane + agent | 只增字段，不改字段编号；不删除字段 |
-| `deploy/docker-compose.test.yml` 中的端口定义 | 所有集成测试 | 修改前通知所有模块 |
+| `deploy/docker-compose.test.yml` 中的端口定义 | 所有集成测试 | 端口固定：PostgreSQL `5432`、Redis `6379`、MinIO `9000/9001`、NATS `4222/8222`；修改前通知所有模块 |
 | `controlplane/migrations/` 迁移文件 | controlplane + 所有依赖 DB 的测试 | 只追加，不修改已有迁移文件 |
+| REST 接口路径 | controlplane + 所有客户端 | 资源类接口统一在 `/api/v1/...`；认证接口统一在 `/api/auth/*`，不得混写 |
+| 文件查询分页 | controlplane + SDK | cursor-based pagination，不得改为 offset-based |
+
+---
+
+## 关键实现模式
+
+- Agent 生命周期是显式状态机：`INIT -> PENDING -> APPROVED -> RUNNING -> OFFLINE/REVOKED`；离线时继续写本地 SQLite 队列，重连后补传（`system-design.md` §4.2）。
+- 上传策略按大小分流：`<=64MB` 单次上传，`>64MB` 分片上传；分片大小 `64MB`，断点续传状态保存在 SQLite（`system-design.md` §4.5）。
+- 心跳周期是 `30s`，Control Plane 通过 Redis TTL `90s` 判定离线（`system-design.md` §5.2）。
+- STS 默认有效期 `1h`，到期前刷新；JWT 身份认证与 STS 上传凭据是两套独立机制（`system-design.md` §§4.7, 5.7）。
+- Control Plane 在处理 `UploadResult` 后做文件归类与索引，并发布 `events.file.uploaded` 等 NATS 事件（`system-design.md` §§5.8, 5.9）。
+- 第一版已知边界：**单组织**、**Bearer JWT**、**不启用 mTLS**、**Control Plane 单实例**（`system-design.md` 附录 D）。
 
 ---
 
@@ -152,6 +183,37 @@ fileagent/                        # Monorepo 根目录
   - 发出真实 HTTP 请求
   以上均须 Mock
 ```
+
+### 测试覆盖率要求
+
+**覆盖率标准：**
+
+- Go（controlplane / agent）：整体 **≥ 80%**，核心业务逻辑 **≥ 90%**
+- Python SDK：整体 **≥ 80%**
+- Web UI（Vitest）：核心 store / service 层 **≥ 80%**
+
+**运行覆盖率报告：**
+
+```bash
+# Go（在 controlplane/ 或 agent/ 目录下）
+go test ./... -coverprofile=coverage.out
+go tool cover -html=coverage.out -o coverage.html   # 生成 HTML 报告
+go tool cover -func=coverage.out | tail -1           # 查看总覆盖率
+
+# Python SDK
+cd sdk/python
+poetry run pytest --cov=fileagent --cov-report=term-missing --cov-report=html
+
+# Web UI
+cd webui
+pnpm test --coverage
+```
+
+**强制要求：**
+
+- 每完成一个 Phase 2+ 的任务，必须运行覆盖率检查，确保未低于阈值。
+- PR 提交前需附上主要模块的覆盖率数据（可在 PR 描述中粘贴 `go tool cover -func` 输出）。
+- 禁止为提高覆盖率数字而写无意义的空测试。
 
 ### Git 规范
 
@@ -249,8 +311,10 @@ docker compose -f deploy/docker-compose.test.yml down -v
 当前为 **Phase 3 — 集成联调**（T3-1 ✅，T3-1-FIX ✅，T3-1-BUGFIX ✅，T3-2-FIX 进行中）。
 详细任务与状态以 `docs/tasks/active.md` + `docs/tasks/phases/phase-3.md` 为准；`TASK_LIST.md` 提供总索引。
 
-**开始任务前必须确认：**
-1. 读 `docs/tasks/active.md` 确认当前 Phase 和前置依赖。
-2. 读 `docs/tasks/phases/phase-3.md` 获取当前 Phase 主线与验收标准。
-3. 若涉及 Bug 修复，读 `docs/tasks/bugs/open.md`。
-4. 本任务会修改哪些契约文件？如果会，先在 DECISIONS.md 记录。
+**开始任务前必须确认（按顺序）：**
+1. 读本文件（`CLAUDE.md`）全文。
+2. 读 `docs/tasks/active.md` 确认当前 Phase 和前置依赖。
+3. 读 `docs/tasks/phases/phase-3.md` 获取当前 Phase 主线与验收标准。
+4. 若涉及 Bug 修复，读 `docs/tasks/bugs/open.md`。
+5. 阅读 `docs/design/system-design.md` 中与本次任务相关的章节。
+6. 若要修改共享契约文件，先在 `DECISIONS.md` 中记录决策。
