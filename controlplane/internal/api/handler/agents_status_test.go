@@ -21,7 +21,9 @@ func TestMapFrontendStatusToDB(t *testing.T) {
 		{"APPROVED", db.AgentStatusApproved},
 		{"OFFLINE", db.AgentStatusOffline},
 		{"REVOKED", db.AgentStatusRevoked},
-		// RUNNING → online (the critical special case caught by T3-2-FIX-C)
+		// RUNNING → online is the critical mapping fixed by T3-2-FIX-C:
+		// the DB stores "online" for connected agents, but the Web UI/SDK
+		// uses "RUNNING" — mismatching this caused approve buttons to vanish.
 		{"RUNNING", db.AgentStatusOnline},
 		// Already lowercase inputs are idempotent
 		{"pending", db.AgentStatusPending},
