@@ -434,7 +434,7 @@ func TestAgentsHandler_DeleteRule_Success(t *testing.T) {
 // ── ListUploadLogs ────────────────────────────────────────────────────────────
 
 func TestAgentsHandler_ListUploadLogs_Success(t *testing.T) {
-	h := handler.NewAgentsHandler(&mockAgentsDB{logs: []*db.UploadLog{newSampleLog()}}, nil, nil, nil, newTestLogger())
+	h := handler.NewAgentsHandler(&mockAgentsDB{logs: []*db.UploadLog{newSampleLog()}, logsCount: 1}, nil, nil, nil, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/upload-logs", nil)
 	testAgentsRouter(h).ServeHTTP(w, req)
@@ -559,7 +559,7 @@ func TestAgentsHandler_ListRules_ItemsEnvelope(t *testing.T) {
 
 func TestAgentsHandler_ListUploadLogs_ItemsEnvelope(t *testing.T) {
 	log := newSampleLog()
-	h := handler.NewAgentsHandler(&mockAgentsDB{logs: []*db.UploadLog{log}}, nil, nil, nil, newTestLogger())
+	h := handler.NewAgentsHandler(&mockAgentsDB{logs: []*db.UploadLog{log}, logsCount: 1}, nil, nil, nil, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/upload-logs", nil)
 	testAgentsRouter(h).ServeHTTP(w, req)
@@ -569,4 +569,5 @@ func TestAgentsHandler_ListUploadLogs_ItemsEnvelope(t *testing.T) {
 	items := body["items"].([]interface{})
 	assert.Len(t, items, 1)
 	assert.Equal(t, float64(1), body["total"])
+	assert.Equal(t, false, body["has_more"])
 }
