@@ -18,6 +18,11 @@
 | T3-2-FIX-G | 后端：upload-logs 端点响应格式与字段对齐 | 🔴 P0 | ✅ | — |
 | T3-2-FIX-H | 前端：`UploadLog` 接口字段对齐 | 🔴 P0 | ✅ | T3-2-FIX-G |
 | T3-2-FIX-I | 后端+前端：非分页列表端点统一为 `{items, total}` 信封 | 🟡 P1 | ✅ | T3-2-FIX-A~H |
+| T3-2-FIX-J | 后端：快增长表分页补齐 `has_more` + 真实 `total` | 🔴 P0 | ✅ | T3-2-FIX-E/G |
+
+> **§8.5 规范对齐说明**：系统设计文档 §8.5 要求分页响应包含 `items`、`total`、`next_cursor`、`has_more` 四个字段。
+> 本文档修正前仅要求 `{items, total, next_cursor}`，已遗漏 `has_more`。
+> 分页策略（快增长表 vs 慢增长表）见 `DECISIONS.md § D-007`。
 
 **修复顺序建议**：
 ```
@@ -26,6 +31,8 @@ T3-2-FIX-A/B/E/G（后端 P0，可并行）
 T3-2-FIX-C/D/F/H（前端 P0，依赖对应后端，可并行）
     ↓
 T3-2-FIX-I（P1，最后做）
+    ↓
+T3-2-FIX-J（补齐 has_more + 真实 total）
     ↓
 T3-2 整体 Smoke Test 验收
 ```
@@ -420,3 +427,41 @@ DB 存 `"pending"` 等小写，前端 `AgentStatus` 用 `'PENDING'` 等大写，
 11. Bucket、文件类型、事件规则、用户列表各页面正常显示数据
 12. `go test ./controlplane/internal/api/handler/... -count=1` 全部通过
 13. `pnpm test` 全部通过
+
+---
+
+## T3-2-FIX-J — 后端：快增长表分页补齐 `has_more` + 真实 `total` ✅
+
+**严重程度**：🔴 P0 — 分页迭代器不符合 §8.5 规范；`total` 值错误（返回当前页条数而非总记录数）  
+**前置依赖**：T3-2-FIX-E/G
+
+### 根因分析
+
+**根因 1：`total` 字段语义错误**
+
+所有分页端点均返回 `"total": len(resp)`，即当前页返回的条数，而非符合过滤条件的数据库总记录数。
+
+**根因 2：缺失 `has_more` 字段**
+
+§8.5 要求响应包含 `has_more` 布尔字段，原实现完全缺失。
+
+**根因 3：数组全量拉取后截断**
+
+原 `agents.go` List 实现先从 DB 拉取全部匹配行到内存，再用 `agents[:limit]` 截断——随着数据增长会触发内存溢出。（files/upload-logs 端点已正确使用 DB-LIMIT，此处修正 agents）
+
+### 修复方案
+
+**文件**：`controlplane/internal/db/read_queries.go`、`controlplane/internal/api/handler/files.go`、`controlplane/internal/api/handler/events.go`（UploadLogsHandler + EventRulesHandler）、`controlplane/internal/api/handler/agents.go`（ListUploadLogs）
+
+1. **DB 层新增三个 COUNT 函数**：`CountFileEntries`、`CountUploadLogs`、`CountDeliveriesByRule`
+2. **使用 `limit + 1` 技巧检测 `has_more`**：向 DB 请求 `limit+1` 条记录；若返回条数 `> limit`，则 `has_more = true`，截断到 `limit` 条
+3. **并发 COUNT 查询**：获取符合过滤条件的总记录数作为 `total`
+4. **响应格式**：`{"items": [...], "total": N, "has_more": bool, "next_cursor": "..."}`
+
+### 验收标准
+
+- `GET /api/v1/files` 返回 `{"items":[...],"total":N,"has_more":bool,"next_cursor":...}`；`total` 是 DB 总记录数（非当前页条数）
+- `GET /api/v1/upload-logs` 同上
+- `GET /api/v1/agents/:id/upload-logs` 同上
+- `GET /api/v1/event-rules/:id/deliveries` 同上
+- `go test ./controlplane/internal/api/handler/... -count=1` 全部通过（含 `has_more` 和 `total` 断言测试）

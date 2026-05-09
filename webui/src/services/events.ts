@@ -27,6 +27,7 @@ export interface DeliveriesResponse {
   items: EventDelivery[]
   total: number
   next_cursor: string | null
+  has_more: boolean
 }
 
 /**

@@ -34,6 +34,7 @@ export interface PaginatedResponse<T> {
   items: T[]
   total: number
   next_cursor: string | null
+  has_more: boolean
 }
 
 /**
