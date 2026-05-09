@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Button, Space, Modal, message, Typography, Tabs } from 'antd'
+import { App, Button, Space, Typography, Tabs } from 'antd'
 import {
   CheckCircleOutlined,
   StopOutlined,
@@ -34,11 +34,12 @@ function AgentsPage() {
   const navigate = useNavigate()
   const actionRef = useRef<ActionType | undefined>(undefined)
   const [activeTab, setActiveTab] = useState('all')
+  const { modal, message } = App.useApp()
 
   const currentStatus = STATUS_TABS.find((t) => t.key === activeTab)?.status
 
   const handleApprove = (agent: Agent) => {
-    Modal.confirm({
+    modal.confirm({
       title: `审批采集器：${agent.name}`,
       content: '确认批准该采集器连接系统？',
       onOk: async () => {
@@ -54,7 +55,7 @@ function AgentsPage() {
   }
 
   const handleRevoke = (agent: Agent) => {
-    Modal.confirm({
+    modal.confirm({
       title: `吊销采集器：${agent.name}`,
       content: '吊销后该采集器将无法连接，确认操作？',
       okType: 'danger',

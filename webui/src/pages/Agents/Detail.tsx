@@ -1,12 +1,11 @@
 import { useState, useEffect } from 'react'
 import {
+  App,
   Typography,
   Tabs,
   Descriptions,
   Button,
   Space,
-  Modal,
-  message,
   Table,
   Tag,
   Spin,
@@ -54,6 +53,7 @@ function formatBytes(bytes: number): string {
 function AgentDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { modal, message } = App.useApp()
 
   const [agent, setAgent] = useState<Agent | null>(null)
   const [loadingAgent, setLoadingAgent] = useState(true)
@@ -114,7 +114,7 @@ function AgentDetailPage() {
 
   const handleApprove = () => {
     if (!agent) return
-    Modal.confirm({
+    modal.confirm({
       title: `审批采集器：${agent.name}`,
       content: '确认批准该采集器连接系统？',
       onOk: async () => {
@@ -131,7 +131,7 @@ function AgentDetailPage() {
 
   const handleRevoke = () => {
     if (!agent) return
-    Modal.confirm({
+    modal.confirm({
       title: `吊销采集器：${agent.name}`,
       content: '吊销后该采集器将无法连接，确认操作？',
       okType: 'danger',
@@ -149,7 +149,7 @@ function AgentDetailPage() {
 
   const handleDeleteRule = (rule: CollectionRule) => {
     if (!id) return
-    Modal.confirm({
+    modal.confirm({
       title: `删除规则：${rule.name}`,
       content: '确认删除该采集规则？',
       okType: 'danger',

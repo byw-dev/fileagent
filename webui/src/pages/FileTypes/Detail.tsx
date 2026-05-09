@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import {
+  App,
   Button,
   Card,
   Descriptions,
@@ -9,7 +10,6 @@ import {
   Space,
   Spin,
   Typography,
-  message,
 } from 'antd'
 import { EditOutlined, DeleteOutlined } from '@ant-design/icons'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -29,6 +29,7 @@ const { TextArea } = Input
 function FileTypeDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { modal, message } = App.useApp()
 
   const [fileType, setFileType] = useState<FileType | null>(null)
   const [loading, setLoading] = useState(true)
@@ -68,7 +69,7 @@ function FileTypeDetailPage() {
 
   const handleDelete = () => {
     if (!fileType || !id) return
-    Modal.confirm({
+    modal.confirm({
       title: `删除文件类型：${fileType.name}`,
       content: '确认删除该文件类型？',
       okType: 'danger',

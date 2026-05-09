@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Button, Space, Typography, Modal, message, Tag, Switch } from 'antd'
+import { App, Button, Space, Typography, Tag, Switch } from 'antd'
 import { PlusOutlined, DeleteOutlined, UnorderedListOutlined } from '@ant-design/icons'
 import { ProTable } from '@ant-design/pro-components'
 import type { ProColumns, ActionType } from '@ant-design/pro-components'
@@ -17,6 +17,7 @@ function EventsPage() {
   const navigate = useNavigate()
   const actionRef = useRef<ActionType | undefined>(undefined)
   const [togglingId, setTogglingId] = useState<string | null>(null)
+  const { modal, message } = App.useApp()
 
   const handleToggle = async (rule: EventRule, enabled: boolean) => {
     setTogglingId(rule.id)
@@ -39,7 +40,7 @@ function EventsPage() {
   }
 
   const handleDelete = (rule: EventRule) => {
-    Modal.confirm({
+    modal.confirm({
       title: `删除事件规则：${rule.name}`,
       content: '确认删除该规则？相关投递记录将不再触发。',
       okType: 'danger',
