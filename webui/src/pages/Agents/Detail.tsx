@@ -1,12 +1,12 @@
 import { useState, useEffect } from 'react'
 import {
+  App,
   Typography,
   Tabs,
   Descriptions,
   Button,
   Space,
   Modal,
-  message,
   Table,
   Tag,
   Spin,
@@ -32,6 +32,7 @@ import {
   listAgentUploadLogs,
 } from '../../services/agents'
 import type { Agent, CollectionRule } from '../../services/agents'
+import type { UploadLog } from '../../services/upload-logs'
 import AgentStatusBadge from '../../components/AgentStatusBadge'
 import DirectoryTree from '../../components/DirectoryTree'
 import type { DirEntry } from '../../components/DirectoryTree'
@@ -46,14 +47,6 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
 }
 
-type UploadLogRow = {
-  id: string
-  filename: string
-  size: number
-  status: string
-  uploaded_at: string
-}
-
 /**
  * Agent detail page — shows 4 tabs: basic info, collection rules, upload logs,
  * and a directory browser backed by the list-dir API.
@@ -61,6 +54,7 @@ type UploadLogRow = {
 function AgentDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { modal, message } = App.useApp()
 
   const [agent, setAgent] = useState<Agent | null>(null)
   const [loadingAgent, setLoadingAgent] = useState(true)
@@ -68,7 +62,7 @@ function AgentDetailPage() {
   const [rules, setRules] = useState<CollectionRule[]>([])
   const [loadingRules, setLoadingRules] = useState(false)
 
-  const [logs, setLogs] = useState<UploadLogRow[]>([])
+  const [logs, setLogs] = useState<UploadLog[]>([])
   const [loadingLogs, setLoadingLogs] = useState(false)
 
   const [dirPath, setDirPath] = useState('/')
@@ -121,7 +115,7 @@ function AgentDetailPage() {
 
   const handleApprove = () => {
     if (!agent) return
-    Modal.confirm({
+    modal.confirm({
       title: `审批采集器：${agent.name}`,
       content: '确认批准该采集器连接系统？',
       onOk: async () => {
@@ -138,7 +132,7 @@ function AgentDetailPage() {
 
   const handleRevoke = () => {
     if (!agent) return
-    Modal.confirm({
+    modal.confirm({
       title: `吊销采集器：${agent.name}`,
       content: '吊销后该采集器将无法连接，确认操作？',
       okType: 'danger',
@@ -156,7 +150,7 @@ function AgentDetailPage() {
 
   const handleDeleteRule = (rule: CollectionRule) => {
     if (!id) return
-    Modal.confirm({
+    modal.confirm({
       title: `删除规则：${rule.name}`,
       content: '确认删除该采集规则？',
       okType: 'danger',
@@ -218,7 +212,7 @@ function AgentDetailPage() {
     },
   ]
 
-  const logColumns: ColumnsType<UploadLogRow> = [
+  const logColumns: ColumnsType<UploadLog> = [
     { title: '文件名', dataIndex: 'filename', key: 'filename', ellipsis: true },
     {
       title: '大小',
@@ -277,18 +271,18 @@ function AgentDetailPage() {
             <Descriptions.Item label="名称">{agent.name}</Descriptions.Item>
             <Descriptions.Item label="主机名">{agent.hostname}</Descriptions.Item>
             <Descriptions.Item label="IP 地址">{agent.ip_address}</Descriptions.Item>
-            <Descriptions.Item label="操作系统">{agent.os}</Descriptions.Item>
-            <Descriptions.Item label="版本">{agent.version}</Descriptions.Item>
+            <Descriptions.Item label="操作系统">{agent.os_type}</Descriptions.Item>
+            <Descriptions.Item label="版本">{agent.agent_version}</Descriptions.Item>
             <Descriptions.Item label="状态">
               <AgentStatusBadge status={agent.status} />
             </Descriptions.Item>
             <Descriptions.Item label="最后心跳">
-              {agent.last_heartbeat_at
-                ? new Date(agent.last_heartbeat_at).toLocaleString('zh-CN')
+              {agent.last_seen_at
+                ? new Date(agent.last_seen_at).toLocaleString('zh-CN')
                 : '-'}
             </Descriptions.Item>
             <Descriptions.Item label="注册时间">
-              {new Date(agent.registered_at).toLocaleString('zh-CN')}
+              {new Date(agent.created_at).toLocaleString('zh-CN')}
             </Descriptions.Item>
           </Descriptions>
         </Card>

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Button, Space, Table, Tag, Typography, Modal, Switch, message } from 'antd'
+import { App, Button, Space, Table, Tag, Typography, Switch } from 'antd'
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -15,6 +15,7 @@ const { Title } = Typography
 function AgentRulesPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { modal, message } = App.useApp()
 
   const [rules, setRules] = useState<CollectionRule[]>([])
   const [loading, setLoading] = useState(true)
@@ -32,7 +33,7 @@ function AgentRulesPage() {
 
   const handleDelete = (rule: CollectionRule) => {
     if (!id) return
-    Modal.confirm({
+    modal.confirm({
       title: `删除规则：${rule.name}`,
       content: '确认删除该采集规则？',
       okType: 'danger',

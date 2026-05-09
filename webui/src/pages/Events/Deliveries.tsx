@@ -27,7 +27,7 @@ function EventDeliveriesPage() {
     if (!id) return
     setLoading(true)
     listRuleDeliveries(id, { limit: 50 })
-      .then((res) => setDeliveries(res.data))
+      .then((res) => setDeliveries(res.items))
       .catch(() => message.error('获取投递记录失败'))
       .finally(() => setLoading(false))
   }, [id])

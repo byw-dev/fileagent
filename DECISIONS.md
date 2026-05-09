@@ -218,3 +218,82 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 - **使用 node-version-file（.nvmrc / .node-version）**：与 `packageManager` + Corepack 方案相比，需要额外工具（nvm/fnm），且对 pnpm 版本无约束力。
 
 ---
+
+## D-006 upload-log 响应不返回 agent_name 字段（T3-2-FIX-G）
+
+**决策日期**：2026-05-08
+**影响范围**：controlplane API、Web UI
+
+### 决策
+
+`GET /api/v1/upload-logs` 和 `GET /api/v1/agents/:id/upload-logs` 响应的每条上传日志记录**不返回 `agent_name` 字段**。
+
+### 原因
+
+1. 上传日志 DB 表（`upload_logs`）仅存储 `agent_id`，不冗余存储 `agent_name`；
+2. 在 API 层 JOIN agents 表会带来额外的查询开销，且与最小改动原则不符；
+3. 前端可通过已有的 `agent_id` 字段（缩短 UUID 显示）满足展示需求，无需完整名称。
+
+### 替代方案（被否决）
+
+- **方案 B（JOIN agents 表）**：额外 JOIN，增加查询复杂度，也不符合 sqlc 生成代码的范式。
+- **方案 C（前端额外请求 `/api/v1/agents/:id`）**：列表页需多次请求，性能差。
+
+---
+
+## D-007：分页策略——快增长表 vs 慢增长表（T3-2-FIX-I）
+
+**决策日期**：2026-05-09  
+**影响范围**：controlplane API、Web UI
+
+### 背景
+
+系统中存在两类端点：
+- **快增长表**：`file_entries`（上传文件）、`upload_logs`（上传日志）、`event_deliveries`（事件投递记录）——数据量随运行时间快速增长，全量拉取会导致内存溢出和响应超时。
+- **慢增长表**：`agents`（采集器）、`collection_rules`（采集规则）、`buckets`（存储桶）、`file_types`（文件类型）、`event_rules`（事件规则）、`users`（用户）——通常条目较少且增加缓慢，全量拉取可接受，前端可自行分页。
+
+### 决策
+
+**快增长表必须服务端分页**，响应格式严格遵循 §8.5：
+```json
+{
+  "items": [...],
+  "total": 1234,
+  "next_cursor": "eyJpZCI6InV1aWQxMjMifQ==",
+  "has_more": true
+}
+```
+实现方式：
+1. 数据库层请求 `limit + 1` 条记录；若返回 `limit + 1` 条则 `has_more = true`，截断到 `limit` 条；
+2. 并发发出 `COUNT(*)` 查询，返回 `total`（符合过滤条件的记录总数，不受 cursor 影响）；
+3. 当 `has_more = true` 时，对最后一条记录编码生成 `next_cursor`；否则 `next_cursor` 为空字符串。
+
+**慢增长表不强制服务端分页**，响应格式为：
+```json
+{
+  "items": [...],
+  "total": N
+}
+```
+全量返回列表，前端可通过 ProTable 本地分页展示。当条目量增长到影响性能时，再按需升级为服务端分页。
+
+### 涉及端点
+
+| 端点 | 表 | 分页方式 |
+|------|---|---------|
+| `GET /api/v1/files` | `file_entries` | 服务端 cursor 分页 ✅ |
+| `GET /api/v1/upload-logs` | `upload_logs` | 服务端 cursor 分页 ✅ |
+| `GET /api/v1/agents/:id/upload-logs` | `upload_logs` | 服务端 cursor 分页 ✅ |
+| `GET /api/v1/event-rules/:id/deliveries` | `event_deliveries` | 服务端 cursor 分页 ✅ |
+| `GET /api/v1/agents` | `agents` | 全量（前端分页） |
+| `GET /api/v1/agents/:id/rules` | `collection_rules` | 全量（前端分页） |
+| `GET /api/v1/buckets` | `buckets` | 全量（前端分页） |
+| `GET /api/v1/file-types` | `file_types` | 全量（前端分页） |
+| `GET /api/v1/event-rules` | `event_rules` | 全量（前端分页） |
+| `GET /api/v1/users` | `users` | 全量（前端分页） |
+
+### 替代方案（被否决）
+
+- **全部端点统一 cursor 分页**：慢增长表条目极少，增加实现复杂度而收益低。
+- **全部端点全量返回**：快增长表在生产环境会触发内存和超时问题，不可接受。
+- **offset 分页**：§8.5 明确规定使用 cursor-based pagination，offset 分页在高偏移量时性能差且存在分页漂移问题。

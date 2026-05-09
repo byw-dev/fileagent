@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Button, Space, Modal, message, Typography, Tabs } from 'antd'
+import { App, Button, Space, Typography, Tabs } from 'antd'
 import {
   CheckCircleOutlined,
   StopOutlined,
@@ -34,11 +34,12 @@ function AgentsPage() {
   const navigate = useNavigate()
   const actionRef = useRef<ActionType | undefined>(undefined)
   const [activeTab, setActiveTab] = useState('all')
+  const { modal, message } = App.useApp()
 
   const currentStatus = STATUS_TABS.find((t) => t.key === activeTab)?.status
 
   const handleApprove = (agent: Agent) => {
-    Modal.confirm({
+    modal.confirm({
       title: `审批采集器：${agent.name}`,
       content: '确认批准该采集器连接系统？',
       onOk: async () => {
@@ -54,7 +55,7 @@ function AgentsPage() {
   }
 
   const handleRevoke = (agent: Agent) => {
-    Modal.confirm({
+    modal.confirm({
       title: `吊销采集器：${agent.name}`,
       content: '吊销后该采集器将无法连接，确认操作？',
       okType: 'danger',
@@ -92,14 +93,14 @@ function AgentsPage() {
     },
     {
       title: '操作系统',
-      dataIndex: 'os',
-      key: 'os',
+      dataIndex: 'os_type',
+      key: 'os_type',
       width: 100,
     },
     {
       title: '版本',
-      dataIndex: 'version',
-      key: 'version',
+      dataIndex: 'agent_version',
+      key: 'agent_version',
       width: 90,
     },
     {
@@ -111,20 +112,20 @@ function AgentsPage() {
     },
     {
       title: '最后心跳',
-      dataIndex: 'last_heartbeat_at',
-      key: 'last_heartbeat_at',
+      dataIndex: 'last_seen_at',
+      key: 'last_seen_at',
       width: 170,
       render: (_, agent) =>
-        agent.last_heartbeat_at
-          ? new Date(agent.last_heartbeat_at).toLocaleString('zh-CN')
+        agent.last_seen_at
+          ? new Date(agent.last_seen_at).toLocaleString('zh-CN')
           : '-',
     },
     {
       title: '注册时间',
-      dataIndex: 'registered_at',
-      key: 'registered_at',
+      dataIndex: 'created_at',
+      key: 'created_at',
       width: 170,
-      render: (_, agent) => new Date(agent.registered_at).toLocaleString('zh-CN'),
+      render: (_, agent) => new Date(agent.created_at).toLocaleString('zh-CN'),
     },
     {
       title: '操作',

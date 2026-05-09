@@ -1,4 +1,4 @@
-import { Button, Space, Modal, message, Typography } from 'antd'
+import { App, Button, Space, Typography } from 'antd'
 import { CheckCircleOutlined } from '@ant-design/icons'
 import { ProTable } from '@ant-design/pro-components'
 import type { ProColumns, ActionType } from '@ant-design/pro-components'
@@ -15,9 +15,10 @@ const { Title } = Typography
 function AgentsPendingPage() {
   const actionRef = useRef<ActionType | undefined>(undefined)
   const navigate = useNavigate()
+  const { modal, message } = App.useApp()
 
   const handleApprove = (agent: Agent) => {
-    Modal.confirm({
+    modal.confirm({
       title: `审批采集器：${agent.name}`,
       content: '确认批准该采集器连接系统？',
       onOk: async () => {
@@ -54,16 +55,16 @@ function AgentsPendingPage() {
     },
     {
       title: '操作系统',
-      dataIndex: 'os',
-      key: 'os',
+      dataIndex: 'os_type',
+      key: 'os_type',
       width: 100,
     },
     {
       title: '注册时间',
-      dataIndex: 'registered_at',
-      key: 'registered_at',
+      dataIndex: 'created_at',
+      key: 'created_at',
       width: 170,
-      render: (_, agent) => new Date(agent.registered_at).toLocaleString('zh-CN'),
+      render: (_, agent) => new Date(agent.created_at).toLocaleString('zh-CN'),
     },
     {
       title: '操作',

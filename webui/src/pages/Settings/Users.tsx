@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import {
+  App,
   Button,
   Form,
   Input,
@@ -8,7 +9,6 @@ import {
   Space,
   Tag,
   Typography,
-  message,
 } from 'antd'
 import { PlusOutlined, EditOutlined, DeleteOutlined, KeyOutlined } from '@ant-design/icons'
 import { ProTable } from '@ant-design/pro-components'
@@ -45,6 +45,7 @@ const ROLE_COLOR: Record<string, string> = {
 function SettingsUsersPage() {
   const currentUser = useAuthStore((s) => s.user)
   const isSuperAdmin = currentUser?.role === 'super_admin'
+  const { modal, message } = App.useApp()
 
   const actionRef = useRef<ActionType | undefined>(undefined)
 
@@ -102,7 +103,7 @@ function SettingsUsersPage() {
   }
 
   const handleDelete = (user: ManagedUser) => {
-    Modal.confirm({
+    modal.confirm({
       title: `删除用户：${user.username}`,
       content: '确认删除该用户？此操作不可撤销。',
       okType: 'danger',

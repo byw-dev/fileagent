@@ -23,22 +23,27 @@ import (
 // ── mocks ─────────────────────────────────────────────────────────────────────
 
 type mockAgentsDB struct {
-	agents     []*db.Agent
-	listErr    error
-	agent      *db.Agent
-	getErr     error
-	rules      []*db.CollectionRule
-	rulesErr   error
-	rule       *db.CollectionRule
-	ruleGetErr error
-	createErr  error
-	updateErr  error
-	deleteErr  error
-	logs       []*db.UploadLog
-	logsErr    error
+	agents        []*db.Agent
+	listErr       error
+	agent         *db.Agent
+	getErr        error
+	rules         []*db.CollectionRule
+	rulesErr      error
+	rule          *db.CollectionRule
+	ruleGetErr    error
+	createErr     error
+	updateErr     error
+	deleteErr     error
+	logs          []*db.UploadLog
+	logsErr       error
+	logsCount     int64
+	countLogsErr  error
 }
 
 func (m *mockAgentsDB) ListAgents(_ context.Context, _ uuid.UUID) ([]*db.Agent, error) {
+	return m.agents, m.listErr
+}
+func (m *mockAgentsDB) ListAgentsByStatus(_ context.Context, _ uuid.UUID, _ db.AgentStatus) ([]*db.Agent, error) {
 	return m.agents, m.listErr
 }
 func (m *mockAgentsDB) GetAgentByID(_ context.Context, _ uuid.UUID) (*db.Agent, error) {
@@ -86,6 +91,9 @@ func (m *mockAgentsDB) UpdateCollectionRuleStatus(_ context.Context, id uuid.UUI
 func (m *mockAgentsDB) DeleteCollectionRule(_ context.Context, _ uuid.UUID) error { return m.deleteErr }
 func (m *mockAgentsDB) ListUploadLogs(_ context.Context, _ db.ListUploadLogsParams) ([]*db.UploadLog, error) {
 	return m.logs, m.logsErr
+}
+func (m *mockAgentsDB) CountUploadLogs(_ context.Context, _ db.CountUploadLogsFilter) (int64, error) {
+	return m.logsCount, m.countLogsErr
 }
 
 type mockAgentMgr struct {
@@ -173,7 +181,44 @@ func TestAgentsHandler_List_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	assert.Len(t, body["data"].([]interface{}), 1)
+	assert.Len(t, body["items"].([]interface{}), 1)
+	assert.Equal(t, float64(1), body["total"])
+}
+
+func TestAgentsHandler_List_ItemsEnvelopeShape(t *testing.T) {
+	agent := newSampleAgent()
+	agent.OsInfo = json.RawMessage(`{"hostname":"host1","os_type":"linux","os_version":"5.15","agent_version":"1.0.0"}`)
+	agent.Status = db.AgentStatusOnline
+	mockDB := &mockAgentsDB{agents: []*db.Agent{agent}}
+	h := handler.NewAgentsHandler(mockDB, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	items := body["items"].([]interface{})
+	require.Len(t, items, 1)
+	item := items[0].(map[string]interface{})
+	assert.Equal(t, "RUNNING", item["status"])
+	assert.Equal(t, "host1", item["hostname"])
+	assert.Equal(t, "linux", item["os_type"])
+	assert.Equal(t, "1.0.0", item["agent_version"])
+}
+
+func TestAgentsHandler_List_WithStatusFilter(t *testing.T) {
+	pending := newSampleAgent()
+	pending.Status = db.AgentStatusPending
+	mockDB := &mockAgentsDB{agents: []*db.Agent{pending}}
+	h := handler.NewAgentsHandler(mockDB, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents?status=PENDING", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	items := body["items"].([]interface{})
+	assert.Len(t, items, 1)
 }
 
 func TestAgentsHandler_List_NilDB_Returns501(t *testing.T) {
@@ -389,7 +434,7 @@ func TestAgentsHandler_DeleteRule_Success(t *testing.T) {
 // ── ListUploadLogs ────────────────────────────────────────────────────────────
 
 func TestAgentsHandler_ListUploadLogs_Success(t *testing.T) {
-	h := handler.NewAgentsHandler(&mockAgentsDB{logs: []*db.UploadLog{newSampleLog()}}, nil, nil, nil, newTestLogger())
+	h := handler.NewAgentsHandler(&mockAgentsDB{logs: []*db.UploadLog{newSampleLog()}, logsCount: 1}, nil, nil, nil, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/upload-logs", nil)
 	testAgentsRouter(h).ServeHTTP(w, req)
@@ -477,4 +522,52 @@ w := httptest.NewRecorder()
 req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/upload-logs", nil)
 testAgentsRouter(h).ServeHTTP(w, req)
 assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestAgentsHandler_ListRules_ItemsEnvelope(t *testing.T) {
+	rule := &db.CollectionRule{
+		ID:                 uuid.New(),
+		AgentID:            uuid.New(),
+		BucketID:           uuid.New(),
+		Status:             db.RuleStatusActive,
+		Mode:               db.UploadModeWatch,
+		SourcePathTemplate: "/data",
+		FileGlob:           "*.log",
+		UploadPathTemplate: "logs/",
+		RunOnceOnStart:     true,
+		Metadata:           json.RawMessage(`{}`),
+		CreatedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
+	}
+	h := handler.NewAgentsHandler(&mockAgentsDB{rules: []*db.CollectionRule{rule}}, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/rules", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	items := body["items"].([]interface{})
+	require.Len(t, items, 1)
+	item := items[0].(map[string]interface{})
+	assert.Equal(t, true, item["is_active"])
+	assert.Equal(t, true, item["run_once_on_start"])
+	assert.Equal(t, "/data", item["source_path"])
+	assert.Equal(t, "*.log", item["file_pattern"])
+	assert.Equal(t, "logs/", item["dest_path_template"])
+	assert.Equal(t, rule.BucketID.String(), item["dest_bucket_id"])
+}
+
+func TestAgentsHandler_ListUploadLogs_ItemsEnvelope(t *testing.T) {
+	log := newSampleLog()
+	h := handler.NewAgentsHandler(&mockAgentsDB{logs: []*db.UploadLog{log}, logsCount: 1}, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/upload-logs", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	items := body["items"].([]interface{})
+	assert.Len(t, items, 1)
+	assert.Equal(t, float64(1), body["total"])
+	assert.Equal(t, false, body["has_more"])
 }

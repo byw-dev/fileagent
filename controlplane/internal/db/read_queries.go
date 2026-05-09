@@ -282,6 +282,79 @@ func (q *Queries) ListDeliveriesByRule(ctx context.Context, arg ListDeliveriesBy
 	return items, rows.Err()
 }
 
+// ── CountFileEntries ─────────────────────────────────────────────────────────
+
+// CountFileEntriesFilter holds the optional filter fields for CountFileEntries.
+// It mirrors the filter fields of ListFileEntriesParams without cursor / limit.
+type CountFileEntriesFilter struct {
+	OrgID      uuid.UUID
+	AgentID    uuid.NullUUID
+	BucketID   uuid.NullUUID
+	FileTypeID uuid.NullUUID
+	Status     NullFileStatus
+}
+
+const countFileEntriesSQL = `
+SELECT COUNT(*)
+FROM file_entries
+WHERE org_id = $1
+  AND ($2::UUID IS NULL OR agent_id = $2)
+  AND ($3::UUID IS NULL OR bucket_id = $3)
+  AND ($4::UUID IS NULL OR file_type_id = $4)
+  AND ($5::file_status IS NULL OR status = $5)
+`
+
+// CountFileEntries returns the total number of file entries matching the
+// given optional filters (no cursor/limit applied).
+func (q *Queries) CountFileEntries(ctx context.Context, f CountFileEntriesFilter) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countFileEntriesSQL,
+		f.OrgID,
+		f.AgentID,
+		f.BucketID,
+		f.FileTypeID,
+		f.Status,
+	)
+	var n int64
+	return n, row.Scan(&n)
+}
+
+// ── CountUploadLogs ───────────────────────────────────────────────────────────
+
+// CountUploadLogsFilter holds the optional filter fields for CountUploadLogs.
+type CountUploadLogsFilter struct {
+	OrgID   uuid.UUID
+	AgentID uuid.NullUUID
+}
+
+const countUploadLogsSQL = `
+SELECT COUNT(*)
+FROM upload_logs
+WHERE org_id = $1
+  AND ($2::UUID IS NULL OR agent_id = $2)
+`
+
+// CountUploadLogs returns the total number of upload log entries matching the
+// given optional filters (no cursor/limit applied).
+func (q *Queries) CountUploadLogs(ctx context.Context, f CountUploadLogsFilter) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countUploadLogsSQL, f.OrgID, f.AgentID)
+	var n int64
+	return n, row.Scan(&n)
+}
+
+// ── CountDeliveriesByRule ─────────────────────────────────────────────────────
+
+const countDeliveriesByRuleSQL = `
+SELECT COUNT(*) FROM event_deliveries WHERE event_rule_id = $1
+`
+
+// CountDeliveriesByRule returns the total number of event deliveries for the
+// given event rule (no cursor/limit applied).
+func (q *Queries) CountDeliveriesByRule(ctx context.Context, eventRuleID uuid.UUID) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countDeliveriesByRuleSQL, eventRuleID)
+	var n int64
+	return n, row.Scan(&n)
+}
+
 // ── helpers (package-internal) ───────────────────────────────────────────────
 
 // NewCursorFromFileEntry builds cursor fields from the last FileEntry in a page.

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Button, Space, Typography, Modal, message, Tag } from 'antd'
+import { App, Button, Space, Typography, Tag } from 'antd'
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons'
 import { ProTable } from '@ant-design/pro-components'
 import type { ProColumns, ActionType } from '@ant-design/pro-components'
@@ -17,9 +17,10 @@ function FileTypesPage() {
   const navigate = useNavigate()
   const actionRef = useRef<ActionType | undefined>(undefined)
   const [deleting, setDeleting] = useState<string | null>(null)
+  const { modal, message } = App.useApp()
 
   const handleDelete = (ft: FileType) => {
-    Modal.confirm({
+    modal.confirm({
       title: `删除文件类型：${ft.name}`,
       content: '确认删除该文件类型？',
       okType: 'danger',

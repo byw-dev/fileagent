@@ -45,13 +45,15 @@ func (m *mockBucketsDB) CreateBucket(_ context.Context, arg db.CreateBucketParam
 // ── mock EventRulesDB ─────────────────────────────────────────────────────────
 
 type mockEventRulesDB struct {
-	rules       []*db.EventRule
-	listErr     error
-	createErr   error
-	updateErr   error
-	deleteErr   error
-	deliveries  []*db.EventDelivery
-	deliveryErr error
+	rules            []*db.EventRule
+	listErr          error
+	createErr        error
+	updateErr        error
+	deleteErr        error
+	deliveries       []*db.EventDelivery
+	deliveryErr      error
+	deliveriesCount  int64
+	countDeliveryErr error
 }
 
 func (m *mockEventRulesDB) ListEventRules(_ context.Context, _ uuid.UUID) ([]*db.EventRule, error) {
@@ -94,18 +96,26 @@ func (m *mockEventRulesDB) DeleteEventRule(_ context.Context, _ uuid.UUID) error
 func (m *mockEventRulesDB) ListDeliveriesByRule(_ context.Context, _ db.ListDeliveriesByRuleParams) ([]*db.EventDelivery, error) {
 	return m.deliveries, m.deliveryErr
 }
+func (m *mockEventRulesDB) CountDeliveriesByRule(_ context.Context, _ uuid.UUID) (int64, error) {
+	return m.deliveriesCount, m.countDeliveryErr
+}
 
 // ── mock UploadLogsDB ─────────────────────────────────────────────────────────
 
 type mockUploadLogsDB struct {
-	logs    []*db.UploadLog
-	listErr error
-	log     *db.UploadLog
-	getErr  error
+	logs        []*db.UploadLog
+	listErr     error
+	logsCount   int64
+	countLogsErr error
+	log         *db.UploadLog
+	getErr      error
 }
 
 func (m *mockUploadLogsDB) ListUploadLogs(_ context.Context, _ db.ListUploadLogsParams) ([]*db.UploadLog, error) {
 	return m.logs, m.listErr
+}
+func (m *mockUploadLogsDB) CountUploadLogs(_ context.Context, _ db.CountUploadLogsFilter) (int64, error) {
+	return m.logsCount, m.countLogsErr
 }
 func (m *mockUploadLogsDB) GetUploadLogByID(_ context.Context, _ uuid.UUID) (*db.UploadLog, error) {
 	return m.log, m.getErr
@@ -168,7 +178,7 @@ func TestBucketsHandler_List_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	assert.Len(t, body["data"].([]interface{}), 1)
+	assert.Len(t, body["items"].([]interface{}), 1)
 }
 
 func TestBucketsHandler_List_NilDB_Returns501(t *testing.T) {
@@ -188,9 +198,9 @@ func TestBucketsHandler_List_EmptyDB_ReturnsEmptyDataArray(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	data, ok := body["data"].([]interface{})
-	require.True(t, ok, "data field should be an array")
-	assert.Empty(t, data, "data array should be empty when DB has no bucket records")
+	data, ok := body["items"].([]interface{})
+	require.True(t, ok, "items field should be an array")
+	assert.Empty(t, data, "items array should be empty when DB has no bucket records")
 }
 
 func TestBucketsHandler_List_DBError_Returns500(t *testing.T) {
@@ -405,14 +415,31 @@ func newSampleLog() *db.UploadLog {
 }
 
 func TestUploadLogsHandler_List_Success(t *testing.T) {
-	h := handler.NewUploadLogsHandler(&mockUploadLogsDB{logs: []*db.UploadLog{newSampleLog()}}, newTestLogger())
+	h := handler.NewUploadLogsHandler(&mockUploadLogsDB{logs: []*db.UploadLog{newSampleLog()}, logsCount: 1}, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/upload-logs", nil)
 	testUploadLogsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	assert.Len(t, body["data"].([]interface{}), 1)
+	assert.Len(t, body["items"].([]interface{}), 1)
+	assert.Equal(t, float64(1), body["total"])
+	assert.Equal(t, false, body["has_more"])
+}
+
+func TestUploadLogsHandler_List_HasMore(t *testing.T) {
+	// Simulate limit=1 with 2 entries (limit+1) returned by mock.
+	logs := []*db.UploadLog{newSampleLog(), newSampleLog()}
+	h := handler.NewUploadLogsHandler(&mockUploadLogsDB{logs: logs, logsCount: 10}, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/upload-logs?limit=1", nil)
+	testUploadLogsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, true, body["has_more"])
+	assert.Equal(t, float64(10), body["total"])
+	assert.Len(t, body["items"].([]interface{}), 1)
 }
 
 func TestUploadLogsHandler_List_NilDB_Returns501(t *testing.T) {

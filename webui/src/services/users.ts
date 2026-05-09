@@ -15,8 +15,8 @@ export interface ManagedUser {
  * List all users in the organisation (super_admin only).
  */
 export async function listUsers(): Promise<ManagedUser[]> {
-  const response = await apiClient.get<{ data: ManagedUser[] }>('/api/v1/users')
-  return response.data.data
+  const response = await apiClient.get<{ items: ManagedUser[]; total: number }>('/api/v1/users')
+  return response.data.items
 }
 
 /**

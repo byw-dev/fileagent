@@ -13,8 +13,8 @@ export interface FileType {
  * List all file types in the current organisation.
  */
 export async function listFileTypes(): Promise<FileType[]> {
-  const response = await apiClient.get<{ data: FileType[] }>('/api/v1/file-types')
-  return response.data.data
+  const response = await apiClient.get<{ items: FileType[]; total: number }>('/api/v1/file-types')
+  return response.data.items
 }
 
 /**
