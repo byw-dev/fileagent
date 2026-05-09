@@ -85,16 +85,32 @@ type agentResponse struct {
 	CreatedAt    string `json:"created_at,omitempty"`
 }
 
-func toAgentResponse(a *db.Agent) agentResponse {
-	status := strings.ToUpper(string(a.Status))
-	if status == "ONLINE" {
-		status = "RUNNING"
+// mapFrontendStatusToDB converts a frontend AgentStatus (uppercase, using RUNNING
+// for the online state) to the DB AgentStatus (lowercase).
+func mapFrontendStatusToDB(frontendStatus string) db.AgentStatus {
+	s := strings.ToLower(frontendStatus)
+	if s == "running" {
+		s = "online"
 	}
+	return db.AgentStatus(s)
+}
+
+// mapDBStatusToFrontend converts a DB AgentStatus (lowercase) to the frontend
+// representation (uppercase, with "online" mapped to "RUNNING").
+func mapDBStatusToFrontend(s db.AgentStatus) string {
+	upper := strings.ToUpper(string(s))
+	if upper == "ONLINE" {
+		return "RUNNING"
+	}
+	return upper
+}
+
+func toAgentResponse(a *db.Agent) agentResponse {
 	r := agentResponse{
 		ID:        a.ID.String(),
 		OrgID:     a.OrgID.String(),
 		Name:      a.Name,
-		Status:    status,
+		Status:    mapDBStatusToFrontend(a.Status),
 		CreatedAt: a.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if a.IpAddress.Valid {
@@ -141,13 +157,7 @@ func (h *AgentsHandler) List(c *gin.Context) {
 	var err error
 
 	if statusParam := c.Query("status"); statusParam != "" {
-		// Accept uppercase (frontend) and map to DB lowercase values.
-		// "RUNNING" maps to the DB "online" status.
-		dbStatusStr := strings.ToLower(statusParam)
-		if dbStatusStr == "running" {
-			dbStatusStr = "online"
-		}
-		agents, err = h.db.ListAgentsByStatus(c.Request.Context(), orgID, db.AgentStatus(dbStatusStr))
+		agents, err = h.db.ListAgentsByStatus(c.Request.Context(), orgID, mapFrontendStatusToDB(statusParam))
 	} else {
 		agents, err = h.db.ListAgents(c.Request.Context(), orgID)
 	}
