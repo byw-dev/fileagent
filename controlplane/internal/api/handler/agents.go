@@ -159,16 +159,13 @@ func (h *AgentsHandler) List(c *gin.Context) {
 		return
 	}
 
-	limit := parseLimitParam(c)
-	if int(limit) < len(agents) {
-		agents = agents[:limit]
-	}
-
+	// agents is a slow-growth table (see DECISIONS.md D-007): return full list;
+	// the frontend handles local pagination.
 	resp := make([]agentResponse, 0, len(agents))
 	for _, a := range agents {
 		resp = append(resp, toAgentResponse(a))
 	}
-	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nil})
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp)})
 }
 
 // Get handles GET /api/v1/agents/:id.
@@ -378,7 +375,8 @@ func (h *AgentsHandler) ListRules(c *gin.Context) {
 	for _, r := range rules {
 		resp = append(resp, toRuleResponse(r))
 	}
-	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp), "next_cursor": nil})
+	// collection_rules is a slow-growth table (see DECISIONS.md D-007): return full list.
+	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp)})
 }
 
 // createRuleRequest is the body expected by POST /api/v1/agents/:id/rules.
