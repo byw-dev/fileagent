@@ -7,7 +7,7 @@
 
 ## 当前阻塞与优先级
 
-- T3-2-FIX 已完成（A~I 全部 ✅），当前阻塞：`T3-2`（Web UI + Control Plane 联调）
+- T3-2-FIX 已完成（A~L 全部 ✅），当前阻塞：`T3-2`（Web UI + Control Plane 联调）
 - 详细规格：[`docs/tasks/bugs/open.md`](bugs/open.md)
 
 ---

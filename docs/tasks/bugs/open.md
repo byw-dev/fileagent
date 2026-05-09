@@ -19,6 +19,8 @@
 | T3-2-FIX-H | 前端：`UploadLog` 接口字段对齐 | 🔴 P0 | ✅ | T3-2-FIX-G |
 | T3-2-FIX-I | 后端+前端：非分页列表端点统一为 `{items, total}` 信封 | 🟡 P1 | ✅ | T3-2-FIX-A~H |
 | T3-2-FIX-J | 后端：快增长表分页补齐 `has_more` + 真实 `total` | 🔴 P0 | ✅ | T3-2-FIX-E/G |
+| T3-2-FIX-K | 前端：`Modal.confirm/message` 静态 API 在 React 18 StrictMode 下静默失效 | 🔴 P0 | ✅ | — |
+| T3-2-FIX-L | 前端：`Detail.tsx` 重构后 `Modal` import 丢失，采集器详情页崩溃 | 🔴 P0 | ✅ | T3-2-FIX-K |
 
 > **§8.5 规范对齐说明**：系统设计文档 §8.5 要求分页响应包含 `items`、`total`、`next_cursor`、`has_more` 四个字段。
 > 本文档修正前仅要求 `{items, total, next_cursor}`，已遗漏 `has_more`。
@@ -465,3 +467,83 @@ DB 存 `"pending"` 等小写，前端 `AgentStatus` 用 `'PENDING'` 等大写，
 - `GET /api/v1/agents/:id/upload-logs` 同上
 - `GET /api/v1/event-rules/:id/deliveries` 同上
 - `go test ./controlplane/internal/api/handler/... -count=1` 全部通过（含 `has_more` 和 `total` 断言测试）
+
+---
+
+## T3-2-FIX-K — 前端：`Modal.confirm/message` 静态 API 在 React 18 StrictMode 下静默失效 ✅
+
+**严重程度**：🔴 P0 — 审批/吊销按钮点击后无任何反应，XHR 请求从未发出  
+**前置依赖**：无
+
+### 根因分析
+
+Ant Design 5 的 `Modal.confirm()` / `message.error()` 等静态 API 内部会创建一个游离的 React Root。在 React 18 StrictMode 的双重渲染机制下，该游离 Root 在挂载前即被清理，导致 `onOk` 回调永远不会触发，业务请求从不发出，且无任何报错。
+
+**受影响文件**（使用了静态 API 的页面组件）：
+
+- `webui/src/main.tsx`（缺少 `<App>` 上下文提供者）
+- `webui/src/pages/Agents/index.tsx`
+- `webui/src/pages/Agents/Pending.tsx`
+- `webui/src/pages/Agents/Detail.tsx`
+- `webui/src/pages/Agents/Rules.tsx`
+- `webui/src/pages/Events/index.tsx`
+- `webui/src/pages/FileTypes/index.tsx`
+- `webui/src/pages/FileTypes/Detail.tsx`
+- `webui/src/pages/Settings/Users.tsx`
+
+### 修复方案
+
+1. `main.tsx`：在 `<ConfigProvider>` 内部包裹 antd `<App>` 组件
+2. 所有受影响页面：用 `App.useApp()` hook 替换静态 API
+   ```tsx
+   // ❌ Before
+   Modal.confirm({ onOk: async () => { await approveAgent(id) } })
+   // ✅ After
+   const { modal, message } = App.useApp()
+   modal.confirm({ onOk: async () => { await approveAgent(id) } })
+   ```
+
+### 验收标准
+
+- 审批按钮 → 确认对话框弹出 → 点击确认后发出 `POST /api/v1/agents/:id/approve` XHR
+- 吊销按钮同理
+- `pnpm test` 全部通过
+
+---
+
+## T3-2-FIX-L — 前端：`Detail.tsx` 重构后 `Modal` import 丢失，采集器详情页崩溃 ✅
+
+**严重程度**：🔴 P0 — 点击采集器详情按钮后页面崩溃，ErrorBoundary 捕获，左侧菜单无响应，须刷新才能恢复  
+**前置依赖**：T3-2-FIX-K
+
+### 根因分析
+
+T3-2-FIX-K 的重构将 `Detail.tsx` 中 antd `Modal.confirm()` 静态调用改为 `modal.confirm()`（hook），同时从 import 列表中删除了 `Modal`。但同一文件中仍有 `<Modal>` JSX 组件用于目录浏览器弹窗（约第 347 行），该组件需要 `Modal` 作为 React 组件导入，与 hook 用法是两套独立机制。
+
+```
+ReferenceError: Modal is not defined
+    at AgentDetailPage (Detail.tsx:347:12)
+```
+
+该错误导致整个 React 子树崩溃，被 ErrorBoundary 捕获后页面陷入不可用状态。
+
+### 修复方案
+
+在 `webui/src/pages/Agents/Detail.tsx` 的 antd import 列表中重新加入 `Modal`：
+
+```tsx
+import {
+  App,
+  // ... 其他组件
+  Modal,   // ← 恢复此行
+  // ...
+} from 'antd'
+```
+
+在同一组件中同时使用 `App.useApp()` 的 `modal.confirm()`（用于确认对话框）和 antd 的 `<Modal>` JSX 组件（用于目录浏览器）是完全合法的。
+
+### 验收标准
+
+- 审批通过的采集器 → 点击详情按钮 → 页面正常渲染，无 JS 错误
+- 目录浏览器弹窗（「浏览目录」按钮）可正常打开
+- `pnpm test` 通过（含新增的 `agent-detail.test.tsx` 中的 Modal 导入回归守护测试）

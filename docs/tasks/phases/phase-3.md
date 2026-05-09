@@ -31,7 +31,11 @@ T3-3 Python SDK + Control Plane 联调
 
 ## 当前优先：T3-2-FIX API 契约对齐
 
-**状态**：✅（A~I 共 9 项已全部完成）
+**状态**：✅（A~L 共 12 项已全部完成）
+
+最新两项（T3-2-FIX-K/L）：
+- **K**：前端 `Modal.confirm/message` 静态 API 在 React 18 StrictMode 下静默失效 → 全站改用 `App.useApp()` hooks + `main.tsx` 加 `<App>` 包裹
+- **L**：`Detail.tsx` 重构后 `Modal` import 丢失 → 采集器详情页崩溃 → 恢复 `Modal` import
 
 详细规格与逐项验收：`docs/tasks/bugs/open.md`
 
@@ -39,7 +43,7 @@ T3-3 Python SDK + Control Plane 联调
 
 ## T3-2 — Web UI + Control Plane 联调 ⬜
 
-**前置依赖**：T3-2-FIX-A~I 全部完成  
+**前置依赖**：T3-2-FIX-A~L 全部完成  
 **涉及模块**：webui、controlplane
 
 ### 验收标准
