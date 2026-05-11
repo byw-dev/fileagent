@@ -276,6 +276,11 @@ function AgentDetailPage() {
             <Descriptions.Item label="状态">
               <AgentStatusBadge status={agent.status} />
             </Descriptions.Item>
+            <Descriptions.Item label="实时在线">
+              {agent.is_online
+                ? <Tag color="green">在线</Tag>
+                : <Tag color="default">离线</Tag>}
+            </Descriptions.Item>
             <Descriptions.Item label="最后心跳">
               {agent.last_seen_at
                 ? new Date(agent.last_seen_at).toLocaleString('zh-CN')
@@ -330,36 +335,43 @@ function AgentDetailPage() {
     {
       key: 'dir',
       label: '目录浏览',
+      disabled: !agent.is_online,
       children: (
         <Card>
-          <Space style={{ marginBottom: 12 }}>
-            <Button
-              icon={<FolderOutlined />}
-              onClick={() => {
-                setDirModalOpen(true)
-                loadDir('/')
-              }}
-            >
-              浏览目录
-            </Button>
-            <Typography.Text type="secondary">当前路径：{dirPath}</Typography.Text>
-          </Space>
+          {!agent.is_online ? (
+            <Typography.Text type="secondary">采集器当前离线，目录浏览不可用。</Typography.Text>
+          ) : (
+            <>
+              <Space style={{ marginBottom: 12 }}>
+                <Button
+                  icon={<FolderOutlined />}
+                  onClick={() => {
+                    setDirModalOpen(true)
+                    loadDir('/')
+                  }}
+                >
+                  浏览目录
+                </Button>
+                <Typography.Text type="secondary">当前路径：{dirPath}</Typography.Text>
+              </Space>
 
-          <Modal
-            title="目录浏览"
-            open={dirModalOpen}
-            onCancel={() => setDirModalOpen(false)}
-            footer={null}
-            width={640}
-          >
-            <Spin spinning={loadingDir}>
-              <DirectoryTree
-                entries={dirEntries}
-                currentPath={dirPath}
-                onNavigate={loadDir}
-              />
-            </Spin>
-          </Modal>
+              <Modal
+                title="目录浏览"
+                open={dirModalOpen}
+                onCancel={() => setDirModalOpen(false)}
+                footer={null}
+                width={640}
+              >
+                <Spin spinning={loadingDir}>
+                  <DirectoryTree
+                    entries={dirEntries}
+                    currentPath={dirPath}
+                    onNavigate={loadDir}
+                  />
+                </Spin>
+              </Modal>
+            </>
+          )}
         </Card>
       ),
     },

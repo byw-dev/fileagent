@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 type BucketsDB interface {
 	ListBuckets(ctx context.Context, orgID uuid.UUID) ([]*db.Bucket, error)
 	CreateBucket(ctx context.Context, arg db.CreateBucketParams) (*db.Bucket, error)
+	DeleteBucket(ctx context.Context, id uuid.UUID) error
 }
 
 // MinioBucketMaker creates physical buckets in MinIO.
@@ -93,6 +96,21 @@ type createBucketRequest struct {
 	Description string `json:"description"`
 }
 
+// bucketNameRegexp matches valid S3-compatible bucket names:
+// 3-63 chars, only lowercase letters/digits/hyphens, not starting or ending with a hyphen.
+var bucketNameRegexp = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$`)
+
+// validateBucketName returns an error when name does not satisfy S3 naming rules.
+func validateBucketName(name string) error {
+	if len(name) < 3 || len(name) > 63 {
+		return fmt.Errorf("bucket name must be 3-63 characters")
+	}
+	if !bucketNameRegexp.MatchString(name) {
+		return fmt.Errorf("bucket name must contain only lowercase letters, numbers, and hyphens, and cannot start or end with a hyphen")
+	}
+	return nil
+}
+
 // Create handles POST /api/v1/buckets.
 func (h *BucketsHandler) Create(c *gin.Context) {
 	if h.db == nil {
@@ -105,6 +123,14 @@ func (h *BucketsHandler) Create(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
+		})
+		return
+	}
+
+	// Validate bucket name before writing to DB (D-001).
+	if err := validateBucketName(req.Name); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{
+			"error": middleware.NewErrorBody("INVALID_BUCKET_NAME", err.Error(), nil),
 		})
 		return
 	}
@@ -126,16 +152,24 @@ func (h *BucketsHandler) Create(c *gin.Context) {
 		return
 	}
 
-	// Create the physical bucket in MinIO. If MinIO is unavailable, the DB
-	// record is still returned but the bucket won't exist yet — an operator
-	// can re-create it manually. We log the error but don't roll back the
-	// DB record because the naming allocation is idempotent.
+	// Create the physical bucket in MinIO. On failure, roll back the DB record
+	// and return a 502 so the client knows the bucket was not actually created.
 	if h.minio != nil {
 		if mkErr := h.minio.MakeBucket(c.Request.Context(), bucket.Name); mkErr != nil {
 			h.logger.Error("create minio bucket",
 				zap.String("bucket", bucket.Name),
 				zap.Error(mkErr),
 			)
+			if delErr := h.db.DeleteBucket(context.Background(), bucket.ID); delErr != nil {
+				h.logger.Error("rollback: delete bucket record failed",
+					zap.String("bucket_id", bucket.ID.String()),
+					zap.Error(delErr),
+				)
+			}
+			c.JSON(http.StatusBadGateway, gin.H{
+				"error": middleware.NewErrorBody("MINIO_ERROR", "failed to create MinIO bucket: "+mkErr.Error(), nil),
+			})
+			return
 		}
 	}
 

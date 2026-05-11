@@ -1,11 +1,11 @@
 import { useState, useEffect } from 'react'
 import {
+  App,
   Typography,
   Button,
   Space,
   Alert,
   Card,
-  message,
 } from 'antd'
 import { StepsForm, ProFormText, ProFormSelect, ProFormSwitch } from '@ant-design/pro-components'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -73,6 +73,7 @@ interface Step3Values {
 function AgentRuleFormPage() {
   const { id: agentId } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { message } = App.useApp()
 
   const [mode, setMode] = useState<CollectionMode>('WATCH')
   const [cronExpr, setCronExpr] = useState('')
@@ -97,8 +98,8 @@ function AgentRuleFormPage() {
     step1: Step1Values,
     step2: Step2WatchValues | Step2ScheduledValues,
     step3: Step3Values
-  ) => {
-    if (!agentId) return
+  ): Promise<boolean> => {
+    if (!agentId) return false
     setSubmitting(true)
     try {
       await createRule(agentId, {
@@ -113,8 +114,10 @@ function AgentRuleFormPage() {
       })
       message.success('规则创建成功')
       navigate(`/agents/${agentId}`, { state: { tab: 'rules' } })
+      return true
     } catch {
       message.error('规则创建失败，请稍后重试')
+      return false
     } finally {
       setSubmitting(false)
     }
@@ -130,39 +133,24 @@ function AgentRuleFormPage() {
       </Space>
 
       <StepsForm<Record<string, unknown>>
-        submitter={{
-          render: (props) => {
-            if (props.step === 0) {
-              return <Button type="primary" onClick={() => props.onSubmit?.()}>下一步</Button>
-            }
-            if (props.step === 1) {
-              return (
-                <Space>
-                  <Button onClick={() => props.onPre?.()}>上一步</Button>
-                  <Button type="primary" onClick={() => props.onSubmit?.()}>下一步</Button>
-                </Space>
-              )
-            }
-            return (
-              <Space>
-                <Button onClick={() => props.onPre?.()}>上一步</Button>
-                <Button type="primary" loading={submitting} onClick={() => props.onSubmit?.()}>
-                  创建规则
-                </Button>
-              </Space>
-            )
-          },
-        }}
         onFinish={async (values) => {
           const v = values as { step1?: Step1Values; step2?: Step2WatchValues | Step2ScheduledValues; step3?: Step3Values }
           if (v.step1 && v.step2 && v.step3) {
-            await handleFinish(v.step1, v.step2, v.step3)
+            return await handleFinish(v.step1, v.step2, v.step3)
           }
-          return true
+          return false
         }}
       >
         {/* Step 1: Basic Config */}
-        <StepsForm.StepForm name="step1" title="基本配置">
+        <StepsForm.StepForm
+          name="step1"
+          title="基本配置"
+          submitter={{
+            render: (props) => (
+              <Button type="primary" onClick={() => props.onSubmit?.()}>下一步</Button>
+            ),
+          }}
+        >
           <ProFormText
             name="name"
             label="规则名称"
@@ -194,7 +182,18 @@ function AgentRuleFormPage() {
         </StepsForm.StepForm>
 
         {/* Step 2: Source Path Config */}
-        <StepsForm.StepForm name="step2" title="源路径配置">
+        <StepsForm.StepForm
+          name="step2"
+          title="源路径配置"
+          submitter={{
+            render: (props) => (
+              <Space>
+                <Button onClick={() => props.onPre?.()}>上一步</Button>
+                <Button type="primary" onClick={() => props.onSubmit?.()}>下一步</Button>
+              </Space>
+            ),
+          }}
+        >
           <ProFormText
             name="source_path"
             label="源目录路径"
@@ -261,7 +260,20 @@ function AgentRuleFormPage() {
         </StepsForm.StepForm>
 
         {/* Step 3: Upload Path Template */}
-        <StepsForm.StepForm name="step3" title="上传路径配置">
+        <StepsForm.StepForm
+          name="step3"
+          title="上传路径配置"
+          submitter={{
+            render: (props) => (
+              <Space>
+                <Button onClick={() => props.onPre?.()}>上一步</Button>
+                <Button type="primary" loading={submitting} onClick={() => props.onSubmit?.()}>
+                  创建规则
+                </Button>
+              </Space>
+            ),
+          }}
+        >
           <Card size="small" title="可用模板变量" style={{ marginBottom: 16 }}>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
               {Object.entries(PATH_TEMPLATE_VARIABLES).map(([key, desc]) => (

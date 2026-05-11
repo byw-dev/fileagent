@@ -16,6 +16,7 @@ export interface Agent {
   hostname: string
   ip_address: string
   status: AgentStatus
+  is_online: boolean
   os_type: string
   os_version: string
   agent_version: string

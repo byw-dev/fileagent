@@ -24,6 +24,7 @@ type mockBucketsDB struct {
 	buckets   []*db.Bucket
 	listErr   error
 	createErr error
+	deleteErr error
 }
 
 func (m *mockBucketsDB) ListBuckets(_ context.Context, _ uuid.UUID) ([]*db.Bucket, error) {
@@ -41,6 +42,7 @@ func (m *mockBucketsDB) CreateBucket(_ context.Context, arg db.CreateBucketParam
 		CreatedAt:   time.Now(),
 	}, nil
 }
+func (m *mockBucketsDB) DeleteBucket(_ context.Context, _ uuid.UUID) error { return m.deleteErr }
 
 // ── mock EventRulesDB ─────────────────────────────────────────────────────────
 
@@ -248,11 +250,59 @@ func TestBucketsHandler_Create_CallsMakeBucket(t *testing.T) {
 	assert.True(t, makeBucketCalled, "MakeBucket should have been called")
 }
 
-func TestBucketsHandler_Create_MinioError_StillReturns201(t *testing.T) {
-	// Even when MinIO fails, the DB record is created and 201 returned.
+func TestBucketsHandler_Create_MinioError_Returns502AndRollsBack(t *testing.T) {
+	// When MinIO fails the DB record should be rolled back and 502 returned.
 	minio := &mockMinioBucketMaker{makeFn: func(_ string) error { return assert.AnError }}
 	h := handler.NewBucketsHandler(&mockBucketsDB{}, minio, newTestLogger())
 	body := `{"name":"new-bucket"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/buckets", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testBucketsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody := resp["error"].(map[string]interface{})
+	assert.Equal(t, "MINIO_ERROR", errBody["code"])
+}
+
+func TestBucketsHandler_Create_InvalidName_UnderscoreReturns422(t *testing.T) {
+	h := handler.NewBucketsHandler(&mockBucketsDB{}, nil, newTestLogger())
+	body := `{"name":"radar_data"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/buckets", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testBucketsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody := resp["error"].(map[string]interface{})
+	assert.Equal(t, "INVALID_BUCKET_NAME", errBody["code"])
+}
+
+func TestBucketsHandler_Create_InvalidName_UppercaseReturns422(t *testing.T) {
+	h := handler.NewBucketsHandler(&mockBucketsDB{}, nil, newTestLogger())
+	body := `{"name":"UPPER"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/buckets", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testBucketsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+}
+
+func TestBucketsHandler_Create_InvalidName_LeadingHyphenReturns422(t *testing.T) {
+	h := handler.NewBucketsHandler(&mockBucketsDB{}, nil, newTestLogger())
+	body := `{"name":"-bad-bucket"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/buckets", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testBucketsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+}
+
+func TestBucketsHandler_Create_ValidName_OkBucket(t *testing.T) {
+	h := handler.NewBucketsHandler(&mockBucketsDB{}, nil, newTestLogger())
+	body := `{"name":"ok-bucket"}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/buckets", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")

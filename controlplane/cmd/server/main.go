@@ -210,6 +210,7 @@ func main() {
 	grpcSrv := grpcserver.New(logger)
 	grpcSrv.WithDeps(registry, redisClient, authSvc, nats, agentMgr)
 	grpcSrv.WithExtraDeps(dispatcher, ix, stsMgr, queries)
+	grpcSrv.WithStateDB(queries)
 	go func() {
 		if err := grpcSrv.Run(cfg.GRPCPort); err != nil {
 			logger.Fatal("gRPC server error", zap.Error(err))
@@ -235,6 +236,7 @@ func main() {
 		AgentMgr:     agentMgr,
 		Dispatcher:   dispatcher,
 		Registry:     registry,
+		AgentCache:   redisClient,
 		MinioIndexer: ix,
 	})
 

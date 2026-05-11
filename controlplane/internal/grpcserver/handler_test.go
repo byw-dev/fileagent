@@ -8,6 +8,8 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
+	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -60,6 +62,23 @@ type mockNATS struct {
 func (m *mockNATS) Publish(subject string, _ []byte) error {
 	m.published = append(m.published, subject)
 	return nil
+}
+
+// ── Mock AgentStateDB ─────────────────────────────────────────────────────────
+
+type mockStateDB struct {
+	lastSeenCalled bool
+	updateStatus   db.AgentStatus
+}
+
+func (m *mockStateDB) UpdateAgentLastSeen(_ context.Context, _ uuid.UUID) error {
+	m.lastSeenCalled = true
+	return nil
+}
+
+func (m *mockStateDB) UpdateAgentStatus(_ context.Context, _ uuid.UUID, status db.AgentStatus) (*db.Agent, error) {
+	m.updateStatus = status
+	return &db.Agent{Status: status}, nil
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -125,6 +144,29 @@ func TestHandleHeartbeat_UpdatesCache(t *testing.T) {
 	onlineKey := cache.AgentOnlineKey("agent-abc")
 	_, ok := c.sets[onlineKey]
 	assert.True(t, ok)
+}
+
+func TestHandleHeartbeat_UpdatesLastSeenAt(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	agentID := "00000000-0000-0000-0000-000000000001"
+	stateDB := &mockStateDB{}
+	srv.WithStateDB(stateDB)
+	srv.WithDeps(nil, nil, nil, nil, nil)
+
+	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+	assert.True(t, stateDB.lastSeenCalled, "UpdateAgentLastSeen should have been called")
+}
+
+func TestHandleHeartbeat_NilStateDB_NoPanic(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	srv.WithDeps(nil, nil, nil, nil, nil)
+
+	assert.NotPanics(t, func() {
+		srv.handleHeartbeat(context.Background(), "agent-xyz",
+			&agentv1.Heartbeat{UptimeSeconds: 10})
+	})
 }
 
 func TestHandleHeartbeat_NilCache(t *testing.T) {

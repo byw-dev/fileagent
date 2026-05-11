@@ -59,6 +59,13 @@ type CredentialDB interface {
 	GetBucketByID(ctx context.Context, id uuid.UUID) (*db.Bucket, error)
 }
 
+// AgentStateDB is the minimal DB interface used by Connect/Disconnect and
+// handleHeartbeat to persist agent lifecycle state.
+type AgentStateDB interface {
+	UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error
+	UpdateAgentStatus(ctx context.Context, iD uuid.UUID, status db.AgentStatus) (*db.Agent, error)
+}
+
 // Server holds dependencies shared by all gRPC handlers.
 type Server struct {
 	// Embed the generated Unimplemented guard so that adding new RPC methods to
@@ -75,6 +82,7 @@ type Server struct {
 	indexer    IndexerClient
 	stsMgr     STSManagerClient
 	credDB     CredentialDB
+	stateDB    AgentStateDB
 }
 
 // New creates a new gRPC Server with the provided logger. Additional
@@ -110,6 +118,12 @@ func (s *Server) WithExtraDeps(
 	s.indexer = ix
 	s.stsMgr = stsMgr
 	s.credDB = credDB
+	return s
+}
+
+// WithStateDB injects the AgentStateDB used to persist agent lifecycle state.
+func (s *Server) WithStateDB(stateDB AgentStateDB) *Server {
+	s.stateDB = stateDB
 	return s
 }
 

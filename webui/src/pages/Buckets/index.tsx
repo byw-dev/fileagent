@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import {
+  App,
   Button,
   Card,
   Form,
@@ -8,7 +9,6 @@ import {
   Space,
   Table,
   Typography,
-  message,
 } from 'antd'
 import { PlusOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
@@ -19,12 +19,17 @@ import useAuthStore from '../../store/auth'
 const { Title } = Typography
 const { TextArea } = Input
 
+/** S3-compatible bucket name pattern: 3-63 chars, lowercase, digits, hyphens only,
+ *  must not start or end with a hyphen. */
+const BUCKET_NAME_RE = /^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$/
+
 /**
  * Buckets page — shows all storage buckets; super_admin can create new ones.
  */
 function BucketsPage() {
   const user = useAuthStore((s) => s.user)
   const isSuperAdmin = user?.role === 'super_admin'
+  const { message } = App.useApp()
 
   const [buckets, setBuckets] = useState<Bucket[]>([])
   const [loading, setLoading] = useState(true)
@@ -51,7 +56,7 @@ function BucketsPage() {
       form.resetFields()
       loadBuckets()
     } catch {
-      message.error('创建失败')
+      message.error('创建失败，请检查 Bucket 名称或稍后重试')
     } finally {
       setSubmitting(false)
     }
@@ -115,7 +120,20 @@ function BucketsPage() {
           <Form.Item
             label="名称"
             name="name"
-            rules={[{ required: true, message: '请输入 Bucket 名称' }]}
+            rules={[
+              { required: true, message: '请输入 Bucket 名称' },
+              {
+                validator: (_, value) => {
+                  if (!value) return Promise.resolve()
+                  if (!BUCKET_NAME_RE.test(value)) {
+                    return Promise.reject(
+                      'Bucket 名称只能包含小写字母、数字和连字符，长度 3-63，不能以连字符开头或结尾'
+                    )
+                  }
+                  return Promise.resolve()
+                },
+              },
+            ]}
           >
             <Input placeholder="例如：logs-bucket" maxLength={63} />
           </Form.Item>

@@ -8,6 +8,7 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
+	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -57,6 +58,13 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		if s.cache != nil {
 			_ = s.cache.Del(context.Background(), cache.AgentOnlineKey(agentID))
 		}
+		if s.stateDB != nil {
+			if id, err := uuid.Parse(agentID); err == nil {
+				if _, dbErr := s.stateDB.UpdateAgentStatus(context.Background(), id, db.AgentStatusOffline); dbErr != nil {
+					s.logger.Warn("disconnect: update status to offline failed", zap.Error(dbErr))
+				}
+			}
+		}
 		s.publishEvent("events.agent.offline", agentID)
 		s.logger.Info("agent disconnected", zap.String("agent_id", agentID))
 	}()
@@ -65,6 +73,13 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	if s.cache != nil {
 		if err := s.cache.Set(ctx, cache.AgentOnlineKey(agentID), "1", agentOnlineTTL); err != nil {
 			s.logger.Warn("connect: set online key failed", zap.Error(err))
+		}
+	}
+	if s.stateDB != nil {
+		if id, err := uuid.Parse(agentID); err == nil {
+			if _, dbErr := s.stateDB.UpdateAgentStatus(ctx, id, db.AgentStatusOnline); dbErr != nil {
+				s.logger.Warn("connect: update status to online failed", zap.Error(dbErr))
+			}
 		}
 	}
 	s.publishEvent("events.agent.online", agentID)
@@ -175,6 +190,13 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 	if s.cache != nil {
 		if err := s.cache.Set(ctx, cache.AgentOnlineKey(agentID), "1", agentOnlineTTL); err != nil {
 			s.logger.Warn("heartbeat: refresh online TTL failed", zap.Error(err))
+		}
+	}
+	if s.stateDB != nil {
+		if id, err := uuid.Parse(agentID); err == nil {
+			if dbErr := s.stateDB.UpdateAgentLastSeen(ctx, id); dbErr != nil {
+				s.logger.Warn("heartbeat: update last_seen_at failed", zap.Error(dbErr))
+			}
 		}
 	}
 	s.logger.Debug("heartbeat received",

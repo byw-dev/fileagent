@@ -267,6 +267,20 @@ func (q *Queries) UpdateAgentAuthToken(ctx context.Context, iD uuid.UUID, authTo
 	return &i, err
 }
 
+const updateAgentLastSeen = `-- name: UpdateAgentLastSeen :exec
+UPDATE agents
+SET last_seen_at = NOW(),
+    updated_at = NOW()
+WHERE id = $1
+`
+
+// UpdateAgentLastSeen updates last_seen_at and updated_at for the given agent
+// without touching the IP address column.
+func (q *Queries) UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.ExecContext(ctx, updateAgentLastSeen, id)
+	return err
+}
+
 const updateAgentHeartbeat = `-- name: UpdateAgentHeartbeat :exec
 UPDATE agents
 SET last_seen_at = NOW(),

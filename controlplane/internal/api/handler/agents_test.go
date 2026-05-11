@@ -571,3 +571,105 @@ func TestAgentsHandler_ListUploadLogs_ItemsEnvelope(t *testing.T) {
 	assert.Equal(t, float64(1), body["total"])
 	assert.Equal(t, false, body["has_more"])
 }
+
+// ── is_online field ───────────────────────────────────────────────────────────
+
+// mockAgentCacheClient satisfies handler.AgentCacheClient for tests.
+type mockAgentCacheClient struct {
+	exists int64
+}
+
+func (m *mockAgentCacheClient) Exists(_ context.Context, _ ...string) (int64, error) {
+	return m.exists, nil
+}
+
+func TestAgentsHandler_List_IsOnline_True_WhenCacheHasKey(t *testing.T) {
+	a := newSampleAgent()
+	mockDB := &mockAgentsDB{agents: []*db.Agent{a}}
+	h := handler.NewAgentsHandler(mockDB, nil, nil, nil, newTestLogger())
+	h.WithCache(&mockAgentCacheClient{exists: 1})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	items := body["items"].([]interface{})
+	item := items[0].(map[string]interface{})
+	assert.Equal(t, true, item["is_online"])
+}
+
+func TestAgentsHandler_List_IsOnline_False_WhenCacheMisses(t *testing.T) {
+	a := newSampleAgent()
+	mockDB := &mockAgentsDB{agents: []*db.Agent{a}}
+	h := handler.NewAgentsHandler(mockDB, nil, nil, nil, newTestLogger())
+	h.WithCache(&mockAgentCacheClient{exists: 0})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	items := body["items"].([]interface{})
+	item := items[0].(map[string]interface{})
+	assert.Equal(t, false, item["is_online"])
+}
+
+func TestAgentsHandler_List_IsOnline_False_WhenNoCache(t *testing.T) {
+	a := newSampleAgent()
+	mockDB := &mockAgentsDB{agents: []*db.Agent{a}}
+	h := handler.NewAgentsHandler(mockDB, nil, nil, nil, newTestLogger())
+	// No WithCache call → cache is nil
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	items := body["items"].([]interface{})
+	item := items[0].(map[string]interface{})
+	assert.Equal(t, false, item["is_online"])
+}
+
+// ── ListDir Redis fallback ─────────────────────────────────────────────────────
+
+func TestAgentsHandler_ListDir_AgentOnline_InRedisNotMemory_Returns202(t *testing.T) {
+	// Registry says offline but Redis cache says online → should succeed.
+	registry := &mockAgentRegistry{online: false}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, registry, newTestLogger())
+	h.WithCache(&mockAgentCacheClient{exists: 1})
+
+	body := `{"path":"/data"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/list-dir", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	// Registry.Send will be called but registry.sendOK is false → 409, not 202.
+	// The important thing is we didn't get 409 for "offline" — we got past the guard.
+	// With sendOK=false the registry.Send returns false and we get 409 from send failure.
+	assert.Equal(t, http.StatusConflict, w.Code)
+	// Read body to confirm it's the send-fail 409, not the "agent is not online" 409.
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errBody := resp["error"].(map[string]interface{})
+	assert.Equal(t, "AGENT_OFFLINE", errBody["code"])
+}
+
+func TestAgentsHandler_ListDir_AgentOfflineNoCache_Returns409(t *testing.T) {
+	registry := &mockAgentRegistry{online: false}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, registry, newTestLogger())
+	h.WithCache(&mockAgentCacheClient{exists: 0})
+
+	body := `{"path":"/data"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/list-dir", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusConflict, w.Code)
+}

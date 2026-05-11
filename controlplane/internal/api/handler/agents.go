@@ -11,6 +11,7 @@ import (
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
+	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -49,12 +50,18 @@ type AgentRegistryClient interface {
 	IsOnline(agentID string) bool
 }
 
+// AgentCacheClient is the cache interface used by AgentsHandler.
+type AgentCacheClient interface {
+	Exists(ctx context.Context, keys ...string) (int64, error)
+}
+
 // AgentsHandler groups the Agent management handlers.
 type AgentsHandler struct {
 	db         AgentsDB
 	agentMgr   AgentManager
 	dispatcher RuleDispatcher
 	registry   AgentRegistryClient
+	cache      AgentCacheClient
 	logger     *zap.Logger
 }
 
@@ -70,12 +77,19 @@ func NewAgentsHandler(agentsDB AgentsDB, agentMgr AgentManager, dispatcher RuleD
 	}
 }
 
+// WithCache injects the cache client for real-time online status queries.
+func (h *AgentsHandler) WithCache(c AgentCacheClient) *AgentsHandler {
+	h.cache = c
+	return h
+}
+
 // agentResponse is the outbound JSON shape for an agent.
 type agentResponse struct {
 	ID           string `json:"id"`
 	OrgID        string `json:"org_id"`
 	Name         string `json:"name"`
 	Status       string `json:"status"`
+	IsOnline     bool   `json:"is_online"`
 	IpAddress    string `json:"ip_address,omitempty"`
 	Hostname     string `json:"hostname,omitempty"`
 	OsType       string `json:"os_type,omitempty"`
@@ -105,6 +119,8 @@ func mapDBStatusToFrontend(s db.AgentStatus) string {
 	return upper
 }
 
+// toAgentResponse converts a DB Agent to the outbound JSON shape. The caller
+// should use toAgentResponseWithCache when a real-time is_online value is needed.
 func toAgentResponse(a *db.Agent) agentResponse {
 	r := agentResponse{
 		ID:        a.ID.String(),
@@ -145,6 +161,18 @@ func toAgentResponse(a *db.Agent) agentResponse {
 	return r
 }
 
+// toAgentResponseWithOnline enriches an agentResponse with a real-time is_online
+// value by querying the cache (Redis TTL key).
+func (h *AgentsHandler) toAgentResponseWithOnline(ctx context.Context, a *db.Agent) agentResponse {
+	r := toAgentResponse(a)
+	if h.cache != nil {
+		if n, err := h.cache.Exists(ctx, cache.AgentOnlineKey(a.ID.String())); err == nil {
+			r.IsOnline = n > 0
+		}
+	}
+	return r
+}
+
 // List handles GET /api/v1/agents.
 func (h *AgentsHandler) List(c *gin.Context) {
 	if h.db == nil {
@@ -173,7 +201,7 @@ func (h *AgentsHandler) List(c *gin.Context) {
 	// the frontend handles local pagination.
 	resp := make([]agentResponse, 0, len(agents))
 	for _, a := range agents {
-		resp = append(resp, toAgentResponse(a))
+		resp = append(resp, h.toAgentResponseWithOnline(c.Request.Context(), a))
 	}
 	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp)})
 }
@@ -205,7 +233,7 @@ func (h *AgentsHandler) Get(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(http.StatusOK, toAgentResponse(agent))
+	c.JSON(http.StatusOK, h.toAgentResponseWithOnline(c.Request.Context(), agent))
 }
 
 // Approve handles POST /api/v1/agents/:id/approve.
@@ -295,11 +323,22 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 		return
 	}
 
-	if !h.registry.IsOnline(agentID) {
-		c.JSON(http.StatusConflict, gin.H{
-			"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent is not online", nil),
-		})
-		return
+	inMemory := h.registry.IsOnline(agentID)
+	if !inMemory {
+		// Fallback: check Redis TTL key; the agent may have reconnected recently
+		// but CP memory registry is empty (e.g. after a CP restart).
+		inRedis := false
+		if h.cache != nil {
+			if n, err := h.cache.Exists(c.Request.Context(), cache.AgentOnlineKey(agentID)); err == nil && n > 0 {
+				inRedis = true
+			}
+		}
+		if !inRedis {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent is not online", nil),
+			})
+			return
+		}
 	}
 
 	requestID := uuid.New().String()
