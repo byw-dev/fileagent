@@ -16,5 +16,6 @@
 
 - 2026-05-07：T3-1 / T3-1-FIX / T3-1-BUGFIX 完成（提交 `e295c05`）
 - 2026-05-09：T3-2-FIX 系列（A~L，API 契约对齐 + WebUI Modal/崩溃修复）完成（提交 `2715706`）
+- 2026-05-11：T3-2-BUG 系列（A~D，集成联调新发现 Bug）全部修复完成；另修复 `createRuleRequest` JSON 字段名不匹配导致的 400 错误，对齐 Agent 路径模板变量，新增 D-008 决策记录（提交 `addb3ee`）
 - 当前主线与验收：`docs/tasks/phases/phase-3.md`
-- 当前待修复 Bug：`docs/tasks/bugs/open.md`
+- 已关闭 Bug 归档：`docs/tasks/bugs/closed.md`
