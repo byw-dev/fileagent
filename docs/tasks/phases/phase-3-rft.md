@@ -64,18 +64,25 @@ func New(pattern string) (*Parser, error)
 func (p *Parser) Validate() error
 
 // Parse 从字符串 s 提取字段值，返回 map[字段名]Value。
-// 若格式串含 '{time:...}'，提取时间字符串并解析为 time.Time（UTC，除非字段含 |tz=）。
+// 时间字段：解析后存为 time.Time（内部统一 UTC，但保留原始时区信息用于 Compose）。
+// 若字段含 |tz=，解析时按该时区解释输入字符串，转换为 UTC 后存储。
 func (p *Parser) Parse(s string) (map[string]Value, error)
 
 // Compose 将字段值 map 格式化到格式串中，返回最终路径字符串。
+// 时间字段：若 parser 中字段含 |tz=，则将时间值（UTC）转换为该时区后格式化输出。
 // allowPartial=true：缺失字段保留原始占位符（适用于预览）。
 // allowPartial=false：任何字段缺失均返回 error。
 func (p *Parser) Compose(vals map[string]Value, allowPartial bool) (string, error)
 
-// Globify 将格式串转为 doublestar 兼容的 glob 字符串：
-//   {字符串字段}         → "*"
-//   {整数字段:width=N}   → N 个 "?"
-//   {time:yyyy/MM/dd}   → "????/??/??"（每个 LDML 符号→等宽 ? 序列）
+// Globify 将格式串转为 doublestar 兼容的 glob 字符串。
+// 转换规则：
+//   {field}        未指定类型（默认字符串）→ "*"
+//   {field:s}      字符串，无宽度          → "*"
+//   {field:Ns}     字符串，宽度 N          → N 个 "?"
+//   {field:d}      十进制整数，无宽度      → "*"
+//   {field:Nd}     十进制整数，宽度 N      → N 个 "?"
+//   {field:LDML}   时间，LDML 格式串       → 每个 LDML 符号替换为等宽 "?" 序列
+//                  （路径中的 "/" 分隔符保留，非 LDML 字面量保留）
 func (p *Parser) Globify() string
 ```
 
@@ -113,8 +120,8 @@ func InjectContext(ctx AgentContext, vals map[string]Value) map[string]Value
 
 字段内含时间格式时写法：`{time:yyyy/MM/dd}` 或 `{created_at:yyyy-MM-dd HH:mm|tz=Asia/Shanghai}`
 
-| LDML 符号 | 含义 | Go layout | Glob |
-|-----------|------|-----------|------|
+| LDML 符号 | 含义 | Go layout | Glob 宽度 |
+|-----------|------|-----------|-----------|
 | `yyyy` | 4 位年 | `2006` | `????` |
 | `yy` | 2 位年 | `06` | `??` |
 | `MM` | 月（01-12） | `01` | `??` |
@@ -125,21 +132,79 @@ func InjectContext(ctx AgentContext, vals map[string]Value) map[string]Value
 
 时区：`|tz=IANA`（如 `|tz=Asia/Shanghai`）；未指定则 UTC。
 
+**Globify 规则**：LDML 格式串中每个符号替换为等宽 `?` 序列，格式串中的 `/` 分隔符和字面量字符保留。
+例：`yyyy/MM/dd` → `????/??/??`；`yyyyMMdd` → `????????`；`yyyy/MM/dd/HHmmss` → `????/??/??/??????`。
+
 ### 验收标准
 
-| # | 测试用例 | 期望结果 |
-|---|----------|---------|
-| T3-4-1 | `New("{agent_name}/{time:yyyy/MM/dd}/{filename}")` | 返回 Parser，无错误 |
-| T3-4-2 | `p.Parse("prod-agent/2024/03/15/data.csv")` | `{agent_name: "prod-agent", time: 2024-03-15, filename: "data.csv"}` |
-| T3-4-3 | `p.Compose({agent_name:"a", time:T(t), filename:"f.csv"}, false)` | `"a/2024/03/15/f.csv"` |
-| T3-4-4 | `p.Globify()` | `"*/???? /??/??/*"` |
-| T3-4-5 | 时区字段：`New("{t:yyyy-MM-dd|tz=Asia/Shanghai}")` → `Parse("2024-01-01")` | time 已折算到 UTC |
-| T3-4-6 | `allowPartial=true`，缺少 filename | 输出含原始占位符，无 error |
-| T3-4-7 | `allowPartial=false`，缺少字段 | 返回包含字段名的错误 |
-| T3-4-8 | 非 trollsift 格式串（无 `{`）| `New` 返回只含字面量的 Parser，`Compose` 原样返回 |
-| T3-4-9 | 不平衡括号 `"{foo"` | `New` 返回语法错误 |
-| T3-4-10 | `InjectContext` 不覆盖已有字段 | 现有 agent_name 不被替换 |
-| 覆盖率 | `go test ./...` | 行覆盖率 ≥ 90% |
+#### Globify 测试用例
+
+以下测试全部断言 `New(pattern)` 无错误，且 `p.Globify()` 输出与期望一致：
+
+| # | 输入 pattern | 期望 Globify 输出 | 说明 |
+|---|---|---|---|
+| G-1 | `{agent_name}/{time:yyyy/MM/dd}/{filename}` | `*/????/??/??/*` | 基础路径：字符串字段、时间字段、字符串字段 |
+| G-2 | `{device}/{date:yyyy/MM/dd}/{seq:d}/{record_id:s}.csv` | `*/????/??/??/*/*.csv` | 时间 + 无宽度整数 + 无宽度字符串 |
+| G-3 | `{device}/{date:yyyy/MM/dd/HHmmss}.csv` | `*/????/??/??/??????.csv` | 时间格式含路径分隔符；`HHmmss`= HH(2)+mm(2)+ss(2)=6 个 `?` |
+| G-4 | `{device:3s}/data.csv` | `???/data.csv` | 固定宽度字符串字段（`3s`=3个`?`） |
+| G-5 | `data/{date:yyyyMMdd}.csv` | `data/????????.csv` | 无路径分隔符的时间格式：4+2+2=8 个 `?` |
+| G-6 | `{device}/{date:yyyy/MM/dd}/report-{seq:d}.csv` | `*/????/??/??/report-*.csv` | 字面量前缀 + 无宽度整数 |
+| G-7 | `static/file.csv`（无 `{`）| `static/file.csv` | 纯字面量：原样返回 |
+| G-8 | `{n:2d}/{m:4s}/{date:yy-MM}.log` | `??/????/??-??.log` | 固定宽度整数 + 固定宽度字符串 + 2位年 |
+
+#### Parse / Compose 基础测试用例
+
+以 `New("{agent_name}/{date:yyyy/MM/dd}/{filename}")` 创建 parser `p`：
+
+| # | 操作 | 期望结果 |
+|---|---|---|
+| PC-1 | `p.Parse("prod-agent/2024/03/15/data.csv")` | `{agent_name:"prod-agent", date:time.Time(2024-03-15 00:00:00 UTC), filename:"data.csv"}` |
+| PC-2 | `p.Compose({agent_name:"a", date:T(t₀), filename:"f.csv"}, false)` 其中 `t₀=2024-03-15 UTC` | `"a/2024/03/15/f.csv"` |
+| PC-3 | `p.Compose({agent_name:"a", date:T(t₀)}, true)`（缺 filename） | `"a/2024/03/15/{filename}"`（allowPartial 保留占位符）|
+| PC-4 | `p.Compose({agent_name:"a", date:T(t₀)}, false)`（缺 filename） | 返回包含 `"filename"` 的 error |
+
+#### 时区 Parse 测试用例
+
+| # | Pattern | 输入字符串 | 期望解析出的 UTC 时间 | 说明 |
+|---|---|---|---|---|
+| TZ-1 | `{device}/{date:yyyy/MM/dd/HHmmss\|tz=Asia/Shanghai}.csv` | `"sensor1/2024/01/01/120000.csv"` | `2024-01-01 04:00:00 UTC` | CST (UTC+8)：12:00-8=04:00 UTC |
+| TZ-2 | `{device}/{date:yyyy-MM-dd\|tz=America/New_York}.csv` | `"sensor1/2024-01-01.csv"` | `2024-01-01 05:00:00 UTC` | EST (UTC-5)：00:00+5=05:00 UTC |
+| TZ-3 | `{device}/{date:yyyy/MM/dd/HHmmss\|tz=UTC}.csv` | `"sensor1/2024/01/01/120000.csv"` | `2024-01-01 12:00:00 UTC` | UTC 直接使用 |
+
+> **注**：TZ-2 中 `2024-01-01` 只有日期，时间分量视为 `00:00:00`；New York 1月份为 EST（UTC-5）。
+
+#### 跨时区 Compose 测试用例
+
+目的：验证 Parse 内部以 UTC 存储时间，Compose 按目标 parser 的时区重新格式化输出。
+
+```
+ParserA = New("{device}/{date:yyyy/MM/dd/HHmmss|tz=Asia/Shanghai}.csv")
+ParserB = New("{device}/{date:yyyy/MM/dd/HHmmss|tz=Asia/Tokyo}.csv")
+
+input = "sensor1/2024/01/01/120000.csv"
+valsA, _ = ParserA.Parse(input)
+// valsA["date"] = T(2024-01-01 04:00:00 UTC)  [CST 12:00 → UTC 04:00]
+
+outA, _ = ParserA.Compose(valsA, false)
+// 期望：outA = "sensor1/2024/01/01/120000.csv"  [UTC 04:00 → CST 12:00 → 输出不变]
+
+outB, _ = ParserB.Compose(valsA, false)
+// 期望：outB = "sensor1/2024/01/01/130000.csv"  [UTC 04:00 → JST 13:00]
+```
+
+验收：`outA == "sensor1/2024/01/01/120000.csv"` 且 `outB == "sensor1/2024/01/01/130000.csv"`。
+
+#### 边界 / 错误测试用例
+
+| # | 输入 | 期望结果 |
+|---|---|---|
+| E-1 | `New("{foo")`（不平衡括号）| 返回语法错误 |
+| E-2 | `New("{}")`（空字段名）| 返回语法错误 |
+| E-3 | `New("{t:yyyy-MM-dd\|tz=}")`（tz 值为空）| 返回语法错误 |
+| E-4 | `New("{t:yyyy-MM-dd\|tz=Invalid/Zone}")`（无效 IANA）| `New` 成功（延迟到 Parse/Compose 时校验），或立即返回错误（实现可选） |
+| E-5 | `InjectContext` 不覆盖已有字段 | `vals["agent_name"]` 已有值时不被替换 |
+
+| 覆盖率 | `go test ./...` in `pkg/trollsift/` | 行覆盖率 ≥ 90% |
 
 ---
 
@@ -155,10 +220,12 @@ func InjectContext(ctx AgentContext, vals map[string]Value) map[string]Value
 
 **文件**：`controlplane/migrations/`
 
-新增迁移文件 `000002_rename_rule_fields.up.sql`（不修改 000001，保持迁移历史）：
+新增迁移文件 `000002_rename_rule_fields.up.sql`（不修改 000001，保持迁移历史）。
+
+**重要约束**：`collection_rules.status` 字段的类型 `rule_status`（枚举值 `'active'`/`'inactive'`）**保留不变**，以便后期扩展更多状态（如 `'paused'`）。`enabled` bool 语义仅在应用层转换，不写入 DB。
 
 ```sql
--- T3-5-A: 采集规则字段重命名 + status → enabled
+-- T3-5-A: 采集规则字段重命名，保留 status rule_status 枚举类型
 BEGIN;
 
 ALTER TABLE collection_rules
@@ -176,14 +243,8 @@ ALTER TABLE collection_rules
 ALTER TABLE collection_rules
     DROP COLUMN IF EXISTS watch_subdir_pattern;
 
--- status rule_status → enabled bool
-ALTER TABLE collection_rules
-    ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT TRUE;
-
-UPDATE collection_rules SET enabled = (status = 'active');
-
-ALTER TABLE collection_rules
-    DROP COLUMN status;
+-- status rule_status 枚举类型保留，不改为 bool
+-- 应用层转换：status='active' → enabled=true；status='inactive' → enabled=false
 
 COMMIT;
 ```
@@ -193,8 +254,14 @@ COMMIT;
 **sqlc 生成代码同步更新**：
 - `controlplane/internal/db/queries/rules.sql`：字段名同步
 - `controlplane/internal/db/rules.sql.go`：手动更新（沙箱内无法运行 sqlc）
+- `db.CollectionRule` 结构体仍保留 `Status RuleStatus` 字段
 
-**验收**：`migrate up` 后 `collection_rules` 表结构符合新字段名；`migrate down` 可完整回滚。
+**`enabled` 的转换位置**：
+- `toRuleResponse()`（REST 输出）：`Enabled: rule.Status == db.RuleStatusActive`
+- `ruleToProto()`（proto 下发）：`Enabled: rule.Status == db.RuleStatusActive`
+- `createRuleRequest.Enabled *bool`（REST 输入）：写入 DB 时 `true → 'active'`，`false → 'inactive'`
+
+**验收**：`migrate up` 后 `collection_rules` 表保留 `status rule_status` 字段，新字段名正确；`migrate down` 可完整回滚。
 
 #### T3-5-B：Proto 字段重命名
 
@@ -356,8 +423,10 @@ Bug 3 修复：handler 中 `mode = strings.ToLower(req.Mode)`，写入 DB 前归
 - `file_pattern` / `file_glob` → `path_pattern`
 - `upload_path_template` → `dest_path_template`
 - `watch_recursive` → `recursive`
-- `is_active` → `enabled`
+- `is_active`（旧） → `enabled: rule.Status == db.RuleStatusActive`（枚举→bool，DB status 字段保留不变）
 - `dest_bucket_id` → `bucket_id`（REST-out 前端展示字段）
+
+`createRuleRequest` 输入时，`enabled` bool → 写入 DB 时转换为 `RuleStatus`：`true → 'active'`，`false → 'inactive'`（nil 默认 `'active'`）。
 
 #### T3-5-H：CP `dispatch.go` 修复 Bug 2（`upload_bucket` 始终为空）
 
@@ -386,12 +455,12 @@ func (d *Dispatcher) ruleToProto(ctx context.Context, rule *db.CollectionRule) (
         BasePath:         rule.BasePath,
         PathPattern:      rule.PathPattern,
         DestPathTemplate: rule.DestPathTemplate,
-        UploadBucket:     bucket.Name,     // ← 修复
+        UploadBucket:     bucket.Name,                          // ← 修复 Bug 2
         Recursive:        rule.Recursive,
         CronExpr:         rule.CronExpr.String,
         RunOnceOnStart:   rule.RunOnceOnStart,
         AppendMode:       rule.AppendMode,
-        Enabled:          rule.Enabled,
+        Enabled:          rule.Status == db.RuleStatusActive,   // ← 枚举→bool 转换
     }, nil
 }
 ```

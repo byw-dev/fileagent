@@ -42,7 +42,7 @@
 | 子目录过滤 | **删除** | `watch_subdir_pattern` | `watch_subdir_pattern` | `watch_subdir_pattern` | 缺失 | 缺失 |
 | 追加模式 | `append_mode` | `append_mode` ✓ | `append_mode` ✓ | `append_mode` ✓ | 缺失 | 缺失 |
 | 采集模式 | `mode`（小写）| `mode` enum ('watch','scheduled') | `mode` string | `mode` string | `mode` string | `mode`（'WATCH'/'SCHEDULED' 大写，需归一化） |
-| 启用状态（采集规则） | `enabled` | `collection_rules.status` enum ('active','inactive') | `enabled` bool ✓ | — | `is_active` bool | `is_active` bool |
+| 启用状态（采集规则） | `enabled`（REST/proto bool） | `collection_rules.status` enum ('active','inactive') **保留枚举，不改 bool** | `enabled` bool ✓ | — | `is_active` bool | `is_active` bool |
 | 目标 Bucket 前端 | `bucket_id` | — | — | — | — | `dest_bucket_id`（改） |
 
 ### ⚠️ 重要澄清：`collection_rules.status` vs `agents.status`
@@ -278,8 +278,8 @@ upload_path_template → dest_path_template
 watch_recursive → recursive
 -- 删除
 DROP COLUMN watch_subdir_pattern
--- 修改 status enum → enabled bool（采集规则启用状态，与 agents.status 无关）
-status rule_status → enabled BOOLEAN NOT NULL DEFAULT TRUE
+-- status rule_status 枚举类型保留（不改为 bool）——便于后期扩展更多状态
+-- 应用层转换：status='active' → enabled=true；status='inactive' → enabled=false
 -- append_mode 默认值保持 'overwrite'（DB 侧不改，Agent 侧统一到此值）
 ```
 

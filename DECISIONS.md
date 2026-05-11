@@ -372,10 +372,11 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 | 目标路径模板 | `dest_path_template` | `upload_path_template` | `upload_path_template` |
 | 是否递归 | `recursive` | `watch_recursive` | `watch_recursive` |
 | 子目录过滤 | **删除** | `watch_subdir_pattern` | `watch_subdir_pattern` |
-| 采集规则启用状态 | `enabled bool` | `status rule_status('active','inactive')` | `enabled bool`（已正确）|
+| 采集规则启用状态 | `enabled bool`（REST/proto 层） | `status rule_status('active','inactive')` **保留枚举，不改为 bool** | `enabled bool`（已正确）|
 
 **关键约束**：
-- `agents.status`（5 个值）与 `collection_rules.status`（2 个值）是**完全不同**的概念；前者描述 Agent 生命周期状态，后者描述规则是否被启用。只将 `collection_rules.status` 改为 `enabled bool`，`agents.status` 保持不变。
+- `agents.status`（5 个值）与 `collection_rules.status`（2 个值）是**完全不同**的概念；前者描述 Agent 生命周期状态，后者描述规则是否被启用。`collection_rules.status` **保持 `rule_status` 枚举类型不变**（便于后期扩展为 `'paused'` 等更多状态）；`agents.status` 保持不变。
+- 应用层在 `toRuleResponse()` 和 `ruleToProto()` 中做枚举→bool 转换：`status='active'` → `enabled=true`；REST 输入 `enabled bool` 在写入 DB 前转换回枚举值。
 - `proto.CollectionRule.upload_bucket` 保留为 MinIO bucket 名称字符串（不是 UUID），Agent 直接用它调用 S3 API。
 
 ### `append_mode` 值域统一
