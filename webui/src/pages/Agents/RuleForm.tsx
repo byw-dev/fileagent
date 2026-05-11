@@ -99,7 +99,10 @@ function AgentRuleFormPage() {
     step2: Step2WatchValues | Step2ScheduledValues,
     step3: Step3Values
   ): Promise<boolean> => {
-    if (!agentId) return false
+    if (!agentId) {
+      message.error('采集器 ID 缺失，请刷新页面后重试')
+      return false
+    }
     setSubmitting(true)
     try {
       await createRule(agentId, {

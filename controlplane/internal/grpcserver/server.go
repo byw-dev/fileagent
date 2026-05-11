@@ -63,7 +63,7 @@ type CredentialDB interface {
 // handleHeartbeat to persist agent lifecycle state.
 type AgentStateDB interface {
 	UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error
-	UpdateAgentStatus(ctx context.Context, iD uuid.UUID, status db.AgentStatus) (*db.Agent, error)
+	UpdateAgentStatus(ctx context.Context, id uuid.UUID, status db.AgentStatus) (*db.Agent, error)
 }
 
 // Server holds dependencies shared by all gRPC handlers.
