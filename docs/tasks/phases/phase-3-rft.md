@@ -3,7 +3,7 @@
 > **状态**：⬜ 待执行  
 > **父阶段**：Phase 3 集成联调  
 > **优先级**：在 T3-2 完成后立即执行，阻塞 T3-3  
-> **设计参考**：`docs/plan.md`、`docs/design/system-design.md` §§4.1, 4.5, 5.5, 5.6, 5.8
+> **设计参考**：`DECISIONS.md` D-009（字段统一命名）、D-010（trollsift 引入）、`docs/design/system-design.md` §§4.1, 4.5, 5.5, 5.6, 5.8
 
 ---
 
@@ -734,7 +734,8 @@ export function testRule(agentId: string, params: TestRuleParams): Promise<TestR
 
 ## 关联入口
 
-- 设计方案：`docs/plan.md`
+- 字段统一命名决策：`DECISIONS.md` D-009
+- trollsift 引入决策：`DECISIONS.md` D-010
+- 待修复 Bug 列表：`docs/tasks/bugs/open.md`
 - 当前 Phase 主线：`docs/tasks/phases/phase-3.md`
 - 系统设计：`docs/design/system-design.md`
-- 技术决策：`DECISIONS.md`（D-009、D-010）

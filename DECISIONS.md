@@ -359,25 +359,41 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 **决策日期**：2026-05-11  
 **影响范围**：DB migrations / proto / controlplane / agent / webui
 
+### 背景
+
+系统在采集规则相关字段命名上存在四层不一致：DB / proto / CP REST / WebUI 使用了四套不同的字段名，导致字段映射断路（规则创建 400）、`upload_bucket` 始终为空等 Bug。
+
 ### 决策
 
-对 `collection_rules` 相关的四层字段名（DB / proto / REST / Frontend）进行全面统一，以消除歧义、修复字段映射断路 Bug。
+对 `collection_rules` 相关的四层字段名进行全面统一。
 
-**统一字段名映射**：
+**完整字段统一映射**（"现状 → 目标"）：
 
-| 概念 | 统一字段名 | 原 DB 名 | 原 proto 名 |
-|------|-----------|---------|------------|
-| 监控根目录 | `base_path` | `source_path_template` | `source_path_template` |
-| 文件/路径过滤 | `path_pattern` | `file_glob` | `file_glob` |
-| 目标路径模板 | `dest_path_template` | `upload_path_template` | `upload_path_template` |
-| 是否递归 | `recursive` | `watch_recursive` | `watch_recursive` |
-| 子目录过滤 | **删除** | `watch_subdir_pattern` | `watch_subdir_pattern` |
-| 采集规则启用状态 | `enabled bool`（REST/proto 层） | `status rule_status('active','inactive')` **保留枚举，不改为 bool** | `enabled bool`（已正确）|
+| 概念 | **统一字段名** | DB 现状 | proto 现状 | REST-in 现状 | REST-out 现状 | Frontend 现状 |
+|---|---|---|---|---|---|---|
+| 监控根目录 | `base_path` | `source_path_template` | `source_path_template` | `source_path_template` | `source_path` | `source_path` |
+| 文件/路径过滤 | `path_pattern` | `file_glob` | `file_glob` | `file_glob` | `file_pattern` | `file_pattern` |
+| 目标路径模板 | `dest_path_template` | `upload_path_template` | `upload_path_template` | `upload_path_template` | `dest_path_template` ✓ | `dest_path_template` ✓ |
+| 目标 Bucket（DB FK） | `bucket_id` | `bucket_id` ✓ | — | `bucket_id` ✓ | `dest_bucket_id` | `dest_bucket_id` |
+| 目标 Bucket（proto，bucket 名称字符串） | `upload_bucket` | — | `upload_bucket` | — | — | — |
+| 是否递归 | `recursive` | `watch_recursive` | `watch_recursive` | `watch_recursive` | `watch_recursive` | 缺失 |
+| 子目录过滤 | **删除** | `watch_subdir_pattern` | `watch_subdir_pattern` | `watch_subdir_pattern` | 缺失 | 缺失 |
+| 追加模式 | `append_mode` | `append_mode` ✓ | `append_mode` ✓ | `append_mode` ✓ | 缺失 | 缺失 |
+| 采集模式 | `mode`（小写） | `mode` enum `('watch','scheduled')` | `mode` string | `mode` string | `mode` string | `mode`（`'WATCH'`/`'SCHEDULED'` 大写，需归一化） |
+| 采集规则启用状态 | `enabled bool`（REST/proto 层） | `status rule_status('active','inactive')` **保留枚举** | `enabled bool` ✓ | — | `is_active` bool | `is_active` bool |
 
-**关键约束**：
-- `agents.status`（5 个值）与 `collection_rules.status`（2 个值）是**完全不同**的概念；前者描述 Agent 生命周期状态，后者描述规则是否被启用。`collection_rules.status` **保持 `rule_status` 枚举类型不变**（便于后期扩展为 `'paused'` 等更多状态）；`agents.status` 保持不变。
-- 应用层在 `toRuleResponse()` 和 `ruleToProto()` 中做枚举→bool 转换：`status='active'` → `enabled=true`；REST 输入 `enabled bool` 在写入 DB 前转换回枚举值。
-- `proto.CollectionRule.upload_bucket` 保留为 MinIO bucket 名称字符串（不是 UUID），Agent 直接用它调用 S3 API。
+### 关键澄清
+
+**`collection_rules.status` vs `agents.status`**：
+
+- **`agents.status`**（5 个值：`pending / approved / online / offline / revoked`）：描述 Agent 生命周期状态。**不改动**。
+- **`collection_rules.status`**（2 个值：`active / inactive`）：描述采集规则是否启用。DB 层**保持 `rule_status` 枚举类型不变**（便于后期扩展 `'paused'` 等状态）；应用层在 `toRuleResponse()` 和 `ruleToProto()` 中做枚举→bool 转换：`status='active'` → `enabled=true`；REST 输入 `enabled bool` 写入 DB 前转换回枚举值。
+
+**`upload_bucket` vs `bucket_id`**：
+
+- **proto `upload_bucket`**：存储 MinIO bucket 的**名称字符串**（不是 UUID），Agent 直接用它调用 S3 `PutObject`。Agent 无法通过 UUID 查询 bucket 名（它不访问 CP 数据库）。
+- **DB/REST `bucket_id`**：存储 UUID，是 `buckets` 表外键。
+- CP 的 `dispatch.go` 负责在下发规则时查出 bucket 名填入 proto `upload_bucket`。
 
 ### `append_mode` 值域统一
 
