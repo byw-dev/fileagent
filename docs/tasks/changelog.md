@@ -15,5 +15,6 @@
 ## Phase 3 关键历史（进行中）
 
 - 2026-05-07：T3-1 / T3-1-FIX / T3-1-BUGFIX 完成（提交 `e295c05`）
+- 2026-05-11：修正 `bugs/open.md` 中 T3-2-BUG-C 的现象与根因描述——实际现象为第三步缺少提交按钮（非"跳回第一步"），根因为 `StepsForm.submitter.render` 在 pro-components 2.8.x 中不透传给子 `StepForm`（提交 `0090419`）
 - 当前主线与验收：`docs/tasks/phases/phase-3.md`
 - 当前待修复 Bug：`docs/tasks/bugs/open.md`
