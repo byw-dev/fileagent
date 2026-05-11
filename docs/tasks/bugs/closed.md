@@ -64,7 +64,7 @@
 
 ---
 
-
+## 2026-05-07 修复 — T3-1-BUGFIX（gRPC 注册链路三个关键 Bug）
 
 ### Bug A — Register ErrNoRows 判断逻辑颠倒 ✅
 
