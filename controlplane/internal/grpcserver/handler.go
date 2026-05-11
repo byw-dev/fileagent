@@ -3,7 +3,7 @@ package grpcserver
 import (
 	"context"
 	"fmt"
-	"strings"
+	"path"
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
@@ -271,12 +271,12 @@ func (s *Server) handleDirectoryListing(agentID string, listing *agentv1.Directo
 		return
 	}
 
-	basePath := strings.TrimSuffix(listing.GetPath(), "/")
+	basePath := listing.GetPath()
 	entries := make([]dirstore.DirEntry, 0, len(listing.GetEntries()))
 	for _, e := range listing.GetEntries() {
 		entry := dirstore.DirEntry{
 			Name:  e.GetName(),
-			Path:  basePath + "/" + e.GetName(),
+			Path:  path.Join(basePath, e.GetName()),
 			IsDir: e.GetIsDir(),
 		}
 		if !e.GetIsDir() {
