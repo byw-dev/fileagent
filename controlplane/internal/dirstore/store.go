@@ -53,7 +53,12 @@ func (s *Store) Register(requestID string) <-chan Result {
 func (s *Store) Deliver(requestID string, result Result) {
 	if v, ok := s.m.LoadAndDelete(requestID); ok {
 		if ch, ok := v.(chan Result); ok {
-			ch <- result
+			select {
+			case ch <- result:
+			default:
+				// The waiter has already given up (cancelled or timed out) and
+				// is no longer reading from the channel.  Drop the result.
+			}
 		}
 	}
 }
