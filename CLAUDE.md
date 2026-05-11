@@ -308,7 +308,7 @@ docker compose -f deploy/docker-compose.test.yml down -v
 
 ## 当前阶段
 
-当前为 **Phase 3 — 集成联调**（T3-1 ✅，T3-1-FIX ✅，T3-1-BUGFIX ✅，T3-2-FIX 进行中）。
+当前为 **Phase 3 — 集成联调**（T3-1 ✅，T3-1-FIX ✅，T3-1-BUGFIX ✅，T3-2-FIX ✅，T3-2-BUG 进行中）。
 详细任务与状态以 `docs/tasks/active.md` + `docs/tasks/phases/phase-3.md` 为准；`TASK_LIST.md` 提供总索引。
 
 **开始任务前必须确认（按顺序）：**

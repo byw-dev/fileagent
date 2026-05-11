@@ -39,6 +39,27 @@
 
 ---
 
+## 2026-05-11 修复 — T3-2-FIX 系列（API 契约对齐 A~L）
+
+| ID | 标题 | 严重程度 | 涉及模块 |
+|----|------|---------|---------|
+| T3-2-FIX-A | 后端：`GET /api/v1/agents` 响应格式与参数对齐 | 🔴 P0 | controlplane |
+| T3-2-FIX-B | 后端：`GET /api/v1/agents/:id/rules` 与上传日志端点信封对齐 | 🔴 P0 | controlplane |
+| T3-2-FIX-C | 前端：`Agent` 接口与 `AgentStatus` 对齐 | 🔴 P0 | webui |
+| T3-2-FIX-D | 前端：`CollectionRule` 接口字段对齐 | 🔴 P0 | webui |
+| T3-2-FIX-E | 后端：`GET /api/v1/files` 响应格式与字段名对齐 | 🔴 P0 | controlplane |
+| T3-2-FIX-F | 前端：`FileEntry` 接口字段对齐 | 🔴 P0 | webui |
+| T3-2-FIX-G | 后端：upload-logs 端点响应格式与字段对齐 | 🔴 P0 | controlplane |
+| T3-2-FIX-H | 前端：`UploadLog` 接口字段对齐 | 🔴 P0 | webui |
+| T3-2-FIX-I | 后端+前端：非分页列表端点统一为 `{items, total}` 信封 | 🟡 P1 | controlplane + webui |
+| T3-2-FIX-J | 后端：快增长表分页补齐 `has_more` + 真实 `total` | 🔴 P0 | controlplane |
+| T3-2-FIX-K | 前端：`Modal.confirm/message` 静态 API 在 React 18 StrictMode 下静默失效 | 🔴 P0 | webui |
+| T3-2-FIX-L | 前端：`Detail.tsx` 重构后 `Modal` import 丢失，采集器详情页崩溃 | 🔴 P0 | webui |
+
+**全部完成**，详细根因与修复方案见该系列提交历史（提交 `2715706`）。
+
+---
+
 ## 2026-05-06 修复 — P3-P 系列（Phase 3 前置质量关卡）
 
 | ID | 标题 | 类型 | 严重程度 |

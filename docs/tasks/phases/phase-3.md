@@ -8,7 +8,7 @@
 ## 主线执行顺序
 
 ```text
-T3-2-FIX（API 契约对齐，见 bugs/open.md）← 当前阻塞
+T3-2-BUG（集成联调新发现 Bug A~D，见 bugs/open.md）← 当前阻塞
     ↓
 T3-2 Web UI + Control Plane 联调
     ↓
@@ -29,21 +29,39 @@ T3-3 Python SDK + Control Plane 联调
 
 ---
 
-## 当前优先：T3-2-FIX API 契约对齐
+## 当前优先：T3-2-BUG 系列 Bug 修复
 
-**状态**：✅（A~L 共 12 项已全部完成）
+**状态**：⬜（A~D 共 4 项，全部待完成）
 
-最新两项（T3-2-FIX-K/L）：
-- **K**：前端 `Modal.confirm/message` 静态 API 在 React 18 StrictMode 下静默失效 → 全站改用 `App.useApp()` hooks + `main.tsx` 加 `<App>` 包裹
-- **L**：`Detail.tsx` 重构后 `Modal` import 丢失 → 采集器详情页崩溃 → 恢复 `Modal` import
+| ID | 标题 | 严重程度 | 涉及模块 |
+|----|------|---------|---------|
+| T3-2-BUG-A | Agent 审批后无最后心跳时间，无在线状态展示 | 🔴 P0 | controlplane + webui |
+| T3-2-BUG-B | 目录浏览请求返回 409，CP 认为采集器 OFFLINE | 🔴 P0 | controlplane + webui |
+| T3-2-BUG-C | 新建采集规则最后一步点击"创建规则"跳回第一步 | 🟡 P1 | webui |
+| T3-2-BUG-D | 创建 Bucket 时 MinIO 报错，CP 静默忽略返回 201 | 🔴 P0 | controlplane + webui |
 
 详细规格与逐项验收：`docs/tasks/bugs/open.md`
 
 ---
 
+## 已完成：T3-2-FIX API 契约对齐 ✅
+
+**状态**：✅（A~L 共 12 项已全部完成，提交 `2715706`）
+
+- **A/B**：后端列表端点响应信封统一为 `{items, total, next_cursor}`
+- **C/D**：前端 `Agent` / `CollectionRule` 接口字段对齐
+- **E/F**：后端+前端 `FileEntry` 字段对齐
+- **G/H**：后端+前端 `UploadLog` 字段对齐
+- **I**：非分页列表端点统一 `{items, total}` 信封
+- **J**：快增长表分页补齐 `has_more` + 真实 `total`
+- **K**：前端 `Modal.confirm/message` 静态 API 改用 `App.useApp()` hooks
+- **L**：`Detail.tsx` `Modal` import 丢失修复
+
+---
+
 ## T3-2 — Web UI + Control Plane 联调 ⬜
 
-**前置依赖**：T3-2-FIX-A~L 全部完成  
+**前置依赖**：T3-2-BUG-A~D 全部完成  
 **涉及模块**：webui、controlplane
 
 ### 验收标准
