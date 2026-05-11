@@ -512,13 +512,15 @@ func (h *AgentsHandler) ListRules(c *gin.Context) {
 }
 
 // createRuleRequest is the body expected by POST /api/v1/agents/:id/rules.
+// Field names match the response shape (collectionRuleResponse) so that the
+// same JSON key set is used for both reads and writes.
 type createRuleRequest struct {
-	BucketID           string          `json:"bucket_id"            binding:"required"`
-	Name               string          `json:"name"                 binding:"required"`
-	Mode               string          `json:"mode"                 binding:"required"`
-	SourcePathTemplate string          `json:"source_path_template" binding:"required"`
-	FileGlob           string          `json:"file_glob"            binding:"required"`
-	UploadPathTemplate string          `json:"upload_path_template" binding:"required"`
+	BucketID           string          `json:"dest_bucket_id"    binding:"required"`
+	Name               string          `json:"name"              binding:"required"`
+	Mode               string          `json:"mode"              binding:"required"`
+	SourcePathTemplate string          `json:"source_path"       binding:"required"`
+	FileGlob           string          `json:"file_pattern"      binding:"required"`
+	UploadPathTemplate string          `json:"dest_path_template" binding:"required"`
 	WatchRecursive     bool            `json:"watch_recursive"`
 	WatchSubdirPattern string          `json:"watch_subdir_pattern"`
 	CronExpr           string          `json:"cron_expr"`

@@ -432,14 +432,25 @@ func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.Collecti
 	}
 }
 
-// buildStoragePath resolves the upload path template and appends the file name.
+// buildStoragePath resolves the upload path template and returns the object
+// key to use in MinIO.
+//
+// If the template contains the {filename} variable it is substituted with the
+// file's base name, and the result is used as-is (leading "/" stripped).
+// Otherwise the resolved prefix is treated as a directory and the file's base
+// name is appended automatically.
 func buildStoragePath(rule scheduler.CollectionRule, localPath string) string {
-	prefix := scheduler.ResolvePath(rule.UploadPathTemplate, time.Now().UTC())
 	base := filepath.Base(localPath)
-	if prefix == "" {
+	resolved := scheduler.ResolvePathWithFile(rule.UploadPathTemplate, time.Now().UTC(), base)
+	if strings.Contains(rule.UploadPathTemplate, "{filename}") {
+		// Template fully describes the object key — just strip the leading slash.
+		return strings.TrimPrefix(resolved, "/")
+	}
+	// Template is a directory prefix — append the file name.
+	if resolved == "" {
 		return base
 	}
-	return strings.TrimRight(prefix, "/") + "/" + base
+	return strings.TrimRight(resolved, "/") + "/" + base
 }
 
 // handleListDir walks the requested path and sends a DirectoryListing response.

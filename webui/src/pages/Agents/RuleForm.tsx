@@ -67,7 +67,7 @@ function AgentRuleFormPage() {
 
   const [mode, setMode] = useState<CollectionMode>('WATCH')
   const [cronExpr, setCronExpr] = useState('')
-  const [pathTemplate, setPathTemplate] = useState('/{year}/{month}/{agent_name}/{filename}')
+  const [pathTemplate, setPathTemplate] = useState('/{year}/{month}/{day}/{filename}')
   const [pathError, setPathError] = useState<string | null>(null)
   const [buckets, setBuckets] = useState<Bucket[]>([])
   const [submitting, setSubmitting] = useState(false)

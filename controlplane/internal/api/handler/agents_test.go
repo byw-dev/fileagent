@@ -431,7 +431,7 @@ func TestAgentsHandler_ListRules_Success(t *testing.T) {
 func TestAgentsHandler_CreateRule_Success(t *testing.T) {
 	dispatcher := &mockDispatcher{}
 	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, dispatcher, nil, newTestLogger())
-	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","source_path_template":"/data","file_glob":"*.log","upload_path_template":"logs/"}`
+	body := `{"dest_bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","source_path":"/data","file_pattern":"*.log","dest_path_template":"logs/"}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -441,7 +441,7 @@ func TestAgentsHandler_CreateRule_Success(t *testing.T) {
 
 func TestAgentsHandler_CreateRule_InvalidBucketID(t *testing.T) {
 	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
-	body := `{"bucket_id":"bad","name":"rule1","mode":"watch","source_path_template":"/data","file_glob":"*.log","upload_path_template":"logs/"}`
+	body := `{"dest_bucket_id":"bad","name":"rule1","mode":"watch","source_path":"/data","file_pattern":"*.log","dest_path_template":"logs/"}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")

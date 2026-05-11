@@ -297,3 +297,57 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 - **全部端点统一 cursor 分页**：慢增长表条目极少，增加实现复杂度而收益低。
 - **全部端点全量返回**：快增长表在生产环境会触发内存和超时问题，不可接受。
 - **offset 分页**：§8.5 明确规定使用 cursor-based pagination，offset 分页在高偏移量时性能差且存在分页漂移问题。
+
+---
+
+## D-008：CP→Agent 异步命令封装为同步 HTTP 响应（30s 等待）
+
+**决策日期**：2026-05-11  
+**影响范围**：`controlplane/internal/api/handler`、`controlplane/internal/dirstore`、`controlplane/internal/grpcserver`
+
+### 背景
+
+系统中存在若干 REST 接口，其语义是：Control Plane 向 Agent 发送一条异步 gRPC 命令，再等待 Agent 通过双向流把结果回传。典型场景是：
+
+- `POST /api/v1/agents/:id/list-dir`：Web UI 请求 CP，CP 再通过 gRPC 双向流向 Agent 发 `ListDirectoryCommand`，Agent 执行目录遍历后通过同一流回传 `DirectoryListing`。
+
+若直接返回 `202 Accepted + request_id`，前端需要轮询或维护 WebSocket 连接，实现复杂度高。
+
+### 决策
+
+**将此类 CP→Agent 命令封装为对前端同步等待的 HTTP 请求**，最长等待时间固定为 **30 秒**：
+
+1. REST handler 在发送命令前，向 `dirstore.Store`（内存 `sync.Map`）注册一个带缓冲的 result channel。
+2. 通过 gRPC 双向流向 Agent 发送命令。
+3. 在注册的 channel 上使用 `select` + `context.WithTimeout(30s)` 等待 Agent 回传结果。
+4. Agent 回传结果后，`grpcserver.handleAgentMessage` 调用 `dirstore.Deliver` 将结果写入 channel（非阻塞 `select/default`，防止 goroutine 泄漏）。
+5. HTTP 响应码：
+   - `200 OK`：Agent 在 30s 内成功回传结果。
+   - `502 Bad Gateway`：Agent 报告了错误。
+   - `504 Gateway Timeout`：30s 内无响应（Agent 离线或过慢）。
+   - `409 Conflict`：Agent 当前离线，命令无法发送。
+
+### 适用场景
+
+仅适用于**用户等待感知强、单次操作耗时预期 < 10s 的命令**，例如：
+- 目录浏览（`list-dir`）：Agent 遍历一层目录的 I/O 耗时通常在毫秒级。
+
+**不适用场景**（应改为异步 + 状态轮询/WebSocket）：
+- 大目录全量递归扫描（可能耗时数分钟）。
+- 批量文件操作（删除、重命名等）。
+- Agent 重启/升级等影响 gRPC 流连通性的操作。
+
+### 设计细节
+
+| 组件 | 职责 |
+|------|------|
+| `controlplane/internal/dirstore.Store` | 注册/投递/取消 result channel；channel 缓冲为 1，防止 Deliver 阻塞 |
+| `grpcserver.Server.dirResultStore` | `DirResultDeliverer` 接口，由 `dirstore.Store` 实现注入 |
+| `handler.AgentsHandler.dirStore` | `DirListingStore` 接口，由 `dirstore.Store` 实现注入 |
+
+### 替代方案（被否决）
+
+- **纯 fire-and-forget（原 202 方案）**：前端必须轮询，且 Agent 回传结果后没有地方可以接收，结果丢失；实测即导致 `rawData.some is not a function` 崩溃。
+- **WebSocket/SSE 推送**：实现复杂（需要连接管理、鉴权），对于仅需 1 次 request-response 的场景过于重量级。
+- **超时设为 60s**：目录浏览操作不应让用户等待超过 30s；30s 已覆盖慢速网络下的正常操作，超时后给 504 比 hang 住更好。
+

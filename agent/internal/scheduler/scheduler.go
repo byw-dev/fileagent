@@ -139,22 +139,42 @@ func (s *Scheduler) Stop() {
 // ResolvePath substitutes time variables in template with the given UTC time
 // and returns the resolved string.
 //
-// Supported variables:
+// Supported variables (friendly names shown in the Web UI):
 //
-//	{yyyy} → 4-digit year
-//	{yy}   → 2-digit year
-//	{mm}   → 2-digit month (01-12)
-//	{dd}   → 2-digit day (01-31)
-//	{HH}   → 2-digit hour (00-23)
-//	{MM}   → 2-digit minute (00-59)
+//	{year}   → 4-digit year  (alias: {yyyy})
+//	{month}  → 2-digit month (alias: {mm})  01-12
+//	{day}    → 2-digit day   (alias: {dd})  01-31
+//	{hour}   → 2-digit hour  (alias: {HH})  00-23
+//	{minute} → 2-digit minute (alias: {MM}) 00-59
+//
+// Legacy technical names ({yyyy}, {yy}, {mm}, {dd}, {HH}, {MM}) are kept for
+// backward compatibility.  Note: {filename} is NOT resolved here — callers
+// that need filename substitution should use ResolvePathWithFile.
 func ResolvePath(template string, t time.Time) string {
-	r := strings.NewReplacer(
+	return ResolvePathWithFile(template, t, "")
+}
+
+// ResolvePathWithFile is like ResolvePath but additionally substitutes
+// {filename} with the supplied base file name.  When filename is empty the
+// {filename} placeholder is left unchanged.
+func ResolvePathWithFile(template string, t time.Time, filename string) string {
+	pairs := []string{
+		// Friendly aliases (primary, shown in the Web UI)
+		"{year}", fmt.Sprintf("%04d", t.Year()),
+		"{month}", fmt.Sprintf("%02d", int(t.Month())),
+		"{day}", fmt.Sprintf("%02d", t.Day()),
+		"{hour}", fmt.Sprintf("%02d", t.Hour()),
+		"{minute}", fmt.Sprintf("%02d", t.Minute()),
+		// Technical names kept for backward compatibility
 		"{yyyy}", fmt.Sprintf("%04d", t.Year()),
 		"{yy}", fmt.Sprintf("%02d", t.Year()%100),
 		"{mm}", fmt.Sprintf("%02d", int(t.Month())),
 		"{dd}", fmt.Sprintf("%02d", t.Day()),
 		"{HH}", fmt.Sprintf("%02d", t.Hour()),
 		"{MM}", fmt.Sprintf("%02d", t.Minute()),
-	)
-	return r.Replace(template)
+	}
+	if filename != "" {
+		pairs = append(pairs, "{filename}", filename)
+	}
+	return strings.NewReplacer(pairs...).Replace(template)
 }
