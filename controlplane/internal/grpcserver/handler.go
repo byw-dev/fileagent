@@ -3,12 +3,14 @@ package grpcserver
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -178,6 +180,8 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, msg *ag
 		s.handleHeartbeat(ctx, agentID, p.Heartbeat)
 	case *agentv1.AgentMessage_UploadResult:
 		s.handleUploadResult(ctx, agentID, p.UploadResult)
+	case *agentv1.AgentMessage_DirectoryListing:
+		s.handleDirectoryListing(agentID, p.DirectoryListing)
 	default:
 		s.logger.Debug("agent message received",
 			zap.String("agent_id", agentID),
@@ -247,6 +251,51 @@ func (s *Server) publishEvent(subject, agentID string) {
 			zap.Error(err),
 		)
 	}
+}
+
+// handleDirectoryListing converts a DirectoryListing proto message from the
+// agent into a dirstore.Result and delivers it to the waiting REST handler.
+func (s *Server) handleDirectoryListing(agentID string, listing *agentv1.DirectoryListing) {
+	if s.dirResultStore == nil {
+		s.logger.Debug("dir listing received but no dirResultStore wired",
+			zap.String("agent_id", agentID),
+			zap.String("request_id", listing.GetRequestId()),
+		)
+		return
+	}
+
+	if listing.GetError() != "" {
+		s.dirResultStore.Deliver(listing.GetRequestId(), dirstore.Result{
+			Error: listing.GetError(),
+		})
+		return
+	}
+
+	basePath := strings.TrimSuffix(listing.GetPath(), "/")
+	entries := make([]dirstore.DirEntry, 0, len(listing.GetEntries()))
+	for _, e := range listing.GetEntries() {
+		entry := dirstore.DirEntry{
+			Name:  e.GetName(),
+			Path:  basePath + "/" + e.GetName(),
+			IsDir: e.GetIsDir(),
+		}
+		if !e.GetIsDir() {
+			sz := e.GetSizeBytes()
+			entry.Size = &sz
+		}
+		if ts := e.GetModifiedAt(); ts != nil && ts.IsValid() {
+			t := ts.AsTime().UTC().Format(time.RFC3339)
+			entry.ModifiedAt = &t
+		}
+		entries = append(entries, entry)
+	}
+
+	s.dirResultStore.Deliver(listing.GetRequestId(), dirstore.Result{Entries: entries})
+	s.logger.Debug("dir listing delivered",
+		zap.String("agent_id", agentID),
+		zap.String("request_id", listing.GetRequestId()),
+		zap.Int("entries", len(entries)),
+	)
 }
 
 // extractAgentID retrieves the agent's subject from JWT claims stored in ctx

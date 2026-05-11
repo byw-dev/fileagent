@@ -32,7 +32,8 @@ type RouterConfig struct {
 	AgentMgr      handler.AgentManager
 	Dispatcher    handler.RuleDispatcher
 	Registry      handler.AgentRegistryClient
-	AgentCache    handler.AgentCacheClient // nil → is_online always false
+	AgentCache    handler.AgentCacheClient  // nil → is_online always false
+	DirStore      handler.DirListingStore   // nil → list-dir returns 202 (legacy)
 	MinioIndexer  handler.IndexerClient // nil → minio webhook events are only logged
 }
 
@@ -87,6 +88,9 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	agentsH := handler.NewAgentsHandler(cfg.AgentsDB, cfg.AgentMgr, cfg.Dispatcher, cfg.Registry, cfg.Logger)
 	if cfg.AgentCache != nil {
 		agentsH.WithCache(cfg.AgentCache)
+	}
+	if cfg.DirStore != nil {
+		agentsH.WithDirStore(cfg.DirStore)
 	}
 	agents := v1.Group("/agents")
 	{

@@ -13,6 +13,7 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -134,6 +135,21 @@ func (m *mockAgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) boo
 	return m.sendOK
 }
 func (m *mockAgentRegistry) IsOnline(_ string) bool { return m.online }
+
+// mockDirStore implements handler.DirListingStore for tests.
+// If result is non-nil, Register immediately sends it into the returned channel.
+type mockDirStore struct {
+	result *dirstore.Result
+}
+
+func (m *mockDirStore) Register(_ string) <-chan dirstore.Result {
+	ch := make(chan dirstore.Result, 1)
+	if m.result != nil {
+		ch <- *m.result
+	}
+	return ch
+}
+func (m *mockDirStore) Cancel(_ string) {}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -321,7 +337,9 @@ func TestAgentsHandler_Revoke_DoesNotSendCommandWhenOffline(t *testing.T) {
 
 // ── ListDir ───────────────────────────────────────────────────────────────────
 
-func TestAgentsHandler_ListDir_AgentOnline_Returns202(t *testing.T) {
+// Without a DirStore wired the handler falls back to the legacy fire-and-forget
+// 202 behaviour so that older deployments keep working without configuration.
+func TestAgentsHandler_ListDir_NoDirStore_AgentOnline_Returns202(t *testing.T) {
 	registry := &mockAgentRegistry{online: true, sendOK: true}
 	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, registry, newTestLogger())
 	body := `{"path":"/data","recursive":true}`
@@ -330,6 +348,50 @@ func TestAgentsHandler_ListDir_AgentOnline_Returns202(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusAccepted, w.Code)
+}
+
+// With a DirStore wired and the agent responding immediately the handler should
+// return 200 with the directory entries.
+func TestAgentsHandler_ListDir_WithDirStore_AgentOnline_Returns200WithEntries(t *testing.T) {
+	registry := &mockAgentRegistry{online: true, sendOK: true}
+	sz := int64(1024)
+	ts := "2025-01-01T00:00:00Z"
+	store := &mockDirStore{result: &dirstore.Result{
+		Entries: []dirstore.DirEntry{
+			{Name: "file.csv", Path: "/data/file.csv", IsDir: false, Size: &sz, ModifiedAt: &ts},
+		},
+	}}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, registry, newTestLogger())
+	h.WithDirStore(store)
+	body := `{"path":"/data"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/list-dir", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	entries := resp["entries"].([]interface{})
+	require.Len(t, entries, 1)
+	entry := entries[0].(map[string]interface{})
+	assert.Equal(t, "file.csv", entry["name"])
+	assert.Equal(t, "/data/file.csv", entry["path"])
+	assert.Equal(t, false, entry["is_dir"])
+}
+
+// When the agent reports an error the handler returns 502 with the agent's
+// error message in the response body.
+func TestAgentsHandler_ListDir_WithDirStore_AgentError_Returns502(t *testing.T) {
+	registry := &mockAgentRegistry{online: true, sendOK: true}
+	store := &mockDirStore{result: &dirstore.Result{Error: "permission denied"}}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, registry, newTestLogger())
+	h.WithDirStore(store)
+	body := `{"path":"/root"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/list-dir", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadGateway, w.Code)
 }
 
 func TestAgentsHandler_ListDir_AgentOffline_Returns409(t *testing.T) {
@@ -639,7 +701,10 @@ func TestAgentsHandler_List_IsOnline_False_WhenNoCache(t *testing.T) {
 
 // ── ListDir Redis fallback ─────────────────────────────────────────────────────
 
-func TestAgentsHandler_ListDir_AgentOnline_InRedisNotMemory_Returns202(t *testing.T) {
+// When the in-memory registry says offline but Redis reports the TTL key exists,
+// the handler passes the online check and proceeds to send the command.
+// With no dirStore wired it falls back to 202; with sendOK=false it gets 409.
+func TestAgentsHandler_ListDir_AgentOnline_InRedisNotMemory_Returns409OnSendFail(t *testing.T) {
 	// Registry says offline but Redis cache says online → should succeed.
 	registry := &mockAgentRegistry{online: false}
 	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, registry, newTestLogger())
@@ -650,7 +715,7 @@ func TestAgentsHandler_ListDir_AgentOnline_InRedisNotMemory_Returns202(t *testin
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/list-dir", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	testAgentsRouter(h).ServeHTTP(w, req)
-	// Registry.Send will be called but registry.sendOK is false → 409, not 202.
+	// Registry.Send will be called but registry.sendOK is false → 409.
 	// The important thing is we didn't get 409 for "offline" — we got past the guard.
 	// With sendOK=false the registry.Send returns false and we get 409 from send failure.
 	assert.Equal(t, http.StatusConflict, w.Code)

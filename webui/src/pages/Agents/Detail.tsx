@@ -103,8 +103,8 @@ function AgentDetailPage() {
     setLoadingDir(true)
     setDirPath(path)
     try {
-      const entries = await listDir(id, path)
-      setDirEntries(entries as DirEntry[])
+      const result = await listDir(id, path)
+      setDirEntries(result.entries)
     } catch {
       message.error('获取目录列表失败')
       setDirEntries([])

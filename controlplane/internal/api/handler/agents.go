@@ -13,6 +13,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -55,6 +56,12 @@ type AgentCacheClient interface {
 	Exists(ctx context.Context, keys ...string) (int64, error)
 }
 
+// DirListingStore manages pending directory listing result channels.
+type DirListingStore interface {
+	Register(requestID string) <-chan dirstore.Result
+	Cancel(requestID string)
+}
+
 // AgentsHandler groups the Agent management handlers.
 type AgentsHandler struct {
 	db         AgentsDB
@@ -62,6 +69,7 @@ type AgentsHandler struct {
 	dispatcher RuleDispatcher
 	registry   AgentRegistryClient
 	cache      AgentCacheClient
+	dirStore   DirListingStore
 	logger     *zap.Logger
 }
 
@@ -80,6 +88,13 @@ func NewAgentsHandler(agentsDB AgentsDB, agentMgr AgentManager, dispatcher RuleD
 // WithCache injects the cache client for real-time online status queries.
 func (h *AgentsHandler) WithCache(c AgentCacheClient) *AgentsHandler {
 	h.cache = c
+	return h
+}
+
+// WithDirStore injects the directory-listing result store used to convert the
+// async gRPC response into a synchronous REST reply.
+func (h *AgentsHandler) WithDirStore(store DirListingStore) *AgentsHandler {
+	h.dirStore = store
 	return h
 }
 
@@ -299,9 +314,17 @@ type listDirRequest struct {
 	MaxDepth  int32  `json:"max_depth"`
 }
 
+// listDirResponse is the successful response body for POST /api/v1/agents/:id/list-dir.
+type listDirResponse struct {
+	Path    string            `json:"path"`
+	Entries []dirstore.DirEntry `json:"entries"`
+}
+
 // ListDir handles POST /api/v1/agents/:id/list-dir.
-// Sends a ListDirectoryCommand to the online agent. Returns 202 when the
-// command was delivered, 409 when the agent is offline.
+// It sends a ListDirectoryCommand to the online agent and waits up to 30 s for
+// the agent to send the result back over the gRPC stream before returning 200
+// with the directory listing. Returns 409 when the agent is offline, 502 when
+// the agent reports an error, and 504 on timeout.
 func (h *AgentsHandler) ListDir(c *gin.Context) {
 	if h.registry == nil {
 		middleware.NotImplemented(c)
@@ -342,6 +365,35 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 	}
 
 	requestID := uuid.New().String()
+
+	// If no dirStore is wired (e.g. during migration / tests without it) fall
+	// back to the original fire-and-forget 202 behaviour.
+	if h.dirStore == nil {
+		msg := &agentv1.ServerMessage{
+			Payload: &agentv1.ServerMessage_ListDirectory{
+				ListDirectory: &agentv1.ListDirectoryCommand{
+					RequestId: requestID,
+					Path:      req.Path,
+					Recursive: req.Recursive,
+					MaxDepth:  req.MaxDepth,
+				},
+			},
+		}
+		if !h.registry.Send(agentID, msg) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent disconnected during send", nil),
+			})
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{"request_id": requestID, "message": "list directory command sent"})
+		return
+	}
+
+	// Register the result channel BEFORE sending the command so we cannot miss
+	// the agent's response.
+	resultCh := h.dirStore.Register(requestID)
+	defer h.dirStore.Cancel(requestID)
+
 	msg := &agentv1.ServerMessage{
 		Payload: &agentv1.ServerMessage_ListDirectory{
 			ListDirectory: &agentv1.ListDirectoryCommand{
@@ -358,7 +410,38 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"request_id": requestID, "message": "list directory command sent"})
+
+	// Wait for the agent's DirectoryListing response with a 30 s deadline.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	select {
+	case result := <-resultCh:
+		if result.Error != "" {
+			h.logger.Warn("list-dir: agent reported error",
+				zap.String("agent_id", agentID),
+				zap.String("request_id", requestID),
+				zap.String("error", result.Error),
+			)
+			c.JSON(http.StatusBadGateway, gin.H{
+				"error": middleware.NewErrorBody("AGENT_ERROR", result.Error, nil),
+			})
+			return
+		}
+		entries := result.Entries
+		if entries == nil {
+			entries = []dirstore.DirEntry{}
+		}
+		c.JSON(http.StatusOK, listDirResponse{Path: req.Path, Entries: entries})
+	case <-ctx.Done():
+		h.logger.Warn("list-dir: timeout waiting for agent response",
+			zap.String("agent_id", agentID),
+			zap.String("request_id", requestID),
+		)
+		c.JSON(http.StatusGatewayTimeout, gin.H{
+			"error": middleware.NewErrorBody("TIMEOUT", "agent did not respond in time", nil),
+		})
+	}
 }
 
 // collectionRuleResponse is the outbound JSON shape for a collection rule.

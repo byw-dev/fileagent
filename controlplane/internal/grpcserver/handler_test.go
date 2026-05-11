@@ -9,6 +9,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -292,4 +293,86 @@ func TestWithDeps_SetsFields(t *testing.T) {
 	assert.NotNil(t, srv.cache)
 	assert.NotNil(t, srv.nats)
 	assert.NotNil(t, srv.agentMgr)
+}
+
+// ── mockDirResultDeliverer ────────────────────────────────────────────────────
+
+type mockDirDeliverer struct {
+	delivered   []dirstore.Result
+	requestIDs  []string
+}
+
+func (m *mockDirDeliverer) Deliver(requestID string, result dirstore.Result) {
+	m.requestIDs = append(m.requestIDs, requestID)
+	m.delivered = append(m.delivered, result)
+}
+
+// ── handleDirectoryListing tests ──────────────────────────────────────────────
+
+func TestHandleDirectoryListing_DeliversEntries(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	d := &mockDirDeliverer{}
+	srv.WithDirResultStore(d)
+
+	listing := &agentv1.DirectoryListing{
+		RequestId: "req-1",
+		Path:      "/data",
+		Entries: []*agentv1.FsEntry{
+			{Name: "file.csv", IsDir: false, SizeBytes: 1024},
+			{Name: "subdir", IsDir: true},
+		},
+	}
+	msg := &agentv1.AgentMessage{
+		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: listing},
+	}
+	srv.handleAgentMessage(context.Background(), "agent-1", msg)
+
+	require.Len(t, d.delivered, 1)
+	assert.Equal(t, "req-1", d.requestIDs[0])
+	result := d.delivered[0]
+	assert.Empty(t, result.Error)
+	require.Len(t, result.Entries, 2)
+	assert.Equal(t, "file.csv", result.Entries[0].Name)
+	assert.Equal(t, "/data/file.csv", result.Entries[0].Path)
+	assert.False(t, result.Entries[0].IsDir)
+	assert.NotNil(t, result.Entries[0].Size)
+	assert.Equal(t, int64(1024), *result.Entries[0].Size)
+	assert.Equal(t, "subdir", result.Entries[1].Name)
+	assert.True(t, result.Entries[1].IsDir)
+	assert.Nil(t, result.Entries[1].Size) // directories have no size
+}
+
+func TestHandleDirectoryListing_DeliversError(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	d := &mockDirDeliverer{}
+	srv.WithDirResultStore(d)
+
+	listing := &agentv1.DirectoryListing{
+		RequestId: "req-err",
+		Path:      "/root",
+		Error:     "permission denied",
+	}
+	msg := &agentv1.AgentMessage{
+		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: listing},
+	}
+	srv.handleAgentMessage(context.Background(), "agent-1", msg)
+
+	require.Len(t, d.delivered, 1)
+	assert.Equal(t, "permission denied", d.delivered[0].Error)
+	assert.Empty(t, d.delivered[0].Entries)
+}
+
+func TestHandleDirectoryListing_NilDirResultStore_NoPanic(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger) // no dirResultStore wired
+
+	listing := &agentv1.DirectoryListing{RequestId: "req-x", Path: "/data"}
+	msg := &agentv1.AgentMessage{
+		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: listing},
+	}
+	assert.NotPanics(t, func() {
+		srv.handleAgentMessage(context.Background(), "agent-1", msg)
+	})
 }
