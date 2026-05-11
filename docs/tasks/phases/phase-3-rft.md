@@ -78,9 +78,10 @@ func (p *Parser) Compose(vals map[string]Value, allowPartial bool) (string, erro
 // 转换规则：
 //   {field}        未指定类型（默认字符串）→ "*"
 //   {field:s}      字符串，无宽度          → "*"
-//   {field:Ns}     字符串，宽度 N          → N 个 "?"
+//   {field:Ns}     字符串，固定宽度 N       → N 个 "?"
 //   {field:d}      十进制整数，无宽度      → "*"
-//   {field:Nd}     十进制整数，宽度 N      → N 个 "?"
+//   {field:Nd}     十进制整数，固定宽度 N  → N 个 "?"
+//   {field:0Nd}    十进制整数，零填充宽度 N → N 个 "?"（例：{seq:05d} → "?????"）
 //   {field:LDML}   时间，LDML 格式串       → 每个 LDML 符号替换为等宽 "?" 序列
 //                  （路径中的 "/" 分隔符保留，非 LDML 字面量保留）
 func (p *Parser) Globify() string
@@ -103,6 +104,19 @@ func S(s string) Value
 func I(n int) Value
 func T(t time.Time) Value
 ```
+
+### 字段类型格式说明
+
+| 格式串语法 | 说明 | Parse | Globify | Compose |
+|-----------|------|-------|---------|---------|
+| `{field}` 或 `{field:s}` | 字符串，无宽度限制 | 任意字符串 → `Str` | `*` | 原样输出 |
+| `{field:Ns}` | 字符串，固定宽度 N（精确匹配 N 个字符）| 长度=N 的字符串 → `Str` | N 个 `?` | 原样输出（不填充）|
+| `{field:d}` | 十进制整数，无宽度限制 | `[0-9]+` → `Int` | `*` | `strconv.Itoa(n)` |
+| `{field:Nd}` | 十进制整数，固定宽度 N | `[0-9]{N}` → `Int` | N 个 `?` | `fmt.Sprintf("%Nd", n)` |
+| `{field:0Nd}` | 十进制整数，零填充宽度 N（`printf` `%0Nd` 语义）| `[0-9]{N}` → `Int` | N 个 `?` | `fmt.Sprintf("%0*d", N, n)` |
+| `{field:LDML}` | 时间字段（见 LDML 表）| 按 Go layout 解析 → `Time`（UTC） | LDML 符号→等宽 `?` | 转回 parser 时区再格式化 |
+
+> **零填充整数示例**：`{seq:05d}` — Parse `"00001"` → `I(1)`；Compose `I(1)` → `"00001"`；Globify → `"?????"（5 个 "?"）`。
 
 ### AgentContext
 
@@ -151,6 +165,7 @@ func InjectContext(ctx AgentContext, vals map[string]Value) map[string]Value
 | G-6 | `{device}/{date:yyyy/MM/dd}/report-{seq:d}.csv` | `*/????/??/??/report-*.csv` | 字面量前缀 + 无宽度整数 |
 | G-7 | `static/file.csv`（无 `{`）| `static/file.csv` | 纯字面量：原样返回 |
 | G-8 | `{n:2d}/{m:4s}/{date:yy-MM}.log` | `??/????/??-??.log` | 固定宽度整数 + 固定宽度字符串 + 2位年 |
+| G-9 | `{device}/{seq:05d}.csv` | `*/?????.csv` | 零填充整数（`05d`=5位 "?"）；Parse 接受 `"00001"`，Compose 输出 `"00001"` |
 
 #### Parse / Compose 基础测试用例
 
@@ -203,6 +218,19 @@ outB, _ = ParserB.Compose(valsA, false)
 | E-3 | `New("{t:yyyy-MM-dd\|tz=}")`（tz 值为空）| 返回语法错误 |
 | E-4 | `New("{t:yyyy-MM-dd\|tz=Invalid/Zone}")`（无效 IANA）| `New` 成功（延迟到 Parse/Compose 时校验），或立即返回错误（实现可选） |
 | E-5 | `InjectContext` 不覆盖已有字段 | `vals["agent_name"]` 已有值时不被替换 |
+
+#### 零填充整数（`0Nd`）测试用例
+
+以 `New("{device}/{seq:05d}.csv")` 创建 parser `pz`：
+
+| # | 操作 | 期望结果 |
+|---|---|---|
+| ZP-1 | `pz.Globify()` | `"*/?????.csv"`（5 个 `?`）|
+| ZP-2 | `pz.Parse("sensor1/00001.csv")` | `{device:"sensor1", seq:I(1)}`（整数值 1）|
+| ZP-3 | `pz.Parse("sensor1/99999.csv")` | `{device:"sensor1", seq:I(99999)}`（整数值 99999）|
+| ZP-4 | `pz.Compose({device:S("sensor1"), seq:I(1)}, false)` | `"sensor1/00001.csv"`（零填充还原）|
+| ZP-5 | `pz.Compose({device:S("sensor1"), seq:I(99999)}, false)` | `"sensor1/99999.csv"` |
+| ZP-6 | `pz.Parse("sensor1/abc.csv")`（非数字）| 返回 parse 错误 |
 
 | 覆盖率 | `go test ./...` in `pkg/trollsift/` | 行覆盖率 ≥ 90% |
 
