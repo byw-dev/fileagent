@@ -11,7 +11,7 @@
 |----|------|---------|------|---------|
 | T3-2-BUG-A | Agent 审批后无最后心跳时间，无在线状态展示 | 🔴 P0 | ⬜ | — |
 | T3-2-BUG-B | 目录浏览请求返回 409，CP 认为采集器 OFFLINE | 🔴 P0 | ⬜ | T3-2-BUG-A |
-| T3-2-BUG-C | 新建采集规则最后一步点击"创建规则"跳回第一步 | 🟡 P1 | ⬜ | — |
+| T3-2-BUG-C | 新建采集规则第三步缺少提交按钮，无法创建规则 | 🟡 P1 | ⬜ | — |
 | T3-2-BUG-D | 创建 Bucket 时 MinIO 报错，CP 静默忽略返回 201 | 🔴 P0 | ⬜ | — |
 
 **修复顺序建议**：
@@ -350,9 +350,9 @@ if !inMemory && !inRedis {
 
 ---
 
-## T3-2-BUG-C — 新建采集规则最后一步点击"创建规则"跳回第一步
+## T3-2-BUG-C — 新建采集规则第三步缺少提交按钮，无法创建规则
 
-**现象**：在采集器详情页「采集规则」Tab 点击「新建采集规则」进入三步表单，填完所有步骤在第三步（上传路径配置）点击「创建规则」按钮后，页面跳转到新建采集规则表单的**第一步**，而非提交成功后导航至采集器详情页，也未显示错误提示。
+**现象**：在采集器详情页「采集规则」Tab 点击「新建采集规则」进入三步表单，填完第一、二步正常，进入第三步（上传路径配置）后，页面底部**没有"创建规则"提交按钮**，用户无法提交表单；浏览器控制台也观察不到任何发出的 HTTP 请求，表明问题发生在 UI 渲染层，完全未到达调用 CP API 的阶段。
 
 **设计文档参考**：§5.11.2（`POST /api/v1/agents/{id}/rules` 创建采集规则）
 
@@ -360,77 +360,131 @@ if !inMemory && !inRedis {
 
 ### 根因分析
 
-`RuleForm.tsx:156-161`（`StepsForm.onFinish`）无论 API 调用成功或失败，均 `return true`：
+`RuleForm.tsx:132-155` 在 `StepsForm` 上配置了自定义 `submitter.render`：
 
 ```typescript
-onFinish={async (values) => {
-  if (v.step1 && v.step2 && v.step3) {
-    await handleFinish(v.step1, v.step2, v.step3)  // 内部 try/catch，不会 throw
-  }
-  return true  // ← 总是 true，无论成功还是失败
-}}
+// RuleForm.tsx:133-155
+<StepsForm
+  submitter={{
+    render: (props) => {
+      if (props.step === 0) {
+        return <Button ...>下一步</Button>
+      }
+      if (props.step === 1) {
+        return <Space>...上一步...下一步...</Space>
+      }
+      // else：step === 2，应渲染"创建规则"按钮
+      return (
+        <Space>
+          <Button onClick={() => props.onPre?.()}>上一步</Button>
+          <Button type="primary" loading={submitting} onClick={() => props.onSubmit?.()}>
+            创建规则
+          </Button>
+        </Space>
+      )
+    },
+  }}
+  onFinish={...}
+>
 ```
 
-`handleFinish`（第 96-121 行）内部用 try/catch 处理所有错误，函数本身不会抛出。因此 `onFinish` 的 `await handleFinish(...)` 总是 resolve，然后 `return true`。
+代码逻辑本身正确：else 分支应为第三步渲染"创建规则"按钮。但在 `@ant-design/pro-components@2.8.x` 中，**`StepsForm.submitter.render` 配置的是整个 `StepsForm` 的最终提交区域，不会被透传给各个 `StepForm` 作为步骤级 submitter。** 各 `StepForm` 依赖自身的 `submitter` prop（或 ProComponents 内置默认按钮）来渲染步骤操作按钮。
 
-ProComponents `StepsForm` 在 `onFinish` 返回 truthy 值时将表单重置到第 0 步（`step === 0`）。成功场景中 `navigate()` 触发导航切换，但 React Router 的路由切换是异步的；在导航生效前 `return true` 已使 StepsForm 重置，用户短暂看到第一步，之后页面才跳走。在**失败场景**中，`navigate` 不被调用，`return true` 导致表单重置，用户填写的所有数据全部丢失，仅看到第一步的空表单。
+由于代码未给每个 `StepForm` 单独设置 `submitter`：
+- 步骤 0/1：ProComponents 内置的「下一步」按钮生效，用户可正常前进
+- 步骤 2（最后步）：ProComponents 内置会尝试渲染最终提交按钮，但因 `StepsForm.submitter.render` 未能正确下发，导致第三步底部无任何按钮渲染
+
+`StepsForm.onFinish` 始终 `return true`（第 161 行）是次要缺陷——该路径当前根本无法到达，修复按钮渲染后需一并解决，否则 API 失败时表单会重置到第一步。
 
 ---
 
 ### 子任务拆分
 
-#### T3-2-BUG-C-1 — WebUI：修正 `RuleForm.tsx` 的 `StepsForm.onFinish` 返回值逻辑
+#### T3-2-BUG-C-1 — WebUI：为每个 `StepForm` 单独配置 `submitter`，确保第三步渲染提交按钮
 
 | 字段 | 内容 |
 |------|------|
 | **优先级** | 🟡 P1 |
 | **涉及模块** | webui |
-| **输入** | 用户在 Step 3 点击「创建规则」 |
-| **输出** | 成功时导航至采集器详情页（规则 Tab）；失败时停留在第三步显示错误提示，保留用户输入 |
+| **输入** | 用户填写完三步表单，进入第三步 |
+| **输出** | 第三步底部出现「上一步」+「创建规则」按钮；点击后正确发出 API 请求 |
 
-**目标**：修正 `onFinish` 在失败路径时不返回 `true`，避免 StepsForm 自动重置；成功路径先导航再让 StepsForm 有机会重置（顺序无关紧要，因为组件已卸载）。
+**目标**：将步骤导航按钮从 `StepsForm.submitter.render` 迁移到各 `StepForm` 的 `submitter` prop，保证每一步都有正确的步骤按钮；同时修正 API 失败时不重置表单的问题。
 
 **修复方案**：
 
 - **文件**：`webui/src/pages/Agents/RuleForm.tsx`
 
-**方案 A（推荐）**：让 `handleFinish` 在成功时返回 `true`、失败时抛出错误；`onFinish` 直接 `return` 其结果：
+**方案**：移除 `StepsForm` 上的 `submitter.render`，改为在各 `StepForm` 上分别配置 `submitter`：
 
 ```typescript
-const handleFinish = async (
-  step1: Step1Values,
-  step2: Step2WatchValues | Step2ScheduledValues,
-  step3: Step3Values
-): Promise<boolean> => {
+// 移除 StepsForm 上的 submitter prop
+
+<StepsForm
+  onFinish={async (values) => {
+    const v = values as { step1?: Step1Values; step2?: ...; step3?: Step3Values }
+    if (v.step1 && v.step2 && v.step3) {
+      return await handleFinish(v.step1, v.step2, v.step3) // 修正：成功返回 true，失败返回 false
+    }
+    return false
+  }}
+>
+  <StepsForm.StepForm name="step1" title="基本配置"
+    submitter={{ render: (props) => <Button type="primary" onClick={() => props.onSubmit?.()}>下一步</Button> }}
+  >
+    {/* ... */}
+  </StepsForm.StepForm>
+
+  <StepsForm.StepForm name="step2" title="源路径配置"
+    submitter={{ render: (props) => (
+      <Space>
+        <Button onClick={() => props.onPre?.()}>上一步</Button>
+        <Button type="primary" onClick={() => props.onSubmit?.()}>下一步</Button>
+      </Space>
+    )}}
+  >
+    {/* ... */}
+  </StepsForm.StepForm>
+
+  <StepsForm.StepForm name="step3" title="上传路径配置"
+    submitter={{ render: (props) => (
+      <Space>
+        <Button onClick={() => props.onPre?.()}>上一步</Button>
+        <Button type="primary" loading={submitting} onClick={() => props.onSubmit?.()}>创建规则</Button>
+      </Space>
+    )}}
+  >
+    {/* ... */}
+  </StepsForm.StepForm>
+</StepsForm>
+```
+
+同时修正 `handleFinish`，使其在成功时返回 `true`，失败时返回 `false`（让 ProComponents 保持在第三步）：
+
+```typescript
+const handleFinish = async (...): Promise<boolean> => {
   if (!agentId) return false
   setSubmitting(true)
   try {
     await createRule(agentId, { /* ... */ })
     message.success('规则创建成功')
     navigate(`/agents/${agentId}`, { state: { tab: 'rules' } })
-    return true   // ← 成功才返回 true（导航已触发，StepsForm 重置无副作用）
+    return true
   } catch {
     message.error('规则创建失败，请稍后重试')
-    return false  // ← 失败返回 false，StepsForm 保持在第三步
+    return false  // ← 失败时保留第三步，不重置表单
   } finally {
     setSubmitting(false)
   }
 }
-
-// StepsForm.onFinish
-onFinish={async (values) => {
-  const v = values as { step1?: Step1Values; step2?: ...; step3?: Step3Values }
-  if (v.step1 && v.step2 && v.step3) {
-    return await handleFinish(v.step1, v.step2, v.step3)
-  }
-  return false
-}}
 ```
 
 **验收标准**：
-- Step 3 点击「创建规则」，API 成功 → 用户被导航到采集器详情页的规则 Tab，新规则出现在列表中
-- Step 3 点击「创建规则」，API 失败（网络错误或后端返回 4xx）→ 用户停留在第三步，`message.error` 提示显示，已填写的所有字段保持不变
-- `pnpm test` 相关用例通过（建议新增 `rule-form.test.tsx` 模拟 API 失败场景）
+- 进入第三步（上传路径配置）后，底部出现「上一步」和「创建规则」两个按钮
+- 点击「创建规则」，浏览器控制台可观察到 `POST /api/v1/agents/{id}/rules` 请求发出
+- API 成功 → 用户被导航到采集器详情页的规则 Tab，新规则出现在列表中
+- API 失败 → 用户停留在第三步，`message.error` 提示显示，填写的字段保持不变
+- `pnpm test` 通过（建议新增 `rule-form.test.tsx` 覆盖步骤渲染和提交场景）
 
 ---
 
