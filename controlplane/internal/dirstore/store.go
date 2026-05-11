@@ -52,7 +52,9 @@ func (s *Store) Register(requestID string) <-chan Result {
 // caller already timed out and called Cancel).
 func (s *Store) Deliver(requestID string, result Result) {
 	if v, ok := s.m.LoadAndDelete(requestID); ok {
-		v.(chan Result) <- result //nolint:forcetypeassert
+		if ch, ok := v.(chan Result); ok {
+			ch <- result
+		}
 	}
 }
 
