@@ -42,12 +42,17 @@
 | 子目录过滤 | **删除** | `watch_subdir_pattern` | `watch_subdir_pattern` | `watch_subdir_pattern` | 缺失 | 缺失 |
 | 追加模式 | `append_mode` | `append_mode` ✓ | `append_mode` ✓ | `append_mode` ✓ | 缺失 | 缺失 |
 | 采集模式 | `mode`（小写）| `mode` enum ('watch','scheduled') | `mode` string | `mode` string | `mode` string | `mode`（'WATCH'/'SCHEDULED' 大写，需归一化） |
-| 启用状态 | `enabled` | `status` enum ('active','inactive') | `enabled` bool ✓ | — | `is_active` bool | `is_active` bool |
+| 启用状态（采集规则） | `enabled` | `collection_rules.status` enum ('active','inactive') | `enabled` bool ✓ | — | `is_active` bool | `is_active` bool |
 | 目标 Bucket 前端 | `bucket_id` | — | — | — | — | `dest_bucket_id`（改） |
 
-### 关键澄清：`upload_bucket` vs `bucket_id`
+### ⚠️ 重要澄清：`collection_rules.status` vs `agents.status`
 
-- **DB** 存储 `bucket_id`（UUID，外键）
+这是两个完全不同的概念，**不能混淆**：
+
+- **`agents.status`**（5 个值：`pending / approved / online / offline / revoked`）：描述采集器程序的注册审批与在线状态。**不改动**。
+- **`collection_rules.status`**（2 个值：`active / inactive`）：描述采集规则在 Agent 端是否被启用。本质是 boolean，**改为 `enabled bool`**（DB 删除 `rule_status` enum，改为 `BOOLEAN NOT NULL DEFAULT TRUE`）。
+
+### 关键澄清：`upload_bucket` vs `bucket_id`
 - **proto `upload_bucket`** 存储 MinIO bucket 的**名称字符串**（不是 UUID），Agent 直接用它调用 S3 `PutObject`
 - Agent 无法通过 UUID 查询 bucket 名（它不访问 CP 数据库），因此 proto 里必须传名称字符串
 - **真正的 Bug**：`dispatch.go` 的 `ruleToProto()` 从未填充 `UploadBucket`，需修复
@@ -82,9 +87,13 @@
 
 ### Bug 4 — `append_mode` 值域不一致
 
-DB 默认值 `'overwrite'`，Agent 认识的值为 `''` / `'tail'` / `'close_wait'`。
+DB 默认值 `'overwrite'`，Agent 常量 `AppendModeNone = ""` 语义等价于"全量覆盖上传"（即 overwrite），但字符串值为空串，与 DB 不一致。
 
-→ **修复方式**：统一值域为 `'none'` / `'tail'` / `'close_wait'`，DB 默认值改为 `'none'`
+→ **修复方式（已确认）**：**不改 DB 默认值**，改 Agent 侧：
+- 将常量 `AppendModeNone = ""` 重命名为 `AppendModeOverwrite = "overwrite"`
+- `watcher.go`、`queue.go`、`main.go` 中所有 `""` 的 append_mode 判断改为 `"overwrite"`
+- SQLite `append_mode` 默认值从 `''` 改为 `'overwrite'`
+- 统一后值域：`'overwrite'` / `'tail'` / `'close_wait'`，三端一致
 
 ---
 
@@ -269,10 +278,9 @@ upload_path_template → dest_path_template
 watch_recursive → recursive
 -- 删除
 DROP COLUMN watch_subdir_pattern
--- 修改 status enum → enabled bool
+-- 修改 status enum → enabled bool（采集规则启用状态，与 agents.status 无关）
 status rule_status → enabled BOOLEAN NOT NULL DEFAULT TRUE
--- 修改 append_mode 默认值
-append_mode → DEFAULT 'none' (原 'overwrite')
+-- append_mode 默认值保持 'overwrite'（DB 侧不改，Agent 侧统一到此值）
 ```
 
 > **重建 DB 方式**：
@@ -398,14 +406,16 @@ Response 504: { "error": "TIMEOUT" }
 
 ---
 
-## 十一、实施顺序
+## 十一、实施顺序（已确认）
 
-1. **DB**：直接原地修改 `controlplane/migrations/000001_init_schema.up.sql`，同步更新 sqlc 生成代码（`rules.sql.go` 等）
-2. **Proto**：原地修改 `proto/v1/agent.proto`（字段重命名 + Dry-Run 新增消息），重新生成 Go 代码
-3. **pkg/trollsift/**：实现核心库（Parse/Compose/Globify/Validate/AgentContext），单元测试覆盖率 ≥ 90%
+> 确认原则：先做独立可测试的库，再做存量代码改造，最后做新功能。
+
+1. **`pkg/trollsift/`**：实现核心库（独立模块，单独可测），单元测试覆盖率 ≥ 90%
+2. **DB**：直接原地修改 `controlplane/migrations/000001_init_schema.up.sql`，同步更新 sqlc 生成代码（`rules.sql.go` 等）
+3. **Proto**：原地修改 `proto/v1/agent.proto`（字段重命名 + Dry-Run 新增消息），重新生成 Go 代码
 4. **Agent**：
-   - 引入 `doublestar` 包
    - 字段名同步（`BasePath`、`PathPattern` 等）
+   - Bug 4：`AppendModeNone = ""` → `AppendModeOverwrite = "overwrite"`，SQLite 默认值同步
    - `matchGlob`、`walkAndSubmit` 改用 `doublestar.Match`（相对路径）
    - `buildStoragePath` 改写为 trollsift Compose 流程
    - `handleDryRun` 函数实现
@@ -413,11 +423,10 @@ Response 504: { "error": "TIMEOUT" }
 5. **CP**：
    - `createRuleRequest` / `toRuleResponse` 字段名统一（修复 Bug 1 / Bug 3）
    - `dispatch.go` `ruleToProto()` 填充 `UploadBucket`（修复 Bug 2）
-   - `append_mode` 值域统一（修复 Bug 4）
    - `dryRunStore` + `handleAgentMessage DryRunResult` case
    - `TestRule` REST 端点（`POST /api/v1/agents/:id/test-rule`）
 6. **WebUI**：`pathTemplate.ts` 重写 + `RuleForm.tsx` Step2/Step3 更新（补全字段 + 测试面板）+ `agents.ts` 字段映射修复
-7. **DECISIONS.md**：记录字段统一命名决策和 trollsift 引入决策
+7. **DECISIONS.md**：记录字段统一命名决策（D-009）和 trollsift 引入决策（D-010）
 
 ---
 

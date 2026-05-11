@@ -351,3 +351,68 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 - **WebSocket/SSE 推送**：实现复杂（需要连接管理、鉴权），对于仅需 1 次 request-response 的场景过于重量级。
 - **超时设为 60s**：目录浏览操作不应让用户等待超过 30s；30s 已覆盖慢速网络下的正常操作，超时后给 504 比 hang 住更好。
 
+
+---
+
+## D-009：采集规则字段统一命名方案（T3-5）
+
+**决策日期**：2026-05-11  
+**影响范围**：DB migrations / proto / controlplane / agent / webui
+
+### 决策
+
+对 `collection_rules` 相关的四层字段名（DB / proto / REST / Frontend）进行全面统一，以消除歧义、修复字段映射断路 Bug。
+
+**统一字段名映射**：
+
+| 概念 | 统一字段名 | 原 DB 名 | 原 proto 名 |
+|------|-----------|---------|------------|
+| 监控根目录 | `base_path` | `source_path_template` | `source_path_template` |
+| 文件/路径过滤 | `path_pattern` | `file_glob` | `file_glob` |
+| 目标路径模板 | `dest_path_template` | `upload_path_template` | `upload_path_template` |
+| 是否递归 | `recursive` | `watch_recursive` | `watch_recursive` |
+| 子目录过滤 | **删除** | `watch_subdir_pattern` | `watch_subdir_pattern` |
+| 采集规则启用状态 | `enabled bool` | `status rule_status('active','inactive')` | `enabled bool`（已正确）|
+
+**关键约束**：
+- `agents.status`（5 个值）与 `collection_rules.status`（2 个值）是**完全不同**的概念；前者描述 Agent 生命周期状态，后者描述规则是否被启用。只将 `collection_rules.status` 改为 `enabled bool`，`agents.status` 保持不变。
+- `proto.CollectionRule.upload_bucket` 保留为 MinIO bucket 名称字符串（不是 UUID），Agent 直接用它调用 S3 API。
+
+### `append_mode` 值域统一
+
+- DB 默认值保持 `'overwrite'`（不变）
+- Agent 侧常量 `AppendModeNone = ""` 重命名为 `AppendModeOverwrite = "overwrite"`
+- 统一后三端值域：`'overwrite'` / `'tail'` / `'close_wait'`
+
+### 备选方案（被否决）
+
+- **`append_mode` DB 改为 `'none'`**：与现有数据不兼容，需要额外 migration；`'overwrite'` 语义已足够清晰。
+- **逐层单独修复而不全局统一**：每次修复后测试范围难以界定，不如一次性对齐。
+
+---
+
+## D-010：引入 `pkg/trollsift` 共享路径模板库（T3-4）
+
+**决策日期**：2026-05-11  
+**影响范围**：新建 `pkg/trollsift/`，agent / controlplane 引用
+
+### 决策
+
+引入 `pkg/trollsift/` 作为独立 Go 模块（`github.com/byw-dev/fileagent/pkg/trollsift`），
+加入 `go.work`，供 agent 和 controlplane 共同 import，以支持结构化路径模板的解析与组合。
+
+**主要能力**：
+- `Parse(s)`：从字符串提取格式字段值（支持字符串、整数、LDML 时间）
+- `Compose(vals, allowPartial)`：将字段值格式化到模板串
+- `Globify()`：将模板串转为 doublestar 兼容的 glob 字符串
+- `IsTrollsiftPattern(s)`：判断是否含格式字段（含 `{` 即为 trollsift 模式）
+- LDML 时间字段子集（`yyyy`、`MM`、`dd`、`HH`、`mm`、`ss`），时区 `|tz=IANA`
+- `AgentContext` 注入（`{agent_name}`、`{agent_id}`）
+
+**模块位置**：`pkg/trollsift/go.mod` module 名为 `github.com/byw-dev/fileagent/pkg/trollsift`，
+`go.work` 追加 `use ./pkg/trollsift`。
+
+### 备选方案（被否决）
+
+- **放入 `agent/` 模块内**：controlplane 的 Dry-Run 端点在校验 path_pattern 时也需要 Globify/Validate，共享为独立包更合理。
+- **使用现有开源 trollsift 库**：Python 的 trollsift 库无对等 Go 版本，且本项目需要 LDML 时间格式支持，需要自己实现。
