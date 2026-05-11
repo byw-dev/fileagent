@@ -42,8 +42,8 @@ Phase 4  完善与收尾    ⬜ 未开始
 | T3-1-FIX Agent 生命周期健壮性修复 | ✅ 已完成（`e295c05`） |
 | T3-1-BUGFIX gRPC 注册链路三个关键 Bug 修复 | ✅ 已完成（`e295c05`） |
 | T3-2-FIX API 契约对齐（A~L 共 12 项） | ✅ 已完成（`2715706`） |
-| T3-2-BUG 集成联调新发现 Bug（A~D 共 4 项） | ⬜ 待完成（见 `bugs/open.md`） |
-| T3-2 Web UI + Control Plane 联调 | ⬜ 待完成（阻塞于 T3-2-BUG） |
+| T3-2-BUG 集成联调新发现 Bug（A~D 共 4 项） | ✅ 已完成 |
+| T3-2 Web UI + Control Plane 联调 | 🔄 进行中（T3-2-BUG 全部完成后启动） |
 | T3-3 Python SDK + Control Plane 联调 | ⬜ 待完成（阻塞于 T3-2） |
 
 ---

@@ -12,6 +12,7 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -59,22 +60,37 @@ type CredentialDB interface {
 	GetBucketByID(ctx context.Context, id uuid.UUID) (*db.Bucket, error)
 }
 
+// AgentStateDB is the minimal DB interface used by Connect/Disconnect and
+// handleHeartbeat to persist agent lifecycle state.
+type AgentStateDB interface {
+	UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error
+	UpdateAgentStatus(ctx context.Context, id uuid.UUID, status db.AgentStatus) (*db.Agent, error)
+}
+
+// DirResultDeliverer receives directory-listing results from the agent gRPC
+// stream and delivers them to the waiting REST handler.
+type DirResultDeliverer interface {
+	Deliver(requestID string, result dirstore.Result)
+}
+
 // Server holds dependencies shared by all gRPC handlers.
 type Server struct {
 	// Embed the generated Unimplemented guard so that adding new RPC methods to
 	// the proto does not break compilation.
 	agentv1.UnimplementedAgentServiceServer
 
-	logger     *zap.Logger
-	registry   *AgentRegistry
-	cache      CacheClient
-	jwtSvc     auth.Service
-	nats       NATSPublisher
-	agentMgr   AgentManager
-	dispatcher DispatcherClient
-	indexer    IndexerClient
-	stsMgr     STSManagerClient
-	credDB     CredentialDB
+	logger        *zap.Logger
+	registry      *AgentRegistry
+	cache         CacheClient
+	jwtSvc        auth.Service
+	nats          NATSPublisher
+	agentMgr      AgentManager
+	dispatcher    DispatcherClient
+	indexer       IndexerClient
+	stsMgr        STSManagerClient
+	credDB        CredentialDB
+	stateDB       AgentStateDB
+	dirResultStore DirResultDeliverer
 }
 
 // New creates a new gRPC Server with the provided logger. Additional
@@ -110,6 +126,19 @@ func (s *Server) WithExtraDeps(
 	s.indexer = ix
 	s.stsMgr = stsMgr
 	s.credDB = credDB
+	return s
+}
+
+// WithStateDB injects the AgentStateDB used to persist agent lifecycle state.
+func (s *Server) WithStateDB(stateDB AgentStateDB) *Server {
+	s.stateDB = stateDB
+	return s
+}
+
+// WithDirResultStore injects the store used to deliver directory listing
+// results from the gRPC receive loop to the waiting REST handler.
+func (s *Server) WithDirResultStore(store DirResultDeliverer) *Server {
+	s.dirResultStore = store
 	return s
 }
 

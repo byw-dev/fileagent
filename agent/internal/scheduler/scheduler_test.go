@@ -16,15 +16,40 @@ func TestResolvePath(t *testing.T) {
 		tmpl string
 		want string
 	}{
+		// Legacy technical names
 		{"/data/{yyyy}/{mm}/{dd}", "/data/2024/03/05"},
 		{"/logs/{yy}{mm}{dd}", "/logs/240305"},
 		{"/out/{HH}/{MM}", "/out/09/07"},
+		// Friendly aliases (same values, user-facing variable names)
+		{"/data/{year}/{month}/{day}", "/data/2024/03/05"},
+		{"/out/{hour}/{minute}", "/out/09/07"},
+		// No substitution
 		{"/flat/path", "/flat/path"},
 		{"no-vars", "no-vars"},
 	}
 	for _, tc := range cases {
 		got := ResolvePath(tc.tmpl, fixed)
 		assert.Equal(t, tc.want, got, "template=%q", tc.tmpl)
+	}
+}
+
+func TestResolvePathWithFile(t *testing.T) {
+	fixed := time.Date(2024, 3, 5, 9, 7, 0, 0, time.UTC)
+	cases := []struct {
+		tmpl     string
+		filename string
+		want     string
+	}{
+		{"/{year}/{month}/{filename}", "data.csv", "/2024/03/data.csv"},
+		{"/{yyyy}/{mm}/{filename}", "log.txt", "/2024/03/log.txt"},
+		// No {filename} in template — placeholder left unchanged when filename=""
+		{"/{year}/{month}", "", "/2024/03"},
+		// {filename} with empty filename — left unchanged
+		{"/{year}/{filename}", "", "/2024/{filename}"},
+	}
+	for _, tc := range cases {
+		got := ResolvePathWithFile(tc.tmpl, fixed, tc.filename)
+		assert.Equal(t, tc.want, got, "template=%q filename=%q", tc.tmpl, tc.filename)
 	}
 }
 

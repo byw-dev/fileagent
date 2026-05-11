@@ -5,6 +5,65 @@
 
 ---
 
+## 2026-05-11 修复 — T3-2-BUG 系列（集成联调新发现 Bug A~D）
+
+| ID | 标题 | 严重程度 | 涉及模块 |
+|----|------|---------|---------|
+| T3-2-BUG-A | Agent 审批后无最后心跳时间，无在线状态展示 | 🔴 P0 | controlplane + webui |
+| T3-2-BUG-B | 目录浏览请求返回 409，CP 认为采集器 OFFLINE | 🔴 P0 | controlplane + webui |
+| T3-2-BUG-C | 新建采集规则第三步缺少提交按钮，无法创建规则 | 🟡 P1 | webui |
+| T3-2-BUG-D | 创建 Bucket 时 MinIO 报错，CP 静默忽略返回 201 | 🔴 P0 | controlplane + webui |
+
+### T3-2-BUG-A — Agent 审批后无最后心跳时间，无在线状态展示 ✅
+
+| 字段 | 内容 |
+|------|------|
+| **严重程度** | 🔴 P0 |
+| **根因** | (A-1) `handleHeartbeat` 只刷新 Redis TTL，从未调用 `UpdateAgentLastSeen`，`agents.last_seen_at` 永远为 NULL；(A-2) `Connect`/`Disconnect` 未调用 `UpdateAgentStatus`，DB `status` 卡在 `approved`；(A-3) REST 响应缺少 `is_online` 字段 |
+| **修复** | A-1: `handleHeartbeat` 新增 `db.UpdateAgentLastSeen` 调用；A-2: `Connect` 时调 `UpdateAgentStatus("online")`，defer 断开时调 `UpdateAgentStatus("offline")`；A-3: `agentResponse` 增加 `is_online bool`（实时查 Redis）；A-4: WebUI 采集器列表/详情新增在线状态徽标和心跳时间展示 |
+| **受影响文件** | `controlplane/internal/grpcserver/handler.go`、`controlplane/internal/api/handler/agents.go`、`webui/src/pages/Agents/` |
+
+### T3-2-BUG-B — 目录浏览请求返回 409，CP 认为采集器 OFFLINE ✅
+
+| 字段 | 内容 |
+|------|------|
+| **严重程度** | 🔴 P0 |
+| **根因** | (B-1) `ListDir` 仅检查内存注册表（`registry.IsOnline`），CP 重启后内存注册表为空，即使 Redis 有有效 TTL 仍返回 409；(B-2) 前端目录浏览 Tab 不检查 `is_online`，离线时无保护提示 |
+| **修复** | B-1: 在内存注册表 miss 时降级检查 Redis（`h.cache.Exists`），两者均无才 409；`dirstore.Deliver` 改为非阻塞，防止边缘情况死锁（提交 `d87fe18`）；B-2: WebUI 目录浏览 Tab 当 `is_online=false` 时显示 Warning Alert 并禁用浏览按钮 |
+| **受影响文件** | `controlplane/internal/api/handler/agents.go`、`controlplane/internal/dirstore/store.go`、`webui/src/pages/Agents/Detail.tsx` |
+
+### T3-2-BUG-C — 新建采集规则第三步缺少提交按钮，无法创建规则 ✅
+
+| 字段 | 内容 |
+|------|------|
+| **严重程度** | 🟡 P1 |
+| **根因** | `StepsForm.submitter.render` 配置的是整体提交区域，不透传给各 `StepForm` 子步骤；第三步底部无任何按钮渲染。次要：`onFinish` 始终 `return true`，API 失败时表单重置到第一步 |
+| **修复** | 将步骤按钮迁移到各 `StepForm.submitter`（`StepsForm` 全局 `submitter.render` 改为统一控制）；`handleFinish` 失败时 `return false` 保留第三步 |
+| **受影响文件** | `webui/src/pages/Agents/RuleForm.tsx` |
+
+### T3-2-BUG-D — 创建 Bucket 时 MinIO 报错，CP 静默忽略返回 201 ✅
+
+| 字段 | 内容 |
+|------|------|
+| **严重程度** | 🔴 P0 |
+| **根因** | (D-1) CP `CreateBucket` 无前置命名校验，非法名称先写 DB 再被 MinIO 拒绝；(D-2) MinIO 错误被静默忽略，始终返回 201，DB 出现孤立记录；(D-3) 前端无 Bucket 命名实时校验 |
+| **修复** | D-1: `CreateBucket` 入口增加 S3 命名规范 regexp 校验，非法时 422；D-2: MinIO 失败时回滚 DB 记录并返回 502；D-3: WebUI 创建 Bucket 表单增加客户端 validator |
+| **受影响文件** | `controlplane/internal/api/handler/events.go`、`webui/src/pages/Buckets/` |
+
+---
+
+## 2026-05-11 修复 — createRule 400 错误（采集规则创建 JSON 字段名不匹配）
+
+| 字段 | 内容 |
+|------|------|
+| **严重程度** | 🔴 P0 |
+| **修复提交** | `addb3ee` |
+| **根因** | CP `createRuleRequest` 结构体 JSON tag 使用的是 DB 内部字段名（`bucket_id`、`source_path_template`、`file_glob`、`upload_path_template`），与 WebUI 发送的字段名（`dest_bucket_id`、`source_path`、`file_pattern`、`dest_path_template`）完全不匹配，gin `binding:"required"` 校验失败返回 400 |
+| **附带修复** | (1) Agent `ResolvePath` 新增用户友好变量别名（`{year}`/`{month}`/`{day}`/`{hour}`/`{minute}`），向下兼容旧技术名（`{yyyy}`, `{mm}` 等）；新增 `ResolvePathWithFile` 支持 `{filename}` 变量；(2) WebUI `PATH_TEMPLATE_VARIABLES` 裁剪至 Agent 实际支持的 6 个变量，移除 `{agent_id}`/`{agent_name}`/`{file_type}`/`{ext}` 等未实现变量；(3) `DECISIONS.md` 新增 D-008 记录 CP→Agent 命令同步等待（30s）决策 |
+| **受影响文件** | `controlplane/internal/api/handler/agents.go`、`controlplane/internal/api/handler/agents_test.go`、`agent/internal/scheduler/scheduler.go`、`agent/internal/scheduler/scheduler_test.go`、`agent/cmd/agent/main.go`、`webui/src/utils/pathTemplate.ts`、`webui/src/pages/Agents/RuleForm.tsx`、`DECISIONS.md` |
+
+---
+
 ## 2026-05-07 修复 — T3-1-BUGFIX（gRPC 注册链路三个关键 Bug）
 
 ### Bug A — Register ErrNoRows 判断逻辑颠倒 ✅

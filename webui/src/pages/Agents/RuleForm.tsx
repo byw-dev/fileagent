@@ -1,11 +1,11 @@
 import { useState, useEffect } from 'react'
 import {
+  App,
   Typography,
   Button,
   Space,
   Alert,
   Card,
-  message,
 } from 'antd'
 import { StepsForm, ProFormText, ProFormSelect, ProFormSwitch } from '@ant-design/pro-components'
 import { useParams, useNavigate } from 'react-router-dom'
@@ -42,25 +42,15 @@ interface Bucket {
   name: string
 }
 
-interface Step1Values {
+/** Flat form values merged by StepsForm.onFinish across all 3 steps. */
+interface RuleFormValues {
   name: string
   mode: CollectionMode
   dest_bucket_id: string
-}
-
-interface Step2WatchValues {
   source_path: string
   file_pattern: string
-}
-
-interface Step2ScheduledValues {
-  source_path: string
-  file_pattern: string
-  cron_expr: string
-  run_once_on_start: boolean
-}
-
-interface Step3Values {
+  cron_expr?: string
+  run_once_on_start?: boolean
   dest_path_template: string
 }
 
@@ -73,10 +63,11 @@ interface Step3Values {
 function AgentRuleFormPage() {
   const { id: agentId } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { message } = App.useApp()
 
   const [mode, setMode] = useState<CollectionMode>('WATCH')
   const [cronExpr, setCronExpr] = useState('')
-  const [pathTemplate, setPathTemplate] = useState('/{year}/{month}/{agent_name}/{filename}')
+  const [pathTemplate, setPathTemplate] = useState('/{year}/{month}/{day}/{filename}')
   const [pathError, setPathError] = useState<string | null>(null)
   const [buckets, setBuckets] = useState<Bucket[]>([])
   const [submitting, setSubmitting] = useState(false)
@@ -93,28 +84,34 @@ function AgentRuleFormPage() {
     setPathError(validatePathTemplate(value))
   }
 
-  const handleFinish = async (
-    step1: Step1Values,
-    step2: Step2WatchValues | Step2ScheduledValues,
-    step3: Step3Values
-  ) => {
-    if (!agentId) return
+  /**
+   * Called by StepsForm.onFinish with the flat merged values from all steps.
+   * StepsForm merges step values via Object.assign, so the result is a flat
+   * object — NOT nested under step names.
+   */
+  const handleFinish = async (values: RuleFormValues): Promise<boolean> => {
+    if (!agentId) {
+      message.error('采集器 ID 缺失，请刷新页面后重试')
+      return false
+    }
     setSubmitting(true)
     try {
       await createRule(agentId, {
-        name: step1.name,
-        mode: step1.mode,
-        dest_bucket_id: step1.dest_bucket_id,
-        source_path: step2.source_path,
-        file_pattern: step2.file_pattern,
-        cron_expr: step1.mode === 'SCHEDULED' ? (step2 as Step2ScheduledValues).cron_expr : null,
-        run_once_on_start: step1.mode === 'SCHEDULED' ? (step2 as Step2ScheduledValues).run_once_on_start : false,
-        dest_path_template: step3.dest_path_template,
+        name: values.name,
+        mode: values.mode,
+        dest_bucket_id: values.dest_bucket_id,
+        source_path: values.source_path,
+        file_pattern: values.file_pattern,
+        cron_expr: values.mode === 'SCHEDULED' ? (values.cron_expr ?? null) : null,
+        run_once_on_start: values.mode === 'SCHEDULED' ? (values.run_once_on_start ?? false) : false,
+        dest_path_template: values.dest_path_template,
       })
       message.success('规则创建成功')
       navigate(`/agents/${agentId}`, { state: { tab: 'rules' } })
+      return true
     } catch {
       message.error('规则创建失败，请稍后重试')
+      return false
     } finally {
       setSubmitting(false)
     }
@@ -129,20 +126,32 @@ function AgentRuleFormPage() {
         <Title level={4} style={{ margin: 0 }}>新建采集规则</Title>
       </Space>
 
-      <StepsForm<Record<string, unknown>>
+      {/*
+        NOTE: StepsForm.submitter.render is the ONLY place to customise step
+        buttons.  Any `submitter` prop placed on a StepForm child is silently
+        overridden to `false` by the parent StepsForm.
+      */}
+      <StepsForm<RuleFormValues>
         submitter={{
           render: (props) => {
             if (props.step === 0) {
-              return <Button type="primary" onClick={() => props.onSubmit?.()}>下一步</Button>
+              return (
+                <Button type="primary" onClick={() => props.onSubmit?.()}>
+                  下一步
+                </Button>
+              )
             }
             if (props.step === 1) {
               return (
                 <Space>
                   <Button onClick={() => props.onPre?.()}>上一步</Button>
-                  <Button type="primary" onClick={() => props.onSubmit?.()}>下一步</Button>
+                  <Button type="primary" onClick={() => props.onSubmit?.()}>
+                    下一步
+                  </Button>
                 </Space>
               )
             }
+            // Last step (step 2)
             return (
               <Space>
                 <Button onClick={() => props.onPre?.()}>上一步</Button>
@@ -154,11 +163,9 @@ function AgentRuleFormPage() {
           },
         }}
         onFinish={async (values) => {
-          const v = values as { step1?: Step1Values; step2?: Step2WatchValues | Step2ScheduledValues; step3?: Step3Values }
-          if (v.step1 && v.step2 && v.step3) {
-            await handleFinish(v.step1, v.step2, v.step3)
-          }
-          return true
+          // StepsForm merges all step values into a single flat object before
+          // calling onFinish — there is no nesting by step name.
+          return await handleFinish(values)
         }}
       >
         {/* Step 1: Basic Config */}

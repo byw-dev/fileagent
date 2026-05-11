@@ -49,6 +49,16 @@ func (q *Queries) CreateBucket(ctx context.Context, arg CreateBucketParams) (*Bu
 	return &i, err
 }
 
+const deleteBucket = `-- name: DeleteBucket :exec
+DELETE FROM buckets WHERE id = $1
+`
+
+// DeleteBucket removes the bucket record by ID.
+func (q *Queries) DeleteBucket(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.ExecContext(ctx, deleteBucket, id)
+	return err
+}
+
 const getBucketByID = `-- name: GetBucketByID :one
 SELECT id, org_id, name, description, policy_json, sts_role_arn, created_at, updated_at
 FROM buckets

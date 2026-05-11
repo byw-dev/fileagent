@@ -16,6 +16,7 @@ export interface Agent {
   hostname: string
   ip_address: string
   status: AgentStatus
+  is_online: boolean
   os_type: string
   os_version: string
   agent_version: string
@@ -176,11 +177,18 @@ export async function deleteRule(agentId: string, ruleId: string): Promise<void>
   await apiClient.delete(`/api/v1/agents/${agentId}/rules/${ruleId}`)
 }
 
+/** Response shape for POST /api/v1/agents/:id/list-dir */
+export interface ListDirResponse {
+  path: string
+  entries: DirEntry[]
+}
+
 /**
  * List directory contents on the remote agent.
+ * Blocks until the agent responds (up to 30 s server-side timeout).
  */
-export async function listDir(agentId: string, path: string): Promise<DirEntry[]> {
-  const response = await apiClient.post<DirEntry[]>(
+export async function listDir(agentId: string, path: string): Promise<ListDirResponse> {
+  const response = await apiClient.post<ListDirResponse>(
     `/api/v1/agents/${agentId}/list-dir`,
     { path }
   )

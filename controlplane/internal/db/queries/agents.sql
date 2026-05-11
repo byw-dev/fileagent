@@ -39,6 +39,12 @@ SET status = $2,
 WHERE id = $1
 RETURNING *;
 
+-- name: UpdateAgentLastSeen :exec
+UPDATE agents
+SET last_seen_at = NOW(),
+    updated_at = NOW()
+WHERE id = $1;
+
 -- name: UpdateAgentHeartbeat :exec
 UPDATE agents
 SET last_seen_at = NOW(),

@@ -14,3 +14,6 @@ LIMIT 1;
 INSERT INTO buckets (org_id, name, description, policy_json, sts_role_arn)
 VALUES ($1, $2, $3, $4, $5)
 RETURNING id, org_id, name, description, policy_json, sts_role_arn, created_at, updated_at;
+
+-- name: DeleteBucket :exec
+DELETE FROM buckets WHERE id = $1;

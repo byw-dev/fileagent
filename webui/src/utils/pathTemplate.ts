@@ -1,17 +1,18 @@
 /**
  * Supported template variables for upload path configuration.
  * These are resolved at upload time by the Agent.
+ *
+ * Time variables use UTC.  {filename} is substituted with the original file's
+ * base name (including extension); if it appears in the template the Agent
+ * uses the resolved path as-is, otherwise the filename is appended automatically.
  */
 export const PATH_TEMPLATE_VARIABLES: Record<string, string> = {
   '{year}': '当前年份（4位），例如 2025',
   '{month}': '当前月份（2位），例如 04',
   '{day}': '当前日期（2位），例如 15',
   '{hour}': '当前小时（2位，24小时制），例如 09',
-  '{agent_id}': '采集器 UUID',
-  '{agent_name}': '采集器名称',
-  '{file_type}': '文件类型名称',
-  '{filename}': '原始文件名（含扩展名）',
-  '{ext}': '文件扩展名（不含点号），例如 csv',
+  '{minute}': '当前分钟（2位），例如 30',
+  '{filename}': '原始文件名（含扩展名），例如 data_20250415.csv',
 }
 
 /**
@@ -28,11 +29,8 @@ export function renderPathPreview(template: string): string {
     '{month}': pad(now.getUTCMonth() + 1),
     '{day}': pad(now.getUTCDate()),
     '{hour}': pad(now.getUTCHours()),
-    '{agent_id}': 'agent-uuid-example',
-    '{agent_name}': 'my-agent',
-    '{file_type}': 'var_hourly',
+    '{minute}': pad(now.getUTCMinutes()),
     '{filename}': 'data_20250415.csv',
-    '{ext}': 'csv',
   }
 
   return Object.entries(substitutions).reduce(

@@ -11,7 +11,9 @@ import (
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
+	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -49,12 +51,25 @@ type AgentRegistryClient interface {
 	IsOnline(agentID string) bool
 }
 
+// AgentCacheClient is the cache interface used by AgentsHandler.
+type AgentCacheClient interface {
+	Exists(ctx context.Context, keys ...string) (int64, error)
+}
+
+// DirListingStore manages pending directory listing result channels.
+type DirListingStore interface {
+	Register(requestID string) <-chan dirstore.Result
+	Cancel(requestID string)
+}
+
 // AgentsHandler groups the Agent management handlers.
 type AgentsHandler struct {
 	db         AgentsDB
 	agentMgr   AgentManager
 	dispatcher RuleDispatcher
 	registry   AgentRegistryClient
+	cache      AgentCacheClient
+	dirStore   DirListingStore
 	logger     *zap.Logger
 }
 
@@ -70,12 +85,26 @@ func NewAgentsHandler(agentsDB AgentsDB, agentMgr AgentManager, dispatcher RuleD
 	}
 }
 
+// WithCache injects the cache client for real-time online status queries.
+func (h *AgentsHandler) WithCache(c AgentCacheClient) *AgentsHandler {
+	h.cache = c
+	return h
+}
+
+// WithDirStore injects the directory-listing result store used to convert the
+// async gRPC response into a synchronous REST reply.
+func (h *AgentsHandler) WithDirStore(store DirListingStore) *AgentsHandler {
+	h.dirStore = store
+	return h
+}
+
 // agentResponse is the outbound JSON shape for an agent.
 type agentResponse struct {
 	ID           string `json:"id"`
 	OrgID        string `json:"org_id"`
 	Name         string `json:"name"`
 	Status       string `json:"status"`
+	IsOnline     bool   `json:"is_online"`
 	IpAddress    string `json:"ip_address,omitempty"`
 	Hostname     string `json:"hostname,omitempty"`
 	OsType       string `json:"os_type,omitempty"`
@@ -105,6 +134,8 @@ func mapDBStatusToFrontend(s db.AgentStatus) string {
 	return upper
 }
 
+// toAgentResponse converts a DB Agent to the outbound JSON shape. The caller
+// should use toAgentResponseWithCache when a real-time is_online value is needed.
 func toAgentResponse(a *db.Agent) agentResponse {
 	r := agentResponse{
 		ID:        a.ID.String(),
@@ -145,6 +176,18 @@ func toAgentResponse(a *db.Agent) agentResponse {
 	return r
 }
 
+// toAgentResponseWithOnline enriches an agentResponse with a real-time is_online
+// value by querying the cache (Redis TTL key).
+func (h *AgentsHandler) toAgentResponseWithOnline(ctx context.Context, a *db.Agent) agentResponse {
+	r := toAgentResponse(a)
+	if h.cache != nil {
+		if n, err := h.cache.Exists(ctx, cache.AgentOnlineKey(a.ID.String())); err == nil {
+			r.IsOnline = n > 0
+		}
+	}
+	return r
+}
+
 // List handles GET /api/v1/agents.
 func (h *AgentsHandler) List(c *gin.Context) {
 	if h.db == nil {
@@ -173,7 +216,7 @@ func (h *AgentsHandler) List(c *gin.Context) {
 	// the frontend handles local pagination.
 	resp := make([]agentResponse, 0, len(agents))
 	for _, a := range agents {
-		resp = append(resp, toAgentResponse(a))
+		resp = append(resp, h.toAgentResponseWithOnline(c.Request.Context(), a))
 	}
 	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp)})
 }
@@ -205,7 +248,7 @@ func (h *AgentsHandler) Get(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(http.StatusOK, toAgentResponse(agent))
+	c.JSON(http.StatusOK, h.toAgentResponseWithOnline(c.Request.Context(), agent))
 }
 
 // Approve handles POST /api/v1/agents/:id/approve.
@@ -271,9 +314,17 @@ type listDirRequest struct {
 	MaxDepth  int32  `json:"max_depth"`
 }
 
+// listDirResponse is the successful response body for POST /api/v1/agents/:id/list-dir.
+type listDirResponse struct {
+	Path    string            `json:"path"`
+	Entries []dirstore.DirEntry `json:"entries"`
+}
+
 // ListDir handles POST /api/v1/agents/:id/list-dir.
-// Sends a ListDirectoryCommand to the online agent. Returns 202 when the
-// command was delivered, 409 when the agent is offline.
+// It sends a ListDirectoryCommand to the online agent and waits up to 30 s for
+// the agent to send the result back over the gRPC stream before returning 200
+// with the directory listing. Returns 409 when the agent is offline, 502 when
+// the agent reports an error, and 504 on timeout.
 func (h *AgentsHandler) ListDir(c *gin.Context) {
 	if h.registry == nil {
 		middleware.NotImplemented(c)
@@ -295,14 +346,54 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 		return
 	}
 
-	if !h.registry.IsOnline(agentID) {
-		c.JSON(http.StatusConflict, gin.H{
-			"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent is not online", nil),
-		})
-		return
+	inMemory := h.registry.IsOnline(agentID)
+	if !inMemory {
+		// Fallback: check Redis TTL key; the agent may have reconnected recently
+		// but CP memory registry is empty (e.g. after a CP restart).
+		inRedis := false
+		if h.cache != nil {
+			if n, err := h.cache.Exists(c.Request.Context(), cache.AgentOnlineKey(agentID)); err == nil && n > 0 {
+				inRedis = true
+			}
+		}
+		if !inRedis {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent is not online", nil),
+			})
+			return
+		}
 	}
 
 	requestID := uuid.New().String()
+
+	// If no dirStore is wired (e.g. during migration / tests without it) fall
+	// back to the original fire-and-forget 202 behaviour.
+	if h.dirStore == nil {
+		msg := &agentv1.ServerMessage{
+			Payload: &agentv1.ServerMessage_ListDirectory{
+				ListDirectory: &agentv1.ListDirectoryCommand{
+					RequestId: requestID,
+					Path:      req.Path,
+					Recursive: req.Recursive,
+					MaxDepth:  req.MaxDepth,
+				},
+			},
+		}
+		if !h.registry.Send(agentID, msg) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent disconnected during send", nil),
+			})
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{"request_id": requestID, "message": "list directory command sent"})
+		return
+	}
+
+	// Register the result channel BEFORE sending the command so we cannot miss
+	// the agent's response.
+	resultCh := h.dirStore.Register(requestID)
+	defer h.dirStore.Cancel(requestID)
+
 	msg := &agentv1.ServerMessage{
 		Payload: &agentv1.ServerMessage_ListDirectory{
 			ListDirectory: &agentv1.ListDirectoryCommand{
@@ -319,7 +410,38 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 		})
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"request_id": requestID, "message": "list directory command sent"})
+
+	// Wait for the agent's DirectoryListing response with a 30 s deadline.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	select {
+	case result := <-resultCh:
+		if result.Error != "" {
+			h.logger.Warn("list-dir: agent reported error",
+				zap.String("agent_id", agentID),
+				zap.String("request_id", requestID),
+				zap.String("error", result.Error),
+			)
+			c.JSON(http.StatusBadGateway, gin.H{
+				"error": middleware.NewErrorBody("AGENT_ERROR", result.Error, nil),
+			})
+			return
+		}
+		entries := result.Entries
+		if entries == nil {
+			entries = []dirstore.DirEntry{}
+		}
+		c.JSON(http.StatusOK, listDirResponse{Path: req.Path, Entries: entries})
+	case <-ctx.Done():
+		h.logger.Warn("list-dir: timeout waiting for agent response",
+			zap.String("agent_id", agentID),
+			zap.String("request_id", requestID),
+		)
+		c.JSON(http.StatusGatewayTimeout, gin.H{
+			"error": middleware.NewErrorBody("TIMEOUT", "agent did not respond in time", nil),
+		})
+	}
 }
 
 // collectionRuleResponse is the outbound JSON shape for a collection rule.
@@ -390,13 +512,15 @@ func (h *AgentsHandler) ListRules(c *gin.Context) {
 }
 
 // createRuleRequest is the body expected by POST /api/v1/agents/:id/rules.
+// Field names match the response shape (collectionRuleResponse) so that the
+// same JSON key set is used for both reads and writes.
 type createRuleRequest struct {
-	BucketID           string          `json:"bucket_id"            binding:"required"`
-	Name               string          `json:"name"                 binding:"required"`
-	Mode               string          `json:"mode"                 binding:"required"`
-	SourcePathTemplate string          `json:"source_path_template" binding:"required"`
-	FileGlob           string          `json:"file_glob"            binding:"required"`
-	UploadPathTemplate string          `json:"upload_path_template" binding:"required"`
+	BucketID           string          `json:"dest_bucket_id"    binding:"required"`
+	Name               string          `json:"name"              binding:"required"`
+	Mode               string          `json:"mode"              binding:"required"`
+	SourcePathTemplate string          `json:"source_path"       binding:"required"`
+	FileGlob           string          `json:"file_pattern"      binding:"required"`
+	UploadPathTemplate string          `json:"dest_path_template" binding:"required"`
 	WatchRecursive     bool            `json:"watch_recursive"`
 	WatchSubdirPattern string          `json:"watch_subdir_pattern"`
 	CronExpr           string          `json:"cron_expr"`
