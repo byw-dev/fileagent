@@ -17,6 +17,8 @@ require (
 	google.golang.org/protobuf v1.36.10
 )
 
+replace github.com/byw-dev/fileagent/pkg/trollsift => ../pkg/trollsift
+
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect

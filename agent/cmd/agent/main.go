@@ -495,6 +495,9 @@ func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx 
 	if err != nil {
 		return filepath.Base(localPath)
 	}
+	if storagePath == "" {
+		return filepath.Base(localPath)
+	}
 	return strings.TrimPrefix(storagePath, "/")
 }
 
