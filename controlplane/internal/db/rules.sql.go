@@ -20,11 +20,11 @@ INSERT INTO collection_rules (
     bucket_id,
     name,
     mode,
-    source_path_template,
-    file_glob,
-    upload_path_template,
-    watch_recursive,
-    watch_subdir_pattern,
+    base_path,
+    path_pattern,
+    dest_path_template,
+    recursive,
+    status,
     cron_expr,
     run_once_on_start,
     append_mode,
@@ -32,24 +32,24 @@ INSERT INTO collection_rules (
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
 )
-RETURNING id, org_id, agent_id, bucket_id, name, mode, status, source_path_template, file_glob, upload_path_template, watch_recursive, watch_subdir_pattern, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at
+RETURNING id, org_id, agent_id, bucket_id, name, mode, status, base_path, path_pattern, dest_path_template, recursive, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at
 `
 
 type CreateCollectionRuleParams struct {
-	OrgID              uuid.UUID       `db:"org_id" json:"org_id"`
-	AgentID            uuid.UUID       `db:"agent_id" json:"agent_id"`
-	BucketID           uuid.UUID       `db:"bucket_id" json:"bucket_id"`
-	Name               string          `db:"name" json:"name"`
-	Mode               UploadMode      `db:"mode" json:"mode"`
-	SourcePathTemplate string          `db:"source_path_template" json:"source_path_template"`
-	FileGlob           string          `db:"file_glob" json:"file_glob"`
-	UploadPathTemplate string          `db:"upload_path_template" json:"upload_path_template"`
-	WatchRecursive     bool            `db:"watch_recursive" json:"watch_recursive"`
-	WatchSubdirPattern sql.NullString  `db:"watch_subdir_pattern" json:"watch_subdir_pattern"`
-	CronExpr           sql.NullString  `db:"cron_expr" json:"cron_expr"`
-	RunOnceOnStart     bool            `db:"run_once_on_start" json:"run_once_on_start"`
-	AppendMode         string          `db:"append_mode" json:"append_mode"`
-	Metadata           json.RawMessage `db:"metadata" json:"metadata"`
+	OrgID            uuid.UUID       `db:"org_id" json:"org_id"`
+	AgentID          uuid.UUID       `db:"agent_id" json:"agent_id"`
+	BucketID         uuid.UUID       `db:"bucket_id" json:"bucket_id"`
+	Name             string          `db:"name" json:"name"`
+	Mode             UploadMode      `db:"mode" json:"mode"`
+	BasePath         string          `db:"base_path" json:"base_path"`
+	PathPattern      string          `db:"path_pattern" json:"path_pattern"`
+	DestPathTemplate string          `db:"dest_path_template" json:"dest_path_template"`
+	Recursive        bool            `db:"recursive" json:"recursive"`
+	Status           RuleStatus      `db:"status" json:"status"`
+	CronExpr         sql.NullString  `db:"cron_expr" json:"cron_expr"`
+	RunOnceOnStart   bool            `db:"run_once_on_start" json:"run_once_on_start"`
+	AppendMode       string          `db:"append_mode" json:"append_mode"`
+	Metadata         json.RawMessage `db:"metadata" json:"metadata"`
 }
 
 func (q *Queries) CreateCollectionRule(ctx context.Context, arg CreateCollectionRuleParams) (*CollectionRule, error) {
@@ -59,11 +59,11 @@ func (q *Queries) CreateCollectionRule(ctx context.Context, arg CreateCollection
 		arg.BucketID,
 		arg.Name,
 		arg.Mode,
-		arg.SourcePathTemplate,
-		arg.FileGlob,
-		arg.UploadPathTemplate,
-		arg.WatchRecursive,
-		arg.WatchSubdirPattern,
+		arg.BasePath,
+		arg.PathPattern,
+		arg.DestPathTemplate,
+		arg.Recursive,
+		arg.Status,
 		arg.CronExpr,
 		arg.RunOnceOnStart,
 		arg.AppendMode,
@@ -78,11 +78,10 @@ func (q *Queries) CreateCollectionRule(ctx context.Context, arg CreateCollection
 		&i.Name,
 		&i.Mode,
 		&i.Status,
-		&i.SourcePathTemplate,
-		&i.FileGlob,
-		&i.UploadPathTemplate,
-		&i.WatchRecursive,
-		&i.WatchSubdirPattern,
+		&i.BasePath,
+		&i.PathPattern,
+		&i.DestPathTemplate,
+		&i.Recursive,
 		&i.CronExpr,
 		&i.RunOnceOnStart,
 		&i.AppendMode,
@@ -103,7 +102,7 @@ func (q *Queries) DeleteCollectionRule(ctx context.Context, id uuid.UUID) error 
 }
 
 const getCollectionRuleByID = `-- name: GetCollectionRuleByID :one
-SELECT id, org_id, agent_id, bucket_id, name, mode, status, source_path_template, file_glob, upload_path_template, watch_recursive, watch_subdir_pattern, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at FROM collection_rules
+SELECT id, org_id, agent_id, bucket_id, name, mode, status, base_path, path_pattern, dest_path_template, recursive, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at FROM collection_rules
 WHERE id = $1
 LIMIT 1
 `
@@ -119,11 +118,10 @@ func (q *Queries) GetCollectionRuleByID(ctx context.Context, id uuid.UUID) (*Col
 		&i.Name,
 		&i.Mode,
 		&i.Status,
-		&i.SourcePathTemplate,
-		&i.FileGlob,
-		&i.UploadPathTemplate,
-		&i.WatchRecursive,
-		&i.WatchSubdirPattern,
+		&i.BasePath,
+		&i.PathPattern,
+		&i.DestPathTemplate,
+		&i.Recursive,
 		&i.CronExpr,
 		&i.RunOnceOnStart,
 		&i.AppendMode,
@@ -135,7 +133,7 @@ func (q *Queries) GetCollectionRuleByID(ctx context.Context, id uuid.UUID) (*Col
 }
 
 const listCollectionRulesByAgent = `-- name: ListCollectionRulesByAgent :many
-SELECT id, org_id, agent_id, bucket_id, name, mode, status, source_path_template, file_glob, upload_path_template, watch_recursive, watch_subdir_pattern, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at FROM collection_rules
+SELECT id, org_id, agent_id, bucket_id, name, mode, status, base_path, path_pattern, dest_path_template, recursive, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at FROM collection_rules
 WHERE agent_id = $1
 ORDER BY created_at DESC
 `
@@ -157,11 +155,10 @@ func (q *Queries) ListCollectionRulesByAgent(ctx context.Context, agentID uuid.U
 			&i.Name,
 			&i.Mode,
 			&i.Status,
-			&i.SourcePathTemplate,
-			&i.FileGlob,
-			&i.UploadPathTemplate,
-			&i.WatchRecursive,
-			&i.WatchSubdirPattern,
+			&i.BasePath,
+			&i.PathPattern,
+			&i.DestPathTemplate,
+			&i.Recursive,
 			&i.CronExpr,
 			&i.RunOnceOnStart,
 			&i.AppendMode,
@@ -187,7 +184,7 @@ UPDATE collection_rules
 SET status = $2,
     updated_at = NOW()
 WHERE id = $1
-RETURNING id, org_id, agent_id, bucket_id, name, mode, status, source_path_template, file_glob, upload_path_template, watch_recursive, watch_subdir_pattern, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at
+RETURNING id, org_id, agent_id, bucket_id, name, mode, status, base_path, path_pattern, dest_path_template, recursive, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at
 `
 
 func (q *Queries) UpdateCollectionRuleStatus(ctx context.Context, iD uuid.UUID, status RuleStatus) (*CollectionRule, error) {
@@ -201,11 +198,10 @@ func (q *Queries) UpdateCollectionRuleStatus(ctx context.Context, iD uuid.UUID, 
 		&i.Name,
 		&i.Mode,
 		&i.Status,
-		&i.SourcePathTemplate,
-		&i.FileGlob,
-		&i.UploadPathTemplate,
-		&i.WatchRecursive,
-		&i.WatchSubdirPattern,
+		&i.BasePath,
+		&i.PathPattern,
+		&i.DestPathTemplate,
+		&i.Recursive,
 		&i.CronExpr,
 		&i.RunOnceOnStart,
 		&i.AppendMode,

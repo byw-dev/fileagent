@@ -101,9 +101,10 @@ export interface CollectionRule {
   run_once_on_start: boolean
   bucket_id: string
   dest_path_template: string
-  is_active: boolean
+  recursive: boolean
+  append_mode: string
+  enabled: boolean
   created_at: string
-  updated_at: string
 }
 
 /** Create/update payload for a collection rule */
@@ -116,6 +117,9 @@ export interface CollectionRulePayload {
   run_once_on_start: boolean
   bucket_id: string
   dest_path_template: string
+  recursive: boolean
+  append_mode?: string
+  enabled?: boolean
 }
 
 /** Directory listing item */

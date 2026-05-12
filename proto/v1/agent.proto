@@ -3,7 +3,6 @@ package fileagent.v1;
 option go_package = "github.com/byw-dev/fileagent/api/v1;agentv1";
 
 import "google/protobuf/timestamp.proto";
-import "google/protobuf/empty.proto";
 
 // ─────────────────────────────────────────────
 // 服务定义
@@ -32,6 +31,7 @@ message AgentMessage {
     DirectoryListing  directory_listing  = 12;
     RuleStatusReport  rule_status        = 13;
     ErrorReport       error_report       = 14;
+    DryRunResult      dry_run_result     = 15;
   }
 }
 
@@ -95,6 +95,19 @@ message ErrorReport {
   string detail   = 3;
 }
 
+message DryRunResult {
+  string rule_id                   = 1;
+  repeated DryRunFileResult files  = 2;
+  string error                     = 3;
+}
+
+message DryRunFileResult {
+  string local_path                 = 1;
+  string upload_path                = 2;
+  map<string, string> parsed_fields = 3;
+  string compose_error              = 4;
+}
+
 // ─────────────────────────────────────────────
 // Server → Agent 消息（Connect 流下行）
 // ─────────────────────────────────────────────
@@ -126,19 +139,19 @@ message PushRuleCommand {
 }
 
 message CollectionRule {
-  string rule_id              = 1;
-  string name                 = 2;
-  string mode                 = 3;
-  string source_path_template = 4;
-  string file_glob            = 5;
-  string upload_bucket        = 6;
-  string upload_path_template = 7;
-  bool   watch_recursive      = 8;
-  string watch_subdir_pattern = 9;
-  string cron_expr            = 10;
-  bool   run_once_on_start    = 11;
-  string append_mode          = 12;
-  bool   enabled              = 13;
+  string rule_id            = 1;
+  string name               = 2;
+  string mode               = 3;
+  string base_path          = 4;
+  string path_pattern       = 5;
+  string dest_path_template = 6;
+  string upload_bucket      = 7;
+  bool   recursive          = 8;
+  string cron_expr          = 9;
+  bool   run_once_on_start  = 10;
+  string append_mode        = 11;
+  bool   enabled            = 12;
+  bool   dry_run            = 13;
 }
 
 message CancelRuleCommand {

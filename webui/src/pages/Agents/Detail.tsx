@@ -188,8 +188,8 @@ function AgentDetailPage() {
     },
     {
       title: '状态',
-      dataIndex: 'is_active',
-      key: 'is_active',
+      dataIndex: 'enabled',
+      key: 'enabled',
       width: 80,
       render: (v: boolean) => <Switch checked={v} size="small" disabled />,
     },

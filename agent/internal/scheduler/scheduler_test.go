@@ -148,11 +148,11 @@ func TestScheduler_PathTemplateResolution(t *testing.T) {
 	s := New(zap.NewNop())
 	var gotPath string
 	rule := CollectionRule{
-		RuleID:             "r4",
-		Enabled:            true,
-		RunOnceOnStart:     true,
-		SourcePathTemplate: "/data/{yyyy}/{mm}",
-		CronExpr:           "",
+		RuleID:         "r4",
+		Enabled:        true,
+		RunOnceOnStart: true,
+		BasePath:       "/data/{yyyy}/{mm}",
+		CronExpr:       "",
 	}
 	err := s.AddRule(rule, func(p string) { gotPath = p })
 	require.NoError(t, err)

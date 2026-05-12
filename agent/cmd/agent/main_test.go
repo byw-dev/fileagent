@@ -7,11 +7,12 @@ import (
 	"testing"
 	"time"
 
-	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/agent/internal/credential"
 	"github.com/byw-dev/fileagent/agent/internal/executor"
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/byw-dev/fileagent/agent/internal/scheduler"
+	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"github.com/byw-dev/fileagent/pkg/trollsift"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -72,53 +73,51 @@ func TestProtoToSchedulerRule_NilReturnsEmpty(t *testing.T) {
 
 func TestProtoToSchedulerRule_MapsAllFields(t *testing.T) {
 	proto := &agentv1.CollectionRule{
-		RuleId:             "rule-1",
-		Name:               "watch-log",
-		Mode:               "watch",
-		SourcePathTemplate: "/var/log",
-		FileGlob:           "*.log",
-		UploadBucket:       "bucket-a",
-		UploadPathTemplate: "logs/",
-		WatchRecursive:     true,
-		WatchSubdirPattern: "sub/*",
-		CronExpr:           "* * * * *",
-		RunOnceOnStart:     true,
-		AppendMode:         "none",
-		Enabled:            true,
+		RuleId:           "rule-1",
+		Name:             "watch-log",
+		Mode:             "watch",
+		BasePath:         "/var/log",
+		PathPattern:      "*.log",
+		UploadBucket:     "bucket-a",
+		DestPathTemplate: "logs/",
+		Recursive:        true,
+		CronExpr:         "* * * * *",
+		RunOnceOnStart:   true,
+		AppendMode:       "overwrite",
+		Enabled:          true,
 	}
 	got := protoToSchedulerRule(proto)
 	assert.Equal(t, "rule-1", got.RuleID)
 	assert.Equal(t, "watch-log", got.Name)
 	assert.Equal(t, "watch", got.Mode)
-	assert.Equal(t, "/var/log", got.SourcePathTemplate)
-	assert.Equal(t, "*.log", got.FileGlob)
+	assert.Equal(t, "/var/log", got.BasePath)
+	assert.Equal(t, "*.log", got.PathPattern)
 	assert.Equal(t, "bucket-a", got.UploadBucket)
-	assert.Equal(t, "logs/", got.UploadPathTemplate)
-	assert.True(t, got.WatchRecursive)
-	assert.Equal(t, "sub/*", got.WatchSubdirPattern)
+	assert.Equal(t, "logs/", got.DestPathTemplate)
+	assert.True(t, got.Recursive)
 	assert.Equal(t, "* * * * *", got.CronExpr)
 	assert.True(t, got.RunOnceOnStart)
-	assert.Equal(t, "none", got.AppendMode)
+	assert.Equal(t, "overwrite", got.AppendMode)
 	assert.True(t, got.Enabled)
 }
 
 // ── buildStoragePath ──────────────────────────────────────────────────────────
 
 func TestBuildStoragePath_WithPrefix(t *testing.T) {
-	rule := scheduler.CollectionRule{UploadPathTemplate: "data/logs"}
-	got := buildStoragePath(rule, "/tmp/file.txt")
+	rule := scheduler.CollectionRule{BasePath: "/tmp", DestPathTemplate: "data/logs/{filename}"}
+	got := buildStoragePath(rule, "/tmp/file.txt", trollsift.AgentContext{}, time.Now().UTC())
 	assert.Equal(t, "data/logs/file.txt", got)
 }
 
 func TestBuildStoragePath_EmptyPrefix(t *testing.T) {
-	rule := scheduler.CollectionRule{UploadPathTemplate: ""}
-	got := buildStoragePath(rule, "/tmp/report.csv")
+	rule := scheduler.CollectionRule{BasePath: "/tmp", DestPathTemplate: ""}
+	got := buildStoragePath(rule, "/tmp/report.csv", trollsift.AgentContext{}, time.Now().UTC())
 	assert.Equal(t, "report.csv", got)
 }
 
 func TestBuildStoragePath_TrailingSlash(t *testing.T) {
-	rule := scheduler.CollectionRule{UploadPathTemplate: "uploads/"}
-	got := buildStoragePath(rule, "/data/out.bin")
+	rule := scheduler.CollectionRule{BasePath: "/data", DestPathTemplate: "uploads/{filename}"}
+	got := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, time.Now().UTC())
 	assert.Equal(t, "uploads/out.bin", got)
 }
 
@@ -142,8 +141,8 @@ func TestSubmitFile_SubmitsNewFile(t *testing.T) {
 	exec.Start(context.Background())
 	defer exec.Stop()
 
-	rule := scheduler.CollectionRule{RuleID: "r1", UploadBucket: "bkt", UploadPathTemplate: "logs"}
-	submitFile(exec, q, rule, "/tmp/f.txt", 100, time.Now(), 0, "", zap.NewNop())
+	rule := scheduler.CollectionRule{RuleID: "r1", BasePath: "/tmp", UploadBucket: "bkt", DestPathTemplate: "logs/{filename}"}
+	submitFile(exec, q, rule, "/tmp/f.txt", 100, time.Now(), 0, "", trollsift.AgentContext{}, zap.NewNop())
 
 	// Allow time for async worker to process.
 	require.Eventually(t, func() bool { return submitted }, 1*time.Second, 10*time.Millisecond)
@@ -159,7 +158,7 @@ func TestSubmitFile_SkipsDuplicate(t *testing.T) {
 	exec.Start(context.Background())
 	defer exec.Stop()
 
-	rule := scheduler.CollectionRule{RuleID: "r1", UploadBucket: "bkt", UploadPathTemplate: "logs"}
+	rule := scheduler.CollectionRule{RuleID: "r1", BasePath: "/tmp", UploadBucket: "bkt", DestPathTemplate: "logs/{filename}"}
 
 	// Mark the file as already processed.
 	err := q.UpsertProcessedFile(&queue.ProcessedFile{
@@ -169,7 +168,7 @@ func TestSubmitFile_SkipsDuplicate(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	submitFile(exec, q, rule, "/tmp/dup.txt", 100, time.Now(), 0, "", zap.NewNop())
+	submitFile(exec, q, rule, "/tmp/dup.txt", 100, time.Now(), 0, "", trollsift.AgentContext{}, zap.NewNop())
 	// Wait briefly to make sure no upload was triggered.
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, 0, callCount)
@@ -191,8 +190,8 @@ func TestWalkAndSubmit_SubmitsMatchingFiles(t *testing.T) {
 	exec.Start(context.Background())
 	defer exec.Stop()
 
-	rule := scheduler.CollectionRule{RuleID: "r2", FileGlob: "*.log", UploadBucket: "bkt", UploadPathTemplate: "logs"}
-	walkAndSubmit(context.Background(), exec, q, rule, dir, zap.NewNop())
+	rule := scheduler.CollectionRule{RuleID: "r2", BasePath: dir, PathPattern: "*.log", UploadBucket: "bkt", DestPathTemplate: "logs/{filename}"}
+	walkAndSubmit(context.Background(), exec, q, rule, dir, trollsift.AgentContext{}, zap.NewNop())
 
 	require.Eventually(t, func() bool { return len(submitted) == 1 }, 1*time.Second, 10*time.Millisecond)
 	assert.Contains(t, submitted[0], "a.log")
@@ -204,9 +203,9 @@ func TestWalkAndSubmit_NonExistentPathLogsWarning(t *testing.T) {
 	exec.Start(context.Background())
 	defer exec.Stop()
 
-	rule := scheduler.CollectionRule{RuleID: "r3", FileGlob: "*.log"}
+	rule := scheduler.CollectionRule{RuleID: "r3", BasePath: "/nonexistent/path", PathPattern: "*.log"}
 	// Should not panic; just logs a warning.
-	walkAndSubmit(context.Background(), exec, q, rule, "/nonexistent/path", zap.NewNop())
+	walkAndSubmit(context.Background(), exec, q, rule, "/nonexistent/path", trollsift.AgentContext{}, zap.NewNop())
 }
 
 // ── runWatcher ────────────────────────────────────────────────────────────────
@@ -219,17 +218,17 @@ func TestRunWatcher_CancelExits(t *testing.T) {
 	defer exec.Stop()
 
 	rule := scheduler.CollectionRule{
-		RuleID:             "r4",
-		FileGlob:           "*.log",
-		UploadBucket:       "bkt",
-		UploadPathTemplate: "logs",
-		SourcePathTemplate: dir,
+		RuleID:           "r4",
+		BasePath:         dir,
+		PathPattern:      "*.log",
+		UploadBucket:     "bkt",
+		DestPathTemplate: "logs/{filename}",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		runWatcher(ctx, rule, exec, q, zap.NewNop())
+		runWatcher(ctx, rule, exec, q, trollsift.AgentContext{}, zap.NewNop())
 		close(done)
 	}()
 	cancel()

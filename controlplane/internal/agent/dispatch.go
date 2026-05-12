@@ -168,18 +168,17 @@ func (d *Dispatcher) lookupBucketName(ctx context.Context, bucketID uuid.UUID) (
 // when calling S3 PutObject.
 func ruleToProto(rule *db.CollectionRule, bucketName string) *agentv1.CollectionRule {
 	return &agentv1.CollectionRule{
-		RuleId:             rule.ID.String(),
-		Name:               rule.Name,
-		Mode:               string(rule.Mode),
-		SourcePathTemplate: rule.SourcePathTemplate,
-		FileGlob:           rule.FileGlob,
-		UploadBucket:       bucketName,
-		UploadPathTemplate: rule.UploadPathTemplate,
-		WatchRecursive:     rule.WatchRecursive,
-		WatchSubdirPattern: rule.WatchSubdirPattern.String,
-		CronExpr:           rule.CronExpr.String,
-		RunOnceOnStart:     rule.RunOnceOnStart,
-		AppendMode:         rule.AppendMode,
-		Enabled:            rule.Status == db.RuleStatusActive,
+		RuleId:           rule.ID.String(),
+		Name:             rule.Name,
+		Mode:             string(rule.Mode),
+		BasePath:         rule.BasePath,
+		PathPattern:      rule.PathPattern,
+		DestPathTemplate: rule.DestPathTemplate,
+		UploadBucket:     bucketName,
+		Recursive:        rule.Recursive,
+		CronExpr:         rule.CronExpr.String,
+		RunOnceOnStart:   rule.RunOnceOnStart,
+		AppendMode:       rule.AppendMode,
+		Enabled:          rule.Status == db.RuleStatusActive,
 	}
 }
