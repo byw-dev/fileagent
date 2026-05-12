@@ -12,6 +12,12 @@ T3-2-BUG（集成联调新发现 Bug A~D）✅ 已完成
     ↓
 T3-2 Web UI + Control Plane 联调  ← 当前任务
     ↓
+T3-4 pkg/trollsift 共享路径模板库
+    ↓
+T3-5 字段统一 + Bug 修复
+    ↓
+T3-6 Dry-Run 规则测试功能
+    ↓
 T3-3 Python SDK + Control Plane 联调
 ```
 
@@ -29,6 +35,19 @@ T3-3 Python SDK + Control Plane 联调
 - [ ] 采集器详情页：创建采集规则 → 规则下发到已连接的 agent（日志可见）
 - [ ] 文件浏览器：搜索文件 → 单文件获取下载链接 → 链接可访问
 - [ ] `pnpm test` 全部通过
+
+---
+
+## T3-4 / T3-5 / T3-6 — 采集规则重构 ⬜
+
+**前置依赖**：T3-2 完成  
+**详细规格**：[`phase-3-rft.md`](phase-3-rft.md)
+
+| ID | 任务 | 状态 |
+|----|------|------|
+| T3-4 | `pkg/trollsift` 共享路径模板库 | ⬜ |
+| T3-5 | 字段统一 + Bug 修复（DB/proto/agent/CP/WebUI） | ⬜ |
+| T3-6 | Dry-Run 规则测试功能 | ⬜ |
 
 ---
 

@@ -351,3 +351,86 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 - **WebSocket/SSE 推送**：实现复杂（需要连接管理、鉴权），对于仅需 1 次 request-response 的场景过于重量级。
 - **超时设为 60s**：目录浏览操作不应让用户等待超过 30s；30s 已覆盖慢速网络下的正常操作，超时后给 504 比 hang 住更好。
 
+
+---
+
+## D-009：采集规则字段统一命名方案（T3-5）
+
+**决策日期**：2026-05-11  
+**影响范围**：DB migrations / proto / controlplane / agent / webui
+
+### 背景
+
+系统在采集规则相关字段命名上存在四层不一致：DB / proto / CP REST / WebUI 使用了四套不同的字段名，导致字段映射断路（规则创建 400）、`upload_bucket` 始终为空等 Bug。
+
+### 决策
+
+对 `collection_rules` 相关的四层字段名进行全面统一。
+
+**完整字段统一映射**（"现状 → 目标"）：
+
+| 概念 | **统一字段名** | DB 现状 | proto 现状 | REST-in 现状 | REST-out 现状 | Frontend 现状 |
+|---|---|---|---|---|---|---|
+| 监控根目录 | `base_path` | `source_path_template` | `source_path_template` | `source_path` | `source_path` | `source_path` |
+| 文件/路径过滤 | `path_pattern` | `file_glob` | `file_glob` | `file_pattern` | `file_pattern` | `file_pattern` |
+| 目标路径模板 | `dest_path_template` | `upload_path_template` | `upload_path_template` | `dest_path_template` ✓ | `dest_path_template` ✓ | `dest_path_template` ✓ |
+| 目标 Bucket（DB FK） | `bucket_id` | `bucket_id` ✓ | — | `dest_bucket_id` | `dest_bucket_id` | `dest_bucket_id` |
+| 目标 Bucket（proto，bucket 名称字符串） | `upload_bucket` | — | `upload_bucket` | — | — | — |
+| 是否递归 | `recursive` | `watch_recursive` | `watch_recursive` | `watch_recursive` | `watch_recursive` | 缺失 |
+| 子目录过滤 | **删除** | `watch_subdir_pattern` | `watch_subdir_pattern` | `watch_subdir_pattern` | 缺失 | 缺失 |
+| 追加模式 | `append_mode` | `append_mode` ✓ | `append_mode` ✓ | `append_mode` ✓ | 缺失 | 缺失 |
+| 采集模式 | `mode`（小写） | `mode` enum `('watch','scheduled')` | `mode` string | `mode` string | `mode` string | `mode`（`'WATCH'`/`'SCHEDULED'` 大写，需归一化） |
+| 采集规则启用状态 | `enabled bool`（REST/proto 层） | `status rule_status('active','inactive')` **保留枚举** | `enabled bool` ✓ | — | `is_active` bool | `is_active` bool |
+
+### 关键澄清
+
+**`collection_rules.status` vs `agents.status`**：
+
+- **`agents.status`**（5 个值：`pending / approved / online / offline / revoked`）：描述 Agent 生命周期状态。**不改动**。
+- **`collection_rules.status`**（2 个值：`active / inactive`）：描述采集规则是否启用。DB 层**保持 `rule_status` 枚举类型不变**（便于后期扩展 `'paused'` 等状态）；应用层在 `toRuleResponse()` 和 `ruleToProto()` 中做枚举→bool 转换：`status='active'` → `enabled=true`；REST 输入 `enabled bool` 写入 DB 前转换回枚举值。
+
+**`upload_bucket` vs `bucket_id`**：
+
+- **proto `upload_bucket`**：存储 MinIO bucket 的**名称字符串**（不是 UUID），Agent 直接用它调用 S3 `PutObject`。Agent 无法通过 UUID 查询 bucket 名（它不访问 CP 数据库）。
+- **DB/REST `bucket_id`**：存储 UUID，是 `buckets` 表外键。
+- CP 的 `dispatch.go` 负责在下发规则时查出 bucket 名填入 proto `upload_bucket`。
+
+### `append_mode` 值域统一
+
+- DB 默认值保持 `'overwrite'`（不变）
+- Agent 侧常量 `AppendModeNone = ""` 重命名为 `AppendModeOverwrite = "overwrite"`
+- CP handler（`CreateRule`）当前错误地将空 `append_mode` 默认为 `"none"`，T3-5 修正为 `"overwrite"`
+- 统一后三端值域：`'overwrite'` / `'tail'` / `'close_wait'`
+
+### 备选方案（被否决）
+
+- **`append_mode` DB 改为 `'none'`**：与现有数据不兼容，需要额外 migration；`'overwrite'` 语义已足够清晰。
+- **逐层单独修复而不全局统一**：每次修复后测试范围难以界定，不如一次性对齐。
+
+---
+
+## D-010：引入 `pkg/trollsift` 共享路径模板库（T3-4）
+
+**决策日期**：2026-05-11  
+**影响范围**：新建 `pkg/trollsift/`，agent / controlplane 引用
+
+### 决策
+
+引入 `pkg/trollsift/` 作为独立 Go 模块（`github.com/byw-dev/fileagent/pkg/trollsift`），
+加入 `go.work`，供 agent 和 controlplane 共同 import，以支持结构化路径模板的解析与组合。
+
+**主要能力**：
+- `Parse(s)`：从字符串提取格式字段值（支持字符串、整数、LDML 时间）
+- `Compose(vals, allowPartial)`：将字段值格式化到模板串
+- `Globify()`：将模板串转为 doublestar 兼容的 glob 字符串
+- `IsTrollsiftPattern(s)`：判断是否含格式字段（含 `{` 即为 trollsift 模式）
+- LDML 时间字段子集（`yyyy`、`MM`、`dd`、`HH`、`mm`、`ss`），时区 `|tz=IANA`
+- `AgentContext` 注入（`{agent_name}`、`{agent_id}`）
+
+**模块位置**：`pkg/trollsift/go.mod` module 名为 `github.com/byw-dev/fileagent/pkg/trollsift`，
+`go.work` 追加 `use ./pkg/trollsift`。
+
+### 备选方案（被否决）
+
+- **放入 `agent/` 模块内**：controlplane 的 Dry-Run 端点在校验 path_pattern 时也需要 Globify/Validate，共享为独立包更合理。
+- **使用现有开源 trollsift 库**：Python 的 trollsift 库无对等 Go 版本，且本项目需要 LDML 时间格式支持，需要自己实现。
