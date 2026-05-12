@@ -181,7 +181,7 @@ func main() {
 	agentMgr := agent.NewManager(queries, redisClient, authSvc, nats, logger, cfg.JWTAccessTokenTTL)
 
 	registry := grpcserver.NewAgentRegistry()
-	dispatcher := agent.NewDispatcher(queries, redisClient, registry, logger)
+	dispatcher := agent.NewDispatcher(queries, queries, redisClient, registry, logger)
 
 	ix := indexer.NewIndexer(database, nats, logger)
 

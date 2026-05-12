@@ -95,11 +95,11 @@ export interface CollectionRule {
   agent_id: string
   name: string
   mode: CollectionMode
-  source_path: string
-  file_pattern: string
+  base_path: string
+  path_pattern: string
   cron_expr: string | null
   run_once_on_start: boolean
-  dest_bucket_id: string
+  bucket_id: string
   dest_path_template: string
   is_active: boolean
   created_at: string
@@ -110,11 +110,11 @@ export interface CollectionRule {
 export interface CollectionRulePayload {
   name: string
   mode: CollectionMode
-  source_path: string
-  file_pattern: string
+  base_path: string
+  path_pattern: string
   cron_expr: string | null
   run_once_on_start: boolean
-  dest_bucket_id: string
+  bucket_id: string
   dest_path_template: string
 }
 

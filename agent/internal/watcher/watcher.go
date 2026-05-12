@@ -34,15 +34,15 @@ type Watcher struct {
 	fileGlob     string
 	recursive    bool
 	pollInterval time.Duration
-	appendMode   string // "" | "tail" | "close_wait"
+	appendMode   string // "overwrite" | "tail" | "close_wait"
 	logger       *zap.Logger
 
 	// tailOffsets tracks the last known byte offset per file for tail mode.
 	tailOffsets map[string]int64
 }
 
-// AppendModeNone means upload the full file on each change.
-const AppendModeNone = ""
+// AppendModeOverwrite means upload the full file on each change (default mode).
+const AppendModeOverwrite = "overwrite"
 
 // AppendModeTail tracks the byte offset of each file and uploads only the
 // bytes added since the last successful upload.
@@ -59,7 +59,7 @@ const closeWaitDebounce = 500 * time.Millisecond
 // fileGlob is matched against file base names (e.g. "*.log").
 // If recursive is true, subdirectories are watched as well.
 // pollInterval controls the fallback polling cadence (default 30 s when 0).
-// appendMode controls append-mode behaviour: "", "tail", or "close_wait".
+// appendMode controls append-mode behaviour: "overwrite", "tail", or "close_wait".
 func New(sourcePath, fileGlob string, recursive bool, pollInterval time.Duration, appendMode string, logger *zap.Logger) (*Watcher, error) {
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second

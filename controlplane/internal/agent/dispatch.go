@@ -17,6 +17,11 @@ type DispatchDB interface {
 	ListCollectionRulesByAgent(ctx context.Context, agentID uuid.UUID) ([]*db.CollectionRule, error)
 }
 
+// BucketQuerier looks up buckets by ID.
+type BucketQuerier interface {
+	GetBucketByID(ctx context.Context, id uuid.UUID) (*db.Bucket, error)
+}
+
 // DispatchCacheClient is the cache interface required by Dispatcher.
 type DispatchCacheClient interface {
 	SetNX(ctx context.Context, key string, value interface{}, ttl time.Duration) (bool, error)
@@ -32,6 +37,7 @@ type RegistryClient interface {
 // Dispatcher sends rule commands to online agents.
 type Dispatcher struct {
 	db       DispatchDB
+	buckets  BucketQuerier
 	cache    DispatchCacheClient
 	registry RegistryClient
 	logger   *zap.Logger
@@ -40,12 +46,14 @@ type Dispatcher struct {
 // NewDispatcher creates a new Dispatcher.
 func NewDispatcher(
 	dispatchDB DispatchDB,
+	bucketQuerier BucketQuerier,
 	cacheClient DispatchCacheClient,
 	registry RegistryClient,
 	logger *zap.Logger,
 ) *Dispatcher {
 	return &Dispatcher{
 		db:       dispatchDB,
+		buckets:  bucketQuerier,
 		cache:    cacheClient,
 		registry: registry,
 		logger:   logger,
@@ -71,7 +79,12 @@ func (d *Dispatcher) DispatchRule(ctx context.Context, rule *db.CollectionRule) 
 	}
 	defer func() { _ = d.cache.Del(ctx, lockKey) }()
 
-	protoRule := ruleToProto(rule)
+	bucketName, err := d.lookupBucketName(ctx, rule.BucketID)
+	if err != nil {
+		return fmt.Errorf("dispatch_rule: lookup bucket: %w", err)
+	}
+
+	protoRule := ruleToProto(rule, bucketName)
 	msg := &agentv1.ServerMessage{
 		Payload: &agentv1.ServerMessage_PushRule{
 			PushRule: &agentv1.PushRuleCommand{Rule: protoRule},
@@ -117,7 +130,15 @@ func (d *Dispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) err
 		if rule.Status != db.RuleStatusActive {
 			continue
 		}
-		protoRule := ruleToProto(rule)
+		bucketName, err := d.lookupBucketName(ctx, rule.BucketID)
+		if err != nil {
+			d.logger.Warn("sync_rules: lookup bucket failed",
+				zap.String("rule_id", rule.ID.String()),
+				zap.Error(err),
+			)
+			continue
+		}
+		protoRule := ruleToProto(rule, bucketName)
 		msg := &agentv1.ServerMessage{
 			Payload: &agentv1.ServerMessage_PushRule{
 				PushRule: &agentv1.PushRuleCommand{Rule: protoRule},
@@ -133,14 +154,26 @@ func (d *Dispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) err
 	return nil
 }
 
+// lookupBucketName retrieves the MinIO bucket name for the given bucket UUID.
+func (d *Dispatcher) lookupBucketName(ctx context.Context, bucketID uuid.UUID) (string, error) {
+	bucket, err := d.buckets.GetBucketByID(ctx, bucketID)
+	if err != nil {
+		return "", fmt.Errorf("get bucket %s: %w", bucketID, err)
+	}
+	return bucket.Name, nil
+}
+
 // ruleToProto converts a db.CollectionRule to the proto representation.
-func ruleToProto(rule *db.CollectionRule) *agentv1.CollectionRule {
+// bucketName is the MinIO bucket name string (not UUID) that the agent will use
+// when calling S3 PutObject.
+func ruleToProto(rule *db.CollectionRule, bucketName string) *agentv1.CollectionRule {
 	return &agentv1.CollectionRule{
 		RuleId:             rule.ID.String(),
 		Name:               rule.Name,
 		Mode:               string(rule.Mode),
 		SourcePathTemplate: rule.SourcePathTemplate,
 		FileGlob:           rule.FileGlob,
+		UploadBucket:       bucketName,
 		UploadPathTemplate: rule.UploadPathTemplate,
 		WatchRecursive:     rule.WatchRecursive,
 		WatchSubdirPattern: rule.WatchSubdirPattern.String,

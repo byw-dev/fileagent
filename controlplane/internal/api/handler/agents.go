@@ -446,32 +446,32 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 
 // collectionRuleResponse is the outbound JSON shape for a collection rule.
 type collectionRuleResponse struct {
-	ID                 string `json:"id"`
-	AgentID            string `json:"agent_id"`
-	DestBucketID       string `json:"dest_bucket_id"`
-	Name               string `json:"name"`
-	Mode               string `json:"mode"`
-	IsActive           bool   `json:"is_active"`
-	RunOnceOnStart     bool   `json:"run_once_on_start"`
-	SourcePath         string `json:"source_path"`
-	FilePattern        string `json:"file_pattern"`
-	DestPathTemplate   string `json:"dest_path_template"`
-	WatchRecursive     bool   `json:"watch_recursive"`
-	CronExpr           string `json:"cron_expr,omitempty"`
-	CreatedAt          string `json:"created_at"`
+	ID               string `json:"id"`
+	AgentID          string `json:"agent_id"`
+	BucketID         string `json:"bucket_id"`
+	Name             string `json:"name"`
+	Mode             string `json:"mode"`
+	IsActive         bool   `json:"is_active"`
+	RunOnceOnStart   bool   `json:"run_once_on_start"`
+	BasePath         string `json:"base_path"`
+	PathPattern      string `json:"path_pattern"`
+	DestPathTemplate string `json:"dest_path_template"`
+	WatchRecursive   bool   `json:"watch_recursive"`
+	CronExpr         string `json:"cron_expr,omitempty"`
+	CreatedAt        string `json:"created_at"`
 }
 
 func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 	resp := collectionRuleResponse{
 		ID:               r.ID.String(),
 		AgentID:          r.AgentID.String(),
-		DestBucketID:     r.BucketID.String(),
+		BucketID:         r.BucketID.String(),
 		Name:             r.Name,
 		Mode:             string(r.Mode),
 		IsActive:         r.Status == db.RuleStatusActive,
 		RunOnceOnStart:   r.RunOnceOnStart,
-		SourcePath:       r.SourcePathTemplate,
-		FilePattern:      r.FileGlob,
+		BasePath:         r.SourcePathTemplate,
+		PathPattern:      r.FileGlob,
 		DestPathTemplate: r.UploadPathTemplate,
 		WatchRecursive:   r.WatchRecursive,
 		CreatedAt:        r.CreatedAt.UTC().Format(time.RFC3339),
@@ -515,12 +515,12 @@ func (h *AgentsHandler) ListRules(c *gin.Context) {
 // Field names match the response shape (collectionRuleResponse) so that the
 // same JSON key set is used for both reads and writes.
 type createRuleRequest struct {
-	BucketID           string          `json:"dest_bucket_id"    binding:"required"`
-	Name               string          `json:"name"              binding:"required"`
-	Mode               string          `json:"mode"              binding:"required"`
-	SourcePathTemplate string          `json:"source_path"       binding:"required"`
-	FileGlob           string          `json:"file_pattern"      binding:"required"`
-	UploadPathTemplate string          `json:"dest_path_template" binding:"required"`
+	BucketID           string          `json:"bucket_id"          binding:"required"`
+	Name               string          `json:"name"               binding:"required"`
+	Mode               string          `json:"mode"               binding:"required"`
+	BasePath           string          `json:"base_path"          binding:"required"`
+	PathPattern        string          `json:"path_pattern"       binding:"required"`
+	DestPathTemplate   string          `json:"dest_path_template" binding:"required"`
 	WatchRecursive     bool            `json:"watch_recursive"`
 	WatchSubdirPattern string          `json:"watch_subdir_pattern"`
 	CronExpr           string          `json:"cron_expr"`
@@ -562,8 +562,9 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 
 	appendMode := req.AppendMode
 	if appendMode == "" {
-		appendMode = "none"
+		appendMode = "overwrite"
 	}
+	mode := strings.ToLower(req.Mode)
 	metadata := req.Metadata
 	if len(metadata) == 0 {
 		metadata = json.RawMessage(`{}`)
@@ -574,10 +575,10 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 		AgentID:            agentID,
 		BucketID:           bucketID,
 		Name:               req.Name,
-		Mode:               db.UploadMode(req.Mode),
-		SourcePathTemplate: req.SourcePathTemplate,
-		FileGlob:           req.FileGlob,
-		UploadPathTemplate: req.UploadPathTemplate,
+		Mode:               db.UploadMode(mode),
+		SourcePathTemplate: req.BasePath,
+		FileGlob:           req.PathPattern,
+		UploadPathTemplate: req.DestPathTemplate,
 		WatchRecursive:     req.WatchRecursive,
 		RunOnceOnStart:     req.RunOnceOnStart,
 		AppendMode:         appendMode,

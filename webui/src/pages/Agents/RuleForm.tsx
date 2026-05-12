@@ -46,9 +46,9 @@ interface Bucket {
 interface RuleFormValues {
   name: string
   mode: CollectionMode
-  dest_bucket_id: string
-  source_path: string
-  file_pattern: string
+  bucket_id: string
+  base_path: string
+  path_pattern: string
   cron_expr?: string
   run_once_on_start?: boolean
   dest_path_template: string
@@ -99,9 +99,9 @@ function AgentRuleFormPage() {
       await createRule(agentId, {
         name: values.name,
         mode: values.mode,
-        dest_bucket_id: values.dest_bucket_id,
-        source_path: values.source_path,
-        file_pattern: values.file_pattern,
+        bucket_id: values.bucket_id,
+        base_path: values.base_path,
+        path_pattern: values.path_pattern,
         cron_expr: values.mode === 'SCHEDULED' ? (values.cron_expr ?? null) : null,
         run_once_on_start: values.mode === 'SCHEDULED' ? (values.run_once_on_start ?? false) : false,
         dest_path_template: values.dest_path_template,
@@ -192,7 +192,7 @@ function AgentRuleFormPage() {
           />
 
           <ProFormSelect
-            name="dest_bucket_id"
+            name="bucket_id"
             label="目标 Bucket"
             options={bucketOptions}
             rules={[{ required: true, message: '请选择目标 Bucket' }]}
@@ -203,7 +203,7 @@ function AgentRuleFormPage() {
         {/* Step 2: Source Path Config */}
         <StepsForm.StepForm name="step2" title="源路径配置">
           <ProFormText
-            name="source_path"
+            name="base_path"
             label="源目录路径"
             placeholder="/data/sensors"
             rules={[
@@ -220,7 +220,7 @@ function AgentRuleFormPage() {
           />
 
           <ProFormText
-            name="file_pattern"
+            name="path_pattern"
             label="文件过滤模式"
             placeholder="*.csv"
             initialValue="*"

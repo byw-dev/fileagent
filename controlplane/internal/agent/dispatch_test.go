@@ -23,6 +23,21 @@ func (m *mockDispatchDB) ListCollectionRulesByAgent(_ context.Context, _ uuid.UU
 	return m.rules, nil
 }
 
+type mockBucketQuerier struct {
+	buckets map[uuid.UUID]*db.Bucket
+}
+
+func newMockBucketQuerier() *mockBucketQuerier {
+	return &mockBucketQuerier{buckets: make(map[uuid.UUID]*db.Bucket)}
+}
+
+func (m *mockBucketQuerier) GetBucketByID(_ context.Context, id uuid.UUID) (*db.Bucket, error) {
+	if b, ok := m.buckets[id]; ok {
+		return b, nil
+	}
+	return &db.Bucket{ID: id, Name: "test-bucket"}, nil
+}
+
 type mockDispatchCache struct {
 	keys map[string]bool
 }
@@ -68,8 +83,9 @@ func newTestDispatcher(t *testing.T) (*Dispatcher, *mockDispatchDB, *mockDispatc
 	dispDB := &mockDispatchDB{}
 	dispCache := newMockDispatchCache()
 	reg := newMockRegistry()
+	buckets := newMockBucketQuerier()
 	logger, _ := zap.NewDevelopment()
-	d := NewDispatcher(dispDB, dispCache, reg, logger)
+	d := NewDispatcher(dispDB, buckets, dispCache, reg, logger)
 	return d, dispDB, dispCache, reg
 }
 
@@ -104,6 +120,8 @@ func TestDispatchRule_AgentOnline(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, reg.sent, 1)
 	assert.NotNil(t, reg.sent[0].GetPushRule())
+	// BUG-2 regression: upload_bucket must be non-empty.
+	assert.NotEmpty(t, reg.sent[0].GetPushRule().GetRule().GetUploadBucket())
 }
 
 func TestDispatchRuleCancel(t *testing.T) {
@@ -177,8 +195,49 @@ return nil, e.err
 
 func TestSyncRulesOnConnect_DBError(t *testing.T) {
 logger, _ := zap.NewDevelopment()
-d := NewDispatcher(&errDispatchDB{err: assert.AnError}, newMockDispatchCache(), newMockRegistry(), logger)
+d := NewDispatcher(&errDispatchDB{err: assert.AnError}, newMockBucketQuerier(), newMockDispatchCache(), newMockRegistry(), logger)
 err := d.SyncRulesOnConnect(context.Background(), uuid.New().String())
 require.Error(t, err)
 assert.Contains(t, err.Error(), "list rules")
+}
+
+type errBucketQuerier struct{ err error }
+
+func (e *errBucketQuerier) GetBucketByID(_ context.Context, _ uuid.UUID) (*db.Bucket, error) {
+	return nil, e.err
+}
+
+func TestDispatchRule_BucketLookupError(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	agentID := uuid.New()
+	reg := newMockRegistry()
+	reg.online[agentID.String()] = true
+	d := NewDispatcher(&mockDispatchDB{}, &errBucketQuerier{err: assert.AnError}, newMockDispatchCache(), reg, logger)
+
+	rule := &db.CollectionRule{
+		ID:      uuid.New(),
+		AgentID: agentID,
+		Status:  db.RuleStatusActive,
+	}
+	err := d.DispatchRule(context.Background(), rule)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "lookup bucket")
+	assert.Empty(t, reg.sent)
+}
+
+func TestSyncRulesOnConnect_BucketLookupError_SkipsRule(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	agentID := uuid.New()
+	reg := newMockRegistry()
+	reg.online[agentID.String()] = true
+	dispDB := &mockDispatchDB{
+		rules: []*db.CollectionRule{
+			{ID: uuid.New(), AgentID: agentID, Status: db.RuleStatusActive},
+		},
+	}
+	d := NewDispatcher(dispDB, &errBucketQuerier{err: assert.AnError}, newMockDispatchCache(), reg, logger)
+	// Should not return an error; rules with failed bucket lookup are skipped.
+	err := d.SyncRulesOnConnect(context.Background(), agentID.String())
+	require.NoError(t, err)
+	assert.Empty(t, reg.sent)
 }
