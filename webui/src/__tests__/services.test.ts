@@ -87,27 +87,31 @@ describe('services/agents – extended functions', () => {
       agent_id: 'agent-1',
       name: 'Test Rule',
       mode: 'WATCH' as const,
-      source_path: '/data',
-      file_pattern: '*.csv',
+      base_path: '/data',
+      path_pattern: '*.csv',
       cron_expr: null,
       run_once_on_start: false,
-      dest_bucket_id: 'bucket-1',
+      bucket_id: 'bucket-1',
       dest_path_template: '/{year}/{filename}',
-      is_active: true,
+      recursive: true,
+      append_mode: 'overwrite',
+      enabled: true,
       created_at: '',
-      updated_at: '',
     }
     mockPost.mockResolvedValue({ data: rule })
     const { createRule } = await import('../services/agents')
     const payload = {
       name: 'Test Rule',
       mode: 'WATCH' as const,
-      source_path: '/data',
-      file_pattern: '*.csv',
+      base_path: '/data',
+      path_pattern: '*.csv',
       cron_expr: null,
       run_once_on_start: false,
-      dest_bucket_id: 'bucket-1',
+      bucket_id: 'bucket-1',
       dest_path_template: '/{year}/{filename}',
+      recursive: true,
+      append_mode: 'overwrite',
+      enabled: true,
     }
     const result = await createRule('agent-1', payload)
     expect(mockPost).toHaveBeenCalledWith('/api/v1/agents/agent-1/rules', payload)

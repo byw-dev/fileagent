@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/alicebob/miniredis/v2"
+	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/google/uuid"
@@ -90,13 +90,13 @@ func (d *integrationTestMockDispatcher) SyncRulesOnConnect(_ context.Context, ag
 		Payload: &agentv1.ServerMessage_PushRule{
 			PushRule: &agentv1.PushRuleCommand{
 				Rule: &agentv1.CollectionRule{
-					RuleId:             "rule-e2e-1",
-					Name:               "watch-log",
-					Mode:               "watch",
-					SourcePathTemplate: "/var/log",
-					FileGlob:           "*.log",
-					UploadPathTemplate: "agents/logs",
-					Enabled:            true,
+					RuleId:           "rule-e2e-1",
+					Name:             "watch-log",
+					Mode:             "watch",
+					BasePath:         "/var/log",
+					PathPattern:      "*.log",
+					DestPathTemplate: "agents/logs",
+					Enabled:          true,
 				},
 			},
 		},

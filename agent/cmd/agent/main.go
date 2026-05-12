@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/byw-dev/fileagent/agent/internal/config"
 	"github.com/byw-dev/fileagent/agent/internal/credential"
 	"github.com/byw-dev/fileagent/agent/internal/executor"
@@ -25,6 +26,7 @@ import (
 	"github.com/byw-dev/fileagent/agent/internal/uploader"
 	"github.com/byw-dev/fileagent/agent/internal/watcher"
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"github.com/byw-dev/fileagent/pkg/trollsift"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -146,6 +148,7 @@ func main() {
 	var (
 		ruleHandlesMu sync.Mutex
 		ruleHandles   = make(map[string]*ruleHandle)
+		agentCtx      trollsift.AgentContext
 	)
 
 	stopRule := func(ruleID string) {
@@ -182,10 +185,10 @@ func main() {
 
 		switch rule.Mode {
 		case "watch":
-			go runWatcher(ruleCtx, rule, exec, q, logger)
+			go runWatcher(ruleCtx, rule, exec, q, agentCtx, logger)
 		case "cron":
 			if err := sched.AddRule(rule, func(resolvedPath string) {
-				walkAndSubmit(ruleCtx, exec, q, rule, resolvedPath, logger)
+				walkAndSubmit(ruleCtx, exec, q, rule, resolvedPath, agentCtx, logger)
 			}); err != nil {
 				logger.Warn("agent: add cron rule failed",
 					zap.String("rule_id", rule.RuleID), zap.Error(err))
@@ -255,6 +258,7 @@ func main() {
 	}
 	grpcClient.SetToken(lc.TokenManager.Token())
 	grpcClient.SetAgentID(lc.AgentID)
+	agentCtx.AgentID = lc.AgentID
 	logger.Info("agent: approved, starting normal operation", zap.String("agent_id", lc.AgentID))
 
 	if err := grpcClient.Connect(ctx); err != nil {
@@ -335,26 +339,25 @@ func protoToSchedulerRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 		return scheduler.CollectionRule{}
 	}
 	return scheduler.CollectionRule{
-		RuleID:             r.GetRuleId(),
-		Name:               r.GetName(),
-		Mode:               r.GetMode(),
-		SourcePathTemplate: r.GetSourcePathTemplate(),
-		FileGlob:           r.GetFileGlob(),
-		UploadBucket:       r.GetUploadBucket(),
-		UploadPathTemplate: r.GetUploadPathTemplate(),
-		WatchRecursive:     r.GetWatchRecursive(),
-		WatchSubdirPattern: r.GetWatchSubdirPattern(),
-		CronExpr:           r.GetCronExpr(),
-		RunOnceOnStart:     r.GetRunOnceOnStart(),
-		AppendMode:         r.GetAppendMode(),
-		Enabled:            r.GetEnabled(),
+		RuleID:           r.GetRuleId(),
+		Name:             r.GetName(),
+		Mode:             r.GetMode(),
+		BasePath:         r.GetBasePath(),
+		PathPattern:      r.GetPathPattern(),
+		UploadBucket:     r.GetUploadBucket(),
+		DestPathTemplate: r.GetDestPathTemplate(),
+		Recursive:        r.GetRecursive(),
+		CronExpr:         r.GetCronExpr(),
+		RunOnceOnStart:   r.GetRunOnceOnStart(),
+		AppendMode:       r.GetAppendMode(),
+		Enabled:          r.GetEnabled(),
 	}
 }
 
 // runWatcher starts a file-system watcher for the given watch-mode rule and
 // submits upload tasks to the executor for every create/write event.
-func runWatcher(ctx context.Context, rule scheduler.CollectionRule, exec *executor.Executor, q *queue.Queue, logger *zap.Logger) {
-	w, err := watcher.New(rule.SourcePathTemplate, rule.FileGlob, rule.WatchRecursive, 0, rule.AppendMode, logger)
+func runWatcher(ctx context.Context, rule scheduler.CollectionRule, exec *executor.Executor, q *queue.Queue, agentCtx trollsift.AgentContext, logger *zap.Logger) {
+	w, err := watcher.New(rule.BasePath, "*", rule.Recursive, 0, rule.AppendMode, logger)
 	if err != nil {
 		logger.Warn("agent: watcher init failed",
 			zap.String("rule_id", rule.RuleID), zap.Error(err))
@@ -378,19 +381,39 @@ func runWatcher(ctx context.Context, rule scheduler.CollectionRule, exec *execut
 			if ev.Op == "remove" {
 				continue
 			}
-			submitFile(exec, q, rule, ev.Path, ev.Size, ev.ModTime, ev.FileOffset, rule.AppendMode, logger)
+			matched, matchErr := matchGlob(rule, ev.Path)
+			if matchErr != nil {
+				logger.Warn("agent: match path failed",
+					zap.String("rule_id", rule.RuleID),
+					zap.String("path", ev.Path),
+					zap.Error(matchErr),
+				)
+				continue
+			}
+			if !matched {
+				continue
+			}
+			submitFile(exec, q, rule, ev.Path, ev.Size, ev.ModTime, ev.FileOffset, rule.AppendMode, agentCtx, logger)
 		}
 	}
 }
 
 // walkAndSubmit walks basePath and submits an upload task for every file
-// matching rule.FileGlob that has not already been processed.
-func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, basePath string, logger *zap.Logger) {
+// matching rule.PathPattern that has not already been processed.
+func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, basePath string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
 	err := filepath.WalkDir(basePath, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil || d.IsDir() {
 			return nil
 		}
-		matched, _ := filepath.Match(rule.FileGlob, d.Name())
+		matched, matchErr := matchGlob(rule, path)
+		if matchErr != nil {
+			logger.Warn("agent: match path failed",
+				zap.String("rule_id", rule.RuleID),
+				zap.String("path", path),
+				zap.Error(matchErr),
+			)
+			return nil
+		}
 		if !matched {
 			return nil
 		}
@@ -398,7 +421,7 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 		if err != nil {
 			return nil
 		}
-		submitFile(exec, q, rule, path, info.Size(), info.ModTime(), 0, "", logger)
+		submitFile(exec, q, rule, path, info.Size(), info.ModTime(), 0, "", agentCtx, logger)
 		return nil
 	})
 	if err != nil && ctx.Err() == nil {
@@ -408,7 +431,7 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 }
 
 // submitFile checks deduplication and enqueues an upload task.
-func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, logger *zap.Logger) {
+func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
 	done, err := q.IsProcessed(rule.RuleID, localPath)
 	if err != nil {
 		logger.Warn("agent: check processed failed", zap.String("path", localPath), zap.Error(err))
@@ -420,7 +443,7 @@ func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.Collecti
 		ID:          uuid.New().String(),
 		RuleID:      rule.RuleID,
 		LocalPath:   localPath,
-		StoragePath: buildStoragePath(rule, localPath),
+		StoragePath: buildStoragePath(rule, localPath, agentCtx, time.Now().UTC()),
 		Bucket:      rule.UploadBucket,
 		FileSize:    size,
 		FileMtime:   mtime.Unix(),
@@ -439,18 +462,61 @@ func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.Collecti
 // file's base name, and the result is used as-is (leading "/" stripped).
 // Otherwise the resolved prefix is treated as a directory and the file's base
 // name is appended automatically.
-func buildStoragePath(rule scheduler.CollectionRule, localPath string) string {
-	base := filepath.Base(localPath)
-	resolved := scheduler.ResolvePathWithFile(rule.UploadPathTemplate, time.Now().UTC(), base)
-	if strings.Contains(rule.UploadPathTemplate, "{filename}") {
-		// Template fully describes the object key — just strip the leading slash.
-		return strings.TrimPrefix(resolved, "/")
+func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx trollsift.AgentContext, now time.Time) string {
+	relPath, err := filepath.Rel(rule.BasePath, localPath)
+	if err != nil {
+		relPath = filepath.Base(localPath)
 	}
-	// Template is a directory prefix — append the file name.
-	if resolved == "" {
-		return base
+	relPath = filepath.ToSlash(relPath)
+
+	fields := map[string]trollsift.Value{}
+	if trollsift.IsTrollsiftPattern(rule.PathPattern) {
+		p, pErr := trollsift.New(rule.PathPattern)
+		if pErr == nil {
+			parsed, parseErr := p.Parse(relPath)
+			if parseErr == nil {
+				fields = parsed
+			}
+		}
 	}
-	return strings.TrimRight(resolved, "/") + "/" + base
+
+	fields = trollsift.InjectContext(agentCtx, fields)
+	fields["filename"] = trollsift.S(filepath.Base(localPath))
+	fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(localPath), "."))
+	if strings.Contains(rule.DestPathTemplate, "{time") {
+		fields["time"] = trollsift.T(now)
+	}
+
+	destParser, err := trollsift.New(rule.DestPathTemplate)
+	if err != nil {
+		return filepath.Base(localPath)
+	}
+	storagePath, err := destParser.Compose(fields, false)
+	if err != nil {
+		return filepath.Base(localPath)
+	}
+	if storagePath == "" {
+		return filepath.Base(localPath)
+	}
+	return strings.TrimPrefix(storagePath, "/")
+}
+
+// matchGlob matches a local absolute path against rule.PathPattern using relative-path semantics.
+func matchGlob(rule scheduler.CollectionRule, absPath string) (bool, error) {
+	relPath, err := filepath.Rel(rule.BasePath, absPath)
+	if err != nil {
+		return false, err
+	}
+	relPath = filepath.ToSlash(relPath)
+
+	if trollsift.IsTrollsiftPattern(rule.PathPattern) {
+		parser, err := trollsift.New(rule.PathPattern)
+		if err != nil {
+			return false, err
+		}
+		return doublestar.Match(parser.Globify(), relPath)
+	}
+	return doublestar.Match(rule.PathPattern, relPath)
 }
 
 // handleListDir walks the requested path and sends a DirectoryListing response.

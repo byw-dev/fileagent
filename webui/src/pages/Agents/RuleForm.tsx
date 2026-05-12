@@ -51,6 +51,9 @@ interface RuleFormValues {
   path_pattern: string
   cron_expr?: string
   run_once_on_start?: boolean
+  recursive?: boolean
+  append_mode?: string
+  enabled?: boolean
   dest_path_template: string
 }
 
@@ -105,6 +108,9 @@ function AgentRuleFormPage() {
         cron_expr: values.mode === 'SCHEDULED' ? (values.cron_expr ?? null) : null,
         run_once_on_start: values.mode === 'SCHEDULED' ? (values.run_once_on_start ?? false) : false,
         dest_path_template: values.dest_path_template,
+        recursive: values.recursive ?? false,
+        append_mode: values.append_mode ?? 'overwrite',
+        enabled: values.enabled ?? true,
       })
       message.success('规则创建成功')
       navigate(`/agents/${agentId}`, { state: { tab: 'rules' } })
@@ -225,7 +231,24 @@ function AgentRuleFormPage() {
             placeholder="*.csv"
             initialValue="*"
             rules={[{ required: true, message: '请输入文件过滤模式' }]}
-            tooltip="支持 glob 模式，例如 *.csv、data_*.log"
+            tooltip="支持 glob（*.csv、**/*.csv）和 trollsift 结构化模式（如 {device}/{date:yyyy/MM/dd}/{filename}）"
+          />
+
+          <ProFormSwitch
+            name="recursive"
+            label="递归监控子目录"
+            initialValue={false}
+          />
+
+          <ProFormSelect
+            name="append_mode"
+            label="上传模式"
+            initialValue="overwrite"
+            options={[
+              { label: 'overwrite（全量）', value: 'overwrite' },
+              { label: 'tail（追加尾部）', value: 'tail' },
+              { label: 'close_wait（写完后上传）', value: 'close_wait' },
+            ]}
           />
 
           {mode === 'SCHEDULED' && (

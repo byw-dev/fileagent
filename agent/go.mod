@@ -4,6 +4,8 @@ go 1.24.13
 
 require (
 	github.com/BurntSushi/toml v1.6.0
+	github.com/bmatcuk/doublestar/v4 v4.10.0
+	github.com/byw-dev/fileagent/pkg/trollsift v0.0.0
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/google/uuid v1.6.0
 	github.com/mattn/go-sqlite3 v1.14.24
@@ -14,6 +16,8 @@ require (
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.10
 )
+
+replace github.com/byw-dev/fileagent/pkg/trollsift => ../pkg/trollsift
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect

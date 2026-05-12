@@ -244,7 +244,7 @@ outB, _ = ParserB.Compose(valsA, false)
 
 ### 子任务
 
-#### T3-5-A：DB 迁移
+#### T3-5-IMPL-A：DB 迁移
 
 **文件**：`controlplane/migrations/`
 
@@ -253,7 +253,7 @@ outB, _ = ParserB.Compose(valsA, false)
 **重要约束**：`collection_rules.status` 字段的类型 `rule_status`（枚举值 `'active'`/`'inactive'`）**保留不变**，以便后期扩展更多状态（如 `'paused'`）。`enabled` bool 语义仅在应用层转换，不写入 DB。
 
 ```sql
--- T3-5-A: 采集规则字段重命名，保留 status rule_status 枚举类型
+-- T3-5-IMPL-A: 采集规则字段重命名，保留 status rule_status 枚举类型
 BEGIN;
 
 ALTER TABLE collection_rules
@@ -291,7 +291,7 @@ COMMIT;
 
 **验收**：`migrate up` 后 `collection_rules` 表保留 `status rule_status` 字段，新字段名正确；`migrate down` 可完整回滚。
 
-#### T3-5-B：Proto 字段重命名
+#### T3-5-IMPL-B：Proto 字段重命名
 
 **文件**：`proto/v1/agent.proto`
 
@@ -342,7 +342,7 @@ DryRunResult dry_run_result = 15;
 
 **验收**：`go build ./...`（根、agent、controlplane 三模块）全部通过。
 
-#### T3-5-C：Agent 字段名同步
+#### T3-5-IMPL-C：Agent 字段名同步
 
 **文件**：`agent/internal/scheduler/scheduler.go`、`agent/cmd/agent/main.go`
 
@@ -377,7 +377,7 @@ func protoToRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 }
 ```
 
-#### T3-5-D：Bug 4 修复 — `append_mode` 值域统一（Agent 侧）
+#### T3-5-IMPL-D：Bug 4 修复 — `append_mode` 值域统一（Agent 侧）
 
 **文件**：`agent/internal/watcher/watcher.go`、`agent/internal/queue/queue.go`、`agent/cmd/agent/main.go`
 
@@ -386,7 +386,7 @@ func protoToRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 - 所有 `appendMode == ""` 的判断改为 `appendMode == AppendModeOverwrite`
 - 测试中 `"none"` 字面量改为 `"overwrite"`（`main_test.go` 等）
 
-#### T3-5-E：`matchGlob` / `walkAndSubmit` 升级为相对路径匹配
+#### T3-5-IMPL-E：`matchGlob` / `walkAndSubmit` 升级为相对路径匹配
 
 **文件**：`agent/cmd/agent/main.go`（`matchGlob`、`walkAndSubmit`）、`agent/go.mod`
 
@@ -399,7 +399,7 @@ func protoToRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 
 **walkAndSubmit 同步修改**：将 `filepath.Base` 匹配改为 relPath 匹配，逻辑同上。
 
-#### T3-5-F：`buildStoragePath` 重写为 trollsift Compose 流程
+#### T3-5-IMPL-F：`buildStoragePath` 重写为 trollsift Compose 流程
 
 **文件**：`agent/cmd/agent/main.go`（新函数 `buildStoragePath`，原 `buildStoragePath` 或 `scheduler.ResolvePath` 标注 deprecated）
 
@@ -424,7 +424,7 @@ func protoToRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 
 `scheduler.ResolvePath()` 添加 `// Deprecated: use buildStoragePath instead` 注释。
 
-#### T3-5-G：CP `createRuleRequest` / `toRuleResponse` 字段统一（Bug 1 + Bug 3）
+#### T3-5-IMPL-G：CP `createRuleRequest` / `toRuleResponse` 字段统一（Bug 1 + Bug 3）
 
 **文件**：`controlplane/internal/api/handler/rules.go`（或同等位置）
 
@@ -456,7 +456,7 @@ Bug 3 修复：handler 中 `mode = strings.ToLower(req.Mode)`，写入 DB 前归
 
 `createRuleRequest` 输入时，`enabled` bool → 写入 DB 时转换为 `RuleStatus`：`true → 'active'`，`false → 'inactive'`（nil 默认 `'active'`）。
 
-#### T3-5-H：CP `dispatch.go` 修复 Bug 2（`upload_bucket` 始终为空）
+#### T3-5-IMPL-H：CP `dispatch.go` 修复 Bug 2（`upload_bucket` 始终为空）
 
 **文件**：`controlplane/internal/dispatch/dispatch.go`（及同模块接口）
 
@@ -493,7 +493,7 @@ func (d *Dispatcher) ruleToProto(ctx context.Context, rule *db.CollectionRule) (
 }
 ```
 
-#### T3-5-I：WebUI 字段映射修复
+#### T3-5-IMPL-I：WebUI 字段映射修复
 
 **文件**：`webui/src/services/agents.ts`、`webui/src/pages/Agents/RuleForm.tsx`
 
@@ -513,6 +513,177 @@ func (d *Dispatcher) ruleToProto(ctx context.Context, rule *db.CollectionRule) (
 
 `RuleForm.tsx` Step 3 WebUI 字段名同步（`dest_path_template` 等）。
 
+#### T3-5-IMPL-J：WebUI 路径模板工具库重设计
+
+> **背景**：trollsift 引入后，`dest_path_template` 的可注入变量来自四个来源——`InjectContext`
+> 注入的 `{agent_name}`/`{agent_id}`、`buildStoragePath` 显式注入的 `{filename}`/`{ext}`、
+> `path_pattern` 解析出的任意用户自定义字段（如 `{sensor_id}`、`{device}`）、以及 LDML
+> 时间字段（如 `{time:yyyy/MM/dd}`）。
+> 旧的 `PATH_TEMPLATE_VARIABLES` 白名单（`{year}`/`{month}` 等）与 trollsift 语法完全不兼容，
+> 验证逻辑错误地拒绝合法模板，预览逻辑也无法正确处理 LDML 格式。
+
+**涉及文件**：
+- `webui/src/utils/pathTemplate.ts`
+- `webui/src/pages/Agents/RuleForm.tsx`
+- `webui/src/__tests__/pathTemplate.test.ts`
+
+---
+
+##### J-1：重写 `pathTemplate.ts`
+
+**删除**：`PATH_TEMPLATE_VARIABLES`（整个导出常量）。
+
+**新增**：`SYSTEM_TEMPLATE_VARIABLES`——始终可注入的 4 个系统变量（对应 Agent 侧
+`InjectContext` + `buildStoragePath` 的显式注入）：
+
+```ts
+export const SYSTEM_TEMPLATE_VARIABLES: ReadonlyArray<{ key: string; desc: string }> = [
+  { key: '{agent_name}', desc: 'Agent 名称，例如 prod-sensor-01' },
+  { key: '{agent_id}',   desc: 'Agent UUID，例如 a1b2c3...' },
+  { key: '{filename}',   desc: '原始文件名（含扩展名），例如 data.csv' },
+  { key: '{ext}',        desc: '文件扩展名（不含点），例如 csv' },
+]
+```
+
+**重写 `validatePathTemplate(template: string): string | null`**
+
+不再做白名单检查，改为 **trollsift 语法校验**（对应 Go 侧 `Parser.Validate()`）：
+
+| # | 规则 | 错误提示 |
+|---|------|---------|
+| V-1 | `template` 为空 | `'路径模板不能为空'` |
+| V-2 | 不以 `/` 开头 | `'路径模板必须以 / 开头'` |
+| V-3 | 包含 `//` | `'路径模板不能包含连续的 //'` |
+| V-4 | `{` 与 `}` 不平衡（出现次数不相等，或存在 `{` 未配对） | `'模板括号不平衡'` |
+| V-5 | `{}` 内字段名为空（即 `{}`） | `'模板变量名不能为空'` |
+| V-6 | 包含 `\|tz=` 但其后值为空（如 `{t:yyyy\|tz=}`） | `'时区（tz=）值不能为空'` |
+
+> **不做**字段名白名单检查——用户自定义字段（来自 `path_pattern`）在运行时才能确定，前端无法穷举。
+
+**重写 `renderPathPreview(template: string, dynamicFields?: string[]): string`**
+
+签名增加可选参数 `dynamicFields`（从 Step 2 的 `path_pattern` 解析出的字段名列表）。
+
+替换优先级（从高到低）：
+
+| 优先级 | 匹配条件 | 替换结果 |
+|--------|---------|---------|
+| 1 | `{fieldname:LDML}` 或 `{fieldname:LDML\|tz=...}` | 用 UTC 当前时间按 LDML 格式化（方案 A，见下）|
+| 2 | `{agent_name}` / `{agent_id}` / `{filename}` / `{ext}` | 固定示例值（如 `'my-agent'`、`'data.csv'`、`'csv'`）|
+| 3 | `{fieldname}`（出现在 `dynamicFields` 中）| `«fieldname»`（书名号，表示运行时由 path_pattern 解析填入）|
+| 4 | 其他未知 `{fieldname}` | 原样保留（语法已通过 V-4/V-5 验证，运行时才能确定）|
+
+**方案 A（轻量 LDML 时间格式化）**：在 TS 内实现以下 LDML 符号的替换即可覆盖主要用例，
+无需完整 LDML parser（完整预览由 T3-6 Dry-Run 服务端承担）：
+
+| LDML 符号 | 输出（对应 UTC 当前时间） |
+|-----------|----------------------|
+| `yyyy`    | 4 位年 |
+| `yy`      | 2 位年 |
+| `MM`      | 2 位月（01-12） |
+| `dd`      | 2 位日（01-31） |
+| `HH`      | 2 位时（00-23） |
+| `mm`      | 2 位分（00-59） |
+| `ss`      | 2 位秒（00-59） |
+
+实现策略：提取 `{fieldname:LDML}` 后，将 LDML 字符串中上述符号替换为当前 UTC 时间对应值，
+其余字面量（如 `-`、`/`）原样保留。`|tz=...` 部分在预览中忽略（始终用 UTC）。
+
+**新增辅助函数 `extractDynamicFields(pathPattern: string): string[]`**
+
+从 `path_pattern` 字符串中提取所有 `{fieldname}` 和 `{fieldname:type}` 的 `fieldname` 列表，
+用于 Step 3 动态变量提示和 `renderPathPreview` 的 `dynamicFields` 参数。
+
+---
+
+##### J-2：更新 `RuleForm.tsx` Step 3
+
+**Step 2 字段联动**：
+
+由于 StepsForm 的每个 StepForm 维护独立的 Form 实例（ProComponents 实现），无法跨步骤
+使用单一 `Form.useWatch`。采用如下方案在不增加冗余外部 state 的前提下实现联动：
+
+- 在父组件 `AgentRuleFormPage` 中增加 `const [pathPattern, setPathPattern] = useState('*')`（初始值与 `path_pattern` 字段 `initialValue` 一致）。
+- Step 2 的 `path_pattern` 字段已有 `tooltip` onChange 处理逻辑；在该 `onChange` 中追加调用 `setPathPattern(e.target.value)`。
+- 该 state 的唯一职责是让 Step 3 知道 Step 2 的当前 `path_pattern`，从中提取动态字段名，与"额外维护父组件 state" 语义不同（它是 form 数据的派生投影，不是独立业务状态）。
+
+> **为什么不用 formRef**：StepsForm 的 `formRef` 是 `StepsFormActionType`，不暴露
+> `getFieldValue`；每个 StepForm 的 `formRef` 可以读取，但要触发 Step 3 重新渲染
+> 仍需通知机制。在没有共享 Form 实例的情况下，`onChange + setState` 是 ProComponents
+> 官方推荐的跨步骤联动方式，与 "form-driven" 语义一致（数据来自表单，不来自业务逻辑）。
+
+**Step 3 UI 改造**：
+
+将"可用模板变量"提示卡从读取 `PATH_TEMPLATE_VARIABLES` 改为两区展示：
+
+**第一区：系统变量（始终可用）**
+
+```tsx
+{SYSTEM_TEMPLATE_VARIABLES.map(({ key, desc }) => (
+  <div key={key}>
+    <Text code>{key}</Text>
+    <Text type="secondary" style={{ marginLeft: 4, fontSize: 12 }}>{desc}</Text>
+  </div>
+))}
+```
+
+时间字段单独展示语法提示（非枚举，仅说明格式规则）：
+
+```
+{字段名:LDML格式}   — 时间字段，例如 {time:yyyy/MM/dd}、{ts:HH:mm:ss|tz=Asia/Shanghai}
+```
+
+**第二区：来自采集模式的字段（动态，仅在 path_pattern 含结构化字段时显示）**
+
+```tsx
+{dynamicFields.length > 0 && (
+  <div>
+    <Text type="secondary" style={{ fontSize: 12 }}>
+      来自文件过滤模式（path_pattern）的字段：
+    </Text>
+    {dynamicFields.map((f) => (
+      <span key={f}>
+        <Text code>&#123;{f}&#125;</Text>
+      </span>
+    ))}
+  </div>
+)}
+```
+
+其中 `dynamicFields = extractDynamicFields(pathPattern)` 在渲染时计算。
+
+**`dest_path_template` 字段**：
+- `initialValue` 从 `'/{year}/{month}/{agent_name}/{filename}'` 改为 `'/{agent_name}/{time:yyyy/MM/dd}/{filename}'`
+- `validator` 改用新的 `validatePathTemplate`（语法校验，无白名单）
+- `renderPathPreview` 调用改为 `renderPathPreview(pathTemplate, dynamicFields)`
+
+---
+
+##### J-3：重写 `pathTemplate.test.ts`
+
+全部重写，覆盖新逻辑：
+
+| # | 测试场景 | 期望 |
+|---|---------|------|
+| R-1 | `renderPathPreview('/{agent_name}/{time:yyyy/MM/dd}/{filename}')` | 含当前年份 `\d{4}`、月份 `\d{2}`、日期 `\d{2}`、`'my-agent'`、`'data.csv'` |
+| R-2 | `renderPathPreview('/{agent_name}/{sensor_id}/{filename}', ['sensor_id'])` | 含 `'my-agent'`、`'«sensor_id»'`、`'data.csv'` |
+| R-3 | `renderPathPreview('/static/path')` | 返回 `'/static/path'` 不变 |
+| R-4 | `renderPathPreview('')` | 返回 `''` |
+| R-5 | `renderPathPreview('/{agent_name}/{time:yyyy/MM/dd/HH}/{filename}')` | 路径含 `/YYYY/MM/DD/HH/` 格式片段 |
+| V-1 | `validatePathTemplate('')` | truthy（空串） |
+| V-2 | `validatePathTemplate('year/month')` | truthy（不以 `/` 开头） |
+| V-3 | `validatePathTemplate('//year')` | truthy（双斜杠） |
+| V-4 | `validatePathTemplate('/{agent_name/{filename}')` | truthy（括号不平衡）|
+| V-5 | `validatePathTemplate('/{}/{filename}')` | truthy（字段名为空）|
+| V-6 | `validatePathTemplate('/{t:yyyy\|tz=}/{filename}')` | truthy（tz 值为空） |
+| V-7 | `validatePathTemplate('/{agent_name}/{time:yyyy/MM/dd}/{filename}')` | `null`（合法） |
+| V-8 | `validatePathTemplate('/{sensor_id}/{device}/{filename}')` | `null`（合法，自定义字段不再报错）|
+| V-9 | `validatePathTemplate('/{agent_name}/{unknown_var}')` | `null`（合法，不做白名单检查）|
+| E-1 | `extractDynamicFields('{sensor_id}/{date:yyyy/MM/dd}/{filename}')` | `['sensor_id', 'date', 'filename']` |
+| E-2 | `extractDynamicFields('*.csv')` | `[]`（无 `{}`）|
+
+> 注：V-8、V-9 与旧测试行为**相反**（旧版报"未知变量"，新版通过），这正是本次修复的核心目的。
+
 ### T3-5 验收标准
 
 | # | 验收项 | 方法 |
@@ -523,8 +694,10 @@ func (d *Dispatcher) ruleToProto(ctx context.Context, rule *db.CollectionRule) (
 | T3-5-4 | 规则下发：`upload_bucket` 字段非空 | Agent 日志确认 |
 | T3-5-5 | `append_mode` 三端一致：DB `'overwrite'`，Agent `AppendModeOverwrite`，proto `'overwrite'` | 单元测试 |
 | T3-5-6 | `mode` 前端传 `"WATCH"`，DB 存 `'watch'` | 集成测试 |
-| T3-5-7 | `pnpm test` 全通过 | WebUI 测试 |
+| T3-5-7 | `pnpm test` 全通过（含新增 pathTemplate 测试，无白名单报错） | WebUI 测试 |
 | T3-5-8 | `go test ./...` agent + controlplane 全通过 | 单元测试 |
+| T3-5-9 | Step 3 路径预览正确渲染 LDML 时间字段（如 `{time:yyyy/MM/dd}` → 当前日期） | 手动确认 |
+| T3-5-10 | Step 3 路径预览在 `path_pattern` 含结构化字段时显示 `«fieldname»` 占位 | 手动确认 |
 
 ---
 

@@ -16,29 +16,29 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/sqlc-dev/pqtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/sqlc-dev/pqtype"
 )
 
 // ── mocks ─────────────────────────────────────────────────────────────────────
 
 type mockAgentsDB struct {
-	agents        []*db.Agent
-	listErr       error
-	agent         *db.Agent
-	getErr        error
-	rules         []*db.CollectionRule
-	rulesErr      error
-	rule          *db.CollectionRule
-	ruleGetErr    error
-	createErr     error
-	updateErr     error
-	deleteErr     error
-	logs          []*db.UploadLog
-	logsErr       error
-	logsCount     int64
-	countLogsErr  error
+	agents       []*db.Agent
+	listErr      error
+	agent        *db.Agent
+	getErr       error
+	rules        []*db.CollectionRule
+	rulesErr     error
+	rule         *db.CollectionRule
+	ruleGetErr   error
+	createErr    error
+	updateErr    error
+	deleteErr    error
+	logs         []*db.UploadLog
+	logsErr      error
+	logsCount    int64
+	countLogsErr error
 }
 
 func (m *mockAgentsDB) ListAgents(_ context.Context, _ uuid.UUID) ([]*db.Agent, error) {
@@ -61,19 +61,20 @@ func (m *mockAgentsDB) CreateCollectionRule(_ context.Context, arg db.CreateColl
 		return nil, m.createErr
 	}
 	return &db.CollectionRule{
-		ID:                 uuid.New(),
-		OrgID:              arg.OrgID,
-		AgentID:            arg.AgentID,
-		BucketID:           arg.BucketID,
-		Name:               arg.Name,
-		Mode:               arg.Mode,
-		Status:             db.RuleStatusActive,
-		SourcePathTemplate: arg.SourcePathTemplate,
-		FileGlob:           arg.FileGlob,
-		UploadPathTemplate: arg.UploadPathTemplate,
-		Metadata:           arg.Metadata,
-		CreatedAt:          time.Now(),
-		UpdatedAt:          time.Now(),
+		ID:               uuid.New(),
+		OrgID:            arg.OrgID,
+		AgentID:          arg.AgentID,
+		BucketID:         arg.BucketID,
+		Name:             arg.Name,
+		Mode:             arg.Mode,
+		Status:           arg.Status,
+		BasePath:         arg.BasePath,
+		PathPattern:      arg.PathPattern,
+		DestPathTemplate: arg.DestPathTemplate,
+		Recursive:        arg.Recursive,
+		Metadata:         arg.Metadata,
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
 	}, nil
 }
 func (m *mockAgentsDB) UpdateCollectionRuleStatus(_ context.Context, id uuid.UUID, status db.RuleStatus) (*db.CollectionRule, error) {
@@ -155,13 +156,13 @@ func (m *mockDirStore) Cancel(_ string) {}
 
 func newSampleAgent() *db.Agent {
 	return &db.Agent{
-		ID:          uuid.New(),
-		OrgID:       uuid.New(),
-		Name:        "edge-01",
-		Status:      db.AgentStatusApproved,
-		IpAddress:   pqtype.Inet{},
-		OsInfo:      json.RawMessage(`{}`),
-		Metadata:    json.RawMessage(`{}`),
+		ID:        uuid.New(),
+		OrgID:     uuid.New(),
+		Name:      "edge-01",
+		Status:    db.AgentStatusApproved,
+		IpAddress: pqtype.Inet{},
+		OsInfo:    json.RawMessage(`{}`),
+		Metadata:  json.RawMessage(`{}`),
 	}
 }
 
@@ -514,51 +515,51 @@ func TestAgentsHandler_ListUploadLogs_InvalidID(t *testing.T) {
 // ── Missing error path tests ──────────────────────────────────────────────────
 
 func TestAgentsHandler_Get_InvalidID(t *testing.T) {
-h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/not-a-uuid", nil)
-testAgentsRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusBadRequest, w.Code)
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/not-a-uuid", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestAgentsHandler_Get_DBError(t *testing.T) {
-h := handler.NewAgentsHandler(&mockAgentsDB{getErr: assert.AnError}, nil, nil, nil, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String(), nil)
-testAgentsRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusInternalServerError, w.Code)
+	h := handler.NewAgentsHandler(&mockAgentsDB{getErr: assert.AnError}, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String(), nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 func TestAgentsHandler_Revoke_InvalidID(t *testing.T) {
-h := handler.NewAgentsHandler(nil, &mockAgentMgr{}, nil, nil, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/not-a-uuid/revoke", nil)
-testAgentsRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusBadRequest, w.Code)
+	h := handler.NewAgentsHandler(nil, &mockAgentMgr{}, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/not-a-uuid/revoke", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestAgentsHandler_Revoke_Error(t *testing.T) {
-h := handler.NewAgentsHandler(nil, &mockAgentMgr{revokeErr: assert.AnError}, nil, nil, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/revoke", nil)
-testAgentsRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusInternalServerError, w.Code)
+	h := handler.NewAgentsHandler(nil, &mockAgentMgr{revokeErr: assert.AnError}, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/revoke", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 func TestAgentsHandler_ListRules_InvalidAgentID(t *testing.T) {
-h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/bad-id/rules", nil)
-testAgentsRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusBadRequest, w.Code)
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/bad-id/rules", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestAgentsHandler_ListRules_DBError(t *testing.T) {
-h := handler.NewAgentsHandler(&mockAgentsDB{rulesErr: assert.AnError}, nil, nil, nil, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/rules", nil)
-testAgentsRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusInternalServerError, w.Code)
+	h := handler.NewAgentsHandler(&mockAgentsDB{rulesErr: assert.AnError}, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/rules", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 func TestAgentsHandler_DeleteRule_InvalidRuleID(t *testing.T) {
@@ -571,35 +572,35 @@ func TestAgentsHandler_DeleteRule_InvalidRuleID(t *testing.T) {
 }
 
 func TestAgentsHandler_DeleteRule_DBError(t *testing.T) {
-h := handler.NewAgentsHandler(&mockAgentsDB{deleteErr: assert.AnError}, nil, nil, nil, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/"+uuid.New().String()+"/rules/"+uuid.New().String(), nil)
-testAgentsRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusInternalServerError, w.Code)
+	h := handler.NewAgentsHandler(&mockAgentsDB{deleteErr: assert.AnError}, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/"+uuid.New().String()+"/rules/"+uuid.New().String(), nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 func TestAgentsHandler_ListUploadLogs_DBError(t *testing.T) {
-h := handler.NewAgentsHandler(&mockAgentsDB{logsErr: assert.AnError}, nil, nil, nil, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/upload-logs", nil)
-testAgentsRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusInternalServerError, w.Code)
+	h := handler.NewAgentsHandler(&mockAgentsDB{logsErr: assert.AnError}, nil, nil, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/upload-logs", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 func TestAgentsHandler_ListRules_ItemsEnvelope(t *testing.T) {
 	rule := &db.CollectionRule{
-		ID:                 uuid.New(),
-		AgentID:            uuid.New(),
-		BucketID:           uuid.New(),
-		Status:             db.RuleStatusActive,
-		Mode:               db.UploadModeWatch,
-		SourcePathTemplate: "/data",
-		FileGlob:           "*.log",
-		UploadPathTemplate: "logs/",
-		RunOnceOnStart:     true,
-		Metadata:           json.RawMessage(`{}`),
-		CreatedAt:          time.Now(),
-		UpdatedAt:          time.Now(),
+		ID:               uuid.New(),
+		AgentID:          uuid.New(),
+		BucketID:         uuid.New(),
+		Status:           db.RuleStatusActive,
+		Mode:             db.UploadModeWatch,
+		BasePath:         "/data",
+		PathPattern:      "*.log",
+		DestPathTemplate: "logs/",
+		RunOnceOnStart:   true,
+		Metadata:         json.RawMessage(`{}`),
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
 	}
 	h := handler.NewAgentsHandler(&mockAgentsDB{rules: []*db.CollectionRule{rule}}, nil, nil, nil, newTestLogger())
 	w := httptest.NewRecorder()
@@ -611,7 +612,7 @@ func TestAgentsHandler_ListRules_ItemsEnvelope(t *testing.T) {
 	items := body["items"].([]interface{})
 	require.Len(t, items, 1)
 	item := items[0].(map[string]interface{})
-	assert.Equal(t, true, item["is_active"])
+	assert.Equal(t, true, item["enabled"])
 	assert.Equal(t, true, item["run_once_on_start"])
 	assert.Equal(t, "/data", item["base_path"])
 	assert.Equal(t, "*.log", item["path_pattern"])

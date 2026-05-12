@@ -10,11 +10,11 @@
 ```text
 T3-2-BUG（集成联调新发现 Bug A~D）✅ 已完成
     ↓
-T3-2 Web UI + Control Plane 联调  ← 当前任务
+T3-2 Web UI + Control Plane 联调  ✅ 已完成
     ↓
-T3-4 pkg/trollsift 共享路径模板库
+T3-4 pkg/trollsift 共享路径模板库 ✅
     ↓
-T3-5 字段统一 + Bug 修复
+T3-5 字段统一 + Bug 修复 ⚠️（待补齐 WebUI 测试验收）
     ↓
 T3-6 Dry-Run 规则测试功能
     ↓
@@ -23,18 +23,18 @@ T3-3 Python SDK + Control Plane 联调
 
 ---
 
-## 当前优先：T3-2 — Web UI + Control Plane 联调
+## 当前优先：T3-5 — 字段统一 + Bug 修复（审计收尾）
 
-**前置依赖**：T3-2-BUG-A~D ✅（全部完成）  
-**涉及模块**：webui、controlplane
+**前置依赖**：T3-4 ✅  
+**涉及模块**：controlplane、agent、proto、webui
 
 ### 验收标准
 
-- [ ] 登录 → 仪表盘显示正确统计数据（文件数 > 0 时不为 0）
-- [ ] 采集器列表页：审批一个 agent → 状态更新为 APPROVED/RUNNING
-- [ ] 采集器详情页：创建采集规则 → 规则下发到已连接的 agent（日志可见）
-- [ ] 文件浏览器：搜索文件 → 单文件获取下载链接 → 链接可访问
-- [ ] `pnpm test` 全部通过
+- [x] DB 迁移字段重命名落地（`000003_rename_rule_fields.*.sql`）
+- [x] proto 字段统一与 dry-run 预留消息落地
+- [x] `go test ./...`（controlplane）通过
+- [x] `go test ./...`（agent）通过
+- [ ] `pnpm test` 全通过（剩余 2 个失败：`pathTemplate.test.ts`，由 T3-5-IMPL-J 修复）
 
 ---
 
@@ -46,7 +46,7 @@ T3-3 Python SDK + Control Plane 联调
 | ID | 任务 | 状态 |
 |----|------|------|
 | T3-4 | `pkg/trollsift` 共享路径模板库 | ✅ |
-| T3-5 | 字段统一 + Bug 修复（DB/proto/agent/CP/WebUI） | ⬜ |
+| T3-5 | 字段统一 + Bug 修复（DB/proto/agent/CP/WebUI） | ⚠️ |
 | T3-6 | Dry-Run 规则测试功能 | ⬜ |
 
 ---
@@ -85,6 +85,22 @@ T3-3 Python SDK + Control Plane 联调
 
 ---
 
+### T3-5 字段统一 + Bug 修复（审计）⚠️
+
+**状态**：⚠️（核心改造已完成，WebUI 测试验收项尚未通过）  
+**关联提交**：`f01598e`、`bbf9378`、`f5537f5`
+
+- 已完成：
+  - DB 字段迁移与 sqlc 模型同步
+  - proto `CollectionRule` 字段统一 + `DryRunResult` 预留
+  - Agent 相对路径匹配（doublestar）与 trollsift Compose 存储路径
+  - Control Plane `createRule`/`toRuleResponse`/dispatch 字段统一
+  - WebUI 规则表单与接口字段统一（`enabled`/`recursive`/`append_mode`）
+- 未完成验收项：
+  - `pnpm test` 未全绿，剩余 2 个失败（`pathTemplate.test.ts`），待 T3-5-IMPL-J 修复
+
+---
+
 ### T3-2-FIX API 契约对齐 ✅
 
 **状态**：✅（A~L 共 12 项已全部完成，提交 `2715706`）
@@ -104,7 +120,6 @@ T3-3 Python SDK + Control Plane 联调
 
 - T3-1 主链路联调完成
 - T3-1-FIX Agent 生命周期健壮性修复完成
-- T3-1-BUGFIX gRPC 注册链路关键问题修复完成
+- T3-1-BUG gRPC 注册链路关键问题修复完成
 
 参考：`docs/tasks/changelog.md` 中 2026-05-07 记录（提交 `e295c05`）。
-

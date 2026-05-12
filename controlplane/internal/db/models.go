@@ -361,24 +361,23 @@ type Bucket struct {
 }
 
 type CollectionRule struct {
-	ID                 uuid.UUID       `db:"id" json:"id"`
-	OrgID              uuid.UUID       `db:"org_id" json:"org_id"`
-	AgentID            uuid.UUID       `db:"agent_id" json:"agent_id"`
-	BucketID           uuid.UUID       `db:"bucket_id" json:"bucket_id"`
-	Name               string          `db:"name" json:"name"`
-	Mode               UploadMode      `db:"mode" json:"mode"`
-	Status             RuleStatus      `db:"status" json:"status"`
-	SourcePathTemplate string          `db:"source_path_template" json:"source_path_template"`
-	FileGlob           string          `db:"file_glob" json:"file_glob"`
-	UploadPathTemplate string          `db:"upload_path_template" json:"upload_path_template"`
-	WatchRecursive     bool            `db:"watch_recursive" json:"watch_recursive"`
-	WatchSubdirPattern sql.NullString  `db:"watch_subdir_pattern" json:"watch_subdir_pattern"`
-	CronExpr           sql.NullString  `db:"cron_expr" json:"cron_expr"`
-	RunOnceOnStart     bool            `db:"run_once_on_start" json:"run_once_on_start"`
-	AppendMode         string          `db:"append_mode" json:"append_mode"`
-	Metadata           json.RawMessage `db:"metadata" json:"metadata"`
-	CreatedAt          time.Time       `db:"created_at" json:"created_at"`
-	UpdatedAt          time.Time       `db:"updated_at" json:"updated_at"`
+	ID               uuid.UUID       `db:"id" json:"id"`
+	OrgID            uuid.UUID       `db:"org_id" json:"org_id"`
+	AgentID          uuid.UUID       `db:"agent_id" json:"agent_id"`
+	BucketID         uuid.UUID       `db:"bucket_id" json:"bucket_id"`
+	Name             string          `db:"name" json:"name"`
+	Mode             UploadMode      `db:"mode" json:"mode"`
+	Status           RuleStatus      `db:"status" json:"status"`
+	BasePath         string          `db:"base_path" json:"base_path"`
+	PathPattern      string          `db:"path_pattern" json:"path_pattern"`
+	DestPathTemplate string          `db:"dest_path_template" json:"dest_path_template"`
+	Recursive        bool            `db:"recursive" json:"recursive"`
+	CronExpr         sql.NullString  `db:"cron_expr" json:"cron_expr"`
+	RunOnceOnStart   bool            `db:"run_once_on_start" json:"run_once_on_start"`
+	AppendMode       string          `db:"append_mode" json:"append_mode"`
+	Metadata         json.RawMessage `db:"metadata" json:"metadata"`
+	CreatedAt        time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt        time.Time       `db:"updated_at" json:"updated_at"`
 }
 
 type EventDelivery struct {

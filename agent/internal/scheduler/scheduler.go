@@ -22,18 +22,16 @@ type CollectionRule struct {
 	Name string
 	// Mode is the collection mode: "watch" or "cron".
 	Mode string
-	// SourcePathTemplate is the directory to monitor, possibly containing time variables.
-	SourcePathTemplate string
-	// FileGlob is the glob pattern matched against file base names.
-	FileGlob string
+	// BasePath is the directory to monitor, possibly containing time variables.
+	BasePath string
+	// PathPattern is the glob/trollsift pattern matched against relative paths.
+	PathPattern string
 	// UploadBucket is the MinIO bucket name to upload files into.
 	UploadBucket string
-	// UploadPathTemplate is the object key prefix template for uploaded files.
-	UploadPathTemplate string
-	// WatchRecursive enables recursive subdirectory monitoring.
-	WatchRecursive bool
-	// WatchSubdirPattern is an optional glob for subdirectory filtering.
-	WatchSubdirPattern string
+	// DestPathTemplate is the object key template for uploaded files.
+	DestPathTemplate string
+	// Recursive enables recursive subdirectory monitoring.
+	Recursive bool
 	// CronExpr is the cron expression used when Mode="cron".
 	CronExpr string
 	// RunOnceOnStart causes the callback to fire immediately when the rule is added.
@@ -76,7 +74,7 @@ func (s *Scheduler) AddRule(rule CollectionRule, callback func(resolvedPath stri
 		return nil
 	}
 
-	resolved := ResolvePath(rule.SourcePathTemplate, time.Now().UTC())
+	resolved := ResolvePath(rule.BasePath, time.Now().UTC())
 
 	if rule.RunOnceOnStart {
 		callback(resolved)
@@ -91,7 +89,7 @@ func (s *Scheduler) AddRule(rule CollectionRule, callback func(resolvedPath stri
 	}
 
 	eid, err := s.cron.AddFunc(rule.CronExpr, func() {
-		path := ResolvePath(rule.SourcePathTemplate, time.Now().UTC())
+		path := ResolvePath(rule.BasePath, time.Now().UTC())
 		s.logger.Info("scheduler: rule fired", zap.String("rule_id", rule.RuleID), zap.String("path", path))
 		callback(path)
 	})
@@ -150,6 +148,8 @@ func (s *Scheduler) Stop() {
 // Legacy technical names ({yyyy}, {yy}, {mm}, {dd}, {HH}, {MM}) are kept for
 // backward compatibility.  Note: {filename} is NOT resolved here — callers
 // that need filename substitution should use ResolvePathWithFile.
+// Deprecated: runtime upload path resolution now uses trollsift Compose flow in
+// the agent command package; this helper remains for legacy path template use.
 func ResolvePath(template string, t time.Time) string {
 	return ResolvePathWithFile(template, t, "")
 }

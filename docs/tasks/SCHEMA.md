@@ -83,8 +83,17 @@ docs/tasks/
 
 ## 命名约定
 
-- Phase 主线任务：`T{phase}-{seq}` 例：`T3-2`
-- Phase 2 遗留补完：`T2-X{seq}` 例：`T2-X4`
-- Phase 3 前置关卡：`P3-P{seq}` 例：`P3-P1`
-- Phase 3 修复组：`T3-{task}-FIX-{letter}` 例：`T3-2-FIX-A`
-- Phase 4 任务：`T4-{seq}` 例：`T4-1`
+统一格式：`T{phase}-{step}[-{GROUP}[-{id}]]`
+
+| 层级 | 格式 | 示例 | 说明 |
+|------|------|------|------|
+| 主线任务 | `T{phase}-{step}` | `T3-5` | Phase 3 第 5 个主线任务 |
+| 实现子任务 | `T{phase}-{step}-IMPL-{id}` | `T3-5-IMPL-A` | 主线任务的实现拆解，id 为大写字母 |
+| Bug 修复子任务 | `T{phase}-{step}-BUG[-{id}]` | `T3-5-BUG`、`T3-5-BUG-A` | Bug 组（无 id）或具体 Bug（id 为大写字母） |
+| 修复迭代子任务 | `T{phase}-{step}-FIX[-{id}]` | `T3-2-FIX`、`T3-2-FIX-A` | 修复组（无 id）或具体修复项（id 为大写字母） |
+| 遗留补完任务 | `T{phase}-X{seq}` | `T2-X4` | Phase 内遗留/补充任务 |
+
+**规则**：
+- `GROUP` 固定为 `IMPL`（实现）、`BUG`（缺陷）、`FIX`（修复迭代） 之一
+- `id` 统一使用**大写字母**（A、B、C …），不使用数字
+- 引用任务时，从左到右每段均可作为分组入口（如 `T3-5-BUG` 表示 T3-5 的全部 Bug）

@@ -15,8 +15,8 @@ import (
 // collectionRuleColumns lists all columns returned by collection rule queries.
 var collectionRuleColumns = []string{
 	"id", "org_id", "agent_id", "bucket_id", "name", "mode", "status",
-	"source_path_template", "file_glob", "upload_path_template",
-	"watch_recursive", "watch_subdir_pattern", "cron_expr",
+	"base_path", "path_pattern", "dest_path_template",
+	"recursive", "cron_expr",
 	"run_once_on_start", "append_mode", "metadata", "created_at", "updated_at",
 }
 
@@ -26,7 +26,7 @@ func addCollectionRuleRow(rows *sqlmock.Rows, id, orgID, agentID, bucketID uuid.
 	return rows.AddRow(
 		id.String(), orgID.String(), agentID.String(), bucketID.String(), name, "watch", "active",
 		"/data/", "*.log", "uploads/",
-		true, nil, nil,
+		true, nil,
 		false, "full", []byte(`{}`), now, now,
 	)
 }
@@ -44,15 +44,17 @@ func TestCreateCollectionRule_Success(t *testing.T) {
 	mock.ExpectQuery("INSERT INTO collection_rules").WillReturnRows(rows)
 
 	rule, err := q.CreateCollectionRule(context.Background(), CreateCollectionRuleParams{
-		OrgID:              orgID,
-		AgentID:            agentID,
-		BucketID:           bucketID,
-		Name:               "rule-1",
-		Mode:               UploadModeWatch,
-		SourcePathTemplate: "/data/",
-		FileGlob:           "*.log",
-		UploadPathTemplate: "uploads/",
-		Metadata:           []byte(`{}`),
+		OrgID:            orgID,
+		AgentID:          agentID,
+		BucketID:         bucketID,
+		Name:             "rule-1",
+		Mode:             UploadModeWatch,
+		BasePath:         "/data/",
+		PathPattern:      "*.log",
+		DestPathTemplate: "uploads/",
+		Recursive:        true,
+		Status:           RuleStatusActive,
+		Metadata:         []byte(`{}`),
 	})
 	require.NoError(t, err)
 	require.NotNil(t, rule)

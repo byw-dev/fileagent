@@ -316,7 +316,7 @@ type listDirRequest struct {
 
 // listDirResponse is the successful response body for POST /api/v1/agents/:id/list-dir.
 type listDirResponse struct {
-	Path    string            `json:"path"`
+	Path    string              `json:"path"`
 	Entries []dirstore.DirEntry `json:"entries"`
 }
 
@@ -451,12 +451,12 @@ type collectionRuleResponse struct {
 	BucketID         string `json:"bucket_id"`
 	Name             string `json:"name"`
 	Mode             string `json:"mode"`
-	IsActive         bool   `json:"is_active"`
+	Enabled          bool   `json:"enabled"`
 	RunOnceOnStart   bool   `json:"run_once_on_start"`
 	BasePath         string `json:"base_path"`
 	PathPattern      string `json:"path_pattern"`
 	DestPathTemplate string `json:"dest_path_template"`
-	WatchRecursive   bool   `json:"watch_recursive"`
+	Recursive        bool   `json:"recursive"`
 	CronExpr         string `json:"cron_expr,omitempty"`
 	CreatedAt        string `json:"created_at"`
 }
@@ -468,12 +468,12 @@ func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 		BucketID:         r.BucketID.String(),
 		Name:             r.Name,
 		Mode:             string(r.Mode),
-		IsActive:         r.Status == db.RuleStatusActive,
+		Enabled:          r.Status == db.RuleStatusActive,
 		RunOnceOnStart:   r.RunOnceOnStart,
-		BasePath:         r.SourcePathTemplate,
-		PathPattern:      r.FileGlob,
-		DestPathTemplate: r.UploadPathTemplate,
-		WatchRecursive:   r.WatchRecursive,
+		BasePath:         r.BasePath,
+		PathPattern:      r.PathPattern,
+		DestPathTemplate: r.DestPathTemplate,
+		Recursive:        r.Recursive,
 		CreatedAt:        r.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if r.CronExpr.Valid {
@@ -515,18 +515,18 @@ func (h *AgentsHandler) ListRules(c *gin.Context) {
 // Field names match the response shape (collectionRuleResponse) so that the
 // same JSON key set is used for both reads and writes.
 type createRuleRequest struct {
-	BucketID           string          `json:"bucket_id"          binding:"required"`
-	Name               string          `json:"name"               binding:"required"`
-	Mode               string          `json:"mode"               binding:"required"`
-	BasePath           string          `json:"base_path"          binding:"required"`
-	PathPattern        string          `json:"path_pattern"       binding:"required"`
-	DestPathTemplate   string          `json:"dest_path_template" binding:"required"`
-	WatchRecursive     bool            `json:"watch_recursive"`
-	WatchSubdirPattern string          `json:"watch_subdir_pattern"`
-	CronExpr           string          `json:"cron_expr"`
-	RunOnceOnStart     bool            `json:"run_once_on_start"`
-	AppendMode         string          `json:"append_mode"`
-	Metadata           json.RawMessage `json:"metadata"`
+	BucketID         string          `json:"bucket_id"          binding:"required"`
+	Name             string          `json:"name"               binding:"required"`
+	Mode             string          `json:"mode"               binding:"required"`
+	BasePath         string          `json:"base_path"          binding:"required"`
+	PathPattern      string          `json:"path_pattern"       binding:"required"`
+	DestPathTemplate string          `json:"dest_path_template" binding:"required"`
+	Recursive        bool            `json:"recursive"`
+	CronExpr         string          `json:"cron_expr"`
+	RunOnceOnStart   bool            `json:"run_once_on_start"`
+	AppendMode       string          `json:"append_mode"`
+	Enabled          *bool           `json:"enabled"`
+	Metadata         json.RawMessage `json:"metadata"`
 }
 
 // CreateRule handles POST /api/v1/agents/:id/rules.
@@ -565,27 +565,29 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 		appendMode = "overwrite"
 	}
 	mode := strings.ToLower(req.Mode)
+	status := db.RuleStatusActive
+	if req.Enabled != nil && !*req.Enabled {
+		status = db.RuleStatusInactive
+	}
 	metadata := req.Metadata
 	if len(metadata) == 0 {
 		metadata = json.RawMessage(`{}`)
 	}
 
 	params := db.CreateCollectionRuleParams{
-		OrgID:              orgID,
-		AgentID:            agentID,
-		BucketID:           bucketID,
-		Name:               req.Name,
-		Mode:               db.UploadMode(mode),
-		SourcePathTemplate: req.BasePath,
-		FileGlob:           req.PathPattern,
-		UploadPathTemplate: req.DestPathTemplate,
-		WatchRecursive:     req.WatchRecursive,
-		RunOnceOnStart:     req.RunOnceOnStart,
-		AppendMode:         appendMode,
-		Metadata:           metadata,
-	}
-	if req.WatchSubdirPattern != "" {
-		params.WatchSubdirPattern = sql.NullString{String: req.WatchSubdirPattern, Valid: true}
+		OrgID:            orgID,
+		AgentID:          agentID,
+		BucketID:         bucketID,
+		Name:             req.Name,
+		Mode:             db.UploadMode(mode),
+		BasePath:         req.BasePath,
+		PathPattern:      req.PathPattern,
+		DestPathTemplate: req.DestPathTemplate,
+		Recursive:        req.Recursive,
+		Status:           status,
+		RunOnceOnStart:   req.RunOnceOnStart,
+		AppendMode:       appendMode,
+		Metadata:         metadata,
 	}
 	if req.CronExpr != "" {
 		params.CronExpr = sql.NullString{String: req.CronExpr, Valid: true}
