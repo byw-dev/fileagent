@@ -177,8 +177,8 @@ function AgentDetailPage() {
         <Tag color={mode === 'WATCH' ? 'blue' : 'purple'}>{mode}</Tag>
       ),
     },
-    { title: '源路径', dataIndex: 'source_path', key: 'source_path', ellipsis: true },
-    { title: '文件过滤', dataIndex: 'file_pattern', key: 'file_pattern', width: 130 },
+    { title: '源路径', dataIndex: 'base_path', key: 'base_path', ellipsis: true },
+    { title: '文件过滤', dataIndex: 'path_pattern', key: 'path_pattern', width: 130 },
     {
       title: 'Cron',
       dataIndex: 'cron_expr',

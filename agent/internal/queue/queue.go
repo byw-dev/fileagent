@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS upload_tasks (
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL,
     file_offset    INTEGER NOT NULL DEFAULT 0,
-    append_mode    TEXT    NOT NULL DEFAULT ''
+    append_mode    TEXT    NOT NULL DEFAULT 'overwrite'
 );
 
 CREATE TABLE IF NOT EXISTS processed_files (
@@ -65,7 +65,7 @@ CREATE INDEX IF NOT EXISTS idx_processed_files_rule
 // silently ignore "duplicate column name" errors.
 var schemaMigrations = []string{
 	`ALTER TABLE upload_tasks ADD COLUMN file_offset INTEGER NOT NULL DEFAULT 0`,
-	`ALTER TABLE upload_tasks ADD COLUMN append_mode TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE upload_tasks ADD COLUMN append_mode TEXT NOT NULL DEFAULT 'overwrite'`,
 }
 
 // Status values for upload tasks.
@@ -96,7 +96,7 @@ type UploadTask struct {
 	// FileOffset is the byte offset from which to begin uploading in tail mode.
 	// Zero means upload from the beginning of the file.
 	FileOffset int64
-	// AppendMode is "tail", "close_wait", or "" (full-file upload).
+	// AppendMode is "tail", "close_wait", or "overwrite" (full-file upload).
 	AppendMode string
 }
 

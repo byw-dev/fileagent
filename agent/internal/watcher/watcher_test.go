@@ -374,20 +374,20 @@ break loop
 assert.GreaterOrEqual(t, received, 0, "close_wait mode: no error")
 }
 
-func TestWatcher_AppendModeNone_OffsetIsAlwaysZero(t *testing.T) {
+func TestWatcher_AppendModeOverwrite_OffsetIsAlwaysZero(t *testing.T) {
 dir := t.TempDir()
 path := filepath.Join(dir, "data.txt")
 require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
 
 w := &Watcher{
 fileGlob:    "*.txt",
-appendMode:  AppendModeNone,
+appendMode:  AppendModeOverwrite,
 tailOffsets: make(map[string]int64),
 }
 
 fe, err := w.buildEvent(path, "create")
 require.NoError(t, err)
-assert.Equal(t, int64(0), fe.FileOffset, "no-append mode: offset should always be 0")
+assert.Equal(t, int64(0), fe.FileOffset, "overwrite mode: offset should always be 0")
 }
 
 // ── Direct runCloseWait / runFsnotify unit tests ──────────────────────────────

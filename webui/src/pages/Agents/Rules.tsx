@@ -67,14 +67,14 @@ function AgentRulesPage() {
     },
     {
       title: '源路径',
-      dataIndex: 'source_path',
-      key: 'source_path',
+      dataIndex: 'base_path',
+      key: 'base_path',
       ellipsis: true,
     },
     {
       title: '文件过滤',
-      dataIndex: 'file_pattern',
-      key: 'file_pattern',
+      dataIndex: 'path_pattern',
+      key: 'path_pattern',
       width: 130,
     },
     {

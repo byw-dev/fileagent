@@ -431,7 +431,7 @@ func TestAgentsHandler_ListRules_Success(t *testing.T) {
 func TestAgentsHandler_CreateRule_Success(t *testing.T) {
 	dispatcher := &mockDispatcher{}
 	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, dispatcher, nil, newTestLogger())
-	body := `{"dest_bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","source_path":"/data","file_pattern":"*.log","dest_path_template":"logs/"}`
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"logs/"}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -441,7 +441,7 @@ func TestAgentsHandler_CreateRule_Success(t *testing.T) {
 
 func TestAgentsHandler_CreateRule_InvalidBucketID(t *testing.T) {
 	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
-	body := `{"dest_bucket_id":"bad","name":"rule1","mode":"watch","source_path":"/data","file_pattern":"*.log","dest_path_template":"logs/"}`
+	body := `{"bucket_id":"bad","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"logs/"}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -613,10 +613,10 @@ func TestAgentsHandler_ListRules_ItemsEnvelope(t *testing.T) {
 	item := items[0].(map[string]interface{})
 	assert.Equal(t, true, item["is_active"])
 	assert.Equal(t, true, item["run_once_on_start"])
-	assert.Equal(t, "/data", item["source_path"])
-	assert.Equal(t, "*.log", item["file_pattern"])
+	assert.Equal(t, "/data", item["base_path"])
+	assert.Equal(t, "*.log", item["path_pattern"])
 	assert.Equal(t, "logs/", item["dest_path_template"])
-	assert.Equal(t, rule.BucketID.String(), item["dest_bucket_id"])
+	assert.Equal(t, rule.BucketID.String(), item["bucket_id"])
 }
 
 func TestAgentsHandler_ListUploadLogs_ItemsEnvelope(t *testing.T) {
