@@ -457,6 +457,7 @@ type collectionRuleResponse struct {
 	PathPattern      string `json:"path_pattern"`
 	DestPathTemplate string `json:"dest_path_template"`
 	Recursive        bool   `json:"recursive"`
+	AppendMode       string `json:"append_mode"`
 	CronExpr         string `json:"cron_expr,omitempty"`
 	CreatedAt        string `json:"created_at"`
 }
@@ -474,6 +475,7 @@ func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 		PathPattern:      r.PathPattern,
 		DestPathTemplate: r.DestPathTemplate,
 		Recursive:        r.Recursive,
+		AppendMode:       r.AppendMode,
 		CreatedAt:        r.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if r.CronExpr.Valid {

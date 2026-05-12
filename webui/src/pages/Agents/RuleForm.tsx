@@ -15,7 +15,8 @@ import apiClient from '../../services/api'
 import {
   renderPathPreview,
   validatePathTemplate,
-  PATH_TEMPLATE_VARIABLES,
+  extractDynamicFields,
+  SYSTEM_TEMPLATE_VARIABLES,
 } from '../../utils/pathTemplate'
 
 const { Title, Text } = Typography
@@ -70,8 +71,9 @@ function AgentRuleFormPage() {
 
   const [mode, setMode] = useState<CollectionMode>('WATCH')
   const [cronExpr, setCronExpr] = useState('')
-  const [pathTemplate, setPathTemplate] = useState('/{year}/{month}/{day}/{filename}')
+  const [pathTemplate, setPathTemplate] = useState('/{agent_name}/{time:yyyy/MM/dd}/{filename}')
   const [pathError, setPathError] = useState<string | null>(null)
+  const [pathPattern, setPathPattern] = useState('*')
   const [buckets, setBuckets] = useState<Bucket[]>([])
   const [submitting, setSubmitting] = useState(false)
 
@@ -232,6 +234,9 @@ function AgentRuleFormPage() {
             initialValue="*"
             rules={[{ required: true, message: '请输入文件过滤模式' }]}
             tooltip="支持 glob（*.csv、**/*.csv）和 trollsift 结构化模式（如 {device}/{date:yyyy/MM/dd}/{filename}）"
+            fieldProps={{
+              onChange: (e) => setPathPattern(e.target.value),
+            }}
           />
 
           <ProFormSwitch
@@ -293,22 +298,46 @@ function AgentRuleFormPage() {
         {/* Step 3: Upload Path Template */}
         <StepsForm.StepForm name="step3" title="上传路径配置">
           <Card size="small" title="可用模板变量" style={{ marginBottom: 16 }}>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {Object.entries(PATH_TEMPLATE_VARIABLES).map(([key, desc]) => (
-                <div key={key}>
-                  <Text code>{key}</Text>
+            <div>
+              <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
+                系统变量（始终可用）：
+              </Text>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+                {SYSTEM_TEMPLATE_VARIABLES.map(({ key, desc }) => (
+                  <div key={key}>
+                    <Text code>{key}</Text>
+                    <Text type="secondary" style={{ marginLeft: 4, fontSize: 12 }}>{desc}</Text>
+                  </div>
+                ))}
+                <div>
+                  <Text code>{'{字段名:LDML格式}'}</Text>
                   <Text type="secondary" style={{ marginLeft: 4, fontSize: 12 }}>
-                    {desc}
+                    时间字段，例如 {'{'}{`time:yyyy/MM/dd`}{'}'} 、{'{'}{`ts:HH:mm:ss|tz=Asia/Shanghai`}{'}'}
                   </Text>
                 </div>
-              ))}
+              </div>
+              {(() => {
+                const dynamicFields = extractDynamicFields(pathPattern)
+                return dynamicFields.length > 0 ? (
+                  <div>
+                    <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
+                      来自文件过滤模式（path_pattern）的字段：
+                    </Text>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                      {dynamicFields.map((f) => (
+                        <Text code key={f}>{`{${f}}`}</Text>
+                      ))}
+                    </div>
+                  </div>
+                ) : null
+              })()}
             </div>
           </Card>
 
           <ProFormText
             name="dest_path_template"
             label="上传路径模板"
-            initialValue="/{year}/{month}/{agent_name}/{filename}"
+            initialValue="/{agent_name}/{time:yyyy/MM/dd}/{filename}"
             rules={[
               { required: true, message: '请输入路径模板' },
               {
@@ -331,7 +360,7 @@ function AgentRuleFormPage() {
             <Text type="secondary">路径预览：</Text>
             <br />
             <Text code style={{ fontSize: 13 }}>
-              {renderPathPreview(pathTemplate)}
+              {renderPathPreview(pathTemplate, extractDynamicFields(pathPattern))}
             </Text>
           </Card>
         </StepsForm.StepForm>

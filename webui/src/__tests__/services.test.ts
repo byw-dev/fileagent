@@ -179,17 +179,27 @@ describe('services/files – extended coverage', () => {
 })
 
 describe('utils/pathTemplate – coverage for renderPathPreview', () => {
-  it('renderPathPreview substitutes all known variables', async () => {
+  it('renderPathPreview substitutes system variables', async () => {
     const { renderPathPreview } = await import('../utils/pathTemplate')
-    const result = renderPathPreview('/{year}/{month}/{day}/{hour}/{agent_id}/{agent_name}/{file_type}/{filename}/{ext}')
-    expect(result).not.toContain('{year}')
-    expect(result).not.toContain('{month}')
+    const result = renderPathPreview('/{agent_id}/{agent_name}/{filename}/{ext}')
+    expect(result).not.toContain('{agent_name}')
     expect(result).not.toContain('{filename}')
+    expect(result).not.toContain('{ext}')
+    expect(result).toContain('my-agent')
+    expect(result).toContain('data.csv')
+    expect(result).toContain('csv')
+  })
+
+  it('renderPathPreview substitutes LDML time fields', async () => {
+    const { renderPathPreview } = await import('../utils/pathTemplate')
+    const result = renderPathPreview('/{time:yyyy}/{time:MM}/{time:dd}')
+    expect(result).not.toContain('{time:')
+    expect(result).toMatch(/\/\d{4}\/\d{2}\/\d{2}/)
   })
 
   it('validatePathTemplate returns null for valid template', async () => {
     const { validatePathTemplate } = await import('../utils/pathTemplate')
-    expect(validatePathTemplate('/{year}/{month}/{filename}')).toBeNull()
+    expect(validatePathTemplate('/{agent_name}/{time:yyyy/MM/dd}/{filename}')).toBeNull()
   })
 
   it('validatePathTemplate rejects empty string', async () => {
@@ -202,8 +212,9 @@ describe('utils/pathTemplate – coverage for renderPathPreview', () => {
     expect(validatePathTemplate('year/month')).toBeTruthy()
   })
 
-  it('validatePathTemplate rejects unknown variables', async () => {
+  it('validatePathTemplate accepts custom variables (no whitelist)', async () => {
     const { validatePathTemplate } = await import('../utils/pathTemplate')
-    expect(validatePathTemplate('/{year}/{unknown_var}')).toBeTruthy()
+    // New behavior: custom field names are valid (resolved at runtime from path_pattern)
+    expect(validatePathTemplate('/{agent_name}/{custom_var}')).toBeNull()
   })
 })
