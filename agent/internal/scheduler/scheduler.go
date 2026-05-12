@@ -148,7 +148,8 @@ func (s *Scheduler) Stop() {
 // Legacy technical names ({yyyy}, {yy}, {mm}, {dd}, {HH}, {MM}) are kept for
 // backward compatibility.  Note: {filename} is NOT resolved here — callers
 // that need filename substitution should use ResolvePathWithFile.
-// Deprecated: use buildStoragePath in agent/cmd/agent/main.go for new rule paths.
+// Deprecated: runtime upload path resolution now uses trollsift Compose flow in
+// the agent command package; this helper remains for legacy path template use.
 func ResolvePath(template string, t time.Time) string {
 	return ResolvePathWithFile(template, t, "")
 }

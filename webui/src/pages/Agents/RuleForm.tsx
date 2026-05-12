@@ -231,7 +231,7 @@ function AgentRuleFormPage() {
             placeholder="*.csv"
             initialValue="*"
             rules={[{ required: true, message: '请输入文件过滤模式' }]}
-            tooltip="支持 glob（*.csv、**/*.csv）和 trollsift 结构化模式（含 {}）"
+            tooltip="支持 glob（*.csv、**/*.csv）和 trollsift 结构化模式（如 {device}/{date:yyyy/MM/dd}/{filename}）"
           />
 
           <ProFormSwitch

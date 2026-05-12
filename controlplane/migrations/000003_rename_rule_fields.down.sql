@@ -1,7 +1,7 @@
 BEGIN;
 
 ALTER TABLE collection_rules
-    ADD COLUMN IF NOT EXISTS watch_subdir_pattern VARCHAR(256);
+    ADD COLUMN watch_subdir_pattern VARCHAR(256);
 
 ALTER TABLE collection_rules
     RENAME COLUMN recursive TO watch_recursive;

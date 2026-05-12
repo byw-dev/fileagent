@@ -13,6 +13,6 @@ ALTER TABLE collection_rules
     RENAME COLUMN watch_recursive TO recursive;
 
 ALTER TABLE collection_rules
-    DROP COLUMN IF EXISTS watch_subdir_pattern;
+    DROP COLUMN watch_subdir_pattern;
 
 COMMIT;
