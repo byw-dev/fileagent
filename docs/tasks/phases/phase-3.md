@@ -45,7 +45,7 @@ T3-3 Python SDK + Control Plane 联调
 
 | ID | 任务 | 状态 |
 |----|------|------|
-| T3-4 | `pkg/trollsift` 共享路径模板库 | ⬜ |
+| T3-4 | `pkg/trollsift` 共享路径模板库 | ✅ |
 | T3-5 | 字段统一 + Bug 修复（DB/proto/agent/CP/WebUI） | ⬜ |
 | T3-6 | Dry-Run 规则测试功能 | ⬜ |
 
