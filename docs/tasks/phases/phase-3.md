@@ -87,17 +87,29 @@ T3-3 Python SDK + Control Plane 联调
 
 ### T3-5 字段统一 + Bug 修复（审计）⚠️
 
-**状态**：⚠️（核心改造已完成，WebUI 测试验收项尚未通过）  
-**关联提交**：`f01598e`、`bbf9378`、`f5537f5`
+**状态**：⚠️（核心改造已完成，WebUI 测试验收项尚未通过，另有 P1 级缺口待修复）  
+**关联提交**：`f01598e`、`bbf9378`、`f5537f5`  
+**审计日期**：2026-05-12（报告：`docs/reports/t3-5-audit-2026-05-12.md`）
 
 - 已完成：
-  - DB 字段迁移与 sqlc 模型同步
+  - DB 字段迁移与 sqlc 模型同步（`migrations/000003_rename_rule_fields`）
   - proto `CollectionRule` 字段统一 + `DryRunResult` 预留
   - Agent 相对路径匹配（doublestar）与 trollsift Compose 存储路径
   - Control Plane `createRule`/`toRuleResponse`/dispatch 字段统一
   - WebUI 规则表单与接口字段统一（`enabled`/`recursive`/`append_mode`）
+  - `append_mode` 默认值修正为 `"overwrite"`（`agents.go:563–566`）
+  - `mode` 输入大小写归一化（`agents.go:567`）
+  - `bucket_id → upload_bucket` CP dispatch 转换稳定（`dispatch.go:lookupBucketName`）
 - 未完成验收项：
   - `pnpm test` 未全绿，剩余 2 个失败（`pathTemplate.test.ts`），待 T3-5-IMPL-J 修复
+- 审计发现的缺口：
+  - **P1** `append_mode` 未包含在 REST 响应（`collectionRuleResponse` 缺字段，`agents.go:448–462`）
+  - **P1** WebUI `validatePathTemplate` 使用白名单拒绝合法动态字段（`pathTemplate.ts:54`）
+  - **P2** `mode` 回显大小写：CP 返回 lowercase，TS 类型期望 uppercase
+
+**验收边界**（T3-5 关闭判定）：  
+- 上述 P1 缺口修复 **且** `pnpm test` 全绿（含 `pathTemplate.test.ts`）→ T3-5 可关闭为 ✅  
+- 仅 P2（mode 大小写）未修复可豁免关闭，须在 T3-6 前补充决策记录
 
 ---
 
