@@ -2,60 +2,135 @@ import { describe, it, expect } from 'vitest'
 import {
   renderPathPreview,
   validatePathTemplate,
-  PATH_TEMPLATE_VARIABLES,
+  extractDynamicFields,
+  SYSTEM_TEMPLATE_VARIABLES,
 } from '../utils/pathTemplate'
 
+describe('SYSTEM_TEMPLATE_VARIABLES', () => {
+  it('should export 4 system variables', () => {
+    expect(SYSTEM_TEMPLATE_VARIABLES).toHaveLength(4)
+    const keys = SYSTEM_TEMPLATE_VARIABLES.map((v) => v.key)
+    expect(keys).toContain('{agent_name}')
+    expect(keys).toContain('{agent_id}')
+    expect(keys).toContain('{filename}')
+    expect(keys).toContain('{ext}')
+  })
+})
+
 describe('renderPathPreview', () => {
-  it('should replace date variables with current date values', () => {
-    const preview = renderPathPreview('/{year}/{month}/{day}')
+  // R-1: LDML time field + system variables
+  it('R-1: replaces LDML time field and system variables', () => {
+    const preview = renderPathPreview('/{agent_name}/{time:yyyy/MM/dd}/{filename}')
     const now = new Date()
-    expect(preview).toContain(String(now.getUTCFullYear()))
-    expect(preview).toMatch(/\/\d{4}\/\d{2}\/\d{2}/)
-  })
-
-  it('should replace agent variables with example strings', () => {
-    const preview = renderPathPreview('/{agent_name}/{file_type}/{filename}')
     expect(preview).toContain('my-agent')
-    expect(preview).toContain('var_hourly')
-    expect(preview).toContain('data_20250415.csv')
+    expect(preview).toContain('data.csv')
+    // LDML-rendered date fragment: YYYY/MM/DD
+    expect(preview).toMatch(/\/\d{4}\/\d{2}\/\d{2}\//)
+    expect(preview).toContain(String(now.getUTCFullYear()))
   })
 
-  it('should return template unchanged when no variables are used', () => {
-    const preview = renderPathPreview('/static/path/to/file')
-    expect(preview).toBe('/static/path/to/file')
+  // R-2: dynamic fields shown as «name»
+  it('R-2: renders dynamic fields from path_pattern as «name» placeholders', () => {
+    const preview = renderPathPreview('/{agent_name}/{sensor_id}/{filename}', ['sensor_id'])
+    expect(preview).toContain('my-agent')
+    expect(preview).toContain('\u00ABsensor_id\u00BB')
+    expect(preview).toContain('data.csv')
   })
 
-  it('should handle empty string input', () => {
+  // R-3: static path unchanged
+  it('R-3: returns static path unchanged when no variables are used', () => {
+    const preview = renderPathPreview('/static/path')
+    expect(preview).toBe('/static/path')
+  })
+
+  // R-4: empty string
+  it('R-4: returns empty string for empty input', () => {
     const preview = renderPathPreview('')
     expect(preview).toBe('')
+  })
+
+  // R-5: LDML with hour segment
+  it('R-5: renders LDML time field with hour correctly', () => {
+    const preview = renderPathPreview('/{agent_name}/{time:yyyy/MM/dd/HH}/{filename}')
+    // Pattern: /YYYY/MM/DD/HH/ fragment somewhere in the result
+    expect(preview).toMatch(/\/\d{4}\/\d{2}\/\d{2}\/\d{2}\//)
+  })
+
+  it('leaves unknown variables unchanged when not in dynamicFields', () => {
+    const preview = renderPathPreview('/{custom_var}/test')
+    expect(preview).toContain('{custom_var}')
+  })
+
+  it('strips |tz= suffix and still renders LDML', () => {
+    const preview = renderPathPreview('/{time:yyyy/MM|tz=Asia/Shanghai}')
+    expect(preview).toMatch(/\/\d{4}\/\d{2}/)
   })
 })
 
 describe('validatePathTemplate', () => {
-  it('should return null for a valid template', () => {
-    expect(validatePathTemplate('/{year}/{month}/{agent_name}/{filename}')).toBeNull()
-  })
-
-  it('should reject empty string', () => {
+  // V-1: empty string
+  it('V-1: rejects empty string', () => {
     expect(validatePathTemplate('')).toBeTruthy()
   })
 
-  it('should reject templates not starting with /', () => {
+  // V-2: not starting with /
+  it('V-2: rejects templates not starting with /', () => {
     expect(validatePathTemplate('year/month')).toBeTruthy()
   })
 
-  it('should reject templates with double slashes', () => {
-    expect(validatePathTemplate('//year/month')).toBeTruthy()
+  // V-3: double slashes
+  it('V-3: rejects templates with double slashes', () => {
+    expect(validatePathTemplate('//year')).toBeTruthy()
   })
 
-  it('should reject unknown template variables', () => {
-    const error = validatePathTemplate('/{year}/{unknown_var}')
-    expect(error).toContain('{unknown_var}')
+  // V-4: unbalanced braces
+  it('V-4: rejects unbalanced braces', () => {
+    expect(validatePathTemplate('/{agent_name/{filename}')).toBeTruthy()
   })
 
-  it('should accept all known template variables', () => {
-    const knownVars = Object.keys(PATH_TEMPLATE_VARIABLES)
-    const template = '/' + knownVars.join('/')
-    expect(validatePathTemplate(template)).toBeNull()
+  // V-5: empty field name
+  it('V-5: rejects empty field name ({})', () => {
+    expect(validatePathTemplate('/{}/{filename}')).toBeTruthy()
+  })
+
+  // V-6: tz= with empty value
+  it('V-6: rejects |tz= with empty value', () => {
+    expect(validatePathTemplate('/{t:yyyy|tz=}/{filename}')).toBeTruthy()
+  })
+
+  // V-7: valid trollsift template with LDML
+  it('V-7: accepts valid template with LDML time field', () => {
+    expect(validatePathTemplate('/{agent_name}/{time:yyyy/MM/dd}/{filename}')).toBeNull()
+  })
+
+  // V-8: custom fields are now valid (no whitelist)
+  it('V-8: accepts custom field names without error', () => {
+    expect(validatePathTemplate('/{sensor_id}/{device}/{filename}')).toBeNull()
+  })
+
+  // V-9: previously-rejected agent_name is now valid
+  it('V-9: accepts {agent_name} and unknown fields (no whitelist check)', () => {
+    expect(validatePathTemplate('/{agent_name}/{unknown_var}')).toBeNull()
+  })
+
+  it('accepts valid tz= with non-empty value', () => {
+    expect(validatePathTemplate('/{t:yyyy/MM/dd|tz=Asia/Shanghai}/{filename}')).toBeNull()
+  })
+})
+
+describe('extractDynamicFields', () => {
+  // E-1: mixed fields
+  it('E-1: extracts field names from trollsift pattern', () => {
+    const fields = extractDynamicFields('{sensor_id}/{date:yyyy/MM/dd}/{filename}')
+    expect(fields).toEqual(['sensor_id', 'date', 'filename'])
+  })
+
+  // E-2: no braces
+  it('E-2: returns empty array when no {} present', () => {
+    expect(extractDynamicFields('*.csv')).toEqual([])
+  })
+
+  it('handles simple field names', () => {
+    expect(extractDynamicFields('{device}/{seq:05d}.csv')).toEqual(['device', 'seq'])
   })
 })

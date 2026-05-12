@@ -14,7 +14,7 @@ T3-2 Web UI + Control Plane 联调  ✅ 已完成
     ↓
 T3-4 pkg/trollsift 共享路径模板库 ✅
     ↓
-T3-5 字段统一 + Bug 修复 ⚠️（待补齐 WebUI 测试验收）
+T3-5 字段统一 + Bug 修复 ✅
     ↓
 T3-6 Dry-Run 规则测试功能
     ↓
@@ -23,18 +23,10 @@ T3-3 Python SDK + Control Plane 联调
 
 ---
 
-## 当前优先：T3-5 — 字段统一 + Bug 修复（审计收尾）
+## 当前优先：T3-6 — Dry-Run 规则测试功能
 
-**前置依赖**：T3-4 ✅  
-**涉及模块**：controlplane、agent、proto、webui
-
-### 验收标准
-
-- [x] DB 迁移字段重命名落地（`000003_rename_rule_fields.*.sql`）
-- [x] proto 字段统一与 dry-run 预留消息落地
-- [x] `go test ./...`（controlplane）通过
-- [x] `go test ./...`（agent）通过
-- [ ] `pnpm test` 全通过（剩余 2 个失败：`pathTemplate.test.ts`，由 T3-5-IMPL-J 修复）
+**前置依赖**：T3-5 ✅  
+**涉及模块**：controlplane（dryRunStore + REST 端点）、agent（handleDryRun）、webui（RuleForm Step 3 测试面板）
 
 ---
 
@@ -46,7 +38,7 @@ T3-3 Python SDK + Control Plane 联调
 | ID | 任务 | 状态 |
 |----|------|------|
 | T3-4 | `pkg/trollsift` 共享路径模板库 | ✅ |
-| T3-5 | 字段统一 + Bug 修复（DB/proto/agent/CP/WebUI） | ⚠️ |
+| T3-5 | 字段统一 + Bug 修复（DB/proto/agent/CP/WebUI） | ✅ |
 | T3-6 | Dry-Run 规则测试功能 | ⬜ |
 
 ---
@@ -85,10 +77,10 @@ T3-3 Python SDK + Control Plane 联调
 
 ---
 
-### T3-5 字段统一 + Bug 修复（审计）⚠️
+### T3-5 字段统一 + Bug 修复（审计）✅
 
-**状态**：⚠️（核心改造已完成，WebUI 测试验收项尚未通过，另有 P1 级缺口待修复）  
-**关联提交**：`f01598e`、`bbf9378`、`f5537f5`  
+**状态**：✅（全部验收项通过，含 T3-5-IMPL-J WebUI 重设计）  
+**关联提交**：`f01598e`、`bbf9378`、`f5537f5`（原始实现）+ T3-5-IMPL-J 提交  
 **审计日期**：2026-05-12（报告：`docs/reports/t3-5-audit-2026-05-12.md`）
 
 - 已完成：
@@ -100,12 +92,13 @@ T3-3 Python SDK + Control Plane 联调
   - `append_mode` 默认值修正为 `"overwrite"`（`agents.go:563–566`）
   - `mode` 输入大小写归一化（`agents.go:567`）
   - `bucket_id → upload_bucket` CP dispatch 转换稳定（`dispatch.go:lookupBucketName`）
-- 未完成验收项：
-  - `pnpm test` 未全绿，剩余 2 个失败（`pathTemplate.test.ts`），待 T3-5-IMPL-J 修复
-- 审计发现的缺口：
-  - **P1** `append_mode` 未包含在 REST 响应（`collectionRuleResponse` 缺字段，`agents.go:448–462`）
-  - **P1** WebUI `validatePathTemplate` 使用白名单拒绝合法动态字段（`pathTemplate.ts:54`）
-  - **P2** `mode` 回显大小写：CP 返回 lowercase，TS 类型期望 uppercase
+  - `append_mode` 补入 `collectionRuleResponse`（P1 缺口修复）
+  - T3-5-IMPL-J：`pathTemplate.ts` 重设计（SYSTEM_TEMPLATE_VARIABLES、trollsift 语法校验、LDML 预览、extractDynamicFields）
+  - T3-5-IMPL-J：`RuleForm.tsx` Step 3 更新（两区变量提示、新 initialValue、dynamicFields 联动）
+  - T3-5-IMPL-J：`pathTemplate.test.ts` 全部重写（21 个测试全绿）
+  - `pnpm test`：68 个测试全部通过
+  - `go test ./...`（controlplane）：80.5% 总覆盖率
+  - `go test ./...`（agent）：全部通过
 
 **验收边界**（T3-5 关闭判定）：  
 - 上述 P1 缺口修复 **且** `pnpm test` 全绿（含 `pathTemplate.test.ts`）→ T3-5 可关闭为 ✅  
