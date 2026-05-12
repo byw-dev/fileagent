@@ -18,5 +18,6 @@
 - 2026-05-09：T3-2-FIX 系列（A~L，API 契约对齐 + WebUI Modal/崩溃修复）完成（提交 `2715706`）
 - 2026-05-11：T3-2-BUG 系列（A~D，集成联调新发现 Bug）全部修复完成；另修复 `createRuleRequest` JSON 字段名不匹配导致的 400 错误，对齐 Agent 路径模板变量，新增 D-008 决策记录（提交 `addb3ee`）
 - 2026-05-12：T3-5（字段统一 + Bug 修复）代码改造完成并审计；`go test`（controlplane/agent）通过，`pnpm test` 仍有 2 个既有失败（`pathTemplate.test.ts`），任务状态更新为 ⚠️（提交 `f01598e`、`bbf9378`、`f5537f5`）
+- 2026-05-12：T3-5-IMPL-J 完成（WebUI 路径模板重设计：`SYSTEM_TEMPLATE_VARIABLES`、trollsift 语法校验、LDML 预览、`extractDynamicFields`；`append_mode` 补入 REST 响应）；`pnpm test` 68/68 通过，controlplane 覆盖率 80.5%；T3-5 全部验收项通过，状态更新为 ✅（提交 `3646f7e`、`1753bfa`）
 - 当前主线与验收：`docs/tasks/phases/phase-3.md`
 - 已关闭 Bug 归档：`docs/tasks/bugs/closed.md`
