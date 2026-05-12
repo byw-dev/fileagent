@@ -371,10 +371,10 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 
 | 概念 | **统一字段名** | DB 现状 | proto 现状 | REST-in 现状 | REST-out 现状 | Frontend 现状 |
 |---|---|---|---|---|---|---|
-| 监控根目录 | `base_path` | `source_path_template` | `source_path_template` | `source_path_template` | `source_path` | `source_path` |
-| 文件/路径过滤 | `path_pattern` | `file_glob` | `file_glob` | `file_glob` | `file_pattern` | `file_pattern` |
-| 目标路径模板 | `dest_path_template` | `upload_path_template` | `upload_path_template` | `upload_path_template` | `dest_path_template` ✓ | `dest_path_template` ✓ |
-| 目标 Bucket（DB FK） | `bucket_id` | `bucket_id` ✓ | — | `bucket_id` ✓ | `dest_bucket_id` | `dest_bucket_id` |
+| 监控根目录 | `base_path` | `source_path_template` | `source_path_template` | `source_path` | `source_path` | `source_path` |
+| 文件/路径过滤 | `path_pattern` | `file_glob` | `file_glob` | `file_pattern` | `file_pattern` | `file_pattern` |
+| 目标路径模板 | `dest_path_template` | `upload_path_template` | `upload_path_template` | `dest_path_template` ✓ | `dest_path_template` ✓ | `dest_path_template` ✓ |
+| 目标 Bucket（DB FK） | `bucket_id` | `bucket_id` ✓ | — | `dest_bucket_id` | `dest_bucket_id` | `dest_bucket_id` |
 | 目标 Bucket（proto，bucket 名称字符串） | `upload_bucket` | — | `upload_bucket` | — | — | — |
 | 是否递归 | `recursive` | `watch_recursive` | `watch_recursive` | `watch_recursive` | `watch_recursive` | 缺失 |
 | 子目录过滤 | **删除** | `watch_subdir_pattern` | `watch_subdir_pattern` | `watch_subdir_pattern` | 缺失 | 缺失 |
@@ -399,6 +399,7 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 
 - DB 默认值保持 `'overwrite'`（不变）
 - Agent 侧常量 `AppendModeNone = ""` 重命名为 `AppendModeOverwrite = "overwrite"`
+- CP handler（`CreateRule`）当前错误地将空 `append_mode` 默认为 `"none"`，T3-5 修正为 `"overwrite"`
 - 统一后三端值域：`'overwrite'` / `'tail'` / `'close_wait'`
 
 ### 备选方案（被否决）

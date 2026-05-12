@@ -9,7 +9,7 @@
 
 | ID | 标题 | 严重程度 | 涉及模块 | 修复子任务 |
 |----|------|---------|---------|-----------|
-| T3-5-BUG-1 | 规则创建断路：Frontend ↔ REST 字段名不匹配 | 🔴 P0 | controlplane + webui | T3-5-G |
+| T3-5-BUG-1 | 规则字段名不规范：REST-in 使用前端别名而非统一字段名 | 🟡 P2 | controlplane + webui | T3-5-G |
 | T3-5-BUG-2 | `upload_bucket` 始终为空，Agent 无法写入 MinIO | 🔴 P0 | controlplane | T3-5-H |
 | T3-5-BUG-3 | `mode` 大小写不一致导致 DB 写入失败 | 🟡 P1 | controlplane | T3-5-G |
 | T3-5-BUG-4 | `append_mode` 值域三端不一致 | 🟡 P1 | agent | T3-5-D |
@@ -18,37 +18,44 @@
 
 ---
 
-## T3-5-BUG-1 — 规则创建断路：Frontend ↔ REST 字段名不匹配
+## T3-5-BUG-1 — 规则字段名不规范：REST-in 使用前端别名而非统一字段名
 
-**严重程度**：🔴 P0（所有规则创建请求均以 400 失败）  
+**严重程度**：🟡 P2（字段命名不规范，规则创建功能本身可用）  
 **涉及模块**：controlplane + webui  
 **修复子任务**：T3-5-G
 
-### 根因
+### 当前状态
 
-前端 `CollectionRulePayload` 发送的字段名与后端 `createRuleRequest` 期望的字段名不匹配：
+`createRuleRequest`（`controlplane/internal/api/handler/agents.go`）的 JSON 标签**已匹配前端字段名**（`dest_bucket_id` / `source_path` / `file_pattern` / `dest_path_template`），与 `collectionRuleResponse` 输出保持对称，Gin binding 不会失败。
 
-| 概念 | 前端发送 | 后端期望 |
-|------|---------|---------|
-| 目标 Bucket | `dest_bucket_id` | `bucket_id` |
-| 监控根目录 | `source_path` | `source_path_template`（T3-5 后改为 `base_path`）|
-| 文件过滤 | `file_pattern` | `file_glob`（T3-5 后改为 `path_pattern`）|
-| 目标路径模板 | `dest_path_template` ✓ | `upload_path_template`（T3-5 后改为 `dest_path_template`）|
+**规则创建请求不会因字段名不匹配而返回 400**。
 
-Gin binding 校验 `binding:"required"` 失败，直接返回 400，规则无法创建。
+T3-5 的目标是将四层（DB / proto / REST / Frontend）统一到规范字段名（`bucket_id` / `base_path` / `path_pattern` / `dest_path_template`），而非修复现有的绑定错误。
+
+> ⚠️ 若 T3-5 变更前 `create rule` 请求仍然失败，请检查 BUG-3（mode 大小写）。
+
+### 当前字段名实际状态（审计于 2026-05-12）
+
+| 概念 | REST-in 现状 | Frontend 现状 | T3-5 统一目标 |
+|------|------------|-------------|-------------|
+| 目标 Bucket | `dest_bucket_id` | `dest_bucket_id` | `bucket_id` |
+| 监控根目录 | `source_path` | `source_path` | `base_path` |
+| 文件过滤 | `file_pattern` | `file_pattern` | `path_pattern` |
+| 目标路径模板 | `dest_path_template` ✓ | `dest_path_template` ✓ | `dest_path_template` ✓（已是目标名） |
 
 ### 代码位置
 
-- `controlplane/internal/api/handler/rules.go`：`createRuleRequest` 结构体 JSON tag
+- `controlplane/internal/api/handler/agents.go`：`createRuleRequest` JSON tag（当前使用前端别名）
+- `controlplane/internal/api/handler/agents.go`：`collectionRuleResponse` JSON tag（同上）
 - `webui/src/services/agents.ts`：`CollectionRulePayload` 接口字段名
 
 ### 修复方案
 
-统一字段命名（T3-5-G）后前后端一致，参见 `DECISIONS.md` D-009 完整字段映射表。
+T3-5-G 将同步变更 REST handler JSON tag 与前端接口字段名至统一命名，参见 `DECISIONS.md` D-009 完整字段映射表。
 
 ### 验收标准
 
-`POST /api/v1/agents/:id/rules` 传入统一字段名后返回 201，规则写入 DB。
+T3-5 完成后，`POST /api/v1/agents/:id/rules` 使用统一字段名（`base_path` / `path_pattern` 等）返回 201，旧别名（`source_path` / `file_pattern`）不再被接受。
 
 ---
 
@@ -145,6 +152,7 @@ Agent 侧常量 `AppendModeNone = ""`（空字符串）语义上等价于"全量
 - `agent/internal/watcher/watcher.go`：`AppendModeNone = ""` 常量定义及其判断逻辑
 - `agent/internal/queue/queue.go`：SQLite DDL `append_mode DEFAULT ''`
 - `agent/cmd/agent/main.go`：`AppendModeNone` 引用处
+- `controlplane/internal/api/handler/agents.go`：`CreateRule` handler，line 564-566，`appendMode = "none"` 为无效默认值（DB 接受 `'overwrite'`，不接受 `'none'`）
 
 ### 修复方案
 
@@ -152,6 +160,15 @@ Agent 侧统一到 `'overwrite'`：
 - `AppendModeNone = ""` → `AppendModeOverwrite = "overwrite"`
 - SQLite DDL：`DEFAULT ''` → `DEFAULT 'overwrite'`
 - 所有 `appendMode == ""` 判断改为 `appendMode == AppendModeOverwrite`
+
+**同时修复 handler**：
+```go
+// controlplane/internal/api/handler/agents.go
+appendMode := req.AppendMode
+if appendMode == "" {
+    appendMode = "overwrite"  // 原为 "none"，修正为合法默认值
+}
+```
 
 DB 侧默认值 `'overwrite'` 保持不变。统一后三端值域：`'overwrite'` / `'tail'` / `'close_wait'`。
 
