@@ -10,19 +10,26 @@ export const SYSTEM_TEMPLATE_VARIABLES: ReadonlyArray<{ key: string; desc: strin
 ]
 
 /**
- * Format a LDML pattern string using the given UTC date.
- * Supported symbols: yyyy, yy, MM, dd, HH, mm, ss.
+ * Format a LDML pattern string using the given UTC date via a single-pass substitution.
+ *
+ * Supported symbols (longest match wins): yyyy, yy, MM, dd, HH, mm, ss.
+ * Any other characters in the LDML string are passed through unchanged.
+ * The `|tz=...` suffix must be stripped by the caller before invoking this function.
  */
 function formatLDML(ldml: string, now: Date): string {
   const pad = (n: number) => String(n).padStart(2, '0')
-  return ldml
-    .replace(/yyyy/g, String(now.getUTCFullYear()))
-    .replace(/yy/g, String(now.getUTCFullYear()).slice(-2))
-    .replace(/MM/g, pad(now.getUTCMonth() + 1))
-    .replace(/dd/g, pad(now.getUTCDate()))
-    .replace(/HH/g, pad(now.getUTCHours()))
-    .replace(/mm/g, pad(now.getUTCMinutes()))
-    .replace(/ss/g, pad(now.getUTCSeconds()))
+  const tokens: Record<string, string> = {
+    yyyy: String(now.getUTCFullYear()),
+    yy:   String(now.getUTCFullYear()).slice(-2),
+    MM:   pad(now.getUTCMonth() + 1),
+    dd:   pad(now.getUTCDate()),
+    HH:   pad(now.getUTCHours()),
+    mm:   pad(now.getUTCMinutes()),
+    ss:   pad(now.getUTCSeconds()),
+  }
+  // Single-pass replacement — longer tokens (yyyy) are listed before shorter ones (yy)
+  // in the alternation so the regex engine matches the longest possible token first.
+  return ldml.replace(/yyyy|yy|MM|dd|HH|mm|ss/g, (tok) => tokens[tok] ?? tok)
 }
 
 /**
@@ -63,7 +70,7 @@ export function renderPathPreview(template: string, dynamicFields?: string[]): s
       }
       return formatLDML(ldmlPart, now)
     }
-    if (match in systemSubs) {
+    if (Object.hasOwn(systemSubs, match)) {
       return systemSubs[match]
     }
     if (dynamicSet.has(inner)) {
