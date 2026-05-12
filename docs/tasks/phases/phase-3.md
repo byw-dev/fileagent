@@ -34,7 +34,7 @@ T3-3 Python SDK + Control Plane 联调
 - [x] proto 字段统一与 dry-run 预留消息落地
 - [x] `go test ./...`（controlplane）通过
 - [x] `go test ./...`（agent）通过
-- [ ] `pnpm test` 全通过（当前剩余 2 个既有失败：`src/__tests__/pathTemplate.test.ts`）
+- [ ] `pnpm test` 全通过（剩余 2 个失败：`pathTemplate.test.ts`，由 T3-5-J 修复）
 
 ---
 
@@ -97,7 +97,7 @@ T3-3 Python SDK + Control Plane 联调
   - Control Plane `createRule`/`toRuleResponse`/dispatch 字段统一
   - WebUI 规则表单与接口字段统一（`enabled`/`recursive`/`append_mode`）
 - 未完成验收项：
-  - `pnpm test` 未全绿，剩余 2 个失败（`pathTemplate.test.ts`）
+  - `pnpm test` 未全绿，剩余 2 个失败（`pathTemplate.test.ts`），待 T3-5-J 修复
 
 ---
 
