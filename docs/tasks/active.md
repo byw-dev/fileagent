@@ -11,12 +11,27 @@
 - 本轮新增工作为 **审计变更与同步任务清单状态**
 - 详细规格与验收标准：[`docs/tasks/phases/phase-3-rft.md`](phases/phase-3-rft.md)
 
-### T3-5 审计结论（快速参考）
+### T3-5 审计结论（2026-05-12）
 
-- [x] DB / proto / agent / controlplane / webui 字段统一改造已落地
+- [x] DB 字段统一（`000003_rename_rule_fields.up.sql`）
+- [x] proto `CollectionRule` 字段统一（`base_path`/`path_pattern`/`dest_path_template`/`upload_bucket`/`recursive`/`append_mode`/`enabled`）
+- [x] CP REST 请求字段统一（`createRuleRequest`：`base_path`/`path_pattern`/`dest_path_template`/`bucket_id`/`recursive`/`append_mode`/`enabled`）
+- [x] CP REST 响应字段统一（`collectionRuleResponse`：已有 `base_path`/`path_pattern`/`dest_path_template`/`bucket_id`/`recursive`/`enabled`）
+- [x] `append_mode` 默认值为 `"overwrite"`（`agents.go:563–566`）
+- [x] `mode` 大小写在输入时归一化（`agents.go:567` `strings.ToLower`）
+- [x] `bucket_id → upload_bucket` 由 CP dispatch 稳定执行（`dispatch.go:lookupBucketName`）
+- [x] `enabled ↔ status` 双向一致（`toRuleResponse` + `CreateRule`）
+- [x] `pkg/trollsift` 已落地（`pkg/trollsift/`），Parse/Compose/Globify/IsTrollsiftPattern 均已实现
+- [x] Agent 使用 `AppendModeOverwrite = "overwrite"`（`watcher.go:45`）
 - [x] `go test ./...`（controlplane）通过
 - [x] `go test ./...`（agent）通过
 - [ ] `pnpm test` 全通过（剩余 2 个失败：`pathTemplate.test.ts`，由 **T3-5-IMPL-J** 修复）
+
+**已知缺口（审计发现）：**
+
+- **P1** `append_mode` 未包含在 REST 响应（`collectionRuleResponse` 缺字段，`agents.go:448–462`）
+- **P1** WebUI `validatePathTemplate` 使用白名单，拒绝合法动态字段（`pathTemplate.ts:54`），导致 2 个测试失败
+- **P2** `mode` 回显大小写：CP 返回 lowercase，WebUI TS 类型期望 uppercase（不影响创建功能，影响回显类型安全）
 
 **T3-5-IMPL-J 待实现**（详细技术规格见 `phase-3-rft.md` §T3-5-IMPL-J）：
 

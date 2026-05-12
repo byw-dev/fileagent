@@ -219,7 +219,7 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 
 ---
 
-## D-006 upload-log 响应不返回 agent_name 字段（T3-2-FIX-G）
+## D-011 upload-log 响应不返回 agent_name 字段（T3-2-FIX-G）
 
 **决策日期**：2026-05-08
 **影响范围**：controlplane API、Web UI
@@ -406,6 +406,35 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 
 - **`append_mode` DB 改为 `'none'`**：与现有数据不兼容，需要额外 migration；`'overwrite'` 语义已足够清晰。
 - **逐层单独修复而不全局统一**：每次修复后测试范围难以界定，不如一次性对齐。
+
+### 实施状态（2026-05-12 审计）
+
+**已落实项：**
+
+| 字段 | 层 | 证据 |
+|------|---|------|
+| `base_path` | DB / proto / CP REST in+out / WebUI | `migrations/000003_rename_rule_fields.up.sql`; `models.go:372`; `agents.go:521,458`; `agents.ts:98` |
+| `path_pattern` | DB / proto / CP REST in+out / WebUI | 同上 |
+| `dest_path_template` | DB / proto / CP REST in+out / WebUI | 同上 |
+| `bucket_id` (DB FK) | DB / CP REST in+out / WebUI | `models.go:367`; `agents.go:518,450`; `agents.ts:103` |
+| `upload_bucket` (proto) | proto / CP dispatch | `agent.proto:7`; `dispatch.go:170–184`（lookupBucketName → UploadBucket） |
+| `recursive` | DB / proto / CP REST in+out / WebUI | `migrations/000003…`; `models.go:375`; `agents.go:524,459`; `agents.ts:104` |
+| `append_mode` 默认值 `'overwrite'` | CP handler / Agent | `agents.go:563–566`; `watcher.go:45`（AppendModeOverwrite = "overwrite"） |
+| `mode` 大小写归一化（输入） | CP handler | `agents.go:567`（strings.ToLower） |
+| `enabled`/`status` 双向映射 | CP REST / proto / DB | `agents.go:470–471`（toRuleResponse）; `dispatch.go:182`（ruleToProto） |
+
+**未落实项（已知缺口）：**
+
+| 缺口 | 层 | 优先级 | 说明 |
+|------|---|--------|------|
+| `append_mode` 缺失于 REST 输出 | CP REST out | P1 | `collectionRuleResponse`（`agents.go:448–462`）未包含 `append_mode` 字段，前端列表/回显无法获取该值 |
+| `mode` 大小写不一致（回显） | CP REST out / WebUI TS type | P2 | CP 返回 `"watch"/"scheduled"`（lowercase），但 WebUI `CollectionMode` 类型定义为 `'WATCH'/'SCHEDULED'`（uppercase）；编辑回显时类型不匹配 |
+| WebUI 路径模板校验白名单过严 | WebUI `pathTemplate.ts` | P1 | `validatePathTemplate` 拒绝 `{agent_name}` 等合法动态字段，导致 2 个单元测试失败（T3-5-IMPL-J） |
+
+**风险/待办项：**
+
+- `append_mode` 回显缺失：需在 `collectionRuleResponse` 添加 `AppendMode string \`json:"append_mode"\`` 字段并在 `toRuleResponse` 赋值（T3-5-IMPL-J 应同时处理）
+- `mode` 回显大小写：前端展示层已用大写 label，不影响功能；但 TypeScript 类型需将 `CollectionMode` 扩展为同时接受大小写，或在收到响应时做 `toUpperCase` 规范化
 
 ---
 
