@@ -9,27 +9,27 @@
 
 | ID | 标题 | 严重程度 | 涉及模块 |
 |----|------|---------|---------|
-| T3-5-BUG-1 | 规则字段名不规范：REST-in 使用前端别名而非统一字段名 | 🟡 P2 | controlplane + webui |
-| T3-5-BUG-2 | `upload_bucket` 始终为空，Agent 无法写入 MinIO | 🔴 P0 | controlplane |
-| T3-5-BUG-3 | `mode` 大小写不一致导致 DB 写入失败 | 🟡 P1 | controlplane |
-| T3-5-BUG-4 | `append_mode` 值域三端不一致 | 🟡 P1 | agent + controlplane |
+| T3-5-BUG-A | 规则字段名不规范：REST-in 使用前端别名而非统一字段名 | 🟡 P2 | controlplane + webui |
+| T3-5-BUG-B | `upload_bucket` 始终为空，Agent 无法写入 MinIO | 🔴 P0 | controlplane |
+| T3-5-BUG-C | `mode` 大小写不一致导致 DB 写入失败 | 🟡 P1 | controlplane |
+| T3-5-BUG-D | `append_mode` 值域三端不一致 | 🟡 P1 | agent + controlplane |
 
-### T3-5-BUG-2 — `upload_bucket` 始终为空 ✅
+### T3-5-BUG-B — `upload_bucket` 始终为空 ✅
 
 **根因**：`ruleToProto()` 从未填充 `UploadBucket` 字段。  
 **修复**：`Dispatcher` 新增 `BucketQuerier` 接口（`GetBucketByID`），在 `DispatchRule` 和 `SyncRulesOnConnect` 中查出 bucket 名后传入 `ruleToProto(rule, bucketName)`。
 
-### T3-5-BUG-3 — `mode` 大小写不一致 ✅
+### T3-5-BUG-C — `mode` 大小写不一致 ✅
 
 **根因**：前端发送 `"WATCH"`/`"SCHEDULED"` 大写，DB enum 只接受小写。  
 **修复**：`CreateRule` handler 写入 DB 前调用 `strings.ToLower(req.Mode)`。
 
-### T3-5-BUG-4 — `append_mode` 三端不一致 ✅
+### T3-5-BUG-D — `append_mode` 三端不一致 ✅
 
 **根因**：`AppendModeNone = ""`（Agent）vs `'overwrite'`（DB/proto）。  
 **修复**：`AppendModeNone` → `AppendModeOverwrite = "overwrite"`；SQLite DDL/migration default `''` → `'overwrite'`；CP handler 默认值 `"none"` → `"overwrite"`。
 
-### T3-5-BUG-1 — 规则字段名不规范 ✅
+### T3-5-BUG-A — 规则字段名不规范 ✅
 
 **根因**：REST/前端使用别名（`dest_bucket_id`、`source_path`、`file_pattern`）而非 D-009 统一字段名。  
 **修复**：REST JSON tag 与前端接口字段名对齐 D-009：`dest_bucket_id`→`bucket_id`，`source_path`→`base_path`，`file_pattern`→`path_pattern`。
@@ -95,7 +95,7 @@
 
 ---
 
-## 2026-05-07 修复 — T3-1-BUGFIX（gRPC 注册链路三个关键 Bug）
+## 2026-05-07 修复 — T3-1-BUG（gRPC 注册链路三个关键 Bug）
 
 ### Bug A — Register ErrNoRows 判断逻辑颠倒 ✅
 

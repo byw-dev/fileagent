@@ -16,9 +16,9 @@
 - [x] DB / proto / agent / controlplane / webui 字段统一改造已落地
 - [x] `go test ./...`（controlplane）通过
 - [x] `go test ./...`（agent）通过
-- [ ] `pnpm test` 全通过（剩余 2 个失败：`pathTemplate.test.ts`，由 **T3-5-J** 修复）
+- [ ] `pnpm test` 全通过（剩余 2 个失败：`pathTemplate.test.ts`，由 **T3-5-IMPL-J** 修复）
 
-**T3-5-J 待实现**（详细技术规格见 `phase-3-rft.md` §T3-5-J）：
+**T3-5-IMPL-J 待实现**（详细技术规格见 `phase-3-rft.md` §T3-5-IMPL-J）：
 
 - [ ] 删除 `PATH_TEMPLATE_VARIABLES`，新增 `SYSTEM_TEMPLATE_VARIABLES`（4 个系统变量）
 - [ ] `validatePathTemplate`：改为 trollsift 语法校验（无白名单，接受任意合法字段名）

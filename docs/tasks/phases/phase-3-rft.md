@@ -244,7 +244,7 @@ outB, _ = ParserB.Compose(valsA, false)
 
 ### 子任务
 
-#### T3-5-A：DB 迁移
+#### T3-5-IMPL-A：DB 迁移
 
 **文件**：`controlplane/migrations/`
 
@@ -253,7 +253,7 @@ outB, _ = ParserB.Compose(valsA, false)
 **重要约束**：`collection_rules.status` 字段的类型 `rule_status`（枚举值 `'active'`/`'inactive'`）**保留不变**，以便后期扩展更多状态（如 `'paused'`）。`enabled` bool 语义仅在应用层转换，不写入 DB。
 
 ```sql
--- T3-5-A: 采集规则字段重命名，保留 status rule_status 枚举类型
+-- T3-5-IMPL-A: 采集规则字段重命名，保留 status rule_status 枚举类型
 BEGIN;
 
 ALTER TABLE collection_rules
@@ -291,7 +291,7 @@ COMMIT;
 
 **验收**：`migrate up` 后 `collection_rules` 表保留 `status rule_status` 字段，新字段名正确；`migrate down` 可完整回滚。
 
-#### T3-5-B：Proto 字段重命名
+#### T3-5-IMPL-B：Proto 字段重命名
 
 **文件**：`proto/v1/agent.proto`
 
@@ -342,7 +342,7 @@ DryRunResult dry_run_result = 15;
 
 **验收**：`go build ./...`（根、agent、controlplane 三模块）全部通过。
 
-#### T3-5-C：Agent 字段名同步
+#### T3-5-IMPL-C：Agent 字段名同步
 
 **文件**：`agent/internal/scheduler/scheduler.go`、`agent/cmd/agent/main.go`
 
@@ -377,7 +377,7 @@ func protoToRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 }
 ```
 
-#### T3-5-D：Bug 4 修复 — `append_mode` 值域统一（Agent 侧）
+#### T3-5-IMPL-D：Bug 4 修复 — `append_mode` 值域统一（Agent 侧）
 
 **文件**：`agent/internal/watcher/watcher.go`、`agent/internal/queue/queue.go`、`agent/cmd/agent/main.go`
 
@@ -386,7 +386,7 @@ func protoToRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 - 所有 `appendMode == ""` 的判断改为 `appendMode == AppendModeOverwrite`
 - 测试中 `"none"` 字面量改为 `"overwrite"`（`main_test.go` 等）
 
-#### T3-5-E：`matchGlob` / `walkAndSubmit` 升级为相对路径匹配
+#### T3-5-IMPL-E：`matchGlob` / `walkAndSubmit` 升级为相对路径匹配
 
 **文件**：`agent/cmd/agent/main.go`（`matchGlob`、`walkAndSubmit`）、`agent/go.mod`
 
@@ -399,7 +399,7 @@ func protoToRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 
 **walkAndSubmit 同步修改**：将 `filepath.Base` 匹配改为 relPath 匹配，逻辑同上。
 
-#### T3-5-F：`buildStoragePath` 重写为 trollsift Compose 流程
+#### T3-5-IMPL-F：`buildStoragePath` 重写为 trollsift Compose 流程
 
 **文件**：`agent/cmd/agent/main.go`（新函数 `buildStoragePath`，原 `buildStoragePath` 或 `scheduler.ResolvePath` 标注 deprecated）
 
@@ -424,7 +424,7 @@ func protoToRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 
 `scheduler.ResolvePath()` 添加 `// Deprecated: use buildStoragePath instead` 注释。
 
-#### T3-5-G：CP `createRuleRequest` / `toRuleResponse` 字段统一（Bug 1 + Bug 3）
+#### T3-5-IMPL-G：CP `createRuleRequest` / `toRuleResponse` 字段统一（Bug 1 + Bug 3）
 
 **文件**：`controlplane/internal/api/handler/rules.go`（或同等位置）
 
@@ -456,7 +456,7 @@ Bug 3 修复：handler 中 `mode = strings.ToLower(req.Mode)`，写入 DB 前归
 
 `createRuleRequest` 输入时，`enabled` bool → 写入 DB 时转换为 `RuleStatus`：`true → 'active'`，`false → 'inactive'`（nil 默认 `'active'`）。
 
-#### T3-5-H：CP `dispatch.go` 修复 Bug 2（`upload_bucket` 始终为空）
+#### T3-5-IMPL-H：CP `dispatch.go` 修复 Bug 2（`upload_bucket` 始终为空）
 
 **文件**：`controlplane/internal/dispatch/dispatch.go`（及同模块接口）
 
@@ -493,7 +493,7 @@ func (d *Dispatcher) ruleToProto(ctx context.Context, rule *db.CollectionRule) (
 }
 ```
 
-#### T3-5-I：WebUI 字段映射修复
+#### T3-5-IMPL-I：WebUI 字段映射修复
 
 **文件**：`webui/src/services/agents.ts`、`webui/src/pages/Agents/RuleForm.tsx`
 
@@ -513,7 +513,7 @@ func (d *Dispatcher) ruleToProto(ctx context.Context, rule *db.CollectionRule) (
 
 `RuleForm.tsx` Step 3 WebUI 字段名同步（`dest_path_template` 等）。
 
-#### T3-5-J：WebUI 路径模板工具库重设计
+#### T3-5-IMPL-J：WebUI 路径模板工具库重设计
 
 > **背景**：trollsift 引入后，`dest_path_template` 的可注入变量来自四个来源——`InjectContext`
 > 注入的 `{agent_name}`/`{agent_id}`、`buildStoragePath` 显式注入的 `{filename}`/`{ext}`、
