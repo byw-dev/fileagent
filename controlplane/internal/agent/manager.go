@@ -82,9 +82,10 @@ func (m *Manager) Register(ctx context.Context, req *agentv1.RegisterRequest) (*
 	}
 	if err == nil {
 		resp := &agentv1.RegisterResponse{
-			AgentId: existing.ID.String(),
-			Status:  string(existing.Status),
-			Message: "Agent already registered",
+			AgentId:   existing.ID.String(),
+			Status:    string(existing.Status),
+			Message:   "Agent already registered",
+			AgentName: existing.Name,
 		}
 		if existing.Status == db.AgentStatusApproved && existing.AuthTokenHash.Valid {
 			// Token was already issued at approval time; return status only.
@@ -132,9 +133,10 @@ func (m *Manager) Register(ctx context.Context, req *agentv1.RegisterRequest) (*
 
 	m.logger.Info("agent registered", zap.String("agent_id", agent.ID.String()))
 	return &agentv1.RegisterResponse{
-		AgentId: agent.ID.String(),
-		Status:  string(db.AgentStatusPending),
-		Message: "Agent registered. Awaiting approval.",
+		AgentId:   agent.ID.String(),
+		Status:    string(db.AgentStatusPending),
+		Message:   "Agent registered. Awaiting approval.",
+		AgentName: agent.Name,
 	}, nil
 }
 
@@ -149,8 +151,9 @@ func (m *Manager) PollApproval(ctx context.Context, req *agentv1.PollApprovalReq
 		return nil, fmt.Errorf("poll_approval: get agent: %w", err)
 	}
 	resp := &agentv1.PollApprovalResponse{
-		Status:  string(agent.Status),
-		Message: statusMessage(agent.Status),
+		Status:    string(agent.Status),
+		Message:   statusMessage(agent.Status),
+		AgentName: agent.Name,
 	}
 	if agent.Status != db.AgentStatusApproved {
 		return resp, nil

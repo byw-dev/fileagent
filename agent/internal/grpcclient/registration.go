@@ -96,6 +96,7 @@ type Lifecycle struct {
 	TokenManager *credential.TokenManager
 	STSManager   *credential.STSManager
 	AgentID      string
+	AgentName    string
 	Fingerprint  string
 }
 
@@ -127,17 +128,21 @@ func (l *Lifecycle) Start(ctx context.Context, svc agentv1.AgentServiceClient, c
 
 	_ = l.StateMachine.Transition(StateInit)
 
-	agentID, err := l.registerWithRetry(ctx, svc, cfg, fp, logger)
+	agentID, agentName, err := l.registerWithRetry(ctx, svc, cfg, fp, logger)
 	if err != nil {
 		return fmt.Errorf("lifecycle: register: %w", err)
 	}
 	l.AgentID = agentID
+	l.AgentName = agentName
 	_ = l.StateMachine.Transition(StatePending)
 	logger.Info("lifecycle: registering... waiting for approval", zap.String("agent_id", agentID))
 
-	token, err := PollApproval(ctx, svc, agentID, fp, 30*time.Second, logger)
+	token, approvedName, err := PollApproval(ctx, svc, agentID, fp, 30*time.Second, logger)
 	if err != nil {
 		return fmt.Errorf("lifecycle: poll approval: %w", err)
+	}
+	if approvedName != "" {
+		l.AgentName = approvedName
 	}
 
 	if err := l.TokenManager.Save(token); err != nil {
@@ -149,20 +154,20 @@ func (l *Lifecycle) Start(ctx context.Context, svc agentv1.AgentServiceClient, c
 
 // registerWithRetry repeatedly attempts Register with exponential backoff until
 // success, context cancellation, or a permanent server rejection is observed.
-func (l *Lifecycle) registerWithRetry(ctx context.Context, svc agentv1.AgentServiceClient, cfg *config.Config, fingerprint string, logger *zap.Logger) (string, error) {
+func (l *Lifecycle) registerWithRetry(ctx context.Context, svc agentv1.AgentServiceClient, cfg *config.Config, fingerprint string, logger *zap.Logger) (string, string, error) {
 	delay := registerRetryInitialDelay
 	for {
-		agentID, err := Register(ctx, svc, cfg, fingerprint, logger)
+		agentID, agentName, err := Register(ctx, svc, cfg, fingerprint, logger)
 		if err == nil {
-			return agentID, nil
+			return agentID, agentName, nil
 		}
 		if ctx.Err() != nil {
-			return "", ctx.Err()
+			return "", "", ctx.Err()
 		}
 
 		code := status.Code(err)
 		if code == codes.PermissionDenied || code == codes.AlreadyExists {
-			return "", err
+			return "", "", err
 		}
 
 		logger.Warn("lifecycle: register failed, retrying",
@@ -179,7 +184,7 @@ func (l *Lifecycle) registerWithRetry(ctx context.Context, svc agentv1.AgentServ
 				default:
 				}
 			}
-			return "", ctx.Err()
+			return "", "", ctx.Err()
 		case <-timer.C:
 		}
 
@@ -213,8 +218,8 @@ func LoadOrCreateFingerprint(path string) (string, error) {
 }
 
 // Register calls the gRPC Register RPC with the machine metadata.
-// It returns the agentID assigned by the Control Plane.
-func Register(ctx context.Context, svc agentv1.AgentServiceClient, cfg *config.Config, fingerprint string, logger *zap.Logger) (string, error) {
+// It returns the agentID and agentName assigned by the Control Plane.
+func Register(ctx context.Context, svc agentv1.AgentServiceClient, cfg *config.Config, fingerprint string, logger *zap.Logger) (string, string, error) {
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "unknown"
@@ -240,30 +245,31 @@ func Register(ctx context.Context, svc agentv1.AgentServiceClient, cfg *config.C
 
 	resp, err := svc.Register(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("grpcclient: register RPC: %w", err)
+		return "", "", fmt.Errorf("grpcclient: register RPC: %w", err)
 	}
 
 	if resp.GetStatus() == "rejected" {
-		return "", status.Errorf(codes.PermissionDenied, "grpcclient: registration rejected: %s", resp.GetMessage())
+		return "", "", status.Errorf(codes.PermissionDenied, "grpcclient: registration rejected: %s", resp.GetMessage())
 	}
 
 	logger.Info("grpcclient: registration submitted",
 		zap.String("agent_id", resp.GetAgentId()),
+		zap.String("agent_name", resp.GetAgentName()),
 		zap.String("status", resp.GetStatus()),
 	)
-	return resp.GetAgentId(), nil
+	return resp.GetAgentId(), resp.GetAgentName(), nil
 }
 
 // PollApproval polls the Control Plane every interval until the agent is approved
-// (token received) or the context is cancelled. It returns the auth token.
-func PollApproval(ctx context.Context, svc agentv1.AgentServiceClient, agentID, fingerprint string, interval time.Duration, logger *zap.Logger) (string, error) {
+// (token received) or the context is cancelled. It returns the auth token and agentName.
+func PollApproval(ctx context.Context, svc agentv1.AgentServiceClient, agentID, fingerprint string, interval time.Duration, logger *zap.Logger) (string, string, error) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", "", ctx.Err()
 		case <-ticker.C:
 			resp, err := svc.PollApproval(ctx, &agentv1.PollApprovalRequest{
 				AgentId:     agentID,
@@ -277,9 +283,9 @@ func PollApproval(ctx context.Context, svc agentv1.AgentServiceClient, agentID, 
 			switch resp.GetStatus() {
 			case "approved":
 				logger.Info("grpcclient: agent approved", zap.String("agent_id", agentID))
-				return resp.GetAuthToken(), nil
+				return resp.GetAuthToken(), resp.GetAgentName(), nil
 			case "rejected":
-				return "", fmt.Errorf("grpcclient: agent rejected: %s", resp.GetMessage())
+				return "", "", fmt.Errorf("grpcclient: agent rejected: %s", resp.GetMessage())
 			default:
 				logger.Info("grpcclient: awaiting approval",
 					zap.String("agent_id", agentID),

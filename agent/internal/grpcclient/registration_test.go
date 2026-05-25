@@ -114,16 +114,17 @@ func TestRegister_HappyPath(t *testing.T) {
 	srv := &fakeRegistrationServer{
 		registerFn: func(req *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
 			assert.Equal(t, "test-fp", req.GetFingerprint())
-			return &agentv1.RegisterResponse{AgentId: "agent-42", Status: "pending"}, nil
+			return &agentv1.RegisterResponse{AgentId: "agent-42", AgentName: "host-42", Status: "pending"}, nil
 		},
 	}
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
 	cfg := &config.Config{}
-	agentID, err := Register(context.Background(), svc, cfg, "test-fp", zap.NewNop())
+	agentID, agentName, err := Register(context.Background(), svc, cfg, "test-fp", zap.NewNop())
 	require.NoError(t, err)
 	assert.Equal(t, "agent-42", agentID)
+	assert.Equal(t, "host-42", agentName)
 }
 
 func TestRegister_Rejected(t *testing.T) {
@@ -135,7 +136,7 @@ func TestRegister_Rejected(t *testing.T) {
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
-	_, err := Register(context.Background(), svc, &config.Config{}, "fp", zap.NewNop())
+	_, _, err := Register(context.Background(), svc, &config.Config{}, "fp", zap.NewNop())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "rejected")
 }
@@ -149,7 +150,7 @@ func TestRegister_RPCError(t *testing.T) {
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
-	_, err := Register(context.Background(), svc, &config.Config{}, "fp", zap.NewNop())
+	_, _, err := Register(context.Background(), svc, &config.Config{}, "fp", zap.NewNop())
 	require.Error(t, err)
 }
 
@@ -158,15 +159,16 @@ func TestRegister_RPCError(t *testing.T) {
 func TestPollApproval_ImmediateApproval(t *testing.T) {
 	srv := &fakeRegistrationServer{
 		pollApprovalFn: func(_ *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error) {
-			return &agentv1.PollApprovalResponse{Status: "approved", AuthToken: "tok-abc"}, nil
+			return &agentv1.PollApprovalResponse{Status: "approved", AuthToken: "tok-abc", AgentName: "host-1"}, nil
 		},
 	}
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
-	tok, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
+	tok, name, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
 	require.NoError(t, err)
 	assert.Equal(t, "tok-abc", tok)
+	assert.Equal(t, "host-1", name)
 }
 
 func TestPollApproval_ContextCancelled(t *testing.T) {
@@ -181,7 +183,7 @@ func TestPollApproval_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	_, err := PollApproval(ctx, svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
+	_, _, err := PollApproval(ctx, svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
@@ -195,7 +197,7 @@ func TestPollApproval_Rejected(t *testing.T) {
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
-	_, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
+	_, _, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "rejected")
 }
@@ -214,7 +216,7 @@ func TestPollApproval_PendingThenApproved(t *testing.T) {
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
-	tok, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
+	tok, _, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
 	require.NoError(t, err)
 	assert.Equal(t, "final-tok", tok)
 	assert.Equal(t, 3, callCount)
@@ -300,10 +302,10 @@ func TestLifecycle_Start_HappyPath(t *testing.T) {
 
 	srv := &fakeRegistrationServer{
 		registerFn: func(_ *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
-			return &agentv1.RegisterResponse{AgentId: "lc-agent-1", Status: "pending"}, nil
+			return &agentv1.RegisterResponse{AgentId: "lc-agent-1", Status: "pending", AgentName: "host-1"}, nil
 		},
 		pollApprovalFn: func(_ *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error) {
-			return &agentv1.PollApprovalResponse{Status: "approved", AuthToken: "lifecycle-tok"}, nil
+			return &agentv1.PollApprovalResponse{Status: "approved", AuthToken: "lifecycle-tok", AgentName: "host-1"}, nil
 		},
 	}
 	svc, cleanup := startRegistrationServer(t, srv)
@@ -321,6 +323,7 @@ func TestLifecycle_Start_HappyPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StateApproved, lc.StateMachine.Current())
 	assert.Equal(t, "lc-agent-1", lc.AgentID)
+	assert.Equal(t, "host-1", lc.AgentName)
 }
 
 func TestRegister_RetryOnTransientError(t *testing.T) {

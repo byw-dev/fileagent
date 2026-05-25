@@ -196,6 +196,7 @@ message RegisterResponse {
   string status     = 2;
   string auth_token = 3;
   string message    = 4;
+  string agent_name = 5;
 }
 
 message PollApprovalRequest {
@@ -207,6 +208,7 @@ message PollApprovalResponse {
   string status     = 1;
   string auth_token = 2;
   string message    = 3;
+  string agent_name = 4;
 }
 
 message RefreshCredentialsRequest {
