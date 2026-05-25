@@ -465,14 +465,14 @@ func TestParseRaw(t *testing.T) {
 // --- nil location path in ldml helpers ---
 
 func TestLDMLHelpers_NilLoc(t *testing.T) {
-now := time.Date(2024, 6, 15, 10, 30, 0, 0, time.UTC)
+	now := time.Date(2024, 6, 15, 10, 30, 0, 0, time.UTC)
 
-// parseTimeField with nil loc should default to UTC
-got, err := parseTimeField("yyyy-MM-dd", "2024-06-15", nil)
-require.NoError(t, err)
-assert.Equal(t, time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC), got)
+	// parseTimeField with nil loc should default to UTC
+	got, err := parseTimeField("yyyy-MM-dd", "2024-06-15", nil)
+	require.NoError(t, err)
+	assert.Equal(t, time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC), got)
 
-// formatTimeField with nil loc should default to UTC
-s := formatTimeField(now, "yyyy-MM-dd", nil)
-assert.Equal(t, "2024-06-15", s)
+	// formatTimeField with nil loc should default to UTC
+	s := formatTimeField(now, "yyyy-MM-dd", nil)
+	assert.Equal(t, "2024-06-15", s)
 }
