@@ -121,7 +121,7 @@ func TestRegister_HappyPath(t *testing.T) {
 	defer cleanup()
 
 	cfg := &config.Config{}
-	agentID, err := Register(context.Background(), svc, cfg, "test-fp", zap.NewNop())
+	agentID, _, err := Register(context.Background(), svc, cfg, "test-fp", zap.NewNop())
 	require.NoError(t, err)
 	assert.Equal(t, "agent-42", agentID)
 }
@@ -135,7 +135,7 @@ func TestRegister_Rejected(t *testing.T) {
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
-	_, err := Register(context.Background(), svc, &config.Config{}, "fp", zap.NewNop())
+	_, _, err := Register(context.Background(), svc, &config.Config{}, "fp", zap.NewNop())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "rejected")
 }
@@ -149,7 +149,7 @@ func TestRegister_RPCError(t *testing.T) {
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
-	_, err := Register(context.Background(), svc, &config.Config{}, "fp", zap.NewNop())
+	_, _, err := Register(context.Background(), svc, &config.Config{}, "fp", zap.NewNop())
 	require.Error(t, err)
 }
 
@@ -164,7 +164,7 @@ func TestPollApproval_ImmediateApproval(t *testing.T) {
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
-	tok, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
+	tok, _, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
 	require.NoError(t, err)
 	assert.Equal(t, "tok-abc", tok)
 }
@@ -181,7 +181,7 @@ func TestPollApproval_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	_, err := PollApproval(ctx, svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
+	_, _, err := PollApproval(ctx, svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
@@ -195,7 +195,7 @@ func TestPollApproval_Rejected(t *testing.T) {
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
-	_, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
+	_, _, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "rejected")
 }
@@ -214,7 +214,7 @@ func TestPollApproval_PendingThenApproved(t *testing.T) {
 	svc, cleanup := startRegistrationServer(t, srv)
 	defer cleanup()
 
-	tok, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
+	tok, _, err := PollApproval(context.Background(), svc, "agent-1", "fp", 10*time.Millisecond, zap.NewNop())
 	require.NoError(t, err)
 	assert.Equal(t, "final-tok", tok)
 	assert.Equal(t, 3, callCount)
@@ -300,10 +300,10 @@ func TestLifecycle_Start_HappyPath(t *testing.T) {
 
 	srv := &fakeRegistrationServer{
 		registerFn: func(_ *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
-			return &agentv1.RegisterResponse{AgentId: "lc-agent-1", Status: "pending"}, nil
+			return &agentv1.RegisterResponse{AgentId: "lc-agent-1", Status: "pending", AgentName: "host-1"}, nil
 		},
 		pollApprovalFn: func(_ *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error) {
-			return &agentv1.PollApprovalResponse{Status: "approved", AuthToken: "lifecycle-tok"}, nil
+			return &agentv1.PollApprovalResponse{Status: "approved", AuthToken: "lifecycle-tok", AgentName: "host-1"}, nil
 		},
 	}
 	svc, cleanup := startRegistrationServer(t, srv)
@@ -321,6 +321,7 @@ func TestLifecycle_Start_HappyPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StateApproved, lc.StateMachine.Current())
 	assert.Equal(t, "lc-agent-1", lc.AgentID)
+	assert.Equal(t, "host-1", lc.AgentName)
 }
 
 func TestRegister_RetryOnTransientError(t *testing.T) {

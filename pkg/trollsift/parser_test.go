@@ -60,13 +60,16 @@ func TestParseCompose_Basic(t *testing.T) {
 
 		require.True(t, vals["agent_name"].IsStr)
 		assert.Equal(t, "prod-agent", vals["agent_name"].Str)
+		assert.Equal(t, "prod-agent", vals["agent_name"].Raw)
 
 		require.True(t, vals["date"].IsTime)
 		wantTime := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
 		assert.Equal(t, wantTime, vals["date"].Time)
+		assert.Equal(t, "2024/03/15", vals["date"].Raw)
 
 		require.True(t, vals["filename"].IsStr)
 		assert.Equal(t, "data.csv", vals["filename"].Str)
+		assert.Equal(t, "data.csv", vals["filename"].Raw)
 	})
 
 	t0 := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
@@ -187,6 +190,7 @@ func TestZeroPaddedInt(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, vals["seq"].IsInt)
 		assert.Equal(t, 1, vals["seq"].Int)
+		assert.Equal(t, "00001", vals["seq"].Raw)
 		assert.Equal(t, "sensor1", vals["device"].Str)
 	})
 
@@ -196,6 +200,7 @@ func TestZeroPaddedInt(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, vals["seq"].IsInt)
 		assert.Equal(t, 99999, vals["seq"].Int)
+		assert.Equal(t, "99999", vals["seq"].Raw)
 	})
 
 	// ZP-4: Compose I(1) → "00001"
@@ -422,17 +427,52 @@ func TestFormatValue_TypeMismatch(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// --- Raw field (R-1 ~ R-3): verify Raw contains original matched substring ---
+
+func TestParseRaw(t *testing.T) {
+	// R-1: time field Raw holds original date string
+	t.Run("R-1 time Raw", func(t *testing.T) {
+		p, err := New(`{device}/{d_dt:yyyy-MM-dd}.csv`)
+		require.NoError(t, err)
+		vals, err := p.Parse("sensor1/2025-10-30.csv")
+		require.NoError(t, err)
+		require.True(t, vals["d_dt"].IsTime)
+		assert.Equal(t, "2025-10-30", vals["d_dt"].Raw)
+	})
+
+	// R-2: int field Raw holds original digit string (with zero-padding)
+	t.Run("R-2 int Raw", func(t *testing.T) {
+		p, err := New(`{device}/{seq:d}.csv`)
+		require.NoError(t, err)
+		vals, err := p.Parse("sensor1/1.csv")
+		require.NoError(t, err)
+		require.True(t, vals["seq"].IsInt)
+		assert.Equal(t, "1", vals["seq"].Raw)
+	})
+
+	// R-3: time field with tz=Asia/Shanghai Raw holds original path substring
+	t.Run("R-3 time tz Raw", func(t *testing.T) {
+		p, err := New(`{device}/{date:yyyy-MM-dd|tz=Asia/Shanghai}.csv`)
+		require.NoError(t, err)
+		vals, err := p.Parse("sensor1/2025-10-30.csv")
+		require.NoError(t, err)
+		require.True(t, vals["date"].IsTime)
+		assert.Equal(t, "2025-10-30", vals["date"].Raw)
+	})
+}
+
+
 // --- nil location path in ldml helpers ---
 
 func TestLDMLHelpers_NilLoc(t *testing.T) {
-	now := time.Date(2024, 6, 15, 10, 30, 0, 0, time.UTC)
+now := time.Date(2024, 6, 15, 10, 30, 0, 0, time.UTC)
 
-	// parseTimeField with nil loc should default to UTC
-	got, err := parseTimeField("yyyy-MM-dd", "2024-06-15", nil)
-	require.NoError(t, err)
-	assert.Equal(t, time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC), got)
+// parseTimeField with nil loc should default to UTC
+got, err := parseTimeField("yyyy-MM-dd", "2024-06-15", nil)
+require.NoError(t, err)
+assert.Equal(t, time.Date(2024, 6, 15, 0, 0, 0, 0, time.UTC), got)
 
-	// formatTimeField with nil loc should default to UTC
-	s := formatTimeField(now, "yyyy-MM-dd", nil)
-	assert.Equal(t, "2024-06-15", s)
+// formatTimeField with nil loc should default to UTC
+s := formatTimeField(now, "yyyy-MM-dd", nil)
+assert.Equal(t, "2024-06-15", s)
 }

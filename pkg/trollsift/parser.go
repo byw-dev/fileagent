@@ -13,7 +13,9 @@ import (
 
 // Value holds the typed value of a parsed field.
 // Exactly one of IsStr / IsInt / IsTime is true.
+// Raw always contains the original substring matched from the input path.
 type Value struct {
+	Raw    string
 	Str    string
 	IsStr  bool
 	Int    int
@@ -152,19 +154,19 @@ func (p *Parser) Parse(s string) (map[string]Value, error) {
 		captured := match[i+1]
 		switch fs.kind {
 		case kindStr:
-			result[fs.name] = S(captured)
+			result[fs.name] = Value{Raw: captured, Str: captured, IsStr: true}
 		case kindInt:
 			n, err := strconv.Atoi(strings.TrimSpace(captured))
 			if err != nil {
 				return nil, fmt.Errorf("trollsift: field %q: parse int %q: %w", fs.name, captured, err)
 			}
-			result[fs.name] = I(n)
+			result[fs.name] = Value{Raw: captured, Int: n, IsInt: true}
 		case kindTime:
 			t, err := parseTimeField(fs.ldml, captured, fs.tz)
 			if err != nil {
 				return nil, fmt.Errorf("trollsift: field %q: parse time %q: %w", fs.name, captured, err)
 			}
-			result[fs.name] = T(t)
+			result[fs.name] = Value{Raw: captured, Time: t, IsTime: true}
 		}
 	}
 	return result, nil

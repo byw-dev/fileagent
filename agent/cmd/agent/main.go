@@ -264,6 +264,7 @@ func main() {
 	grpcClient.SetToken(lc.TokenManager.Token())
 	grpcClient.SetAgentID(lc.AgentID)
 	agentCtx.AgentID = lc.AgentID
+	agentCtx.AgentName = lc.AgentName
 	logger.Info("agent: approved, starting normal operation", zap.String("agent_id", lc.AgentID))
 
 	if err := grpcClient.Connect(ctx); err != nil {
@@ -581,7 +582,7 @@ func handleDryRun(rule scheduler.CollectionRule, client *grpcclient.Client, agen
 			if parsed, pErr := pathParser.Parse(relPath); pErr == nil {
 				for k, v := range parsed {
 					fields[k] = v
-					fileResult.ParsedFields[k] = v.Str // simplified string display
+					fileResult.ParsedFields[k] = v.Raw // original matched substring for display
 				}
 			}
 		}
