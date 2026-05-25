@@ -1942,11 +1942,11 @@ func (x *RefreshCredentialsResponse) GetCredentials() *CredentialsPayload {
 	return nil
 }
 
-var File_v1_agent_proto protoreflect.FileDescriptor
+var File_proto_v1_agent_proto protoreflect.FileDescriptor
 
 const file_proto_v1_agent_proto_rawDesc = "" +
 	"\n" +
-	"\x0ev1/agent.proto\x12\ffileagent.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xca\x03\n" +
+	"\x14proto/v1/agent.proto\x12\ffileagent.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xca\x03\n" +
 	"\fAgentMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x127\n" +
@@ -2210,7 +2210,7 @@ var file_proto_v1_agent_proto_depIdxs = []int32{
 
 func init() { file_proto_v1_agent_proto_init() }
 func file_proto_v1_agent_proto_init() {
-	if File_v1_agent_proto != nil {
+	if File_proto_v1_agent_proto != nil {
 		return
 	}
 	file_proto_v1_agent_proto_msgTypes[0].OneofWrappers = []any{
@@ -2244,7 +2244,7 @@ func file_proto_v1_agent_proto_init() {
 		DependencyIndexes: file_proto_v1_agent_proto_depIdxs,
 		MessageInfos:      file_proto_v1_agent_proto_msgTypes,
 	}.Build()
-	File_v1_agent_proto = out.File
+	File_proto_v1_agent_proto = out.File
 	file_proto_v1_agent_proto_goTypes = nil
 	file_proto_v1_agent_proto_depIdxs = nil
 }
