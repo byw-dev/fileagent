@@ -73,6 +73,12 @@ type DirResultDeliverer interface {
 	Deliver(requestID string, result dirstore.Result)
 }
 
+// DryRunResultDeliverer receives dry-run results from the agent gRPC stream
+// and delivers them to the waiting REST handler.
+type DryRunResultDeliverer interface {
+	Deliver(reqID string, result *agentv1.DryRunResult)
+}
+
 // Server holds dependencies shared by all gRPC handlers.
 type Server struct {
 	// Embed the generated Unimplemented guard so that adding new RPC methods to
@@ -90,7 +96,8 @@ type Server struct {
 	stsMgr        STSManagerClient
 	credDB        CredentialDB
 	stateDB       AgentStateDB
-	dirResultStore DirResultDeliverer
+	dirResultStore  DirResultDeliverer
+	dryRunStore     DryRunResultDeliverer
 }
 
 // New creates a new gRPC Server with the provided logger. Additional
@@ -139,6 +146,13 @@ func (s *Server) WithStateDB(stateDB AgentStateDB) *Server {
 // results from the gRPC receive loop to the waiting REST handler.
 func (s *Server) WithDirResultStore(store DirResultDeliverer) *Server {
 	s.dirResultStore = store
+	return s
+}
+
+// WithDryRunStore injects the store used to deliver dry-run results from the
+// gRPC receive loop to the waiting REST handler.
+func (s *Server) WithDryRunStore(store DryRunResultDeliverer) *Server {
+	s.dryRunStore = store
 	return s
 }
 

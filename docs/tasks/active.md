@@ -5,11 +5,11 @@
 
 ---
 
-## 当前任务：T3-6 — Dry-Run 规则测试功能
+## 当前任务：T3-3 — Python SDK + Control Plane 联调
 
-**前置依赖**：T3-5 ✅  
-**涉及模块**：controlplane（dryRunStore + REST 端点）、agent（handleDryRun）、webui（RuleForm Step 3 测试面板）  
-**详细规格与验收标准**：[`docs/tasks/phases/phase-3-rft.md`](phases/phase-3-rft.md) §T3-6
+**前置依赖**：T3-6 ✅  
+**涉及模块**：sdk/python、controlplane  
+**详细规格与验收标准**：[`docs/tasks/phases/phase-3.md`](phases/phase-3.md) §T3-3
 
 ---
 
@@ -21,7 +21,7 @@ T3-2 完成后立即执行，任务规格详见：[`docs/tasks/phases/phase-3-rf
 |----|------|------|
 | T3-4 | `pkg/trollsift` 共享路径模板库 | ✅ |
 | T3-5 | 字段统一 + Bug 修复（DB/proto/agent/CP/WebUI） | ✅ |
-| T3-6 | Dry-Run 规则测试功能 | ⬜ |
+| T3-6 | Dry-Run 规则测试功能 | ✅ |
 
 ---
 

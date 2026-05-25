@@ -6,11 +6,15 @@ import {
   Space,
   Alert,
   Card,
+  Collapse,
+  Table,
+  Spin,
+  Empty,
 } from 'antd'
 import { StepsForm, ProFormText, ProFormSelect, ProFormSwitch } from '@ant-design/pro-components'
 import { useParams, useNavigate } from 'react-router-dom'
-import { createRule } from '../../services/agents'
-import type { CollectionMode } from '../../services/agents'
+import { createRule, testRule } from '../../services/agents'
+import type { CollectionMode, TestRuleFileResult } from '../../services/agents'
 import apiClient from '../../services/api'
 import {
   renderPathPreview,
@@ -74,8 +78,45 @@ function AgentRuleFormPage() {
   const [pathTemplate, setPathTemplate] = useState('/{agent_name}/{time:yyyy/MM/dd}/{filename}')
   const [pathError, setPathError] = useState<string | null>(null)
   const [pathPattern, setPathPattern] = useState('*')
+  const [basePath, setBasePath] = useState('')
+  const [recursive, setRecursive] = useState(false)
   const [buckets, setBuckets] = useState<Bucket[]>([])
   const [submitting, setSubmitting] = useState(false)
+
+  const [testLoading, setTestLoading] = useState(false)
+  const [testFiles, setTestFiles] = useState<TestRuleFileResult[] | null>(null)
+  const [testError, setTestError] = useState<{ type: 'warning' | 'error'; message: string } | null>(null)
+
+  const handleTestRule = async () => {
+    if (!agentId) return
+    setTestLoading(true)
+    setTestFiles(null)
+    setTestError(null)
+    try {
+      const result = await testRule(agentId, {
+        base_path: basePath,
+        path_pattern: pathPattern,
+        dest_path_template: pathTemplate,
+        recursive,
+        dry_run_limit: 10,
+      })
+      setTestFiles(result.files)
+    } catch (err: unknown) {
+      const status = (err as { response?: { status?: number; data?: { error?: { message?: string } } } })?.response?.status
+      const errMsg = (err as { response?: { data?: { error?: { message?: string } } } })?.response?.data?.error?.message
+      if (status === 409) {
+        setTestError({ type: 'warning', message: '采集器当前离线，无法预览' })
+      } else if (status === 504) {
+        setTestError({ type: 'error', message: '采集器响应超时（30s）' })
+      } else if (status === 422) {
+        setTestError({ type: 'error', message: errMsg ?? '采集模式格式错误' })
+      } else {
+        setTestError({ type: 'error', message: '测试失败，请重试' })
+      }
+    } finally {
+      setTestLoading(false)
+    }
+  }
 
   useEffect(() => {
     apiClient
@@ -225,6 +266,9 @@ function AgentRuleFormPage() {
                 },
               },
             ]}
+            fieldProps={{
+              onChange: (e) => setBasePath(e.target.value),
+            }}
           />
 
           <ProFormText
@@ -243,6 +287,9 @@ function AgentRuleFormPage() {
             name="recursive"
             label="递归监控子目录"
             initialValue={false}
+            fieldProps={{
+              onChange: (checked) => setRecursive(checked),
+            }}
           />
 
           <ProFormSelect
@@ -363,6 +410,60 @@ function AgentRuleFormPage() {
               {renderPathPreview(pathTemplate, extractDynamicFields(pathPattern))}
             </Text>
           </Card>
+
+          <Collapse
+            style={{ marginTop: 16 }}
+            items={[{
+              key: 'test',
+              label: '规则测试（在线预览）',
+              children: (
+                <Space direction="vertical" style={{ width: '100%' }}>
+                  <Button
+                    type="primary"
+                    loading={testLoading}
+                    onClick={handleTestRule}
+                    disabled={!basePath || !pathPattern || !pathTemplate}
+                  >
+                    立即测试
+                  </Button>
+                  {testLoading && <Spin />}
+                  {testError && (
+                    <Alert type={testError.type} message={testError.message} showIcon />
+                  )}
+                  {!testLoading && !testError && testFiles !== null && (
+                    testFiles.length === 0
+                      ? <Empty description="未找到匹配文件" />
+                      : (
+                        <Table<TestRuleFileResult>
+                          size="small"
+                          dataSource={testFiles}
+                          rowKey="local_path"
+                          pagination={false}
+                          columns={[
+                            { title: '本地路径', dataIndex: 'local_path', ellipsis: true },
+                            {
+                              title: '解析字段',
+                              dataIndex: 'parsed_fields',
+                              render: (fields: Record<string, string>) =>
+                                Object.entries(fields).map(([k, v]) => `${k}=${v}`).join(', ') || '—',
+                              ellipsis: true,
+                            },
+                            { title: '上传路径', dataIndex: 'upload_path', ellipsis: true },
+                            {
+                              title: '状态',
+                              dataIndex: 'compose_error',
+                              render: (e: string) => e
+                                ? <Alert type="error" message={e} banner />
+                                : <Text type="success">✓</Text>,
+                            },
+                          ]}
+                        />
+                      )
+                  )}
+                </Space>
+              ),
+            }]}
+          />
         </StepsForm.StepForm>
       </StepsForm>
     </div>

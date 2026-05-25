@@ -219,8 +219,13 @@ func main() {
 
 		case *agentv1.ServerMessage_PushRule:
 			rule := protoToSchedulerRule(p.PushRule.GetRule())
-			logger.Info("agent: push rule", zap.String("rule_id", rule.RuleID), zap.String("mode", rule.Mode))
-			applyRule(rule)
+			if p.PushRule.GetRule().GetDryRun() {
+				logger.Info("agent: dry-run rule", zap.String("rule_id", rule.RuleID))
+				go handleDryRun(rule, grpcClient, agentCtx, logger)
+			} else {
+				logger.Info("agent: push rule", zap.String("rule_id", rule.RuleID), zap.String("mode", rule.Mode))
+				applyRule(rule)
+			}
 
 		case *agentv1.ServerMessage_CancelRule:
 			ruleID := p.CancelRule.GetRuleId()
@@ -517,6 +522,103 @@ func matchGlob(rule scheduler.CollectionRule, absPath string) (bool, error) {
 		return doublestar.Match(parser.Globify(), relPath)
 	}
 	return doublestar.Match(rule.PathPattern, relPath)
+}
+
+// defaultDryRunLimit is the maximum number of files returned per dry-run scan.
+const defaultDryRunLimit = 10
+
+// handleDryRun walks rule.BasePath, matches files against rule.PathPattern,
+// composes the destination path for each match, and sends a DryRunResult back
+// to the Control Plane over the gRPC stream.
+func handleDryRun(rule scheduler.CollectionRule, client *grpcclient.Client, agentCtx trollsift.AgentContext, logger *zap.Logger) {
+	result := &agentv1.DryRunResult{RuleId: rule.RuleID}
+
+	var pathParser *trollsift.Parser
+	if trollsift.IsTrollsiftPattern(rule.PathPattern) {
+		p, err := trollsift.New(rule.PathPattern)
+		if err != nil {
+			result.Error = err.Error()
+			sendDryRunResult(client, result, logger)
+			return
+		}
+		pathParser = p
+	}
+
+	var globPat string
+	if pathParser != nil {
+		globPat = pathParser.Globify()
+	} else {
+		globPat = rule.PathPattern
+	}
+
+	count := 0
+	_ = filepath.WalkDir(rule.BasePath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if count >= defaultDryRunLimit {
+			return filepath.SkipAll
+		}
+
+		relPath, relErr := filepath.Rel(rule.BasePath, path)
+		if relErr != nil {
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		matched, _ := doublestar.Match(globPat, relPath)
+		if !matched {
+			return nil
+		}
+
+		fileResult := &agentv1.DryRunFileResult{
+			LocalPath:    path,
+			ParsedFields: make(map[string]string),
+		}
+
+		fields := map[string]trollsift.Value{}
+		if pathParser != nil {
+			if parsed, pErr := pathParser.Parse(relPath); pErr == nil {
+				for k, v := range parsed {
+					fields[k] = v
+					fileResult.ParsedFields[k] = v.Str // simplified string display
+				}
+			}
+		}
+		fields = trollsift.InjectContext(agentCtx, fields)
+		fields["filename"] = trollsift.S(filepath.Base(path))
+		fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(path), "."))
+
+		destParser, dErr := trollsift.New(rule.DestPathTemplate)
+		if dErr != nil {
+			fileResult.ComposeError = dErr.Error()
+		} else {
+			uploadPath, cErr := destParser.Compose(fields, false)
+			if cErr != nil {
+				fileResult.ComposeError = cErr.Error()
+			} else {
+				fileResult.UploadPath = uploadPath
+			}
+		}
+
+		result.Files = append(result.Files, fileResult)
+		count++
+		return nil
+	})
+
+	sendDryRunResult(client, result, logger)
+}
+
+// sendDryRunResult sends a DryRunResult proto message over the gRPC stream.
+func sendDryRunResult(client *grpcclient.Client, result *agentv1.DryRunResult, logger *zap.Logger) {
+	msg := &agentv1.AgentMessage{
+		MessageId: uuid.New().String(),
+		Payload:   &agentv1.AgentMessage_DryRunResult{DryRunResult: result},
+	}
+	if err := client.SendMessage(msg); err != nil {
+		logger.Warn("agent: send dry-run result failed",
+			zap.String("rule_id", result.GetRuleId()), zap.Error(err))
+	}
 }
 
 // handleListDir walks the requested path and sends a DirectoryListing response.

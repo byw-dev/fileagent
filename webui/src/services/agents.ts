@@ -199,6 +199,41 @@ export async function listDir(agentId: string, path: string): Promise<ListDirRes
   return response.data
 }
 
+/** Parameters for POST /api/v1/agents/:id/test-rule */
+export interface TestRuleParams {
+  base_path: string
+  path_pattern: string
+  dest_path_template: string
+  recursive?: boolean
+  dry_run_limit?: number
+}
+
+/** A single matched file in the dry-run result */
+export interface TestRuleFileResult {
+  local_path: string
+  upload_path: string
+  parsed_fields: Record<string, string>
+  compose_error?: string
+}
+
+/** Response from POST /api/v1/agents/:id/test-rule */
+export interface TestRuleResult {
+  files: TestRuleFileResult[]
+}
+
+/**
+ * Dry-run a collection rule against a live agent.
+ * The agent walks base_path, matches files, and returns path mappings.
+ * Blocks until the agent responds (up to 30 s server-side timeout).
+ */
+export async function testRule(agentId: string, params: TestRuleParams): Promise<TestRuleResult> {
+  const response = await apiClient.post<TestRuleResult>(
+    `/api/v1/agents/${agentId}/test-rule`,
+    params
+  )
+  return response.data
+}
+
 /**
  * List upload logs for a specific agent.
  */

@@ -22,6 +22,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/config"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
+	"github.com/byw-dev/fileagent/controlplane/internal/dryrun"
 	"github.com/byw-dev/fileagent/controlplane/internal/event"
 	"github.com/byw-dev/fileagent/controlplane/internal/grpcserver"
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
@@ -209,11 +210,13 @@ func main() {
 
 	// ── Start gRPC server (background goroutine) ─────────────────────────────
 	dirStore := dirstore.New()
+	dryRunStore := dryrun.New()
 	grpcSrv := grpcserver.New(logger)
 	grpcSrv.WithDeps(registry, redisClient, authSvc, nats, agentMgr)
 	grpcSrv.WithExtraDeps(dispatcher, ix, stsMgr, queries)
 	grpcSrv.WithStateDB(queries)
 	grpcSrv.WithDirResultStore(dirStore)
+	grpcSrv.WithDryRunStore(dryRunStore)
 	go func() {
 		if err := grpcSrv.Run(cfg.GRPCPort); err != nil {
 			logger.Fatal("gRPC server error", zap.Error(err))
@@ -241,6 +244,7 @@ func main() {
 		Registry:     registry,
 		AgentCache:   redisClient,
 		DirStore:     dirStore,
+		DryRunStore:  dryRunStore,
 		MinioIndexer: ix,
 	})
 

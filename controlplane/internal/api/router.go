@@ -34,6 +34,7 @@ type RouterConfig struct {
 	Registry      handler.AgentRegistryClient
 	AgentCache    handler.AgentCacheClient  // nil → is_online always false
 	DirStore      handler.DirListingStore   // nil → list-dir returns 202 (legacy)
+	DryRunStore   handler.DryRunStore       // nil → test-rule returns 501
 	MinioIndexer  handler.IndexerClient // nil → minio webhook events are only logged
 }
 
@@ -92,6 +93,9 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	if cfg.DirStore != nil {
 		agentsH.WithDirStore(cfg.DirStore)
 	}
+	if cfg.DryRunStore != nil {
+		agentsH.WithDryRunStore(cfg.DryRunStore)
+	}
 	agents := v1.Group("/agents")
 	{
 		agents.GET("", agentsH.List)
@@ -99,6 +103,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		agents.POST("/:id/approve", superAdmin, agentsH.Approve)
 		agents.POST("/:id/revoke", superAdmin, agentsH.Revoke)
 		agents.POST("/:id/list-dir", agentsH.ListDir)
+		agents.POST("/:id/test-rule", agentsH.TestRule)
 		agents.GET("/:id/rules", agentsH.ListRules)
 		agents.POST("/:id/rules", agentsH.CreateRule)
 		agents.PUT("/:id/rules/:rid", agentsH.UpdateRule)

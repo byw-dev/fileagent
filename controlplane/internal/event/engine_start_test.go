@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 // ── Mock NATSListener ─────────────────────────────────────────────────────────
 
 type mockNATSListener struct {
+	mu   sync.RWMutex
 	subs map[string]func([]byte)
 }
 
@@ -26,12 +28,21 @@ func newMockNATSListener() *mockNATSListener {
 }
 
 func (m *mockNATSListener) Subscribe(subject string, cb func([]byte)) (func(), error) {
+	m.mu.Lock()
 	m.subs[subject] = cb
-	return func() { delete(m.subs, subject) }, nil
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		delete(m.subs, subject)
+		m.mu.Unlock()
+	}, nil
 }
 
 func (m *mockNATSListener) trigger(subject string, data []byte) {
-	if cb, ok := m.subs[subject]; ok {
+	m.mu.RLock()
+	cb, ok := m.subs[subject]
+	m.mu.RUnlock()
+	if ok {
 		cb(data)
 	}
 }

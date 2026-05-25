@@ -62,15 +62,22 @@ type DirListingStore interface {
 	Cancel(requestID string)
 }
 
+// DryRunStore manages pending dry-run result channels.
+type DryRunStore interface {
+	Register(reqID string) <-chan *agentv1.DryRunResult
+	Cancel(reqID string)
+}
+
 // AgentsHandler groups the Agent management handlers.
 type AgentsHandler struct {
-	db         AgentsDB
-	agentMgr   AgentManager
-	dispatcher RuleDispatcher
-	registry   AgentRegistryClient
-	cache      AgentCacheClient
-	dirStore   DirListingStore
-	logger     *zap.Logger
+	db          AgentsDB
+	agentMgr    AgentManager
+	dispatcher  RuleDispatcher
+	registry    AgentRegistryClient
+	cache       AgentCacheClient
+	dirStore    DirListingStore
+	dryRunStore DryRunStore
+	logger      *zap.Logger
 }
 
 // NewAgentsHandler returns a new AgentsHandler. Nil arguments cause affected
@@ -95,6 +102,12 @@ func (h *AgentsHandler) WithCache(c AgentCacheClient) *AgentsHandler {
 // async gRPC response into a synchronous REST reply.
 func (h *AgentsHandler) WithDirStore(store DirListingStore) *AgentsHandler {
 	h.dirStore = store
+	return h
+}
+
+// WithDryRunStore injects the dry-run result store.
+func (h *AgentsHandler) WithDryRunStore(store DryRunStore) *AgentsHandler {
+	h.dryRunStore = store
 	return h
 }
 
@@ -440,6 +453,136 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 		)
 		c.JSON(http.StatusGatewayTimeout, gin.H{
 			"error": middleware.NewErrorBody("TIMEOUT", "agent did not respond in time", nil),
+		})
+	}
+}
+
+// testRuleRequest is the body for POST /api/v1/agents/:id/test-rule.
+type testRuleRequest struct {
+	BasePath         string `json:"base_path"          binding:"required"`
+	PathPattern      string `json:"path_pattern"       binding:"required"`
+	DestPathTemplate string `json:"dest_path_template" binding:"required"`
+	Recursive        bool   `json:"recursive"`
+	DryRunLimit      int    `json:"dry_run_limit"`
+}
+
+// testRuleFileResult is a single file entry in the TestRule response.
+type testRuleFileResult struct {
+	LocalPath    string            `json:"local_path"`
+	UploadPath   string            `json:"upload_path,omitempty"`
+	ParsedFields map[string]string `json:"parsed_fields"`
+	ComposeError string            `json:"compose_error,omitempty"`
+}
+
+// TestRule handles POST /api/v1/agents/:id/test-rule.
+// It sends a dry-run PushRuleCommand to the online agent and waits up to 30 s
+// for the agent to walk its filesystem and return matching file results.
+// Returns 409 when the agent is offline, 504 on timeout, 422 on pattern error.
+func (h *AgentsHandler) TestRule(c *gin.Context) {
+	if h.registry == nil || h.dryRunStore == nil {
+		middleware.NotImplemented(c)
+		return
+	}
+	agentID := c.Param("id")
+	if _, err := uuid.Parse(agentID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": middleware.NewErrorBody("INVALID_ID", "invalid agent id", nil),
+		})
+		return
+	}
+
+	var req testRuleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
+		})
+		return
+	}
+	if req.DryRunLimit <= 0 {
+		req.DryRunLimit = 10
+	}
+	if req.DryRunLimit > 50 {
+		req.DryRunLimit = 50
+	}
+
+	// Check agent online status (memory registry first, then Redis fallback).
+	inMemory := h.registry.IsOnline(agentID)
+	if !inMemory {
+		inRedis := false
+		if h.cache != nil {
+			if n, err := h.cache.Exists(c.Request.Context(), cache.AgentOnlineKey(agentID)); err == nil && n > 0 {
+				inRedis = true
+			}
+		}
+		if !inRedis {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent is not online", nil),
+			})
+			return
+		}
+	}
+
+	// Use a temporary rule_id so the gRPC round-trip can be correlated.
+	ruleID := uuid.New().String()
+	resultCh := h.dryRunStore.Register(ruleID)
+	defer h.dryRunStore.Cancel(ruleID)
+
+	msg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_PushRule{
+			PushRule: &agentv1.PushRuleCommand{
+				Rule: &agentv1.CollectionRule{
+					RuleId:           ruleID,
+					BasePath:         req.BasePath,
+					PathPattern:      req.PathPattern,
+					DestPathTemplate: req.DestPathTemplate,
+					Recursive:        req.Recursive,
+					DryRun:           true,
+				},
+			},
+		},
+	}
+	if !h.registry.Send(agentID, msg) {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent disconnected during send", nil),
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	select {
+	case result := <-resultCh:
+		if result.GetError() != "" {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error": middleware.NewErrorBody("INVALID_PATTERN", result.GetError(), nil),
+			})
+			return
+		}
+		files := make([]testRuleFileResult, 0, len(result.GetFiles()))
+		for i, f := range result.GetFiles() {
+			if i >= req.DryRunLimit {
+				break
+			}
+			pf := f.GetParsedFields()
+			if pf == nil {
+				pf = map[string]string{}
+			}
+			files = append(files, testRuleFileResult{
+				LocalPath:    f.GetLocalPath(),
+				UploadPath:   f.GetUploadPath(),
+				ParsedFields: pf,
+				ComposeError: f.GetComposeError(),
+			})
+		}
+		c.JSON(http.StatusOK, gin.H{"files": files})
+	case <-ctx.Done():
+		h.logger.Warn("test-rule: timeout waiting for agent response",
+			zap.String("agent_id", agentID),
+			zap.String("rule_id", ruleID),
+		)
+		c.JSON(http.StatusGatewayTimeout, gin.H{
+			"error": middleware.NewErrorBody("TIMEOUT", "agent did not respond within 30s", nil),
 		})
 	}
 }

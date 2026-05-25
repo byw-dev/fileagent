@@ -182,6 +182,8 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, msg *ag
 		s.handleUploadResult(ctx, agentID, p.UploadResult)
 	case *agentv1.AgentMessage_DirectoryListing:
 		s.handleDirectoryListing(agentID, p.DirectoryListing)
+	case *agentv1.AgentMessage_DryRunResult:
+		s.handleDryRunResult(p.DryRunResult)
 	default:
 		s.logger.Debug("agent message received",
 			zap.String("agent_id", agentID),
@@ -295,6 +297,21 @@ func (s *Server) handleDirectoryListing(agentID string, listing *agentv1.Directo
 		zap.String("agent_id", agentID),
 		zap.String("request_id", listing.GetRequestId()),
 		zap.Int("entries", len(entries)),
+	)
+}
+
+// handleDryRunResult delivers a dry-run result from the agent to the waiting
+// REST handler via the dryRunStore.
+func (s *Server) handleDryRunResult(result *agentv1.DryRunResult) {
+	if s.dryRunStore == nil {
+		s.logger.Debug("dry_run result received but no dryRunStore wired",
+			zap.String("rule_id", result.GetRuleId()))
+		return
+	}
+	s.dryRunStore.Deliver(result.GetRuleId(), result)
+	s.logger.Debug("dry_run result delivered",
+		zap.String("rule_id", result.GetRuleId()),
+		zap.Int("files", len(result.GetFiles())),
 	)
 }
 
