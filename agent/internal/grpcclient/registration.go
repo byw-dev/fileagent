@@ -137,12 +137,12 @@ func (l *Lifecycle) Start(ctx context.Context, svc agentv1.AgentServiceClient, c
 	_ = l.StateMachine.Transition(StatePending)
 	logger.Info("lifecycle: registering... waiting for approval", zap.String("agent_id", agentID))
 
-	token, agentName2, err := PollApproval(ctx, svc, agentID, fp, 30*time.Second, logger)
+	token, approvedName, err := PollApproval(ctx, svc, agentID, fp, 30*time.Second, logger)
 	if err != nil {
 		return fmt.Errorf("lifecycle: poll approval: %w", err)
 	}
-	if agentName2 != "" {
-		l.AgentName = agentName2
+	if approvedName != "" {
+		l.AgentName = approvedName
 	}
 
 	if err := l.TokenManager.Save(token); err != nil {
@@ -254,6 +254,7 @@ func Register(ctx context.Context, svc agentv1.AgentServiceClient, cfg *config.C
 
 	logger.Info("grpcclient: registration submitted",
 		zap.String("agent_id", resp.GetAgentId()),
+		zap.String("agent_name", resp.GetAgentName()),
 		zap.String("status", resp.GetStatus()),
 	)
 	return resp.GetAgentId(), resp.GetAgentName(), nil
