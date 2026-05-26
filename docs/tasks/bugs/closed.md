@@ -5,6 +5,35 @@
 
 ---
 
+## 2026-05-25 修复 — T3-6-BUG 系列（Dry-Run 两个 P1 Bug）
+
+| ID | 标题 | 严重程度 | 涉及模块 |
+|----|------|---------|---------|
+| T3-6-BUG-A | `{agent_name}` 路径模板占位符永远报错 missing field | 🟡 P1 | agent + controlplane + proto |
+| T3-6-BUG-B | Dry-Run `parsed_fields` 中时间/整数类型字段值为空字符串 | 🟡 P1 | pkg/trollsift + agent |
+
+**修复提交**：`85b5544` (fix(T3-6): address review comments — proto source path, naming, logging, test coverage)
+
+### T3-6-BUG-A — `{agent_name}` 路径模板占位符永远报错 missing field ✅
+
+| 字段 | 内容 |
+|------|------|
+| **严重程度** | 🟡 P1 |
+| **根因** | 链式缺失：(1) proto `RegisterResponse`/`PollApprovalResponse` 不含 `agent_name`；(2) `Lifecycle` 无 `AgentName` 字段；(3) `main.go` 未赋值 `agentCtx.AgentName`；(4) `InjectContext` 在 `AgentName == ""` 时跳过注入 |
+| **修复** | 方案 B：proto 两条响应消息各新增 `string agent_name = N`；`controlplane` handler 填入 DB `agent.Name`；`Lifecycle` 新增 `AgentName`，`Register`/`PollApproval` 读取并存储；`main.go` 新增 `agentCtx.AgentName = lc.AgentName` |
+| **受影响文件** | `proto/v1/agent.proto`、`api/v1/agent.pb.go`、`controlplane/internal/agent/manager.go`、`agent/internal/grpcclient/registration.go`、`agent/cmd/agent/main.go` |
+
+### T3-6-BUG-B — Dry-Run `parsed_fields` 中时间/整数类型字段值为空字符串 ✅
+
+| 字段 | 内容 |
+|------|------|
+| **严重程度** | 🟡 P1 |
+| **根因** | `main.go` handleDryRun 使用 `v.Str` 填充 ParsedFields；`kindTime`/`kindInt` 的 `Str` 为零值 `""` |
+| **修复** | Raw string 方案：`trollsift.Value` 新增 `Raw string` 字段，`Parse` 赋值为正则捕获的原始子串；handleDryRun 改用 `v.Raw`；补充 parser_test.go Raw 断言 |
+| **受影响文件** | `pkg/trollsift/parser.go`、`pkg/trollsift/parser_test.go`、`agent/cmd/agent/main.go` |
+
+---
+
 ## 2026-05-12 修复 — T3-5-BUG 系列（采集规则字段统一 + BUG 修复）
 
 | ID | 标题 | 严重程度 | 涉及模块 |
