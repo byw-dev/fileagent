@@ -1,0 +1,46 @@
+name: Build — Agent
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.goos }} amd64
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            binary: agent
+          - os: windows-latest
+            goos: windows
+            binary: agent.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # mattn/go-sqlite3 needs CGO. On windows-latest, GCC is provided by the
+      # pre-installed MSYS2 (mingw64). We just need to put it on PATH.
+      - name: Add GCC to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+
+      - name: Build
+        shell: bash
+        run: |
+          mkdir -p bin
+          cd agent && go build -o ../bin/${{ matrix.binary }} ./cmd/agent
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.goos }}-amd64
+          path: bin/${{ matrix.binary }}
+          retention-days: 30

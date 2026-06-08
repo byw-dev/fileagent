@@ -1,0 +1,36 @@
+name: Build — Web UI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: webui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        working-directory: webui
+        run: pnpm build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webui-dist
+          path: webui/dist/
+          retention-days: 30
