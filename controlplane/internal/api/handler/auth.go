@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -37,10 +39,23 @@ func NewAuthHandler(authSvc auth.Service, authDB AuthDB) *AuthHandler {
 	return &AuthHandler{authSvc: authSvc, authDB: authDB}
 }
 
+// Token lifetimes shared by the login and refresh flows.
+const (
+	accessTokenTTL  = 2 * time.Hour
+	refreshTokenTTL = 7 * 24 * time.Hour
+)
+
 // loginRequest is the body expected by POST /api/auth/login.
 type loginRequest struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
+}
+
+// refreshRequest is the body expected by POST /api/auth/refresh. The refresh
+// token is presented in the JSON body (OAuth2 refresh-grant convention); this
+// is the canonical contract shared with the Web UI and SDK clients.
+type refreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
 }
 
 // userInfo is the user object embedded in auth responses.
@@ -103,13 +118,10 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	const accessTTL = 2 * time.Hour
-	const refreshTTL = 7 * 24 * time.Hour
-
 	accessToken, err := h.authSvc.GenerateAccessToken(
 		user.ID.String(),
 		user.OrgID.String(), string(user.Role), user.Username,
-		accessTTL,
+		accessTokenTTL,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -121,7 +133,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	refreshToken, err := h.authSvc.GenerateRefreshToken(
 		user.ID.String(),
 		user.OrgID.String(), string(user.Role), user.Username,
-		refreshTTL,
+		refreshTokenTTL,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -135,7 +147,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	c.JSON(http.StatusOK, loginResponse{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
-		ExpiresIn:    int(accessTTL.Seconds()),
+		ExpiresIn:    int(accessTokenTTL.Seconds()),
 		TokenType:    "Bearer",
 		User: &userInfo{
 			ID:       user.ID.String(),
@@ -147,20 +159,46 @@ func (h *AuthHandler) Login(c *gin.Context) {
 }
 
 // Refresh handles POST /api/auth/refresh.
+//
+// The refresh token is read from the JSON body ({"refresh_token": "..."}),
+// which is the canonical contract used by the Web UI and SDK. A Bearer
+// Authorization header is accepted as a fallback for older callers.
+//
+// On success the endpoint rotates credentials: it issues a brand-new
+// access/refresh token pair and revokes the presented refresh token, so the
+// response always carries a fresh refresh_token that clients persist for the
+// next cycle.
 func (h *AuthHandler) Refresh(c *gin.Context) {
 	if h.authSvc == nil {
 		middleware.NotImplemented(c)
 		return
 	}
 
-	raw := c.GetHeader("Authorization")
-	if !strings.HasPrefix(raw, "Bearer ") {
+	var req refreshRequest
+	// An empty body is legitimate (the token may arrive via the Authorization
+	// header fallback), so io.EOF is tolerated. Any other bind error means a
+	// non-empty but malformed JSON body — a request-format problem.
+	bindErr := c.ShouldBindJSON(&req)
+	tokenStr := strings.TrimSpace(req.RefreshToken)
+	if tokenStr == "" {
+		if raw := c.GetHeader("Authorization"); strings.HasPrefix(raw, "Bearer ") {
+			tokenStr = strings.TrimSpace(strings.TrimPrefix(raw, "Bearer "))
+		}
+	}
+	if tokenStr == "" {
+		// No usable token from body or header. Distinguish a malformed body
+		// (400) from a genuinely absent token (401).
+		if bindErr != nil && !errors.Is(bindErr, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": middleware.NewErrorBody("INVALID_REQUEST", "malformed JSON body", nil),
+			})
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("MISSING_TOKEN", "Bearer token required", nil),
+			"error": middleware.NewErrorBody("MISSING_TOKEN", "refresh_token is required", nil),
 		})
 		return
 	}
-	tokenStr := strings.TrimPrefix(raw, "Bearer ")
 
 	claims, err := h.authSvc.ValidateToken(tokenStr)
 	if err != nil {
@@ -177,7 +215,13 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		return
 	}
 
-	revoked, _ := h.authSvc.IsRevoked(c.Request.Context(), claims.ID)
+	revoked, revErr := h.authSvc.IsRevoked(c.Request.Context(), claims.ID)
+	if revErr != nil {
+		// Fail open (treat as not revoked) but log, so a Redis outage silently
+		// disabling the blacklist is observable rather than invisible.
+		zap.L().Warn("refresh: revocation check failed, treating token as not revoked",
+			zap.String("jti", claims.ID), zap.Error(revErr))
+	}
 	if revoked {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": middleware.NewErrorBody("TOKEN_REVOKED", "Token has been revoked", nil),
@@ -185,14 +229,12 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		return
 	}
 
-	// Revoke old refresh token.
-	_ = h.authSvc.RevokeToken(c.Request.Context(), tokenStr)
-
-	const accessTTL = 2 * time.Hour
+	// Generate the new pair before revoking the old token so a generation
+	// failure leaves the presented refresh token still usable.
 	accessToken, err := h.authSvc.GenerateAccessToken(
 		claims.Subject,
 		claims.OrgID, claims.Role, claims.Username,
-		accessTTL,
+		accessTokenTTL,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -201,10 +243,41 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		return
 	}
 
+	newRefreshToken, err := h.authSvc.GenerateRefreshToken(
+		claims.Subject,
+		claims.OrgID, claims.Role, claims.Username,
+		refreshTokenTTL,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": middleware.NewErrorBody("TOKEN_ERROR", "Failed to generate refresh token", nil),
+		})
+		return
+	}
+
+	// Rotate: revoke the presented refresh token so it cannot be reused.
+	// Revocation is best-effort and consistent with the rest of the auth layer,
+	// which degrades gracefully when Redis is unavailable. We still return the
+	// new pair so refresh does not hard-fail during a Redis outage, but we make
+	// any failure to actually enforce rotation observable rather than silent —
+	// including the case where RevokeToken is a no-op (Redis disabled) and thus
+	// returns nil without persisting anything.
+	if err := h.authSvc.RevokeToken(c.Request.Context(), tokenStr); err != nil {
+		zap.L().Warn("refresh: failed to revoke rotated refresh token",
+			zap.String("jti", claims.ID), zap.Error(err))
+	} else if stillRevoked, verifyErr := h.authSvc.IsRevoked(c.Request.Context(), claims.ID); verifyErr != nil {
+		zap.L().Warn("refresh: could not verify rotated refresh token revocation",
+			zap.String("jti", claims.ID), zap.Error(verifyErr))
+	} else if !stillRevoked {
+		zap.L().Warn("refresh: rotation not enforced — presented refresh token remains usable (token revocation appears disabled, e.g. Redis unavailable)",
+			zap.String("jti", claims.ID))
+	}
+
 	c.JSON(http.StatusOK, loginResponse{
-		AccessToken: accessToken,
-		ExpiresIn:   int(accessTTL.Seconds()),
-		TokenType:   "Bearer",
+		AccessToken:  accessToken,
+		RefreshToken: newRefreshToken,
+		ExpiresIn:    int(accessTokenTTL.Seconds()),
+		TokenType:    "Bearer",
 	})
 }
 

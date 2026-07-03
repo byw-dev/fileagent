@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -289,6 +293,9 @@ func TestRefresh_NilAuthSvc_Returns501(t *testing.T) {
 	assert.Equal(t, http.StatusNotImplemented, w.Code)
 }
 
+// TestRefresh_WithRefreshToken exercises the canonical contract: the refresh
+// token is presented in the JSON body, and the response rotates credentials by
+// returning both a new access_token and a new refresh_token.
 func TestRefresh_WithRefreshToken(t *testing.T) {
 	user := newTestAuthUser(t)
 	authSvc := newTestAuthSvc(t)
@@ -307,7 +314,40 @@ func TestRefresh_WithRefreshToken(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &loginResp))
 	refreshToken := loginResp["refresh_token"].(string)
 
-	// Now refresh
+	// Refresh using the JSON body contract (as the Web UI and SDK do).
+	refreshBody := `{"refresh_token":"` + refreshToken + `"}`
+	req2 := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", bytes.NewBufferString(refreshBody))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	require.Equal(t, http.StatusOK, w2.Code)
+
+	var refreshResp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &refreshResp))
+	assert.NotEmpty(t, refreshResp["access_token"])
+	// Rotation: the response must carry a fresh refresh_token for the next cycle.
+	assert.NotEmpty(t, refreshResp["refresh_token"], "refresh must return a rotated refresh_token")
+}
+
+// TestRefresh_HeaderFallback verifies that presenting the refresh token via the
+// Authorization: Bearer header still works, for backward compatibility.
+func TestRefresh_HeaderFallback(t *testing.T) {
+	user := newTestAuthUser(t)
+	authSvc := newTestAuthSvc(t)
+	dbMock := &mockAuthDB{user: user}
+	r := setupTestRouter(t, authSvc, dbMock)
+
+	body := `{"username":"alice","password":"testpass"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var loginResp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &loginResp))
+	refreshToken := loginResp["refresh_token"].(string)
+
 	req2 := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", nil)
 	req2.Header.Set("Authorization", "Bearer "+refreshToken)
 	w2 := httptest.NewRecorder()
@@ -317,6 +357,7 @@ func TestRefresh_WithRefreshToken(t *testing.T) {
 	var refreshResp map[string]interface{}
 	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &refreshResp))
 	assert.NotEmpty(t, refreshResp["access_token"])
+	assert.NotEmpty(t, refreshResp["refresh_token"])
 }
 
 func TestRefresh_NoToken(t *testing.T) {
@@ -326,6 +367,122 @@ func TestRefresh_NoToken(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+// fakeRedis is an in-memory auth.RedisClient for exercising the JWT blacklist
+// (revocation) without a real Redis. It only needs Set + Exists.
+type fakeRedis struct {
+	keys map[string]struct{}
+}
+
+func newFakeRedis() *fakeRedis { return &fakeRedis{keys: map[string]struct{}{}} }
+
+func (f *fakeRedis) Set(_ context.Context, key string, _ interface{}, _ time.Duration) error {
+	f.keys[key] = struct{}{}
+	return nil
+}
+
+func (f *fakeRedis) Exists(_ context.Context, keys ...string) (int64, error) {
+	var n int64
+	for _, k := range keys {
+		if _, ok := f.keys[k]; ok {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// TestRefresh_RotationRevokesPresentedToken locks the security half of the
+// rotation contract: after a successful refresh, the *presented* refresh token
+// must be revoked and rejected on reuse. It wires a real Redis-backed auth
+// service (via fakeRedis) so revocation is actually effective — a plain
+// auth.New(secret, nil) would make revocation a no-op and hide regressions.
+func TestRefresh_RotationRevokesPresentedToken(t *testing.T) {
+	user := newTestAuthUser(t)
+	authSvc := auth.New("test-secret-at-least-32-bytes!!", newFakeRedis())
+	r := setupTestRouter(t, authSvc, &mockAuthDB{user: user})
+
+	// Login to obtain the first refresh token.
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login",
+		bytes.NewBufferString(`{"username":"alice","password":"testpass"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginW := httptest.NewRecorder()
+	r.ServeHTTP(loginW, loginReq)
+	require.Equal(t, http.StatusOK, loginW.Code)
+	var login map[string]any
+	require.NoError(t, json.Unmarshal(loginW.Body.Bytes(), &login))
+	firstRefresh := login["refresh_token"].(string)
+
+	// Refresh once — succeeds and rotates.
+	body := `{"refresh_token":"` + firstRefresh + `"}`
+	okReq := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", bytes.NewBufferString(body))
+	okReq.Header.Set("Content-Type", "application/json")
+	okW := httptest.NewRecorder()
+	r.ServeHTTP(okW, okReq)
+	require.Equal(t, http.StatusOK, okW.Code)
+
+	// Reusing the original (now revoked) refresh token must be rejected.
+	reuseReq := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", bytes.NewBufferString(body))
+	reuseReq.Header.Set("Content-Type", "application/json")
+	reuseW := httptest.NewRecorder()
+	r.ServeHTTP(reuseW, reuseReq)
+	assert.Equal(t, http.StatusUnauthorized, reuseW.Code,
+		"the presented refresh token must be unusable after rotation")
+}
+
+// TestRefresh_MalformedBody_Returns400 verifies a non-empty but invalid JSON
+// body is reported as a request-format error (400), not misclassified as a
+// missing-token auth error (401).
+func TestRefresh_MalformedBody_Returns400(t *testing.T) {
+	authSvc := newTestAuthSvc(t)
+	r := setupTestRouter(t, authSvc, &mockAuthDB{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/refresh",
+		bytes.NewBufferString(`{"refresh_token": `)) // truncated / malformed
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestRefresh_RotationNotEnforced_LogsWarning verifies observability of fix #3:
+// when token revocation is disabled (auth wired with nil Redis, so RevokeToken
+// is a no-op that returns nil), refresh still succeeds but logs a warning that
+// rotation could not be enforced — rather than silently leaving the old token
+// usable with no signal.
+func TestRefresh_RotationNotEnforced_LogsWarning(t *testing.T) {
+	core, logs := observer.New(zapcore.WarnLevel)
+	restore := zap.ReplaceGlobals(zap.New(core))
+	defer restore()
+
+	user := newTestAuthUser(t)
+	authSvc := newTestAuthSvc(t) // auth.New(secret, nil) — revocation disabled
+	r := setupTestRouter(t, authSvc, &mockAuthDB{user: user})
+
+	loginW := httptest.NewRecorder()
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login",
+		bytes.NewBufferString(`{"username":"alice","password":"testpass"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(loginW, loginReq)
+	require.Equal(t, http.StatusOK, loginW.Code)
+	var login map[string]any
+	require.NoError(t, json.Unmarshal(loginW.Body.Bytes(), &login))
+
+	refreshW := httptest.NewRecorder()
+	refreshReq := httptest.NewRequest(http.MethodPost, "/api/auth/refresh",
+		bytes.NewBufferString(`{"refresh_token":"`+login["refresh_token"].(string)+`"}`))
+	refreshReq.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(refreshW, refreshReq)
+	require.Equal(t, http.StatusOK, refreshW.Code)
+
+	var found bool
+	for _, e := range logs.All() {
+		if strings.Contains(e.Message, "rotation not enforced") {
+			found = true
+		}
+	}
+	assert.True(t, found, "expected a warning that rotation could not be enforced")
 }
 
 func TestRefresh_WithAccessToken_Rejected(t *testing.T) {
@@ -396,6 +553,38 @@ func TestRefresh_GenerateAccessTokenError(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", nil)
 	req.Header.Set("Authorization", "Bearer refresh-token")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+// TestRefresh_GenerateRefreshTokenError verifies that a failure to mint the new
+// (rotated) refresh token surfaces as a 500, and does not leave the client with
+// only half a token pair.
+func TestRefresh_GenerateRefreshTokenError(t *testing.T) {
+	authSvc := &mockAuthService{
+		validateTokenFunc: func(tokenStr string) (*auth.Claims, error) {
+			return &auth.Claims{
+				RegisteredClaims: jwt.RegisteredClaims{Subject: uuid.NewString()},
+				OrgID:            uuid.NewString(),
+				Role:             string(db.UserRoleSuperAdmin),
+				Username:         "alice",
+				TokenType:        "refresh",
+			}, nil
+		},
+		generateAccessTokenFunc: func(subject, orgID, role, username string, ttl time.Duration) (string, error) {
+			return "new-access", nil
+		},
+		generateRefreshTokenFunc: func(subject, orgID, role, username string, ttl time.Duration) (string, error) {
+			return "", errors.New("sign refresh token")
+		},
+	}
+	r := setupTestRouter(t, authSvc, &mockAuthDB{})
+
+	body := `{"refresh_token":"some-refresh-token"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

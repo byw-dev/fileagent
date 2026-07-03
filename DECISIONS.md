@@ -466,7 +466,51 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 
 ---
 
-> 注：D-012（Token 刷新契约）在 PR #39 分支（`fix/auth-refresh-contract`）中记录，两 PR 合并后即连续。
+## D-012：Token 刷新契约——refresh_token 走请求体 + 轮转（止血冲刺第 1 步）
+
+**决策日期**：2026-07-03
+**影响范围**：controlplane（`controlplane/internal/api/handler/auth.go` 的 `Refresh`）、webui（`webui/src/services/api.ts`、`webui/src/store/auth.ts`）、sdk/python（`sdk/python/fileagent/auth.py`）
+**背景报告**：`docs/reports/design-gap-analysis/`（G-1，06 报告 E-2）
+
+### 背景
+
+`POST /api/auth/refresh` 存在两处契约漂移，会在 SDK 联调（T3-3）时爆发：
+
+1. **令牌位置不一致**：Web UI（`api.ts:109`）与 Python SDK（`auth.py:130`）都把 refresh token
+   放在 **JSON 请求体** `{"refresh_token": "..."}`；而 CP 旧实现只读 `Authorization: Bearer` 头，
+   实测返回 `MISSING_TOKEN`。→ 客户端 access token 到期后自动刷新 100% 失败。
+2. **无轮转**：CP 旧实现吊销了旧 refresh token，却**不在响应中签发新的** refresh token。
+   Web UI/SDK 都期望响应包含新 `refresh_token` 并持久化。→ 首次刷新后 refresh token 失效，
+   第二次刷新只能回退到用户名密码重新登录。
+
+### 决策
+
+**canonical 契约**：refresh token 通过 **JSON 请求体** 传递，响应执行**令牌轮转**。
+
+- 请求：`POST /api/auth/refresh`，body `{"refresh_token": "<token>"}`
+  （OAuth2 refresh-grant 惯例；与 Web UI / SDK 现有实现一致）。
+  - 向后兼容：CP 同时接受 `Authorization: Bearer <refresh_token>` 头作为回退，
+    body 为空时才读取头。
+- 响应（200）：`{access_token, refresh_token, expires_in, token_type}`
+  - **必须**返回新的 `refresh_token`（轮转），旧 token 被吊销后不可复用。
+  - 生成新令牌对 **先于** 吊销旧令牌，生成失败则旧令牌仍可用。
+- TTL：access 2h、refresh 7d（`controlplane/internal/api/handler/auth.go` 包级常量 `accessTokenTTL`/`refreshTokenTTL`，
+  login 与 refresh 共用，避免漂移）。
+
+### 契约回归锁
+
+新增跨进程契约测试 `TestRefresh_Integration_BodyContractAndRotation`
+（`auth_integration_test.go`，`-tags=integration`）：真起 HTTP server + 真实 Postgres，
+用真实 http.Client 复现 SDK/Web UI 的 body 调用，断言 body 契约 + 连续轮转两轮可用。
+**这是本项目第一个跨进程契约测试**，用于堵住"单测全 mock、契约漂移不可见"的结构性缺口
+（详见 07 报告"回路 1"）。
+
+### 备选方案（被否决）
+
+- **改客户端去适配 header**：需同时改 Web UI + SDK 两处，且违背 OAuth2 惯例；CP 是唯一异类，改 CP 成本最低、面最小。
+- **只吊销不轮转（保持无状态）**：Web UI/SDK 均已实现"存储响应中的新 refresh_token"，不轮转会让二者的持久化逻辑写入 undefined，链路更脆。
+
+---
 
 ## D-013：Agent Token 生命周期——长效签发 + 重连自愈（止血冲刺第 2 步）
 
