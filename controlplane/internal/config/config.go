@@ -62,8 +62,10 @@ type Config struct {
 	// Defaults to "info".
 	LogLevel string
 
-	// InternalWebhookSecret is the shared secret for MinIO → Control Plane events.
-	// Optional; if empty, the internal webhook endpoint is unauthenticated.
+	// InternalWebhookSecret is the shared secret for MinIO → Control Plane events
+	// (MinIO notify_webhook auth_token). When empty, the /internal/minio-event
+	// endpoint fails closed and rejects every request, since it mutates the file
+	// index from an external source and must be authenticated.
 	InternalWebhookSecret string
 
 	// BootstrapAdminUsername is the username used for first-start admin creation.

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -397,11 +398,11 @@ func (h *EventRulesHandler) Delete(c *gin.Context) {
 
 // eventDeliveryResponse is the outbound JSON shape for an event delivery.
 type eventDeliveryResponse struct {
-	ID          string `json:"id"`
-	EventRuleID string `json:"event_rule_id"`
-	Status      string `json:"status"`
-	AttemptCount int32 `json:"attempt_count"`
-	CreatedAt   string `json:"created_at"`
+	ID           string `json:"id"`
+	EventRuleID  string `json:"event_rule_id"`
+	Status       string `json:"status"`
+	AttemptCount int32  `json:"attempt_count"`
+	CreatedAt    string `json:"created_at"`
 }
 
 func toEventDeliveryResponse(d *db.EventDelivery) eventDeliveryResponse {
@@ -652,27 +653,54 @@ type IndexerClient interface {
 // MinioEventHandler handles POST /internal/minio-event — the MinIO S3 event
 // webhook endpoint. This serves as an alternate indexing path for file events
 // that arrive directly from MinIO rather than through an agent.
+//
+// The endpoint writes to the file index from an external source, so it is
+// authenticated with a shared secret (MinIO's notify_webhook auth_token, see
+// system-design.md §6.1.2 / §6.5). The secret is compared in constant time.
 type MinioEventHandler struct {
 	logger  *zap.Logger
 	indexer IndexerClient // optional; nil disables indexing
+	secret  string        // shared webhook secret; empty disables the endpoint
 }
 
 // NewMinioEventHandler returns a new MinioEventHandler.
-// indexer may be nil, in which case upload events are only logged.
-func NewMinioEventHandler(indexer IndexerClient, logger *zap.Logger) *MinioEventHandler {
-	return &MinioEventHandler{logger: logger, indexer: indexer}
+//
+// indexer may be nil, in which case upload events are only logged. secret is the
+// shared webhook token; when empty the endpoint fails closed (rejects every
+// request), because an endpoint that mutates the index from external input must
+// be authenticated and without a secret it cannot be.
+func NewMinioEventHandler(indexer IndexerClient, secret string, logger *zap.Logger) *MinioEventHandler {
+	if secret == "" {
+		logger.Warn("minio event webhook: INTERNAL_WEBHOOK_SECRET is not set; " +
+			"the /internal/minio-event endpoint will reject all requests until it is configured")
+	}
+	return &MinioEventHandler{logger: logger, indexer: indexer, secret: secret}
+}
+
+// authorized reports whether the request carries the correct shared secret.
+// MinIO sends the configured auth_token in the Authorization header; depending
+// on the MinIO version it may or may not be prefixed with "Bearer ", so both
+// forms are accepted. The comparison is constant-time to avoid leaking the
+// secret through timing. When no secret is configured the endpoint fails closed.
+func (h *MinioEventHandler) authorized(c *gin.Context) bool {
+	if h.secret == "" {
+		return false
+	}
+	presented := strings.TrimSpace(c.GetHeader("Authorization"))
+	presented = strings.TrimSpace(strings.TrimPrefix(presented, "Bearer "))
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(h.secret)) == 1
 }
 
 // minioS3Event is the top-level MinIO S3 event notification payload.
 type minioS3Event struct {
-	EventName string              `json:"EventName"`
-	Key       string              `json:"Key"`
-	Records   []minioEventRecord  `json:"Records"`
+	EventName string             `json:"EventName"`
+	Key       string             `json:"Key"`
+	Records   []minioEventRecord `json:"Records"`
 }
 
 type minioEventRecord struct {
-	EventName string            `json:"eventName"`
-	S3        minioS3            `json:"s3"`
+	EventName string  `json:"eventName"`
+	S3        minioS3 `json:"s3"`
 }
 
 type minioS3 struct {
@@ -692,6 +720,15 @@ type minioS3Object struct {
 
 // Handle handles POST /internal/minio-event.
 func (h *MinioEventHandler) Handle(c *gin.Context) {
+	if !h.authorized(c) {
+		h.logger.Warn("minio event: rejected unauthorized webhook call",
+			zap.String("remote_addr", c.ClientIP()))
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": middleware.NewErrorBody("UNAUTHORIZED", "invalid or missing webhook credentials", nil),
+		})
+		return
+	}
+
 	var payload minioS3Event
 	if err := c.ShouldBindJSON(&payload); err != nil {
 		// MinIO may send different payload shapes; accept any JSON and log.
