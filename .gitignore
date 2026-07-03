@@ -158,3 +158,9 @@ root/
 # Legacy binary paths (before Makefile was introduced)
 /agent/agent
 /controlplane/server
+
+# Local runtime config & secrets (never commit — machine-specific / sensitive)
+/controlplane/bootstrap_admin_credentials.txt
+/deploy/config/
+/agent/config.toml
+.claude/settings.local.json
