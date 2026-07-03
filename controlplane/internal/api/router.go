@@ -16,10 +16,10 @@ import (
 
 // RouterConfig carries the dependencies required by the router.
 type RouterConfig struct {
-	JWTSecret  string
-	Logger     *zap.Logger
-	JWTService auth.Service   // nil → auth routes return 501 (Phase 1 behaviour)
-	AuthDB     handler.AuthDB // nil → auth routes return 501
+	JWTSecret     string
+	Logger        *zap.Logger
+	JWTService    auth.Service   // nil → auth routes return 501 (Phase 1 behaviour)
+	AuthDB        handler.AuthDB // nil → auth routes return 501
 	UsersDB       handler.UsersDB
 	FileTypesDB   handler.FileTypesDB
 	FilesDB       handler.FilesDB
@@ -32,10 +32,11 @@ type RouterConfig struct {
 	AgentMgr      handler.AgentManager
 	Dispatcher    handler.RuleDispatcher
 	Registry      handler.AgentRegistryClient
-	AgentCache    handler.AgentCacheClient  // nil → is_online always false
-	DirStore      handler.DirListingStore   // nil → list-dir returns 202 (legacy)
-	DryRunStore   handler.DryRunStore       // nil → test-rule returns 501
-	MinioIndexer  handler.IndexerClient // nil → minio webhook events are only logged
+	AgentCache    handler.AgentCacheClient // nil → is_online always false
+	DirStore      handler.DirListingStore  // nil → list-dir returns 202 (legacy)
+	DryRunStore   handler.DryRunStore      // nil → test-rule returns 501
+	MinioIndexer  handler.IndexerClient    // nil → minio webhook events are only logged
+	WebhookSecret string                   // shared secret for /internal/minio-event; empty → endpoint rejects all
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -53,8 +54,8 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	// ── Internal MinIO event webhook (no auth, secured by shared secret) ────
-	minioH := handler.NewMinioEventHandler(cfg.MinioIndexer, cfg.Logger)
+	// ── Internal MinIO event webhook (authenticated by shared secret) ───────
+	minioH := handler.NewMinioEventHandler(cfg.MinioIndexer, cfg.WebhookSecret, cfg.Logger)
 	r.POST("/internal/minio-event", minioH.Handle)
 
 	// ── Auth routes ──────────────────────────────────────────────────────────

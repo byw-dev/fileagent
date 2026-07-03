@@ -105,12 +105,12 @@ func (m *mockEventRulesDB) CountDeliveriesByRule(_ context.Context, _ uuid.UUID)
 // ── mock UploadLogsDB ─────────────────────────────────────────────────────────
 
 type mockUploadLogsDB struct {
-	logs        []*db.UploadLog
-	listErr     error
-	logsCount   int64
+	logs         []*db.UploadLog
+	listErr      error
+	logsCount    int64
 	countLogsErr error
-	log         *db.UploadLog
-	getErr      error
+	log          *db.UploadLog
+	getErr       error
 }
 
 func (m *mockUploadLogsDB) ListUploadLogs(_ context.Context, _ db.ListUploadLogsParams) ([]*db.UploadLog, error) {
@@ -528,49 +528,60 @@ func TestUploadLogsHandler_Get_InvalidID(t *testing.T) {
 // ── EventRulesHandler missing error path tests ────────────────────────────────
 
 func TestEventRulesHandler_Delete_InvalidID(t *testing.T) {
-h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodDelete, "/api/v1/event-rules/not-a-uuid", nil)
-testEventRulesRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusBadRequest, w.Code)
+	h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/event-rules/not-a-uuid", nil)
+	testEventRulesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestEventRulesHandler_Delete_DBError(t *testing.T) {
-h := handler.NewEventRulesHandler(&mockEventRulesDB{deleteErr: assert.AnError}, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodDelete, "/api/v1/event-rules/"+uuid.New().String(), nil)
-testEventRulesRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusInternalServerError, w.Code)
+	h := handler.NewEventRulesHandler(&mockEventRulesDB{deleteErr: assert.AnError}, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/event-rules/"+uuid.New().String(), nil)
+	testEventRulesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 // ── MinioEventHandler tests ───────────────────────────────────────────────────
 
 // mockIndexerClient is a test double for handler.IndexerClient.
 type mockIndexerClient struct {
-err     error
-called  bool
-lastBucket string
-lastKey    string
+	err        error
+	called     bool
+	lastBucket string
+	lastKey    string
 }
 
 func (m *mockIndexerClient) IndexUpload(_ context.Context, bucketName, objectKey string, _ int64, _ string) error {
-m.called = true
-m.lastBucket = bucketName
-m.lastKey = objectKey
-return m.err
+	m.called = true
+	m.lastBucket = bucketName
+	m.lastKey = objectKey
+	return m.err
 }
 
+// testWebhookSecret is the shared secret used by the MinIO webhook tests.
+const testWebhookSecret = "test-webhook-secret"
+
+// testMinioEventRouter wires the handler and, for payload-focused tests, injects
+// the valid webhook secret when the request carries no Authorization header.
+// Auth-specific tests set their own header (or none) and assert the status.
 func testMinioEventRouter(h *handler.MinioEventHandler) *gin.Engine {
-gin.SetMode(gin.TestMode)
-r := gin.New()
-r.POST("/internal/minio-event", h.Handle)
-return r
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/internal/minio-event", func(c *gin.Context) {
+		if c.GetHeader("Authorization") == "" {
+			c.Request.Header.Set("Authorization", "Bearer "+testWebhookSecret)
+		}
+		h.Handle(c)
+	})
+	return r
 }
 
 func TestMinioEventHandler_Handle_Success_WithRecords(t *testing.T) {
-ix := &mockIndexerClient{}
-h := handler.NewMinioEventHandler(ix, newTestLogger())
-body := `{
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	body := `{
 "EventName": "s3:ObjectCreated:Put",
 "Key": "data-sensor/file.csv",
 "Records": [{
@@ -581,59 +592,138 @@ body := `{
 }
 }]
 }`
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
-req.Header.Set("Content-Type", "application/json")
-testMinioEventRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusOK, w.Code)
-assert.True(t, ix.called, "IndexUpload should have been called")
-assert.Equal(t, "data-sensor", ix.lastBucket)
-assert.Equal(t, "uploads/file.csv", ix.lastKey)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testMinioEventRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, ix.called, "IndexUpload should have been called")
+	assert.Equal(t, "data-sensor", ix.lastBucket)
+	assert.Equal(t, "uploads/file.csv", ix.lastKey)
 }
 
 func TestMinioEventHandler_Handle_EmptyRecords(t *testing.T) {
-ix := &mockIndexerClient{}
-h := handler.NewMinioEventHandler(ix, newTestLogger())
-body := `{"EventName":"s3:ObjectCreated:Put","Key":"","Records":[]}`
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
-req.Header.Set("Content-Type", "application/json")
-testMinioEventRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusOK, w.Code)
-assert.False(t, ix.called, "IndexUpload should not be called for empty records")
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	body := `{"EventName":"s3:ObjectCreated:Put","Key":"","Records":[]}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testMinioEventRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.False(t, ix.called, "IndexUpload should not be called for empty records")
 }
 
 func TestMinioEventHandler_Handle_InvalidJSON(t *testing.T) {
-ix := &mockIndexerClient{}
-h := handler.NewMinioEventHandler(ix, newTestLogger())
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString("not-json"))
-req.Header.Set("Content-Type", "application/json")
-testMinioEventRouter(h).ServeHTTP(w, req)
-// Non-fatal: still returns 200 OK.
-assert.Equal(t, http.StatusOK, w.Code)
-assert.False(t, ix.called)
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString("not-json"))
+	req.Header.Set("Content-Type", "application/json")
+	testMinioEventRouter(h).ServeHTTP(w, req)
+	// Non-fatal: still returns 200 OK.
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.False(t, ix.called)
 }
 
 func TestMinioEventHandler_Handle_NilIndexer(t *testing.T) {
-h := handler.NewMinioEventHandler(nil, newTestLogger())
-body := `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1}}}]}`
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
-req.Header.Set("Content-Type", "application/json")
-testMinioEventRouter(h).ServeHTTP(w, req)
-assert.Equal(t, http.StatusOK, w.Code)
+	h := handler.NewMinioEventHandler(nil, testWebhookSecret, newTestLogger())
+	body := `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1}}}]}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testMinioEventRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
 }
 
 func TestMinioEventHandler_Handle_IndexerError_StillReturns200(t *testing.T) {
-ix := &mockIndexerClient{err: assert.AnError}
-h := handler.NewMinioEventHandler(ix, newTestLogger())
-body := `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1}}}]}`
-w := httptest.NewRecorder()
-req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
-req.Header.Set("Content-Type", "application/json")
-testMinioEventRouter(h).ServeHTTP(w, req)
-// Indexer error is non-fatal; still 200.
-assert.Equal(t, http.StatusOK, w.Code)
-assert.True(t, ix.called)
+	ix := &mockIndexerClient{err: assert.AnError}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	body := `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1}}}]}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testMinioEventRouter(h).ServeHTTP(w, req)
+	// Indexer error is non-fatal; still 200.
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, ix.called)
+}
+
+// ── Webhook authentication (G-3) ──────────────────────────────────────────────
+
+const validMinioBody = `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1}}}]}`
+
+// plainMinioRouter wires Handle without any header injection, so auth behaviour
+// can be asserted directly.
+func plainMinioRouter(h *handler.MinioEventHandler) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/internal/minio-event", h.Handle)
+	return r
+}
+
+func TestMinioEventHandler_RejectsMissingAuthHeader(t *testing.T) {
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
+	req.Header.Set("Content-Type", "application/json")
+	plainMinioRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.False(t, ix.called, "unauthenticated event must not be indexed")
+}
+
+// TestMinioEventHandler_AcceptsCaseInsensitiveScheme verifies the scheme is
+// matched per RFC 7235 (case-insensitive) and tolerates extra whitespace.
+func TestMinioEventHandler_AcceptsCaseInsensitiveScheme(t *testing.T) {
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "bearer   "+testWebhookSecret) // lowercase + extra spaces
+	plainMinioRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, ix.called)
+}
+
+func TestMinioEventHandler_RejectsWrongSecret(t *testing.T) {
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer wrong-secret")
+	plainMinioRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.False(t, ix.called)
+}
+
+// TestMinioEventHandler_AcceptsRawToken verifies robustness against MinIO
+// versions that send auth_token without a "Bearer " prefix.
+func TestMinioEventHandler_AcceptsRawToken(t *testing.T) {
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", testWebhookSecret) // no "Bearer " prefix
+	plainMinioRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, ix.called)
+}
+
+// TestMinioEventHandler_NoSecretConfigured_FailsClosed verifies that with no
+// configured secret the endpoint rejects every request rather than silently
+// accepting unauthenticated input.
+func TestMinioEventHandler_NoSecretConfigured_FailsClosed(t *testing.T) {
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, "", newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer anything")
+	plainMinioRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.False(t, ix.called)
 }

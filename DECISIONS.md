@@ -552,3 +552,38 @@ Agent 也能自愈，使 token 时长不再是单点故障。
   到期仍会掉线；且超长 token 削弱吊销时效性。必须配合 B。
 - **新增 token 续期 RPC**（设计 §4.7 的原始设想）：proto 无对应 RPC，需改契约；
   而 `PollApproval` 已是幂等的发 token 通道，复用它成本最低、面最小。
+
+---
+
+## D-014：MinIO 事件 webhook 端点鉴权——共享密钥 + 失败即拒（止血冲刺第 3 步）
+
+**决策日期**：2026-07-03
+**影响范围**：controlplane（`internal/api/handler/events.go`、`router.go`、`config`）
+**背景报告**：`docs/reports/design-gap-analysis/`（G-3，01 报告 §1）
+
+### 背景
+
+`POST /internal/minio-event`（MinIO 上传事件回调）会把外部输入写入 `file_entries`
+索引，但**从未校验任何凭据**——路由注释甚至写着"secured by shared secret"，实际却没实现。
+任何能访问该端口的人都可伪造上传事件污染文件索引。设计 §6.1.2 / §6.5 本就要求
+MinIO 侧配置 `notify_webhook auth_token`，CP 侧却没消费它。
+
+### 决策
+
+以 **MinIO `notify_webhook` 的 `auth_token`（共享密钥）** 鉴权，**失败即拒（fail-closed）**：
+
+- 密钥来源：配置项 `INTERNAL_WEBHOOK_SECRET`（已存在，此前未被消费）。
+- 校验：读 `Authorization` 头，兼容 MinIO 不同版本——接受 `Bearer <secret>` 和裸 `<secret>`
+  两种形式；用 `crypto/subtle.ConstantTimeCompare` 常量时间比较，避免时序侧信道。
+- **未配置密钥时端点拒绝一切请求**（fail-closed），而非放行：一个会改数据库的外部端点
+  必须可鉴权，无密钥即无法鉴权，故关闭。构造时打印一次启动告警，提示运维配置密钥。
+- 失败请求返回 401 并记 warn 日志（含来源 IP），便于发现伪造/误配。
+
+### 备选方案（被否决）
+
+- **无密钥时放行 + 告警（fail-open）**：日志只是记录漏洞，并未修复它；G-3 的目的就是堵洞，
+  必须拒绝未鉴权请求。
+- **把 `INTERNAL_WEBHOOK_SECRET` 设为必填、缺失则 CP 启动失败**：影响面过大（每个部署都必须配），
+  改为运行时 fail-closed 把影响局限在 webhook 这一个端点，CP 仍能正常启动其余功能。
+- **改用 mTLS / IP 白名单**：第一版不引入 mTLS（见 CLAUDE.md 边界）；IP 白名单在容器网络下脆弱。
+  共享密钥与设计 §6.5 一致，最简单可靠。
