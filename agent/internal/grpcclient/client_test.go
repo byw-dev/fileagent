@@ -3,6 +3,7 @@ package grpcclient
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -20,14 +23,25 @@ import (
 type fakeAgentServer struct {
 	agentv1.UnimplementedAgentServiceServer
 	receivedCh chan *agentv1.AgentMessage
+	// connectErr, when non-nil, is returned immediately from Connect so tests
+	// can simulate the Control Plane rejecting the stream (e.g. Unauthenticated).
+	connectErr error
+	// pollStatus / pollToken shape the PollApproval response used by the reauth
+	// path tests.
+	pollStatus string
+	pollToken  string
 }
 
 func newFakeServer() *fakeAgentServer {
 	return &fakeAgentServer{receivedCh: make(chan *agentv1.AgentMessage, 16)}
 }
 
-// Connect receives all messages until the stream closes.
+// Connect receives all messages until the stream closes, or returns connectErr
+// immediately when configured.
 func (f *fakeAgentServer) Connect(stream agentv1.AgentService_ConnectServer) error {
+	if f.connectErr != nil {
+		return f.connectErr
+	}
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
@@ -35,6 +49,12 @@ func (f *fakeAgentServer) Connect(stream agentv1.AgentService_ConnectServer) err
 		}
 		f.receivedCh <- msg
 	}
+}
+
+// PollApproval returns a response shaped by pollStatus/pollToken, for exercising
+// the reauth self-heal path.
+func (f *fakeAgentServer) PollApproval(_ context.Context, _ *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error) {
+	return &agentv1.PollApprovalResponse{Status: f.pollStatus, AuthToken: f.pollToken}, nil
 }
 
 // startFakeServer starts an in-process gRPC server and returns its address.
@@ -188,4 +208,149 @@ func TestClient_ReconnectOnStreamClose(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for first heartbeat")
 	}
+}
+
+// TestClient_ReauthOnUnauthenticated verifies the self-heal path (G-2): when the
+// Control Plane rejects the token with Unauthenticated, the client invokes the
+// reauth callback and installs the fresh token for the next reconnect, instead
+// of looping forever on the stale credential.
+func TestClient_ReauthOnUnauthenticated(t *testing.T) {
+	addr, fakeServer := startFakeServer(t)
+	fakeServer.connectErr = status.Error(codes.Unauthenticated, "token expired")
+
+	logger := zap.NewNop()
+	client := newInsecureClient(buildTestConfig(addr), logger)
+	client.SetToken("stale-token")
+
+	reauthCalled := make(chan struct{}, 1)
+	client.SetReauthFunc(func(context.Context) (string, error) {
+		select {
+		case reauthCalled <- struct{}{}:
+		default:
+		}
+		return "fresh-token", nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, connectInsecure(ctx, client))
+	defer func() { _ = client.Close() }()
+
+	select {
+	case <-reauthCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reauth was not triggered on Unauthenticated")
+	}
+
+	require.Eventually(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.token == "fresh-token"
+	}, 3*time.Second, 20*time.Millisecond, "refreshed token should be installed")
+}
+
+// TestClient_NoReauthOnNonAuthError verifies the reauth path is gated strictly on
+// Unauthenticated: a transient non-auth error must NOT burn a reauth attempt.
+func TestClient_NoReauthOnNonAuthError(t *testing.T) {
+	addr, fakeServer := startFakeServer(t)
+	fakeServer.connectErr = status.Error(codes.Unavailable, "temporary outage")
+
+	logger := zap.NewNop()
+	client := newInsecureClient(buildTestConfig(addr), logger)
+	client.SetToken("some-token")
+
+	var reauthCalls int32
+	client.SetReauthFunc(func(context.Context) (string, error) {
+		atomic.AddInt32(&reauthCalls, 1)
+		return "should-not-be-used", nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, connectInsecure(ctx, client))
+	defer func() { _ = client.Close() }()
+
+	// Give the run loop time to fail and (wrongly) attempt reauth if misgated.
+	time.Sleep(1500 * time.Millisecond)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&reauthCalls),
+		"reauth must not fire for non-Unauthenticated errors")
+	client.mu.Lock()
+	tok := client.token
+	client.mu.Unlock()
+	assert.Equal(t, "some-token", tok, "token must be untouched on non-auth errors")
+}
+
+// TestClient_ReauthEmptyTokenIgnored guards the defensive check: if the reauth
+// callback returns an empty token, the client must keep its existing credential
+// rather than dropping the Bearer header and reconnecting anonymously.
+func TestClient_ReauthEmptyTokenIgnored(t *testing.T) {
+	addr, fakeServer := startFakeServer(t)
+	fakeServer.connectErr = status.Error(codes.Unauthenticated, "token expired")
+
+	client := newInsecureClient(buildTestConfig(addr), zap.NewNop())
+	client.SetToken("original-token")
+
+	var calls int32
+	client.SetReauthFunc(func(context.Context) (string, error) {
+		atomic.AddInt32(&calls, 1)
+		return "", nil // buggy/unexpected empty token with nil error
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, connectInsecure(ctx, client))
+	defer func() { _ = client.Close() }()
+
+	// Wait until reauth has actually been invoked at least once.
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&calls) > 0
+	}, 5*time.Second, 20*time.Millisecond, "reauth should have been attempted")
+
+	client.mu.Lock()
+	tok := client.token
+	client.mu.Unlock()
+	assert.Equal(t, "original-token", tok, "empty reauth token must not overwrite the credential")
+}
+
+// dialTestService dials the in-process fake server and returns an AgentService
+// client for direct RPC-level tests.
+func dialTestService(t *testing.T, addr string) agentv1.AgentServiceClient {
+	t.Helper()
+	conn, err := grpc.NewClient(addr, InsecureDialOpts()...)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	return agentv1.NewAgentServiceClient(conn)
+}
+
+func TestReAuthenticate_ApprovedReturnsToken(t *testing.T) {
+	addr, srv := startFakeServer(t)
+	srv.pollStatus = "approved"
+	srv.pollToken = "fresh-token-123"
+
+	tok, err := ReAuthenticate(context.Background(), dialTestService(t, addr), "agent-1", "fp-1", zap.NewNop())
+	require.NoError(t, err)
+	assert.Equal(t, "fresh-token-123", tok)
+}
+
+func TestReAuthenticate_NotApproved(t *testing.T) {
+	addr, srv := startFakeServer(t)
+	srv.pollStatus = "revoked"
+
+	_, err := ReAuthenticate(context.Background(), dialTestService(t, addr), "agent-1", "fp-1", zap.NewNop())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not approved")
+}
+
+// TestReAuthenticate_ApprovedButNoToken locks the split error case: an approved
+// status with an empty token reports a distinct, accurate message rather than
+// the misleading "not approved (status=approved)".
+func TestReAuthenticate_ApprovedButNoToken(t *testing.T) {
+	addr, srv := startFakeServer(t)
+	srv.pollStatus = "approved"
+	srv.pollToken = ""
+
+	_, err := ReAuthenticate(context.Background(), dialTestService(t, addr), "agent-1", "fp-1", zap.NewNop())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no token")
+	assert.NotContains(t, err.Error(), "not approved")
 }

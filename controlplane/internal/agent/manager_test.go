@@ -198,6 +198,45 @@ func TestPollApproval_ApprovedReturnsToken(t *testing.T) {
 	assert.Equal(t, expectedHash, agentDB.agents[agentID.String()].AuthTokenHash.String)
 }
 
+// TestPollApproval_TokenUsesAgentTokenTTL guards against the regression where
+// agents were issued a short (2h access) token: because agents reuse the token
+// across gRPC reconnects, a short TTL permanently locks them out after expiry.
+// The issued token — both its stored expiry and its JWT exp claim — must reflect
+// the long agentTokenTTL configured on the Manager.
+func TestPollApproval_TokenUsesAgentTokenTTL(t *testing.T) {
+	agentDB := newMockAgentDB()
+	logger, _ := zap.NewDevelopment()
+	jwtSvc := auth.New("test-secret", nil)
+	const ttl = 720 * time.Hour
+	m := NewManager(agentDB, &mockCache{}, jwtSvc, &mockNATS{}, logger, ttl)
+
+	agentID := uuid.New()
+	agentDB.agents[agentID.String()] = &db.Agent{
+		ID:     agentID,
+		OrgID:  defaultOrgID,
+		Name:   "approved-agent",
+		Status: db.AgentStatusApproved,
+	}
+
+	before := time.Now()
+	resp, err := m.PollApproval(context.Background(), &agentv1.PollApprovalRequest{
+		AgentId: agentID.String(),
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.AuthToken)
+
+	// Stored expiry reflects the long TTL (allow a generous skew for slow CI).
+	storedExp := agentDB.agents[agentID.String()].TokenExpiresAt
+	require.True(t, storedExp.Valid)
+	assert.WithinDuration(t, before.Add(ttl), storedExp.Time, time.Minute)
+
+	// The JWT itself carries the long expiry, not the 2h access TTL.
+	claims, err := jwtSvc.ValidateToken(resp.AuthToken)
+	require.NoError(t, err)
+	require.NotNil(t, claims.ExpiresAt)
+	assert.WithinDuration(t, before.Add(ttl), claims.ExpiresAt.Time, time.Minute)
+}
+
 func TestPollApproval_InvalidID(t *testing.T) {
 	agentDB := newMockAgentDB()
 	logger, _ := zap.NewDevelopment()

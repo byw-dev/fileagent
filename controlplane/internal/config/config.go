@@ -39,6 +39,12 @@ type Config struct {
 	JWTAccessTokenTTL time.Duration
 	// JWTRefreshTokenTTL is the lifetime of a Refresh Token (default 720h / 30 days).
 	JWTRefreshTokenTTL time.Duration
+	// AgentTokenTTL is the lifetime of the JWT issued to an Agent at approval
+	// (default 720h / 30 days). Agents hold a long-lived gRPC connection and
+	// reuse this token across reconnects, so a short TTL (e.g. the 2h access
+	// TTL) would cause an Agent to be permanently rejected after any reconnect
+	// past expiry. See system-design.md §4.7 and appendix C.1 (AGENT_TOKEN_TTL).
+	AgentTokenTTL time.Duration
 
 	// MinIO configuration.
 	MinIOEndpoint  string // required, e.g. "minio.internal:9000"
@@ -106,6 +112,7 @@ func Load() (*Config, error) {
 	}
 	cfg.JWTAccessTokenTTL = envDuration("JWT_ACCESS_TOKEN_TTL", 2*time.Hour)
 	cfg.JWTRefreshTokenTTL = envDuration("JWT_REFRESH_TOKEN_TTL", 720*time.Hour)
+	cfg.AgentTokenTTL = envDuration("AGENT_TOKEN_TTL", 720*time.Hour)
 
 	// ── minio ─────────────────────────────────────────────────────────────────
 	cfg.MinIOEndpoint = os.Getenv("MINIO_ENDPOINT")
@@ -174,6 +181,9 @@ func (c *Config) Validate() error {
 	}
 	if c.BootstrapAdminCredentialsFile == "" {
 		return errors.New("BOOTSTRAP_ADMIN_CREDENTIALS_FILE cannot be empty")
+	}
+	if c.AgentTokenTTL <= 0 {
+		return errors.New("AGENT_TOKEN_TTL must be a positive duration")
 	}
 	return nil
 }
