@@ -662,7 +662,7 @@ func plainMinioRouter(h *handler.MinioEventHandler) *gin.Engine {
 	return r
 }
 
-func TestMinioEventHandler_RejectsMissingSecret(t *testing.T) {
+func TestMinioEventHandler_RejectsMissingAuthHeader(t *testing.T) {
 	ix := &mockIndexerClient{}
 	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
 	w := httptest.NewRecorder()
@@ -671,6 +671,20 @@ func TestMinioEventHandler_RejectsMissingSecret(t *testing.T) {
 	plainMinioRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 	assert.False(t, ix.called, "unauthenticated event must not be indexed")
+}
+
+// TestMinioEventHandler_AcceptsCaseInsensitiveScheme verifies the scheme is
+// matched per RFC 7235 (case-insensitive) and tolerates extra whitespace.
+func TestMinioEventHandler_AcceptsCaseInsensitiveScheme(t *testing.T) {
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "bearer   "+testWebhookSecret) // lowercase + extra spaces
+	plainMinioRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, ix.called)
 }
 
 func TestMinioEventHandler_RejectsWrongSecret(t *testing.T) {

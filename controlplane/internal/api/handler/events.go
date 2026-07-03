@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
@@ -679,16 +680,24 @@ func NewMinioEventHandler(indexer IndexerClient, secret string, logger *zap.Logg
 
 // authorized reports whether the request carries the correct shared secret.
 // MinIO sends the configured auth_token in the Authorization header; depending
-// on the MinIO version it may or may not be prefixed with "Bearer ", so both
-// forms are accepted. The comparison is constant-time to avoid leaking the
-// secret through timing. When no secret is configured the endpoint fails closed.
+// on the MinIO version it may or may not be prefixed with a "Bearer" scheme, so
+// both forms are accepted (the scheme is matched case-insensitively per RFC 7235
+// and tolerant of arbitrary whitespace). The presented and expected secrets are
+// SHA-256 hashed before a constant-time compare, so the comparison time is
+// independent of the secret's length and content (a plain ConstantTimeCompare
+// returns early on a length mismatch, leaking the expected length). When no
+// secret is configured the endpoint fails closed.
 func (h *MinioEventHandler) authorized(c *gin.Context) bool {
 	if h.secret == "" {
 		return false
 	}
 	presented := strings.TrimSpace(c.GetHeader("Authorization"))
-	presented = strings.TrimSpace(strings.TrimPrefix(presented, "Bearer "))
-	return subtle.ConstantTimeCompare([]byte(presented), []byte(h.secret)) == 1
+	if fields := strings.Fields(presented); len(fields) == 2 && strings.EqualFold(fields[0], "bearer") {
+		presented = fields[1]
+	}
+	want := sha256.Sum256([]byte(h.secret))
+	got := sha256.Sum256([]byte(presented))
+	return subtle.ConstantTimeCompare(want[:], got[:]) == 1
 }
 
 // minioS3Event is the top-level MinIO S3 event notification payload.
