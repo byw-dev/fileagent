@@ -3,6 +3,7 @@ package grpcclient
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
@@ -20,14 +23,21 @@ import (
 type fakeAgentServer struct {
 	agentv1.UnimplementedAgentServiceServer
 	receivedCh chan *agentv1.AgentMessage
+	// connectErr, when non-nil, is returned immediately from Connect so tests
+	// can simulate the Control Plane rejecting the stream (e.g. Unauthenticated).
+	connectErr error
 }
 
 func newFakeServer() *fakeAgentServer {
 	return &fakeAgentServer{receivedCh: make(chan *agentv1.AgentMessage, 16)}
 }
 
-// Connect receives all messages until the stream closes.
+// Connect receives all messages until the stream closes, or returns connectErr
+// immediately when configured.
 func (f *fakeAgentServer) Connect(stream agentv1.AgentService_ConnectServer) error {
+	if f.connectErr != nil {
+		return f.connectErr
+	}
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
@@ -188,4 +198,74 @@ func TestClient_ReconnectOnStreamClose(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for first heartbeat")
 	}
+}
+
+// TestClient_ReauthOnUnauthenticated verifies the self-heal path (G-2): when the
+// Control Plane rejects the token with Unauthenticated, the client invokes the
+// reauth callback and installs the fresh token for the next reconnect, instead
+// of looping forever on the stale credential.
+func TestClient_ReauthOnUnauthenticated(t *testing.T) {
+	addr, fakeServer := startFakeServer(t)
+	fakeServer.connectErr = status.Error(codes.Unauthenticated, "token expired")
+
+	logger := zap.NewNop()
+	client := newInsecureClient(buildTestConfig(addr), logger)
+	client.SetToken("stale-token")
+
+	reauthCalled := make(chan struct{}, 1)
+	client.SetReauthFunc(func(context.Context) (string, error) {
+		select {
+		case reauthCalled <- struct{}{}:
+		default:
+		}
+		return "fresh-token", nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, connectInsecure(ctx, client))
+	defer func() { _ = client.Close() }()
+
+	select {
+	case <-reauthCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reauth was not triggered on Unauthenticated")
+	}
+
+	require.Eventually(t, func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return client.token == "fresh-token"
+	}, 3*time.Second, 20*time.Millisecond, "refreshed token should be installed")
+}
+
+// TestClient_NoReauthOnNonAuthError verifies the reauth path is gated strictly on
+// Unauthenticated: a transient non-auth error must NOT burn a reauth attempt.
+func TestClient_NoReauthOnNonAuthError(t *testing.T) {
+	addr, fakeServer := startFakeServer(t)
+	fakeServer.connectErr = status.Error(codes.Unavailable, "temporary outage")
+
+	logger := zap.NewNop()
+	client := newInsecureClient(buildTestConfig(addr), logger)
+	client.SetToken("some-token")
+
+	var reauthCalls int32
+	client.SetReauthFunc(func(context.Context) (string, error) {
+		atomic.AddInt32(&reauthCalls, 1)
+		return "should-not-be-used", nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, connectInsecure(ctx, client))
+	defer func() { _ = client.Close() }()
+
+	// Give the run loop time to fail and (wrongly) attempt reauth if misgated.
+	time.Sleep(1500 * time.Millisecond)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&reauthCalls),
+		"reauth must not fire for non-Unauthenticated errors")
+	client.mu.Lock()
+	tok := client.token
+	client.mu.Unlock()
+	assert.Equal(t, "some-token", tok, "token must be untouched on non-auth errors")
 }

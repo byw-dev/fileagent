@@ -463,3 +463,48 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 
 - **放入 `agent/` 模块内**：controlplane 的 Dry-Run 端点在校验 path_pattern 时也需要 Globify/Validate，共享为独立包更合理。
 - **使用现有开源 trollsift 库**：Python 的 trollsift 库无对等 Go 版本，且本项目需要 LDML 时间格式支持，需要自己实现。
+
+---
+
+> 注：D-012（Token 刷新契约）在 PR #39 分支（`fix/auth-refresh-contract`）中记录，两 PR 合并后即连续。
+
+## D-013：Agent Token 生命周期——长效签发 + 重连自愈（止血冲刺第 2 步）
+
+**决策日期**：2026-07-03
+**影响范围**：controlplane（config、agent manager）、agent（grpcclient）
+**背景报告**：`docs/reports/design-gap-analysis/`（G-2，06 报告 E-1）
+
+### 背景
+
+CP 用 2h 的 access token TTL 给 Agent 签发身份 token（`manager.go` 的 `PollApproval`/
+`ApproveAgent`，注释却写着 "long-lived"）。但 Agent 持有长连接、重连时复用同一 token
+（`grpcclient` 从不重新取 token），而 gRPC `Connect` 流会校验 token 过期。因此：
+签发 2h 后任何一次重连（网络抖动 / CP 重启 / TCP 半开）→ Unauthenticated →
+`runLoop` 用同一过期 token 无限重试 → **Agent 永久掉线，只能重启进程**。
+凡部署超过 2 小时的 Agent，一次网络抖动就可能永久离线。
+
+### 决策：双重防御
+
+**防御 A（治本，CP 侧）**：给 Agent 签发真正长效的 token。
+- 新增配置 `AGENT_TOKEN_TTL`（默认 720h / 30 天），对齐设计 §4.7 与附录 C.1；校验为正值。
+- `Manager.accessTTL` 重命名为 `agentTokenTTL`，由 `cfg.AgentTokenTTL` 注入；
+  Agent token 不再复用 2h 的 `JWTAccessTokenTTL`。
+- 用户/SDK 的 access token 仍是 2h（不受影响）——两类 token 生命周期本就应独立。
+
+**防御 B（自愈网，Agent 侧）**：token 被拒时自动重新获取。
+- `grpcclient.Client` 新增可选 `reauthFunc`；`runLoop` 捕获流的终止错误，
+  当 `status.Code == Unauthenticated` 时调用它刷新 token 再重连。
+- `reauthFunc` 经 `ReAuthenticate()` 调用**豁免 JWT** 的 `PollApproval`
+  （已审批 Agent 会立即拿到新 token），成功后持久化并安装；非审批态（如已吊销）
+  返回错误、不安装空 token → 已吊销 Agent 不会自愈，无安全回退。
+- 严格按 `Unauthenticated` 门控：`Unavailable` 等瞬时错误不触发重新认证（有单测守卫）。
+
+两层独立：A 让 30 天内基本不触发 B；B 保证即便 token 最终过期/被吊销后重新审批，
+Agent 也能自愈，使 token 时长不再是单点故障。
+
+### 备选方案（被否决）
+
+- **仅防御 A（超长 / 永不过期 token）**：单靠拉长 TTL 只是把炸弹从 2h 推迟到 30 天，
+  到期仍会掉线；且超长 token 削弱吊销时效性。必须配合 B。
+- **新增 token 续期 RPC**（设计 §4.7 的原始设想）：proto 无对应 RPC，需改契约；
+  而 `PollApproval` 已是幂等的发 token 通道，复用它成本最低、面最小。

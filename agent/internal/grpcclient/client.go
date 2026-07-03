@@ -17,9 +17,11 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -42,6 +44,7 @@ type Client struct {
 	token      string
 	agentID    string
 	msgHandler func(*agentv1.ServerMessage)
+	reauthFunc func(context.Context) (string, error)
 }
 
 // New constructs a Client. Call Connect to establish the connection.
@@ -73,6 +76,17 @@ func (c *Client) SetMessageHandler(h func(*agentv1.ServerMessage)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.msgHandler = h
+}
+
+// SetReauthFunc registers a callback used to obtain a fresh Bearer token when
+// the Control Plane rejects the current one (gRPC Unauthenticated). The callback
+// typically re-runs the approval poll (which is exempt from JWT auth) to mint a
+// new agent token. It is optional; when unset, the client only retries with the
+// existing token.
+func (c *Client) SetReauthFunc(f func(context.Context) (string, error)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reauthFunc = f
 }
 
 // ServiceClient returns the underlying AgentServiceClient after Connect has been called.
@@ -209,19 +223,46 @@ func (c *Client) runLoop(ctx context.Context) {
 		}
 		attempt++
 
-		if err := c.openStream(ctx); err != nil {
-			c.logger.Warn("grpcclient: stream error", zap.Error(err))
-			continue
+		streamErr := c.openStream(ctx)
+		if streamErr == nil {
+			// Stream opened successfully — reset backoff counter.
+			attempt = 0
+
+			streamCtx, cancel := context.WithCancel(ctx)
+			go c.heartbeatLoop(streamCtx)
+			streamErr = c.receiveLoop(streamCtx)
+			cancel()
 		}
 
-		// Stream opened successfully — reset backoff counter.
-		attempt = 0
-
-		streamCtx, cancel := context.WithCancel(ctx)
-		go c.heartbeatLoop(streamCtx)
-		c.receiveLoop(streamCtx)
-		cancel()
+		if streamErr != nil {
+			c.logger.Warn("grpcclient: stream error", zap.Error(streamErr))
+			// A rejected token means the stored credential is expired or revoked.
+			// Retrying with the same token would loop forever, so try to obtain a
+			// fresh one before the next attempt (self-heal). See G-2 / 06 E-1.
+			if status.Code(streamErr) == codes.Unauthenticated {
+				c.reauthenticate(ctx)
+			}
+		}
 	}
+}
+
+// reauthenticate invokes the registered reauth callback (if any) to obtain a
+// fresh Bearer token and installs it for subsequent reconnect attempts. Failures
+// are logged and swallowed: the run loop keeps retrying under backoff.
+func (c *Client) reauthenticate(ctx context.Context) {
+	c.mu.Lock()
+	f := c.reauthFunc
+	c.mu.Unlock()
+	if f == nil {
+		return
+	}
+	token, err := f(ctx)
+	if err != nil {
+		c.logger.Warn("grpcclient: reauthentication failed", zap.Error(err))
+		return
+	}
+	c.SetToken(token)
+	c.logger.Info("grpcclient: reauthenticated, refreshed token for reconnect")
 }
 
 // openStream calls Connect on the gRPC service and stores the resulting stream.
@@ -254,15 +295,17 @@ func (c *Client) openStream(ctx context.Context) error {
 }
 
 // receiveLoop reads server messages from the stream until it closes or errors,
-// dispatching each message to the registered handler (if any).
-func (c *Client) receiveLoop(ctx context.Context) {
+// dispatching each message to the registered handler (if any). It returns the
+// terminal stream error (nil when the loop exits due to context cancellation),
+// so the caller can react to auth rejections.
+func (c *Client) receiveLoop(ctx context.Context) error {
 	c.mu.Lock()
 	stream := c.stream
 	c.mu.Unlock()
 
 	for {
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
 		msg, err := stream.Recv()
 		if err != nil {
@@ -270,7 +313,7 @@ func (c *Client) receiveLoop(ctx context.Context) {
 			c.mu.Lock()
 			c.stream = nil
 			c.mu.Unlock()
-			return
+			return err
 		}
 		c.mu.Lock()
 		h := c.msgHandler
