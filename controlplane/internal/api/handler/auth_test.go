@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -424,6 +428,61 @@ func TestRefresh_RotationRevokesPresentedToken(t *testing.T) {
 	r.ServeHTTP(reuseW, reuseReq)
 	assert.Equal(t, http.StatusUnauthorized, reuseW.Code,
 		"the presented refresh token must be unusable after rotation")
+}
+
+// TestRefresh_MalformedBody_Returns400 verifies a non-empty but invalid JSON
+// body is reported as a request-format error (400), not misclassified as a
+// missing-token auth error (401).
+func TestRefresh_MalformedBody_Returns400(t *testing.T) {
+	authSvc := newTestAuthSvc(t)
+	r := setupTestRouter(t, authSvc, &mockAuthDB{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/refresh",
+		bytes.NewBufferString(`{"refresh_token": `)) // truncated / malformed
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// TestRefresh_RotationNotEnforced_LogsWarning verifies observability of fix #3:
+// when token revocation is disabled (auth wired with nil Redis, so RevokeToken
+// is a no-op that returns nil), refresh still succeeds but logs a warning that
+// rotation could not be enforced — rather than silently leaving the old token
+// usable with no signal.
+func TestRefresh_RotationNotEnforced_LogsWarning(t *testing.T) {
+	core, logs := observer.New(zapcore.WarnLevel)
+	restore := zap.ReplaceGlobals(zap.New(core))
+	defer restore()
+
+	user := newTestAuthUser(t)
+	authSvc := newTestAuthSvc(t) // auth.New(secret, nil) — revocation disabled
+	r := setupTestRouter(t, authSvc, &mockAuthDB{user: user})
+
+	loginW := httptest.NewRecorder()
+	loginReq := httptest.NewRequest(http.MethodPost, "/api/auth/login",
+		bytes.NewBufferString(`{"username":"alice","password":"testpass"}`))
+	loginReq.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(loginW, loginReq)
+	require.Equal(t, http.StatusOK, loginW.Code)
+	var login map[string]any
+	require.NoError(t, json.Unmarshal(loginW.Body.Bytes(), &login))
+
+	refreshW := httptest.NewRecorder()
+	refreshReq := httptest.NewRequest(http.MethodPost, "/api/auth/refresh",
+		bytes.NewBufferString(`{"refresh_token":"`+login["refresh_token"].(string)+`"}`))
+	refreshReq.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(refreshW, refreshReq)
+	require.Equal(t, http.StatusOK, refreshW.Code)
+
+	var found bool
+	for _, e := range logs.All() {
+		if strings.Contains(e.Message, "rotation not enforced") {
+			found = true
+		}
+	}
+	assert.True(t, found, "expected a warning that rotation could not be enforced")
 }
 
 func TestRefresh_WithAccessToken_Rejected(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -174,9 +175,10 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	}
 
 	var req refreshRequest
-	// Ignore bind errors: the token may instead arrive via the Authorization
-	// header fallback below, and a missing token is reported uniformly.
-	_ = c.ShouldBindJSON(&req)
+	// An empty body is legitimate (the token may arrive via the Authorization
+	// header fallback), so io.EOF is tolerated. Any other bind error means a
+	// non-empty but malformed JSON body — a request-format problem.
+	bindErr := c.ShouldBindJSON(&req)
 	tokenStr := strings.TrimSpace(req.RefreshToken)
 	if tokenStr == "" {
 		if raw := c.GetHeader("Authorization"); strings.HasPrefix(raw, "Bearer ") {
@@ -184,6 +186,14 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		}
 	}
 	if tokenStr == "" {
+		// No usable token from body or header. Distinguish a malformed body
+		// (400) from a genuinely absent token (401).
+		if bindErr != nil && !errors.Is(bindErr, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": middleware.NewErrorBody("INVALID_REQUEST", "malformed JSON body", nil),
+			})
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": middleware.NewErrorBody("MISSING_TOKEN", "refresh_token is required", nil),
 		})
@@ -205,7 +215,13 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		return
 	}
 
-	revoked, _ := h.authSvc.IsRevoked(c.Request.Context(), claims.ID)
+	revoked, revErr := h.authSvc.IsRevoked(c.Request.Context(), claims.ID)
+	if revErr != nil {
+		// Fail open (treat as not revoked) but log, so a Redis outage silently
+		// disabling the blacklist is observable rather than invisible.
+		zap.L().Warn("refresh: revocation check failed, treating token as not revoked",
+			zap.String("jti", claims.ID), zap.Error(revErr))
+	}
 	if revoked {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": middleware.NewErrorBody("TOKEN_REVOKED", "Token has been revoked", nil),
@@ -241,13 +257,20 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 
 	// Rotate: revoke the presented refresh token so it cannot be reused.
 	// Revocation is best-effort and consistent with the rest of the auth layer,
-	// which degrades gracefully when Redis is unavailable (IsRevoked then treats
-	// tokens as not-revoked). We still return the new pair so refresh does not
-	// hard-fail during a Redis outage, but we log the failure so the weakened
-	// rotation guarantee is observable rather than silent.
+	// which degrades gracefully when Redis is unavailable. We still return the
+	// new pair so refresh does not hard-fail during a Redis outage, but we make
+	// any failure to actually enforce rotation observable rather than silent —
+	// including the case where RevokeToken is a no-op (Redis disabled) and thus
+	// returns nil without persisting anything.
 	if err := h.authSvc.RevokeToken(c.Request.Context(), tokenStr); err != nil {
 		zap.L().Warn("refresh: failed to revoke rotated refresh token",
 			zap.String("jti", claims.ID), zap.Error(err))
+	} else if stillRevoked, verifyErr := h.authSvc.IsRevoked(c.Request.Context(), claims.ID); verifyErr != nil {
+		zap.L().Warn("refresh: could not verify rotated refresh token revocation",
+			zap.String("jti", claims.ID), zap.Error(verifyErr))
+	} else if !stillRevoked {
+		zap.L().Warn("refresh: rotation not enforced — presented refresh token remains usable (token revocation appears disabled, e.g. Redis unavailable)",
+			zap.String("jti", claims.ID))
 	}
 
 	c.JSON(http.StatusOK, loginResponse{
