@@ -296,6 +296,29 @@ func PollApproval(ctx context.Context, svc agentv1.AgentServiceClient, agentID, 
 	}
 }
 
+// ReAuthenticate performs a single PollApproval call to obtain a fresh auth
+// token for an already-approved agent. Unlike PollApproval it does not loop: it
+// is meant for the reconnect self-heal path, where the run loop already handles
+// backoff between attempts. It returns an error if the agent is not currently
+// approved (e.g. revoked), so the caller does not install an empty token.
+func ReAuthenticate(ctx context.Context, svc agentv1.AgentServiceClient, agentID, fingerprint string, logger *zap.Logger) (string, error) {
+	resp, err := svc.PollApproval(ctx, &agentv1.PollApprovalRequest{
+		AgentId:     agentID,
+		Fingerprint: fingerprint,
+	})
+	if err != nil {
+		return "", fmt.Errorf("grpcclient: reauth poll: %w", err)
+	}
+	if resp.GetStatus() != "approved" {
+		return "", fmt.Errorf("grpcclient: reauth not approved (status=%q)", resp.GetStatus())
+	}
+	if resp.GetAuthToken() == "" {
+		return "", fmt.Errorf("grpcclient: reauth approved but server returned no token")
+	}
+	logger.Info("grpcclient: reauth issued fresh token", zap.String("agent_id", agentID))
+	return resp.GetAuthToken(), nil
+}
+
 // localIPAddress returns the preferred outbound IP of the machine.
 // Falls back to "127.0.0.1" if no suitable address is found.
 func localIPAddress() string {

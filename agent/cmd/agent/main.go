@@ -265,6 +265,23 @@ func main() {
 	grpcClient.SetAgentID(lc.AgentID)
 	agentCtx.AgentID = lc.AgentID
 	agentCtx.AgentName = lc.AgentName
+
+	// Self-heal: if the Control Plane ever rejects our token (expired or the CP
+	// was restarted), re-run the approval poll to mint a fresh one and persist
+	// it, so a reconnect after token expiry recovers instead of looping forever
+	// on Unauthenticated. See docs/reports/design-gap-analysis G-2 / 06 E-1.
+	agentID := lc.AgentID
+	grpcClient.SetReauthFunc(func(ctx context.Context) (string, error) {
+		token, err := grpcclient.ReAuthenticate(ctx, grpcClient.ServiceClient(), agentID, fp, logger)
+		if err != nil {
+			return "", err
+		}
+		if err := tokenMgr.Save(token); err != nil {
+			logger.Warn("agent: persist reauth token failed", zap.Error(err))
+		}
+		return token, nil
+	})
+
 	logger.Info("agent: approved, starting normal operation", zap.String("agent_id", lc.AgentID))
 
 	if err := grpcClient.Connect(ctx); err != nil {

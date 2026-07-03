@@ -179,7 +179,7 @@ func main() {
 		logger.Fatal("bootstrap default buckets failed", zap.Error(err))
 	}
 
-	agentMgr := agent.NewManager(queries, redisClient, authSvc, nats, logger, cfg.JWTAccessTokenTTL)
+	agentMgr := agent.NewManager(queries, redisClient, authSvc, nats, logger, cfg.AgentTokenTTL)
 
 	registry := grpcserver.NewAgentRegistry()
 	dispatcher := agent.NewDispatcher(queries, queries, redisClient, registry, logger)
