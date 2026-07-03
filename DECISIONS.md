@@ -469,7 +469,7 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 ## D-012：Token 刷新契约——refresh_token 走请求体 + 轮转（止血冲刺第 1 步）
 
 **决策日期**：2026-07-03
-**影响范围**：controlplane（`auth.go Refresh`）、webui（`api.ts`、`store/auth.ts`）、sdk/python（`auth.py`）
+**影响范围**：controlplane（`controlplane/internal/api/handler/auth.go` 的 `Refresh`）、webui（`webui/src/services/api.ts`、`webui/src/store/auth.ts`）、sdk/python（`sdk/python/fileagent/auth.py`）
 **背景报告**：`docs/reports/design-gap-analysis/`（G-1，06 报告 E-2）
 
 ### 背景
@@ -494,7 +494,7 @@ JWT 访问令牌长度通常超过 72 字节。bcrypt 在处理超过 72 字节�
 - 响应（200）：`{access_token, refresh_token, expires_in, token_type}`
   - **必须**返回新的 `refresh_token`（轮转），旧 token 被吊销后不可复用。
   - 生成新令牌对 **先于** 吊销旧令牌，生成失败则旧令牌仍可用。
-- TTL：access 2h、refresh 7d（`auth.go` 包级常量 `accessTokenTTL`/`refreshTokenTTL`，
+- TTL：access 2h、refresh 7d（`controlplane/internal/api/handler/auth.go` 包级常量 `accessTokenTTL`/`refreshTokenTTL`，
   login 与 refresh 共用，避免漂移）。
 
 ### 契约回归锁

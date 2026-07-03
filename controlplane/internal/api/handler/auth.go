@@ -16,6 +16,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -179,7 +180,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	tokenStr := strings.TrimSpace(req.RefreshToken)
 	if tokenStr == "" {
 		if raw := c.GetHeader("Authorization"); strings.HasPrefix(raw, "Bearer ") {
-			tokenStr = strings.TrimPrefix(raw, "Bearer ")
+			tokenStr = strings.TrimSpace(strings.TrimPrefix(raw, "Bearer "))
 		}
 	}
 	if tokenStr == "" {
@@ -239,7 +240,15 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	}
 
 	// Rotate: revoke the presented refresh token so it cannot be reused.
-	_ = h.authSvc.RevokeToken(c.Request.Context(), tokenStr)
+	// Revocation is best-effort and consistent with the rest of the auth layer,
+	// which degrades gracefully when Redis is unavailable (IsRevoked then treats
+	// tokens as not-revoked). We still return the new pair so refresh does not
+	// hard-fail during a Redis outage, but we log the failure so the weakened
+	// rotation guarantee is observable rather than silent.
+	if err := h.authSvc.RevokeToken(c.Request.Context(), tokenStr); err != nil {
+		zap.L().Warn("refresh: failed to revoke rotated refresh token",
+			zap.String("jti", claims.ID), zap.Error(err))
+	}
 
 	c.JSON(http.StatusOK, loginResponse{
 		AccessToken:  accessToken,
