@@ -731,7 +731,7 @@ type minioS3Object struct {
 func (h *MinioEventHandler) Handle(c *gin.Context) {
 	if !h.authorized(c) {
 		h.logger.Warn("minio event: rejected unauthorized webhook call",
-			zap.String("remote_addr", c.ClientIP()))
+			zap.String("client_ip", c.ClientIP()))
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": middleware.NewErrorBody("UNAUTHORIZED", "invalid or missing webhook credentials", nil),
 		})
