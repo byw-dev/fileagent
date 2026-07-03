@@ -261,6 +261,13 @@ func (c *Client) reauthenticate(ctx context.Context) {
 		c.logger.Warn("grpcclient: reauthentication failed", zap.Error(err))
 		return
 	}
+	if token == "" {
+		// Defensive: never install an empty token. Doing so would drop the
+		// Bearer header entirely and turn a recoverable auth error into
+		// repeated anonymous Unauthenticated reconnects.
+		c.logger.Warn("grpcclient: reauth returned empty token, keeping existing credential")
+		return
+	}
 	c.SetToken(token)
 	c.logger.Info("grpcclient: reauthenticated, refreshed token for reconnect")
 }

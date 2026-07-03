@@ -309,8 +309,11 @@ func ReAuthenticate(ctx context.Context, svc agentv1.AgentServiceClient, agentID
 	if err != nil {
 		return "", fmt.Errorf("grpcclient: reauth poll: %w", err)
 	}
-	if resp.GetStatus() != "approved" || resp.GetAuthToken() == "" {
+	if resp.GetStatus() != "approved" {
 		return "", fmt.Errorf("grpcclient: reauth not approved (status=%q)", resp.GetStatus())
+	}
+	if resp.GetAuthToken() == "" {
+		return "", fmt.Errorf("grpcclient: reauth approved but server returned no token")
 	}
 	logger.Info("grpcclient: reauth issued fresh token", zap.String("agent_id", agentID))
 	return resp.GetAuthToken(), nil
