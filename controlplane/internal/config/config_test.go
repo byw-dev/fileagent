@@ -61,6 +61,9 @@ func TestLoad_Defaults(t *testing.T) {
 	// JWT TTL defaults
 	assert.Equal(t, 2*time.Hour, cfg.JWTAccessTokenTTL)
 	assert.Equal(t, 720*time.Hour, cfg.JWTRefreshTokenTTL)
+	// Agent token must default to a long lifetime so reconnects past the 2h
+	// access TTL do not permanently lock the Agent out.
+	assert.Equal(t, 720*time.Hour, cfg.AgentTokenTTL)
 
 	// misc defaults
 	assert.Equal(t, "info", cfg.LogLevel)
@@ -95,6 +98,24 @@ func TestLoad_CustomDurations(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 30*time.Minute, cfg.JWTAccessTokenTTL)
 	assert.Equal(t, 168*time.Hour, cfg.JWTRefreshTokenTTL)
+}
+
+func TestLoad_CustomAgentTokenTTL(t *testing.T) {
+	env := validEnv()
+	env["AGENT_TOKEN_TTL"] = "168h"
+	setEnv(t, env)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 168*time.Hour, cfg.AgentTokenTTL)
+}
+
+func TestValidate_RejectsNonPositiveAgentTokenTTL(t *testing.T) {
+	setEnv(t, validEnv())
+	cfg, err := Load()
+	require.NoError(t, err)
+	cfg.AgentTokenTTL = 0
+	assert.Error(t, cfg.Validate())
 }
 
 func TestLoad_MissingRequired_SingleVariable(t *testing.T) {

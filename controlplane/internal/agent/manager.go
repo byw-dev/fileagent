@@ -47,30 +47,32 @@ type NATSPublisher interface {
 
 // Manager orchestrates agent registration, approval and revocation.
 type Manager struct {
-	db        AgentDB
-	cache     CacheClient
-	jwtSvc    auth.Service
-	nats      NATSPublisher
-	logger    *zap.Logger
-	accessTTL time.Duration
+	db            AgentDB
+	cache         CacheClient
+	jwtSvc        auth.Service
+	nats          NATSPublisher
+	logger        *zap.Logger
+	agentTokenTTL time.Duration
 }
 
-// NewManager creates a new agent Manager.
+// NewManager creates a new agent Manager. agentTokenTTL is the lifetime of the
+// JWT issued to an approved Agent; it must be long-lived (see Config.AgentTokenTTL)
+// because Agents reuse the token across gRPC reconnects.
 func NewManager(
 	agentDB AgentDB,
 	cacheClient CacheClient,
 	jwtSvc auth.Service,
 	nats NATSPublisher,
 	logger *zap.Logger,
-	accessTTL time.Duration,
+	agentTokenTTL time.Duration,
 ) *Manager {
 	return &Manager{
-		db:        agentDB,
-		cache:     cacheClient,
-		jwtSvc:    jwtSvc,
-		nats:      nats,
-		logger:    logger,
-		accessTTL: accessTTL,
+		db:            agentDB,
+		cache:         cacheClient,
+		jwtSvc:        jwtSvc,
+		nats:          nats,
+		logger:        logger,
+		agentTokenTTL: agentTokenTTL,
 	}
 }
 
@@ -167,7 +169,7 @@ func (m *Manager) PollApproval(ctx context.Context, req *agentv1.PollApprovalReq
 		agent.OrgID.String(),
 		"agent",
 		agent.Name,
-		m.accessTTL,
+		m.agentTokenTTL,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("poll_approval: generate token: %w", err)
@@ -175,7 +177,7 @@ func (m *Manager) PollApproval(ctx context.Context, req *agentv1.PollApprovalReq
 
 	sum := sha256.Sum256([]byte(rawToken))
 	hash := hex.EncodeToString(sum[:])
-	expiresAt := time.Now().Add(m.accessTTL)
+	expiresAt := time.Now().Add(m.agentTokenTTL)
 	if _, err = m.db.UpdateAgentAuthToken(
 		ctx,
 		agent.ID,
@@ -203,7 +205,7 @@ func (m *Manager) ApproveAgent(ctx context.Context, agentID uuid.UUID, approvedB
 		agent.OrgID.String(),
 		"agent",
 		agent.Name,
-		m.accessTTL,
+		m.agentTokenTTL,
 	)
 	if err != nil {
 		return "", fmt.Errorf("approve_agent: generate token: %w", err)
@@ -213,7 +215,7 @@ func (m *Manager) ApproveAgent(ctx context.Context, agentID uuid.UUID, approvedB
 	sum := sha256.Sum256([]byte(rawToken))
 	hash := hex.EncodeToString(sum[:])
 
-	expiresAt := time.Now().Add(m.accessTTL)
+	expiresAt := time.Now().Add(m.agentTokenTTL)
 	_, err = m.db.UpdateAgentAuthToken(ctx, agentID,
 		sql.NullString{String: hash, Valid: true},
 		sql.NullTime{Time: expiresAt, Valid: true},
