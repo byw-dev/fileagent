@@ -289,6 +289,9 @@ func TestRefresh_NilAuthSvc_Returns501(t *testing.T) {
 	assert.Equal(t, http.StatusNotImplemented, w.Code)
 }
 
+// TestRefresh_WithRefreshToken exercises the canonical contract: the refresh
+// token is presented in the JSON body, and the response rotates credentials by
+// returning both a new access_token and a new refresh_token.
 func TestRefresh_WithRefreshToken(t *testing.T) {
 	user := newTestAuthUser(t)
 	authSvc := newTestAuthSvc(t)
@@ -307,7 +310,40 @@ func TestRefresh_WithRefreshToken(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &loginResp))
 	refreshToken := loginResp["refresh_token"].(string)
 
-	// Now refresh
+	// Refresh using the JSON body contract (as the Web UI and SDK do).
+	refreshBody := `{"refresh_token":"` + refreshToken + `"}`
+	req2 := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", bytes.NewBufferString(refreshBody))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	require.Equal(t, http.StatusOK, w2.Code)
+
+	var refreshResp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &refreshResp))
+	assert.NotEmpty(t, refreshResp["access_token"])
+	// Rotation: the response must carry a fresh refresh_token for the next cycle.
+	assert.NotEmpty(t, refreshResp["refresh_token"], "refresh must return a rotated refresh_token")
+}
+
+// TestRefresh_HeaderFallback verifies that presenting the refresh token via the
+// Authorization: Bearer header still works, for backward compatibility.
+func TestRefresh_HeaderFallback(t *testing.T) {
+	user := newTestAuthUser(t)
+	authSvc := newTestAuthSvc(t)
+	dbMock := &mockAuthDB{user: user}
+	r := setupTestRouter(t, authSvc, dbMock)
+
+	body := `{"username":"alice","password":"testpass"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var loginResp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &loginResp))
+	refreshToken := loginResp["refresh_token"].(string)
+
 	req2 := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", nil)
 	req2.Header.Set("Authorization", "Bearer "+refreshToken)
 	w2 := httptest.NewRecorder()
@@ -317,6 +353,7 @@ func TestRefresh_WithRefreshToken(t *testing.T) {
 	var refreshResp map[string]interface{}
 	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &refreshResp))
 	assert.NotEmpty(t, refreshResp["access_token"])
+	assert.NotEmpty(t, refreshResp["refresh_token"])
 }
 
 func TestRefresh_NoToken(t *testing.T) {
@@ -396,6 +433,38 @@ func TestRefresh_GenerateAccessTokenError(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", nil)
 	req.Header.Set("Authorization", "Bearer refresh-token")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+// TestRefresh_GenerateRefreshTokenError verifies that a failure to mint the new
+// (rotated) refresh token surfaces as a 500, and does not leave the client with
+// only half a token pair.
+func TestRefresh_GenerateRefreshTokenError(t *testing.T) {
+	authSvc := &mockAuthService{
+		validateTokenFunc: func(tokenStr string) (*auth.Claims, error) {
+			return &auth.Claims{
+				RegisteredClaims: jwt.RegisteredClaims{Subject: uuid.NewString()},
+				OrgID:            uuid.NewString(),
+				Role:             string(db.UserRoleSuperAdmin),
+				Username:         "alice",
+				TokenType:        "refresh",
+			}, nil
+		},
+		generateAccessTokenFunc: func(subject, orgID, role, username string, ttl time.Duration) (string, error) {
+			return "new-access", nil
+		},
+		generateRefreshTokenFunc: func(subject, orgID, role, username string, ttl time.Duration) (string, error) {
+			return "", errors.New("sign refresh token")
+		},
+	}
+	r := setupTestRouter(t, authSvc, &mockAuthDB{})
+
+	body := `{"refresh_token":"some-refresh-token"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/refresh", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

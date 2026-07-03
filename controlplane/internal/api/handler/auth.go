@@ -37,10 +37,23 @@ func NewAuthHandler(authSvc auth.Service, authDB AuthDB) *AuthHandler {
 	return &AuthHandler{authSvc: authSvc, authDB: authDB}
 }
 
+// Token lifetimes shared by the login and refresh flows.
+const (
+	accessTokenTTL  = 2 * time.Hour
+	refreshTokenTTL = 7 * 24 * time.Hour
+)
+
 // loginRequest is the body expected by POST /api/auth/login.
 type loginRequest struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
+}
+
+// refreshRequest is the body expected by POST /api/auth/refresh. The refresh
+// token is presented in the JSON body (OAuth2 refresh-grant convention); this
+// is the canonical contract shared with the Web UI and SDK clients.
+type refreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
 }
 
 // userInfo is the user object embedded in auth responses.
@@ -103,13 +116,10 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	const accessTTL = 2 * time.Hour
-	const refreshTTL = 7 * 24 * time.Hour
-
 	accessToken, err := h.authSvc.GenerateAccessToken(
 		user.ID.String(),
 		user.OrgID.String(), string(user.Role), user.Username,
-		accessTTL,
+		accessTokenTTL,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -121,7 +131,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	refreshToken, err := h.authSvc.GenerateRefreshToken(
 		user.ID.String(),
 		user.OrgID.String(), string(user.Role), user.Username,
-		refreshTTL,
+		refreshTokenTTL,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -135,7 +145,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	c.JSON(http.StatusOK, loginResponse{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
-		ExpiresIn:    int(accessTTL.Seconds()),
+		ExpiresIn:    int(accessTokenTTL.Seconds()),
 		TokenType:    "Bearer",
 		User: &userInfo{
 			ID:       user.ID.String(),
@@ -147,20 +157,37 @@ func (h *AuthHandler) Login(c *gin.Context) {
 }
 
 // Refresh handles POST /api/auth/refresh.
+//
+// The refresh token is read from the JSON body ({"refresh_token": "..."}),
+// which is the canonical contract used by the Web UI and SDK. A Bearer
+// Authorization header is accepted as a fallback for older callers.
+//
+// On success the endpoint rotates credentials: it issues a brand-new
+// access/refresh token pair and revokes the presented refresh token, so the
+// response always carries a fresh refresh_token that clients persist for the
+// next cycle.
 func (h *AuthHandler) Refresh(c *gin.Context) {
 	if h.authSvc == nil {
 		middleware.NotImplemented(c)
 		return
 	}
 
-	raw := c.GetHeader("Authorization")
-	if !strings.HasPrefix(raw, "Bearer ") {
+	var req refreshRequest
+	// Ignore bind errors: the token may instead arrive via the Authorization
+	// header fallback below, and a missing token is reported uniformly.
+	_ = c.ShouldBindJSON(&req)
+	tokenStr := strings.TrimSpace(req.RefreshToken)
+	if tokenStr == "" {
+		if raw := c.GetHeader("Authorization"); strings.HasPrefix(raw, "Bearer ") {
+			tokenStr = strings.TrimPrefix(raw, "Bearer ")
+		}
+	}
+	if tokenStr == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("MISSING_TOKEN", "Bearer token required", nil),
+			"error": middleware.NewErrorBody("MISSING_TOKEN", "refresh_token is required", nil),
 		})
 		return
 	}
-	tokenStr := strings.TrimPrefix(raw, "Bearer ")
 
 	claims, err := h.authSvc.ValidateToken(tokenStr)
 	if err != nil {
@@ -185,14 +212,12 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		return
 	}
 
-	// Revoke old refresh token.
-	_ = h.authSvc.RevokeToken(c.Request.Context(), tokenStr)
-
-	const accessTTL = 2 * time.Hour
+	// Generate the new pair before revoking the old token so a generation
+	// failure leaves the presented refresh token still usable.
 	accessToken, err := h.authSvc.GenerateAccessToken(
 		claims.Subject,
 		claims.OrgID, claims.Role, claims.Username,
-		accessTTL,
+		accessTokenTTL,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -201,10 +226,26 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		return
 	}
 
+	newRefreshToken, err := h.authSvc.GenerateRefreshToken(
+		claims.Subject,
+		claims.OrgID, claims.Role, claims.Username,
+		refreshTokenTTL,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": middleware.NewErrorBody("TOKEN_ERROR", "Failed to generate refresh token", nil),
+		})
+		return
+	}
+
+	// Rotate: revoke the presented refresh token so it cannot be reused.
+	_ = h.authSvc.RevokeToken(c.Request.Context(), tokenStr)
+
 	c.JSON(http.StatusOK, loginResponse{
-		AccessToken: accessToken,
-		ExpiresIn:   int(accessTTL.Seconds()),
-		TokenType:   "Bearer",
+		AccessToken:  accessToken,
+		RefreshToken: newRefreshToken,
+		ExpiresIn:    int(accessTokenTTL.Seconds()),
+		TokenType:    "Bearer",
 	})
 }
 

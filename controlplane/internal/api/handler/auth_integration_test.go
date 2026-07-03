@@ -102,6 +102,70 @@ func TestLogin_Integration_IncludesUserPayload(t *testing.T) {
 	assert.Equal(t, user.OrgID.String(), resp.User.OrgID)
 }
 
+// TestRefresh_Integration_BodyContractAndRotation is the cross-process contract
+// regression test for the /api/auth/refresh endpoint. It drives a real HTTP
+// server with a real http.Client exactly as the Web UI and Python SDK do —
+// presenting the refresh token in the JSON body — and asserts:
+//
+//  1. the endpoint accepts the token from the body (not just the header);
+//  2. the response rotates credentials (returns a NEW refresh_token);
+//  3. the rotated refresh token works for a subsequent refresh, so a client can
+//     refresh continuously without falling back to a full re-login.
+//
+// This locks the contract that broke silently before: the SDK/Web UI send the
+// token in the body while the handler previously only read the Authorization
+// header, and the handler previously returned no refresh_token to rotate.
+func TestRefresh_Integration_BodyContractAndRotation(t *testing.T) {
+	_, queries, router := setupIntegrationTestRouter(t)
+	user := createIntegrationAuthUser(t, queries)
+
+	srv := httptest.NewServer(router)
+	t.Cleanup(srv.Close)
+	client := srv.Client()
+
+	postJSON := func(path, body string) (*http.Response, map[string]any) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, srv.URL+path, bytes.NewBufferString(body))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = resp.Body.Close() })
+		var decoded map[string]any
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&decoded))
+		return resp, decoded
+	}
+
+	// Step 1: login to obtain the initial token pair.
+	loginResp, login := postJSON("/api/auth/login",
+		`{"username":"`+user.Username+`","password":"testpass"}`)
+	require.Equal(t, http.StatusOK, loginResp.StatusCode)
+	firstRefresh, _ := login["refresh_token"].(string)
+	require.NotEmpty(t, firstRefresh)
+
+	// Step 2: refresh using the JSON body contract (what the SDK/Web UI send).
+	refreshResp, refreshed := postJSON("/api/auth/refresh",
+		`{"refresh_token":"`+firstRefresh+`"}`)
+	require.Equal(t, http.StatusOK, refreshResp.StatusCode,
+		"refresh must accept the token from the JSON body")
+
+	newAccess, _ := refreshed["access_token"].(string)
+	secondRefresh, _ := refreshed["refresh_token"].(string)
+	assert.NotEmpty(t, newAccess, "refresh must return a new access_token")
+	require.NotEmpty(t, secondRefresh, "refresh must rotate and return a new refresh_token")
+	assert.NotEqual(t, firstRefresh, secondRefresh,
+		"the rotated refresh_token must differ from the presented one")
+
+	// Step 3: the rotated refresh token must itself be usable — proving a client
+	// can refresh indefinitely without re-login.
+	secondResp, secondBody := postJSON("/api/auth/refresh",
+		`{"refresh_token":"`+secondRefresh+`"}`)
+	require.Equal(t, http.StatusOK, secondResp.StatusCode,
+		"the rotated refresh_token must be usable for the next refresh")
+	assert.NotEmpty(t, secondBody["access_token"])
+	assert.NotEmpty(t, secondBody["refresh_token"])
+}
+
 func TestMe_Integration_ReturnsIDField(t *testing.T) {
 	_, queries, router := setupIntegrationTestRouter(t)
 	user := createIntegrationAuthUser(t, queries)
