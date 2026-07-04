@@ -640,10 +640,17 @@ func TestAgentsHandler_ListUploadLogs_ItemsEnvelope(t *testing.T) {
 // mockAgentCacheClient satisfies handler.AgentCacheClient for tests.
 type mockAgentCacheClient struct {
 	exists int64
+	// statsJSON, when non-empty, is returned by Get for any key (the stats blob).
+	statsJSON string
+	getErr    error
 }
 
 func (m *mockAgentCacheClient) Exists(_ context.Context, _ ...string) (int64, error) {
 	return m.exists, nil
+}
+
+func (m *mockAgentCacheClient) Get(_ context.Context, _ string) (string, error) {
+	return m.statsJSON, m.getErr
 }
 
 func TestAgentsHandler_List_IsOnline_True_WhenCacheHasKey(t *testing.T) {
@@ -662,6 +669,50 @@ func TestAgentsHandler_List_IsOnline_True_WhenCacheHasKey(t *testing.T) {
 	items := body["items"].([]interface{})
 	item := items[0].(map[string]interface{})
 	assert.Equal(t, true, item["is_online"])
+}
+
+func TestAgentsHandler_List_EnrichesTelemetry_FromCache(t *testing.T) {
+	a := newSampleAgent()
+	mockDB := &mockAgentsDB{agents: []*db.Agent{a}}
+	h := handler.NewAgentsHandler(mockDB, nil, nil, nil, newTestLogger())
+	h.WithCache(&mockAgentCacheClient{
+		exists:    1,
+		statsJSON: `{"queue_depth":5,"uptime_seconds":900,"version":"0.1.0"}`,
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	item := body["items"].([]interface{})[0].(map[string]interface{})
+	assert.Equal(t, float64(5), item["queue_depth"])
+	assert.Equal(t, float64(900), item["uptime_seconds"])
+	assert.Equal(t, "0.1.0", item["agent_version"])
+}
+
+// TestAgentsHandler_List_NoTelemetry_WhenNoStats verifies the live-telemetry
+// fields are omitted (not misleading zeros) when the agent has no cached stats.
+func TestAgentsHandler_List_NoTelemetry_WhenNoStats(t *testing.T) {
+	a := newSampleAgent()
+	mockDB := &mockAgentsDB{agents: []*db.Agent{a}}
+	h := handler.NewAgentsHandler(mockDB, nil, nil, nil, newTestLogger())
+	h.WithCache(&mockAgentCacheClient{exists: 0, statsJSON: ""})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	item := body["items"].([]interface{})[0].(map[string]interface{})
+	_, hasQD := item["queue_depth"]
+	_, hasUp := item["uptime_seconds"]
+	assert.False(t, hasQD, "queue_depth should be omitted without stats")
+	assert.False(t, hasUp, "uptime_seconds should be omitted without stats")
 }
 
 func TestAgentsHandler_List_IsOnline_False_WhenCacheMisses(t *testing.T) {

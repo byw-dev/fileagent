@@ -241,7 +241,7 @@ func main() {
 		case *agentv1.ServerMessage_Ping:
 			if err := grpcClient.SendMessage(&agentv1.AgentMessage{
 				MessageId: uuid.New().String(),
-				Payload:   &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{}},
+				Payload:   &agentv1.AgentMessage_Heartbeat{Heartbeat: grpcClient.BuildHeartbeat()},
 			}); err != nil {
 				logger.Warn("agent: ping response failed", zap.Error(err))
 			}
@@ -280,6 +280,23 @@ func main() {
 			logger.Warn("agent: persist reauth token failed", zap.Error(err))
 		}
 		return token, nil
+	})
+
+	// Populate the heartbeat with live telemetry (G-4): without this the CP and
+	// Web UI have no source for queue depth / uptime / version, and the queue
+	// backlog alert can never fire. disks and upload_bps are not yet reported.
+	startTime := time.Now()
+	grpcClient.SetHeartbeatFunc(func() *agentv1.Heartbeat {
+		depth, err := q.CountPending()
+		if err != nil {
+			logger.Warn("agent: heartbeat queue depth failed", zap.Error(err))
+		}
+		return &agentv1.Heartbeat{
+			AgentId:       lc.AgentID,
+			UptimeSeconds: int64(time.Since(startTime).Seconds()),
+			QueueDepth:    int32(depth),
+			Version:       grpcclient.AgentVersion,
+		}
 	})
 
 	logger.Info("agent: approved, starting normal operation", zap.String("agent_id", lc.AgentID))

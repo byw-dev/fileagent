@@ -26,6 +26,13 @@ func AgentSTSKey(agentID string) string {
 	return fmt.Sprintf("agent:%s:sts", agentID)
 }
 
+// AgentStatsKey returns the Redis key holding the latest heartbeat telemetry
+// snapshot for an Agent (queue depth, uptime, version) as a JSON string. It
+// shares the online TTL, so it is absent once the Agent is considered offline.
+func AgentStatsKey(agentID string) string {
+	return fmt.Sprintf("agent:%s:stats", agentID)
+}
+
 // JWTBlacklistKey returns the Redis key for a revoked JWT token identified by
 // its jti (JWT ID) claim. Presence of this key means the token is revoked.
 func JWTBlacklistKey(jti string) string {

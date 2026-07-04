@@ -43,8 +43,9 @@ type Client struct {
 	stream     agentv1.AgentService_ConnectClient
 	token      string
 	agentID    string
-	msgHandler func(*agentv1.ServerMessage)
-	reauthFunc func(context.Context) (string, error)
+	msgHandler    func(*agentv1.ServerMessage)
+	reauthFunc    func(context.Context) (string, error)
+	heartbeatFunc func() *agentv1.Heartbeat
 }
 
 // New constructs a Client. Call Connect to establish the connection.
@@ -76,6 +77,28 @@ func (c *Client) SetMessageHandler(h func(*agentv1.ServerMessage)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.msgHandler = h
+}
+
+// SetHeartbeatFunc registers a callback that builds the Heartbeat payload sent
+// on each interval (and in response to a Ping). When unset, an empty Heartbeat
+// is sent (online presence only, no telemetry).
+func (c *Client) SetHeartbeatFunc(f func() *agentv1.Heartbeat) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.heartbeatFunc = f
+}
+
+// BuildHeartbeat returns the current Heartbeat payload from the registered
+// builder, or an empty Heartbeat when none is set. It is exported so the Ping
+// response path can reuse the same telemetry.
+func (c *Client) BuildHeartbeat() *agentv1.Heartbeat {
+	c.mu.Lock()
+	f := c.heartbeatFunc
+	c.mu.Unlock()
+	if f == nil {
+		return &agentv1.Heartbeat{}
+	}
+	return f()
 }
 
 // SetReauthFunc registers a callback used to obtain a fresh Bearer token when
@@ -340,8 +363,7 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			hb := &agentv1.Heartbeat{}
-			if err := c.SendHeartbeat(hb); err != nil {
+			if err := c.SendHeartbeat(c.BuildHeartbeat()); err != nil {
 				c.logger.Warn("grpcclient: heartbeat failed", zap.Error(err))
 				return
 			}

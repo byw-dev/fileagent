@@ -60,6 +60,29 @@ func TestEnqueueDequeue(t *testing.T) {
 	assert.Empty(t, tasks2)
 }
 
+func TestCountPending(t *testing.T) {
+	q := openMemQueue(t)
+
+	n, err := q.CountPending()
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+
+	require.NoError(t, q.Enqueue(newTask("a", "")))
+	require.NoError(t, q.Enqueue(newTask("b", "")))
+	require.NoError(t, q.Enqueue(newTask("c", "")))
+
+	n, err = q.CountPending()
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
+
+	// Dequeuing transitions tasks to running, so they no longer count as pending.
+	_, err = q.DequeuePending(2)
+	require.NoError(t, err)
+	n, err = q.CountPending()
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+}
+
 func TestDequeuePending_Limit(t *testing.T) {
 	q := openMemQueue(t)
 	for i := 0; i < 5; i++ {

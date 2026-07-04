@@ -2,6 +2,7 @@ package grpcserver
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -19,10 +20,10 @@ import (
 // ── Mock AgentManager ─────────────────────────────────────────────────────────
 
 type mockAgentMgr struct {
-	registerResp   *agentv1.RegisterResponse
-	registerErr    error
-	pollResp       *agentv1.PollApprovalResponse
-	pollErr        error
+	registerResp *agentv1.RegisterResponse
+	registerErr  error
+	pollResp     *agentv1.PollApprovalResponse
+	pollErr      error
 }
 
 func (m *mockAgentMgr) Register(ctx context.Context, req *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
@@ -45,7 +46,8 @@ func newMockCache() *mockCache {
 }
 
 func (m *mockCache) Set(_ context.Context, key string, value interface{}, _ time.Duration) error {
-	m.sets[key] = ""
+	s, _ := value.(string)
+	m.sets[key] = s
 	return nil
 }
 
@@ -145,6 +147,29 @@ func TestHandleHeartbeat_UpdatesCache(t *testing.T) {
 	onlineKey := cache.AgentOnlineKey("agent-abc")
 	_, ok := c.sets[onlineKey]
 	assert.True(t, ok)
+}
+
+func TestHandleHeartbeat_CachesTelemetrySnapshot(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	c := newMockCache()
+	srv.WithDeps(nil, c, nil, nil, nil)
+
+	srv.handleHeartbeat(context.Background(), "agent-xyz",
+		&agentv1.Heartbeat{UptimeSeconds: 300, QueueDepth: 7, Version: "0.1.0"})
+
+	raw, ok := c.sets[cache.AgentStatsKey("agent-xyz")]
+	require.True(t, ok, "stats snapshot should be cached")
+
+	var snap struct {
+		QueueDepth    int32  `json:"queue_depth"`
+		UptimeSeconds int64  `json:"uptime_seconds"`
+		Version       string `json:"version"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(raw), &snap))
+	assert.Equal(t, int32(7), snap.QueueDepth)
+	assert.Equal(t, int64(300), snap.UptimeSeconds)
+	assert.Equal(t, "0.1.0", snap.Version)
 }
 
 func TestHandleHeartbeat_UpdatesLastSeenAt(t *testing.T) {
@@ -298,8 +323,8 @@ func TestWithDeps_SetsFields(t *testing.T) {
 // ── mockDirResultDeliverer ────────────────────────────────────────────────────
 
 type mockDirDeliverer struct {
-	delivered   []dirstore.Result
-	requestIDs  []string
+	delivered  []dirstore.Result
+	requestIDs []string
 }
 
 func (m *mockDirDeliverer) Deliver(requestID string, result dirstore.Result) {
