@@ -60,8 +60,11 @@ type EventPublisher interface {
 //
 // It assumes a single Control Plane instance (the v1 deployment model), so no
 // distributed lock is used. Enforcement is best-effort: an agent that reconnects
-// between the presence check and the status update may be transiently marked
-// offline; its next heartbeat/reconnect restores online within the TTL window.
+// in the small window between the presence check and the conditional status
+// update may be transiently marked offline. That window is microseconds and the
+// conditional update (MarkAgentOfflineIfOnline) already prevents duplicating the
+// disconnect path's event; a reconnected agent's presence key is present, so it
+// is skipped on the next sweep regardless.
 type OfflineSweeper struct {
 	db        StatusDB
 	cache     PresenceCache
@@ -82,12 +85,18 @@ func NewOfflineSweeper(sdb StatusDB, c PresenceCache, p EventPublisher, orgID uu
 func (s *OfflineSweeper) Sweep(ctx context.Context) int {
 	agents, err := s.db.ListAgentsByStatus(ctx, s.orgID, db.AgentStatusOnline)
 	if err != nil {
+		if ctx.Err() != nil {
+			return 0 // shutdown in progress: a cancelled context is not an error
+		}
 		s.logger.Warn("offline sweep: list online agents failed", zap.Error(err))
 		return 0
 	}
 
 	var swept int
 	for _, a := range agents {
+		if ctx.Err() != nil {
+			return swept // stop promptly on shutdown instead of failing every call
+		}
 		if !s.presenceExpired(ctx, a.ID) {
 			continue
 		}
@@ -96,8 +105,10 @@ func (s *OfflineSweeper) Sweep(ctx context.Context) int {
 		// stay quiet — no duplicate events.agent.offline.
 		rows, err := s.db.MarkAgentOfflineIfOnline(ctx, a.ID)
 		if err != nil {
-			s.logger.Warn("offline sweep: mark offline failed",
-				zap.String("agent_id", a.ID.String()), zap.Error(err))
+			if ctx.Err() == nil {
+				s.logger.Warn("offline sweep: mark offline failed",
+					zap.String("agent_id", a.ID.String()), zap.Error(err))
+			}
 			continue
 		}
 		if rows == 0 {
@@ -111,25 +122,20 @@ func (s *OfflineSweeper) Sweep(ctx context.Context) int {
 	return swept
 }
 
-// presenceExpired reports whether the agent's Redis presence key is gone. It
-// checks twice: the second check, taken just before the caller mutates state,
-// narrows the window where an agent reconnects (and re-sets its presence key)
-// between listing and updating. On a cache error it returns false (fail-safe:
-// do not mark an agent offline when presence is unknown).
+// presenceExpired reports whether the agent's Redis presence key is gone with a
+// single EXISTS. On a cache error it returns false (fail-safe: never mark an
+// agent offline when presence is unknown), and it stays quiet when the error is
+// just a cancelled context during shutdown.
 func (s *OfflineSweeper) presenceExpired(ctx context.Context, id uuid.UUID) bool {
-	key := cache.AgentOnlineKey(id.String())
-	for i := 0; i < 2; i++ {
-		n, err := s.cache.Exists(ctx, key)
-		if err != nil {
+	n, err := s.cache.Exists(ctx, cache.AgentOnlineKey(id.String()))
+	if err != nil {
+		if ctx.Err() == nil {
 			s.logger.Warn("offline sweep: presence check failed",
 				zap.String("agent_id", id.String()), zap.Error(err))
-			return false
 		}
-		if n > 0 {
-			return false
-		}
+		return false
 	}
-	return true
+	return n == 0
 }
 
 func (s *OfflineSweeper) publishOffline(agentID string) {

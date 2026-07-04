@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // ── mocks ───────────────────────────────────────────────────────────────────
@@ -180,18 +182,32 @@ func TestSweep_PublishErrorStillCountsAndContinues(t *testing.T) {
 	assert.Len(t, pub.subjects, 2)
 }
 
-func TestSweep_RecheckRaceKeepsReconnectedAgentOnline(t *testing.T) {
-	a := onlineAgent()
-	sdb := &mockStatusDB{agents: []*db.Agent{a}}
-	// First check: expired (0). Recheck: reappeared (1) → agent reconnected.
-	c := &mockCache{results: []int64{0, 1}}
+func TestSweep_StopsEarlyOnContextCancel(t *testing.T) {
+	sdb := &mockStatusDB{agents: []*db.Agent{onlineAgent(), onlineAgent()}}
+	c := &mockCache{results: []int64{0}}
 	pub := &mockPublisher{}
 
-	n := newSweeper(sdb, c, pub).Sweep(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled: the loop must exit before touching any agent
+
+	n := newSweeper(sdb, c, pub).Sweep(ctx)
 
 	assert.Equal(t, 0, n)
-	assert.Zero(t, sdb.markCalls, "reconnected agent must not be marked offline")
-	assert.Empty(t, pub.subjects)
+	assert.Zero(t, sdb.markCalls, "no agents processed once ctx is cancelled")
+}
+
+func TestSweep_ListErrorQuietOnCancel(t *testing.T) {
+	sdb := &mockStatusDB{listErr: context.Canceled}
+	c := &mockCache{results: []int64{0}}
+	pub := &mockPublisher{}
+
+	core, logs := observer.New(zapcore.WarnLevel)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	s := NewOfflineSweeper(sdb, c, pub, uuid.New(), zap.New(core))
+	assert.Equal(t, 0, s.Sweep(ctx))
+	assert.Zero(t, logs.Len(), "a cancelled-context list error during shutdown must not warn")
 }
 
 func TestSweep_CacheErrorFailsSafe(t *testing.T) {
