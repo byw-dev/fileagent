@@ -375,7 +375,13 @@ type DashboardStats struct {
 	UploadTrend  []DayCount `json:"upload_trend"` // last 7 days, oldest first
 }
 
-const trendDays = 7
+const (
+	// trendDays is the length of the dashboard upload-trend window.
+	trendDays = 7
+	// dashboardOfflineThreshold matches the heartbeat/online TTL (90s): an agent
+	// whose last_seen_at is older than this is counted as offline.
+	dashboardOfflineThreshold = 90 * time.Second
+)
 
 // DashboardStats computes the dashboard aggregates for an org as of now (UTC).
 // An agent counts as online when its last_seen_at is within the offline
@@ -383,7 +389,7 @@ const trendDays = 7
 // the 7-day trend are keyed on uploaded_at in UTC.
 func (q *Queries) DashboardStats(ctx context.Context, orgID uuid.UUID, now time.Time) (*DashboardStats, error) {
 	now = now.UTC()
-	onlineSince := now.Add(-90 * time.Second)
+	onlineSince := now.Add(-dashboardOfflineThreshold)
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	trendStart := todayStart.AddDate(0, 0, -(trendDays - 1))
 
@@ -421,8 +427,11 @@ func (q *Queries) DashboardStats(ctx context.Context, orgID uuid.UUID, now time.
 
 	// Upload trend: query days with data, then fill a dense 7-day skeleton so
 	// days with zero uploads still appear.
+	// Bucket by the UTC calendar day: `AT TIME ZONE 'UTC'` converts the
+	// TIMESTAMPTZ to the wall-clock time in UTC before truncating, so counts do
+	// not shift across day boundaries when the DB/session timezone is not UTC.
 	rows, err := q.db.QueryContext(ctx,
-		`SELECT to_char(date_trunc('day', uploaded_at), 'YYYY-MM-DD') AS day, COUNT(*)
+		`SELECT to_char(date_trunc('day', uploaded_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day, COUNT(*)
 		 FROM file_entries
 		 WHERE org_id = $1 AND uploaded_at >= $2
 		 GROUP BY day`, orgID, trendStart)

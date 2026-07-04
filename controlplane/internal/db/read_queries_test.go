@@ -419,7 +419,7 @@ func TestDashboardStats_AggregatesAndTrendSkeleton(t *testing.T) {
 	mock.ExpectQuery(`COALESCE\(SUM\(size_bytes\)`).WillReturnRows(intRow(5000000))
 	mock.ExpectQuery(`FROM file_entries WHERE org_id = \$1 AND uploaded_at`).WillReturnRows(intRow(42))
 	// Trend: only two days have data; the rest of the 7-day window must be 0.
-	mock.ExpectQuery(`date_trunc\('day', uploaded_at\)`).WillReturnRows(
+	mock.ExpectQuery(`date_trunc\('day', uploaded_at`).WillReturnRows(
 		sqlmock.NewRows([]string{"day", "count"}).
 			AddRow("2026-07-03", int64(3)).
 			AddRow("2026-07-04", int64(9)),
