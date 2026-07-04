@@ -1,0 +1,52 @@
+name: CI — Control Plane
+
+# PR / push correctness gate for the Control Plane: verifies generated code is
+# in sync with its sources (sqlc drift guard) and that CP builds/tests pass.
+# Release-artifact builds stay in build-cp.yml (manual workflow_dispatch).
+
+on:
+  pull_request:
+    paths:
+      - 'controlplane/**'
+      - 'tools/**'
+      - '.github/workflows/ci-cp.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'controlplane/**'
+      - 'tools/**'
+      - '.github/workflows/ci-cp.yml'
+
+jobs:
+  check:
+    name: codegen-drift + vet + test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The codegen tools live in tools/go.mod (which requires the newest Go);
+      # using its version also satisfies the older controlplane module.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go.mod
+          cache-dependency-path: |
+            tools/go.sum
+            controlplane/go.sum
+
+      # Regenerate with the version pinned in tools/ and fail if anything drifts
+      # from the committed generated code. Uses `make generate` so local and CI
+      # run the identical command.
+      - name: sqlc drift guard
+        run: |
+          make generate
+          if ! git diff --exit-code; then
+            echo "::error::Generated code is out of sync with its sources. Run 'make generate' and commit the result."
+            exit 1
+          fi
+
+      - name: vet + test
+        run: |
+          cd controlplane
+          go vet ./...
+          go test ./...

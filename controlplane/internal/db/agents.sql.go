@@ -233,100 +233,6 @@ func (q *Queries) ListAgentsByStatus(ctx context.Context, orgID uuid.UUID, statu
 	return items, nil
 }
 
-const updateAgentAuthToken = `-- name: UpdateAgentAuthToken :one
-UPDATE agents
-SET auth_token_hash = $2,
-    token_expires_at = $3,
-    updated_at = NOW()
-WHERE id = $1
-RETURNING id, org_id, name, fingerprint, status, auth_token_hash, token_expires_at, os_info, ip_address, approved_by, approved_at, revoked_by, revoked_at, last_seen_at, metadata, created_at, updated_at
-`
-
-func (q *Queries) UpdateAgentAuthToken(ctx context.Context, iD uuid.UUID, authTokenHash sql.NullString, tokenExpiresAt sql.NullTime) (*Agent, error) {
-	row := q.db.QueryRowContext(ctx, updateAgentAuthToken, iD, authTokenHash, tokenExpiresAt)
-	var i Agent
-	err := row.Scan(
-		&i.ID,
-		&i.OrgID,
-		&i.Name,
-		&i.Fingerprint,
-		&i.Status,
-		&i.AuthTokenHash,
-		&i.TokenExpiresAt,
-		&i.OsInfo,
-		&i.IpAddress,
-		&i.ApprovedBy,
-		&i.ApprovedAt,
-		&i.RevokedBy,
-		&i.RevokedAt,
-		&i.LastSeenAt,
-		&i.Metadata,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return &i, err
-}
-
-const updateAgentLastSeen = `-- name: UpdateAgentLastSeen :exec
-UPDATE agents
-SET last_seen_at = NOW(),
-    updated_at = NOW()
-WHERE id = $1
-`
-
-// UpdateAgentLastSeen updates last_seen_at and updated_at for the given agent
-// without touching the IP address column.
-func (q *Queries) UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.ExecContext(ctx, updateAgentLastSeen, id)
-	return err
-}
-
-const updateAgentHeartbeat = `-- name: UpdateAgentHeartbeat :exec
-UPDATE agents
-SET last_seen_at = NOW(),
-    ip_address = $2,
-    updated_at = NOW()
-WHERE id = $1
-`
-
-func (q *Queries) UpdateAgentHeartbeat(ctx context.Context, iD uuid.UUID, ipAddress pqtype.Inet) error {
-	_, err := q.db.ExecContext(ctx, updateAgentHeartbeat, iD, ipAddress)
-	return err
-}
-
-const updateAgentStatus = `-- name: UpdateAgentStatus :one
-UPDATE agents
-SET status = $2,
-    updated_at = NOW()
-WHERE id = $1
-RETURNING id, org_id, name, fingerprint, status, auth_token_hash, token_expires_at, os_info, ip_address, approved_by, approved_at, revoked_by, revoked_at, last_seen_at, metadata, created_at, updated_at
-`
-
-func (q *Queries) UpdateAgentStatus(ctx context.Context, iD uuid.UUID, status AgentStatus) (*Agent, error) {
-	row := q.db.QueryRowContext(ctx, updateAgentStatus, iD, status)
-	var i Agent
-	err := row.Scan(
-		&i.ID,
-		&i.OrgID,
-		&i.Name,
-		&i.Fingerprint,
-		&i.Status,
-		&i.AuthTokenHash,
-		&i.TokenExpiresAt,
-		&i.OsInfo,
-		&i.IpAddress,
-		&i.ApprovedBy,
-		&i.ApprovedAt,
-		&i.RevokedBy,
-		&i.RevokedAt,
-		&i.LastSeenAt,
-		&i.Metadata,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return &i, err
-}
-
 const markAgentOfflineIfOnline = `-- name: MarkAgentOfflineIfOnline :execrows
 UPDATE agents
 SET status = 'offline',
@@ -366,4 +272,96 @@ func (q *Queries) MarkAgentOnlineIfOffline(ctx context.Context, id uuid.UUID) (i
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const updateAgentAuthToken = `-- name: UpdateAgentAuthToken :one
+UPDATE agents
+SET auth_token_hash = $2,
+    token_expires_at = $3,
+    updated_at = NOW()
+WHERE id = $1
+RETURNING id, org_id, name, fingerprint, status, auth_token_hash, token_expires_at, os_info, ip_address, approved_by, approved_at, revoked_by, revoked_at, last_seen_at, metadata, created_at, updated_at
+`
+
+func (q *Queries) UpdateAgentAuthToken(ctx context.Context, iD uuid.UUID, authTokenHash sql.NullString, tokenExpiresAt sql.NullTime) (*Agent, error) {
+	row := q.db.QueryRowContext(ctx, updateAgentAuthToken, iD, authTokenHash, tokenExpiresAt)
+	var i Agent
+	err := row.Scan(
+		&i.ID,
+		&i.OrgID,
+		&i.Name,
+		&i.Fingerprint,
+		&i.Status,
+		&i.AuthTokenHash,
+		&i.TokenExpiresAt,
+		&i.OsInfo,
+		&i.IpAddress,
+		&i.ApprovedBy,
+		&i.ApprovedAt,
+		&i.RevokedBy,
+		&i.RevokedAt,
+		&i.LastSeenAt,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
+}
+
+const updateAgentHeartbeat = `-- name: UpdateAgentHeartbeat :exec
+UPDATE agents
+SET last_seen_at = NOW(),
+    ip_address = $2,
+    updated_at = NOW()
+WHERE id = $1
+`
+
+func (q *Queries) UpdateAgentHeartbeat(ctx context.Context, iD uuid.UUID, ipAddress pqtype.Inet) error {
+	_, err := q.db.ExecContext(ctx, updateAgentHeartbeat, iD, ipAddress)
+	return err
+}
+
+const updateAgentLastSeen = `-- name: UpdateAgentLastSeen :exec
+UPDATE agents
+SET last_seen_at = NOW(),
+    updated_at = NOW()
+WHERE id = $1
+`
+
+func (q *Queries) UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.ExecContext(ctx, updateAgentLastSeen, id)
+	return err
+}
+
+const updateAgentStatus = `-- name: UpdateAgentStatus :one
+UPDATE agents
+SET status = $2,
+    updated_at = NOW()
+WHERE id = $1
+RETURNING id, org_id, name, fingerprint, status, auth_token_hash, token_expires_at, os_info, ip_address, approved_by, approved_at, revoked_by, revoked_at, last_seen_at, metadata, created_at, updated_at
+`
+
+func (q *Queries) UpdateAgentStatus(ctx context.Context, iD uuid.UUID, status AgentStatus) (*Agent, error) {
+	row := q.db.QueryRowContext(ctx, updateAgentStatus, iD, status)
+	var i Agent
+	err := row.Scan(
+		&i.ID,
+		&i.OrgID,
+		&i.Name,
+		&i.Fingerprint,
+		&i.Status,
+		&i.AuthTokenHash,
+		&i.TokenExpiresAt,
+		&i.OsInfo,
+		&i.IpAddress,
+		&i.ApprovedBy,
+		&i.ApprovedAt,
+		&i.RevokedBy,
+		&i.RevokedAt,
+		&i.LastSeenAt,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
 }

@@ -53,7 +53,6 @@ const deleteBucket = `-- name: DeleteBucket :exec
 DELETE FROM buckets WHERE id = $1
 `
 
-// DeleteBucket removes the bucket record by ID.
 func (q *Queries) DeleteBucket(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.ExecContext(ctx, deleteBucket, id)
 	return err
