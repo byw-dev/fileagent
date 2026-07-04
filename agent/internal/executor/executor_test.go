@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -307,4 +309,31 @@ func TestExecutor_Submit_AtCapButNothingPendingToEvict(t *testing.T) {
 	n, err := q.CountActive()
 	require.NoError(t, err)
 	assert.Equal(t, 3, n) // exceeded cap because nothing was evictable
+}
+
+// When a failed task is evicted (queue_max_size) while its retry goroutine is
+// still sleeping, the re-queue on wake finds the row gone. That is expected, so
+// it must log at debug ("retry skipped") — not warn ("re-queue failed").
+func TestExecutor_RetryOfEvictedTaskLogsNoWarning(t *testing.T) {
+	q := newTestQueue(t)
+	core, logs := observer.New(zapcore.DebugLevel)
+	e := New(1, q, failUploader, zap.New(core), 0) // cap disabled; we evict manually
+	e.retryDelays = []time.Duration{50 * time.Millisecond}
+
+	// Enqueue a task, then drive it through a failure so a retry is scheduled.
+	task := newTask("r1", "/f1")
+	require.NoError(t, q.Enqueue(task))
+	e.handleFailure(task, fmt.Errorf("boom"))
+
+	// Evict the (now failed) task before the retry goroutine wakes.
+	dropped, err := q.DeleteOldestEvictable()
+	require.NoError(t, err)
+	require.NotNil(t, dropped)
+
+	// On wake the retry finds nothing to re-queue and logs a benign debug line.
+	require.Eventually(t, func() bool {
+		return logs.FilterMessage("executor: retry skipped, task was evicted").Len() == 1
+	}, 2*time.Second, 10*time.Millisecond)
+	assert.Zero(t, logs.FilterMessage("executor: re-queue failed").Len(),
+		"eviction is expected; must not surface as a warning")
 }

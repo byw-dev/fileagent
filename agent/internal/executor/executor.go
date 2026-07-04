@@ -5,6 +5,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -249,6 +250,13 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 		time.Sleep(delay)
 		// Re-queue by resetting status to pending.
 		if rerr := e.queue.UpdateStatus(task.ID, queue.StatusPending); rerr != nil {
+			// A not-found row was evicted to honour queue_max_size while this
+			// retry was sleeping — an expected outcome, not a failure.
+			if errors.Is(rerr, queue.ErrTaskNotFound) {
+				e.logger.Debug("executor: retry skipped, task was evicted",
+					zap.String("task_id", task.ID))
+				return
+			}
 			e.logger.Warn("executor: re-queue failed", zap.String("task_id", task.ID), zap.Error(rerr))
 			return
 		}

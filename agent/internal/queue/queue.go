@@ -76,6 +76,12 @@ const (
 	StatusFailed    = "failed"
 )
 
+// ErrTaskNotFound is returned by mutating operations (UpdateStatus, MarkFailed)
+// when no task matches the given id — typically because the row was already
+// evicted to honour queue_max_size. Callers can use errors.Is to treat this as a
+// benign, expected outcome rather than a failure.
+var ErrTaskNotFound = errors.New("task not found")
+
 // UploadTask represents a row in the upload_tasks table.
 type UploadTask struct {
 	ID             string
@@ -323,7 +329,7 @@ func (q *Queue) UpdateStatus(id, status string) error {
 		return fmt.Errorf("queue: update status %q: %w", id, err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("queue: task %q not found", id)
+		return fmt.Errorf("queue: task %q: %w", id, ErrTaskNotFound)
 	}
 	return nil
 }
@@ -342,7 +348,7 @@ func (q *Queue) MarkFailed(id, errMsg string) error {
 		return fmt.Errorf("queue: mark failed %q: %w", id, err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("queue: task %q not found", id)
+		return fmt.Errorf("queue: task %q: %w", id, ErrTaskNotFound)
 	}
 	return nil
 }

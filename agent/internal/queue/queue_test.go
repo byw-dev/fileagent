@@ -120,7 +120,7 @@ func TestUpdateStatus_NotFound(t *testing.T) {
 	q := openMemQueue(t)
 	err := q.UpdateStatus("nonexistent", StatusCompleted)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not found")
+	assert.ErrorIs(t, err, ErrTaskNotFound)
 }
 
 func TestMarkFailed(t *testing.T) {
@@ -160,6 +160,7 @@ func TestMarkFailed_NotFound(t *testing.T) {
 	q := openMemQueue(t)
 	err := q.MarkFailed("nonexistent", "err")
 	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTaskNotFound)
 }
 
 func TestListByStatus(t *testing.T) {
