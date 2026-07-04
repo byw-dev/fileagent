@@ -1256,7 +1256,7 @@ func IsRevoked(jti string) bool {
 | Method | Path              | 说明                              | 认证要求          |
 |--------|-------------------|---------------------------------|---------------|
 | POST   | /api/auth/login   | 用户名密码登录，返回双 Token               | 无             |
-| POST   | /api/auth/refresh | 用 Refresh Token 换新令牌对（见下方契约） | Refresh Token（请求体） |
+| POST   | /api/auth/refresh | 用 Refresh Token 换新令牌对（见下方契约） | Refresh Token（请求体，或 Bearer 头回退） |
 | POST   | /api/auth/logout  | 吊销当前 Token                      | Access Token  |
 | GET    | /api/auth/me      | 返回当前用户信息                        | Access Token  |
 
@@ -1264,6 +1264,9 @@ func IsRevoked(jti string) bool {
 `{"refresh_token": "..."}` 传递（OAuth2 refresh-grant 惯例；Bearer 头作为向后兼容回退），
 响应执行**令牌轮转**——返回新的 `{access_token, refresh_token, expires_in, token_type}`
 并吊销旧 refresh token。Web UI 与 SDK 均依赖此契约（历史上因 CP 只读 header、不轮转而断裂）。
+旧 token 吊销是**尽力而为**：依赖 Redis 黑名单，黑名单不可用时吊销及其校验会降级
+（放行并记 Warn 日志，非硬失败），此时旧 refresh token 可能仍短暂可用——与整个 auth 层
+"Redis 不可用时优雅降级"一致（见 D-012 及 auth.go 的可观测降级逻辑）。
 
 ### 5.3.3 OIDC 扩展预留
 

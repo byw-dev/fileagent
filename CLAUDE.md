@@ -314,9 +314,13 @@ G-2（Agent token 生命周期，D-013）、G-3（minio-event 端点鉴权，D-0
 后续排期：P1（G-4 心跳载荷、G-5 Dashboard 统计）与 T3-3（Python SDK 联调）。
 详细任务与状态以 `docs/tasks/active.md` 为准；`TASK_LIST.md` 提供总索引。
 
-> **文档权威优先级**：共享契约以**代码本身**为准——`proto/v1/agent.proto`、
-> `controlplane/migrations/`、handler 的 struct/响应体是契约真相；**决策与其理由**记于
-> `DECISIONS.md`。`system-design.md` 是架构背景，可能滞后；三者冲突时以代码 + DECISIONS 为准。
+> **文档权威优先级**（层级从高到低）：
+> 1. **代码是最终真相**——`proto/v1/agent.proto`、`controlplane/migrations/`、
+>    handler 的 struct/响应体即契约本身；任何冲突以代码为准。
+> 2. `DECISIONS.md` 记录**决策与其理由**——解释代码为何如此、否决了什么，
+>    用于理解背景，**不覆盖代码实现**。
+> 3. `system-design.md` 是**架构背景**，最可能滞后于代码。
+>
 > 修改行为的决策，收尾应就地更新 `system-design.md` 相关章节，避免文档再次漂移。
 
 **开始任务前必须确认（按顺序）：**
