@@ -203,6 +203,46 @@ func GetBucketByName(ctx context.Context, dbtx db.DBTX, orgID uuid.UUID, name st
 	return &b, err
 }
 
+// ── MarkFileEntryDeleted ─────────────────────────────────────────────────────
+
+const markFileEntryDeletedSQL = `
+UPDATE file_entries
+SET status = 'deleted', updated_at = NOW()
+WHERE bucket_id = $1 AND storage_path = $2 AND status != 'deleted'
+RETURNING id, org_id, file_type_id, agent_id, rule_id, bucket_id,
+    storage_path, original_path, file_name, size_bytes,
+    sha256, etag, content_type, file_mtime, status, uploaded_at, created_at, updated_at
+`
+
+// MarkFileEntryDeleted soft-deletes the file entry identified by (bucket, path),
+// returning the updated row. It returns sql.ErrNoRows when no matching entry
+// exists or it was already deleted, so the caller can treat it as a no-op.
+func MarkFileEntryDeleted(ctx context.Context, dbtx db.DBTX, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error) {
+	row := dbtx.QueryRowContext(ctx, markFileEntryDeletedSQL, bucketID, storagePath)
+	var i db.FileEntry
+	err := row.Scan(
+		&i.ID,
+		&i.OrgID,
+		&i.FileTypeID,
+		&i.AgentID,
+		&i.RuleID,
+		&i.BucketID,
+		&i.StoragePath,
+		&i.OriginalPath,
+		&i.FileName,
+		&i.SizeBytes,
+		&i.Sha256,
+		&i.Etag,
+		&i.ContentType,
+		&i.FileMtime,
+		&i.Status,
+		&i.UploadedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
+}
+
 // ── ListEnabledEventRules ────────────────────────────────────────────────────
 
 const listEnabledEventRulesSQL = `

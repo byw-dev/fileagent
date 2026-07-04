@@ -665,3 +665,36 @@ Dashboard 的"今日上传/存储用量/7 日趋势"一直是**前端拿最近 2
 - **存储用量用 `madmin.BucketUsageInfo`（§6.6）**：更贴近物理用量，但每次刷新一次 MinIO Admin 调用、
   且与"已索引文件"口径不同；SUM(size_bytes) 更便宜、语义清晰，够用。物理用量可后续单列。
 - **用 sqlc 生成聚合查询**：可选过滤/日期分组用 sqlc 表达不便，手写查询 + sqlmock 更直接（与既有 read_queries 一致）。
+
+---
+
+## D-017：MinIO 文件事件补完 —— file_deleted 发布 + 软删除 + webhook 路径复活（CC-1）
+
+**决策日期**：2026-07-04
+**影响范围**：controlplane（indexer、events handler）、webui（Events/Create）
+**背景**：`docs/tasks/core-completeness.md` CC-1；报告 01 §4
+
+### 背景
+
+`events.file.deleted` 只有订阅方、无发布方，事件规则 UI 可配 `file_deleted` 却永不触发。
+排查中另发现两个更深的问题：
+1. `MinioEventHandler.Handle` 对所有事件一律 `IndexUpload`，**不区分 ObjectCreated / ObjectRemoved**——删除被当成上传。
+2. webhook 索引路径 `IndexUpload` / 新增的 `IndexDeletion` 用 `uuid.Nil` 作为 orgID 查 bucket 与写 file_entries，
+   而 bucket/entry 属于默认组织 `…0001`——**该路径其实从未成功过**（bucket 查不到、org_id 还会违反 FK）。
+3. webui 事件类型下拉 `EVENT_TYPE_OPTIONS` 用了错误值（`file.uploaded` 点号形式、`file.indexed`/`agent.registered`
+   等不存在的类型），且**根本没有 `file_deleted` 选项**。
+
+### 决策
+
+- **按事件类型路由**：`s3:ObjectCreated:*` → 索引上传；`s3:ObjectRemoved:*` → **软删除**（`status='deleted'`，
+  保留行以供审计，非物理删行）并发布 `events.file.deleted`。未匹配类型忽略。
+- **发布 `events.file.deleted`**，payload：`{file_entry_id, bucket_id, storage_path, file_name}`（契约，事件消费方依赖）。
+- **删除不存在/已删对象为幂等 no-op**（`MarkFileEntryDeleted` 返回 `sql.ErrNoRows` 时不报错、不发事件）。
+- **orgID 用默认组织**（`…0001`）而非 `uuid.Nil`，修复 webhook 索引路径——此路径此前对 IndexUpload 也是坏的。
+- **webui 事件类型对齐 DB enum**（下划线 6 值，含 `file_deleted`）；action 下拉暂只留 `webhook`（`email` 无效、
+  `kafka_publish`/`nats_publish` 见 CC-7）。
+
+### 备选方案（被否决）
+
+- **硬删除 file_entries 行**：丢失审计与历史关联（upload_logs 外键指向 file_entry）；软删除更安全，且设计 §3.3 已有 `deleted` 状态。
+- **从 UI 移除 file_deleted 选项**（另一条 CC-1 路线）：设计 §6.5 本就要求接入 ObjectRemoved，且 DB/事件引擎均已预留，接通比阉割更符合设计意图。
