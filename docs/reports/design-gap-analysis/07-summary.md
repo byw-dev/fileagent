@@ -139,7 +139,9 @@ revoke 可观测降级、G-5 的 UTC 分桶、时序侧信道），这些都已�
 - **G-8/G-9**：契约单一权威 / OpenAPI 自动校验（防第三次契约错位；下一个契约引爆点是 T3-3 SDK 联调）。
 - **结构性文档重构**：design 去重指针化、CLAUDE.md 减肥（等代码稳定后做，避免文档追着动的代码跑）。
 - **监控**：Prometheus 指标导出（T4-1）；Agent `disks`/`upload_bps` 遥测；存储物理用量（`madmin.BucketUsageInfo`）。
-- **文档欠账**：附录 C.1 `JWT_ACCESS_TTL` 环境变量名笔误（实际 `JWT_ACCESS_TOKEN_TTL`）。
+- **文档欠账（附录 C.1 env 名）**：
+  - ~~`JWT_ACCESS_TTL` 环境变量名笔误~~ ✅ **已修复（PR #50）**：五个过时 env 名（`MINIO_WEBHOOK_TOKEN`、`JWT_ACCESS_TTL`、`JWT_REFRESH_TTL`、`GRPC_LISTEN`、`HTTP_LISTEN`）已对齐代码。经全量交叉核对（CP `os.Getenv` 全集 vs design doc env token 全集），错名类到此为止，无遗漏。
+  - **遗留（归结构性文档重构，非本 PR）**：① 附录 C.1 仍列"设计了但代码未读"的未实现项——`DATABASE_MAX_CONNS`、`STS_CREDENTIAL_TTL`、`STS_REFRESH_THRESHOLD`、`METRICS_LISTEN`、`AGENT_HEARTBEAT_INTERVAL`、`AGENT_OFFLINE_THRESHOLD`、`LOG_FORMAT`；② 代码实读但附录 C.1 未记的 env——`BOOTSTRAP_ADMIN_*`、`MINIO_ROLE_ARN`、`MIGRATIONS_PATH`。
 
 ### 后续（2026-07-04 之后）
 
