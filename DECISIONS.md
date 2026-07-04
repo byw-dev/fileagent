@@ -628,3 +628,40 @@ Agent 心跳一直发送**空 `Heartbeat{}`**（`client.go`、Ping 响应两处�
 - **遥测写入 `agents` 表**：每 30s 一次 DB 写入、churn 高；且这是易失的实时状态，
   Redis + TTL 更贴合（与在线状态同构）。
 - **仅填充 Agent 端不落地 CP**：数据到不了 UI/监控，等于没修（"空心"陷阱）。
+
+---
+
+## D-016：仪表盘统计端点——服务端聚合替代前端抽样估算（P1 G-5）
+
+**决策日期**：2026-07-04
+**影响范围**：controlplane（db read_queries、stats handler、router）、webui（Dashboard）、design §5.11.5/§7.3.1
+**背景报告**：`docs/reports/design-gap-analysis/`（G-5，03 报告 §3）
+
+### 背景
+
+Dashboard 的"今日上传/存储用量/7 日趋势"一直是**前端拿最近 20 条上传日志硬凑**的假值
+（`listUploadLogs({limit:20})` 再本地 reduce/filter）——今日上传上限 20、存储用量与真实
+无关、趋势无意义。根因：**设计 §7.3.1 只画了 UI 卡片，§5.11 REST 清单从未定义支撑它的
+统计端点**，实现者只能硬凑。这是"设计只画 UI、没定义 API"的典型返工来源。
+
+### 决策
+
+新增 `GET /api/v1/stats/dashboard`，由**服务端一次聚合**返回真实值；设计补齐端点定义（§5.11.5）。
+
+- `total_agents`/`online_agents`/`total_files`/`storage_bytes`/`today_uploads`/`upload_trend`（7 天稠密）。
+- 口径：`online_agents` 用 `last_seen_at` 在 90s 内（与在线阈值一致）；`storage_bytes` 用
+  `SUM(file_entries.size_bytes)`（CP 索引口径，非 MinIO 物理用量，避免每次刷新调 madmin）；
+  `today_uploads`/`upload_trend` 按 `uploaded_at` UTC 统计，趋势在 Go 侧补齐 7 天骨架。
+- 实现走 `internal/db/read_queries.go` 手写聚合查询（sqlmock 测试，遵循 D-005），不引入 sqlc 变更。
+
+### 流程约定（防复发）
+
+采纳 07 报告建议：**新功能的"设计完成"判据 = 每个 UI 稿都对应到已定义的 REST 端点**，
+否则视为设计未完成。本次即按此补齐 §5.11.5 与 §7.3.1 的数据来源标注。
+
+### 备选方案（被否决）
+
+- **保留前端估算**：数字错误，等于没修（"空心"陷阱）。
+- **存储用量用 `madmin.BucketUsageInfo`（§6.6）**：更贴近物理用量，但每次刷新一次 MinIO Admin 调用、
+  且与"已索引文件"口径不同；SUM(size_bytes) 更便宜、语义清晰，够用。物理用量可后续单列。
+- **用 sqlc 生成聚合查询**：可选过滤/日期分组用 sqlc 表达不便，手写查询 + sqlmock 更直接（与既有 read_queries 一致）。

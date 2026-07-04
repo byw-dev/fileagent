@@ -6,6 +6,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -355,6 +356,102 @@ func (q *Queries) CountDeliveriesByRule(ctx context.Context, eventRuleID uuid.UU
 	return n, row.Scan(&n)
 }
 
+// ── DashboardStats ────────────────────────────────────────────────────────────
+
+// DayCount is one bucket of the upload trend: a UTC date and the number of
+// files uploaded that day.
+type DayCount struct {
+	Date  string `json:"date"` // YYYY-MM-DD (UTC)
+	Count int64  `json:"count"`
+}
+
+// DashboardStats holds the aggregate figures shown on the dashboard.
+type DashboardStats struct {
+	TotalAgents  int64      `json:"total_agents"`
+	OnlineAgents int64      `json:"online_agents"`
+	TotalFiles   int64      `json:"total_files"`
+	StorageBytes int64      `json:"storage_bytes"`
+	TodayUploads int64      `json:"today_uploads"`
+	UploadTrend  []DayCount `json:"upload_trend"` // last 7 days, oldest first
+}
+
+const trendDays = 7
+
+// DashboardStats computes the dashboard aggregates for an org as of now (UTC).
+// An agent counts as online when its last_seen_at is within the offline
+// threshold (90s); storage is the sum of indexed file sizes; today's uploads and
+// the 7-day trend are keyed on uploaded_at in UTC.
+func (q *Queries) DashboardStats(ctx context.Context, orgID uuid.UUID, now time.Time) (*DashboardStats, error) {
+	now = now.UTC()
+	onlineSince := now.Add(-90 * time.Second)
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	trendStart := todayStart.AddDate(0, 0, -(trendDays - 1))
+
+	stats := &DashboardStats{}
+
+	scalar := func(query string, args ...interface{}) (int64, error) {
+		var n sql.NullInt64
+		if err := q.db.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
+			return 0, err
+		}
+		return n.Int64, nil
+	}
+
+	var err error
+	if stats.TotalAgents, err = scalar(
+		`SELECT COUNT(*) FROM agents WHERE org_id = $1`, orgID); err != nil {
+		return nil, err
+	}
+	if stats.OnlineAgents, err = scalar(
+		`SELECT COUNT(*) FROM agents WHERE org_id = $1 AND last_seen_at >= $2`, orgID, onlineSince); err != nil {
+		return nil, err
+	}
+	if stats.TotalFiles, err = scalar(
+		`SELECT COUNT(*) FROM file_entries WHERE org_id = $1`, orgID); err != nil {
+		return nil, err
+	}
+	if stats.StorageBytes, err = scalar(
+		`SELECT COALESCE(SUM(size_bytes), 0) FROM file_entries WHERE org_id = $1`, orgID); err != nil {
+		return nil, err
+	}
+	if stats.TodayUploads, err = scalar(
+		`SELECT COUNT(*) FROM file_entries WHERE org_id = $1 AND uploaded_at >= $2`, orgID, todayStart); err != nil {
+		return nil, err
+	}
+
+	// Upload trend: query days with data, then fill a dense 7-day skeleton so
+	// days with zero uploads still appear.
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT to_char(date_trunc('day', uploaded_at), 'YYYY-MM-DD') AS day, COUNT(*)
+		 FROM file_entries
+		 WHERE org_id = $1 AND uploaded_at >= $2
+		 GROUP BY day`, orgID, trendStart)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := make(map[string]int64)
+	for rows.Next() {
+		var day string
+		var n int64
+		if err := rows.Scan(&day, &n); err != nil {
+			return nil, err
+		}
+		counts[day] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	stats.UploadTrend = make([]DayCount, trendDays)
+	for i := 0; i < trendDays; i++ {
+		day := trendStart.AddDate(0, 0, i).Format("2006-01-02")
+		stats.UploadTrend[i] = DayCount{Date: day, Count: counts[day]}
+	}
+	return stats, nil
+}
+
 // ── helpers (package-internal) ───────────────────────────────────────────────
 
 // NewCursorFromFileEntry builds cursor fields from the last FileEntry in a page.
@@ -374,4 +471,3 @@ func NewCursorFromDelivery(d *EventDelivery) (sql.NullTime, uuid.NullUUID) {
 	return sql.NullTime{Time: d.CreatedAt, Valid: true},
 		uuid.NullUUID{UUID: d.ID, Valid: true}
 }
-

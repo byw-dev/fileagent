@@ -17,23 +17,12 @@ import {
 import useSWR from 'swr'
 import type { ColumnsType } from 'antd/es/table'
 import { listAgents } from '../../services/agents'
-import { listFiles } from '../../services/files'
 import { listUploadLogs } from '../../services/upload-logs'
 import type { UploadLog } from '../../services/upload-logs'
+import { getDashboardStats } from '../../services/stats'
 import AgentStatusBadge from '../../components/AgentStatusBadge'
 
 const { Title } = Typography
-
-/** Generate the last N days as chart X-axis labels */
-function generateLastNDays(n: number): string[] {
-  const days: string[] = []
-  for (let i = n - 1; i >= 0; i--) {
-    const d = new Date()
-    d.setDate(d.getDate() - i)
-    days.push(`${d.getMonth() + 1}/${d.getDate()}`)
-  }
-  return days
-}
 
 /** Format bytes to human-readable storage size */
 function formatBytes(bytes: number): string {
@@ -87,15 +76,18 @@ const uploadLogColumns: ColumnsType<UploadLog> = [
 function DashboardPage() {
   const SWR_OPTS = { refreshInterval: 30_000 }
 
-  const { data: agentsData, isLoading: loadingAgents } = useSWR(
-    'dashboard-agents',
-    () => listAgents({ limit: 100 }),
+  // Real aggregates from the Control Plane (replaces the earlier client-side
+  // approximations derived from a 20-row upload-logs sample).
+  const { data: stats, isLoading: loadingStats } = useSWR(
+    'dashboard-stats',
+    getDashboardStats,
     SWR_OPTS
   )
 
-  const { data: filesData, isLoading: loadingFiles } = useSWR(
-    'dashboard-files',
-    () => listFiles({ limit: 1 }),
+  // Agents list feeds the online-status table; recent logs feed the log table.
+  const { data: agentsData, isLoading: loadingAgents } = useSWR(
+    'dashboard-agents',
+    () => listAgents({ limit: 100 }),
     SWR_OPTS
   )
 
@@ -106,30 +98,17 @@ function DashboardPage() {
   )
 
   const agents = agentsData?.items ?? []
-  const onlineCount = agents.filter((a) => a.status === 'RUNNING').length
-  const totalCount = agentsData?.total ?? 0
-  const totalFiles = filesData?.total ?? 0
+  const onlineCount = stats?.online_agents ?? 0
+  const totalCount = stats?.total_agents ?? 0
+  const totalFiles = stats?.total_files ?? 0
+  const totalStorage = stats?.storage_bytes ?? 0
+  const todayUploads = stats?.today_uploads ?? 0
 
-  // Calculate total storage from recent logs as an approximation
-  const totalStorage = (logsData?.items ?? []).reduce((sum, l) => sum + (l.size || 0), 0)
-
-  // Count today's uploads from logs
-  const today = new Date().toDateString()
-  const todayUploads = (logsData?.items ?? []).filter(
-    (l) => new Date(l.uploaded_at).toDateString() === today
-  ).length
-
-  // Build 7-day trend data using upload logs timestamps
-  const days = generateLastNDays(7)
-  const trendData = days.map((label) => {
-    const count = (logsData?.items ?? []).filter((l) => {
-      const d = new Date(l.uploaded_at)
-      return `${d.getMonth() + 1}/${d.getDate()}` === label
-    }).length
-    return { date: label, count }
+  // 7-day upload trend from the API; format ISO dates as short M/D labels.
+  const trendData = (stats?.upload_trend ?? []).map((d) => {
+    const [, m, day] = d.date.split('-')
+    return { date: `${Number(m)}/${Number(day)}`, count: d.count }
   })
-
-  const isLoading = loadingAgents || loadingFiles || loadingLogs
 
   return (
     <div>
@@ -139,7 +118,7 @@ function DashboardPage() {
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
         <Col xs={24} sm={12} lg={6}>
           <Card>
-            <Spin spinning={loadingAgents}>
+            <Spin spinning={loadingStats}>
               <Statistic
                 title="在线采集器"
                 value={onlineCount}
@@ -152,7 +131,7 @@ function DashboardPage() {
         </Col>
         <Col xs={24} sm={12} lg={6}>
           <Card>
-            <Spin spinning={loadingLogs}>
+            <Spin spinning={loadingStats}>
               <Statistic
                 title="今日上传"
                 value={todayUploads}
@@ -165,7 +144,7 @@ function DashboardPage() {
         </Col>
         <Col xs={24} sm={12} lg={6}>
           <Card>
-            <Spin spinning={loadingFiles}>
+            <Spin spinning={loadingStats}>
               <Statistic
                 title="总文件数"
                 value={totalFiles}
@@ -176,9 +155,9 @@ function DashboardPage() {
         </Col>
         <Col xs={24} sm={12} lg={6}>
           <Card>
-            <Spin spinning={loadingLogs}>
+            <Spin spinning={loadingStats}>
               <Statistic
-                title="存储用量（近20条）"
+                title="存储用量"
                 value={formatBytes(totalStorage)}
                 prefix={<CloudServerOutlined />}
               />
@@ -191,7 +170,7 @@ function DashboardPage() {
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
         <Col xs={24} lg={14}>
           <Card title="近7日上传量趋势">
-            <Spin spinning={isLoading}>
+            <Spin spinning={loadingStats}>
               {trendData.every((d) => d.count === 0) ? (
                 <Empty description="暂无上传数据" style={{ padding: 40 }} />
               ) : (

@@ -247,6 +247,7 @@ func main() {
 		DryRunStore:   dryRunStore,
 		MinioIndexer:  ix,
 		WebhookSecret: cfg.InternalWebhookSecret,
+		StatsDB:       queries,
 	})
 
 	httpSrv := &http.Server{

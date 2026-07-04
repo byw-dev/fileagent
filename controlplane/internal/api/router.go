@@ -37,6 +37,7 @@ type RouterConfig struct {
 	DryRunStore   handler.DryRunStore      // nil → test-rule returns 501
 	MinioIndexer  handler.IndexerClient    // nil → minio webhook events are only logged
 	WebhookSecret string                   // shared secret for /internal/minio-event; empty → endpoint rejects all
+	StatsDB       handler.StatsDB          // nil → stats endpoint returns 501
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -158,6 +159,10 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		uploadLogs.GET("", uploadLogsH.List)
 		uploadLogs.GET("/:id", uploadLogsH.Get)
 	}
+
+	// Dashboard statistics
+	statsH := handler.NewStatsHandler(cfg.StatsDB, cfg.Logger)
+	v1.GET("/stats/dashboard", statsH.Dashboard)
 
 	return r
 }
