@@ -200,10 +200,17 @@ func (q *Queue) CountPending() (int, error) {
 // "running", or "failed") currently held in the queue. Completed tasks are
 // excluded because they represent finished work and do not contribute to backlog
 // pressure. It is used to enforce the configured queue_max_size cap.
+//
+// The active statuses are matched with an explicit IN list rather than
+// `status != 'completed'` so SQLite can use the idx_upload_tasks_status index:
+// completed rows are never removed (only evicted rows are) and can accumulate
+// without bound, so an inequality full-table scan would make every Submit's
+// capacity check progressively slower.
 func (q *Queue) CountActive() (int, error) {
 	var n int
 	if err := q.db.QueryRow(
-		`SELECT COUNT(*) FROM upload_tasks WHERE status != ?`, StatusCompleted,
+		`SELECT COUNT(*) FROM upload_tasks WHERE status IN (?, ?, ?)`,
+		StatusPending, StatusRunning, StatusFailed,
 	).Scan(&n); err != nil {
 		return 0, fmt.Errorf("queue: count active: %w", err)
 	}
@@ -221,8 +228,18 @@ func (q *Queue) CountActive() (int, error) {
 // (system-design §4.6). Failed tasks must be evictable, not just pending, because
 // under a sustained upload outage tasks continually cycle pending→running→failed,
 // so the backlog to bound lives largely in the "failed" state.
+//
+// The SELECT and DELETE are separate statements, so a worker's DequeuePending
+// could transition the chosen row to "running" in between. The DELETE is
+// therefore guarded by the same status filter and, if it removes nothing (the row
+// transitioned), the selection is retried on the next-oldest evictable task. This
+// prevents deleting an in-flight task and orphaning its upload. Retries are
+// bounded; if the queue is churning too hard to settle on a victim it returns
+// (nil, nil), which the caller treats as "nothing evictable".
 func (q *Queue) DeleteOldestEvictable() (*UploadTask, error) {
-	rows, err := q.db.Query(`
+	const maxAttempts = 8
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		rows, err := q.db.Query(`
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
                retry_count, last_error, created_at, updated_at,
@@ -231,22 +248,33 @@ func (q *Queue) DeleteOldestEvictable() (*UploadTask, error) {
         WHERE status IN (?, ?)
         ORDER BY created_at ASC
         LIMIT 1`, StatusPending, StatusFailed)
-	if err != nil {
-		return nil, fmt.Errorf("queue: select oldest evictable: %w", err)
+		if err != nil {
+			return nil, fmt.Errorf("queue: select oldest evictable: %w", err)
+		}
+		tasks, err := scanTasks(rows)
+		_ = rows.Close() // release the single connection before the DELETE below
+		if err != nil {
+			return nil, err
+		}
+		if len(tasks) == 0 {
+			return nil, nil
+		}
+		t := tasks[0]
+		// Guard the DELETE with the status filter: if the row transitioned to
+		// "running" since the SELECT, this removes nothing and we retry.
+		res, err := q.db.Exec(
+			`DELETE FROM upload_tasks WHERE id=? AND status IN (?, ?)`,
+			t.ID, StatusPending, StatusFailed,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("queue: delete oldest evictable %q: %w", t.ID, err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			return t, nil
+		}
+		// Row changed state under us; try the next-oldest evictable task.
 	}
-	tasks, err := scanTasks(rows)
-	_ = rows.Close() // release the single connection before the DELETE below
-	if err != nil {
-		return nil, err
-	}
-	if len(tasks) == 0 {
-		return nil, nil
-	}
-	t := tasks[0]
-	if _, err := q.db.Exec(`DELETE FROM upload_tasks WHERE id=?`, t.ID); err != nil {
-		return nil, fmt.Errorf("queue: delete oldest evictable %q: %w", t.ID, err)
-	}
-	return t, nil
+	return nil, nil
 }
 
 // DequeuePending returns up to limit tasks with status "pending", ordered by
