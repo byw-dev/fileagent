@@ -12,7 +12,7 @@
 |----|------|------|
 | 认证接口 `/api/auth/*` | ✅ | login/refresh/logout/me/oidc-callback 全部注册（`router.go:62-68`）。**注意**：设计文档自身矛盾——§5.3.2 写 `/api/auth/*`，附录 B.2 却写 `/api/v1/auth/*`；实现遵循 §5.3.2 和 CLAUDE.md 契约表 |
 | 用户/agents/files/file-types/buckets/event-rules/upload-logs | ✅ | 与附录 B.2 完全对齐，另新增 `POST /agents/:id/test-rule`（T3-6 dry-run，📝设计文档未回填） |
-| `/internal/minio-event` | ✅ | 路由存在且已接 indexer（B-4 已修）。~~未校验共享密钥~~ **已修复（止血冲刺 G-3 / D-014）**：用 `INTERNAL_WEBHOOK_SECRET`（哈希后常量时间比较）校验 `auth_token`，未配置密钥时 fail-closed（注：报告原文写的 env 名 `MINIO_WEBHOOK_TOKEN` 有误，实际为 `INTERNAL_WEBHOOK_SECRET`） |
+| `/internal/minio-event` | ✅ | 路由存在且已接 indexer（B-4 已修）。~~未校验共享密钥~~ **已修复（止血冲刺 G-3 / D-014）**：用 `INTERNAL_WEBHOOK_SECRET`（哈希后常量时间比较）校验 `auth_token`，未配置密钥时 fail-closed（注：env 名 `MINIO_WEBHOOK_TOKEN` 是**旧名**——CP 实际读取 `INTERNAL_WEBHOOK_SECRET`（`config.go:143`）；设计文档正文 §6.5 已用新名，但**附录 C（`system-design.md:2300`）仍写旧名 `MINIO_WEBHOOK_TOKEN`，待回填**——归入 design-doc drift，不属本报告） |
 | API 限流 | ❌ | 设计 §5.1 与 Redis Key 表要求 `ratelimit:api:{user_id}`；`internal/api/middleware/` 只有 error.go 和 jwt.go，**无限流中间件**。`cache/keys.go` 注释里列了 key 模式但无实现 |
 | 统一错误响应格式 | 待验证 | 设计 §5.11 定义 `{error:{code,message,detail},request_id}`，待 e2e 验证实际格式 |
 
@@ -45,8 +45,8 @@
 | 项 | 状态 | 说明 |
 |----|------|------|
 | 创建 Bucket 调 MinIO | ✅ | `events.go:158 MakeBucket`（B-3 已修） |
-| **Bucket 创建后 SetBucketPolicy** | ❌ | 设计 §6.6 要求创建后设置 Policy；代码无 SetBucketPolicy 调用 |
-| **tmp-uploads Lifecycle 7 天清理** | ❌ | 无 Lifecycle 配置代码 |
+| **Bucket 创建后 SetBucketPolicy** | ❌ → CC-3 | 设计 §6.6 要求创建后设置 Policy；**CP 代码**（`events.go` MakeBucket 之后）无 SetBucketPolicy 调用 |
+| **tmp-uploads Lifecycle 7 天清理** | ❌ → CC-3 | **CP 代码**无 Lifecycle 配置。注：`deploy/scripts/init-minio.sh` 会在初始化时给种子 `tmp-uploads` 配 7 天 Lifecycle，但 CP 运行时新建的 bucket 不覆盖，不满足设计"创建后自动设置" |
 | Bucket 存储用量（Dashboard） | 待查 | 设计要求 madmin.BucketUsageInfo 每 5 分钟缓存 |
 | STS AssumeRole | ✅ | `storage/sts.go:49` 按设计实现 |
 | 预签名 URL 15 分钟 | ✅ | `files.go:257`（B-1/B-2 已修） |
