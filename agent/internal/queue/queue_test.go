@@ -320,3 +320,87 @@ Bucket: "b", FileSize: 1, FileMtime: 1, FileOffset: 100, AppendMode: "close_wait
 }
 require.NoError(t, q.Enqueue(task))
 }
+
+// ── Capacity enforcement (queue_max_size) ─────────────────────────────────────
+
+// taskAt builds a pending task with an explicit created_at so ordering is
+// deterministic in fast-running tests.
+func taskAt(id string, createdAt int64) *UploadTask {
+	t := newTask(id, "")
+	t.CreatedAt = createdAt
+	t.UpdatedAt = createdAt
+	return t
+}
+
+func TestCountActive_ExcludesCompleted(t *testing.T) {
+	q := openMemQueue(t)
+
+	require.NoError(t, q.Enqueue(taskAt("a", 1)))
+	require.NoError(t, q.Enqueue(taskAt("b", 2)))
+	require.NoError(t, q.Enqueue(taskAt("c", 3)))
+
+	// One running, one failed, one completed: only pending+running+failed count.
+	require.NoError(t, q.UpdateStatus("a", StatusRunning))
+	require.NoError(t, q.MarkFailed("b", "boom"))
+	require.NoError(t, q.UpdateStatus("c", StatusCompleted))
+
+	n, err := q.CountActive()
+	require.NoError(t, err)
+	assert.Equal(t, 2, n) // a (running) + b (failed); c (completed) excluded
+}
+
+func TestDeleteOldestEvictable(t *testing.T) {
+	q := openMemQueue(t)
+
+	require.NoError(t, q.Enqueue(taskAt("old", 100)))
+	require.NoError(t, q.Enqueue(taskAt("mid", 200)))
+	require.NoError(t, q.Enqueue(taskAt("new", 300)))
+
+	dropped, err := q.DeleteOldestEvictable()
+	require.NoError(t, err)
+	require.NotNil(t, dropped)
+	assert.Equal(t, "old", dropped.ID)
+
+	// "old" is gone; the remaining two are intact.
+	remaining, err := q.ListByStatus(StatusPending)
+	require.NoError(t, err)
+	assert.Len(t, remaining, 2)
+}
+
+func TestDeleteOldestEvictable_IncludesFailedSkipsRunning(t *testing.T) {
+	q := openMemQueue(t)
+
+	// Oldest is running (in-flight, must NOT be evicted); next-oldest is failed
+	// (awaiting retry, IS evictable); newest is pending.
+	require.NoError(t, q.Enqueue(taskAt("running", 100)))
+	require.NoError(t, q.UpdateStatus("running", StatusRunning))
+	require.NoError(t, q.Enqueue(taskAt("failed", 200)))
+	require.NoError(t, q.MarkFailed("failed", "boom"))
+	require.NoError(t, q.Enqueue(taskAt("pending", 300)))
+
+	dropped, err := q.DeleteOldestEvictable()
+	require.NoError(t, err)
+	require.NotNil(t, dropped)
+	assert.Equal(t, "failed", dropped.ID,
+		"failed task is evictable and older than pending; running is skipped")
+}
+
+func TestDeleteOldestEvictable_OnlyRunning(t *testing.T) {
+	q := openMemQueue(t)
+
+	// Nothing evictable when the sole active task is running (in-flight).
+	require.NoError(t, q.Enqueue(taskAt("running", 100)))
+	require.NoError(t, q.UpdateStatus("running", StatusRunning))
+
+	dropped, err := q.DeleteOldestEvictable()
+	require.NoError(t, err)
+	assert.Nil(t, dropped)
+}
+
+func TestDeleteOldestEvictable_Empty(t *testing.T) {
+	q := openMemQueue(t)
+
+	dropped, err := q.DeleteOldestEvictable()
+	require.NoError(t, err)
+	assert.Nil(t, dropped)
+}

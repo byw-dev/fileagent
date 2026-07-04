@@ -54,7 +54,7 @@ func TestExecutor_SubmitAndProcess(t *testing.T) {
 		return nil
 	}
 
-	e := New(2, q, uploader, zap.NewNop())
+	e := New(2, q, uploader, zap.NewNop(), 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	e.Start(ctx)
@@ -77,7 +77,7 @@ func TestExecutor_Dedup(t *testing.T) {
 		return nil
 	}
 
-	e := New(1, q, uploader, zap.NewNop())
+	e := New(1, q, uploader, zap.NewNop(), 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	e.Start(ctx)
@@ -101,7 +101,7 @@ func TestExecutor_Dedup(t *testing.T) {
 }
 
 func TestExecutor_RetryDelay(t *testing.T) {
-	e := New(1, nil, nil, zap.NewNop())
+	e := New(1, nil, nil, zap.NewNop(), 0)
 	assert.Equal(t, 1*time.Minute, e.retryDelay(1))
 	assert.Equal(t, 5*time.Minute, e.retryDelay(2))
 	assert.Equal(t, 15*time.Minute, e.retryDelay(3))
@@ -125,7 +125,7 @@ func TestExecutor_GivenUpAfterMaxRetries(t *testing.T) {
 	runningTask.RetryCount = maxRetries - 1
 
 	var requeued atomic.Bool
-	e := New(1, q, failUploader, zap.NewNop())
+	e := New(1, q, failUploader, zap.NewNop(), 0)
 	// Directly call handleFailure — at maxRetries, it should not re-queue.
 	e.handleFailure(runningTask, fmt.Errorf("permanent error"))
 
@@ -146,7 +146,7 @@ func TestExecutor_ConcurrentWorkers(t *testing.T) {
 		return nil
 	}
 
-	e := New(4, q, uploader, zap.NewNop())
+	e := New(4, q, uploader, zap.NewNop(), 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	e.Start(ctx)
@@ -176,7 +176,7 @@ func TestExecutor_GracefulShutdown(t *testing.T) {
 		return nil
 	}
 
-	e := New(1, q, uploader, zap.NewNop())
+	e := New(1, q, uploader, zap.NewNop(), 0)
 	ctx := context.Background()
 	e.Start(ctx)
 
@@ -200,7 +200,7 @@ func TestExecutor_GracefulShutdown(t *testing.T) {
 
 func TestExecutor_SubmitAssignsID(t *testing.T) {
 	q := newTestQueue(t)
-	e := New(0, q, successUploader, zap.NewNop())
+	e := New(0, q, successUploader, zap.NewNop(), 0)
 
 	task := &queue.UploadTask{
 		RuleID:      "r1",
@@ -224,7 +224,7 @@ func TestExecutor_RetryRequeues(t *testing.T) {
 		return nil
 	}
 
-	e := New(1, q, uploader, zap.NewNop())
+	e := New(1, q, uploader, zap.NewNop(), 0)
 	// Use short delays so the test does not take minutes.
 	e.retryDelays = []time.Duration{50 * time.Millisecond, 50 * time.Millisecond}
 
@@ -240,4 +240,71 @@ func TestExecutor_RetryRequeues(t *testing.T) {
 	}, 3*time.Second, 50*time.Millisecond, "task should be retried")
 
 	e.Stop()
+}
+
+// taskWithTime builds a pending task with an explicit created_at for
+// deterministic eviction ordering.
+func taskWithTime(id, path string, createdAt int64) *queue.UploadTask {
+	tk := newTask("r1", path)
+	tk.ID = id
+	tk.CreatedAt = createdAt
+	tk.UpdatedAt = createdAt
+	return tk
+}
+
+func TestExecutor_Submit_EnforcesQueueMaxSize(t *testing.T) {
+	q := newTestQueue(t)
+	// cap of 3, no workers started so tasks stay pending.
+	e := New(1, q, successUploader, zap.NewNop(), 3)
+
+	require.NoError(t, e.Submit(taskWithTime("t1", "/f1", 1)))
+	require.NoError(t, e.Submit(taskWithTime("t2", "/f2", 2)))
+	require.NoError(t, e.Submit(taskWithTime("t3", "/f3", 3)))
+
+	// Fourth submit is at cap → oldest pending (t1) must be evicted.
+	require.NoError(t, e.Submit(taskWithTime("t4", "/f4", 4)))
+
+	pending, err := q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	assert.Len(t, pending, 3)
+
+	ids := map[string]bool{}
+	for _, p := range pending {
+		ids[p.ID] = true
+	}
+	assert.False(t, ids["t1"], "oldest task t1 should have been evicted")
+	assert.True(t, ids["t2"] && ids["t3"] && ids["t4"])
+}
+
+func TestExecutor_Submit_UnlimitedWhenCapZero(t *testing.T) {
+	q := newTestQueue(t)
+	e := New(1, q, successUploader, zap.NewNop(), 0) // cap disabled
+
+	for i := 0; i < 5; i++ {
+		require.NoError(t, e.Submit(taskWithTime(
+			uuid.New().String(), "/f", int64(i+1))))
+	}
+
+	pending, err := q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	assert.Len(t, pending, 5)
+}
+
+func TestExecutor_Submit_AtCapButNothingPendingToEvict(t *testing.T) {
+	q := newTestQueue(t)
+	e := New(1, q, successUploader, zap.NewNop(), 2)
+
+	// Fill to cap, then move both to running so no pending task can be evicted.
+	require.NoError(t, e.Submit(taskWithTime("t1", "/f1", 1)))
+	require.NoError(t, e.Submit(taskWithTime("t2", "/f2", 2)))
+	running, err := q.DequeuePending(10)
+	require.NoError(t, err)
+	require.Len(t, running, 2)
+
+	// At cap (2 active, both running) → eviction finds nothing; task is accepted anyway.
+	require.NoError(t, e.Submit(taskWithTime("t3", "/f3", 3)))
+
+	n, err := q.CountActive()
+	require.NoError(t, err)
+	assert.Equal(t, 3, n) // exceeded cap because nothing was evictable
 }

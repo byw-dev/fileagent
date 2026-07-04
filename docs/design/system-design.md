@@ -1024,7 +1024,11 @@ CREATE INDEX idx_processed_files_rule ON processed_files (rule_id, local_path);
 - Worker goroutine 数量默认为 3，可由 Control Plane 下发配置动态调整；
 - 失败任务按指数退避重试：1min → 5min → 15min → 60min，最多重试 10 次；
 - 超过重试上限的任务标记为 failed，上报 Control Plane，不自动删除；
-- 本地队列总大小上限可配置（默认 10000 条），超出时丢弃最旧的 pending 任务并告警。
+- 本地队列总大小上限可配置（`queue_max_size`，默认 10000 条）。入队新任务前，
+  当活跃任务数（pending + running + failed，不含 completed）达到上限时，丢弃**最旧的可驱逐任务**
+  （状态为 pending 或 failed；running 为在途上传不驱逐，其数量受 worker 并发数约束）并告警。
+  失败任务必须可驱逐——上传持续中断时任务会在 pending→running→failed 间循环，待清理的积压主要处于 failed 态，
+  若只驱逐 pending 则断网久了队列仍会无限增长。上限 ≤ 0 视为不限制。
 
 ## 4.7 凭据管理与轮转
 

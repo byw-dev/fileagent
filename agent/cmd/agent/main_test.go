@@ -137,7 +137,7 @@ func TestSubmitFile_SubmitsNewFile(t *testing.T) {
 	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) error {
 		submitted = true
 		return nil
-	}, zap.NewNop())
+	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
 	defer exec.Stop()
 
@@ -154,7 +154,7 @@ func TestSubmitFile_SkipsDuplicate(t *testing.T) {
 	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) error {
 		callCount++
 		return nil
-	}, zap.NewNop())
+	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
 	defer exec.Stop()
 
@@ -186,7 +186,7 @@ func TestWalkAndSubmit_SubmitsMatchingFiles(t *testing.T) {
 	exec := executor.New(1, q, func(_ context.Context, task *queue.UploadTask) error {
 		submitted = append(submitted, task.LocalPath)
 		return nil
-	}, zap.NewNop())
+	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
 	defer exec.Stop()
 
@@ -199,7 +199,7 @@ func TestWalkAndSubmit_SubmitsMatchingFiles(t *testing.T) {
 
 func TestWalkAndSubmit_NonExistentPathLogsWarning(t *testing.T) {
 	q := openTestQueue(t)
-	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) error { return nil }, zap.NewNop())
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) error { return nil }, zap.NewNop(), 0)
 	exec.Start(context.Background())
 	defer exec.Stop()
 
@@ -213,7 +213,7 @@ func TestWalkAndSubmit_NonExistentPathLogsWarning(t *testing.T) {
 func TestRunWatcher_CancelExits(t *testing.T) {
 	dir := t.TempDir()
 	q := openTestQueue(t)
-	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) error { return nil }, zap.NewNop())
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) error { return nil }, zap.NewNop(), 0)
 	exec.Start(context.Background())
 	defer exec.Stop()
 
