@@ -642,13 +642,16 @@ func (h *UploadLogsHandler) Get(c *gin.Context) {
 
 // ── MinioEventHandler ────────────────────────────────────────────────────────
 
-// IndexerClient is the minimal interface needed by MinioEventHandler to
-// index uploads that arrive through the MinIO webhook path.
+// IndexerClient is the minimal interface needed by MinioEventHandler to reflect
+// MinIO object events in the file index.
 type IndexerClient interface {
-	// IndexUpload records an upload event from MinIO in the file index.
+	// IndexUpload records an ObjectCreated event in the file index.
 	// It is called in a best-effort, non-blocking fashion; errors are only
 	// logged (warn level) and do not affect the HTTP response.
 	IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string) error
+	// IndexDeletion records an ObjectRemoved event: it soft-deletes the matching
+	// file entry and publishes events.file.deleted. Best-effort like IndexUpload.
+	IndexDeletion(ctx context.Context, bucketName, objectKey string) error
 }
 
 // MinioEventHandler handles POST /internal/minio-event — the MinIO S3 event
@@ -753,20 +756,28 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 			zap.String("key", rec.S3.Object.Key),
 			zap.Int64("size", rec.S3.Object.Size),
 		)
-		if h.indexer != nil {
-			if err := h.indexer.IndexUpload(
-				c.Request.Context(),
-				rec.S3.Bucket.Name,
-				rec.S3.Object.Key,
-				rec.S3.Object.Size,
-				rec.S3.Object.ETag,
-			); err != nil {
-				h.logger.Warn("minio event: index upload failed",
-					zap.String("bucket", rec.S3.Bucket.Name),
-					zap.String("key", rec.S3.Object.Key),
-					zap.Error(err),
-				)
+		if h.indexer == nil {
+			continue
+		}
+		// Route by S3 event type: ObjectCreated:* indexes an upload, while
+		// ObjectRemoved:* soft-deletes the entry and emits events.file.deleted.
+		// Previously every event was indexed as an upload, so deletions were
+		// mis-recorded and file_deleted event rules never fired.
+		bucket, key := rec.S3.Bucket.Name, rec.S3.Object.Key
+		switch {
+		case strings.HasPrefix(rec.EventName, "s3:ObjectRemoved:"):
+			if err := h.indexer.IndexDeletion(c.Request.Context(), bucket, key); err != nil {
+				h.logger.Warn("minio event: index deletion failed",
+					zap.String("bucket", bucket), zap.String("key", key), zap.Error(err))
 			}
+		case strings.HasPrefix(rec.EventName, "s3:ObjectCreated:"):
+			if err := h.indexer.IndexUpload(c.Request.Context(), bucket, key, rec.S3.Object.Size, rec.S3.Object.ETag); err != nil {
+				h.logger.Warn("minio event: index upload failed",
+					zap.String("bucket", bucket), zap.String("key", key), zap.Error(err))
+			}
+		default:
+			h.logger.Debug("minio event: ignoring unhandled event type",
+				zap.String("event", rec.EventName))
 		}
 	}
 	c.Status(http.StatusOK)

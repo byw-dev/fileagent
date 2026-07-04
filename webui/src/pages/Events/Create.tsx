@@ -16,18 +16,22 @@ import { createEventRule } from '../../services/events'
 const { Title } = Typography
 const { TextArea } = Input
 
+// Must match the DB event_type enum exactly (underscore form). The previous
+// values (dotted names, file.indexed, agent.registered) were invalid and, in
+// particular, file_deleted was missing so those rules could never be created.
 const EVENT_TYPE_OPTIONS = [
-  { label: 'file.uploaded', value: 'file.uploaded' },
-  { label: 'file.indexed', value: 'file.indexed' },
-  { label: 'agent.registered', value: 'agent.registered' },
-  { label: 'agent.approved', value: 'agent.approved' },
-  { label: 'agent.revoked', value: 'agent.revoked' },
+  { label: 'file_uploaded', value: 'file_uploaded' },
+  { label: 'file_deleted', value: 'file_deleted' },
+  { label: 'agent_online', value: 'agent_online' },
+  { label: 'agent_offline', value: 'agent_offline' },
+  { label: 'agent_approved', value: 'agent_approved' },
+  { label: 'agent_revoked', value: 'agent_revoked' },
 ]
 
-const ACTION_TYPE_OPTIONS = [
-  { label: 'webhook', value: 'webhook' },
-  { label: 'email', value: 'email' },
-]
+// TODO(CC-7): action_type options are also out of sync — the DB enum is
+// webhook / nats_publish / kafka_publish, "email" is invalid, and kafka_publish
+// is currently a dead action. Only webhook is wired end-to-end today.
+const ACTION_TYPE_OPTIONS = [{ label: 'webhook', value: 'webhook' }]
 
 /**
  * Create event rule page — form for name, event type, action type,

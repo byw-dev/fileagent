@@ -38,6 +38,8 @@ type mockIndexerStore struct {
 	bucketErr    error
 	fileEntry    *db.FileEntry
 	upsertErr    error
+	deletedEntry *db.FileEntry
+	deleteErr    error
 	uploadLog    *db.UploadLog
 	uploadLogErr error
 	typeRules    []*db.FileTypeRule
@@ -50,6 +52,10 @@ func (m *mockIndexerStore) GetBucketByName(_ context.Context, _ uuid.UUID, _ str
 
 func (m *mockIndexerStore) UpsertFileEntry(_ context.Context, _ UpsertFileEntryParams) (*db.FileEntry, error) {
 	return m.fileEntry, m.upsertErr
+}
+
+func (m *mockIndexerStore) MarkFileEntryDeleted(_ context.Context, _ uuid.UUID, _ string) (*db.FileEntry, error) {
+	return m.deletedEntry, m.deleteErr
 }
 
 func (m *mockIndexerStore) CreateUploadLog(_ context.Context, _ CreateUploadLogParams) (*db.UploadLog, error) {
@@ -399,61 +405,100 @@ func TestFileNameFromPath(t *testing.T) {
 
 // TestNewIndexer_DBBacked tests the production constructor that wraps db.DBTX.
 func TestNewIndexer_DBBacked(t *testing.T) {
-// Use the errDBTX to satisfy the db.DBTX interface for construction.
-// We only verify the constructor doesn't panic and returns non-nil.
-ix := NewIndexer(&errDBTX{err: nil}, newMockNATS(), newTestLogger())
-require.NotNil(t, ix)
+	// Use the errDBTX to satisfy the db.DBTX interface for construction.
+	// We only verify the constructor doesn't panic and returns non-nil.
+	ix := NewIndexer(&errDBTX{err: nil}, newMockNATS(), newTestLogger())
+	require.NotNil(t, ix)
 }
 
 // TestNewClassifier_DBBacked tests the production constructor.
 func TestNewClassifier_DBBacked(t *testing.T) {
-c := NewClassifier(&errDBTX{err: nil})
-require.NotNil(t, c)
+	c := NewClassifier(&errDBTX{err: nil})
+	require.NotNil(t, c)
 }
 
 // ── IndexUpload ───────────────────────────────────────────────────────────────
 
 func newSampleBucket() *db.Bucket {
-return &db.Bucket{ID: uuid.New(), OrgID: uuid.New(), Name: "data-sensor"}
+	return &db.Bucket{ID: uuid.New(), OrgID: uuid.New(), Name: "data-sensor"}
 }
 
 func newSampleFileEntry() *db.FileEntry {
-return &db.FileEntry{
-ID:          uuid.New(),
-OrgID:       uuid.New(),
-BucketID:    uuid.New(),
-StoragePath: "uploads/file.csv",
-FileName:    "file.csv",
-SizeBytes:   1024,
-Status:      db.FileStatusCompleted,
-}
+	return &db.FileEntry{
+		ID:          uuid.New(),
+		OrgID:       uuid.New(),
+		BucketID:    uuid.New(),
+		StoragePath: "uploads/file.csv",
+		FileName:    "file.csv",
+		SizeBytes:   1024,
+		Status:      db.FileStatusCompleted,
+	}
 }
 
 func TestIndexUpload_Success(t *testing.T) {
-store := &mockIndexerStore{
-bucket:    newSampleBucket(),
-fileEntry: newSampleFileEntry(),
-}
-ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-err := ix.IndexUpload(context.Background(), "data-sensor", "uploads/file.csv", 1024, "abc123")
-require.NoError(t, err)
+	store := &mockIndexerStore{
+		bucket:    newSampleBucket(),
+		fileEntry: newSampleFileEntry(),
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.IndexUpload(context.Background(), "data-sensor", "uploads/file.csv", 1024, "abc123")
+	require.NoError(t, err)
 }
 
 func TestIndexUpload_BucketNotFound(t *testing.T) {
-store := &mockIndexerStore{bucketErr: assert.AnError}
-ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-err := ix.IndexUpload(context.Background(), "missing-bucket", "key.csv", 0, "")
-require.Error(t, err)
-assert.Contains(t, err.Error(), "get bucket")
+	store := &mockIndexerStore{bucketErr: assert.AnError}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.IndexUpload(context.Background(), "missing-bucket", "key.csv", 0, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "get bucket")
 }
 
 func TestIndexUpload_UpsertError(t *testing.T) {
-store := &mockIndexerStore{
-bucket:    newSampleBucket(),
-upsertErr: assert.AnError,
+	store := &mockIndexerStore{
+		bucket:    newSampleBucket(),
+		upsertErr: assert.AnError,
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.IndexUpload(context.Background(), "data-sensor", "key.csv", 100, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "upsert file entry")
 }
-ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-err := ix.IndexUpload(context.Background(), "data-sensor", "key.csv", 100, "")
-require.Error(t, err)
-assert.Contains(t, err.Error(), "upsert file entry")
+
+// ── IndexDeletion (CC-1) ──────────────────────────────────────────────────────
+
+func TestIndexDeletion_Found_MarksDeletedAndPublishes(t *testing.T) {
+	bucketID := uuid.New()
+	entryID := uuid.New()
+	store := &mockIndexerStore{
+		bucket:       &db.Bucket{ID: bucketID, Name: "data-sensor"},
+		deletedEntry: &db.FileEntry{ID: entryID, BucketID: bucketID, StoragePath: "uploads/gone.csv", FileName: "gone.csv"},
+	}
+	nats := newMockNATS()
+	ix := NewIndexerWithStore(store, nats, newTestLogger())
+
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv")
+	require.NoError(t, err)
+	published := nats.published["events.file.deleted"]
+	require.Len(t, published, 1, "events.file.deleted must be published")
+	assert.Contains(t, string(published[0]), entryID.String())
+}
+
+func TestIndexDeletion_NotFound_NoOp(t *testing.T) {
+	store := &mockIndexerStore{
+		bucket:    &db.Bucket{ID: uuid.New(), Name: "data-sensor"},
+		deleteErr: sql.ErrNoRows,
+	}
+	nats := newMockNATS()
+	ix := NewIndexerWithStore(store, nats, newTestLogger())
+
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/never-indexed.csv")
+	require.NoError(t, err, "deleting an unindexed object is a no-op")
+	assert.Empty(t, nats.published["events.file.deleted"], "no event for a no-op delete")
+}
+
+func TestIndexDeletion_BucketError(t *testing.T) {
+	store := &mockIndexerStore{bucketErr: assert.AnError}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "k")
+	require.Error(t, err)
 }

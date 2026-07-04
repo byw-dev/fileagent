@@ -549,14 +549,23 @@ func TestEventRulesHandler_Delete_DBError(t *testing.T) {
 type mockIndexerClient struct {
 	err        error
 	called     bool
+	deleted    bool
 	lastBucket string
 	lastKey    string
+	deletedKey string
 }
 
 func (m *mockIndexerClient) IndexUpload(_ context.Context, bucketName, objectKey string, _ int64, _ string) error {
 	m.called = true
 	m.lastBucket = bucketName
 	m.lastKey = objectKey
+	return m.err
+}
+
+func (m *mockIndexerClient) IndexDeletion(_ context.Context, bucketName, objectKey string) error {
+	m.deleted = true
+	m.lastBucket = bucketName
+	m.deletedKey = objectKey
 	return m.err
 }
 
@@ -647,6 +656,36 @@ func TestMinioEventHandler_Handle_IndexerError_StillReturns200(t *testing.T) {
 	// Indexer error is non-fatal; still 200.
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.True(t, ix.called)
+}
+
+// TestMinioEventHandler_RoutesRemovedToDeletion verifies an ObjectRemoved event
+// is routed to IndexDeletion (soft-delete + file_deleted), not indexed as an
+// upload. Previously every event was treated as an upload (CC-1).
+func TestMinioEventHandler_RoutesRemovedToDeletion(t *testing.T) {
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	body := `{"Records":[{"eventName":"s3:ObjectRemoved:Delete","s3":{"bucket":{"name":"data-sensor"},"object":{"key":"uploads/gone.csv"}}}]}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testMinioEventRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, ix.deleted, "ObjectRemoved must route to IndexDeletion")
+	assert.False(t, ix.called, "ObjectRemoved must not be indexed as an upload")
+	assert.Equal(t, "uploads/gone.csv", ix.deletedKey)
+}
+
+func TestMinioEventHandler_RoutesCreatedToUpload(t *testing.T) {
+	ix := &mockIndexerClient{}
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	body := `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"data-sensor"},"object":{"key":"uploads/new.csv","size":10}}}]}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testMinioEventRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, ix.called, "ObjectCreated must be indexed as an upload")
+	assert.False(t, ix.deleted)
 }
 
 // ── Webhook authentication (G-3) ──────────────────────────────────────────────

@@ -340,3 +340,38 @@ func TestListPendingEventDeliveries_DBError(t *testing.T) {
 	_, err := ListPendingEventDeliveries(context.Background(), mockDB)
 	require.Error(t, err)
 }
+
+// ── MarkFileEntryDeleted ──────────────────────────────────────────────────────
+
+func TestMarkFileEntryDeleted_Success(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	now := time.Now().UTC()
+	bucketID := uuid.New()
+	entryID := uuid.New()
+
+	rows := sqlmock.NewRows([]string{
+		"id", "org_id", "file_type_id", "agent_id", "rule_id", "bucket_id",
+		"storage_path", "original_path", "file_name", "size_bytes",
+		"sha256", "etag", "content_type", "file_mtime", "status",
+		"uploaded_at", "created_at", "updated_at",
+	}).AddRow(
+		entryID, uuid.New(), nil, nil, nil, bucketID,
+		"uploads/gone.csv", nil, "gone.csv", int64(10),
+		nil, nil, nil, nil, db.FileStatusDeleted,
+		now, now, now,
+	)
+	mock.ExpectQuery("UPDATE file_entries").WillReturnRows(rows)
+
+	fe, err := MarkFileEntryDeleted(context.Background(), mockDB, bucketID, "uploads/gone.csv")
+	require.NoError(t, err)
+	assert.Equal(t, entryID, fe.ID)
+	assert.Equal(t, db.FileStatusDeleted, fe.Status)
+}
+
+func TestMarkFileEntryDeleted_NotFound(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	mock.ExpectQuery("UPDATE file_entries").WillReturnError(sql.ErrNoRows)
+
+	_, err := MarkFileEntryDeleted(context.Background(), mockDB, uuid.New(), "missing")
+	require.ErrorIs(t, err, sql.ErrNoRows)
+}

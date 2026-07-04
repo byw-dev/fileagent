@@ -18,12 +18,18 @@ type NATSPublisher interface {
 	Publish(subject string, data []byte) error
 }
 
+// defaultOrgID is the single-org UUID (Phase 1). MinIO webhook events carry no
+// org, so the webhook indexing path resolves buckets/entries under this org.
+// (Mirrors bootstrap.DefaultOrgID / agent.defaultOrgID; single-org MVP.)
+var defaultOrgID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
+
 // IndexerStore is the minimal database interface used by the Indexer. Using an
 // interface (rather than db.DBTX directly) makes the Indexer unit-testable
 // without a real database.
 type IndexerStore interface {
 	GetBucketByName(ctx context.Context, orgID uuid.UUID, name string) (*db.Bucket, error)
 	UpsertFileEntry(ctx context.Context, params UpsertFileEntryParams) (*db.FileEntry, error)
+	MarkFileEntryDeleted(ctx context.Context, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error)
 	CreateUploadLog(ctx context.Context, params CreateUploadLogParams) (*db.UploadLog, error)
 	ListFileTypeRules(ctx context.Context) ([]*db.FileTypeRule, error)
 }
@@ -41,6 +47,11 @@ func (d *dbtxIndexerStore) GetBucketByName(ctx context.Context, orgID uuid.UUID,
 // UpsertFileEntry delegates to the package-level function.
 func (d *dbtxIndexerStore) UpsertFileEntry(ctx context.Context, params UpsertFileEntryParams) (*db.FileEntry, error) {
 	return UpsertFileEntry(ctx, d.dbtx, params)
+}
+
+// MarkFileEntryDeleted delegates to the package-level function.
+func (d *dbtxIndexerStore) MarkFileEntryDeleted(ctx context.Context, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error) {
+	return MarkFileEntryDeleted(ctx, d.dbtx, bucketID, storagePath)
 }
 
 // CreateUploadLog delegates to the package-level function.
@@ -212,8 +223,7 @@ func (ix *Indexer) publishFileUploaded(fe *db.FileEntry, agentID uuid.UUID, resu
 // within the default org scope, upserts a file entry, and publishes a NATS
 // event. This method implements handler.IndexerClient.
 func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string) error {
-	// GetBucketByName requires an orgID; pass uuid.Nil for the single-org MVP.
-	bucket, err := ix.store.GetBucketByName(ctx, uuid.Nil, bucketName)
+	bucket, err := ix.store.GetBucketByName(ctx, defaultOrgID, bucketName)
 	if err != nil {
 		return fmt.Errorf("indexer: get bucket %q for minio event: %w", bucketName, err)
 	}
@@ -225,7 +235,7 @@ func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string
 	}
 
 	fileEntry, err := ix.store.UpsertFileEntry(ctx, UpsertFileEntryParams{
-		OrgID:       uuid.Nil,
+		OrgID:       defaultOrgID,
 		FileTypeID:  uuid.NullUUID{UUID: fileTypeID, Valid: fileTypeID != uuid.Nil},
 		BucketID:    bucket.ID,
 		StoragePath: objectKey,
@@ -245,4 +255,50 @@ func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string
 		zap.String("key", objectKey),
 	)
 	return nil
+}
+
+// IndexDeletion handles a MinIO ObjectRemoved event: it soft-deletes the
+// matching file entry and publishes events.file.deleted. Deleting an object that
+// was never indexed (or already deleted) is a no-op.
+func (ix *Indexer) IndexDeletion(ctx context.Context, bucketName, objectKey string) error {
+	bucket, err := ix.store.GetBucketByName(ctx, defaultOrgID, bucketName)
+	if err != nil {
+		return fmt.Errorf("indexer: get bucket %q for delete event: %w", bucketName, err)
+	}
+
+	fileEntry, err := ix.store.MarkFileEntryDeleted(ctx, bucket.ID, objectKey)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			ix.logger.Info("minio delete event: no matching file entry (no-op)",
+				zap.String("bucket", bucketName), zap.String("key", objectKey))
+			return nil
+		}
+		return fmt.Errorf("indexer: mark file entry deleted for minio event: %w", err)
+	}
+
+	ix.publishFileDeleted(fileEntry)
+	ix.logger.Info("minio delete event indexed",
+		zap.String("file_entry_id", fileEntry.ID.String()),
+		zap.String("bucket", bucketName),
+		zap.String("key", objectKey),
+	)
+	return nil
+}
+
+// publishFileDeleted emits events.file.deleted for a soft-deleted entry.
+func (ix *Indexer) publishFileDeleted(fe *db.FileEntry) {
+	payload := map[string]interface{}{
+		"file_entry_id": fe.ID.String(),
+		"bucket_id":     fe.BucketID.String(),
+		"storage_path":  fe.StoragePath,
+		"file_name":     fe.FileName,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		ix.logger.Error("indexer: marshal file deleted event", zap.Error(err))
+		return
+	}
+	if err := ix.nats.Publish("events.file.deleted", data); err != nil {
+		ix.logger.Error("indexer: publish file deleted event", zap.Error(err))
+	}
 }
