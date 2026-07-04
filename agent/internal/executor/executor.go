@@ -49,8 +49,12 @@ type Executor struct {
 
 // New creates an Executor with the given number of worker goroutines. queueMaxSize
 // caps the number of active (non-completed) tasks retained in the local queue;
-// when exceeded, Submit drops the oldest evictable (pending or failed) task. A
-// value <= 0 disables the cap (unbounded queue).
+// when exceeded, Submit drops the oldest evictable (pending or failed) task.
+//
+// A non-positive queueMaxSize disables capacity enforcement. This is an internal
+// safety default (and convenience for tests); the agent's config validation
+// requires queue_max_size > 0 (agent/internal/config), so in a running agent the
+// cap is always active.
 func New(workers int, q *queue.Queue, uploader UploadFunc, logger *zap.Logger, queueMaxSize int) *Executor {
 	if workers <= 0 {
 		workers = 1
@@ -74,10 +78,12 @@ func (e *Executor) Submit(task *queue.UploadTask) error {
 	if task.ID == "" {
 		task.ID = uuid.New().String()
 	}
-	e.enforceCapacity()
 	if err := e.queue.Enqueue(task); err != nil {
 		return fmt.Errorf("executor: enqueue task: %w", err)
 	}
+	// Trim the queue back to the cap only after the new task is safely persisted,
+	// so a failed Enqueue never costs us already-queued tasks.
+	e.enforceCapacity(task.ID)
 	// Signal workers non-blocking.
 	select {
 	case e.notify <- struct{}{}:
@@ -86,18 +92,21 @@ func (e *Executor) Submit(task *queue.UploadTask) error {
 	return nil
 }
 
-// enforceCapacity applies the configured queue_max_size cap before a new task is
-// enqueued. While the number of active (non-completed) tasks meets or exceeds the
+// enforceCapacity trims the local queue back to queue_max_size after a task has
+// been enqueued. While the number of active (non-completed) tasks exceeds the
 // cap, it drops the oldest evictable task (pending or failed) and logs a warning,
-// matching the design's queue-full policy (system-design §4.6). If nothing is
-// evictable — every active task is running, whose count is bounded by the worker
-// concurrency and so far below the cap — it warns once and accepts the new task
-// rather than blocking collection. A cap of zero or less disables enforcement.
+// matching the design's queue-full policy (system-design §4.6). newID is the
+// just-enqueued task, which is excluded from eviction so a freshly collected file
+// is never the one dropped — the queue always sheds older backlog first. If
+// nothing is evictable — every other active task is running, whose count is
+// bounded by the worker concurrency and so far below the cap — it warns once and
+// leaves the queue slightly over the cap rather than blocking collection. A cap
+// of zero or less disables enforcement.
 //
-// Enforcement is best-effort: the count/evict/enqueue steps are not a single
+// Enforcement is best-effort: the enqueue/count/evict steps are not a single
 // transaction, so under concurrent Submit calls the active count may briefly
 // exceed the cap. This is acceptable for a soft backpressure limit.
-func (e *Executor) enforceCapacity() {
+func (e *Executor) enforceCapacity(newID string) {
 	if e.queueMaxSize <= 0 {
 		return
 	}
@@ -107,16 +116,16 @@ func (e *Executor) enforceCapacity() {
 			e.logger.Warn("executor: queue capacity check failed", zap.Error(err))
 			return
 		}
-		if n < e.queueMaxSize {
+		if n <= e.queueMaxSize {
 			return
 		}
-		dropped, err := e.queue.DeleteOldestEvictable()
+		dropped, err := e.queue.DeleteOldestEvictable(newID)
 		if err != nil {
 			e.logger.Warn("executor: queue eviction failed", zap.Error(err))
 			return
 		}
 		if dropped == nil {
-			e.logger.Warn("executor: queue full but no evictable task; accepting task anyway",
+			e.logger.Warn("executor: queue over capacity but no evictable task; keeping task anyway",
 				zap.Int("queue_max_size", e.queueMaxSize),
 				zap.Int("active", n),
 			)

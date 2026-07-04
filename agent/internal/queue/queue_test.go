@@ -357,7 +357,7 @@ func TestDeleteOldestEvictable(t *testing.T) {
 	require.NoError(t, q.Enqueue(taskAt("mid", 200)))
 	require.NoError(t, q.Enqueue(taskAt("new", 300)))
 
-	dropped, err := q.DeleteOldestEvictable()
+	dropped, err := q.DeleteOldestEvictable("")
 	require.NoError(t, err)
 	require.NotNil(t, dropped)
 	assert.Equal(t, "old", dropped.ID)
@@ -379,7 +379,7 @@ func TestDeleteOldestEvictable_IncludesFailedSkipsRunning(t *testing.T) {
 	require.NoError(t, q.MarkFailed("failed", "boom"))
 	require.NoError(t, q.Enqueue(taskAt("pending", 300)))
 
-	dropped, err := q.DeleteOldestEvictable()
+	dropped, err := q.DeleteOldestEvictable("")
 	require.NoError(t, err)
 	require.NotNil(t, dropped)
 	assert.Equal(t, "failed", dropped.ID,
@@ -393,7 +393,7 @@ func TestDeleteOldestEvictable_OnlyRunning(t *testing.T) {
 	require.NoError(t, q.Enqueue(taskAt("running", 100)))
 	require.NoError(t, q.UpdateStatus("running", StatusRunning))
 
-	dropped, err := q.DeleteOldestEvictable()
+	dropped, err := q.DeleteOldestEvictable("")
 	require.NoError(t, err)
 	assert.Nil(t, dropped)
 }
@@ -401,7 +401,31 @@ func TestDeleteOldestEvictable_OnlyRunning(t *testing.T) {
 func TestDeleteOldestEvictable_Empty(t *testing.T) {
 	q := openMemQueue(t)
 
-	dropped, err := q.DeleteOldestEvictable()
+	dropped, err := q.DeleteOldestEvictable("")
+	require.NoError(t, err)
+	assert.Nil(t, dropped)
+}
+
+func TestDeleteOldestEvictable_ExcludesGivenID(t *testing.T) {
+	q := openMemQueue(t)
+
+	require.NoError(t, q.Enqueue(taskAt("old", 100)))
+	require.NoError(t, q.Enqueue(taskAt("new", 200)))
+
+	// Excluding the oldest forces eviction to skip it and pick the next candidate.
+	dropped, err := q.DeleteOldestEvictable("old")
+	require.NoError(t, err)
+	require.NotNil(t, dropped)
+	assert.Equal(t, "new", dropped.ID)
+}
+
+func TestDeleteOldestEvictable_ExcludedIsOnlyCandidate(t *testing.T) {
+	q := openMemQueue(t)
+
+	// The only evictable task is the excluded one → nothing to drop.
+	require.NoError(t, q.Enqueue(taskAt("solo", 100)))
+
+	dropped, err := q.DeleteOldestEvictable("solo")
 	require.NoError(t, err)
 	assert.Nil(t, dropped)
 }

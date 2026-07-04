@@ -1023,12 +1023,15 @@ CREATE INDEX idx_processed_files_rule ON processed_files (rule_id, local_path);
 
 - Worker goroutine 数量默认为 3，可由 Control Plane 下发配置动态调整；
 - 失败任务按指数退避重试：1min → 5min → 15min → 60min，最多重试 10 次；
-- 超过重试上限的任务标记为 failed，上报 Control Plane，不自动删除；
-- 本地队列总大小上限可配置（`queue_max_size`，默认 10000 条）。入队新任务前，
-  当活跃任务数（pending + running + failed，不含 completed）达到上限时，丢弃**最旧的可驱逐任务**
-  （状态为 pending 或 failed；running 为在途上传不驱逐，其数量受 worker 并发数约束）并告警。
+- 超过重试上限的任务标记为 failed，上报 Control Plane，正常重试流程中**不主动删除**
+  （唯一例外是下方 `queue_max_size` 容量驱逐：容量吃紧时最旧的 failed 行也可能被驱逐）；
+- 本地队列总大小上限可配置（`queue_max_size`，默认 10000 条；config 校验要求 **> 0**，即始终有界）。
+  **新任务先入队、再回收**：入队成功后，当活跃任务数（pending + running + failed，不含 completed）
+  超过上限时，丢弃**最旧的可驱逐任务**（状态为 pending 或 failed；running 为在途上传不驱逐，
+  其数量受 worker 并发数约束）并告警。先入队后回收可避免"已驱逐旧任务却因入队失败而白白丢数据"，
+  且刚入队的新任务被排除在驱逐之外，保证新采集的文件不会被自己的 submit 挤掉。
   失败任务必须可驱逐——上传持续中断时任务会在 pending→running→failed 间循环，待清理的积压主要处于 failed 态，
-  若只驱逐 pending 则断网久了队列仍会无限增长。上限 ≤ 0 视为不限制。
+  若只驱逐 pending 则断网久了队列仍会无限增长。
 
 ## 4.7 凭据管理与轮转
 

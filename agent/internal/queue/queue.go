@@ -235,6 +235,11 @@ func (q *Queue) CountActive() (int, error) {
 // under a sustained upload outage tasks continually cycle pending→running→failed,
 // so the backlog to bound lives largely in the "failed" state.
 //
+// excludeID is never evicted (pass "" to exclude nothing). Capacity enforcement
+// runs after the new task has been enqueued and passes that task's id here, so a
+// freshly collected file is never the one dropped — eviction always sheds older
+// backlog first.
+//
 // The SELECT and DELETE are separate statements, so a worker's DequeuePending
 // could transition the chosen row to "running" in between. The DELETE is
 // therefore guarded by the same status filter and, if it removes nothing (the row
@@ -242,7 +247,7 @@ func (q *Queue) CountActive() (int, error) {
 // prevents deleting an in-flight task and orphaning its upload. Retries are
 // bounded; if the queue is churning too hard to settle on a victim it returns
 // (nil, nil), which the caller treats as "nothing evictable".
-func (q *Queue) DeleteOldestEvictable() (*UploadTask, error) {
+func (q *Queue) DeleteOldestEvictable(excludeID string) (*UploadTask, error) {
 	const maxAttempts = 8
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		rows, err := q.db.Query(`
@@ -251,9 +256,9 @@ func (q *Queue) DeleteOldestEvictable() (*UploadTask, error) {
                retry_count, last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
-        WHERE status IN (?, ?)
+        WHERE status IN (?, ?) AND id != ?
         ORDER BY created_at ASC
-        LIMIT 1`, StatusPending, StatusFailed)
+        LIMIT 1`, StatusPending, StatusFailed, excludeID)
 		if err != nil {
 			return nil, fmt.Errorf("queue: select oldest evictable: %w", err)
 		}

@@ -311,6 +311,41 @@ func TestExecutor_Submit_AtCapButNothingPendingToEvict(t *testing.T) {
 	assert.Equal(t, 3, n) // exceeded cap because nothing was evictable
 }
 
+// Enforcement runs after the enqueue, so the just-submitted task is never the one
+// dropped: at cap it sheds older backlog and keeps the fresh file.
+func TestExecutor_Submit_KeepsNewTaskEvictsOld(t *testing.T) {
+	q := newTestQueue(t)
+	e := New(1, q, successUploader, zap.NewNop(), 1) // cap of 1
+
+	require.NoError(t, e.Submit(taskWithTime("old", "/old", 1)))
+	require.NoError(t, e.Submit(taskWithTime("new", "/new", 2)))
+
+	pending, err := q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "new", pending[0].ID, "the freshly submitted task must survive; the older one is evicted")
+}
+
+// When the new task is the only evictable one (all others in-flight), it is kept
+// rather than immediately dropped — collection is never starved by its own submit.
+func TestExecutor_Submit_NeverEvictsOnlyTheNewTask(t *testing.T) {
+	q := newTestQueue(t)
+	e := New(1, q, successUploader, zap.NewNop(), 1) // cap of 1
+
+	// Occupy the cap with a running (in-flight, non-evictable) task.
+	require.NoError(t, e.Submit(taskWithTime("running", "/r", 1)))
+	running, err := q.DequeuePending(10)
+	require.NoError(t, err)
+	require.Len(t, running, 1)
+
+	require.NoError(t, e.Submit(taskWithTime("new", "/new", 2)))
+
+	pending, err := q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, "new", pending[0].ID, "new task must not evict itself when it is the only evictable candidate")
+}
+
 // When a failed task is evicted (queue_max_size) while its retry goroutine is
 // still sleeping, the re-queue on wake finds the row gone. That is expected, so
 // it must log at debug ("retry skipped") — not warn ("re-queue failed").
@@ -326,7 +361,7 @@ func TestExecutor_RetryOfEvictedTaskLogsNoWarning(t *testing.T) {
 	e.handleFailure(task, fmt.Errorf("boom"))
 
 	// Evict the (now failed) task before the retry goroutine wakes.
-	dropped, err := q.DeleteOldestEvictable()
+	dropped, err := q.DeleteOldestEvictable("")
 	require.NoError(t, err)
 	require.NotNil(t, dropped)
 
