@@ -1460,6 +1460,30 @@ NATS 主题规划：
 | DELETE | /api/v1/event-rules/{id}            | 删除事件规则                 |
 | GET    | /api/v1/event-rules/{id}/deliveries | 查看事件投递历史               |
 
+### 5.11.5 仪表盘统计
+
+| Method | Path                     | 说明                       |
+|--------|--------------------------|--------------------------|
+| GET    | /api/v1/stats/dashboard  | 仪表盘聚合数据（见下方响应） |
+
+仪表盘所需的聚合**由服务端一次算好**返回，前端不再从"最近若干条日志"抽样估算
+（避免 §7.3.1 出现的失真，见 D-016）。响应：
+
+```json
+{
+  "total_agents": 15,
+  "online_agents": 12,
+  "total_files": 89234,
+  "storage_bytes": 2528876743884,
+  "today_uploads": 1234,
+  "upload_trend": [ {"date": "2026-06-28", "count": 0}, ... ]  // 最近 7 天，UTC，最旧在前
+}
+```
+
+- `online_agents`：`last_seen_at` 在离线阈值（90s）内的采集器数。
+- `storage_bytes`：`file_entries.size_bytes` 之和（CP 索引口径，非 MinIO 物理用量）。
+- `today_uploads` / `upload_trend`：按 `uploaded_at`（UTC）统计；趋势补齐为稠密 7 天。
+
 **统一错误响应格式：**
 
 ```json
@@ -1710,6 +1734,10 @@ mc event add myminio/data-sensor primary \
 │  底部：最近上传日志（最新20条）                                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+统计卡片与 7 日趋势的数据来自 `GET /api/v1/stats/dashboard`（§5.11.5），
+由服务端聚合返回真实值；采集器在线状态列表来自 `GET /api/v1/agents`，
+最近上传日志来自 `GET /api/v1/upload-logs`。
 
 ### 7.3.2 采集规则创建表单（分步，共3步）
 
@@ -2244,6 +2272,7 @@ migrations/
 | DELETE | /api/v1/event-rules/{id}            | 删除事件规则            |
 | GET    | /api/v1/event-rules/{id}/deliveries | 事件投递历史            |
 | GET    | /api/v1/upload-logs                 | 上传日志查询            |
+| GET    | /api/v1/stats/dashboard             | 仪表盘聚合统计           |
 | POST   | /internal/minio-event               | MinIO 事件回调（仅内部访问） |
 
 ---

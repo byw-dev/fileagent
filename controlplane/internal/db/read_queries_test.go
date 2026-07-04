@@ -399,3 +399,54 @@ func TestNewCursorFromDelivery(t *testing.T) {
 	assert.True(t, uid.Valid)
 	assert.Equal(t, id, uid.UUID)
 }
+
+// ── DashboardStats ────────────────────────────────────────────────────────────
+
+func TestDashboardStats_AggregatesAndTrendSkeleton(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	orgID := uuid.New()
+	now := time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC)
+
+	intRow := func(n int64) *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"count"}).AddRow(n)
+	}
+
+	// Queries run in order: total agents, online agents, total files, storage,
+	// today's uploads, then the trend group-by.
+	mock.ExpectQuery(`COUNT\(\*\) FROM agents WHERE org_id = \$1`).WillReturnRows(intRow(10))
+	mock.ExpectQuery(`FROM agents WHERE org_id = \$1 AND last_seen_at`).WillReturnRows(intRow(7))
+	mock.ExpectQuery(`COUNT\(\*\) FROM file_entries WHERE org_id = \$1`).WillReturnRows(intRow(1234))
+	mock.ExpectQuery(`COALESCE\(SUM\(size_bytes\)`).WillReturnRows(intRow(5000000))
+	mock.ExpectQuery(`FROM file_entries WHERE org_id = \$1 AND uploaded_at`).WillReturnRows(intRow(42))
+	// Trend: only two days have data; the rest of the 7-day window must be 0.
+	mock.ExpectQuery(`date_trunc\('day', uploaded_at`).WillReturnRows(
+		sqlmock.NewRows([]string{"day", "count"}).
+			AddRow("2026-07-03", int64(3)).
+			AddRow("2026-07-04", int64(9)),
+	)
+
+	stats, err := q.DashboardStats(context.Background(), orgID, now)
+	require.NoError(t, err)
+	assert.Equal(t, int64(10), stats.TotalAgents)
+	assert.Equal(t, int64(7), stats.OnlineAgents)
+	assert.Equal(t, int64(1234), stats.TotalFiles)
+	assert.Equal(t, int64(5000000), stats.StorageBytes)
+	assert.Equal(t, int64(42), stats.TodayUploads)
+
+	// Dense 7-day skeleton, oldest first, ending today (2026-07-04).
+	require.Len(t, stats.UploadTrend, 7)
+	assert.Equal(t, "2026-06-28", stats.UploadTrend[0].Date)
+	assert.Equal(t, int64(0), stats.UploadTrend[0].Count)
+	assert.Equal(t, "2026-07-03", stats.UploadTrend[5].Date)
+	assert.Equal(t, int64(3), stats.UploadTrend[5].Count)
+	assert.Equal(t, "2026-07-04", stats.UploadTrend[6].Date)
+	assert.Equal(t, int64(9), stats.UploadTrend[6].Count)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDashboardStats_DBError(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectQuery(`COUNT\(\*\) FROM agents`).WillReturnError(assert.AnError)
+	_, err := q.DashboardStats(context.Background(), uuid.New(), time.Now())
+	require.Error(t, err)
+}

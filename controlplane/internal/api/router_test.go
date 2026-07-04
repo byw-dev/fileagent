@@ -73,6 +73,7 @@ func TestProtectedRoutes_NoToken_Returns401(t *testing.T) {
 		{"GET", "/api/v1/event-rules"},
 		{"GET", "/api/v1/upload-logs"},
 		{"GET", "/api/v1/users"},
+		{"GET", "/api/v1/stats/dashboard"},
 	}
 
 	for _, rt := range protectedRoutes {

@@ -61,6 +61,30 @@ describe('services/upload-logs', () => {
   })
 })
 
+describe('services/stats', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('getDashboardStats calls GET /api/v1/stats/dashboard and returns aggregates', async () => {
+    mockGet.mockResolvedValue({
+      data: {
+        total_agents: 10,
+        online_agents: 7,
+        total_files: 1234,
+        storage_bytes: 5_000_000,
+        today_uploads: 42,
+        upload_trend: [{ date: '2026-07-04', count: 9 }],
+      },
+    })
+    const { getDashboardStats } = await import('../services/stats')
+    const result = await getDashboardStats()
+    expect(mockGet).toHaveBeenCalledWith('/api/v1/stats/dashboard')
+    expect(result.online_agents).toBe(7)
+    expect(result.upload_trend).toHaveLength(1)
+  })
+})
+
 describe('services/agents – extended functions', () => {
   beforeEach(() => {
     vi.clearAllMocks()
