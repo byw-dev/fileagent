@@ -61,14 +61,7 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		if s.cache != nil {
 			_ = s.cache.Del(context.Background(), cache.AgentOnlineKey(agentID))
 		}
-		if s.stateDB != nil {
-			if id, err := uuid.Parse(agentID); err == nil {
-				if _, dbErr := s.stateDB.UpdateAgentStatus(context.Background(), id, db.AgentStatusOffline); dbErr != nil {
-					s.logger.Warn("disconnect: update status to offline failed", zap.Error(dbErr))
-				}
-			}
-		}
-		s.publishEvent("events.agent.offline", agentID)
+		s.markOfflineOnDisconnect(agentID)
 		s.logger.Info("agent disconnected", zap.String("agent_id", agentID))
 	}()
 
@@ -276,6 +269,31 @@ func (s *Server) handleUploadResult(ctx context.Context, agentID string, result 
 			zap.String("agent_id", agentID),
 			zap.Error(err),
 		)
+	}
+}
+
+// markOfflineOnDisconnect transitions the agent to offline on stream disconnect
+// and publishes events.agent.offline, but only when it actually transitions from
+// online. This mirrors the offline sweeper's conditional update so a disconnect
+// does not double-fire the offline event if the sweeper already marked the agent
+// offline. When no state DB is wired (e.g. unit tests), it preserves the prior
+// always-publish behaviour.
+func (s *Server) markOfflineOnDisconnect(agentID string) {
+	if s.stateDB == nil {
+		s.publishEvent("events.agent.offline", agentID)
+		return
+	}
+	id, err := uuid.Parse(agentID)
+	if err != nil {
+		return
+	}
+	rows, dbErr := s.stateDB.MarkAgentOfflineIfOnline(context.Background(), id)
+	if dbErr != nil {
+		s.logger.Warn("disconnect: update status to offline failed", zap.Error(dbErr))
+		return
+	}
+	if rows > 0 {
+		s.publishEvent("events.agent.offline", agentID)
 	}
 }
 
