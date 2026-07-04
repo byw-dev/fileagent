@@ -33,8 +33,8 @@
 | 编号 | 问题 | 位置 | 报告 |
 |------|------|------|------|
 | ~~G-1~~ ✅ | ~~**SDK↔CP refresh 契约断裂**：SDK 放 body，CP 只认 header。~~ **已修复（2026-07-03，止血冲刺第 1 步）**：CP 改读 body（header 回退）+ 补 token 轮转；记 DECISIONS D-012；新增跨进程契约测试 `TestRefresh_Integration_BodyContractAndRotation`（本项目首个）。真实 CP 实测：body 契约✅ / 轮转✅ / 连续刷新✅ / 旧 token 吊销 401✅ | `cp auth.go Refresh` | 06 E-2 |
-| G-2 | **Agent token 定时炸弹**：签的是 2h access token，重连超 2h 即被拒、永久掉线无法自愈 | `manager.go` accessTTL / `interceptor.go:109` | 06 E-1 |
-| G-3 | **/internal/minio-event 无鉴权**：任何人可伪造上传事件污染 file_entries | `events.go` MinioEventHandler | 01 §1 |
+| ~~G-2~~ ✅ | ~~**Agent token 定时炸弹**：签的是 2h access token，重连超 2h 即被拒、永久掉线无法自愈。~~ **已修复（PR #40，止血冲刺第 2 步）**：双重防御——CP 改签长效 token（`AGENT_TOKEN_TTL`，默认 720h）+ Agent 在 Unauthenticated 时经 `PollApproval` 重连自愈；记 DECISIONS D-013 | `manager.go` / `grpcclient` | 06 E-1 |
+| ~~G-3~~ ✅ | ~~**/internal/minio-event 无鉴权**：任何人可伪造上传事件污染 file_entries。~~ **已修复（PR #41，止血冲刺第 3 步）**：用 `INTERNAL_WEBHOOK_SECRET` 校验 MinIO `auth_token`（哈希后常量时间比较），未配置密钥时 fail-closed；记 DECISIONS D-014。真实 CP 实测：无凭据/错密钥 401、正确密钥 200 | `events.go` MinioEventHandler | 01 §1 |
 
 ### P1 — "看起来完成了"的空心功能，用户一用就露馅
 
@@ -66,6 +66,11 @@
 ---
 
 ## 三、破局建议：先修回路，再修功能
+
+> **执行进度（截至 2026-07-04）**：三个 P0 已全部修复合并——G-1（PR #39，含本项目首个
+> 跨进程契约测试）、G-2（PR #40）、G-3（PR #41）。第 4 步"文档纠偏"进行中（本次同步：
+> 回填 design §4.7/§5.3.2/§6.5、修正 CLAUDE.md 定性与当前阶段）。**未做**：第 1 步的
+> OpenAPI/契约单一权威治理（G-8/G-9 仍在 backlog）、第 3 步空心功能（G-4/G-5，P1 待排）。
 
 不建议继续按 T3-3、T3-4… 线性往下推——那只会制造第四次 FIX 循环。建议插入一个
 **"止血 + 建立可信判据"的收尾冲刺**，顺序如下：

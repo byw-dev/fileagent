@@ -38,7 +38,7 @@ fileagent/                        # Monorepo 根目录
 │
 ├── docs/
 │   ├── design/
-│   │   ├── system-design.md      # 完整系统设计文档（权威来源）
+│   │   ├── system-design.md      # 系统设计文档（架构背景；细节可能滞后于代码）
 │   │   └── fileagent_design_complete.docx
 │   ├── reports/                  # 审计报告（已归档）
 │   └── tasks/                    # 任务管理（详见 TASK_LIST.md 导航）
@@ -308,8 +308,20 @@ docker compose -f deploy/docker-compose.test.yml down -v
 
 ## 当前阶段
 
-当前为 **Phase 3 — 集成联调**（T3-1 ✅，T3-1-FIX ✅，T3-1-BUGFIX ✅，T3-2-FIX ✅，T3-2-BUG ✅，T3-2 进行中）。
-详细任务与状态以 `docs/tasks/active.md` + `docs/tasks/phases/phase-3.md` 为准；`TASK_LIST.md` 提供总索引。
+当前为 **Phase 3 — 集成联调**。近期完成了一轮"止血冲刺"：全面差异分析
+（`docs/reports/design-gap-analysis/`）后修复并合并了三个 P0——G-1（refresh 契约，D-012）、
+G-2（Agent token 生命周期，D-013）、G-3（minio-event 端点鉴权，D-014）。
+后续排期：P1（G-4 心跳载荷、G-5 Dashboard 统计）与 T3-3（Python SDK 联调）。
+详细任务与状态以 `docs/tasks/active.md` 为准；`TASK_LIST.md` 提供总索引。
+
+> **文档权威优先级**（层级从高到低）：
+> 1. **代码是最终真相**——`proto/v1/agent.proto`、`controlplane/migrations/`、
+>    handler 的 struct/响应体即契约本身；任何冲突以代码为准。
+> 2. `DECISIONS.md` 记录**决策与其理由**——解释代码为何如此、否决了什么，
+>    用于理解背景，**不覆盖代码实现**。
+> 3. `system-design.md` 是**架构背景**，最可能滞后于代码。
+>
+> 修改行为的决策，收尾应就地更新 `system-design.md` 相关章节，避免文档再次漂移。
 
 **开始任务前必须确认（按顺序）：**
 1. 读本文件（`CLAUDE.md`）全文。
