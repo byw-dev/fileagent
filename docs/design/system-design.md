@@ -1031,8 +1031,11 @@ CREATE INDEX idx_processed_files_rule ON processed_files (rule_id, local_path);
 ```
 Auth Token（JWT）管理：
   - 存储：加密后写入本地文件（AES-256-GCM，密钥派生自 fingerprint）
-  - 有效期：由 Control Plane 配置，默认 30 天
-  - 续期触发：有效期剩余 < 20% 时，通过已有 gRPC 连接请求续期
+  - 有效期：由 Control Plane 配置项 AGENT_TOKEN_TTL 控制，默认 30 天（720h）；
+    刻意长效——Agent 复用同一 token 跨重连，短 TTL 会在过期后令重连被拒（见 D-013）
+  - 重连自愈：无专门的续期 RPC。当 Control Plane 以 gRPC Unauthenticated 拒绝
+    token（过期/被吊销后重新审批）时，Agent 通过免鉴权的 PollApproval 重新领取 token
+    再重连；非审批态不发新 token，已吊销 Agent 不会自愈（见 D-013）
   - 吊销感知：服务端推送 RevokeCommand，立即清除本地 token
 
 STS 凭据（MinIO 临时访问密钥）管理：
@@ -1253,9 +1256,14 @@ func IsRevoked(jti string) bool {
 | Method | Path              | 说明                              | 认证要求          |
 |--------|-------------------|---------------------------------|---------------|
 | POST   | /api/auth/login   | 用户名密码登录，返回双 Token               | 无             |
-| POST   | /api/auth/refresh | 用 Refresh Token 换新 Access Token | Refresh Token |
+| POST   | /api/auth/refresh | 用 Refresh Token 换新令牌对（见下方契约） | Refresh Token（请求体） |
 | POST   | /api/auth/logout  | 吊销当前 Token                      | Access Token  |
 | GET    | /api/auth/me      | 返回当前用户信息                        | Access Token  |
+
+**`/api/auth/refresh` 契约（D-012）**：refresh token 通过 **JSON 请求体**
+`{"refresh_token": "..."}` 传递（OAuth2 refresh-grant 惯例；Bearer 头作为向后兼容回退），
+响应执行**令牌轮转**——返回新的 `{access_token, refresh_token, expires_in, token_type}`
+并吊销旧 refresh token。Web UI 与 SDK 均依赖此契约（历史上因 CP 只读 header、不轮转而断裂）。
 
 ### 5.3.3 OIDC 扩展预留
 
@@ -1613,6 +1621,11 @@ mc admin config set myminio notify_webhook:primary \
 mc event add myminio/data-sensor primary \
     --event "s3:ObjectCreated:*,s3:ObjectRemoved:*"
 ```
+
+**Control Plane 侧鉴权（D-014）**：`/internal/minio-event` 会把外部输入写入
+`file_entries`，故必须鉴权。CP 用配置项 `INTERNAL_WEBHOOK_SECRET` 校验 MinIO 发来的
+`auth_token`（`Authorization` 头，兼容 `Bearer <token>` 与裸 token，常量时间比较）。
+**未配置密钥时端点失败即拒（fail-closed）**，拒绝一切请求而非放行，避免未鉴权写入。
 
 ## 6.6 MinIO 管理功能在后台的集成
 
