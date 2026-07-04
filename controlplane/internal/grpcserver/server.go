@@ -65,6 +65,10 @@ type CredentialDB interface {
 type AgentStateDB interface {
 	UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error
 	UpdateAgentStatus(ctx context.Context, id uuid.UUID, status db.AgentStatus) (*db.Agent, error)
+	// MarkAgentOnlineIfNotOnline restores status to online (rows==1) when a
+	// heartbeat proves the agent is alive but the DB says otherwise — e.g. after
+	// the offline sweeper's reconnect-race false positive.
+	MarkAgentOnlineIfNotOnline(ctx context.Context, id uuid.UUID) (int64, error)
 }
 
 // DirResultDeliverer receives directory-listing results from the agent gRPC

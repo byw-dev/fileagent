@@ -70,8 +70,10 @@ func (m *mockNATS) Publish(subject string, _ []byte) error {
 // ── Mock AgentStateDB ─────────────────────────────────────────────────────────
 
 type mockStateDB struct {
-	lastSeenCalled bool
-	updateStatus   db.AgentStatus
+	lastSeenCalled  bool
+	updateStatus    db.AgentStatus
+	markOnlineRows  int64 // rows returned by MarkAgentOnlineIfNotOnline (0 = already online)
+	markOnlineCalls int
 }
 
 func (m *mockStateDB) UpdateAgentLastSeen(_ context.Context, _ uuid.UUID) error {
@@ -82,6 +84,11 @@ func (m *mockStateDB) UpdateAgentLastSeen(_ context.Context, _ uuid.UUID) error 
 func (m *mockStateDB) UpdateAgentStatus(_ context.Context, _ uuid.UUID, status db.AgentStatus) (*db.Agent, error) {
 	m.updateStatus = status
 	return &db.Agent{Status: status}, nil
+}
+
+func (m *mockStateDB) MarkAgentOnlineIfNotOnline(_ context.Context, _ uuid.UUID) (int64, error) {
+	m.markOnlineCalls++
+	return m.markOnlineRows, nil
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -182,6 +189,38 @@ func TestHandleHeartbeat_UpdatesLastSeenAt(t *testing.T) {
 
 	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
 	assert.True(t, stateDB.lastSeenCalled, "UpdateAgentLastSeen should have been called")
+}
+
+func TestHandleHeartbeat_RestoresOnlineWhenStale(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	agentID := "00000000-0000-0000-0000-000000000002"
+	stateDB := &mockStateDB{markOnlineRows: 1} // DB was not online → restore transitions it
+	nats := &mockNATS{}
+	srv.WithStateDB(stateDB)
+	srv.WithDeps(nil, nil, nil, nats, nil)
+
+	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+
+	assert.Equal(t, 1, stateDB.markOnlineCalls)
+	assert.Contains(t, nats.published, "events.agent.online",
+		"a heartbeat that restores a stale-offline agent must publish a corrective online event")
+}
+
+func TestHandleHeartbeat_NoOnlineEventWhenAlreadyOnline(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	agentID := "00000000-0000-0000-0000-000000000003"
+	stateDB := &mockStateDB{markOnlineRows: 0} // already online → no transition
+	nats := &mockNATS{}
+	srv.WithStateDB(stateDB)
+	srv.WithDeps(nil, nil, nil, nats, nil)
+
+	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+
+	assert.Equal(t, 1, stateDB.markOnlineCalls)
+	assert.NotContains(t, nats.published, "events.agent.online",
+		"steady-state heartbeats must not emit online events")
 }
 
 func TestHandleHeartbeat_NilStateDB_NoPanic(t *testing.T) {

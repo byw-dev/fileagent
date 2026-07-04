@@ -59,12 +59,14 @@ type EventPublisher interface {
 // OfflineSweeper reconciles persistent agent status against Redis presence TTL.
 //
 // It assumes a single Control Plane instance (the v1 deployment model), so no
-// distributed lock is used. Enforcement is best-effort: an agent that reconnects
-// in the small window between the presence check and the conditional status
-// update may be transiently marked offline. That window is microseconds and the
-// conditional update (MarkAgentOfflineIfOnline) already prevents duplicating the
-// disconnect path's event; a reconnected agent's presence key is present, so it
-// is skipped on the next sweep regardless.
+// distributed lock is used. Enforcement is best-effort: a reconnected agent whose
+// presence key is present is skipped, but in the microsecond window between the
+// presence check and the conditional update a just-reconnected agent could still
+// be marked offline (emitting a spurious offline event). Two things bound that:
+// the conditional update (MarkAgentOfflineIfOnline) never duplicates the
+// disconnect path's event, and the heartbeat handler self-heals a false offline —
+// it restores status to online and publishes a corrective online event on the
+// agent's next heartbeat, so a false positive cannot become durable.
 type OfflineSweeper struct {
 	db        StatusDB
 	cache     PresenceCache

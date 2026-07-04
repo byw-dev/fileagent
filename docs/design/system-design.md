@@ -1236,6 +1236,9 @@ func (s *AgentServer) Connect(stream AgentService_ConnectServer) error {
   2. **TTL 兜底扫描**（CC-6，`internal/worker` OfflineSweeper）：CP 崩溃/重启、TCP 半开时上面的 defer 不执行，
      Redis Key 仍会过期但 DB 状态与离线事件会残留 online——后台每 30s 扫描"DB=online 但 Redis Key 已过期"的
      Agent，兜底置 `offline` 并补发 `events.agent.offline`。属最终一致的兜底，非精确即时判定。
+  3. **心跳自愈**：兜底扫描在"EXISTS→UPDATE"极窄窗口内可能误判一个刚重连的 Agent 为离线；心跳处理据此
+     自愈——收到心跳时若 DB 状态非 online 则条件式恢复为 online 并补发 `events.agent.online`（稳态下 0 行、不刷事件），
+     使误判不可持久。
 - Control Plane 实例重启后，从 Redis 恢复在线状态，等待 Agent 重连；真正已离线的 Agent 由上面的 TTL 兜底扫描收敛。
 
 ## 5.3 用户认证模块

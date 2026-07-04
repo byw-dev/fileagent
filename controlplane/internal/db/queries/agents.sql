@@ -50,6 +50,17 @@ SET status = 'offline',
     updated_at = NOW()
 WHERE id = $1 AND status = 'online';
 
+-- name: MarkAgentOnlineIfNotOnline :execrows
+-- Restore an agent to online when a heartbeat arrives but the persisted status is
+-- not online. Returns rows affected (1 = actually restored), so the heartbeat
+-- handler can self-heal a status that the offline sweeper marked offline in the
+-- narrow reconnect race, and publish a corrective events.agent.online only when a
+-- transition really happened (0 rows in steady state = no event spam).
+UPDATE agents
+SET status = 'online',
+    updated_at = NOW()
+WHERE id = $1 AND status <> 'online';
+
 -- name: UpdateAgentLastSeen :exec
 UPDATE agents
 SET last_seen_at = NOW(),

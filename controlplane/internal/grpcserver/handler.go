@@ -204,6 +204,17 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 			if dbErr := s.stateDB.UpdateAgentLastSeen(ctx, id); dbErr != nil {
 				s.logger.Warn("heartbeat: update last_seen_at failed", zap.Error(dbErr))
 			}
+			// Self-heal: a heartbeat proves the agent is alive, so if the DB status
+			// is not online (e.g. the offline sweeper's reconnect-race false
+			// positive), restore it and publish a corrective online event. The
+			// conditional update is a no-op (0 rows) in steady state, so this does
+			// not spam events on every heartbeat.
+			if rows, dbErr := s.stateDB.MarkAgentOnlineIfNotOnline(ctx, id); dbErr != nil {
+				s.logger.Warn("heartbeat: restore online status failed", zap.Error(dbErr))
+			} else if rows > 0 {
+				s.logger.Info("heartbeat: restored agent to online", zap.String("agent_id", agentID))
+				s.publishEvent("events.agent.online", agentID)
+			}
 		}
 	}
 	// Persist the live telemetry snapshot (G-4) so the agents API can surface
