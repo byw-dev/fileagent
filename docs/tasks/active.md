@@ -5,12 +5,17 @@
 
 ---
 
-## 当前任务：CC-3 — Bucket Policy + tmp-uploads Lifecycle
+## 当前任务：CC-6 — TTL 驱动的离线兜底扫描
 
 **所属冲刺**：core-completeness（核心模块补完备）
-**涉及模块**：controlplane（storage 层）
-**缺口**：设计 §6.6 要求 **controlplane 创建 Bucket 后**自动 `SetBucketPolicy` + 给 `tmp-uploads` 配 7 天 Lifecycle。现状：**CP 运行时经 API 新建 bucket 的代码路径既不设 Policy 也不配 Lifecycle**；`deploy/scripts/init-minio.sh` 虽*尝试*给种子 `tmp-uploads` 配 Lifecycle，但 e2e 实测该步报错未生效（`../reports/design-gap-analysis/06-e2e-verification.md` D-1，`Unable to read ILM configuration`）。CC-3 应在 CP 侧可靠实现，不依赖初始化脚本。
-**权威 backlog 与验收**：[`docs/tasks/core-completeness.md`](core-completeness.md) CC-3（Tier B）
+**涉及模块**：controlplane（新增 `internal/worker` OfflineSweeper）
+**缺口**：Agent 在线状态只在 gRPC 流干净断开时置离线；CP 崩溃/重启、TCP 半开时 DB `agents.status`
+残留 online 且 `events.agent.offline` 永不发布。加后台扫描，把"DB=online 但 Redis 在线 key 已过期"的
+Agent 兜底置 offline + 补发离线事件（设计 §5.2）。
+**权威 backlog 与验收**：[`docs/tasks/core-completeness.md`](core-completeness.md) CC-6（Tier B）
+
+> **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
+> bucket policy 对本系统冗余（MinIO 默认私有，访问全走 STS/presigned IAM）。待有 staging workflow 再做。
 
 > 每项 CC 独立 PR + Copilot review，改完真跑 e2e 再算完成。
 
@@ -22,8 +27,9 @@
 |----|------|------|------|
 | CC-1 | CP + webui | `file_deleted` 事件死配置 | ✅ PR #47 / D-017 |
 | CC-2 | Agent | `queue_max_size` 未强制 | ✅ PR #48 |
-| **CC-3** | CP | Bucket Policy + tmp-uploads Lifecycle | ⬜ **进行中** |
-| CC-4~7 | CP | 限流 / request_id / TTL 离线兜底 / kafka_publish | ⬜ |
+| CC-3 | CP | Bucket Policy + tmp-uploads Lifecycle | ⏸️ 已推后（低价值，见上） |
+| **CC-6** | CP | TTL 驱动离线兜底扫描 | ⬜ **进行中** |
+| CC-4 / CC-5 / CC-7 | CP | 限流 / request_id + 未知参数 / kafka_publish | ⬜ |
 | CC-8~10 | webui | Agent 重命名 / 规则原地编辑 / 隐性契约文档 | ⬜（视使用价值） |
 
 前序已收官：**止血冲刺（P0+P1）** G-1…G-5（PR #39–#45，D-012…D-016），

@@ -326,3 +326,44 @@ func (q *Queries) UpdateAgentStatus(ctx context.Context, iD uuid.UUID, status Ag
 	)
 	return &i, err
 }
+
+const markAgentOfflineIfOnline = `-- name: MarkAgentOfflineIfOnline :execrows
+UPDATE agents
+SET status = 'offline',
+    updated_at = NOW()
+WHERE id = $1 AND status = 'online'
+`
+
+// Transition an agent to offline only when it is currently online. Returns the
+// number of rows affected (1 = actually transitioned, 0 = already offline or
+// gone), so a caller such as the offline sweeper can publish
+// events.agent.offline exactly once and avoid double-firing when the gRPC
+// disconnect path already marked the agent offline.
+func (q *Queries) MarkAgentOfflineIfOnline(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markAgentOfflineIfOnline, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const markAgentOnlineIfOffline = `-- name: MarkAgentOnlineIfOffline :execrows
+UPDATE agents
+SET status = 'online',
+    updated_at = NOW()
+WHERE id = $1 AND status = 'offline'
+`
+
+// Restore an agent to online when a heartbeat arrives but the persisted status is
+// offline (e.g. the offline sweeper's reconnect-race false positive). Constrained
+// to offline→online only — it must never resurrect terminal states such as
+// 'revoked' or 'pending'. Returns rows affected (1 = actually restored), so the
+// heartbeat handler publishes a corrective events.agent.online only when a
+// transition really happened (0 rows in steady state = no event spam).
+func (q *Queries) MarkAgentOnlineIfOffline(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markAgentOnlineIfOffline, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}

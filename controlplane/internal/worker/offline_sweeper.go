@@ -1,0 +1,186 @@
+// Package worker holds Control Plane background reconciliation loops.
+//
+// OfflineSweeper is the TTL-driven offline fallback for agent presence. The
+// gRPC handler marks an agent offline in its stream-disconnect defer, but that
+// defer never runs when the Control Plane crashes/restarts or the TCP connection
+// half-opens. In those cases the Redis presence key (AgentOnlineKey, 90s TTL
+// refreshed by heartbeats) still expires, but the persistent agents.status stays
+// "online" forever and the events.agent.offline event is never published. The
+// sweeper reconciles that: it periodically marks agents whose presence key has
+// expired as offline and republishes the offline event (system-design §5.2).
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/byw-dev/fileagent/controlplane/internal/cache"
+	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+)
+
+// defaultSweepInterval is how often OfflineSweeper.Run reconciles when no
+// interval is supplied. Presence keys carry a 90s TTL, so a 30s sweep bounds the
+// stale-online window to roughly one TTL plus one interval.
+const defaultSweepInterval = 30 * time.Second
+
+// agentOfflineSubject and the offlineEvent payload mirror the gRPC disconnect
+// path (grpcserver.publishEvent) so downstream event rules observe identical
+// offline events regardless of which path detected the disconnect.
+const agentOfflineSubject = "events.agent.offline"
+
+type offlineEvent struct {
+	AgentID string `json:"agent_id"`
+}
+
+// StatusDB is the subset of DB queries the sweeper needs.
+//
+// MarkAgentOfflineIfOnline transitions an agent to offline only when it is still
+// online and returns the number of rows affected, so the sweeper publishes the
+// offline event exactly once even if the gRPC disconnect path marked the agent
+// offline first.
+type StatusDB interface {
+	ListAgentsByStatus(ctx context.Context, orgID uuid.UUID, status db.AgentStatus) ([]*db.Agent, error)
+	MarkAgentOfflineIfOnline(ctx context.Context, id uuid.UUID) (int64, error)
+}
+
+// PresenceCache exposes a batched presence lookup: MGet returns one element per
+// key (nil = the presence key has expired), so a sweep is O(1) round-trips.
+type PresenceCache interface {
+	MGet(ctx context.Context, keys ...string) ([]interface{}, error)
+}
+
+// EventPublisher publishes NATS events.
+type EventPublisher interface {
+	Publish(subject string, data []byte) error
+}
+
+// OfflineSweeper reconciles persistent agent status against Redis presence TTL.
+//
+// It assumes a single Control Plane instance (the v1 deployment model), so no
+// distributed lock is used. Enforcement is best-effort: a reconnected agent whose
+// presence key is present is skipped, but in the microsecond window between the
+// presence check and the conditional update a just-reconnected agent could still
+// be marked offline (emitting a spurious offline event). Two things bound that:
+// the conditional update (MarkAgentOfflineIfOnline) never duplicates the
+// disconnect path's event, and the heartbeat handler self-heals a false offline —
+// it restores status to online and publishes a corrective online event on the
+// agent's next heartbeat, so a false positive cannot become durable.
+type OfflineSweeper struct {
+	db        StatusDB
+	cache     PresenceCache
+	publisher EventPublisher
+	orgID     uuid.UUID
+	logger    *zap.Logger
+}
+
+// NewOfflineSweeper constructs an OfflineSweeper scoped to a single organisation.
+func NewOfflineSweeper(sdb StatusDB, c PresenceCache, p EventPublisher, orgID uuid.UUID, logger *zap.Logger) *OfflineSweeper {
+	return &OfflineSweeper{db: sdb, cache: c, publisher: p, orgID: orgID, logger: logger}
+}
+
+// Sweep marks every online agent whose Redis presence key has expired as offline
+// and publishes events.agent.offline for each. It returns the number of agents
+// transitioned. Per-agent errors are logged and skipped so one failure does not
+// abort the whole pass.
+func (s *OfflineSweeper) Sweep(ctx context.Context) int {
+	if ctx.Err() != nil {
+		return 0 // shutdown already started: skip the DB list + Redis round-trip
+	}
+	agents, err := s.db.ListAgentsByStatus(ctx, s.orgID, db.AgentStatusOnline)
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0 // shutdown in progress: a cancelled context is not an error
+		}
+		s.logger.Warn("offline sweep: list online agents failed", zap.Error(err))
+		return 0
+	}
+	if len(agents) == 0 {
+		return 0
+	}
+
+	// Batch all presence lookups into one round-trip (O(1) instead of O(N)).
+	keys := make([]string, len(agents))
+	for i, a := range agents {
+		keys[i] = cache.AgentOnlineKey(a.ID.String())
+	}
+	present, err := s.cache.MGet(ctx, keys...)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.logger.Warn("offline sweep: presence check failed", zap.Error(err))
+		}
+		return 0 // fail-safe: unknown presence → mark nothing offline
+	}
+
+	var swept int
+	for i, a := range agents {
+		if ctx.Err() != nil {
+			return swept // stop promptly on shutdown instead of failing every call
+		}
+		// A non-nil value means the presence key still exists (agent online). Out
+		// of range is treated as present too, so ambiguous data never marks offline.
+		if i >= len(present) || present[i] != nil {
+			continue
+		}
+		// Conditional transition: only mark offline if still online. If the gRPC
+		// disconnect path already flipped it (and published), rows == 0 and we
+		// stay quiet — no duplicate events.agent.offline.
+		rows, err := s.db.MarkAgentOfflineIfOnline(ctx, a.ID)
+		if err != nil {
+			if ctx.Err() == nil {
+				s.logger.Warn("offline sweep: mark offline failed",
+					zap.String("agent_id", a.ID.String()), zap.Error(err))
+			}
+			continue
+		}
+		if rows == 0 {
+			continue // already offline elsewhere; do not re-publish
+		}
+		s.publishOffline(a.ID.String())
+		swept++
+		s.logger.Info("offline sweep: agent marked offline (presence expired)",
+			zap.String("agent_id", a.ID.String()))
+	}
+	return swept
+}
+
+func (s *OfflineSweeper) publishOffline(agentID string) {
+	payload, err := json.Marshal(offlineEvent{AgentID: agentID})
+	if err != nil { // unreachable for a fixed struct, but stay explicit
+		s.logger.Error("offline sweep: marshal offline event failed",
+			zap.String("agent_id", agentID), zap.Error(err))
+		return
+	}
+	if err := s.publisher.Publish(agentOfflineSubject, payload); err != nil {
+		s.logger.Error("offline sweep: publish agent.offline failed",
+			zap.String("agent_id", agentID), zap.Error(err))
+	}
+}
+
+// Run sweeps on a ticker until ctx is cancelled. A non-positive interval falls
+// back to defaultSweepInterval.
+func (s *OfflineSweeper) Run(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = defaultSweepInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	s.logger.Info("offline sweeper started", zap.Duration("interval", interval))
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Info("offline sweeper stopped")
+			return
+		case <-ticker.C:
+			// ctx.Done() and ticker.C can be ready simultaneously; skip the tick
+			// if shutdown has started rather than sweeping with a cancelled ctx.
+			if ctx.Err() != nil {
+				s.logger.Info("offline sweeper stopped")
+				return
+			}
+			s.Sweep(ctx)
+		}
+	}
+}

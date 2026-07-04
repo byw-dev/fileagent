@@ -70,8 +70,13 @@ func (m *mockNATS) Publish(subject string, _ []byte) error {
 // ── Mock AgentStateDB ─────────────────────────────────────────────────────────
 
 type mockStateDB struct {
-	lastSeenCalled bool
-	updateStatus   db.AgentStatus
+	lastSeenCalled  bool
+	updateStatus    db.AgentStatus
+	markOnlineRows   int64 // rows returned by MarkAgentOnlineIfOffline (0 = not offline / no restore)
+	markOnlineCalls  int
+	markOfflineRows  int64 // rows returned by MarkAgentOfflineIfOnline (0 = already offline)
+	markOfflineErr   error
+	markOfflineCalls int
 }
 
 func (m *mockStateDB) UpdateAgentLastSeen(_ context.Context, _ uuid.UUID) error {
@@ -82,6 +87,19 @@ func (m *mockStateDB) UpdateAgentLastSeen(_ context.Context, _ uuid.UUID) error 
 func (m *mockStateDB) UpdateAgentStatus(_ context.Context, _ uuid.UUID, status db.AgentStatus) (*db.Agent, error) {
 	m.updateStatus = status
 	return &db.Agent{Status: status}, nil
+}
+
+func (m *mockStateDB) MarkAgentOnlineIfOffline(_ context.Context, _ uuid.UUID) (int64, error) {
+	m.markOnlineCalls++
+	return m.markOnlineRows, nil
+}
+
+func (m *mockStateDB) MarkAgentOfflineIfOnline(_ context.Context, _ uuid.UUID) (int64, error) {
+	m.markOfflineCalls++
+	if m.markOfflineErr != nil {
+		return 0, m.markOfflineErr
+	}
+	return m.markOfflineRows, nil
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -182,6 +200,111 @@ func TestHandleHeartbeat_UpdatesLastSeenAt(t *testing.T) {
 
 	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
 	assert.True(t, stateDB.lastSeenCalled, "UpdateAgentLastSeen should have been called")
+}
+
+func TestHandleHeartbeat_RestoresOnlineWhenStale(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	agentID := "00000000-0000-0000-0000-000000000002"
+	stateDB := &mockStateDB{markOnlineRows: 1} // DB was not online → restore transitions it
+	nats := &mockNATS{}
+	srv.WithStateDB(stateDB)
+	srv.WithDeps(nil, nil, nil, nats, nil)
+
+	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+
+	assert.Equal(t, 1, stateDB.markOnlineCalls)
+	assert.Contains(t, nats.published, "events.agent.online",
+		"a heartbeat that restores a stale-offline agent must publish a corrective online event")
+}
+
+func TestMarkOfflineOnDisconnect_PublishesOnlyOnTransition(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	agentID := "00000000-0000-0000-0000-000000000004"
+
+	// Was online → disconnect transitions it (rows==1) → publish offline once.
+	t.Run("transition publishes", func(t *testing.T) {
+		srv := New(logger)
+		stateDB := &mockStateDB{markOfflineRows: 1}
+		nats := &mockNATS{}
+		srv.WithStateDB(stateDB)
+		srv.WithDeps(nil, nil, nil, nats, nil)
+
+		srv.markOfflineOnDisconnect(agentID)
+
+		assert.Equal(t, 1, stateDB.markOfflineCalls)
+		assert.Contains(t, nats.published, "events.agent.offline")
+	})
+
+	// Already offline (e.g. sweeper did it) → rows==0 → no duplicate event.
+	t.Run("no transition stays quiet", func(t *testing.T) {
+		srv := New(logger)
+		stateDB := &mockStateDB{markOfflineRows: 0}
+		nats := &mockNATS{}
+		srv.WithStateDB(stateDB)
+		srv.WithDeps(nil, nil, nil, nats, nil)
+
+		srv.markOfflineOnDisconnect(agentID)
+
+		assert.Equal(t, 1, stateDB.markOfflineCalls)
+		assert.NotContains(t, nats.published, "events.agent.offline",
+			"must not double-fire when the sweeper already marked the agent offline")
+	})
+
+	// No state DB wired (tests) → preserve the prior always-publish behaviour.
+	t.Run("nil stateDB preserves publish", func(t *testing.T) {
+		srv := New(logger)
+		nats := &mockNATS{}
+		srv.WithDeps(nil, nil, nil, nats, nil)
+
+		srv.markOfflineOnDisconnect(agentID)
+
+		assert.Contains(t, nats.published, "events.agent.offline")
+	})
+
+	// DB transition error → transition unknown → publish anyway (don't drop event).
+	t.Run("db error preserves publish", func(t *testing.T) {
+		srv := New(logger)
+		stateDB := &mockStateDB{markOfflineErr: assert.AnError}
+		nats := &mockNATS{}
+		srv.WithStateDB(stateDB)
+		srv.WithDeps(nil, nil, nil, nats, nil)
+
+		srv.markOfflineOnDisconnect(agentID)
+
+		assert.Equal(t, 1, stateDB.markOfflineCalls)
+		assert.Contains(t, nats.published, "events.agent.offline")
+	})
+
+	// Non-UUID agent id → can't do a conditional transition → publish anyway.
+	t.Run("non-uuid id preserves publish", func(t *testing.T) {
+		srv := New(logger)
+		stateDB := &mockStateDB{markOfflineRows: 1}
+		nats := &mockNATS{}
+		srv.WithStateDB(stateDB)
+		srv.WithDeps(nil, nil, nil, nats, nil)
+
+		srv.markOfflineOnDisconnect("not-a-uuid")
+
+		assert.Zero(t, stateDB.markOfflineCalls, "no conditional transition without a valid UUID")
+		assert.Contains(t, nats.published, "events.agent.offline")
+	})
+}
+
+func TestHandleHeartbeat_NoOnlineEventWhenAlreadyOnline(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	agentID := "00000000-0000-0000-0000-000000000003"
+	stateDB := &mockStateDB{markOnlineRows: 0} // already online → no transition
+	nats := &mockNATS{}
+	srv.WithStateDB(stateDB)
+	srv.WithDeps(nil, nil, nil, nats, nil)
+
+	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+
+	assert.Equal(t, 1, stateDB.markOnlineCalls)
+	assert.NotContains(t, nats.published, "events.agent.online",
+		"steady-state heartbeats must not emit online events")
 }
 
 func TestHandleHeartbeat_NilStateDB_NoPanic(t *testing.T) {

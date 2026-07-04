@@ -61,14 +61,7 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		if s.cache != nil {
 			_ = s.cache.Del(context.Background(), cache.AgentOnlineKey(agentID))
 		}
-		if s.stateDB != nil {
-			if id, err := uuid.Parse(agentID); err == nil {
-				if _, dbErr := s.stateDB.UpdateAgentStatus(context.Background(), id, db.AgentStatusOffline); dbErr != nil {
-					s.logger.Warn("disconnect: update status to offline failed", zap.Error(dbErr))
-				}
-			}
-		}
-		s.publishEvent("events.agent.offline", agentID)
+		s.markOfflineOnDisconnect(agentID)
 		s.logger.Info("agent disconnected", zap.String("agent_id", agentID))
 	}()
 
@@ -204,6 +197,18 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 			if dbErr := s.stateDB.UpdateAgentLastSeen(ctx, id); dbErr != nil {
 				s.logger.Warn("heartbeat: update last_seen_at failed", zap.Error(dbErr))
 			}
+			// Self-heal: a heartbeat proves the agent is alive, so if the DB status
+			// is offline (e.g. the offline sweeper's reconnect-race false positive),
+			// restore it to online and publish a corrective online event. Only
+			// offline→online transitions — terminal states like 'revoked'/'pending'
+			// are intentionally left untouched. The conditional update is a no-op
+			// (0 rows) in steady state, so this does not spam events per heartbeat.
+			if rows, dbErr := s.stateDB.MarkAgentOnlineIfOffline(ctx, id); dbErr != nil {
+				s.logger.Warn("heartbeat: restore online status failed", zap.Error(dbErr))
+			} else if rows > 0 {
+				s.logger.Info("heartbeat: restored agent to online", zap.String("agent_id", agentID))
+				s.publishEvent("events.agent.online", agentID)
+			}
 		}
 	}
 	// Persist the live telemetry snapshot (G-4) so the agents API can surface
@@ -265,6 +270,39 @@ func (s *Server) handleUploadResult(ctx context.Context, agentID string, result 
 			zap.String("agent_id", agentID),
 			zap.Error(err),
 		)
+	}
+}
+
+// markOfflineOnDisconnect transitions the agent to offline on stream disconnect
+// and publishes events.agent.offline, but only when it actually transitions from
+// online. This mirrors the offline sweeper's conditional update so a disconnect
+// does not double-fire the offline event if the sweeper already marked the agent
+// offline. When no state DB is wired (e.g. unit tests), it preserves the prior
+// always-publish behaviour.
+func (s *Server) markOfflineOnDisconnect(agentID string) {
+	id, err := uuid.Parse(agentID)
+	if s.stateDB == nil || err != nil {
+		// No state DB wired, or the agent id is not a UUID (tests / mis-issued
+		// token): we cannot do a conditional transition, so preserve the prior
+		// always-publish behaviour rather than silently swallowing the disconnect.
+		if err != nil {
+			s.logger.Warn("disconnect: agent id is not a UUID; publishing offline unconditionally",
+				zap.String("agent_id", agentID))
+		}
+		s.publishEvent("events.agent.offline", agentID)
+		return
+	}
+	rows, dbErr := s.stateDB.MarkAgentOfflineIfOnline(context.Background(), id)
+	if dbErr != nil {
+		// The transition is unknown, so fall back to the prior always-publish
+		// behaviour rather than dropping the offline event on a transient DB error.
+		s.logger.Warn("disconnect: update status to offline failed; publishing offline anyway",
+			zap.Error(dbErr))
+		s.publishEvent("events.agent.offline", agentID)
+		return
+	}
+	if rows > 0 {
+		s.publishEvent("events.agent.offline", agentID)
 	}
 }
 

@@ -105,6 +105,15 @@ func (c *Client) Exists(ctx context.Context, keys ...string) (int64, error) {
 	return c.rdb.Exists(ctx, keys...).Result()
 }
 
+// MGet returns the values at the given keys in order; a missing key yields a nil
+// element. It batches many presence lookups into a single round-trip.
+func (c *Client) MGet(ctx context.Context, keys ...string) ([]interface{}, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	return c.rdb.MGet(ctx, keys...).Result()
+}
+
 // HSet sets field in the hash stored at key.
 func (c *Client) HSet(ctx context.Context, key string, values ...interface{}) error {
 	return c.rdb.HSet(ctx, key, values...).Err()

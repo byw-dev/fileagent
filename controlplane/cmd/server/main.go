@@ -27,6 +27,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/grpcserver"
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
+	"github.com/byw-dev/fileagent/controlplane/internal/worker"
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	natsgo "github.com/nats-io/nats.go"
@@ -223,6 +224,14 @@ func main() {
 		}
 	}()
 	logger.Info("gRPC server starting", zap.Int("port", cfg.GRPCPort))
+
+	// ── Offline sweeper: TTL-driven fallback for stale agent status (CC-6) ────
+	// The gRPC disconnect defer marks agents offline, but it never runs on CP
+	// crash/restart or a half-open TCP connection. This loop reconciles agents
+	// whose Redis presence key has expired back to offline and republishes
+	// events.agent.offline. Stops when ctx is cancelled on shutdown.
+	offlineSweeper := worker.NewOfflineSweeper(queries, redisClient, nats, bootstrap.DefaultOrgID, logger)
+	go offlineSweeper.Run(ctx, 0)
 
 	// ── Build HTTP router ────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
