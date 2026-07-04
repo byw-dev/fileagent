@@ -40,7 +40,7 @@
 
 | 编号 | 问题 | 报告 |
 |------|------|------|
-| G-4 | **心跳载荷全空**（queue_depth/upload_bps/version/disks 都没填）→ UI 状态、整个监控告警链无数据源 | 02 §2 |
+| ~~G-4~~ ✅ | ~~**心跳载荷全空**（queue_depth/upload_bps/version/disks 都没填）→ UI 状态、整个监控告警链无数据源~~ **已修复（PR #43 / D-015）**：填 queue_depth/uptime/version → Redis 快照 → agents API。暂缓 disks/upload_bps（随 Prometheus 推后） | 02 §2 |
 | ~~G-5~~ ✅ | ~~**Dashboard 数字全是假的**：用"最近 20 条日志"推算今日上传/存储用量/7日趋势。根因是设计+CP 缺统计 API。~~ **已修复（PR #44）**：新增 `GET /api/v1/stats/dashboard` 服务端聚合端点（agents/files/storage/today/7日趋势），前端接真实数字；设计补齐 §5.11.5/§7.3.1；记 D-016。真实 CP 实测数字正确 | 03 §3 |
 | G-6 | **两个配置空壳**：Agent metrics 端点、~~queue_max_size 上限~~——有配置、有校验、无实现。queue_max_size ✅ **已修复（CC-2/PR #48）**；metrics 端点仍空（随 Prometheus 推后） | 02 §1/§4 |
 | G-7 | **Prometheus 指标整体缺失**：CP+Agent 均无插桩，设计第九章整章落空 | 01 §7 / 02 §1 |

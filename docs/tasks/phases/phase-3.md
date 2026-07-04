@@ -5,8 +5,8 @@
 >
 > **阶段现状（2026-07-04）**：T3-x 采集规则重构完成后，主线**未**线性推进到 T3-3，而是插入了
 > **止血冲刺**（P0+P1 差异，G-1…G-5；见 `docs/reports/design-gap-analysis/` 与 07-summary §五）
-> 和 **core-completeness 冲刺**（CC-1…CC-10；当前入口 `docs/tasks/active.md` + `core-completeness.md`）。
-> **T3-3 Python SDK 已按产品决策推后**（详见下方 T3-3 段与 core-completeness.md 文末）。
+> 和 **core-completeness 冲刺**（CC-1…CC-10；当前入口 `docs/tasks/active.md` + `docs/tasks/core-completeness.md`）。
+> **T3-3 Python SDK 已按产品决策推后**（详见下方 T3-3 段与 `docs/tasks/core-completeness.md` 文末）。
 
 ---
 
