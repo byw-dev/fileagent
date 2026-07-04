@@ -39,6 +39,17 @@ SET status = $2,
 WHERE id = $1
 RETURNING *;
 
+-- name: MarkAgentOfflineIfOnline :execrows
+-- Transition an agent to offline only when it is currently online. Returns the
+-- number of rows affected (1 = actually transitioned, 0 = already offline or
+-- gone), so a caller such as the offline sweeper can publish
+-- events.agent.offline exactly once and avoid double-firing when the gRPC
+-- disconnect path already marked the agent offline.
+UPDATE agents
+SET status = 'offline',
+    updated_at = NOW()
+WHERE id = $1 AND status = 'online';
+
 -- name: UpdateAgentLastSeen :exec
 UPDATE agents
 SET last_seen_at = NOW(),

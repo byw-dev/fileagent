@@ -36,9 +36,14 @@ type offlineEvent struct {
 }
 
 // StatusDB is the subset of DB queries the sweeper needs.
+//
+// MarkAgentOfflineIfOnline transitions an agent to offline only when it is still
+// online and returns the number of rows affected, so the sweeper publishes the
+// offline event exactly once even if the gRPC disconnect path marked the agent
+// offline first.
 type StatusDB interface {
 	ListAgentsByStatus(ctx context.Context, orgID uuid.UUID, status db.AgentStatus) ([]*db.Agent, error)
-	UpdateAgentStatus(ctx context.Context, id uuid.UUID, status db.AgentStatus) (*db.Agent, error)
+	MarkAgentOfflineIfOnline(ctx context.Context, id uuid.UUID) (int64, error)
 }
 
 // PresenceCache exposes the Redis existence check for presence keys.
@@ -86,10 +91,17 @@ func (s *OfflineSweeper) Sweep(ctx context.Context) int {
 		if !s.presenceExpired(ctx, a.ID) {
 			continue
 		}
-		if _, err := s.db.UpdateAgentStatus(ctx, a.ID, db.AgentStatusOffline); err != nil {
+		// Conditional transition: only mark offline if still online. If the gRPC
+		// disconnect path already flipped it (and published), rows == 0 and we
+		// stay quiet — no duplicate events.agent.offline.
+		rows, err := s.db.MarkAgentOfflineIfOnline(ctx, a.ID)
+		if err != nil {
 			s.logger.Warn("offline sweep: mark offline failed",
 				zap.String("agent_id", a.ID.String()), zap.Error(err))
 			continue
+		}
+		if rows == 0 {
+			continue // already offline elsewhere; do not re-publish
 		}
 		s.publishOffline(a.ID.String())
 		swept++
@@ -148,6 +160,12 @@ func (s *OfflineSweeper) Run(ctx context.Context, interval time.Duration) {
 			s.logger.Info("offline sweeper stopped")
 			return
 		case <-ticker.C:
+			// ctx.Done() and ticker.C can be ready simultaneously; skip the tick
+			// if shutdown has started rather than sweeping with a cancelled ctx.
+			if ctx.Err() != nil {
+				s.logger.Info("offline sweeper stopped")
+				return
+			}
 			s.Sweep(ctx)
 		}
 	}

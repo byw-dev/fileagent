@@ -17,11 +17,12 @@ import (
 // ── mocks ───────────────────────────────────────────────────────────────────
 
 type mockStatusDB struct {
-	agents      []*db.Agent
-	listErr     error
-	updateErr   error
-	updatedIDs  []uuid.UUID
-	updateCalls int
+	agents       []*db.Agent
+	listErr      error
+	markErr      error
+	markZeroRows bool // simulate "already offline" (0 rows affected → no transition)
+	markedIDs    []uuid.UUID
+	markCalls    int
 }
 
 func (m *mockStatusDB) ListAgentsByStatus(_ context.Context, _ uuid.UUID, _ db.AgentStatus) ([]*db.Agent, error) {
@@ -31,13 +32,16 @@ func (m *mockStatusDB) ListAgentsByStatus(_ context.Context, _ uuid.UUID, _ db.A
 	return m.agents, nil
 }
 
-func (m *mockStatusDB) UpdateAgentStatus(_ context.Context, id uuid.UUID, _ db.AgentStatus) (*db.Agent, error) {
-	m.updateCalls++
-	if m.updateErr != nil {
-		return nil, m.updateErr
+func (m *mockStatusDB) MarkAgentOfflineIfOnline(_ context.Context, id uuid.UUID) (int64, error) {
+	m.markCalls++
+	if m.markErr != nil {
+		return 0, m.markErr
 	}
-	m.updatedIDs = append(m.updatedIDs, id)
-	return &db.Agent{ID: id, Status: db.AgentStatusOffline}, nil
+	if m.markZeroRows {
+		return 0, nil // already offline elsewhere
+	}
+	m.markedIDs = append(m.markedIDs, id)
+	return 1, nil
 }
 
 // mockCache returns queued Exists results in order; when exhausted it repeats the
@@ -91,7 +95,7 @@ func TestSweep_MarksOfflineWhenPresenceExpired(t *testing.T) {
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
 
 	assert.Equal(t, 1, n)
-	assert.Equal(t, []uuid.UUID{a.ID}, sdb.updatedIDs)
+	assert.Equal(t, []uuid.UUID{a.ID}, sdb.markedIDs)
 	require.Len(t, pub.subjects, 1)
 	assert.Equal(t, "events.agent.offline", pub.subjects[0])
 	assert.JSONEq(t, `{"agent_id":"`+a.ID.String()+`"}`, string(pub.payloads[0]))
@@ -106,7 +110,7 @@ func TestSweep_SkipsWhenStillPresent(t *testing.T) {
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
 
 	assert.Equal(t, 0, n)
-	assert.Zero(t, sdb.updateCalls)
+	assert.Zero(t, sdb.markCalls)
 	assert.Empty(t, pub.subjects)
 }
 
@@ -118,7 +122,7 @@ func TestSweep_NoOnlineAgents(t *testing.T) {
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
 
 	assert.Equal(t, 0, n)
-	assert.Zero(t, sdb.updateCalls)
+	assert.Zero(t, sdb.markCalls)
 	assert.Empty(t, pub.subjects)
 }
 
@@ -130,12 +134,12 @@ func TestSweep_ListErrorReturnsZero(t *testing.T) {
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
 
 	assert.Equal(t, 0, n)
-	assert.Zero(t, sdb.updateCalls)
+	assert.Zero(t, sdb.markCalls)
 }
 
-func TestSweep_UpdateErrorContinuesToNextAgent(t *testing.T) {
+func TestSweep_MarkErrorContinuesToNextAgent(t *testing.T) {
 	a1, a2 := onlineAgent(), onlineAgent()
-	sdb := &mockStatusDB{agents: []*db.Agent{a1, a2}, updateErr: errors.New("update failed")}
+	sdb := &mockStatusDB{agents: []*db.Agent{a1, a2}, markErr: errors.New("update failed")}
 	c := &mockCache{results: []int64{0}} // all expired
 	pub := &mockPublisher{}
 
@@ -143,8 +147,23 @@ func TestSweep_UpdateErrorContinuesToNextAgent(t *testing.T) {
 
 	// Both fail to update, but the loop must attempt both and never publish.
 	assert.Equal(t, 0, n)
-	assert.Equal(t, 2, sdb.updateCalls)
+	assert.Equal(t, 2, sdb.markCalls)
 	assert.Empty(t, pub.subjects)
+}
+
+// When the gRPC disconnect path already marked the agent offline, the conditional
+// update affects 0 rows and the sweeper must NOT publish a duplicate offline event.
+func TestSweep_NoDuplicateWhenAlreadyOffline(t *testing.T) {
+	a := onlineAgent()
+	sdb := &mockStatusDB{agents: []*db.Agent{a}, markZeroRows: true}
+	c := &mockCache{results: []int64{0}} // presence expired
+	pub := &mockPublisher{}
+
+	n := newSweeper(sdb, c, pub).Sweep(context.Background())
+
+	assert.Equal(t, 0, n)
+	assert.Equal(t, 1, sdb.markCalls, "sweeper attempts the conditional transition")
+	assert.Empty(t, pub.subjects, "no duplicate event when another path already set offline")
 }
 
 func TestSweep_PublishErrorStillCountsAndContinues(t *testing.T) {
@@ -157,7 +176,7 @@ func TestSweep_PublishErrorStillCountsAndContinues(t *testing.T) {
 
 	// Status was updated for both; publish failures are logged, not fatal.
 	assert.Equal(t, 2, n)
-	assert.Len(t, sdb.updatedIDs, 2)
+	assert.Len(t, sdb.markedIDs, 2)
 	assert.Len(t, pub.subjects, 2)
 }
 
@@ -171,7 +190,7 @@ func TestSweep_RecheckRaceKeepsReconnectedAgentOnline(t *testing.T) {
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
 
 	assert.Equal(t, 0, n)
-	assert.Zero(t, sdb.updateCalls, "reconnected agent must not be marked offline")
+	assert.Zero(t, sdb.markCalls, "reconnected agent must not be marked offline")
 	assert.Empty(t, pub.subjects)
 }
 
@@ -184,7 +203,7 @@ func TestSweep_CacheErrorFailsSafe(t *testing.T) {
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
 
 	assert.Equal(t, 0, n, "must not mark offline when presence is unknown")
-	assert.Zero(t, sdb.updateCalls)
+	assert.Zero(t, sdb.markCalls)
 }
 
 func TestRun_StopsOnContextCancel(t *testing.T) {
@@ -215,12 +234,23 @@ func TestRun_SweepsOnTick(t *testing.T) {
 	pub := &countingPublisher{n: &published}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go newSweeper(sdb, c, pub).Run(ctx, 10*time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		newSweeper(sdb, c, pub).Run(ctx, 10*time.Millisecond)
+		close(done)
+	}()
 
 	require.Eventually(t, func() bool {
 		return published.Load() >= 1
 	}, 2*time.Second, 10*time.Millisecond, "sweeper should mark the expired agent offline on tick")
+
+	// Stop the loop and wait for it to exit so no goroutine leaks into later tests.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop after context cancel")
+	}
 }
 
 // countingPublisher counts publishes without racing on a slice.

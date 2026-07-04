@@ -326,3 +326,23 @@ func (q *Queries) UpdateAgentStatus(ctx context.Context, iD uuid.UUID, status Ag
 	)
 	return &i, err
 }
+
+const markAgentOfflineIfOnline = `-- name: MarkAgentOfflineIfOnline :execrows
+UPDATE agents
+SET status = 'offline',
+    updated_at = NOW()
+WHERE id = $1 AND status = 'online'
+`
+
+// Transition an agent to offline only when it is currently online. Returns the
+// number of rows affected (1 = actually transitioned, 0 = already offline or
+// gone), so a caller such as the offline sweeper can publish
+// events.agent.offline exactly once and avoid double-firing when the gRPC
+// disconnect path already marked the agent offline.
+func (q *Queries) MarkAgentOfflineIfOnline(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markAgentOfflineIfOnline, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
