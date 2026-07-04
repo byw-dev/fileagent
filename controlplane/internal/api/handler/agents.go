@@ -54,6 +54,16 @@ type AgentRegistryClient interface {
 // AgentCacheClient is the cache interface used by AgentsHandler.
 type AgentCacheClient interface {
 	Exists(ctx context.Context, keys ...string) (int64, error)
+	Get(ctx context.Context, key string) (string, error)
+}
+
+// agentStatsSnapshot mirrors the heartbeat telemetry cached by the gRPC server
+// under cache.AgentStatsKey (see grpcserver.agentStats).
+type agentStatsSnapshot struct {
+	QueueDepth    int32   `json:"queue_depth"`
+	UptimeSeconds int64   `json:"uptime_seconds"`
+	UploadBps     float32 `json:"upload_bps"`
+	Version       string  `json:"version"`
 }
 
 // DirListingStore manages pending directory listing result channels.
@@ -125,6 +135,9 @@ type agentResponse struct {
 	AgentVersion string `json:"agent_version,omitempty"`
 	LastSeenAt   string `json:"last_seen_at,omitempty"`
 	CreatedAt    string `json:"created_at,omitempty"`
+	// Live telemetry from the latest heartbeat (present only while online).
+	QueueDepth    *int32 `json:"queue_depth,omitempty"`
+	UptimeSeconds *int64 `json:"uptime_seconds,omitempty"`
 }
 
 // mapFrontendStatusToDB converts a frontend AgentStatus (uppercase, using RUNNING
@@ -189,13 +202,31 @@ func toAgentResponse(a *db.Agent) agentResponse {
 	return r
 }
 
-// toAgentResponseWithOnline enriches an agentResponse with a real-time is_online
-// value by querying the cache (Redis TTL key).
+// toAgentResponseWithOnline enriches an agentResponse with real-time values from
+// the cache: the is_online flag (Redis TTL key) and, when present, the latest
+// heartbeat telemetry snapshot (queue depth, uptime).
 func (h *AgentsHandler) toAgentResponseWithOnline(ctx context.Context, a *db.Agent) agentResponse {
 	r := toAgentResponse(a)
-	if h.cache != nil {
-		if n, err := h.cache.Exists(ctx, cache.AgentOnlineKey(a.ID.String())); err == nil {
-			r.IsOnline = n > 0
+	if h.cache == nil {
+		return r
+	}
+	if n, err := h.cache.Exists(ctx, cache.AgentOnlineKey(a.ID.String())); err == nil {
+		r.IsOnline = n > 0
+	}
+	// Only surface live telemetry for agents we consider online, so the fields
+	// never contradict is_online under partial cache desync (e.g. the stats key
+	// outliving the online key).
+	if r.IsOnline {
+		if raw, err := h.cache.Get(ctx, cache.AgentStatsKey(a.ID.String())); err == nil && raw != "" {
+			var stats agentStatsSnapshot
+			if err := json.Unmarshal([]byte(raw), &stats); err == nil {
+				qd, up := stats.QueueDepth, stats.UptimeSeconds
+				r.QueueDepth = &qd
+				r.UptimeSeconds = &up
+				if stats.Version != "" {
+					r.AgentVersion = stats.Version
+				}
+			}
 		}
 	}
 	return r

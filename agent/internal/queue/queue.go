@@ -184,6 +184,18 @@ func (q *Queue) Enqueue(task *UploadTask) error {
 	return nil
 }
 
+// CountPending returns the number of tasks currently waiting to be uploaded
+// (status "pending"). It is used to report queue depth in the agent heartbeat.
+func (q *Queue) CountPending() (int, error) {
+	var n int
+	if err := q.db.QueryRow(
+		`SELECT COUNT(*) FROM upload_tasks WHERE status = ?`, StatusPending,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("queue: count pending: %w", err)
+	}
+	return n, nil
+}
+
 // DequeuePending returns up to limit tasks with status "pending", ordered by
 // created_at ascending (oldest first), and transitions them to "running".
 func (q *Queue) DequeuePending(limit int) ([]*UploadTask, error) {

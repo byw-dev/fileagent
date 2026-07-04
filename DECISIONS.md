@@ -587,3 +587,44 @@ MinIO 侧配置 `notify_webhook auth_token`，CP 侧却没消费它。
   改为运行时 fail-closed 把影响局限在 webhook 这一个端点，CP 仍能正常启动其余功能。
 - **改用 mTLS / IP 白名单**：第一版不引入 mTLS（见 CLAUDE.md 边界）；IP 白名单在容器网络下脆弱。
   共享密钥与设计 §6.5 一致，最简单可靠。
+
+---
+
+## D-015：Agent 心跳遥测落地——填充载荷 + Redis 快照 + API 暴露（P1 G-4）
+
+**决策日期**：2026-07-04
+**影响范围**：agent（queue/grpcclient/main）、controlplane（grpcserver/cache/agents handler）
+**背景报告**：`docs/reports/design-gap-analysis/`（G-4，02 报告 §2）
+
+### 背景
+
+Agent 心跳一直发送**空 `Heartbeat{}`**（`client.go`、Ping 响应两处），proto 定义的
+`queue_depth`/`uptime_seconds`/`version`/`disks`/`upload_bps` 全部为零。CP 侧 `handleHeartbeat`
+也只刷新在线 TTL + last_seen，丢弃其余字段。后果：Web UI 无队列深度/版本可展示、
+监控 §9.2 的 Agent 指标无数据源、`AgentQueueBacklog` 告警永不触发（典型"空心功能"）。
+
+### 决策
+
+打通"Agent 填充 → CP 落地 → API 暴露"链路，先做**廉价高价值**字段：
+
+- **Agent 端**：心跳填充 `agent_id`、`uptime_seconds`（进程启动至今）、`queue_depth`
+  （`queue.CountPending()`）、`version`。经 `SetHeartbeatFunc` 注入构建器，周期心跳与
+  Ping 响应共用（`BuildHeartbeat()`）。
+- **CP 端**：`handleHeartbeat` 把遥测快照 JSON 写入 Redis `agent:{id}:stats`，
+  **共用在线 TTL（90s）**——离线即消失，语义与 `is_online` 一致。
+- **API 端**：`agents` 响应经 `toAgentResponseWithOnline` 从 Redis 富化
+  `queue_depth`/`uptime_seconds`（指针字段，无快照时 omitempty 省略，不显示误导性 0）。
+
+### 暂缓（本次不做，明确记录避免再次伪装完成）
+
+- **`disks`（磁盘剩余）**：需跨平台磁盘枚举（设计 §4.1 的 `sysinfo/` 模块仍缺），
+  是新依赖/平台代码，单列后续。
+- **`upload_bps`（上传速率）**：需在 uploader 加吞吐计量，后续。
+- **Prometheus 指标导出**：整体推迟（backlog T4-1），本次只打通到 REST API。
+- **Web UI 渲染**：API 已暴露字段，前端展示为快速跟进项。
+
+### 备选方案（被否决）
+
+- **遥测写入 `agents` 表**：每 30s 一次 DB 写入、churn 高；且这是易失的实时状态，
+  Redis + TTL 更贴合（与在线状态同构）。
+- **仅填充 Agent 端不落地 CP**：数据到不了 UI/监控，等于没修（"空心"陷阱）。

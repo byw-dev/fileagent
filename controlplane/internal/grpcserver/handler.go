@@ -2,6 +2,7 @@ package grpcserver
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
 	"time"
@@ -205,10 +206,35 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 			}
 		}
 	}
+	// Persist the live telemetry snapshot (G-4) so the agents API can surface
+	// queue depth / uptime / version. Shares the online TTL, so it disappears
+	// when the agent goes offline.
+	if s.cache != nil {
+		snapshot, err := json.Marshal(agentStats{
+			QueueDepth:    hb.GetQueueDepth(),
+			UptimeSeconds: hb.GetUptimeSeconds(),
+			UploadBps:     hb.GetUploadBps(),
+			Version:       hb.GetVersion(),
+		})
+		if err == nil {
+			if setErr := s.cache.Set(ctx, cache.AgentStatsKey(agentID), string(snapshot), agentOnlineTTL); setErr != nil {
+				s.logger.Warn("heartbeat: cache stats failed", zap.Error(setErr))
+			}
+		}
+	}
 	s.logger.Debug("heartbeat received",
 		zap.String("agent_id", agentID),
 		zap.Int64("uptime_seconds", hb.GetUptimeSeconds()),
+		zap.Int32("queue_depth", hb.GetQueueDepth()),
 	)
+}
+
+// agentStats is the JSON telemetry snapshot cached per agent from its heartbeat.
+type agentStats struct {
+	QueueDepth    int32   `json:"queue_depth"`
+	UptimeSeconds int64   `json:"uptime_seconds"`
+	UploadBps     float32 `json:"upload_bps"`
+	Version       string  `json:"version"`
 }
 
 // handleUploadResult forwards the upload result to the Indexer for file entry

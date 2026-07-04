@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/agent/internal/config"
+	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -76,8 +76,8 @@ func startFakeServer(t *testing.T) (addr string, srv *fakeAgentServer) {
 // buildTestConfig returns a config that points to addr and disables TLS.
 func buildTestConfig(addr string) *config.Config {
 	return &config.Config{
-		Server: config.ServerConfig{Endpoint: addr},
-		Upload: config.UploadConfig{Concurrency: 1, PartSizeMB: 64, QueueMaxSize: 100, RetryMax: 3},
+		Server:  config.ServerConfig{Endpoint: addr},
+		Upload:  config.UploadConfig{Concurrency: 1, PartSizeMB: 64, QueueMaxSize: 100, RetryMax: 3},
 		Metrics: config.MetricsConfig{Enabled: false, Port: 9100},
 		Log:     config.LogConfig{Level: "info", Output: "/dev/null", MaxSizeMB: 1, MaxBackups: 1},
 	}
@@ -353,4 +353,26 @@ func TestReAuthenticate_ApprovedButNoToken(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no token")
 	assert.NotContains(t, err.Error(), "not approved")
+}
+
+// TestClient_BuildHeartbeat verifies the heartbeat builder is used when set and
+// falls back to an empty payload when unset.
+func TestClient_BuildHeartbeat(t *testing.T) {
+	c := newInsecureClient(buildTestConfig("localhost:0"), zap.NewNop())
+
+	// No builder → empty (online-presence only).
+	empty := c.BuildHeartbeat()
+	require.NotNil(t, empty)
+	assert.Equal(t, int32(0), empty.GetQueueDepth())
+	assert.Equal(t, "", empty.GetVersion())
+
+	// With builder → carries telemetry.
+	c.SetHeartbeatFunc(func() *agentv1.Heartbeat {
+		return &agentv1.Heartbeat{AgentId: "a1", QueueDepth: 4, UptimeSeconds: 42, Version: "9.9.9"}
+	})
+	hb := c.BuildHeartbeat()
+	assert.Equal(t, "a1", hb.GetAgentId())
+	assert.Equal(t, int32(4), hb.GetQueueDepth())
+	assert.Equal(t, int64(42), hb.GetUptimeSeconds())
+	assert.Equal(t, "9.9.9", hb.GetVersion())
 }
