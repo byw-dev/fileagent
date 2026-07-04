@@ -120,7 +120,7 @@ agent 生命周期、端点鉴权、心跳遥测、Dashboard 真实数据全部�
 |----|------|---------|------|
 | #39 | G-1 refresh 契约断裂 | body 契约 + 令牌轮转；**本项目首个跨进程契约测试** | D-012 |
 | #40 | G-2 Agent token 定时炸弹 | 长效 token（`AGENT_TOKEN_TTL`）+ 重连自愈 | D-013 |
-| #41 | G-3 minio-event 无鉴权 | 共享密钥（哈希定长比较）+ fail-closed | D-014 |
+| #41 | G-3 minio-event 无鉴权 | 共享密钥（SHA-256 后 `crypto/subtle.ConstantTimeCompare` 常量时间比较，避免长度/时序泄露）+ fail-closed | D-014 |
 | #42 | 文档漂移 | 回填 design §4.7/§5.3.2/§6.5；纠正"design=权威"定性 | — |
 | #43 | G-4 心跳载荷全空 | 填 queue_depth/uptime/version → Redis 快照 → agents API | D-015 |
 | #44 | G-5 Dashboard 假数据 | 新增 `GET /api/v1/stats/dashboard` 服务端聚合 | D-016 |

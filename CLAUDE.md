@@ -316,7 +316,8 @@ docker compose -f deploy/docker-compose.test.yml down -v
 
 **剩余为 P2/P3（防复发与完善，非阻塞）**：契约单一权威/OpenAPI 校验（G-8/G-9）、
 结构性文档重构（design 去重指针化、CLAUDE.md 减肥）、Prometheus 指标（T4-1）、
-Agent `disks`/`upload_bps` 遥测、存储物理用量。冲刺回顾见 `07-summary.md` §五。
+Agent `disks`/`upload_bps` 遥测、存储物理用量。冲刺回顾见
+`docs/reports/design-gap-analysis/07-summary.md` §五。
 
 后续主线回到 **T3-3（Python SDK + Control Plane 联调）**。
 详细任务与状态以 `docs/tasks/active.md` 为准；`TASK_LIST.md` 提供总索引。
