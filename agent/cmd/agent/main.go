@@ -32,6 +32,11 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// processStart records when the process began, initialized at package load so
+// uptime_seconds reflects true process uptime regardless of how long the
+// registration/approval flow takes before the heartbeat builder is installed.
+var processStart = time.Now()
+
 // ruleHandle holds the cancel function for an active rule's watcher or scheduler entry.
 type ruleHandle struct {
 	cancel context.CancelFunc
@@ -285,7 +290,6 @@ func main() {
 	// Populate the heartbeat with live telemetry (G-4): without this the CP and
 	// Web UI have no source for queue depth / uptime / version, and the queue
 	// backlog alert can never fire. disks and upload_bps are not yet reported.
-	startTime := time.Now()
 	grpcClient.SetHeartbeatFunc(func() *agentv1.Heartbeat {
 		depth, err := q.CountPending()
 		if err != nil {
@@ -293,7 +297,7 @@ func main() {
 		}
 		return &agentv1.Heartbeat{
 			AgentId:       lc.AgentID,
-			UptimeSeconds: int64(time.Since(startTime).Seconds()),
+			UptimeSeconds: int64(time.Since(processStart).Seconds()),
 			QueueDepth:    int32(depth),
 			Version:       grpcclient.AgentVersion,
 		}

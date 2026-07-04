@@ -715,6 +715,31 @@ func TestAgentsHandler_List_NoTelemetry_WhenNoStats(t *testing.T) {
 	assert.False(t, hasUp, "uptime_seconds should be omitted without stats")
 }
 
+// TestAgentsHandler_List_NoTelemetry_WhenOffline verifies that a stale stats key
+// is not surfaced when the agent is offline (online key absent) — telemetry is
+// gated on is_online so the API never contradicts itself under cache desync.
+func TestAgentsHandler_List_NoTelemetry_WhenOffline(t *testing.T) {
+	a := newSampleAgent()
+	mockDB := &mockAgentsDB{agents: []*db.Agent{a}}
+	h := handler.NewAgentsHandler(mockDB, nil, nil, nil, newTestLogger())
+	h.WithCache(&mockAgentCacheClient{
+		exists:    0, // offline
+		statsJSON: `{"queue_depth":5,"uptime_seconds":900,"version":"0.1.0"}`,
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	item := body["items"].([]interface{})[0].(map[string]interface{})
+	assert.Equal(t, false, item["is_online"])
+	_, hasQD := item["queue_depth"]
+	assert.False(t, hasQD, "offline agent must not surface stale telemetry")
+}
+
 func TestAgentsHandler_List_IsOnline_False_WhenCacheMisses(t *testing.T) {
 	a := newSampleAgent()
 	mockDB := &mockAgentsDB{agents: []*db.Agent{a}}

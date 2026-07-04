@@ -213,14 +213,19 @@ func (h *AgentsHandler) toAgentResponseWithOnline(ctx context.Context, a *db.Age
 	if n, err := h.cache.Exists(ctx, cache.AgentOnlineKey(a.ID.String())); err == nil {
 		r.IsOnline = n > 0
 	}
-	if raw, err := h.cache.Get(ctx, cache.AgentStatsKey(a.ID.String())); err == nil && raw != "" {
-		var stats agentStatsSnapshot
-		if err := json.Unmarshal([]byte(raw), &stats); err == nil {
-			qd, up := stats.QueueDepth, stats.UptimeSeconds
-			r.QueueDepth = &qd
-			r.UptimeSeconds = &up
-			if stats.Version != "" {
-				r.AgentVersion = stats.Version
+	// Only surface live telemetry for agents we consider online, so the fields
+	// never contradict is_online under partial cache desync (e.g. the stats key
+	// outliving the online key).
+	if r.IsOnline {
+		if raw, err := h.cache.Get(ctx, cache.AgentStatsKey(a.ID.String())); err == nil && raw != "" {
+			var stats agentStatsSnapshot
+			if err := json.Unmarshal([]byte(raw), &stats); err == nil {
+				qd, up := stats.QueueDepth, stats.UptimeSeconds
+				r.QueueDepth = &qd
+				r.UptimeSeconds = &up
+				if stats.Version != "" {
+					r.AgentVersion = stats.Version
+				}
 			}
 		}
 	}
