@@ -1231,8 +1231,12 @@ func (s *AgentServer) Connect(stream AgentService_ConnectServer) error {
 
 - Agent 每 30 秒发送一次 Heartbeat 消息；
 - Control Plane 收到 Heartbeat 后刷新 Redis Key TTL（90 秒）；
-- Redis Key 过期 → 判定 Agent 离线 → 触发 agent_offline 事件；
-- Control Plane 实例重启后，从 Redis 恢复在线状态，等待 Agent 重连。
+- **离线判定（两条路径）**：
+  1. gRPC 流断开时立即置离线（`agents.status=offline` + Del Redis Key + 发 `events.agent.offline`）；
+  2. **TTL 兜底扫描**（CC-6，`internal/worker` OfflineSweeper）：CP 崩溃/重启、TCP 半开时上面的 defer 不执行，
+     Redis Key 仍会过期但 DB 状态与离线事件会残留 online——后台每 30s 扫描"DB=online 但 Redis Key 已过期"的
+     Agent，兜底置 `offline` 并补发 `events.agent.offline`。属最终一致的兜底，非精确即时判定。
+- Control Plane 实例重启后，从 Redis 恢复在线状态，等待 Agent 重连；真正已离线的 Agent 由上面的 TTL 兜底扫描收敛。
 
 ## 5.3 用户认证模块
 
@@ -1550,6 +1554,7 @@ controlplane/
 │   │   ├── jwt.go
 │   │   └── oidc.go
 │   └── worker/
+│       ├── offline_sweeper.go   # CC-6：Agent 在线状态 TTL 兜底扫描（已实现）
 │       ├── credential_rotator.go
 │       └── event_retry.go
 ├── api/

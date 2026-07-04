@@ -18,10 +18,10 @@
 
 | ID | 模块 | 缺口 | 现状 | 来源 |
 |----|------|------|------|------|
-| **CC-3** | CP | Bucket 创建后未设 Policy + `tmp-uploads` 无 Lifecycle | 设计 §6.6 要求 **CP 创建 bucket 后**自动 `SetBucketPolicy` + `tmp-uploads` 7 天 Lifecycle。**CP 运行时创建 bucket 的代码路径两者皆无**；`deploy/scripts/init-minio.sh` 虽*尝试*给种子 bucket 配 Lifecycle，但 e2e 实测该步失败（06 D-1，`Unable to read ILM configuration`）——即当前 tmp-uploads 根本未自动清理 | 01 §5 |
+| **CC-3** ⏸️ | CP | Bucket 创建后未设 Policy + `tmp-uploads` 无 Lifecycle | **已推后（低价值，2026-07-04）**：`tmp-uploads` 全代码库未接入（agent 直传 rule 目标 bucket，无 staging/ETL），其 lifecycle 当前无对象可清；bucket policy 对本系统冗余（MinIO bucket 默认私有，访问全走 STS/presigned IAM，与 bucket policy 无关）。待真有 staging→promote workflow 或多租户共享 bucket 场景再做。原缺口：设计 §6.6 要求 CP 创建 bucket 后自动 `SetBucketPolicy` + `tmp-uploads` 7 天 Lifecycle，CP 运行时路径皆无（init 脚本那步 e2e 亦报错，06 D-1） | 01 §5 |
 | **CC-4** | CP | 无 API 限流 | 设计 §5.1 + Redis `ratelimit:api:{user_id}` 要求限流；`middleware/` 无实现 | 01 §1 |
 | **CC-5** | CP | 错误响应缺顶层 `request_id`；未知 query 参数静默 200 | 设计 §5.11 错误格式含 `request_id`，实测无；`files` 未知过滤参数返回 200 不报错 | 06 契约瑕疵 |
-| **CC-6** | CP | 无 TTL 驱动的离线兜底判定 | 现仅在 gRPC 流断开时置离线；CP 崩溃重启 / TCP 半开会残留 online 状态，无扫描/过期兜底 | 01 §3 |
+| **CC-6** ✅ | CP | ~~无 TTL 驱动的离线兜底判定~~ | **已修复（PR #TBD）**：新增 `internal/worker` OfflineSweeper——每 30s 扫描"DB=online 但 Redis 在线 key 已过期"的 Agent，兜底置 offline + 补发 `events.agent.offline`（形状与流断开路径一致）；设计 §5.2/§5.12 已更新。修前：仅 gRPC 流断开时置离线，CP 崩溃/半开残留 online | 01 §3 |
 | **CC-7** | CP + webui | `kafka_publish` action 死配置 + action_type UI 失配 | 已核实：DB enum = `webhook / nats_publish / kafka_publish`（**无 `email`**）；engine 已实现 `webhook` + `nats_publish`（`engine.go:290,292`），**仅 `kafka_publish` 无实现**（配了不生效）。CC-1 期间 webui `Events/Create.tsx` 已临时收窄为 **webhook-only** 并留 `TODO(CC-7)`。CC-7 收尾：实现或从枚举/UI 移除 `kafka_publish`，并把已可用的 `nats_publish` 放回 UI | 01 §4 |
 
 ## Tier C — 功能完备（webui，按实际使用价值可提前到 A/B）
@@ -41,7 +41,7 @@
 
 - **止血冲刺**：G-1 refresh 契约（D-012）、G-2 Agent token 生命周期 + **JWT 续期自愈**（D-013，解决了 02 报告"token 续期疑似缺失"）、
   G-3 minio-event 鉴权（D-014）、G-4 心跳遥测（D-015）、G-5 Dashboard 统计（D-016）、G-15 凭据文件 gitignore。
-- **本清单**：CC-1 file_deleted（PR #47 / D-017）、CC-2 queue_max_size（PR #48）。
+- **本清单**：CC-1 file_deleted（PR #47 / D-017）、CC-2 queue_max_size（PR #48）、CC-6 离线兜底扫描（PR #TBD）。
 
 ## 明确推后（非核心模块 / 按产品决策）
 
@@ -57,4 +57,4 @@
 
 ## 执行顺序建议
 
-`CC-1 ✅` → `CC-2 ✅` → `CC-3（下一步：bucket policy/lifecycle）` → `CC-4~7（CP 健壮性，可分批）` → `CC-8/9（视使用价值）`
+`CC-1 ✅` → `CC-2 ✅` → `CC-6 ✅（离线兜底扫描）` → `CC-3 ⏸️ 推后（低价值）` → `CC-5（下一步：request_id + 未知参数）→ CC-4 / CC-7` → `CC-8/9（视使用价值）`
