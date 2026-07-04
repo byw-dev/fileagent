@@ -18,7 +18,7 @@
 
 | ID | 模块 | 缺口 | 现状 | 来源 |
 |----|------|------|------|------|
-| **CC-3** | CP | Bucket 创建后未设 Policy + `tmp-uploads` 无 Lifecycle | 设计 §6.6 要求 **CP 创建 bucket 后**自动 `SetBucketPolicy` + `tmp-uploads` 7 天 Lifecycle。`deploy/scripts/init-minio.sh` 只覆盖**初始化时**的种子 bucket；**CP 运行时创建 bucket 的代码路径两者皆无** | 01 §5 |
+| **CC-3** | CP | Bucket 创建后未设 Policy + `tmp-uploads` 无 Lifecycle | 设计 §6.6 要求 **CP 创建 bucket 后**自动 `SetBucketPolicy` + `tmp-uploads` 7 天 Lifecycle。**CP 运行时创建 bucket 的代码路径两者皆无**；`deploy/scripts/init-minio.sh` 虽*尝试*给种子 bucket 配 Lifecycle，但 e2e 实测该步失败（06 D-1，`Unable to read ILM configuration`）——即当前 tmp-uploads 根本未自动清理 | 01 §5 |
 | **CC-4** | CP | 无 API 限流 | 设计 §5.1 + Redis `ratelimit:api:{user_id}` 要求限流；`middleware/` 无实现 | 01 §1 |
 | **CC-5** | CP | 错误响应缺顶层 `request_id`；未知 query 参数静默 200 | 设计 §5.11 错误格式含 `request_id`，实测无；`files` 未知过滤参数返回 200 不报错 | 06 契约瑕疵 |
 | **CC-6** | CP | 无 TTL 驱动的离线兜底判定 | 现仅在 gRPC 流断开时置离线；CP 崩溃重启 / TCP 半开会残留 online 状态，无扫描/过期兜底 | 01 §3 |

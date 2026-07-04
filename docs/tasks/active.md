@@ -9,7 +9,7 @@
 
 **所属冲刺**：core-completeness（核心模块补完备）
 **涉及模块**：controlplane（storage 层）
-**缺口**：设计 §6.6 要求 **controlplane 创建 Bucket 后**自动 `SetBucketPolicy` + 给 `tmp-uploads` 配 7 天 Lifecycle。现状：`deploy/scripts/init-minio.sh` 仅在**初始化**时给种子 bucket `tmp-uploads` 配了 7 天 Lifecycle；**CP 运行时经 API 新建 bucket 的代码路径既不设 Policy 也不配 Lifecycle**，不满足"创建后自动设置"。
+**缺口**：设计 §6.6 要求 **controlplane 创建 Bucket 后**自动 `SetBucketPolicy` + 给 `tmp-uploads` 配 7 天 Lifecycle。现状：**CP 运行时经 API 新建 bucket 的代码路径既不设 Policy 也不配 Lifecycle**；`deploy/scripts/init-minio.sh` 虽*尝试*给种子 `tmp-uploads` 配 Lifecycle，但 e2e 实测该步报错未生效（`../reports/design-gap-analysis/06-e2e-verification.md` D-1，`Unable to read ILM configuration`）。CC-3 应在 CP 侧可靠实现，不依赖初始化脚本。
 **权威 backlog 与验收**：[`docs/tasks/core-completeness.md`](core-completeness.md) CC-3（Tier B）
 
 > 每项 CC 独立 PR + Copilot review，改完真跑 e2e 再算完成。

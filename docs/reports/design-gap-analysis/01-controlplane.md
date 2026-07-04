@@ -46,7 +46,7 @@
 |----|------|------|
 | 创建 Bucket 调 MinIO | ✅ | `events.go:158 MakeBucket`（B-3 已修） |
 | **Bucket 创建后 SetBucketPolicy** | ❌ → CC-3 | 设计 §6.6 要求创建后设置 Policy；**CP 代码**（`events.go` MakeBucket 之后）无 SetBucketPolicy 调用 |
-| **tmp-uploads Lifecycle 7 天清理** | ❌ → CC-3 | **CP 代码**无 Lifecycle 配置。注：`deploy/scripts/init-minio.sh` 会在初始化时给种子 `tmp-uploads` 配 7 天 Lifecycle，但 CP 运行时新建的 bucket 不覆盖，不满足设计"创建后自动设置" |
+| **tmp-uploads Lifecycle 7 天清理** | ❌ → CC-3 | **CP 代码**无 Lifecycle 配置。注：`deploy/scripts/init-minio.sh` *尝试*给种子 `tmp-uploads` 配 7 天 Lifecycle，但 06 报告 D-1 实测该步报错（`Unable to read ILM configuration`）未生效——即便如此 CP 运行时新建的 bucket 也不覆盖 |
 | Bucket 存储用量（Dashboard） | 待查 | 设计要求 madmin.BucketUsageInfo 每 5 分钟缓存 |
 | STS AssumeRole | ✅ | `storage/sts.go:49` 按设计实现 |
 | 预签名 URL 15 分钟 | ✅ | `files.go:257`（B-1/B-2 已修） |
