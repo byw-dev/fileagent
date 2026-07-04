@@ -5,6 +5,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -32,11 +33,12 @@ const maxRetries = 10
 
 // Executor manages a pool of upload workers consuming from the queue.
 type Executor struct {
-	workers     int
-	queue       *queue.Queue
-	uploader    UploadFunc
-	logger      *zap.Logger
-	retryDelays []time.Duration
+	workers      int
+	queue        *queue.Queue
+	uploader     UploadFunc
+	logger       *zap.Logger
+	retryDelays  []time.Duration
+	queueMaxSize int
 
 	mu      sync.Mutex
 	notify  chan struct{}
@@ -45,19 +47,27 @@ type Executor struct {
 	retryWg sync.WaitGroup
 }
 
-// New creates an Executor with the given number of worker goroutines.
-func New(workers int, q *queue.Queue, uploader UploadFunc, logger *zap.Logger) *Executor {
+// New creates an Executor with the given number of worker goroutines. queueMaxSize
+// caps the number of active (non-completed) tasks retained in the local queue;
+// when exceeded, Submit drops the oldest evictable (pending or failed) task.
+//
+// A non-positive queueMaxSize disables capacity enforcement. This is an internal
+// safety default (and convenience for tests); the agent's config validation
+// requires queue_max_size > 0 (agent/internal/config), so in a running agent the
+// cap is always active.
+func New(workers int, q *queue.Queue, uploader UploadFunc, logger *zap.Logger, queueMaxSize int) *Executor {
 	if workers <= 0 {
 		workers = 1
 	}
 	return &Executor{
-		workers:     workers,
-		queue:       q,
-		uploader:    uploader,
-		logger:      logger,
-		retryDelays: defaultRetryDelays,
-		notify:      make(chan struct{}, 1),
-		stopCh:      make(chan struct{}),
+		workers:      workers,
+		queue:        q,
+		uploader:     uploader,
+		logger:       logger,
+		retryDelays:  defaultRetryDelays,
+		queueMaxSize: queueMaxSize,
+		notify:       make(chan struct{}, 1),
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -71,12 +81,63 @@ func (e *Executor) Submit(task *queue.UploadTask) error {
 	if err := e.queue.Enqueue(task); err != nil {
 		return fmt.Errorf("executor: enqueue task: %w", err)
 	}
+	// Trim the queue back to the cap only after the new task is safely persisted,
+	// so a failed Enqueue never costs us already-queued tasks.
+	e.enforceCapacity(task.ID)
 	// Signal workers non-blocking.
 	select {
 	case e.notify <- struct{}{}:
 	default:
 	}
 	return nil
+}
+
+// enforceCapacity trims the local queue back to queue_max_size after a task has
+// been enqueued. While the number of active (non-completed) tasks exceeds the
+// cap, it drops the oldest evictable task (pending or failed) and logs a warning,
+// matching the design's queue-full policy (system-design §4.6). newID is the
+// just-enqueued task, which is excluded from eviction so a freshly collected file
+// is never the one dropped — the queue always sheds older backlog first. If
+// nothing is evictable — every other active task is running, whose count is
+// bounded by the worker concurrency and so far below the cap — it warns once and
+// leaves the queue slightly over the cap rather than blocking collection. A cap
+// of zero or less disables enforcement.
+//
+// Enforcement is best-effort: the enqueue/count/evict steps are not a single
+// transaction, so under concurrent Submit calls the active count may briefly
+// exceed the cap. This is acceptable for a soft backpressure limit.
+func (e *Executor) enforceCapacity(newID string) {
+	if e.queueMaxSize <= 0 {
+		return
+	}
+	for {
+		n, err := e.queue.CountActive()
+		if err != nil {
+			e.logger.Warn("executor: queue capacity check failed", zap.Error(err))
+			return
+		}
+		if n <= e.queueMaxSize {
+			return
+		}
+		dropped, err := e.queue.DeleteOldestEvictable(newID)
+		if err != nil {
+			e.logger.Warn("executor: queue eviction failed", zap.Error(err))
+			return
+		}
+		if dropped == nil {
+			e.logger.Warn("executor: queue over capacity but no evictable task; keeping task anyway",
+				zap.Int("queue_max_size", e.queueMaxSize),
+				zap.Int("active", n),
+			)
+			return
+		}
+		e.logger.Warn("executor: queue full, dropped oldest task",
+			zap.Int("queue_max_size", e.queueMaxSize),
+			zap.Int("active", n),
+			zap.String("dropped_task_id", dropped.ID),
+			zap.String("dropped_path", dropped.LocalPath),
+		)
+	}
 }
 
 // Start launches the worker goroutines. It returns immediately; workers run
@@ -192,12 +253,22 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 		zap.Duration("delay", delay),
 	)
 
+	// Add to the WaitGroup before starting the goroutine: calling Add inside the
+	// goroutine races with Stop's retryWg.Wait() and can let Wait return early or
+	// panic when the counter is momentarily zero.
+	e.retryWg.Add(1)
 	go func() {
-		e.retryWg.Add(1)
 		defer e.retryWg.Done()
 		time.Sleep(delay)
 		// Re-queue by resetting status to pending.
 		if rerr := e.queue.UpdateStatus(task.ID, queue.StatusPending); rerr != nil {
+			// A not-found row was evicted to honour queue_max_size while this
+			// retry was sleeping — an expected outcome, not a failure.
+			if errors.Is(rerr, queue.ErrTaskNotFound) {
+				e.logger.Debug("executor: retry skipped, task was evicted",
+					zap.String("task_id", task.ID))
+				return
+			}
 			e.logger.Warn("executor: re-queue failed", zap.String("task_id", task.ID), zap.Error(rerr))
 			return
 		}

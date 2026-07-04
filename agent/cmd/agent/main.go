@@ -144,7 +144,7 @@ func main() {
 	}
 
 	// ── 7. Worker pool (starts goroutines after exec.Start is called) ────────
-	exec := executor.New(cfg.Upload.Concurrency, q, uploadFn, logger)
+	exec := executor.New(cfg.Upload.Concurrency, q, uploadFn, logger, cfg.Upload.QueueMaxSize)
 
 	// ── Scheduler (cron-mode rules) ──────────────────────────────────────────
 	sched := scheduler.New(logger)
