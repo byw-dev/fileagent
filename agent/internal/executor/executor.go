@@ -253,8 +253,11 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 		zap.Duration("delay", delay),
 	)
 
+	// Add to the WaitGroup before starting the goroutine: calling Add inside the
+	// goroutine races with Stop's retryWg.Wait() and can let Wait return early or
+	// panic when the counter is momentarily zero.
+	e.retryWg.Add(1)
 	go func() {
-		e.retryWg.Add(1)
 		defer e.retryWg.Done()
 		time.Sleep(delay)
 		// Re-queue by resetting status to pending.
