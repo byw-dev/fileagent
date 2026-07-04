@@ -202,7 +202,7 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 			// positive), restore it and publish a corrective online event. The
 			// conditional update is a no-op (0 rows) in steady state, so this does
 			// not spam events on every heartbeat.
-			if rows, dbErr := s.stateDB.MarkAgentOnlineIfNotOnline(ctx, id); dbErr != nil {
+			if rows, dbErr := s.stateDB.MarkAgentOnlineIfOffline(ctx, id); dbErr != nil {
 				s.logger.Warn("heartbeat: restore online status failed", zap.Error(dbErr))
 			} else if rows > 0 {
 				s.logger.Info("heartbeat: restored agent to online", zap.String("agent_id", agentID))
@@ -293,7 +293,11 @@ func (s *Server) markOfflineOnDisconnect(agentID string) {
 	}
 	rows, dbErr := s.stateDB.MarkAgentOfflineIfOnline(context.Background(), id)
 	if dbErr != nil {
-		s.logger.Warn("disconnect: update status to offline failed", zap.Error(dbErr))
+		// The transition is unknown, so fall back to the prior always-publish
+		// behaviour rather than dropping the offline event on a transient DB error.
+		s.logger.Warn("disconnect: update status to offline failed; publishing offline anyway",
+			zap.Error(dbErr))
+		s.publishEvent("events.agent.offline", agentID)
 		return
 	}
 	if rows > 0 {

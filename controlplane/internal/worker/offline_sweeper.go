@@ -86,6 +86,9 @@ func NewOfflineSweeper(sdb StatusDB, c PresenceCache, p EventPublisher, orgID uu
 // transitioned. Per-agent errors are logged and skipped so one failure does not
 // abort the whole pass.
 func (s *OfflineSweeper) Sweep(ctx context.Context) int {
+	if ctx.Err() != nil {
+		return 0 // shutdown already started: skip the DB list + Redis round-trip
+	}
 	agents, err := s.db.ListAgentsByStatus(ctx, s.orgID, db.AgentStatusOnline)
 	if err != nil {
 		if ctx.Err() != nil {

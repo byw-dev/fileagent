@@ -72,9 +72,10 @@ func (m *mockNATS) Publish(subject string, _ []byte) error {
 type mockStateDB struct {
 	lastSeenCalled  bool
 	updateStatus    db.AgentStatus
-	markOnlineRows   int64 // rows returned by MarkAgentOnlineIfNotOnline (0 = already online)
+	markOnlineRows   int64 // rows returned by MarkAgentOnlineIfOffline (0 = not offline / no restore)
 	markOnlineCalls  int
 	markOfflineRows  int64 // rows returned by MarkAgentOfflineIfOnline (0 = already offline)
+	markOfflineErr   error
 	markOfflineCalls int
 }
 
@@ -88,13 +89,16 @@ func (m *mockStateDB) UpdateAgentStatus(_ context.Context, _ uuid.UUID, status d
 	return &db.Agent{Status: status}, nil
 }
 
-func (m *mockStateDB) MarkAgentOnlineIfNotOnline(_ context.Context, _ uuid.UUID) (int64, error) {
+func (m *mockStateDB) MarkAgentOnlineIfOffline(_ context.Context, _ uuid.UUID) (int64, error) {
 	m.markOnlineCalls++
 	return m.markOnlineRows, nil
 }
 
 func (m *mockStateDB) MarkAgentOfflineIfOnline(_ context.Context, _ uuid.UUID) (int64, error) {
 	m.markOfflineCalls++
+	if m.markOfflineErr != nil {
+		return 0, m.markOfflineErr
+	}
 	return m.markOfflineRows, nil
 }
 
@@ -255,6 +259,20 @@ func TestMarkOfflineOnDisconnect_PublishesOnlyOnTransition(t *testing.T) {
 
 		srv.markOfflineOnDisconnect(agentID)
 
+		assert.Contains(t, nats.published, "events.agent.offline")
+	})
+
+	// DB transition error → transition unknown → publish anyway (don't drop event).
+	t.Run("db error preserves publish", func(t *testing.T) {
+		srv := New(logger)
+		stateDB := &mockStateDB{markOfflineErr: assert.AnError}
+		nats := &mockNATS{}
+		srv.WithStateDB(stateDB)
+		srv.WithDeps(nil, nil, nil, nats, nil)
+
+		srv.markOfflineOnDisconnect(agentID)
+
+		assert.Equal(t, 1, stateDB.markOfflineCalls)
 		assert.Contains(t, nats.published, "events.agent.offline")
 	})
 

@@ -1558,8 +1558,8 @@ controlplane/
 │   │   └── oidc.go
 │   └── worker/
 │       ├── offline_sweeper.go   # CC-6：Agent 在线状态 TTL 兜底扫描（已实现）
-│       ├── credential_rotator.go
-│       └── event_retry.go
+│       ├── credential_rotator.go # 规划，未实现（STS 续期现由 Agent 主动发起，见 01 §6）
+│       └── event_retry.go        # 规划，未实现（重试逻辑内嵌于 event/engine.go）
 ├── api/
 ├── migrations/
 │   ├── 000001_init.up.sql
