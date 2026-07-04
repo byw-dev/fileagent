@@ -279,12 +279,16 @@ func (s *Server) handleUploadResult(ctx context.Context, agentID string, result 
 // offline. When no state DB is wired (e.g. unit tests), it preserves the prior
 // always-publish behaviour.
 func (s *Server) markOfflineOnDisconnect(agentID string) {
-	if s.stateDB == nil {
-		s.publishEvent("events.agent.offline", agentID)
-		return
-	}
 	id, err := uuid.Parse(agentID)
-	if err != nil {
+	if s.stateDB == nil || err != nil {
+		// No state DB wired, or the agent id is not a UUID (tests / mis-issued
+		// token): we cannot do a conditional transition, so preserve the prior
+		// always-publish behaviour rather than silently swallowing the disconnect.
+		if err != nil {
+			s.logger.Warn("disconnect: agent id is not a UUID; publishing offline unconditionally",
+				zap.String("agent_id", agentID))
+		}
+		s.publishEvent("events.agent.offline", agentID)
 		return
 	}
 	rows, dbErr := s.stateDB.MarkAgentOfflineIfOnline(context.Background(), id)

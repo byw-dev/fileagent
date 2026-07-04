@@ -46,24 +46,29 @@ func (m *mockStatusDB) MarkAgentOfflineIfOnline(_ context.Context, id uuid.UUID)
 	return 1, nil
 }
 
-// mockCache returns queued Exists results in order; when exhausted it repeats the
-// last value. This lets a test simulate "expired, then reappeared" for the recheck.
+// mockCache implements the batched presence lookup. MGet returns one element per
+// key aligned to the agent order: a nil element means the presence key expired
+// (agent looks offline), a non-nil element means it is still present (online).
+// Unspecified indices default to nil (expired), so the common "all expired" case
+// needs no setup.
 type mockCache struct {
-	results []int64
-	err     error
-	calls   int32
+	values []interface{}
+	err    error
+	calls  int32
 }
 
-func (m *mockCache) Exists(_ context.Context, _ ...string) (int64, error) {
+func (m *mockCache) MGet(_ context.Context, keys ...string) ([]interface{}, error) {
 	m.calls++
 	if m.err != nil {
-		return 0, m.err
+		return nil, m.err
 	}
-	i := int(m.calls) - 1
-	if i >= len(m.results) {
-		i = len(m.results) - 1
+	out := make([]interface{}, len(keys))
+	for i := range keys {
+		if i < len(m.values) {
+			out[i] = m.values[i]
+		}
 	}
-	return m.results[i], nil
+	return out, nil
 }
 
 type mockPublisher struct {
@@ -91,7 +96,7 @@ func newSweeper(sdb StatusDB, c PresenceCache, p EventPublisher) *OfflineSweeper
 func TestSweep_MarksOfflineWhenPresenceExpired(t *testing.T) {
 	a := onlineAgent()
 	sdb := &mockStatusDB{agents: []*db.Agent{a}}
-	c := &mockCache{results: []int64{0}} // key gone (both checks)
+	c := &mockCache{} // presence key gone (nil)
 	pub := &mockPublisher{}
 
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
@@ -106,7 +111,7 @@ func TestSweep_MarksOfflineWhenPresenceExpired(t *testing.T) {
 func TestSweep_SkipsWhenStillPresent(t *testing.T) {
 	a := onlineAgent()
 	sdb := &mockStatusDB{agents: []*db.Agent{a}}
-	c := &mockCache{results: []int64{1}} // key still present
+	c := &mockCache{values: []interface{}{"1"}} // key still present
 	pub := &mockPublisher{}
 
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
@@ -118,7 +123,7 @@ func TestSweep_SkipsWhenStillPresent(t *testing.T) {
 
 func TestSweep_NoOnlineAgents(t *testing.T) {
 	sdb := &mockStatusDB{agents: nil}
-	c := &mockCache{results: []int64{0}}
+	c := &mockCache{}
 	pub := &mockPublisher{}
 
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
@@ -130,7 +135,7 @@ func TestSweep_NoOnlineAgents(t *testing.T) {
 
 func TestSweep_ListErrorReturnsZero(t *testing.T) {
 	sdb := &mockStatusDB{listErr: errors.New("db down")}
-	c := &mockCache{results: []int64{0}}
+	c := &mockCache{}
 	pub := &mockPublisher{}
 
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
@@ -142,7 +147,7 @@ func TestSweep_ListErrorReturnsZero(t *testing.T) {
 func TestSweep_MarkErrorContinuesToNextAgent(t *testing.T) {
 	a1, a2 := onlineAgent(), onlineAgent()
 	sdb := &mockStatusDB{agents: []*db.Agent{a1, a2}, markErr: errors.New("update failed")}
-	c := &mockCache{results: []int64{0}} // all expired
+	c := &mockCache{} // all expired
 	pub := &mockPublisher{}
 
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
@@ -158,7 +163,7 @@ func TestSweep_MarkErrorContinuesToNextAgent(t *testing.T) {
 func TestSweep_NoDuplicateWhenAlreadyOffline(t *testing.T) {
 	a := onlineAgent()
 	sdb := &mockStatusDB{agents: []*db.Agent{a}, markZeroRows: true}
-	c := &mockCache{results: []int64{0}} // presence expired
+	c := &mockCache{} // presence expired
 	pub := &mockPublisher{}
 
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
@@ -171,7 +176,7 @@ func TestSweep_NoDuplicateWhenAlreadyOffline(t *testing.T) {
 func TestSweep_PublishErrorStillCountsAndContinues(t *testing.T) {
 	a1, a2 := onlineAgent(), onlineAgent()
 	sdb := &mockStatusDB{agents: []*db.Agent{a1, a2}}
-	c := &mockCache{results: []int64{0}}
+	c := &mockCache{}
 	pub := &mockPublisher{err: errors.New("nats down")}
 
 	n := newSweeper(sdb, c, pub).Sweep(context.Background())
@@ -184,7 +189,7 @@ func TestSweep_PublishErrorStillCountsAndContinues(t *testing.T) {
 
 func TestSweep_StopsEarlyOnContextCancel(t *testing.T) {
 	sdb := &mockStatusDB{agents: []*db.Agent{onlineAgent(), onlineAgent()}}
-	c := &mockCache{results: []int64{0}}
+	c := &mockCache{}
 	pub := &mockPublisher{}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -198,7 +203,7 @@ func TestSweep_StopsEarlyOnContextCancel(t *testing.T) {
 
 func TestSweep_ListErrorQuietOnCancel(t *testing.T) {
 	sdb := &mockStatusDB{listErr: context.Canceled}
-	c := &mockCache{results: []int64{0}}
+	c := &mockCache{}
 	pub := &mockPublisher{}
 
 	core, logs := observer.New(zapcore.WarnLevel)
@@ -224,7 +229,7 @@ func TestSweep_CacheErrorFailsSafe(t *testing.T) {
 
 func TestRun_StopsOnContextCancel(t *testing.T) {
 	sdb := &mockStatusDB{}
-	c := &mockCache{results: []int64{1}}
+	c := &mockCache{values: []interface{}{"1"}}
 	pub := &mockPublisher{}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -245,7 +250,7 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 func TestRun_SweepsOnTick(t *testing.T) {
 	a := onlineAgent()
 	sdb := &mockStatusDB{agents: []*db.Agent{a}}
-	c := &mockCache{results: []int64{0}}
+	c := &mockCache{}
 	var published atomic.Int32
 	pub := &countingPublisher{n: &published}
 

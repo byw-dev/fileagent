@@ -257,6 +257,20 @@ func TestMarkOfflineOnDisconnect_PublishesOnlyOnTransition(t *testing.T) {
 
 		assert.Contains(t, nats.published, "events.agent.offline")
 	})
+
+	// Non-UUID agent id → can't do a conditional transition → publish anyway.
+	t.Run("non-uuid id preserves publish", func(t *testing.T) {
+		srv := New(logger)
+		stateDB := &mockStateDB{markOfflineRows: 1}
+		nats := &mockNATS{}
+		srv.WithStateDB(stateDB)
+		srv.WithDeps(nil, nil, nil, nats, nil)
+
+		srv.markOfflineOnDisconnect("not-a-uuid")
+
+		assert.Zero(t, stateDB.markOfflineCalls, "no conditional transition without a valid UUID")
+		assert.Contains(t, nats.published, "events.agent.offline")
+	})
 }
 
 func TestHandleHeartbeat_NoOnlineEventWhenAlreadyOnline(t *testing.T) {

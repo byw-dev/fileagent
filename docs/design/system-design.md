@@ -1231,7 +1231,7 @@ func (s *AgentServer) Connect(stream AgentService_ConnectServer) error {
 
 - Agent 每 30 秒发送一次 Heartbeat 消息；
 - Control Plane 收到 Heartbeat 后刷新 Redis Key TTL（90 秒）；
-- **离线判定（两条路径）**：
+- **离线判定与自愈（三条路径）**：
   1. gRPC 流断开时立即置离线（`agents.status=offline` + Del Redis Key + 发 `events.agent.offline`）；
   2. **TTL 兜底扫描**（CC-6，`internal/worker` OfflineSweeper）：CP 崩溃/重启、TCP 半开时上面的 defer 不执行，
      Redis Key 仍会过期但 DB 状态与离线事件会残留 online——后台每 30s 扫描"DB=online 但 Redis Key 已过期"的
