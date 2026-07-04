@@ -42,7 +42,7 @@
 |------|------|------|
 | G-4 | **心跳载荷全空**（queue_depth/upload_bps/version/disks 都没填）→ UI 状态、整个监控告警链无数据源 | 02 §2 |
 | ~~G-5~~ ✅ | ~~**Dashboard 数字全是假的**：用"最近 20 条日志"推算今日上传/存储用量/7日趋势。根因是设计+CP 缺统计 API。~~ **已修复（PR #44）**：新增 `GET /api/v1/stats/dashboard` 服务端聚合端点（agents/files/storage/today/7日趋势），前端接真实数字；设计补齐 §5.11.5/§7.3.1；记 D-016。真实 CP 实测数字正确 | 03 §3 |
-| G-6 | **两个配置空壳**：Agent metrics 端点、queue_max_size 上限——有配置、有校验、无实现 | 02 §1/§4 |
+| G-6 | **两个配置空壳**：Agent metrics 端点、~~queue_max_size 上限~~——有配置、有校验、无实现。queue_max_size ✅ **已修复（CC-2/PR #48）**；metrics 端点仍空（随 Prometheus 推后） | 02 §1/§4 |
 | G-7 | **Prometheus 指标整体缺失**：CP+Agent 均无插桩，设计第九章整章落空 | 01 §7 / 02 §1 |
 
 ### P2 — 契约治理（防第三、第四次复发）
@@ -60,7 +60,7 @@
 | G-11 | 设计文档 6 处过时（字段/proto/路径语法/REST 清单/token 续期/配置项） | 05 §2 |
 | G-12 | 设计文档 3 处自相矛盾（auth 路径、模板变量、离线判定） | 05 §1 |
 | G-13 | 任务文档 3 处状态矛盾（CLAUDE.md 说 T3-2 进行中 / T3-6 状态打架） | 05 §3 |
-| G-14 | bucket policy/lifecycle 未设置；file_deleted 事件死配置；TTL 驱动离线判定缺失 | 01 §4/§5 |
+| G-14 | bucket policy/lifecycle 未设置（→ CC-3）；~~file_deleted 事件死配置~~ ✅ **已修复（CC-1/PR #47/D-017）**；TTL 驱动离线判定缺失（→ CC-6） | 01 §4/§5 |
 | G-15 | 凭据文件 `controlplane/bootstrap_admin_credentials.txt` 躺在工作区（应 gitignore） | 00 侦察 |
 
 ---
@@ -141,5 +141,11 @@ revoke 可观测降级、G-5 的 UTC 分桶、时序侧信道），这些都已�
 - **监控**：Prometheus 指标导出（T4-1）；Agent `disks`/`upload_bps` 遥测；存储物理用量（`madmin.BucketUsageInfo`）。
 - **文档欠账**：附录 C.1 `JWT_ACCESS_TTL` 环境变量名笔误（实际 `JWT_ACCESS_TOKEN_TTL`）。
 
-**主线**回到 T3-3（Python SDK + Control Plane 联调）——建议在其之前先做 G-8（契约测试覆盖 SDK↔CP），
-避免重演 T3-2-FIX 那轮契约错位。
+### 后续（2026-07-04 之后）
+
+止血冲刺收官后**未**回到 T3-3，而是启动 **core-completeness 冲刺**（聚焦 webui+CP+Agent 核心模块剩余缺口）——
+**T3-3 Python SDK 按产品决策推后**（暂无消费方）。已完成 **CC-1**（file_deleted，PR #47/D-017）、
+**CC-2**（queue_max_size，PR #48）；下一步 **CC-3**（bucket policy/lifecycle）。
+该冲刺的权威 tracker = `docs/tasks/core-completeness.md`，当前入口 = `docs/tasks/active.md`。
+
+> 注：本节以上内容为止血冲刺收尾时（2026-07-04）的快照；上面"主线回到 T3-3"的原判断已被 core-completeness 冲刺取代。

@@ -314,13 +314,18 @@ docker compose -f deploy/docker-compose.test.yml down -v
 - P1：G-4 心跳遥测（D-015）、G-5 Dashboard 统计端点（D-016）
 - 另含一次文档同步（PR #42，回填 design + 纠正权威定性）
 
-**剩余为 P2/P3（防复发与完善，非阻塞）**：契约单一权威/OpenAPI 校验（G-8/G-9）、
-结构性文档重构（design 去重指针化、CLAUDE.md 减肥）、Prometheus 指标（T4-1）、
-Agent `disks`/`upload_bps` 遥测、存储物理用量。冲刺回顾见
+止血冲刺后进入 **core-completeness 冲刺**（核心模块 webui+CP+Agent 剩余缺口，清单见
+`docs/tasks/core-completeness.md`）。已完成：**CC-1** file_deleted 事件补完（PR #47 / D-017）、
+**CC-2** `queue_max_size` 强制（PR #48）。**下一步：CC-3**（Bucket Policy + tmp-uploads 7 天 Lifecycle）。
+每项 CC 独立 PR + Copilot review，改完真跑 e2e 再算完成。
+
+**已按产品决策推后**（2026-07-04）：**T3-3（Python SDK）/ T4-4（Java SDK）**——暂无消费方；
+契约单一权威/OpenAPI 校验（G-8/G-9）、结构性文档重构（design 去重指针化、CLAUDE.md 减肥）、
+Prometheus 指标（T4-1）、Agent `disks`/`upload_bps` 遥测、存储物理用量。止血冲刺回顾见
 `docs/reports/design-gap-analysis/07-summary.md` §五。
 
-后续主线回到 **T3-3（Python SDK + Control Plane 联调）**。
-详细任务与状态以 `docs/tasks/active.md` 为准；`TASK_LIST.md` 提供总索引。
+当前任务与状态以 `docs/tasks/active.md`（当前 = CC-3）+ `docs/tasks/core-completeness.md` 为准；
+`TASK_LIST.md` 提供总索引。
 
 > **文档权威优先级**（层级从高到低）：
 > 1. **代码是最终真相**——`proto/v1/agent.proto`、`controlplane/migrations/`、

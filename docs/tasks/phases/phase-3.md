@@ -1,7 +1,12 @@
 # phase-3.md — Phase 3 集成联调主线
 
-> **阶段状态**：🔄 进行中  
+> **阶段状态**：🔄 进行中（T3-x 主线已完成 T3-1/T3-2/T3-4/T3-5/T3-6；随后插入两轮收尾冲刺）
 > **阶段目标**：完成 Control Plane、Agent、Web UI、Python SDK 的端到端联调闭环。
+>
+> **阶段现状（2026-07-04）**：T3-x 采集规则重构完成后，主线**未**线性推进到 T3-3，而是插入了
+> **止血冲刺**（P0+P1 差异，G-1…G-5；见 `docs/reports/design-gap-analysis/` 与 07-summary §五）
+> 和 **core-completeness 冲刺**（CC-1…CC-10；当前入口 `docs/tasks/active.md` + `core-completeness.md`）。
+> **T3-3 Python SDK 已按产品决策推后**（详见下方 T3-3 段与 core-completeness.md 文末）。
 
 ---
 
@@ -16,21 +21,16 @@ T3-4 pkg/trollsift 共享路径模板库 ✅
     ↓
 T3-5 字段统一 + Bug 修复 ✅
     ↓
-T3-6 Dry-Run 规则测试功能
+T3-6 Dry-Run 规则测试功能 ✅
     ↓
-T3-3 Python SDK + Control Plane 联调
+（插入）止血冲刺 G-1…G-5 ✅ → core-completeness 冲刺 CC-1 ✅ / CC-2 ✅ / CC-3… 进行中
+    ↓
+T3-3 Python SDK + Control Plane 联调 ⏸️ 已推后
 ```
 
 ---
 
-## 当前优先：T3-6 — Dry-Run 规则测试功能
-
-**前置依赖**：T3-5 ✅  
-**涉及模块**：controlplane（dryRunStore + REST 端点）、agent（handleDryRun）、webui（RuleForm Step 3 测试面板）
-
----
-
-## T3-4 / T3-5 / T3-6 — 采集规则重构 ⬜
+## T3-4 / T3-5 / T3-6 — 采集规则重构 ✅
 
 **前置依赖**：T3-2 完成  
 **详细规格**：[`phase-3-rft.md`](phase-3-rft.md)
@@ -39,13 +39,15 @@ T3-3 Python SDK + Control Plane 联调
 |----|------|------|
 | T3-4 | `pkg/trollsift` 共享路径模板库 | ✅ |
 | T3-5 | 字段统一 + Bug 修复（DB/proto/agent/CP/WebUI） | ✅ |
-| T3-6 | Dry-Run 规则测试功能 | ⬜ |
+| T3-6 | Dry-Run 规则测试功能 | ✅ |
 
 ---
 
-## T3-3 — Python SDK + Control Plane 联调 ⬜
+## T3-3 — Python SDK + Control Plane 联调 ⏸️ 已推后
 
-**前置依赖**：T3-2 完成  
+> **状态**：按产品决策推后（2026-07-04）——暂无消费方，CP 契约维护好则后期单独开发风险低。
+> 理由与全清单见 `docs/tasks/core-completeness.md` 文末"明确推后"。下列验收标准保留，供日后恢复时使用。
+
 **涉及模块**：sdk/python、controlplane
 
 ### 验收标准
