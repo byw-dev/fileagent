@@ -16,8 +16,11 @@
 
 ## 2. 心跳（设计 §4.3 Heartbeat 消息）
 
-❌ **心跳发送的是空结构体**（`grpcclient/client.go:293`：`hb := &agentv1.Heartbeat{}`）。
-设计定义的 6 个字段——agent_id、uptime_seconds、queue_depth、upload_bps、version、disks——**全部未填充**。
+✅ **已修复（G-4 / PR #43 / D-015）**：心跳填充 agent_id、uptime_seconds、queue_depth、version →
+Redis 快照 → agents API。**暂缓**：disks（需 sysinfo/ 磁盘枚举）、upload_bps（列为诚实"暂缓项"，随 Prometheus 一并推后）。
+
+> 原始发现（保留）：~~心跳发送的是空结构体（`grpcclient/client.go:293`：`hb := &agentv1.Heartbeat{}`），
+> 设计定义的 6 个字段全部未填充~~。
 
 影响链：
 - Web UI / Dashboard 无法展示队列深度、上传速率、Agent 版本；
@@ -44,7 +47,7 @@
 | 断点续传（ListParts + completed_parts） | ✅ | `multipart.go:117` |
 | SHA-256 幂等 | ✅ | CP 侧 UpsertFileEntry |
 | 失败退避重试 | ✅ | executor.go 指数退避 |
-| **queue_max_size 上限** | ❌ | **配置空壳**：`QueueMaxSize`（默认 10000）只在 config.go 定义和校验，queue.go 无任何容量检查/丢弃最旧任务/告警逻辑。断网久了队列无限增长 |
+| **queue_max_size 上限** | ✅ | ~~配置空壳：queue.go 无容量检查~~ **已修复（CC-2 / PR #48）**：`queue.CountActive` + `DeleteOldestEvictable` + `executor.enforceCapacity`——入队后回收、驱逐最旧 pending/failed（running 不驱逐）、排除刚入队的新任务；design §4.6 已更新 |
 | Worker 数量动态调整 | ❌ | 设计说"可由 CP 下发配置动态调整"，无此机制（可接受，无决策记录） |
 
 ## 5. 凭据管理（设计 §4.7）
@@ -53,7 +56,7 @@
 |----|------|------|
 | JWT AES-256-GCM 加密落盘 | ✅ | credential.go，密钥派生自 fingerprint |
 | STS 内存存储 + 到期前刷新 | ✅（待动态验证） | |
-| JWT 剩余 <20% 自动续期 | 待查 | 设计要求通过 gRPC 续期 token；proto 无对应 RPC（只有 STS 的 RefreshCredentials），疑似 ❌ 无 Agent token 续期机制——token 30 天过期后 Agent 是否需要重新注册？需在 e2e/代码中确认 |
+| Agent token 生命周期 | ✅ | ~~疑似缺自动续期，30 天过期后可能集体掉线~~ **已澄清并修复（G-2 / PR #40 / D-013）**：CP 改签长效 token（`AGENT_TOKEN_TTL`，默认 720h），Agent 在 Unauthenticated 时经 `PollApproval` 重连自愈——不依赖单独的续期 RPC |
 
 ## 6. 跨平台（设计 §4.8）
 
@@ -65,6 +68,6 @@
 ## 7. 小结
 
 - 核心采集/上传链路完整且与设计一致，早期审计缺口已修。
-- **三个"配置空壳"**（有配置无实现）：metrics 端点、queue_max_size、（CP 侧对应的）METRICS_LISTEN——这类缺口单测无法发现，是"每处看似完成"错觉的直接来源。
-- **心跳载荷为空**是最高价值的单点修复：它同时解锁 UI 状态展示与整个监控告警链。
-- Agent JWT token 续期机制疑似缺失，30 天后所有 Agent 可能集体掉线，需确认。
+- **原三个"配置空壳"**（有配置无实现）：~~queue_max_size~~（✅ CC-2/PR #48）、metrics 端点 + （CP 侧）METRICS_LISTEN 仍空（Prometheus 整体推后）。这类缺口单测无法发现，是"每处看似完成"错觉的直接来源。
+- **心跳载荷为空** ✅ 已修复（G-4/D-015：填 queue_depth/uptime/version → Redis 快照 → agents API）。
+- ~~Agent JWT token 续期机制疑似缺失~~ ✅ 已澄清并修复（G-2/D-013：长效 token + 重连自愈）。

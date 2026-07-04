@@ -12,7 +12,7 @@
 |----|------|------|
 | 认证接口 `/api/auth/*` | ✅ | login/refresh/logout/me/oidc-callback 全部注册（`router.go:62-68`）。**注意**：设计文档自身矛盾——§5.3.2 写 `/api/auth/*`，附录 B.2 却写 `/api/v1/auth/*`；实现遵循 §5.3.2 和 CLAUDE.md 契约表 |
 | 用户/agents/files/file-types/buckets/event-rules/upload-logs | ✅ | 与附录 B.2 完全对齐，另新增 `POST /agents/:id/test-rule`（T3-6 dry-run，📝设计文档未回填） |
-| `/internal/minio-event` | ⚠️ | 路由存在且已接 indexer（B-4 已修），**但未校验 `MINIO_WEBHOOK_TOKEN` 共享密钥**（设计 §6.1.2/§6.5 要求 auth_token）。任何能访问该端口的人都可伪造上传事件写入 file_entries。安全缺口 |
+| `/internal/minio-event` | ✅ | 路由存在且已接 indexer（B-4 已修）。~~未校验共享密钥~~ **已修复（止血冲刺 G-3 / D-014）**：用 `INTERNAL_WEBHOOK_SECRET`（哈希后常量时间比较）校验 `auth_token`，未配置密钥时 fail-closed（注：env 名 `MINIO_WEBHOOK_TOKEN` 是**旧名**——CP 实际读取 `INTERNAL_WEBHOOK_SECRET`（`config.go:143`）；设计文档正文 §6.5 已用新名，但**附录 C（`system-design.md:2300`）仍写旧名 `MINIO_WEBHOOK_TOKEN`，待回填**——归入 design-doc drift，不属本报告） |
 | API 限流 | ❌ | 设计 §5.1 与 Redis Key 表要求 `ratelimit:api:{user_id}`；`internal/api/middleware/` 只有 error.go 和 jwt.go，**无限流中间件**。`cache/keys.go` 注释里列了 key 模式但无实现 |
 | 统一错误响应格式 | 待验证 | 设计 §5.11 定义 `{error:{code,message,detail},request_id}`，待 e2e 验证实际格式 |
 
@@ -36,17 +36,17 @@
 
 | 项 | 状态 | 说明 |
 |----|------|------|
-| NATS 主题 | ⚠️ | uploaded/online/offline/approved/revoked 5 个已发布；**`events.file.deleted` 只有订阅、无发布方**——事件规则 UI 允许配置 file_deleted 规则，但该事件永远不会触发（设计 §6.5 要求 MinIO ObjectRemoved 事件接入，MinioEventHandler 是否处理 Removed 待查） |
+| NATS 主题 | ✅ | uploaded/online/offline/approved/revoked 5 个已发布；~~`events.file.deleted` 只有订阅、无发布方~~ **已修复（CC-1 / PR #47 / D-017）**：新增 `IndexDeletion` + `publishFileDeleted` 发布 `events.file.deleted`，webhook 按 `ObjectCreated:*` / `ObjectRemoved:*` 路由（不再一律 IndexUpload），MinIO ObjectRemoved 已接入 |
 | Webhook 重试退避 | ✅ | 30s→2min→10min→30min→2h（`event/engine.go:175`，B-6 已修） |
-| kafka_publish action | 待查 | DDL 枚举有 kafka_publish，engine 是否实现待查 |
+| kafka_publish action | ⚠️ → CC-7 | 已核实：engine 实现了 `webhook` + `nats_publish`（`engine.go:290,292`），**仅 `kafka_publish` 无实现**（配了不生效）。归入 CC-7 收尾 |
 
 ## 5. 存储层集成（设计 §6.6）
 
 | 项 | 状态 | 说明 |
 |----|------|------|
 | 创建 Bucket 调 MinIO | ✅ | `events.go:158 MakeBucket`（B-3 已修） |
-| **Bucket 创建后 SetBucketPolicy** | ❌ | 设计 §6.6 要求创建后设置 Policy；代码无 SetBucketPolicy 调用 |
-| **tmp-uploads Lifecycle 7 天清理** | ❌ | 无 Lifecycle 配置代码 |
+| **Bucket 创建后 SetBucketPolicy** | ❌ → CC-3 | 设计 §6.6 要求创建后设置 Policy；**CP 代码**（`events.go` MakeBucket 之后）无 SetBucketPolicy 调用 |
+| **tmp-uploads Lifecycle 7 天清理** | ❌ → CC-3 | **CP 代码**无 Lifecycle 配置。注：`deploy/scripts/init-minio.sh` *尝试*给种子 `tmp-uploads` 配 7 天 Lifecycle，但 06 报告 D-1 实测该步报错（`Unable to read ILM configuration`）未生效——即便如此 CP 运行时新建的 bucket 也不覆盖 |
 | Bucket 存储用量（Dashboard） | 待查 | 设计要求 madmin.BucketUsageInfo 每 5 分钟缓存 |
 | STS AssumeRole | ✅ | `storage/sts.go:49` 按设计实现 |
 | 预签名 URL 15 分钟 | ✅ | `files.go:257`（B-1/B-2 已修） |
@@ -67,5 +67,5 @@
 ## 8. 小结
 
 - 主链路（注册审批、规则下发、上传索引、文件查询下载、事件 webhook）结构完整，历史审计缺口（B-1~B-6）确已修复。
-- **实质缺口**：minio-event 无鉴权（安全）、无 API 限流、无 Prometheus 指标、bucket policy/lifecycle 未设置、TTL 驱动离线判定缺失、file_deleted 事件死配置。
+- **实质缺口**：~~minio-event 无鉴权~~（✅ G-3/D-014）、无 API 限流（→ CC-4）、无 Prometheus 指标（推后）、bucket policy/lifecycle 未设置（→ CC-3）、TTL 驱动离线判定缺失（→ CC-6）、~~file_deleted 事件死配置~~（✅ CC-1/D-017）；`kafka_publish` 死 action（→ CC-7）。
 - **文档欠账**：test-rule 端点、字段重命名、seed migration 均未回填设计文档。

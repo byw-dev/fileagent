@@ -11,18 +11,18 @@
 
 | ID | 模块 | 缺口 | 现状（已核实） | 来源 |
 |----|------|------|---------------|------|
-| **CC-1** | CP + webui | `file_deleted` 事件死配置 | `events.file.deleted` 只有订阅方（`engine.go:107`），**无发布方**；且 `MinioEventHandler.Handle` 对所有事件一律 `IndexUpload`，**不区分 ObjectCreated / ObjectRemoved**——删除事件被当成上传索引。事件规则 UI 允许配 `file_deleted`，但永不触发 | 01 §4 |
-| **CC-2** | Agent | `queue_max_size` 未强制 | 配置项（默认 10000）只在 `config.go` 定义+校验，`queue.go` 无容量检查/丢弃/告警。离线久了本地 SQLite 队列**无上限增长** | 02 §1/§4 |
+| **CC-1** ✅ | CP + webui | ~~`file_deleted` 事件死配置~~ | **已修复（PR #47 / D-017）**：新增 `IndexDeletion` + `publishFileDeleted`（发布 `events.file.deleted`）；webhook 按 `ObjectCreated:*` / `ObjectRemoved:*` 路由，删除不再当成上传索引 | 01 §4 |
+| **CC-2** ✅ | Agent | ~~`queue_max_size` 未强制~~ | **已修复（PR #48）**：`queue.CountActive` + `DeleteOldestEvictable` + `executor.enforceCapacity`——入队后回收、驱逐最旧 pending/failed（running 不驱逐）、排除刚入队的新任务；design §4.6 已更新 | 02 §1/§4 |
 
 ## Tier B — API / 存储健壮性（可打包）
 
 | ID | 模块 | 缺口 | 现状 | 来源 |
 |----|------|------|------|------|
-| **CC-3** | CP | Bucket 创建后未设 Policy + `tmp-uploads` 无 Lifecycle | 设计 §6.6 要求 `SetBucketPolicy` + 7 天 Lifecycle；代码均无 | 01 §5 |
+| **CC-3** | CP | Bucket 创建后未设 Policy + `tmp-uploads` 无 Lifecycle | 设计 §6.6 要求 **CP 创建 bucket 后**自动 `SetBucketPolicy` + `tmp-uploads` 7 天 Lifecycle。**CP 运行时创建 bucket 的代码路径两者皆无**；`deploy/scripts/init-minio.sh` 虽*尝试*给种子 bucket 配 Lifecycle，但 e2e 实测该步失败（06 D-1，`Unable to read ILM configuration`）——即当前 tmp-uploads 根本未自动清理 | 01 §5 |
 | **CC-4** | CP | 无 API 限流 | 设计 §5.1 + Redis `ratelimit:api:{user_id}` 要求限流；`middleware/` 无实现 | 01 §1 |
 | **CC-5** | CP | 错误响应缺顶层 `request_id`；未知 query 参数静默 200 | 设计 §5.11 错误格式含 `request_id`，实测无；`files` 未知过滤参数返回 200 不报错 | 06 契约瑕疵 |
 | **CC-6** | CP | 无 TTL 驱动的离线兜底判定 | 现仅在 gRPC 流断开时置离线；CP 崩溃重启 / TCP 半开会残留 online 状态，无扫描/过期兜底 | 01 §3 |
-| **CC-7** | CP | `kafka_publish` action 死配置 | `models.go` 仅有枚举常量，engine 无实现；事件规则可配但不生效（同 CC-1 类空心） | 01 §4（待查已确认） |
+| **CC-7** | CP + webui | `kafka_publish` action 死配置 + action_type UI 失配 | 已核实：DB enum = `webhook / nats_publish / kafka_publish`（**无 `email`**）；engine 已实现 `webhook` + `nats_publish`（`engine.go:290,292`），**仅 `kafka_publish` 无实现**（配了不生效）。CC-1 期间 webui `Events/Create.tsx` 已临时收窄为 **webhook-only** 并留 `TODO(CC-7)`。CC-7 收尾：实现或从枚举/UI 移除 `kafka_publish`，并把已可用的 `nats_publish` 放回 UI | 01 §4 |
 
 ## Tier C — 功能完备（webui，按实际使用价值可提前到 A/B）
 
@@ -37,10 +37,11 @@
 
 ---
 
-## 已修复（止血冲刺，勿重复）
+## 已修复（勿重复）
 
-- G-1 refresh 契约（D-012）、G-2 Agent token 生命周期 + **JWT 续期自愈**（D-013，解决了 02 报告"token 续期疑似缺失"）、
+- **止血冲刺**：G-1 refresh 契约（D-012）、G-2 Agent token 生命周期 + **JWT 续期自愈**（D-013，解决了 02 报告"token 续期疑似缺失"）、
   G-3 minio-event 鉴权（D-014）、G-4 心跳遥测（D-015）、G-5 Dashboard 统计（D-016）、G-15 凭据文件 gitignore。
+- **本清单**：CC-1 file_deleted（PR #47 / D-017）、CC-2 queue_max_size（PR #48）。
 
 ## 明确推后（非核心模块 / 按产品决策）
 
@@ -56,4 +57,4 @@
 
 ## 执行顺序建议
 
-`CC-1（file_deleted，进行中）` → `CC-2（队列上限）` → `CC-3~7（CP 健壮性，可分批）` → `CC-8/9（视使用价值）`
+`CC-1 ✅` → `CC-2 ✅` → `CC-3（下一步：bucket policy/lifecycle）` → `CC-4~7（CP 健壮性，可分批）` → `CC-8/9（视使用价值）`
