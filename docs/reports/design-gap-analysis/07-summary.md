@@ -108,3 +108,38 @@
 代码底子是好的，主链路是通的。当前不是"实现难题"，而是**工程反馈系统的问题**：
 补上"跨进程契约测试 + 契约单一权威 + 诚实的完成判据"这三样，
 三个 P0 + 心跳/Dashboard 两个空心功能修掉，僵局即可打破，T3-3 之后的推进会顺畅得多。
+
+---
+
+## 五、冲刺回顾（2026-07-04 收尾）
+
+**P0 与 P1 差异已全部修复合并。** 从"每处看似完成实则空心"的僵局，到主链路契约、
+agent 生命周期、端点鉴权、心跳遥测、Dashboard 真实数据全部落地并有测试兜底。
+
+| PR | 差异 | 修复要点 | 决策 |
+|----|------|---------|------|
+| #39 | G-1 refresh 契约断裂 | body 契约 + 令牌轮转；**本项目首个跨进程契约测试** | D-012 |
+| #40 | G-2 Agent token 定时炸弹 | 长效 token（`AGENT_TOKEN_TTL`）+ 重连自愈 | D-013 |
+| #41 | G-3 minio-event 无鉴权 | 共享密钥（SHA-256 后 `crypto/subtle.ConstantTimeCompare` 常量时间比较，避免长度/时序泄露）+ fail-closed | D-014 |
+| #42 | 文档漂移 | 回填 design §4.7/§5.3.2/§6.5；纠正"design=权威"定性 | — |
+| #43 | G-4 心跳载荷全空 | 填 queue_depth/uptime/version → Redis 快照 → agents API | D-015 |
+| #44 | G-5 Dashboard 假数据 | 新增 `GET /api/v1/stats/dashboard` 服务端聚合 | D-016 |
+
+**兑现的方法论（三条回路修复）**：
+1. **跨进程契约测试**：G-1 引入了不 mock CP 的真实进程测试，堵住"单测全 mock、契约漂移不可见"。
+2. **文档权威归位**：PR #42 把 `system-design.md` 从"唯一权威"降为"架构背景"，确立
+   代码 + DECISIONS 为契约真相（CLAUDE.md 已写明层级）。
+3. **诚实的完成判据**：G-4/G-5 明确列出"暂缓项"（disks/upload_bps/Prometheus/物理用量），
+   不再让空心功能伪装成已完成；并确立"UI 稿必须对应已定义 REST 端点才算设计完成"（D-016）。
+
+**每个 PR 都过了 Copilot 多轮 review**——多轮追问逼出了若干第一轮想当然处（如 G-1 的
+revoke 可观测降级、G-5 的 UTC 分桶、时序侧信道），这些都已修入。
+
+### 剩余（P2/P3，非阻塞，可从容排期）
+- **G-8/G-9**：契约单一权威 / OpenAPI 自动校验（防第三次契约错位；下一个契约引爆点是 T3-3 SDK 联调）。
+- **结构性文档重构**：design 去重指针化、CLAUDE.md 减肥（等代码稳定后做，避免文档追着动的代码跑）。
+- **监控**：Prometheus 指标导出（T4-1）；Agent `disks`/`upload_bps` 遥测；存储物理用量（`madmin.BucketUsageInfo`）。
+- **文档欠账**：附录 C.1 `JWT_ACCESS_TTL` 环境变量名笔误（实际 `JWT_ACCESS_TOKEN_TTL`）。
+
+**主线**回到 T3-3（Python SDK + Control Plane 联调）——建议在其之前先做 G-8（契约测试覆盖 SDK↔CP），
+避免重演 T3-2-FIX 那轮契约错位。

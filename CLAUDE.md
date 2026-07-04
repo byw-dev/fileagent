@@ -308,10 +308,18 @@ docker compose -f deploy/docker-compose.test.yml down -v
 
 ## 当前阶段
 
-当前为 **Phase 3 — 集成联调**。近期完成了一轮"止血冲刺"：全面差异分析
-（`docs/reports/design-gap-analysis/`）后修复并合并了三个 P0——G-1（refresh 契约，D-012）、
-G-2（Agent token 生命周期，D-013）、G-3（minio-event 端点鉴权，D-014）。
-后续排期：P1（G-4 心跳载荷、G-5 Dashboard 统计）与 T3-3（Python SDK 联调）。
+当前为 **Phase 3 — 集成联调**。已完成一轮"止血冲刺"：全面差异分析
+（`docs/reports/design-gap-analysis/`）后，**P0 与 P1 差异均已修复合并**：
+- P0：G-1 refresh 契约（D-012）、G-2 Agent token 生命周期（D-013）、G-3 minio-event 鉴权（D-014）
+- P1：G-4 心跳遥测（D-015）、G-5 Dashboard 统计端点（D-016）
+- 另含一次文档同步（PR #42，回填 design + 纠正权威定性）
+
+**剩余为 P2/P3（防复发与完善，非阻塞）**：契约单一权威/OpenAPI 校验（G-8/G-9）、
+结构性文档重构（design 去重指针化、CLAUDE.md 减肥）、Prometheus 指标（T4-1）、
+Agent `disks`/`upload_bps` 遥测、存储物理用量。冲刺回顾见
+`docs/reports/design-gap-analysis/07-summary.md` §五。
+
+后续主线回到 **T3-3（Python SDK + Control Plane 联调）**。
 详细任务与状态以 `docs/tasks/active.md` 为准；`TASK_LIST.md` 提供总索引。
 
 > **文档权威优先级**（层级从高到低）：
