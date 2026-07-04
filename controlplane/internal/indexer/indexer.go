@@ -8,6 +8,7 @@ import (
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"github.com/byw-dev/fileagent/controlplane/internal/bootstrap"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -17,11 +18,6 @@ import (
 type NATSPublisher interface {
 	Publish(subject string, data []byte) error
 }
-
-// defaultOrgID is the single-org UUID (Phase 1). MinIO webhook events carry no
-// org, so the webhook indexing path resolves buckets/entries under this org.
-// (Mirrors bootstrap.DefaultOrgID / agent.defaultOrgID; single-org MVP.)
-var defaultOrgID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
 
 // IndexerStore is the minimal database interface used by the Indexer. Using an
 // interface (rather than db.DBTX directly) makes the Indexer unit-testable
@@ -220,10 +216,13 @@ func (ix *Indexer) publishFileUploaded(fe *db.FileEntry, agentID uuid.UUID, resu
 
 // IndexUpload records a file upload event that arrived via the MinIO webhook
 // path (i.e., not via an agent UploadResult). It looks up the bucket by name
-// within the default org scope, upserts a file entry, and publishes a NATS
-// event. This method implements handler.IndexerClient.
+// within the default org scope and upserts a file entry. It deliberately does
+// NOT publish events.file.uploaded: agent uploads already emit that event via
+// HandleUploadResult, and a MinIO ObjectCreated webhook fires for the same
+// object, so publishing here would double-emit. This method implements
+// handler.IndexerClient.
 func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string) error {
-	bucket, err := ix.store.GetBucketByName(ctx, defaultOrgID, bucketName)
+	bucket, err := ix.store.GetBucketByName(ctx, bootstrap.DefaultOrgID, bucketName)
 	if err != nil {
 		return fmt.Errorf("indexer: get bucket %q for minio event: %w", bucketName, err)
 	}
@@ -235,7 +234,7 @@ func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string
 	}
 
 	fileEntry, err := ix.store.UpsertFileEntry(ctx, UpsertFileEntryParams{
-		OrgID:       defaultOrgID,
+		OrgID:       bootstrap.DefaultOrgID,
 		FileTypeID:  uuid.NullUUID{UUID: fileTypeID, Valid: fileTypeID != uuid.Nil},
 		BucketID:    bucket.ID,
 		StoragePath: objectKey,
@@ -261,7 +260,7 @@ func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string
 // matching file entry and publishes events.file.deleted. Deleting an object that
 // was never indexed (or already deleted) is a no-op.
 func (ix *Indexer) IndexDeletion(ctx context.Context, bucketName, objectKey string) error {
-	bucket, err := ix.store.GetBucketByName(ctx, defaultOrgID, bucketName)
+	bucket, err := ix.store.GetBucketByName(ctx, bootstrap.DefaultOrgID, bucketName)
 	if err != nil {
 		return fmt.Errorf("indexer: get bucket %q for delete event: %w", bucketName, err)
 	}
