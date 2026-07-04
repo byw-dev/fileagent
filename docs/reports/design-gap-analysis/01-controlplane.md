@@ -12,7 +12,7 @@
 |----|------|------|
 | 认证接口 `/api/auth/*` | ✅ | login/refresh/logout/me/oidc-callback 全部注册（`router.go:62-68`）。**注意**：设计文档自身矛盾——§5.3.2 写 `/api/auth/*`，附录 B.2 却写 `/api/v1/auth/*`；实现遵循 §5.3.2 和 CLAUDE.md 契约表 |
 | 用户/agents/files/file-types/buckets/event-rules/upload-logs | ✅ | 与附录 B.2 完全对齐，另新增 `POST /agents/:id/test-rule`（T3-6 dry-run，📝设计文档未回填） |
-| `/internal/minio-event` | ✅ | 路由存在且已接 indexer（B-4 已修）。~~未校验共享密钥~~ **已修复（止血冲刺 G-3 / D-014）**：用 `INTERNAL_WEBHOOK_SECRET`（哈希后常量时间比较）校验 auth_token，未配置密钥时 fail-closed（注：报告原文写的 env 名 `MINIO_WEBHOOK_TOKEN` 有误，实际为 `INTERNAL_WEBHOOK_SECRET`） |
+| `/internal/minio-event` | ✅ | 路由存在且已接 indexer（B-4 已修）。~~未校验共享密钥~~ **已修复（止血冲刺 G-3 / D-014）**：用 `INTERNAL_WEBHOOK_SECRET`（哈希后常量时间比较）校验 `auth_token`，未配置密钥时 fail-closed（注：报告原文写的 env 名 `MINIO_WEBHOOK_TOKEN` 有误，实际为 `INTERNAL_WEBHOOK_SECRET`） |
 | API 限流 | ❌ | 设计 §5.1 与 Redis Key 表要求 `ratelimit:api:{user_id}`；`internal/api/middleware/` 只有 error.go 和 jwt.go，**无限流中间件**。`cache/keys.go` 注释里列了 key 模式但无实现 |
 | 统一错误响应格式 | 待验证 | 设计 §5.11 定义 `{error:{code,message,detail},request_id}`，待 e2e 验证实际格式 |
 

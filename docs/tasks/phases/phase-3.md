@@ -1,7 +1,7 @@
 # phase-3.md — Phase 3 集成联调主线
 
 > **阶段状态**：🔄 进行中（T3-x 主线已完成 T3-1/T3-2/T3-4/T3-5/T3-6；随后插入两轮收尾冲刺）
-> **阶段目标**：完成 Control Plane、Agent、Web UI、Python SDK 的端到端联调闭环。
+> **阶段目标**：完成 Control Plane、Agent、Web UI 的端到端联调闭环（**Python SDK 联调 T3-3 已按产品决策推后**，不再是本阶段收口的必要条件）。
 >
 > **阶段现状（2026-07-04）**：T3-x 采集规则重构完成后，主线**未**线性推进到 T3-3，而是插入了
 > **止血冲刺**（P0+P1 差异，G-1…G-5；见 `docs/reports/design-gap-analysis/` 与 07-summary §五）
