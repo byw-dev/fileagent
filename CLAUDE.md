@@ -100,7 +100,9 @@ fileagent/                        # Monorepo 根目录
 - 数据库查询：**sqlc** 生成代码，禁止手写裸 SQL 字符串拼接。生成器版本由 **`tools/` 子模块**钉定
   （`tools/go.mod` 的 `tool` 指令），统一经 **`make generate`** 运行——**禁止手改 `*.sql.go` 等生成文件**；
   改查询请编辑 `controlplane/internal/db/queries/*.sql` 后 `make generate`。CI（`ci-cp.yml`）会跑
-  `make generate` + `git diff --exit-code` 拦截漂移。
+  `make generate` + `git status --porcelain` 拦截漂移（含新增文件）。
+  > 注：sqlc 的依赖要求 **Go 1.26+**（`tools/go.mod` 声明 `go 1.26.0`）。服务代码本身仍是 Go 1.22+，
+  > 但 `make generate` 需要 Go 1.26+；`GOTOOLCHAIN=auto`（默认）会按需自动下载对应 toolchain。
 - 测试框架：**testify**（assert + require + mock）
 - 单元测试覆盖率要求：**≥ 80%**（核心业务逻辑 ≥ 90%）
 - 每个导出函数必须有 godoc 注释

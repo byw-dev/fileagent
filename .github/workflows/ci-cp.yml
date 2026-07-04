@@ -9,12 +9,14 @@ on:
     paths:
       - 'controlplane/**'
       - 'tools/**'
+      - 'Makefile'
       - '.github/workflows/ci-cp.yml'
   push:
     branches: [master]
     paths:
       - 'controlplane/**'
       - 'tools/**'
+      - 'Makefile'
       - '.github/workflows/ci-cp.yml'
 
 jobs:
@@ -40,8 +42,13 @@ jobs:
       - name: sqlc drift guard
         run: |
           make generate
-          if ! git diff --exit-code; then
+          # git status --porcelain catches modified AND new/untracked/deleted
+          # files (git diff --exit-code misses untracked), so a newly-generated
+          # output can't slip through.
+          if [ -n "$(git status --porcelain)" ]; then
             echo "::error::Generated code is out of sync with its sources. Run 'make generate' and commit the result."
+            git status --porcelain
+            git diff
             exit 1
           fi
 
