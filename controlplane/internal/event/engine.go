@@ -186,16 +186,19 @@ func (e *Engine) retryWorker(ctx context.Context) {
 	}
 }
 
-// retryBackoffSchedule defines the wait duration before each retry attempt
-// (indexed by attempt number, 1-based). Matches the design spec §5.9. It is the
-// single source of truth for both the initial webhook scheduling
+// retryBackoffSchedule defines the wait before each successive retry, as a
+// 0-based slice: schedule[0] is the delay before the 1st retry, schedule[4]
+// before the 5th (final) retry. It is indexed by the number of retries already
+// completed — 0 on the initial failure (schedule[0]=30s), then newAttemptCount
+// in the retry worker — giving 30s → 2m → 10m → 30m → 2h (design spec §5.9).
+// It is the single source of truth for both the initial webhook scheduling
 // (WebhookSender.scheduleRetry) and the retry worker, so the two cannot drift.
 var retryBackoffSchedule = []time.Duration{
-	30 * time.Second, // attempt 1
-	2 * time.Minute,  // attempt 2
-	10 * time.Minute, // attempt 3
-	30 * time.Minute, // attempt 4
-	2 * time.Hour,    // attempt 5 — final
+	30 * time.Second, // before retry 1
+	2 * time.Minute,  // before retry 2
+	10 * time.Minute, // before retry 3
+	30 * time.Minute, // before retry 4
+	2 * time.Hour,    // before retry 5 (final)
 }
 
 // maxRetryAttempts is the maximum number of retry attempts before giving up.
