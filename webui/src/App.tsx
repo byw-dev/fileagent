@@ -66,6 +66,7 @@ function App() {
               <Route path="/agents/:id" element={<AgentDetailPage />} />
               <Route path="/agents/:id/rules" element={<AgentRulesPage />} />
               <Route path="/agents/:id/rules/create" element={<AgentRuleFormPage />} />
+              <Route path="/agents/:id/rules/:rid/edit" element={<AgentRuleFormPage />} />
               <Route path="/agents/:id/logs" element={<AgentLogsPage />} />
 
               {/* Files */}

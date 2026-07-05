@@ -13,7 +13,7 @@ import {
 } from 'antd'
 import { StepsForm, ProFormText, ProFormSelect, ProFormSwitch } from '@ant-design/pro-components'
 import { useParams, useNavigate } from 'react-router-dom'
-import { createRule, testRule } from '../../services/agents'
+import { createRule, updateRule, listRules, testRule } from '../../services/agents'
 import type { CollectionMode, TestRuleFileResult } from '../../services/agents'
 import apiClient from '../../services/api'
 import {
@@ -68,20 +68,91 @@ interface RuleFormValues {
  * Step 2: Source path config (Watch vs Scheduled fields differ).
  * Step 3: Upload path template with live preview.
  */
+/** Default form values used for creation and as the base for editing. */
+const DEFAULT_VALUES: RuleFormValues = {
+  name: '',
+  mode: 'WATCH',
+  bucket_id: '',
+  base_path: '',
+  path_pattern: '*',
+  cron_expr: '',
+  run_once_on_start: false,
+  recursive: false,
+  append_mode: 'overwrite',
+  enabled: true,
+  dest_path_template: '/{agent_name}/{time:yyyy/MM/dd}/{filename}',
+}
+
 function AgentRuleFormPage() {
-  const { id: agentId } = useParams<{ id: string }>()
+  const { id: agentId, rid } = useParams<{ id: string; rid?: string }>()
+  const isEdit = Boolean(rid)
   const navigate = useNavigate()
   const { message } = App.useApp()
 
+  // In edit mode the existing rule is fetched before rendering the form so the
+  // steps can be prefilled; creation starts from DEFAULT_VALUES immediately.
+  const [loading, setLoading] = useState(isEdit)
+  const [initial, setInitial] = useState<RuleFormValues>(DEFAULT_VALUES)
+
   const [mode, setMode] = useState<CollectionMode>('WATCH')
   const [cronExpr, setCronExpr] = useState('')
-  const [pathTemplate, setPathTemplate] = useState('/{agent_name}/{time:yyyy/MM/dd}/{filename}')
+  const [pathTemplate, setPathTemplate] = useState(DEFAULT_VALUES.dest_path_template)
   const [pathError, setPathError] = useState<string | null>(null)
   const [pathPattern, setPathPattern] = useState('*')
   const [basePath, setBasePath] = useState('')
   const [recursive, setRecursive] = useState(false)
   const [buckets, setBuckets] = useState<Bucket[]>([])
   const [submitting, setSubmitting] = useState(false)
+
+  // Edit mode: load the rule and prefill both the form initial values and the
+  // local state the previews/conditionals depend on.
+  useEffect(() => {
+    if (!isEdit || !agentId || !rid) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await listRules(agentId)
+        const rule = res.items.find((r) => r.id === rid)
+        if (cancelled) return
+        if (!rule) {
+          message.error('规则不存在')
+          navigate(`/agents/${agentId}`, { state: { tab: 'rules' } })
+          return
+        }
+        // The API returns mode lowercase; the select expects WATCH/SCHEDULED.
+        const ruleMode = (rule.mode ?? 'WATCH').toUpperCase() as CollectionMode
+        setInitial({
+          name: rule.name,
+          mode: ruleMode,
+          bucket_id: rule.bucket_id,
+          base_path: rule.base_path,
+          path_pattern: rule.path_pattern,
+          cron_expr: rule.cron_expr ?? '',
+          run_once_on_start: rule.run_once_on_start,
+          recursive: rule.recursive,
+          append_mode: rule.append_mode || 'overwrite',
+          enabled: rule.enabled,
+          dest_path_template: rule.dest_path_template,
+        })
+        setMode(ruleMode)
+        setBasePath(rule.base_path)
+        setPathPattern(rule.path_pattern)
+        setPathTemplate(rule.dest_path_template)
+        setRecursive(rule.recursive)
+        setCronExpr(rule.cron_expr ?? '')
+      } catch {
+        if (!cancelled) {
+          message.error('加载规则失败')
+          navigate(`/agents/${agentId}`, { state: { tab: 'rules' } })
+        }
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [isEdit, agentId, rid, navigate, message])
 
   const [testLoading, setTestLoading] = useState(false)
   const [testFiles, setTestFiles] = useState<TestRuleFileResult[] | null>(null)
@@ -142,7 +213,7 @@ function AgentRuleFormPage() {
     }
     setSubmitting(true)
     try {
-      await createRule(agentId, {
+      const payload = {
         name: values.name,
         mode: values.mode,
         bucket_id: values.bucket_id,
@@ -153,13 +224,21 @@ function AgentRuleFormPage() {
         dest_path_template: values.dest_path_template,
         recursive: values.recursive ?? false,
         append_mode: values.append_mode ?? 'overwrite',
-        enabled: values.enabled ?? true,
-      })
-      message.success('规则创建成功')
+        // Editing preserves the rule's enabled state (managed via the list
+        // toggle); creation defaults to enabled.
+        enabled: isEdit ? (initial.enabled ?? true) : true,
+      }
+      if (isEdit && rid) {
+        await updateRule(agentId, rid, payload)
+        message.success('规则更新成功')
+      } else {
+        await createRule(agentId, payload)
+        message.success('规则创建成功')
+      }
       navigate(`/agents/${agentId}`, { state: { tab: 'rules' } })
       return true
     } catch {
-      message.error('规则创建失败，请稍后重试')
+      message.error(isEdit ? '规则更新失败，请稍后重试' : '规则创建失败，请稍后重试')
       return false
     } finally {
       setSubmitting(false)
@@ -168,11 +247,19 @@ function AgentRuleFormPage() {
 
   const bucketOptions = buckets.map((b) => ({ label: b.name, value: b.id }))
 
+  if (isEdit && loading) {
+    return (
+      <div style={{ maxWidth: 760, margin: '0 auto', textAlign: 'center', paddingTop: 80 }}>
+        <Spin />
+      </div>
+    )
+  }
+
   return (
     <div style={{ maxWidth: 760, margin: '0 auto' }}>
       <Space style={{ marginBottom: 24 }}>
         <Button onClick={() => navigate(`/agents/${agentId}`)}>← 返回</Button>
-        <Title level={4} style={{ margin: 0 }}>新建采集规则</Title>
+        <Title level={4} style={{ margin: 0 }}>{isEdit ? '编辑采集规则' : '新建采集规则'}</Title>
       </Space>
 
       {/*
@@ -205,7 +292,7 @@ function AgentRuleFormPage() {
               <Space>
                 <Button onClick={() => props.onPre?.()}>上一步</Button>
                 <Button type="primary" loading={submitting} onClick={() => props.onSubmit?.()}>
-                  创建规则
+                  {isEdit ? '保存修改' : '创建规则'}
                 </Button>
               </Space>
             )
@@ -223,13 +310,14 @@ function AgentRuleFormPage() {
             name="name"
             label="规则名称"
             placeholder="例如：每小时采集传感器数据"
+            initialValue={initial.name}
             rules={[{ required: true, message: '请输入规则名称' }]}
           />
 
           <ProFormSelect
             name="mode"
             label="采集模式"
-            initialValue="WATCH"
+            initialValue={initial.mode}
             options={[
               { label: 'Watch 模式（实时监控）', value: 'WATCH' },
               { label: 'Scheduled 模式（定时任务）', value: 'SCHEDULED' },
@@ -243,6 +331,7 @@ function AgentRuleFormPage() {
           <ProFormSelect
             name="bucket_id"
             label="目标 Bucket"
+            initialValue={initial.bucket_id || undefined}
             options={bucketOptions}
             rules={[{ required: true, message: '请选择目标 Bucket' }]}
             placeholder="选择上传目标 Bucket"
@@ -255,6 +344,7 @@ function AgentRuleFormPage() {
             name="base_path"
             label="源目录路径"
             placeholder="/data/sensors"
+            initialValue={initial.base_path}
             rules={[
               { required: true, message: '请输入源路径' },
               {
@@ -275,7 +365,7 @@ function AgentRuleFormPage() {
             name="path_pattern"
             label="文件过滤模式"
             placeholder="*.csv"
-            initialValue="*"
+            initialValue={initial.path_pattern}
             rules={[{ required: true, message: '请输入文件过滤模式' }]}
             tooltip="支持 glob（*.csv、**/*.csv）和 trollsift 结构化模式（如 {device}/{date:yyyy/MM/dd}/{filename}）"
             fieldProps={{
@@ -286,7 +376,7 @@ function AgentRuleFormPage() {
           <ProFormSwitch
             name="recursive"
             label="递归监控子目录"
-            initialValue={false}
+            initialValue={initial.recursive}
             fieldProps={{
               onChange: (checked) => setRecursive(checked),
             }}
@@ -295,7 +385,7 @@ function AgentRuleFormPage() {
           <ProFormSelect
             name="append_mode"
             label="上传模式"
-            initialValue="overwrite"
+            initialValue={initial.append_mode}
             options={[
               { label: 'overwrite（全量）', value: 'overwrite' },
               { label: 'tail（追加尾部）', value: 'tail' },
@@ -309,6 +399,7 @@ function AgentRuleFormPage() {
                 name="cron_expr"
                 label="Cron 表达式"
                 placeholder="0 * * * *"
+                initialValue={initial.cron_expr}
                 rules={[
                   { required: true, message: '请输入 Cron 表达式' },
                   {
@@ -336,7 +427,7 @@ function AgentRuleFormPage() {
               <ProFormSwitch
                 name="run_once_on_start"
                 label="启动时立即执行一次"
-                initialValue={false}
+                initialValue={initial.run_once_on_start}
               />
             </>
           )}
@@ -384,7 +475,7 @@ function AgentRuleFormPage() {
           <ProFormText
             name="dest_path_template"
             label="上传路径模板"
-            initialValue="/{agent_name}/{time:yyyy/MM/dd}/{filename}"
+            initialValue={initial.dest_path_template}
             rules={[
               { required: true, message: '请输入路径模板' },
               {

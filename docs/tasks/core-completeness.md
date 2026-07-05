@@ -29,7 +29,7 @@
 | ID | 模块 | 缺口 | 来源 |
 |----|------|------|------|
 | **CC-8** | CP + webui | Agent 重命名（管理员设自定义显示名） | backlog T4-5 |
-| **CC-9** 🚧 | CP + webui | 采集规则原地编辑（复用三步 Wizard 回填 + PUT 全字段） | **后端已完成（本 PR / D-020）**：sqlc `UpdateCollectionRule` + `PUT .../rules/{rid}` 双形态（status-only 向后兼容 + 含 `name` 时全字段更新，缺字段/非法 mode `422`，非法 bucket `400`）+ active 结果重新 dispatch 热重载；live-e2e 通过。**webui 编辑入口 + RuleForm edit 模式回填 = 下一 PR（Part 2）**。backlog T4-6 |
+| **CC-9** ✅ | CP + webui | ~~采集规则原地编辑~~ | **已完成**：Part 1 后端（PR #56 / D-020）——sqlc `UpdateCollectionRule` + `PUT .../rules/{rid}` 双形态（status-only 向后兼容 + 含 `name` 全字段更新，缺字段/非法 mode `422`、非法 bucket `400`、`id+agent_id+org_id` 防 IDOR）+ active 结果热重载。Part 2 webui（本 PR）——规则列表/详情加「编辑」入口 + RuleForm edit 模式（三步全回填、mode 大小写归一、标题/按钮切换、提交调 `updateRule`、Dry-Run 可跳过、保留 enabled）+ 路由 `/agents/:id/rules/:rid/edit`。**浏览器 live-e2e 全程通过**（三步回填 → 改模板 → 保存 → DB 持久化、规则 ID 不变）。backlog T4-6 |
 | **CC-10** | webui | 状态枚举大小写映射等"隐性契约"无文档 | 03 §小结 / 05 §4 |
 
 > **注**：CC-8/CC-9 是纯功能增量，若按实际使用它们比 Tier B 的健壮性修复更有价值，可提前。
