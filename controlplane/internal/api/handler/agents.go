@@ -737,14 +737,16 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 // updateRuleRequest is the body expected by PUT /api/v1/agents/:id/rules/:rid.
 // The endpoint serves two shapes:
 //   - status-only toggle: {"status":"active"|"inactive"} — enable/disable.
-//   - full-field edit (CC-9): when Name is non-empty, every content field below
-//     is applied. Status is derived from Enabled (defaulting to active).
+//   - full-field edit (CC-9): when a "name" string is provided, every content
+//     field below is applied. Status is derived from Enabled (defaulting to active).
 //
-// The two are distinguished by the presence of the Name key (a *string, so an
-// explicit empty "name" still selects the full-update path and is rejected as a
-// validation error rather than silently falling back to the status toggle),
-// which the toggle never sends — keeping the enable/disable path backward
-// compatible.
+// The two are distinguished by whether "name" is present as a JSON string: Name
+// is a *string, so a provided string (including "") selects the full-update path
+// and an empty value is rejected as a validation error rather than silently
+// falling back to the status toggle. An absent "name" — or an explicit
+// "name": null, which JSON-unmarshals to nil and is treated the same as absent —
+// takes the status-only path. The enable/disable toggle never sends "name", so
+// it stays backward compatible.
 type updateRuleRequest struct {
 	Status string `json:"status"`
 

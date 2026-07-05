@@ -1464,8 +1464,9 @@ NATS 主题规划：
 **`PUT .../rules/{rid}` 双形态（CC-9）**：
 
 - **仅状态切换**：`{"status":"active"|"inactive"}` —— 启用/停用。
-- **全字段编辑**：请求体**含 `name` 键**时视为全量更新（`name` 为 `*string`，显式空串 `""` 仍走全量路径
-  并按缺字段报错，不会静默回退到状态切换），应用 `name` / `bucket_id` / `mode` / `base_path` /
+- **全字段编辑**：请求体提供 **`name` 字符串**时视为全量更新（`name` 为 `*string`，空串 `""` 仍走全量路径
+  并按缺字段报错，不会静默回退到状态切换；**`name` 缺省或显式 `null`**——`null` 经 JSON 反序列化为 `nil`，
+  与缺省等价——走 status-only 路径）。全量更新应用 `name` / `bucket_id` / `mode` / `base_path` /
   `path_pattern` / `dest_path_template` / `recursive` / `cron_expr` / `run_once_on_start` /
   `append_mode` / `enabled`（→ status）。缺任一必填字段返回 `422 VALIDATION_ERROR`，
   `mode` 非 `watch`/`scheduled` 返回 `422`，`bucket_id` 非法返回 `400 INVALID_BUCKET_ID`。

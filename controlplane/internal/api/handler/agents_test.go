@@ -573,6 +573,16 @@ func TestAgentsHandler_UpdateRule_EmptyName_IsFullUpdateValidationError(t *testi
 	assert.Equal(t, "VALIDATION_ERROR", body["error"].(map[string]interface{})["code"])
 }
 
+func TestAgentsHandler_UpdateRule_NullName_TakesStatusPath(t *testing.T) {
+	// {"name": null} unmarshals to nil (same as absent) and takes the status-only
+	// path — here with a valid status, so it succeeds as a toggle.
+	dispatcher := &mockDispatcher{}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, dispatcher, nil, newTestLogger())
+	w := putRule(t, h, `{"name":null,"status":"inactive"}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, 1, dispatcher.cancelled)
+}
+
 func TestAgentsHandler_UpdateRule_FullUpdate_MissingField(t *testing.T) {
 	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
 	// name present (→ full-update path) but base_path missing.
