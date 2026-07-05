@@ -96,6 +96,8 @@ func TestDispatchNATS_PublishError_MarksFailedWithRetry(t *testing.T) {
 	assert.Equal(t, "failed", updated.Status)
 	assert.False(t, updated.DeliveredAt.Valid)
 	assert.True(t, updated.NextRetryAt.Valid, "failed nats delivery must be scheduled for retry")
+	assert.Equal(t, int32(0), updated.AttemptCount,
+		"initial attempt leaves attempt_count 0; the retry worker increments it")
 }
 
 func TestDispatchNATS_NoPublisher_MarksFailed(t *testing.T) {

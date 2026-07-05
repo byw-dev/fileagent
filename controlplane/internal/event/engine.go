@@ -360,15 +360,18 @@ func (e *Engine) dispatchNATS(ctx context.Context, rule *db.EventRule, eventType
 			zap.Error(pubErr),
 		)
 		status = "failed"
-		nextRetryAt = sql.NullTime{Time: time.Now().Add(retryBackoffSchedule[0]), Valid: true}
+		nextRetryAt = sql.NullTime{Time: time.Now().UTC().Add(retryBackoffSchedule[0]), Valid: true}
 	} else {
 		deliveredAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
 	}
 
+	// AttemptCount stays 0 for the initial attempt — the retry worker increments
+	// it on each retry, matching the webhook path (which never touches
+	// attempt_count on the first send).
 	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
 		ID:           delivery.ID,
 		Status:       status,
-		AttemptCount: 1,
+		AttemptCount: 0,
 		NextRetryAt:  nextRetryAt,
 		DeliveredAt:  deliveredAt,
 	})

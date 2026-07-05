@@ -35,7 +35,6 @@ live-e2e 通过。设计 §5.9 + D-019，本 PR 提交中。
 | CC-4 | CP | API 限流（固定窗口，per-user） | ✅ PR #54 |
 | **CC-7** | CP + webui | nats_publish 实现 + kafka_publish 拒绝 | ✅ 本 PR |
 | CC-8~10 | webui | Agent 重命名 / 规则原地编辑 / 隐性契约文档 | ⬜（视使用价值） |
-| CC-8~10 | webui | Agent 重命名 / 规则原地编辑 / 隐性契约文档 | ⬜（视使用价值） |
 
 前序已收官：**止血冲刺（P0+P1）** G-1…G-5（PR #39–#45，D-012…D-016），
 回顾见 [`docs/reports/design-gap-analysis/07-summary.md`](../reports/design-gap-analysis/07-summary.md) §五。
