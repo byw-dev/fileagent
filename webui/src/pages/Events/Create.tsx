@@ -137,7 +137,7 @@ function EventCreatePage() {
             rules={[{ required: true, message: '请填写动作配置' }]}
             extra='webhook：{"url": "https://example.com/hook"}；nats_publish：{"subject": "events.custom.sink"}'
           >
-            <TextArea rows={4} placeholder='webhook：{"url": "..."} ｜ nats_publish：{"subject": "..."}' />
+            <TextArea rows={4} placeholder='{"url": "https://example.com/hook"}' />
           </Form.Item>
 
           <Form.Item

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/event"
@@ -82,6 +83,26 @@ func TestDispatchNATS_PublishesAndMarksDelivered(t *testing.T) {
 	assert.JSONEq(t, `{"file":"a.txt"}`, string(pub.data))
 	assert.Equal(t, "delivered", updated.Status)
 	assert.True(t, updated.DeliveredAt.Valid)
+}
+
+func TestDispatchNATS_CreatesWithInFlightGuard(t *testing.T) {
+	pub := &fakeNATSPublisher{}
+	var created indexer.CreateEventDeliveryParams
+	base := &capturingEngineStore{
+		onCreate: func(p indexer.CreateEventDeliveryParams) { created = p },
+	}
+	store := &capturingListStore{capturingEngineStore: base, rules: []*db.EventRule{natsRule(`{"subject":"events.custom.sink"}`)}}
+
+	engine := newNATSEngine(t, store, pub)
+	require.NoError(t, engine.HandleEvent(context.Background(), uuid.New(), db.EventTypeFileUploaded,
+		map[string]interface{}{"file": "a.txt"}))
+
+	// The row is inserted with a future next_retry_at so a concurrent retry tick
+	// cannot pick it up (NULL = "due now") and double-publish before the outcome
+	// is recorded.
+	require.True(t, created.NextRetryAt.Valid, "delivery must be created with an in-flight next_retry_at")
+	assert.True(t, created.NextRetryAt.Time.After(time.Now()),
+		"in-flight next_retry_at must be in the future")
 }
 
 func TestDispatchNATS_PublishError_MarksFailedWithRetry(t *testing.T) {

@@ -377,13 +377,17 @@ type capturingEngineStore struct {
 	ruleByID          *db.EventRule
 	ruleByIDErr       error
 	onUpdate          func(indexer.UpdateEventDeliveryParams)
+	onCreate          func(indexer.CreateEventDeliveryParams)
 }
 
 func (s *capturingEngineStore) ListEnabledEventRules(_ context.Context, _ uuid.UUID, _ db.EventType) ([]*db.EventRule, error) {
 	return nil, nil
 }
 
-func (s *capturingEngineStore) CreateEventDelivery(_ context.Context, _ indexer.CreateEventDeliveryParams) (*db.EventDelivery, error) {
+func (s *capturingEngineStore) CreateEventDelivery(_ context.Context, p indexer.CreateEventDeliveryParams) (*db.EventDelivery, error) {
+	if s.onCreate != nil {
+		s.onCreate(p)
+	}
 	return &db.EventDelivery{ID: uuid.New()}, nil
 }
 

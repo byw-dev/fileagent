@@ -388,12 +388,7 @@ func (e *Engine) dispatchNATS(ctx context.Context, rule *db.EventRule, eventType
 		return fmt.Errorf("engine: nats subject empty for rule %s", rule.ID)
 	}
 
-	delivery, err := e.store.CreateEventDelivery(ctx, indexer.CreateEventDeliveryParams{
-		EventRuleID: rule.ID,
-		EventType:   eventType,
-		Payload:     payload,
-		Status:      "pending",
-	})
+	delivery, err := e.store.CreateEventDelivery(ctx, inFlightDeliveryParams(rule.ID, eventType, payload))
 	if err != nil {
 		return fmt.Errorf("engine: create delivery record: %w", err)
 	}
@@ -441,6 +436,22 @@ func (e *Engine) publishNATS(subject string, payload []byte) error {
 	return e.publisher.Publish(subject, payload)
 }
 
+// inFlightDeliveryParams builds the CreateEventDelivery params for a freshly
+// dispatched delivery. It stamps an in-flight next_retry_at in the future so a
+// concurrent retry tick cannot pick up the row (the scan treats a NULL
+// next_retry_at as "due now") and double-send it during the window before the
+// dispatcher records the final outcome. If the process crashes mid-send, the row
+// becomes retry-eligible after this delay rather than being stranded.
+func inFlightDeliveryParams(ruleID uuid.UUID, eventType db.EventType, payload []byte) indexer.CreateEventDeliveryParams {
+	return indexer.CreateEventDeliveryParams{
+		EventRuleID: ruleID,
+		EventType:   eventType,
+		Payload:     payload,
+		Status:      "pending",
+		NextRetryAt: sql.NullTime{Time: time.Now().UTC().Add(retryBackoffSchedule[0]), Valid: true},
+	}
+}
+
 func (e *Engine) dispatchWebhook(ctx context.Context, rule *db.EventRule, eventType db.EventType, payload []byte) error {
 	var cfg WebhookActionConfig
 	if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
@@ -450,12 +461,7 @@ func (e *Engine) dispatchWebhook(ctx context.Context, rule *db.EventRule, eventT
 		return fmt.Errorf("engine: webhook url empty for rule %s", rule.ID)
 	}
 
-	delivery, err := e.store.CreateEventDelivery(ctx, indexer.CreateEventDeliveryParams{
-		EventRuleID: rule.ID,
-		EventType:   eventType,
-		Payload:     payload,
-		Status:      "pending",
-	})
+	delivery, err := e.store.CreateEventDelivery(ctx, inFlightDeliveryParams(rule.ID, eventType, payload))
 	if err != nil {
 		return fmt.Errorf("engine: create delivery record: %w", err)
 	}
