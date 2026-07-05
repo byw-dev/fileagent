@@ -1464,10 +1464,12 @@ NATS 主题规划：
 **`PUT .../rules/{rid}` 双形态（CC-9）**：
 
 - **仅状态切换**：`{"status":"active"|"inactive"}` —— 启用/停用。
-- **全字段编辑**：请求体含 `name` 时视为全量更新，应用 `name` / `bucket_id` / `mode` /
-  `base_path` / `path_pattern` / `dest_path_template` / `recursive` / `cron_expr` /
-  `run_once_on_start` / `append_mode` / `enabled`（→ status）。缺任一必填字段返回 `422 VALIDATION_ERROR`，
+- **全字段编辑**：请求体**含 `name` 键**时视为全量更新（`name` 为 `*string`，显式空串 `""` 仍走全量路径
+  并按缺字段报错，不会静默回退到状态切换），应用 `name` / `bucket_id` / `mode` / `base_path` /
+  `path_pattern` / `dest_path_template` / `recursive` / `cron_expr` / `run_once_on_start` /
+  `append_mode` / `enabled`（→ status）。缺任一必填字段返回 `422 VALIDATION_ERROR`，
   `mode` 非 `watch`/`scheduled` 返回 `422`，`bucket_id` 非法返回 `400 INVALID_BUCKET_ID`。
+  全量更新的 SQL 以 `id + agent_id + org_id` 三键定位（防越权改他人/他组织规则；不匹配返回 `404`）。
 - 两种形态在结果为 active 时都会重新 `DispatchRule`（Agent 收到 `PushRuleCommand` 内部 `stopRule`+重启
   watcher，热重载，无需先 disable）；结果为 inactive 时 `DispatchRuleCancel`。Agent 离线时更新照常写库，
   重连时经 `SyncRulesOnConnect` 自动同步。规则 ID 不变，历史上传日志保持关联。

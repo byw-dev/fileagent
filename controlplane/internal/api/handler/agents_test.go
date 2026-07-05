@@ -136,14 +136,20 @@ func (m *mockAgentMgr) RevokeAgent(_ context.Context, _ uuid.UUID, _ uuid.UUID) 
 }
 
 type mockDispatcher struct {
-	dispatchErr error
-	cancelErr   error
+	dispatchErr    error
+	cancelErr      error
+	dispatched     int
+	cancelled      int
+	lastDispatched *db.CollectionRule
 }
 
-func (m *mockDispatcher) DispatchRule(_ context.Context, _ *db.CollectionRule) error {
+func (m *mockDispatcher) DispatchRule(_ context.Context, rule *db.CollectionRule) error {
+	m.dispatched++
+	m.lastDispatched = rule
 	return m.dispatchErr
 }
 func (m *mockDispatcher) DispatchRuleCancel(_ context.Context, _, _ string) error {
+	m.cancelled++
 	return m.cancelErr
 }
 
@@ -535,6 +541,9 @@ func TestAgentsHandler_UpdateRule_FullUpdate_Success(t *testing.T) {
 	assert.Equal(t, "edited", body["name"])
 	assert.Equal(t, "scheduled", body["mode"])
 	assert.Equal(t, "tail", body["append_mode"])
+	// An active result must hot-reload via DispatchRule, not cancel.
+	assert.Equal(t, 1, dispatcher.dispatched)
+	assert.Equal(t, 0, dispatcher.cancelled)
 }
 
 func TestAgentsHandler_UpdateRule_FullUpdate_Disable(t *testing.T) {
@@ -548,6 +557,20 @@ func TestAgentsHandler_UpdateRule_FullUpdate_Disable(t *testing.T) {
 	var resp map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, false, resp["enabled"])
+	// An inactive result must cancel the dispatch, not re-dispatch.
+	assert.Equal(t, 1, dispatcher.cancelled)
+	assert.Equal(t, 0, dispatcher.dispatched)
+}
+
+func TestAgentsHandler_UpdateRule_EmptyName_IsFullUpdateValidationError(t *testing.T) {
+	// A present-but-empty "name" selects the full-update path and must be a 422
+	// validation error, not a silent fallback to the status toggle.
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	w := putRule(t, h, `{"name":""}`)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "VALIDATION_ERROR", body["error"].(map[string]interface{})["code"])
 }
 
 func TestAgentsHandler_UpdateRule_FullUpdate_MissingField(t *testing.T) {

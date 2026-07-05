@@ -740,12 +740,15 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 //   - full-field edit (CC-9): when Name is non-empty, every content field below
 //     is applied. Status is derived from Enabled (defaulting to active).
 //
-// The two are distinguished by the presence of Name, which the toggle never
-// sends, keeping the enable/disable path backward compatible.
+// The two are distinguished by the presence of the Name key (a *string, so an
+// explicit empty "name" still selects the full-update path and is rejected as a
+// validation error rather than silently falling back to the status toggle),
+// which the toggle never sends — keeping the enable/disable path backward
+// compatible.
 type updateRuleRequest struct {
 	Status string `json:"status"`
 
-	Name             string          `json:"name"`
+	Name             *string         `json:"name"`
 	BucketID         string          `json:"bucket_id"`
 	Mode             string          `json:"mode"`
 	BasePath         string          `json:"base_path"`
@@ -780,7 +783,7 @@ func (h *AgentsHandler) UpdateRule(c *gin.Context) {
 		return
 	}
 
-	if req.Name != "" {
+	if req.Name != nil {
 		h.updateRuleFull(c, rid, req)
 		return
 	}
@@ -812,21 +815,35 @@ func (h *AgentsHandler) updateRuleStatus(c *gin.Context, rid uuid.UUID, statusSt
 	c.JSON(http.StatusOK, toRuleResponse(rule))
 }
 
-// updateRuleFull applies a full-field edit of a collection rule.
+// updateRuleFull applies a full-field edit of a collection rule. The update is
+// scoped to the path agent and the caller's org so a guessed rule UUID cannot
+// modify another agent's or org's rule (a mismatch yields NOT_FOUND).
 func (h *AgentsHandler) updateRuleFull(c *gin.Context, rid uuid.UUID, req updateRuleRequest) {
-	// All content fields are required for a full update.
-	missing := map[string]string{
-		"name":               req.Name,
-		"bucket_id":          req.BucketID,
-		"mode":               req.Mode,
-		"base_path":          req.BasePath,
-		"path_pattern":       req.PathPattern,
-		"dest_path_template": req.DestPathTemplate,
+	agentID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
+		return
 	}
-	for field, val := range missing {
-		if val == "" {
+	orgID := orgIDFromClaims(c)
+
+	name := ""
+	if req.Name != nil {
+		name = *req.Name
+	}
+	// All content fields are required for a full update. Use a fixed order so the
+	// reported field is deterministic (a map would randomise it).
+	required := []struct{ field, value string }{
+		{"name", name},
+		{"bucket_id", req.BucketID},
+		{"mode", req.Mode},
+		{"base_path", req.BasePath},
+		{"path_pattern", req.PathPattern},
+		{"dest_path_template", req.DestPathTemplate},
+	}
+	for _, r := range required {
+		if r.value == "" {
 			middleware.RespondError(c, http.StatusUnprocessableEntity, "VALIDATION_ERROR",
-				field+" is required for a full rule update", nil)
+				r.field+" is required for a full rule update", nil)
 			return
 		}
 	}
@@ -861,8 +878,10 @@ func (h *AgentsHandler) updateRuleFull(c *gin.Context, rid uuid.UUID, req update
 
 	params := db.UpdateCollectionRuleParams{
 		ID:               rid,
+		AgentID:          agentID,
+		OrgID:            orgID,
 		BucketID:         bucketID,
-		Name:             req.Name,
+		Name:             name,
 		Mode:             db.UploadMode(mode),
 		BasePath:         req.BasePath,
 		PathPattern:      req.PathPattern,

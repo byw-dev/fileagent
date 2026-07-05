@@ -786,9 +786,14 @@ nats_publish**，`kafka_publish` 拒绝（系统固定基础设施是 NATS，无
 
 ### 决策
 
-- **同一 PUT 端点承载两种形态**，用请求体是否含 `name` 区分：无 `name` → 走原 status-only 路径
-  （`UpdateCollectionRuleStatus`，向后兼容开关）；有 `name` → 全字段更新（新增 sqlc `UpdateCollectionRule`）。
+- **同一 PUT 端点承载两种形态**，用请求体是否**含 `name` 键**区分（`name` 为 `*string`，显式空串仍走全量
+  路径按缺字段 `422`，避免"含 name 但为空"静默回退到状态切换）：无 `name` → 原 status-only 路径
+  （`UpdateCollectionRuleStatus`，向后兼容开关）；含 `name` → 全字段更新（新增 sqlc `UpdateCollectionRule`）。
   不新增端点，保持 REST 路径契约不变。
+- **全量更新按 `id + agent_id + org_id` 三键定位**（防 IDOR：仅凭猜到的 rule UUID 改他 agent/他 org 的规则；
+  不匹配返回 `404` 不泄露存在性）。handler 解析路径 agent id + claims org id 传入。全字段更新影响面
+  （bucket/路径）比原 status-only 大，值得收紧。（注：现存 status-only 与 delete 仍是 id-only，属既有面，
+  本 PR 未一并改，留作后续。）
 - **全字段校验**：`name`/`bucket_id`/`mode`/`base_path`/`path_pattern`/`dest_path_template` 必填，
   缺失 `422 VALIDATION_ERROR`；`mode` 限 `watch`/`scheduled`，否则 `422`；`bucket_id` 非法 `400`。
   status 由 `enabled` 派生（与创建对称），默认 active。

@@ -51,7 +51,7 @@ SET bucket_id = $2,
     append_mode = $12,
     metadata = $13,
     updated_at = NOW()
-WHERE id = $1
+WHERE id = $1 AND agent_id = $14 AND org_id = $15
 RETURNING *;
 
 -- name: DeleteCollectionRule :exec

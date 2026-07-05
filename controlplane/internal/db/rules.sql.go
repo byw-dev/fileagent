@@ -194,7 +194,7 @@ SET bucket_id = $2,
     append_mode = $12,
     metadata = $13,
     updated_at = NOW()
-WHERE id = $1
+WHERE id = $1 AND agent_id = $14 AND org_id = $15
 RETURNING id, org_id, agent_id, bucket_id, name, mode, status, base_path, path_pattern, dest_path_template, recursive, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at
 `
 
@@ -212,6 +212,8 @@ type UpdateCollectionRuleParams struct {
 	RunOnceOnStart   bool            `db:"run_once_on_start" json:"run_once_on_start"`
 	AppendMode       string          `db:"append_mode" json:"append_mode"`
 	Metadata         json.RawMessage `db:"metadata" json:"metadata"`
+	AgentID          uuid.UUID       `db:"agent_id" json:"agent_id"`
+	OrgID            uuid.UUID       `db:"org_id" json:"org_id"`
 }
 
 func (q *Queries) UpdateCollectionRule(ctx context.Context, arg UpdateCollectionRuleParams) (*CollectionRule, error) {
@@ -229,6 +231,8 @@ func (q *Queries) UpdateCollectionRule(ctx context.Context, arg UpdateCollection
 		arg.RunOnceOnStart,
 		arg.AppendMode,
 		arg.Metadata,
+		arg.AgentID,
+		arg.OrgID,
 	)
 	var i CollectionRule
 	err := row.Scan(
