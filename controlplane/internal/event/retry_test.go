@@ -186,9 +186,9 @@ func TestProcessRetries_UnknownActionType_MarkedTerminal(t *testing.T) {
 	require.True(t, updateCalled, "unknown action delivery must be updated, not left eligible")
 	assert.Equal(t, "dead", captured.Status)
 	assert.False(t, captured.NextRetryAt.Valid)
-	// Diagnostics must be preserved, not cleared, on the terminal transition.
+	// response_code is preserved; response_body carries the terminal reason.
 	assert.Equal(t, int32(500), captured.ResponseCode.Int32)
-	assert.Equal(t, "boom", captured.ResponseBody.String)
+	assert.Contains(t, captured.ResponseBody.String, "unsupported action type")
 }
 
 func TestProcessRetries_BadNatsConfig_MarkedTerminal(t *testing.T) {
@@ -213,6 +213,33 @@ func TestProcessRetries_BadNatsConfig_MarkedTerminal(t *testing.T) {
 	require.True(t, updateCalled, "bad-config delivery must be marked dead, not left eligible")
 	assert.Equal(t, "dead", captured.Status)
 	assert.False(t, captured.NextRetryAt.Valid)
+	assert.Contains(t, captured.ResponseBody.String, "nats subject empty",
+		"terminal reason must be persisted for operator visibility")
+}
+
+func TestProcessRetries_EmptyWebhookURL_MarkedTerminal(t *testing.T) {
+	logger := newTestLogger()
+	ruleID := uuid.New()
+	// A webhook rule with an empty url can never be delivered → terminal, rather
+	// than retried to max.
+	rule := &db.EventRule{ID: ruleID, ActionType: db.ActionTypeWebhook, ActionConfig: []byte(`{"url":""}`)}
+	delivery := &db.EventDelivery{ID: uuid.New(), EventRuleID: ruleID, Payload: []byte(`{}`), Status: "failed"}
+
+	var captured indexer.UpdateEventDeliveryParams
+	updateCalled := false
+	store := &capturingEngineStore{
+		pendingDeliveries: []*db.EventDelivery{delivery},
+		ruleByID:          rule,
+		onUpdate:          func(p indexer.UpdateEventDeliveryParams) { captured = p; updateCalled = true },
+	}
+	engine := event.NewEngineWithStore(store, event.NewWebhookSender(&dummyDeliveryDB{}, logger), logger)
+
+	engine.ProcessRetries(context.Background())
+
+	require.True(t, updateCalled)
+	assert.Equal(t, "dead", captured.Status)
+	assert.False(t, captured.NextRetryAt.Valid)
+	assert.Contains(t, captured.ResponseBody.String, "webhook url empty")
 }
 
 func TestProcessRetries_RuleNotFound_SkipsDelivery(t *testing.T) {

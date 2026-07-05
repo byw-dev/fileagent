@@ -133,7 +133,7 @@ func TestWebhookSender_Send_Exhausted(t *testing.T) {
 		ID:        "delivery-3",
 		URL:       srv.URL,
 		Payload:   []byte(`{}`),
-		AttemptNo: len(retryDelays), // already at max retries
+		AttemptNo: len(retryBackoffSchedule), // already at max retries
 	}
 	err := sender.Send(context.Background(), rec)
 	require.NoError(t, err)
@@ -144,7 +144,7 @@ func TestWebhookSender_Send_Exhausted(t *testing.T) {
 
 func TestMarshalDeliveryPayload(t *testing.T) {
 	payload := map[string]interface{}{
-		"event_type":  "file.uploaded",
+		"event_type":   "file.uploaded",
 		"storage_path": "uploads/file.log",
 	}
 	data, err := MarshalDeliveryPayload(payload)

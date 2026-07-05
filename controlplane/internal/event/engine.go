@@ -187,7 +187,9 @@ func (e *Engine) retryWorker(ctx context.Context) {
 }
 
 // retryBackoffSchedule defines the wait duration before each retry attempt
-// (indexed by attempt number, 1-based). Matches the design spec §5.9.
+// (indexed by attempt number, 1-based). Matches the design spec §5.9. It is the
+// single source of truth for both the initial webhook scheduling
+// (WebhookSender.scheduleRetry) and the retry worker, so the two cannot drift.
 var retryBackoffSchedule = []time.Duration{
 	30 * time.Second, // attempt 1
 	2 * time.Minute,  // attempt 2
@@ -237,35 +239,31 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 
 	newAttemptCount := d.AttemptCount + 1
 
+	// Config/validation failures below are deterministic — they can never succeed
+	// on retry — so they are marked terminal ("dead") with the reason persisted to
+	// response_body, instead of being retried to max and looping in the scan.
 	var sendErr error
 	switch rule.ActionType {
 	case db.ActionTypeWebhook:
 		var cfg WebhookActionConfig
 		if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
-			// Malformed config can never succeed on retry — mark terminal so the
-			// scan stops re-selecting (and re-logging) it every tick forever.
-			e.logger.Warn("retry: parse webhook config, marking dead",
-				zap.String("delivery_id", d.ID.String()), zap.Error(err))
-			return e.markDeliveryDead(ctx, d)
+			return e.markDeliveryDeadf(ctx, d, "webhook config parse error: %v", err)
+		}
+		if cfg.URL == "" {
+			return e.markDeliveryDeadf(ctx, d, "webhook url empty for rule %s", rule.ID)
 		}
 		sendErr = postWebhook(ctx, cfg.URL, d.Payload)
 	case db.ActionTypeNatsPublish:
 		var cfg NATSActionConfig
 		if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
-			e.logger.Warn("retry: parse nats config, marking dead",
-				zap.String("delivery_id", d.ID.String()), zap.Error(err))
-			return e.markDeliveryDead(ctx, d)
+			return e.markDeliveryDeadf(ctx, d, "nats config parse error: %v", err)
 		}
 		if cfg.Subject == "" {
-			e.logger.Warn("retry: nats subject empty, marking dead",
-				zap.String("delivery_id", d.ID.String()), zap.String("rule_id", rule.ID.String()))
-			return e.markDeliveryDead(ctx, d)
+			return e.markDeliveryDeadf(ctx, d, "nats subject empty for rule %s", rule.ID)
 		}
 		sendErr = e.publishNATS(cfg.Subject, d.Payload)
 	default:
-		// Unknown/unsupported action can never be delivered — mark terminal so the
-		// retry scan stops re-selecting it every tick instead of looping forever.
-		return e.markDeliveryDead(ctx, d)
+		return e.markDeliveryDeadf(ctx, d, "unsupported action type %q", string(rule.ActionType))
 	}
 
 	var newStatus string
@@ -319,17 +317,21 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 	})
 }
 
-// markDeliveryDead transitions a delivery to the terminal 'dead' status for
+// markDeliveryDeadf transitions a delivery to the terminal 'dead' status for
 // failures that can never succeed on retry (unsupported action type,
-// unrecoverable config/validation errors). It preserves the existing
-// response_code/response_body diagnostics and attempt_count, and leaves
-// next_retry_at NULL so the row drops out of the retry scan.
-func (e *Engine) markDeliveryDead(ctx context.Context, d *db.EventDelivery) error {
+// unrecoverable config/validation errors), persisting the formatted reason to
+// response_body so operators can see why without digging through logs. It keeps
+// response_code and attempt_count, logs the reason, and leaves next_retry_at
+// NULL so the row drops out of the retry scan.
+func (e *Engine) markDeliveryDeadf(ctx context.Context, d *db.EventDelivery, format string, args ...interface{}) error {
+	reason := fmt.Sprintf(format, args...)
+	e.logger.Warn("engine: marking delivery dead",
+		zap.String("delivery_id", d.ID.String()), zap.String("reason", reason))
 	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
 		ID:           d.ID,
 		Status:       deliveryStatusDead,
 		ResponseCode: d.ResponseCode,
-		ResponseBody: d.ResponseBody,
+		ResponseBody: sql.NullString{String: reason, Valid: true},
 		AttemptCount: d.AttemptCount,
 	})
 }
