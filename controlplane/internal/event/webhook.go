@@ -12,15 +12,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// retryDelays defines the back-off schedule for failed webhook deliveries.
-var retryDelays = []time.Duration{
-	30 * time.Second,
-	2 * time.Minute,
-	10 * time.Minute,
-	30 * time.Minute,
-	2 * time.Hour,
-}
-
 // DeliveryRecord represents a pending/failed event delivery that needs retry.
 type DeliveryRecord struct {
 	ID          string
@@ -92,14 +83,16 @@ func (w *WebhookSender) Send(ctx context.Context, rec DeliveryRecord) error {
 
 func (w *WebhookSender) scheduleRetry(ctx context.Context, rec DeliveryRecord, code int32) error {
 	attempt := rec.AttemptNo
-	if attempt >= len(retryDelays) {
-		// Exhausted all retries.
-		return w.db.UpdateEventDeliveryStatus(ctx, rec.ID, "failed",
+	if attempt >= len(retryBackoffSchedule) {
+		// Exhausted all retries — mark terminal ('dead') so the row drops out of
+		// the retry scan. A 'failed' row with a NULL next_retry_at is treated as
+		// "due now" and would be re-selected (and re-sent) every tick forever.
+		return w.db.UpdateEventDeliveryStatus(ctx, rec.ID, deliveryStatusDead,
 			sql.NullInt32{Int32: code, Valid: code != 0},
 			sql.NullTime{},
 		)
 	}
-	next := time.Now().Add(retryDelays[attempt])
+	next := time.Now().UTC().Add(retryBackoffSchedule[attempt])
 	return w.db.UpdateEventDeliveryStatus(ctx, rec.ID, "pending",
 		sql.NullInt32{Int32: code, Valid: code != 0},
 		sql.NullTime{Time: next, Valid: true},

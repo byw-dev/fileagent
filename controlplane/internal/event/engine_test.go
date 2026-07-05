@@ -133,18 +133,20 @@ func TestWebhookSender_Send_Exhausted(t *testing.T) {
 		ID:        "delivery-3",
 		URL:       srv.URL,
 		Payload:   []byte(`{}`),
-		AttemptNo: len(retryDelays), // already at max retries
+		AttemptNo: len(retryBackoffSchedule), // already at max retries
 	}
 	err := sender.Send(context.Background(), rec)
 	require.NoError(t, err)
 
 	require.Len(t, db.updates, 1)
-	assert.Contains(t, db.updates[0], "failed")
+	// Exhausted retries transition to the terminal 'dead' status so the retry
+	// scan stops re-selecting the row.
+	assert.Contains(t, db.updates[0], "dead")
 }
 
 func TestMarshalDeliveryPayload(t *testing.T) {
 	payload := map[string]interface{}{
-		"event_type":  "file.uploaded",
+		"event_type":   "file.uploaded",
 		"storage_path": "uploads/file.log",
 	}
 	data, err := MarshalDeliveryPayload(payload)

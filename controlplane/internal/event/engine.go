@@ -21,6 +21,13 @@ type WebhookActionConfig struct {
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
+// NATSActionConfig is the expected JSON shape of EventRule.ActionConfig for
+// nats_publish actions. Subject is the NATS subject the event payload is
+// re-published to for downstream internal consumers.
+type NATSActionConfig struct {
+	Subject string `json:"subject"`
+}
+
 // NATSListener is the minimal NATS interface needed to subscribe to event subjects.
 type NATSListener interface {
 	// Subscribe registers a callback for messages on subject. The returned
@@ -73,9 +80,18 @@ func (d *dbtxEngineStore) GetEventRuleByID(ctx context.Context, id uuid.UUID) (*
 // Engine routes inbound NATS events to the appropriate rules and creates
 // event_delivery records for webhook and other actions.
 type Engine struct {
-	store  EngineStore
-	sender *WebhookSender
-	logger *zap.Logger
+	store     EngineStore
+	sender    *WebhookSender
+	publisher NATSConn // re-publishes payloads for nats_publish actions; nil until WithPublisher
+	logger    *zap.Logger
+}
+
+// WithPublisher wires the NATS publisher used by nats_publish action rules and
+// returns the Engine for chaining. Without it, nats_publish deliveries fail
+// (and are retried) rather than silently succeeding.
+func (e *Engine) WithPublisher(p NATSConn) *Engine {
+	e.publisher = p
+	return e
 }
 
 // NewEngine creates an Engine backed by the given db.DBTX. This is the
@@ -170,18 +186,30 @@ func (e *Engine) retryWorker(ctx context.Context) {
 	}
 }
 
-// retryBackoffSchedule defines the wait duration before each retry attempt
-// (indexed by attempt number, 1-based). Matches the design spec §5.9.
+// retryBackoffSchedule defines the wait before each successive retry, as a
+// 0-based slice: schedule[0] is the delay before the 1st retry, schedule[4]
+// before the 5th (final) retry. It is indexed by the number of retries already
+// completed — 0 on the initial failure (schedule[0]=30s), then newAttemptCount
+// in the retry worker — giving 30s → 2m → 10m → 30m → 2h (design spec §5.9).
+// It is the single source of truth for both the initial webhook scheduling
+// (WebhookSender.scheduleRetry) and the retry worker, so the two cannot drift.
 var retryBackoffSchedule = []time.Duration{
-	30 * time.Second,  // attempt 1
-	2 * time.Minute,   // attempt 2
-	10 * time.Minute,  // attempt 3
-	30 * time.Minute,  // attempt 4
-	2 * time.Hour,     // attempt 5 — final
+	30 * time.Second, // before retry 1
+	2 * time.Minute,  // before retry 2
+	10 * time.Minute, // before retry 3
+	30 * time.Minute, // before retry 4
+	2 * time.Hour,    // before retry 5 (final)
 }
 
 // maxRetryAttempts is the maximum number of retry attempts before giving up.
 const maxRetryAttempts = 5
+
+// deliveryStatusDead is the terminal status for a delivery that must never be
+// retried again (retries exhausted, or an unsupported action type). The retry
+// scan only selects 'pending'/'failed', so a 'dead' delivery drops out — without
+// it, a terminal row with a NULL next_retry_at is treated as "due now" and
+// re-processed (re-sent) every tick forever.
+const deliveryStatusDead = "dead"
 
 // ProcessRetries is the exported entry point for the retry worker logic.
 // It is called periodically by the retryWorker ticker, and may also be
@@ -211,38 +239,68 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 	if err != nil {
 		return fmt.Errorf("retry: get rule %s: %w", d.EventRuleID, err)
 	}
-	if rule.ActionType != db.ActionTypeWebhook {
-		return nil
-	}
-
-	var cfg WebhookActionConfig
-	if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
-		return fmt.Errorf("retry: parse webhook config: %w", err)
-	}
 
 	newAttemptCount := d.AttemptCount + 1
-	sendErr := postWebhook(ctx, cfg.URL, d.Payload)
+
+	// Config/validation failures below are deterministic — they can never succeed
+	// on retry — so they are marked terminal ("dead") with the reason persisted to
+	// response_body, instead of being retried to max and looping in the scan.
+	var sendErr error
+	switch rule.ActionType {
+	case db.ActionTypeWebhook:
+		var cfg WebhookActionConfig
+		if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
+			return e.markDeliveryDeadf(ctx, d, "webhook config parse error: %v", err)
+		}
+		if cfg.URL == "" {
+			return e.markDeliveryDeadf(ctx, d, "webhook url empty for rule %s", rule.ID)
+		}
+		sendErr = postWebhook(ctx, cfg.URL, d.Payload)
+	case db.ActionTypeNatsPublish:
+		var cfg NATSActionConfig
+		if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
+			return e.markDeliveryDeadf(ctx, d, "nats config parse error: %v", err)
+		}
+		if cfg.Subject == "" {
+			return e.markDeliveryDeadf(ctx, d, "nats subject empty for rule %s", rule.ID)
+		}
+		sendErr = e.publishNATS(cfg.Subject, d.Payload)
+	default:
+		return e.markDeliveryDeadf(ctx, d, "unsupported action type %q", string(rule.ActionType))
+	}
 
 	var newStatus string
-	var respCode sql.NullInt32
 	var deliveredAt sql.NullTime
 	var nextRetryAt sql.NullTime
+	// Default to carrying diagnostics forward (retryDelivery captures no fresh
+	// response code); refreshed with the latest error on failure, cleared on
+	// success so a delivered row does not keep a stale error.
+	respCode := d.ResponseCode
+	respBody := d.ResponseBody
 
 	if sendErr != nil {
+		respBody = sql.NullString{String: sendErr.Error(), Valid: true}
 		if int(newAttemptCount) >= maxRetryAttempts {
-			// Exceeded maximum retries — mark permanently failed.
-			newStatus = "failed"
+			// Exceeded maximum retries — mark terminal so it drops out of the
+			// retry scan (a 'failed' row with NULL next_retry_at would loop).
+			newStatus = deliveryStatusDead
 		} else {
 			newStatus = "failed"
-			idx := int(newAttemptCount) - 1
+			// The initial failure already used schedule[0] (attempt_count stays 0),
+			// so the delay before the *next* retry is indexed by newAttemptCount,
+			// giving 30s → 2m → 10m → 30m → 2h across the retry sequence.
+			idx := int(newAttemptCount)
 			if idx >= len(retryBackoffSchedule) {
 				idx = len(retryBackoffSchedule) - 1
 			}
-			nextRetryAt = sql.NullTime{Time: time.Now().Add(retryBackoffSchedule[idx]), Valid: true}
+			nextRetryAt = sql.NullTime{Time: time.Now().UTC().Add(retryBackoffSchedule[idx]), Valid: true}
 		}
 	} else {
 		newStatus = "delivered"
 		deliveredAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+		// Clear stale error diagnostics from prior failed attempts.
+		respCode = sql.NullInt32{}
+		respBody = sql.NullString{}
 	}
 
 	e.logger.Debug("engine: retry delivery complete",
@@ -255,9 +313,29 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 		ID:           d.ID,
 		Status:       newStatus,
 		ResponseCode: respCode,
+		ResponseBody: respBody,
 		AttemptCount: newAttemptCount,
 		NextRetryAt:  nextRetryAt,
 		DeliveredAt:  deliveredAt,
+	})
+}
+
+// markDeliveryDeadf transitions a delivery to the terminal 'dead' status for
+// failures that can never succeed on retry (unsupported action type,
+// unrecoverable config/validation errors), persisting the formatted reason to
+// response_body so operators can see why without digging through logs. It keeps
+// response_code and attempt_count, logs the reason, and leaves next_retry_at
+// NULL so the row drops out of the retry scan.
+func (e *Engine) markDeliveryDeadf(ctx context.Context, d *db.EventDelivery, format string, args ...interface{}) error {
+	reason := fmt.Sprintf(format, args...)
+	e.logger.Warn("engine: marking delivery dead",
+		zap.String("delivery_id", d.ID.String()), zap.String("reason", reason))
+	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
+		ID:           d.ID,
+		Status:       deliveryStatusDead,
+		ResponseCode: d.ResponseCode,
+		ResponseBody: sql.NullString{String: reason, Valid: true},
+		AttemptCount: d.AttemptCount,
 	})
 }
 
@@ -290,35 +368,116 @@ func (e *Engine) dispatch(ctx context.Context, rule *db.EventRule, eventType db.
 	case db.ActionTypeWebhook:
 		return e.dispatchWebhook(ctx, rule, eventType, payload)
 	case db.ActionTypeNatsPublish:
-		// NATS re-publish is handled by the publisher; create a delivery record only.
-		_, err := e.store.CreateEventDelivery(ctx, indexer.CreateEventDeliveryParams{
-			EventRuleID: rule.ID,
-			EventType:   eventType,
-			Payload:     payload,
-			Status:      "delivered",
-		})
-		return err
+		return e.dispatchNATS(ctx, rule, eventType, payload)
 	default:
 		e.logger.Warn("engine: unsupported action type", zap.String("action_type", string(rule.ActionType)))
 		return nil
 	}
 }
 
-func (e *Engine) dispatchWebhook(ctx context.Context, rule *db.EventRule, eventType db.EventType, payload []byte) error {
-	var cfg WebhookActionConfig
+// dispatchNATS re-publishes the event payload to the rule's configured NATS
+// subject and records the outcome as an event_delivery. On publish failure the
+// delivery is marked failed with a retry schedule so the retry worker re-attempts
+// it, mirroring the webhook lifecycle.
+func (e *Engine) dispatchNATS(ctx context.Context, rule *db.EventRule, eventType db.EventType, payload []byte) error {
+	// A misconfigured rule (unparseable config / empty subject) can never
+	// deliver. It is already rejected at rule create/update (INVALID_ACTION_*),
+	// so this only guards legacy/hand-edited rows: skip as a no-op with a single
+	// Warn rather than returning an error that HandleEvent logs at Error level
+	// for every matching event.
+	var cfg NATSActionConfig
 	if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
-		return fmt.Errorf("engine: parse webhook config: %w", err)
+		e.logger.Warn("engine: skipping nats_publish rule with unparseable config",
+			zap.String("rule_id", rule.ID.String()), zap.Error(err))
+		return nil
 	}
-	if cfg.URL == "" {
-		return fmt.Errorf("engine: webhook url empty for rule %s", rule.ID)
+	if cfg.Subject == "" {
+		e.logger.Warn("engine: skipping nats_publish rule with empty subject",
+			zap.String("rule_id", rule.ID.String()))
+		return nil
 	}
 
-	delivery, err := e.store.CreateEventDelivery(ctx, indexer.CreateEventDeliveryParams{
-		EventRuleID: rule.ID,
+	delivery, err := e.store.CreateEventDelivery(ctx, inFlightDeliveryParams(rule.ID, eventType, payload))
+	if err != nil {
+		return fmt.Errorf("engine: create delivery record: %w", err)
+	}
+
+	pubErr := e.publishNATS(cfg.Subject, payload)
+
+	status := "delivered"
+	var deliveredAt, nextRetryAt sql.NullTime
+	var respBody sql.NullString
+	if pubErr != nil {
+		e.logger.Warn("engine: nats publish error",
+			zap.String("delivery_id", delivery.ID.String()),
+			zap.String("subject", cfg.Subject),
+			zap.Error(pubErr),
+		)
+		status = "failed"
+		nextRetryAt = sql.NullTime{Time: time.Now().UTC().Add(retryBackoffSchedule[0]), Valid: true}
+		// Persist why it failed (incl. the "no publisher configured" case) so
+		// operators can see it on the delivery record.
+		respBody = sql.NullString{String: pubErr.Error(), Valid: true}
+	} else {
+		deliveredAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+	}
+
+	// AttemptCount stays 0 for the initial attempt — the retry worker increments
+	// it on each retry, matching the webhook path (which never touches
+	// attempt_count on the first send).
+	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
+		ID:           delivery.ID,
+		Status:       status,
+		ResponseBody: respBody,
+		AttemptCount: 0,
+		NextRetryAt:  nextRetryAt,
+		DeliveredAt:  deliveredAt,
+	})
+}
+
+// publishNATS publishes payload to subject via the wired publisher, returning an
+// error if no publisher is configured (so the delivery is recorded as failed
+// rather than silently dropped).
+func (e *Engine) publishNATS(subject string, payload []byte) error {
+	if e.publisher == nil {
+		return fmt.Errorf("engine: no NATS publisher configured for nats_publish action")
+	}
+	return e.publisher.Publish(subject, payload)
+}
+
+// inFlightDeliveryParams builds the CreateEventDelivery params for a freshly
+// dispatched delivery. It stamps an in-flight next_retry_at in the future so a
+// concurrent retry tick cannot pick up the row (the scan treats a NULL
+// next_retry_at as "due now") and double-send it during the window before the
+// dispatcher records the final outcome. If the process crashes mid-send, the row
+// becomes retry-eligible after this delay rather than being stranded.
+func inFlightDeliveryParams(ruleID uuid.UUID, eventType db.EventType, payload []byte) indexer.CreateEventDeliveryParams {
+	return indexer.CreateEventDeliveryParams{
+		EventRuleID: ruleID,
 		EventType:   eventType,
 		Payload:     payload,
 		Status:      "pending",
-	})
+		NextRetryAt: sql.NullTime{Time: time.Now().UTC().Add(retryBackoffSchedule[0]), Valid: true},
+	}
+}
+
+func (e *Engine) dispatchWebhook(ctx context.Context, rule *db.EventRule, eventType db.EventType, payload []byte) error {
+	// See dispatchNATS: a misconfigured rule is API-rejected at create/update, so
+	// skip legacy/hand-edited bad rows as a no-op with a single Warn instead of a
+	// per-event Error.
+	var cfg WebhookActionConfig
+	if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
+		e.logger.Warn("engine: skipping webhook rule with unparseable config",
+			zap.String("rule_id", rule.ID.String()), zap.Error(err))
+		return nil
+	}
+	if cfg.URL == "" {
+		e.logger.Warn("engine: skipping webhook rule with empty url",
+			zap.String("rule_id", rule.ID.String()))
+		return nil
+	}
+
+	delivery, err := e.store.CreateEventDelivery(ctx, inFlightDeliveryParams(rule.ID, eventType, payload))
 	if err != nil {
 		return fmt.Errorf("engine: create delivery record: %w", err)
 	}
@@ -379,6 +538,13 @@ func (a *dbAdapter) UpdateEventDeliveryStatus(ctx context.Context, id string, st
 	if err != nil {
 		return fmt.Errorf("event delivery db: invalid id %q: %w", id, err)
 	}
+	// Stamp delivered_at on success so a first-attempt webhook success matches
+	// nats_publish and retry-success deliveries (which set it), keeping the
+	// timestamp consistent across actions and first-attempt vs retry.
+	var deliveredAt sql.NullTime
+	if status == "delivered" {
+		deliveredAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+	}
 	return indexer.UpdateEventDelivery(ctx, a.dbtx, indexer.UpdateEventDeliveryParams{
 		ID:           parsed,
 		Status:       status,
@@ -386,6 +552,6 @@ func (a *dbAdapter) UpdateEventDeliveryStatus(ctx context.Context, id string, st
 		ResponseBody: sql.NullString{},
 		AttemptCount: 0,
 		NextRetryAt:  nextRetryAt,
-		DeliveredAt:  sql.NullTime{},
+		DeliveredAt:  deliveredAt,
 	})
 }

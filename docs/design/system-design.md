@@ -1409,11 +1409,23 @@ NATS 主题规划：
   events.agent.revoked
 ```
 
-**Webhook 投递与重试：**
+**动作类型（`action_type`，CC-7）：**
 
-- HTTP POST，超时 10 秒，2xx 视为成功；
-- 失败后指数退避重试：30s → 2min → 10min → 30min → 2h，最多 5 次；
-- Background Worker 每分钟扫描 `next_retry_at <= now()` 的记录执行重试。
+- `webhook`：HTTP POST 事件 payload 到 `action_config.url`。
+- `nats_publish`：把事件 payload 原样重新发布到 `action_config.subject` 指定的 NATS 主题，
+  供内部下游消费者订阅。引擎持有一个 NATS publisher（`Engine.WithPublisher`）；未配置 publisher
+  时该动作记为 `failed` 并进入重试，而非静默"成功"。
+- `kafka_publish`：DB enum 中保留但**无实现**（部署固定基础设施不含 Kafka）。API 创建/更新事件规则时
+  对非 `webhook`/`nats_publish` 的 `action_type` 返回 `400 INVALID_ACTION_TYPE`；`action_config`
+  缺少必填字段（webhook 的 `url` / nats_publish 的 `subject`）返回 `400 INVALID_ACTION_CONFIG`。
+
+**投递与重试：**
+
+- webhook：HTTP POST，超时 10 秒，2xx 视为成功；nats_publish：publisher 返回 nil 视为成功（`delivered`）。
+- 两种动作失败后共用指数退避重试：30s → 2min → 10min → 30min → 2h，最多 5 次；
+- Background Worker 每 30s 扫描 `next_retry_at <= now()` 的 `pending`/`failed` 记录执行重试；
+- 重试耗尽或动作类型不可投递（如历史遗留的 `kafka_publish` 投递）时置**终态 `dead`**，
+  从重试扫描中剔除——避免终态记录（`next_retry_at` 为空被视为"立即到期"）被每 30s 反复重投。
 
 ## 5.10 上传日志记录
 

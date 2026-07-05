@@ -732,3 +732,41 @@ Dashboard 的"今日上传/存储用量/7 日趋势"一直是**前端拿最近 2
 - **失败关闭（Redis 错即 429）**：一次 Redis 抖动即全站不可用，代价远大于限流被短暂绕过。
 - **对 `/api/auth/login` 也限流**：登录无 user_id，需改为按 IP 计数，属独立的暴力破解防护议题；
   本次按设计 §3.5（键为 user_id）只做认证后接口，登录防护另行处理。
+
+---
+
+## D-019：事件动作 —— 实现 nats_publish + 拒绝 kafka_publish（CC-7）
+
+**决策日期**：2026-07-05
+**影响范围**：controlplane（`event` 引擎、`api/handler/events`）、webui（Events/Create）
+**背景**：`docs/tasks/core-completeness.md` CC-7；报告 01 §4
+
+### 背景
+
+DB `action_type` enum = `webhook / nats_publish / kafka_publish`。核查代码发现：
+- `webhook` 真正可用（HTTP POST + 重试 + delivery 记录）。
+- `nats_publish` **是空心的**：dispatch 只写一条 `status='delivered'` 的 delivery，**从不真正发布**到任何
+  NATS 主题——`Engine` 结构体压根没有 publisher 依赖，也没有 `NatsActionConfig`（无 subject）。
+- `kafka_publish` 未实现（default 分支只 warn）。
+
+原 CC-7 计划以为"nats_publish 已可用，放回 UI 即可"，实为把另一个空心功能重新暴露。经产品决策：**真正实现
+nats_publish**，`kafka_publish` 拒绝（系统固定基础设施是 NATS，无 Kafka）。
+
+### 决策
+
+- **实现 nats_publish**：新增 `NATSActionConfig{subject}`；`Engine` 增加 `NATSConn` publisher 依赖
+  （`WithPublisher` 注入，复用 main.go 既有 `natsPublisher`）；`dispatchNATS` 建 pending delivery →
+  发布 payload 到 subject → 成功记 `delivered`+`delivered_at`、失败记 `failed`+`next_retry_at`。
+- **重试打通**：`retryDelivery` 从"仅 webhook"改为按 `action_type` 分派，nats_publish 失败也走同一套指数退避重试。
+- **无 publisher 兜底**：未注入 publisher 时 nats_publish 记 `failed`（进重试），而非静默成功——避免再造空心。
+- **API 校验**：Create/Update 事件规则拒绝非 `webhook`/`nats_publish` 的 `action_type`（`400 INVALID_ACTION_TYPE`），
+  并校验 `action_config` 必填字段（webhook `url` / nats_publish `subject`，缺失 `400 INVALID_ACTION_CONFIG`）。
+- **webui**：动作下拉恢复 `nats_publish`（含 subject 配置示例），不提供 `kafka_publish`，移除 `TODO(CC-7)`。
+- **kafka_publish 保留在 DB enum**：Postgres 删除 enum 值代价高且迁移只追加；保留值无害（API 已拒绝），
+  待真有 Kafka 需求再实现。
+
+### 备选方案（被否决）
+
+- **也把 nats_publish 当不支持、走 webhook-only**：更省事但放弃了设计 §5.9 既有的 NATS 事件总线复用能力；
+  既然基础设施就是 NATS，做实 nats_publish 成本低、价值真实（人工决策 2026-07-05 选 A）。
+- **迁移删除 kafka_publish enum 值**：Postgres enum 删值需重建类型 + 转换列，风险高、收益低；API 层拒绝即可。

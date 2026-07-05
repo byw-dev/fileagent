@@ -2,6 +2,7 @@ package event_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -155,6 +156,90 @@ func TestProcessRetries_MaxRetries_NoNextRetry(t *testing.T) {
 
 	assert.False(t, capturedParams.NextRetryAt.Valid,
 		"NextRetryAt should not be set after max retries")
+	assert.Equal(t, "dead", capturedParams.Status,
+		"exhausted retries must be marked terminal so the scan stops re-selecting them")
+}
+
+func TestProcessRetries_UnknownActionType_MarkedTerminal(t *testing.T) {
+	logger := newTestLogger()
+	ruleID := uuid.New()
+	// kafka_publish has no implementation; a stale delivery for it must not be
+	// re-scanned every tick — it should be marked terminal ("dead") and drop out.
+	rule := &db.EventRule{ID: ruleID, ActionType: db.ActionTypeKafkaPublish, ActionConfig: []byte(`{}`)}
+	delivery := &db.EventDelivery{
+		ID: uuid.New(), EventRuleID: ruleID, Payload: []byte(`{}`), Status: "failed",
+		ResponseCode: sql.NullInt32{Int32: 500, Valid: true},
+		ResponseBody: sql.NullString{String: "boom", Valid: true},
+	}
+
+	var captured indexer.UpdateEventDeliveryParams
+	updateCalled := false
+	store := &capturingEngineStore{
+		pendingDeliveries: []*db.EventDelivery{delivery},
+		ruleByID:          rule,
+		onUpdate:          func(p indexer.UpdateEventDeliveryParams) { captured = p; updateCalled = true },
+	}
+	engine := event.NewEngineWithStore(store, event.NewWebhookSender(&dummyDeliveryDB{}, logger), logger)
+
+	engine.ProcessRetries(context.Background())
+
+	require.True(t, updateCalled, "unknown action delivery must be updated, not left eligible")
+	assert.Equal(t, "dead", captured.Status)
+	assert.False(t, captured.NextRetryAt.Valid)
+	// response_code is preserved; response_body carries the terminal reason.
+	assert.Equal(t, int32(500), captured.ResponseCode.Int32)
+	assert.Contains(t, captured.ResponseBody.String, "unsupported action type")
+}
+
+func TestProcessRetries_BadNatsConfig_MarkedTerminal(t *testing.T) {
+	logger := newTestLogger()
+	ruleID := uuid.New()
+	// nats_publish rule with an empty subject can never be delivered → terminal.
+	rule := &db.EventRule{ID: ruleID, ActionType: db.ActionTypeNatsPublish, ActionConfig: []byte(`{"subject":""}`)}
+	delivery := &db.EventDelivery{ID: uuid.New(), EventRuleID: ruleID, Payload: []byte(`{}`), Status: "failed"}
+
+	var captured indexer.UpdateEventDeliveryParams
+	updateCalled := false
+	store := &capturingEngineStore{
+		pendingDeliveries: []*db.EventDelivery{delivery},
+		ruleByID:          rule,
+		onUpdate:          func(p indexer.UpdateEventDeliveryParams) { captured = p; updateCalled = true },
+	}
+	engine := event.NewEngineWithStore(store, event.NewWebhookSender(&dummyDeliveryDB{}, logger), logger).
+		WithPublisher(&fakeNATSPublisher{})
+
+	engine.ProcessRetries(context.Background())
+
+	require.True(t, updateCalled, "bad-config delivery must be marked dead, not left eligible")
+	assert.Equal(t, "dead", captured.Status)
+	assert.False(t, captured.NextRetryAt.Valid)
+	assert.Contains(t, captured.ResponseBody.String, "nats subject empty",
+		"terminal reason must be persisted for operator visibility")
+}
+
+func TestProcessRetries_EmptyWebhookURL_MarkedTerminal(t *testing.T) {
+	logger := newTestLogger()
+	ruleID := uuid.New()
+	// A webhook rule with an empty url can never be delivered → terminal, rather
+	// than retried to max.
+	rule := &db.EventRule{ID: ruleID, ActionType: db.ActionTypeWebhook, ActionConfig: []byte(`{"url":""}`)}
+	delivery := &db.EventDelivery{ID: uuid.New(), EventRuleID: ruleID, Payload: []byte(`{}`), Status: "failed"}
+
+	var captured indexer.UpdateEventDeliveryParams
+	updateCalled := false
+	store := &capturingEngineStore{
+		pendingDeliveries: []*db.EventDelivery{delivery},
+		ruleByID:          rule,
+		onUpdate:          func(p indexer.UpdateEventDeliveryParams) { captured = p; updateCalled = true },
+	}
+	engine := event.NewEngineWithStore(store, event.NewWebhookSender(&dummyDeliveryDB{}, logger), logger)
+
+	engine.ProcessRetries(context.Background())
+
+	require.True(t, updateCalled)
+	assert.Equal(t, "dead", captured.Status)
+	assert.False(t, captured.NextRetryAt.Valid)
+	assert.Contains(t, captured.ResponseBody.String, "webhook url empty")
 }
 
 func TestProcessRetries_RuleNotFound_SkipsDelivery(t *testing.T) {
@@ -177,13 +262,16 @@ func TestProcessRetries_RuleNotFound_SkipsDelivery(t *testing.T) {
 	})
 }
 
-func TestProcessRetries_NonWebhookRule_IsSkipped(t *testing.T) {
+func TestProcessRetries_NatsRuleBadConfig_NoPanic(t *testing.T) {
 	logger := newTestLogger()
 
 	ruleID := uuid.New()
+	// nats_publish rule with an unparseable/empty action_config: the retry must
+	// surface an error and be skipped for this tick without panicking. (The
+	// happy nats retry path is covered in nats_publish_test.go.)
 	rule := &db.EventRule{
 		ID:         ruleID,
-		ActionType: db.ActionTypeNatsPublish, // non-webhook
+		ActionType: db.ActionTypeNatsPublish,
 	}
 	delivery := &db.EventDelivery{
 		ID:          uuid.New(),
@@ -232,14 +320,17 @@ func TestProcessRetries_BadWebhookConfig_Error(t *testing.T) {
 func TestRetryBackoffSchedule_IncreasesOverAttempts(t *testing.T) {
 	// Each attempt's next_retry must be later than the previous.
 	// We verify by checking delivery updates at attempt counts 1–4.
+	// The initial failure already consumed schedule[0] (30s) with attempt_count=0,
+	// so a retry with incoming attempt_count=N schedules the next one at
+	// schedule[N+1], giving 2min → 10min → 30min → 2h.
 	delays := []struct {
-		attemptCount int32 // current attempt count
+		attemptCount int32 // retries already completed
 		minDelay     time.Duration
 	}{
-		{0, 25 * time.Second},   // next = attempt 1 → 30s
-		{1, 100 * time.Second},  // next = attempt 2 → 2min
-		{2, 500 * time.Second},  // next = attempt 3 → 10min
-		{3, 1500 * time.Second}, // next = attempt 4 → 30min
+		{0, 100 * time.Second},  // next retry → 2min
+		{1, 500 * time.Second},  // next retry → 10min
+		{2, 1500 * time.Second}, // next retry → 30min
+		{3, 6000 * time.Second}, // next retry → 2h
 	}
 
 	for _, tc := range delays {
@@ -286,13 +377,17 @@ type capturingEngineStore struct {
 	ruleByID          *db.EventRule
 	ruleByIDErr       error
 	onUpdate          func(indexer.UpdateEventDeliveryParams)
+	onCreate          func(indexer.CreateEventDeliveryParams)
 }
 
 func (s *capturingEngineStore) ListEnabledEventRules(_ context.Context, _ uuid.UUID, _ db.EventType) ([]*db.EventRule, error) {
 	return nil, nil
 }
 
-func (s *capturingEngineStore) CreateEventDelivery(_ context.Context, _ indexer.CreateEventDeliveryParams) (*db.EventDelivery, error) {
+func (s *capturingEngineStore) CreateEventDelivery(_ context.Context, p indexer.CreateEventDeliveryParams) (*db.EventDelivery, error) {
+	if s.onCreate != nil {
+		s.onCreate(p)
+	}
 	return &db.EventDelivery{ID: uuid.New()}, nil
 }
 

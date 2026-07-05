@@ -206,7 +206,7 @@ func main() {
 	}
 
 	webhookSender := event.NewWebhookSender(event.NewDBAdapter(database), logger)
-	eventEngine := event.NewEngine(database, webhookSender, logger)
+	eventEngine := event.NewEngine(database, webhookSender, logger).WithPublisher(nats)
 	eventEngine.Start(ctx, listener)
 
 	// ── Start gRPC server (background goroutine) ─────────────────────────────

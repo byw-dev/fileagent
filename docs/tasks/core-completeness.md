@@ -22,7 +22,7 @@
 | **CC-4** ✅ | CP | ~~无 API 限流~~ | **已修复（本 PR）**：`/api/v1/*` 按用户固定窗口限流——`cache.IncrWithWindow`（Lua 原子 INCR+EXPIRE）计数 `ratelimit:api:{user_id}`（TTL 60s），`middleware.RateLimit` 在 JWT 后按 `sub` 计数，超限 `429 RATE_LIMITED`+`Retry-After`+`X-RateLimit-*` 头。上限 `API_RATE_LIMIT_PER_MINUTE`（默认 600，`<=0` 关闭）。失败开放。设计 §5.1/§5.11 + 附录 C 已更新（D-018） | 01 §1 |
 | **CC-5** ✅ | CP | ~~错误响应缺顶层 `request_id`；未知 query 参数静默 200~~ | **已修复（本 PR）**：新增 `middleware.RespondError`（非 abort，写完整信封含顶层 `request_id`）+ 将 ~120 处 handler `gin.H{"error":NewErrorBody(...)}` 与 JWT/RequireRole 中间件统一改走 `RespondError`/`AbortWithError`——所有错误响应现携带 `request_id`（`error` 子对象形状不变，纯增量）；新增 `middleware.RejectUnknownQuery`，`GET /api/v1/files` 对白名单外参数返回 `400 INVALID_QUERY_PARAM`。设计 §5.11 已更新 | 06 契约瑕疵 |
 | **CC-6** ✅ | CP | ~~无 TTL 驱动的离线兜底判定~~ | **已修复（本 PR）**：新增 `internal/worker` OfflineSweeper——每 30s 扫描"DB=online 但 Redis 在线 key 已过期"的 Agent，兜底置 offline + 补发 `events.agent.offline`（形状与流断开路径一致）；设计 §5.2/§5.12 已更新。修前：仅 gRPC 流断开时置离线，CP 崩溃/半开残留 online | 01 §3 |
-| **CC-7** | CP + webui | `kafka_publish` action 死配置 + action_type UI 失配 | 已核实：DB enum = `webhook / nats_publish / kafka_publish`（**无 `email`**）；engine 已实现 `webhook` + `nats_publish`（`engine.go:290,292`），**仅 `kafka_publish` 无实现**（配了不生效）。CC-1 期间 webui `Events/Create.tsx` 已临时收窄为 **webhook-only** 并留 `TODO(CC-7)`。CC-7 收尾：实现或从枚举/UI 移除 `kafka_publish`，并把已可用的 `nats_publish` 放回 UI | 01 §4 |
+| **CC-7** ✅ | CP + webui | ~~`kafka_publish` 死配置 + `nats_publish` 空心 + action_type UI 失配~~ | **已修复（本 PR / D-019）**：核查发现 `nats_publish` 其实**也是空心的**（只写 `delivered` delivery，从不真正发布）。真正实现之：`NATSActionConfig{subject}` + `Engine.WithPublisher` + `dispatchNATS`（发布到 subject、失败进重试）+ retry 打通 nats。API 拒绝非 `webhook`/`nats_publish` 的 action_type（`400 INVALID_ACTION_TYPE`）与缺字段的 config（`400 INVALID_ACTION_CONFIG`）。webui 恢复 `nats_publish`、不提供 `kafka_publish`、移除 `TODO(CC-7)`。live-e2e：发 `events.file.uploaded` → 引擎重发到自定义 subject 收到、delivery=delivered。设计 §5.9 已更新 | 01 §4 |
 
 ## Tier C — 功能完备（webui，按实际使用价值可提前到 A/B）
 
@@ -41,7 +41,7 @@
 
 - **止血冲刺**：G-1 refresh 契约（D-012）、G-2 Agent token 生命周期 + **JWT 续期自愈**（D-013，解决了 02 报告"token 续期疑似缺失"）、
   G-3 minio-event 鉴权（D-014）、G-4 心跳遥测（D-015）、G-5 Dashboard 统计（D-016）、G-15 凭据文件 gitignore。
-- **本清单**：CC-1 file_deleted（PR #47 / D-017）、CC-2 queue_max_size（PR #48）、CC-6 离线兜底扫描（PR #51）、CC-5 错误响应 `request_id` + 未知参数拒绝（PR #53）、CC-4 API 限流（本 PR / D-018）。
+- **本清单**：CC-1 file_deleted（PR #47 / D-017）、CC-2 queue_max_size（PR #48）、CC-6 离线兜底扫描（PR #51）、CC-5 错误响应 `request_id` + 未知参数拒绝（PR #53）、CC-4 API 限流（PR #54 / D-018）、CC-7 nats_publish 实现 + kafka 拒绝（本 PR / D-019）。
 
 ## 明确推后（非核心模块 / 按产品决策）
 
@@ -57,4 +57,4 @@
 
 ## 执行顺序建议
 
-`CC-1 ✅` → `CC-2 ✅` → `CC-6 ✅（离线兜底扫描）` → `CC-3 ⏸️ 推后（低价值）` → `CC-5 ✅（request_id + 未知参数）` → `CC-4 ✅（API 限流）` → `CC-7（下一步：kafka_publish 清理）` → `CC-8/9（视使用价值）`
+`CC-1 ✅` → `CC-2 ✅` → `CC-6 ✅（离线兜底扫描）` → `CC-3 ⏸️ 推后（低价值）` → `CC-5 ✅（request_id + 未知参数）` → `CC-4 ✅（API 限流）` → `CC-7 ✅（nats_publish 实现 + kafka 拒绝）` → `CC-8/9（视使用价值）/ optional proto→buf`

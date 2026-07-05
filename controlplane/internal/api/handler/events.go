@@ -16,6 +16,7 @@ import (
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/event"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -239,6 +240,36 @@ func (h *EventRulesHandler) List(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": resp, "total": len(resp)})
 }
 
+// validateEventAction checks that action_type is supported end-to-end and that
+// its action_config carries the field the action needs. kafka_publish exists in
+// the DB enum but has no implementation (no Kafka in the deployment's fixed
+// infra), so it is rejected here rather than silently accepted (CC-7). Returns
+// an error code + message when invalid, or ok=true when the action is valid.
+func validateEventAction(actionType string, actionConfig json.RawMessage) (code, message string, ok bool) {
+	switch actionType {
+	case string(db.ActionTypeWebhook):
+		var cfg event.WebhookActionConfig
+		if err := json.Unmarshal(actionConfig, &cfg); err != nil {
+			return "INVALID_ACTION_CONFIG", "invalid webhook action_config: " + err.Error(), false
+		}
+		if cfg.URL == "" {
+			return "INVALID_ACTION_CONFIG", "webhook action_config requires a non-empty \"url\"", false
+		}
+	case string(db.ActionTypeNatsPublish):
+		var cfg event.NATSActionConfig
+		if err := json.Unmarshal(actionConfig, &cfg); err != nil {
+			return "INVALID_ACTION_CONFIG", "invalid nats_publish action_config: " + err.Error(), false
+		}
+		if cfg.Subject == "" {
+			return "INVALID_ACTION_CONFIG", "nats_publish action_config requires a non-empty \"subject\"", false
+		}
+	default:
+		return "INVALID_ACTION_TYPE",
+			fmt.Sprintf("unsupported action_type %q; supported: webhook, nats_publish", actionType), false
+	}
+	return "", "", true
+}
+
 // createEventRuleRequest is the body expected by POST /api/v1/event-rules.
 type createEventRuleRequest struct {
 	Name         string          `json:"name"          binding:"required"`
@@ -261,6 +292,11 @@ func (h *EventRulesHandler) Create(c *gin.Context) {
 	var req createEventRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
+		return
+	}
+
+	if code, msg, ok := validateEventAction(req.ActionType, req.ActionConfig); !ok {
+		middleware.RespondError(c, http.StatusBadRequest, code, msg, nil)
 		return
 	}
 
@@ -319,6 +355,11 @@ func (h *EventRulesHandler) Update(c *gin.Context) {
 	var req updateEventRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
+		return
+	}
+
+	if code, msg, ok := validateEventAction(req.ActionType, req.ActionConfig); !ok {
+		middleware.RespondError(c, http.StatusBadRequest, code, msg, nil)
 		return
 	}
 
