@@ -30,12 +30,14 @@ type RateLimitStore interface {
 // without JWT claims are not counted (fail open).
 //
 // The counter lives in Redis under ratelimit:api:{user_id} with a 1-minute TTL
-// (system-design.md §5.1). Every response carries X-RateLimit-Limit and
+// (system-design.md §5.1). Counted responses carry X-RateLimit-Limit and
 // X-RateLimit-Remaining headers. When the limit is exceeded the request is
 // rejected with 429 RATE_LIMITED and a Retry-After header.
 //
-// The limiter fails open: if Redis is unavailable the request is allowed and
-// the error is logged, so a Redis blip cannot lock every user out of the API.
+// The limiter fails open: if Redis is unavailable, or the request carries no
+// JWT claims, the request is allowed without counting and without rate-limit
+// headers (there is no reliable count to report), so a Redis blip cannot lock
+// every user out of the API.
 func RateLimit(store RateLimitStore, perMinute int, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		claims := GetClaims(c)

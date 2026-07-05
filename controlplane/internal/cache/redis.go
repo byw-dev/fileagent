@@ -122,8 +122,14 @@ return count
 // expire after window, so subsequent increments within the window share the
 // same expiry (fixed-window rate limiting, system-design.md §5.1 /
 // ratelimit:api:{user_id}).
+//
+// The expiry is applied at Redis EXPIRE's whole-second precision: window is
+// truncated to seconds via integer division (a sub-second window rounds down,
+// and a window below 1s would yield 0 — callers should pass whole-second
+// windows, e.g. the 1-minute API window).
 func (c *Client) IncrWithWindow(ctx context.Context, key string, window time.Duration) (int64, error) {
-	return fixedWindowScript.Run(ctx, c.rdb, []string{key}, int(window.Seconds())).Int64()
+	seconds := int(window / time.Second)
+	return fixedWindowScript.Run(ctx, c.rdb, []string{key}, seconds).Int64()
 }
 
 // MGet returns the values at the given keys in order; a missing key yields a nil

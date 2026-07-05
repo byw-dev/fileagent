@@ -1523,10 +1523,10 @@ NATS 主题规划：
 - 认证后的 `/api/v1/*` 接口按用户做**固定窗口**限流：Redis 计数键 `ratelimit:api:{user_id}`，
   窗口 1 分钟（键 TTL=60s，§3.5）。上限由 `API_RATE_LIMIT_PER_MINUTE` 配置（默认 600，即
   10 req/s/用户；`<= 0` 关闭）。限流中间件在 JWT 之后执行，故按 JWT `sub`（user_id）计数。
-- 每个响应带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` 头。超限返回 `429 RATE_LIMITED`
+- 被计数的响应带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` 头。超限返回 `429 RATE_LIMITED`
   并附 `Retry-After: 60`。
-- **失败开放**：Redis 不可用时放行请求并记 warn 日志，避免 Redis 抖动把所有用户挡在门外
-  （与 JWT 黑名单查询同策略）。未携带 JWT 声明的请求不计数。
+- **失败开放**：Redis 不可用、或请求无 JWT 声明时放行且**不计数、不带**限流头（无可靠计数可报），
+  记 warn 日志，避免 Redis 抖动把所有用户挡在门外（与 JWT 黑名单查询同策略）。
 - `/api/auth/*`（登录/刷新）为**前置认证**接口，无 user_id 可计数，本版不在此限流范围
   （登录暴力破解防护为独立议题，另行处理）。
 

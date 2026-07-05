@@ -20,7 +20,8 @@ import (
 )
 
 // fakeRateStore is an in-memory fixed-window counter for testing the limiter
-// without Redis. errOnce, when set, is returned by the next IncrWithWindow.
+// without Redis. When failNow is set, IncrWithWindow returns an error to
+// exercise the fail-open path.
 type fakeRateStore struct {
 	mu      sync.Mutex
 	counts  map[string]int64
