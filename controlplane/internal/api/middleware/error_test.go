@@ -95,15 +95,79 @@ func TestNotImplemented_Returns501(t *testing.T) {
 	assert.Equal(t, http.StatusNotImplemented, w.Code)
 }
 
-func TestNewErrorBody_Shape(t *testing.T) {
-	body := middleware.NewErrorBody("ERR_CODE", "some message", nil)
-	assert.Equal(t, "ERR_CODE", body["code"])
-	assert.Equal(t, "some message", body["message"])
-	assert.Nil(t, body["detail"])
+func TestRespondError_StandardShape(t *testing.T) {
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	r.GET("/err", func(c *gin.Context) {
+		middleware.RespondError(c, http.StatusBadRequest, "BAD_REQUEST", "bad request test", nil)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/err", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var body middleware.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "BAD_REQUEST", body.Error.Code)
+	assert.Equal(t, "bad request test", body.Error.Message)
+	assert.NotEmpty(t, body.RequestID, "error responses must carry the top-level request_id")
 }
 
-func TestNewErrorBody_WithDetail(t *testing.T) {
-	detail := []string{"a", "b"}
-	body := middleware.NewErrorBody("ERR_CODE", "msg", detail)
-	assert.Equal(t, detail, body["detail"])
+func TestRespondError_DoesNotAbort(t *testing.T) {
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	reached := false
+	r.GET("/err", func(c *gin.Context) {
+		middleware.RespondError(c, http.StatusBadRequest, "BAD_REQUEST", "msg", nil)
+		reached = !c.IsAborted()
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/err", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.True(t, reached, "RespondError must not abort the handler chain")
+}
+
+func TestRejectUnknownQuery_AllAllowed(t *testing.T) {
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	r.GET("/list", func(c *gin.Context) {
+		if !middleware.RejectUnknownQuery(c, "status", "limit") {
+			return
+		}
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/list?status=INDEXED&limit=10", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestRejectUnknownQuery_RejectsUnknown(t *testing.T) {
+	r := gin.New()
+	r.Use(middleware.RequestID())
+	r.GET("/list", func(c *gin.Context) {
+		if !middleware.RejectUnknownQuery(c, "status", "limit") {
+			return
+		}
+		c.Status(http.StatusOK)
+	})
+
+	// Two unknown keys, one with an empty value — both must be rejected.
+	req := httptest.NewRequest(http.MethodGet, "/list?path_prefix=/x&start_time=", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var body middleware.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "INVALID_QUERY_PARAM", body.Error.Code)
+	assert.NotEmpty(t, body.RequestID)
+	// Message lists offending keys in sorted order.
+	assert.Contains(t, body.Error.Message, "path_prefix")
+	assert.Contains(t, body.Error.Message, "start_time")
 }

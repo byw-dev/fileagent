@@ -40,9 +40,7 @@ func (h *StatsHandler) Dashboard(c *gin.Context) {
 	stats, err := h.db.DashboardStats(c.Request.Context(), orgID, time.Now().UTC())
 	if err != nil {
 		h.logger.Error("dashboard stats", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to compute dashboard stats", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to compute dashboard stats", nil)
 		return
 	}
 	c.JSON(http.StatusOK, stats)

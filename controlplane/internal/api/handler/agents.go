@@ -250,9 +250,7 @@ func (h *AgentsHandler) List(c *gin.Context) {
 	}
 	if err != nil {
 		h.logger.Error("list agents", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to list agents", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list agents", nil)
 		return
 	}
 
@@ -273,23 +271,17 @@ func (h *AgentsHandler) Get(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid agent id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
 		return
 	}
 	agent, err := h.db.GetAgentByID(c.Request.Context(), id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": middleware.NewErrorBody("NOT_FOUND", "agent not found", nil),
-			})
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "agent not found", nil)
 			return
 		}
 		h.logger.Error("get agent", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to get agent", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get agent", nil)
 		return
 	}
 	c.JSON(http.StatusOK, h.toAgentResponseWithOnline(c.Request.Context(), agent))
@@ -303,18 +295,14 @@ func (h *AgentsHandler) Approve(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid agent id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
 		return
 	}
 	callerID := callerIDFromClaims(c)
 	token, err := h.agentMgr.ApproveAgent(c.Request.Context(), id, callerID)
 	if err != nil {
 		h.logger.Error("approve agent", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to approve agent", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to approve agent", nil)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"token": token, "message": "agent approved"})
@@ -328,17 +316,13 @@ func (h *AgentsHandler) Revoke(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid agent id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
 		return
 	}
 	callerID := callerIDFromClaims(c)
 	if err := h.agentMgr.RevokeAgent(c.Request.Context(), id, callerID); err != nil {
 		h.logger.Error("revoke agent", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to revoke agent", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to revoke agent", nil)
 		return
 	}
 	if h.registry != nil && h.registry.IsOnline(id.String()) {
@@ -376,17 +360,13 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 	}
 	agentID := c.Param("id")
 	if _, err := uuid.Parse(agentID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid agent id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
 		return
 	}
 
 	var req listDirRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
@@ -401,9 +381,7 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 			}
 		}
 		if !inRedis {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent is not online", nil),
-			})
+			middleware.RespondError(c, http.StatusConflict, "AGENT_OFFLINE", "agent is not online", nil)
 			return
 		}
 	}
@@ -424,9 +402,7 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 			},
 		}
 		if !h.registry.Send(agentID, msg) {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent disconnected during send", nil),
-			})
+			middleware.RespondError(c, http.StatusConflict, "AGENT_OFFLINE", "agent disconnected during send", nil)
 			return
 		}
 		c.JSON(http.StatusAccepted, gin.H{"request_id": requestID, "message": "list directory command sent"})
@@ -449,9 +425,7 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 		},
 	}
 	if !h.registry.Send(agentID, msg) {
-		c.JSON(http.StatusConflict, gin.H{
-			"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent disconnected during send", nil),
-		})
+		middleware.RespondError(c, http.StatusConflict, "AGENT_OFFLINE", "agent disconnected during send", nil)
 		return
 	}
 
@@ -467,9 +441,7 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 				zap.String("request_id", requestID),
 				zap.String("error", result.Error),
 			)
-			c.JSON(http.StatusBadGateway, gin.H{
-				"error": middleware.NewErrorBody("AGENT_ERROR", result.Error, nil),
-			})
+			middleware.RespondError(c, http.StatusBadGateway, "AGENT_ERROR", result.Error, nil)
 			return
 		}
 		entries := result.Entries
@@ -482,9 +454,7 @@ func (h *AgentsHandler) ListDir(c *gin.Context) {
 			zap.String("agent_id", agentID),
 			zap.String("request_id", requestID),
 		)
-		c.JSON(http.StatusGatewayTimeout, gin.H{
-			"error": middleware.NewErrorBody("TIMEOUT", "agent did not respond in time", nil),
-		})
+		middleware.RespondError(c, http.StatusGatewayTimeout, "TIMEOUT", "agent did not respond in time", nil)
 	}
 }
 
@@ -516,17 +486,13 @@ func (h *AgentsHandler) TestRule(c *gin.Context) {
 	}
 	agentID := c.Param("id")
 	if _, err := uuid.Parse(agentID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid agent id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
 		return
 	}
 
 	var req testRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 	if req.DryRunLimit <= 0 {
@@ -546,9 +512,7 @@ func (h *AgentsHandler) TestRule(c *gin.Context) {
 			}
 		}
 		if !inRedis {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent is not online", nil),
-			})
+			middleware.RespondError(c, http.StatusConflict, "AGENT_OFFLINE", "agent is not online", nil)
 			return
 		}
 	}
@@ -573,9 +537,7 @@ func (h *AgentsHandler) TestRule(c *gin.Context) {
 		},
 	}
 	if !h.registry.Send(agentID, msg) {
-		c.JSON(http.StatusConflict, gin.H{
-			"error": middleware.NewErrorBody("AGENT_OFFLINE", "agent disconnected during send", nil),
-		})
+		middleware.RespondError(c, http.StatusConflict, "AGENT_OFFLINE", "agent disconnected during send", nil)
 		return
 	}
 
@@ -585,9 +547,7 @@ func (h *AgentsHandler) TestRule(c *gin.Context) {
 	select {
 	case result := <-resultCh:
 		if result.GetError() != "" {
-			c.JSON(http.StatusUnprocessableEntity, gin.H{
-				"error": middleware.NewErrorBody("INVALID_PATTERN", result.GetError(), nil),
-			})
+			middleware.RespondError(c, http.StatusUnprocessableEntity, "INVALID_PATTERN", result.GetError(), nil)
 			return
 		}
 		files := make([]testRuleFileResult, 0, len(result.GetFiles()))
@@ -612,9 +572,7 @@ func (h *AgentsHandler) TestRule(c *gin.Context) {
 			zap.String("agent_id", agentID),
 			zap.String("rule_id", ruleID),
 		)
-		c.JSON(http.StatusGatewayTimeout, gin.H{
-			"error": middleware.NewErrorBody("TIMEOUT", "agent did not respond within 30s", nil),
-		})
+		middleware.RespondError(c, http.StatusGatewayTimeout, "TIMEOUT", "agent did not respond within 30s", nil)
 	}
 }
 
@@ -666,17 +624,13 @@ func (h *AgentsHandler) ListRules(c *gin.Context) {
 	}
 	agentID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid agent id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
 		return
 	}
 	rules, err := h.db.ListCollectionRulesByAgent(c.Request.Context(), agentID)
 	if err != nil {
 		h.logger.Error("list rules", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to list rules", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list rules", nil)
 		return
 	}
 	resp := make([]collectionRuleResponse, 0, len(rules))
@@ -713,26 +667,20 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 	}
 	agentID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid agent id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
 		return
 	}
 	orgID := orgIDFromClaims(c)
 
 	var req createRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
 	bucketID, err := uuid.Parse(req.BucketID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_BUCKET_ID", "invalid bucket_id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_BUCKET_ID", "invalid bucket_id", nil)
 		return
 	}
 
@@ -772,9 +720,7 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 	rule, err := h.db.CreateCollectionRule(c.Request.Context(), params)
 	if err != nil {
 		h.logger.Error("create rule", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to create rule", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create rule", nil)
 		return
 	}
 
@@ -802,17 +748,13 @@ func (h *AgentsHandler) UpdateRule(c *gin.Context) {
 	}
 	rid, err := uuid.Parse(c.Param("rid"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid rule id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid rule id", nil)
 		return
 	}
 
 	var req updateRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
@@ -820,24 +762,18 @@ func (h *AgentsHandler) UpdateRule(c *gin.Context) {
 	switch status {
 	case db.RuleStatusActive, db.RuleStatusInactive:
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_STATUS", "status must be 'active' or 'inactive'", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_STATUS", "status must be 'active' or 'inactive'", nil)
 		return
 	}
 
 	rule, err := h.db.UpdateCollectionRuleStatus(c.Request.Context(), rid, status)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": middleware.NewErrorBody("NOT_FOUND", "rule not found", nil),
-			})
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "rule not found", nil)
 			return
 		}
 		h.logger.Error("update rule status", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to update rule", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update rule", nil)
 		return
 	}
 
@@ -865,17 +801,13 @@ func (h *AgentsHandler) DeleteRule(c *gin.Context) {
 	agentID := c.Param("id")
 	rid, err := uuid.Parse(c.Param("rid"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid rule id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid rule id", nil)
 		return
 	}
 
 	if err := h.db.DeleteCollectionRule(c.Request.Context(), rid); err != nil {
 		h.logger.Error("delete rule", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to delete rule", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to delete rule", nil)
 		return
 	}
 
@@ -896,9 +828,7 @@ func (h *AgentsHandler) ListUploadLogs(c *gin.Context) {
 	}
 	agentID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid agent id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
 		return
 	}
 
@@ -906,9 +836,7 @@ func (h *AgentsHandler) ListUploadLogs(c *gin.Context) {
 	limit := parseLimitParam(c)
 	cursorCreatedAt, cursorID, err := decodeCursor(c.Query("cursor"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_CURSOR", "invalid cursor", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_CURSOR", "invalid cursor", nil)
 		return
 	}
 
@@ -923,9 +851,7 @@ func (h *AgentsHandler) ListUploadLogs(c *gin.Context) {
 	logs, err := h.db.ListUploadLogs(c.Request.Context(), params)
 	if err != nil {
 		h.logger.Error("list upload logs for agent", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to list upload logs", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list upload logs", nil)
 		return
 	}
 
@@ -940,9 +866,7 @@ func (h *AgentsHandler) ListUploadLogs(c *gin.Context) {
 	})
 	if err != nil {
 		h.logger.Error("count upload logs for agent", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to count upload logs", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to count upload logs", nil)
 		return
 	}
 

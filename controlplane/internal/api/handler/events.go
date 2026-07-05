@@ -80,9 +80,7 @@ func (h *BucketsHandler) List(c *gin.Context) {
 	buckets, err := h.db.ListBuckets(c.Request.Context(), orgID)
 	if err != nil {
 		h.logger.Error("list buckets", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to list buckets", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list buckets", nil)
 		return
 	}
 	resp := make([]bucketResponse, 0, len(buckets))
@@ -123,17 +121,13 @@ func (h *BucketsHandler) Create(c *gin.Context) {
 
 	var req createBucketRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
 	// Validate bucket name before writing to DB (D-001).
 	if err := validateBucketName(req.Name); err != nil {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{
-			"error": middleware.NewErrorBody("INVALID_BUCKET_NAME", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusUnprocessableEntity, "INVALID_BUCKET_NAME", err.Error(), nil)
 		return
 	}
 
@@ -148,9 +142,7 @@ func (h *BucketsHandler) Create(c *gin.Context) {
 	bucket, err := h.db.CreateBucket(c.Request.Context(), params)
 	if err != nil {
 		h.logger.Error("create bucket", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to create bucket", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create bucket", nil)
 		return
 	}
 
@@ -168,9 +160,7 @@ func (h *BucketsHandler) Create(c *gin.Context) {
 					zap.Error(delErr),
 				)
 			}
-			c.JSON(http.StatusBadGateway, gin.H{
-				"error": middleware.NewErrorBody("MINIO_ERROR", "failed to create MinIO bucket: "+mkErr.Error(), nil),
-			})
+			middleware.RespondError(c, http.StatusBadGateway, "MINIO_ERROR", "failed to create MinIO bucket: "+mkErr.Error(), nil)
 			return
 		}
 	}
@@ -239,9 +229,7 @@ func (h *EventRulesHandler) List(c *gin.Context) {
 	rules, err := h.db.ListEventRules(c.Request.Context(), orgID)
 	if err != nil {
 		h.logger.Error("list event rules", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to list event rules", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list event rules", nil)
 		return
 	}
 	resp := make([]eventRuleResponse, 0, len(rules))
@@ -272,9 +260,7 @@ func (h *EventRulesHandler) Create(c *gin.Context) {
 
 	var req createEventRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
@@ -302,9 +288,7 @@ func (h *EventRulesHandler) Create(c *gin.Context) {
 	rule, err := h.db.CreateEventRule(c.Request.Context(), params)
 	if err != nil {
 		h.logger.Error("create event rule", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to create event rule", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create event rule", nil)
 		return
 	}
 	c.JSON(http.StatusCreated, toEventRuleResponse(rule))
@@ -328,17 +312,13 @@ func (h *EventRulesHandler) Update(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid event rule id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid event rule id", nil)
 		return
 	}
 
 	var req updateEventRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
@@ -360,15 +340,11 @@ func (h *EventRulesHandler) Update(c *gin.Context) {
 	rule, err := h.db.UpdateEventRule(c.Request.Context(), params)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": middleware.NewErrorBody("NOT_FOUND", "event rule not found", nil),
-			})
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "event rule not found", nil)
 			return
 		}
 		h.logger.Error("update event rule", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to update event rule", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update event rule", nil)
 		return
 	}
 	c.JSON(http.StatusOK, toEventRuleResponse(rule))
@@ -382,16 +358,12 @@ func (h *EventRulesHandler) Delete(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid event rule id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid event rule id", nil)
 		return
 	}
 	if err := h.db.DeleteEventRule(c.Request.Context(), id); err != nil {
 		h.logger.Error("delete event rule", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to delete event rule", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to delete event rule", nil)
 		return
 	}
 	c.Status(http.StatusNoContent)
@@ -424,18 +396,14 @@ func (h *EventRulesHandler) ListDeliveries(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid event rule id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid event rule id", nil)
 		return
 	}
 
 	limit := parseLimitParam(c)
 	cursorCreatedAt, cursorID, err := decodeCursor(c.Query("cursor"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_CURSOR", "invalid cursor", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_CURSOR", "invalid cursor", nil)
 		return
 	}
 
@@ -448,9 +416,7 @@ func (h *EventRulesHandler) ListDeliveries(c *gin.Context) {
 	deliveries, err := h.db.ListDeliveriesByRule(c.Request.Context(), params)
 	if err != nil {
 		h.logger.Error("list deliveries", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to list deliveries", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list deliveries", nil)
 		return
 	}
 
@@ -462,9 +428,7 @@ func (h *EventRulesHandler) ListDeliveries(c *gin.Context) {
 	total, err := h.db.CountDeliveriesByRule(c.Request.Context(), id)
 	if err != nil {
 		h.logger.Error("count deliveries", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to count deliveries", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to count deliveries", nil)
 		return
 	}
 
@@ -548,9 +512,7 @@ func (h *UploadLogsHandler) List(c *gin.Context) {
 	limit := parseLimitParam(c)
 	cursorCreatedAt, cursorID, err := decodeCursor(c.Query("cursor"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_CURSOR", "invalid cursor", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_CURSOR", "invalid cursor", nil)
 		return
 	}
 
@@ -573,9 +535,7 @@ func (h *UploadLogsHandler) List(c *gin.Context) {
 	logs, err := h.db.ListUploadLogs(c.Request.Context(), params)
 	if err != nil {
 		h.logger.Error("list upload logs", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to list upload logs", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list upload logs", nil)
 		return
 	}
 
@@ -587,9 +547,7 @@ func (h *UploadLogsHandler) List(c *gin.Context) {
 	total, err := h.db.CountUploadLogs(c.Request.Context(), filter)
 	if err != nil {
 		h.logger.Error("count upload logs", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to count upload logs", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to count upload logs", nil)
 		return
 	}
 
@@ -618,23 +576,17 @@ func (h *UploadLogsHandler) Get(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid upload log id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid upload log id", nil)
 		return
 	}
 	log, err := h.db.GetUploadLogByID(c.Request.Context(), id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": middleware.NewErrorBody("NOT_FOUND", "upload log not found", nil),
-			})
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "upload log not found", nil)
 			return
 		}
 		h.logger.Error("get upload log", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to get upload log", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get upload log", nil)
 		return
 	}
 	c.JSON(http.StatusOK, toUploadLogResponse(log))
@@ -735,9 +687,7 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 	if !h.authorized(c) {
 		h.logger.Warn("minio event: rejected unauthorized webhook call",
 			zap.String("client_ip", c.ClientIP()))
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("UNAUTHORIZED", "invalid or missing webhook credentials", nil),
-		})
+		middleware.RespondError(c, http.StatusUnauthorized, "UNAUTHORIZED", "invalid or missing webhook credentials", nil)
 		return
 	}
 

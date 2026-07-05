@@ -84,37 +84,27 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	var req loginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
 	user, err := h.authDB.GetUserByUsername(c.Request.Context(), req.Username)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": middleware.NewErrorBody("INVALID_CREDENTIALS", "Invalid username or password", nil),
-			})
+			middleware.RespondError(c, http.StatusUnauthorized, "INVALID_CREDENTIALS", "Invalid username or password", nil)
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "Internal server error", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error", nil)
 		return
 	}
 
 	if !user.IsActive {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("ACCOUNT_DISABLED", "Account is disabled", nil),
-		})
+		middleware.RespondError(c, http.StatusUnauthorized, "ACCOUNT_DISABLED", "Account is disabled", nil)
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("INVALID_CREDENTIALS", "Invalid username or password", nil),
-		})
+		middleware.RespondError(c, http.StatusUnauthorized, "INVALID_CREDENTIALS", "Invalid username or password", nil)
 		return
 	}
 
@@ -124,9 +114,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		accessTokenTTL,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("TOKEN_ERROR", "Failed to generate token", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "TOKEN_ERROR", "Failed to generate token", nil)
 		return
 	}
 
@@ -136,9 +124,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		refreshTokenTTL,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("TOKEN_ERROR", "Failed to generate refresh token", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "TOKEN_ERROR", "Failed to generate refresh token", nil)
 		return
 	}
 
@@ -189,29 +175,21 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		// No usable token from body or header. Distinguish a malformed body
 		// (400) from a genuinely absent token (401).
 		if bindErr != nil && !errors.Is(bindErr, io.EOF) {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": middleware.NewErrorBody("INVALID_REQUEST", "malformed JSON body", nil),
-			})
+			middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "malformed JSON body", nil)
 			return
 		}
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("MISSING_TOKEN", "refresh_token is required", nil),
-		})
+		middleware.RespondError(c, http.StatusUnauthorized, "MISSING_TOKEN", "refresh_token is required", nil)
 		return
 	}
 
 	claims, err := h.authSvc.ValidateToken(tokenStr)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("INVALID_TOKEN", "Token invalid or expired", nil),
-		})
+		middleware.RespondError(c, http.StatusUnauthorized, "INVALID_TOKEN", "Token invalid or expired", nil)
 		return
 	}
 
 	if claims.TokenType != "refresh" {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("WRONG_TOKEN_TYPE", "Refresh token required", nil),
-		})
+		middleware.RespondError(c, http.StatusUnauthorized, "WRONG_TOKEN_TYPE", "Refresh token required", nil)
 		return
 	}
 
@@ -223,9 +201,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 			zap.String("jti", claims.ID), zap.Error(revErr))
 	}
 	if revoked {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("TOKEN_REVOKED", "Token has been revoked", nil),
-		})
+		middleware.RespondError(c, http.StatusUnauthorized, "TOKEN_REVOKED", "Token has been revoked", nil)
 		return
 	}
 
@@ -237,9 +213,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		accessTokenTTL,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("TOKEN_ERROR", "Failed to generate token", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "TOKEN_ERROR", "Failed to generate token", nil)
 		return
 	}
 
@@ -249,9 +223,7 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		refreshTokenTTL,
 	)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("TOKEN_ERROR", "Failed to generate refresh token", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "TOKEN_ERROR", "Failed to generate refresh token", nil)
 		return
 	}
 
@@ -312,26 +284,20 @@ func (h *AuthHandler) Me(c *gin.Context) {
 
 	raw := c.GetHeader("Authorization")
 	if !strings.HasPrefix(raw, "Bearer ") {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("MISSING_TOKEN", "Bearer token required", nil),
-		})
+		middleware.RespondError(c, http.StatusUnauthorized, "MISSING_TOKEN", "Bearer token required", nil)
 		return
 	}
 	tokenStr := strings.TrimPrefix(raw, "Bearer ")
 
 	claims, err := h.authSvc.ValidateToken(tokenStr)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("INVALID_TOKEN", "Token invalid or expired", nil),
-		})
+		middleware.RespondError(c, http.StatusUnauthorized, "INVALID_TOKEN", "Token invalid or expired", nil)
 		return
 	}
 
 	revoked, _ := h.authSvc.IsRevoked(c.Request.Context(), claims.ID)
 	if revoked {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"error": middleware.NewErrorBody("TOKEN_REVOKED", "Token has been revoked", nil),
-		})
+		middleware.RespondError(c, http.StatusUnauthorized, "TOKEN_REVOKED", "Token has been revoked", nil)
 		return
 	}
 

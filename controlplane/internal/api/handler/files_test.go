@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
+	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -241,6 +242,7 @@ func TestFileTypesHandler_Delete_DBError(t *testing.T) {
 func testFilesRouter(h *handler.FilesHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
+	r.Use(middleware.RequestID())
 	r.Use(func(c *gin.Context) {
 		injectClaims(c, "org_admin", uuid.New().String(), uuid.New().String())
 		c.Next()
@@ -324,6 +326,35 @@ func TestFilesHandler_List_InvalidCursor(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files?cursor=!!!invalid!!!", nil)
 	testFilesRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestFilesHandler_List_UnknownQueryParam(t *testing.T) {
+	// A mistyped filter must return 400 INVALID_QUERY_PARAM instead of a
+	// silent 200 with the filter ignored (CC-5).
+	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countTotal: 1}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files?file_type_name=foo", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "INVALID_QUERY_PARAM", body["error"].(map[string]interface{})["code"])
+	assert.NotEmpty(t, body["request_id"])
+}
+
+func TestFilesHandler_List_KnownFiltersAccepted(t *testing.T) {
+	// All documented filters must pass the unknown-param guard.
+	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countTotal: 1}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	url := "/api/v1/files?agent_id=" + uuid.NewString() +
+		"&bucket_id=" + uuid.NewString() +
+		"&file_type_id=" + uuid.NewString() +
+		"&status=completed&limit=10"
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
 }
 
 func TestFilesHandler_Get_Success(t *testing.T) {

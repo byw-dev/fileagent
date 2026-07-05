@@ -1511,6 +1511,13 @@ NATS 主题规划：
 }
 ```
 
+- 顶层 `request_id` 由 `RequestID` 中间件注入（复用请求头 `X-Request-ID`，缺失则生成 UUID v4），
+  并回写到响应头 `X-Request-ID`；**所有**错误响应（handler + 认证/鉴权中间件）都经统一封装带上它，
+  用于链路追踪。成功响应仅在响应头携带 `X-Request-ID`。
+- 未知/拼错的 query 过滤参数不再静默按 200 忽略：`GET /api/v1/files` 对不在白名单
+  （`cursor` / `limit` / `agent_id` / `bucket_id` / `file_type_id` / `status`）内的参数返回
+  `400 INVALID_QUERY_PARAM`，`detail.unknown_params` 列出违规键（CC-5）。
+
 ## 5.12 Go 项目结构
 
 ```
