@@ -56,15 +56,18 @@ func RateLimit(store RateLimitStore, perMinute int, logger *zap.Logger) gin.Hand
 			return
 		}
 
-		c.Header("X-RateLimit-Limit", strconv.Itoa(perMinute))
-		remaining := perMinute - int(count)
+		// Counter arithmetic stays in int64 (count is int64) to avoid any
+		// truncation/overflow from int() on 32-bit builds; format only for headers.
+		limit := int64(perMinute)
+		c.Header("X-RateLimit-Limit", strconv.FormatInt(limit, 10))
+		remaining := limit - count
 		if remaining < 0 {
 			remaining = 0
 		}
-		c.Header("X-RateLimit-Remaining", strconv.Itoa(remaining))
+		c.Header("X-RateLimit-Remaining", strconv.FormatInt(remaining, 10))
 
-		if int(count) > perMinute {
-			c.Header("Retry-After", strconv.Itoa(int(rateLimitWindow.Seconds())))
+		if count > limit {
+			c.Header("Retry-After", strconv.Itoa(int(rateLimitWindow/time.Second)))
 			AbortWithError(c, http.StatusTooManyRequests, "RATE_LIMITED",
 				"API rate limit exceeded, retry later", nil)
 			return
