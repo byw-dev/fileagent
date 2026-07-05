@@ -179,6 +179,80 @@ func (q *Queries) ListCollectionRulesByAgent(ctx context.Context, agentID uuid.U
 	return items, nil
 }
 
+const updateCollectionRule = `-- name: UpdateCollectionRule :one
+UPDATE collection_rules
+SET bucket_id = $2,
+    name = $3,
+    mode = $4,
+    base_path = $5,
+    path_pattern = $6,
+    dest_path_template = $7,
+    recursive = $8,
+    status = $9,
+    cron_expr = $10,
+    run_once_on_start = $11,
+    append_mode = $12,
+    metadata = $13,
+    updated_at = NOW()
+WHERE id = $1
+RETURNING id, org_id, agent_id, bucket_id, name, mode, status, base_path, path_pattern, dest_path_template, recursive, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at
+`
+
+type UpdateCollectionRuleParams struct {
+	ID               uuid.UUID       `db:"id" json:"id"`
+	BucketID         uuid.UUID       `db:"bucket_id" json:"bucket_id"`
+	Name             string          `db:"name" json:"name"`
+	Mode             UploadMode      `db:"mode" json:"mode"`
+	BasePath         string          `db:"base_path" json:"base_path"`
+	PathPattern      string          `db:"path_pattern" json:"path_pattern"`
+	DestPathTemplate string          `db:"dest_path_template" json:"dest_path_template"`
+	Recursive        bool            `db:"recursive" json:"recursive"`
+	Status           RuleStatus      `db:"status" json:"status"`
+	CronExpr         sql.NullString  `db:"cron_expr" json:"cron_expr"`
+	RunOnceOnStart   bool            `db:"run_once_on_start" json:"run_once_on_start"`
+	AppendMode       string          `db:"append_mode" json:"append_mode"`
+	Metadata         json.RawMessage `db:"metadata" json:"metadata"`
+}
+
+func (q *Queries) UpdateCollectionRule(ctx context.Context, arg UpdateCollectionRuleParams) (*CollectionRule, error) {
+	row := q.db.QueryRowContext(ctx, updateCollectionRule,
+		arg.ID,
+		arg.BucketID,
+		arg.Name,
+		arg.Mode,
+		arg.BasePath,
+		arg.PathPattern,
+		arg.DestPathTemplate,
+		arg.Recursive,
+		arg.Status,
+		arg.CronExpr,
+		arg.RunOnceOnStart,
+		arg.AppendMode,
+		arg.Metadata,
+	)
+	var i CollectionRule
+	err := row.Scan(
+		&i.ID,
+		&i.OrgID,
+		&i.AgentID,
+		&i.BucketID,
+		&i.Name,
+		&i.Mode,
+		&i.Status,
+		&i.BasePath,
+		&i.PathPattern,
+		&i.DestPathTemplate,
+		&i.Recursive,
+		&i.CronExpr,
+		&i.RunOnceOnStart,
+		&i.AppendMode,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
+}
+
 const updateCollectionRuleStatus = `-- name: UpdateCollectionRuleStatus :one
 UPDATE collection_rules
 SET status = $2,

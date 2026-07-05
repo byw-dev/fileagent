@@ -36,5 +36,23 @@ SET status = $2,
 WHERE id = $1
 RETURNING *;
 
+-- name: UpdateCollectionRule :one
+UPDATE collection_rules
+SET bucket_id = $2,
+    name = $3,
+    mode = $4,
+    base_path = $5,
+    path_pattern = $6,
+    dest_path_template = $7,
+    recursive = $8,
+    status = $9,
+    cron_expr = $10,
+    run_once_on_start = $11,
+    append_mode = $12,
+    metadata = $13,
+    updated_at = NOW()
+WHERE id = $1
+RETURNING *;
+
 -- name: DeleteCollectionRule :exec
 DELETE FROM collection_rules WHERE id = $1;

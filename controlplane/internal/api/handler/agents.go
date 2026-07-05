@@ -28,6 +28,7 @@ type AgentsDB interface {
 	GetCollectionRuleByID(ctx context.Context, id uuid.UUID) (*db.CollectionRule, error)
 	CreateCollectionRule(ctx context.Context, arg db.CreateCollectionRuleParams) (*db.CollectionRule, error)
 	UpdateCollectionRuleStatus(ctx context.Context, iD uuid.UUID, status db.RuleStatus) (*db.CollectionRule, error)
+	UpdateCollectionRule(ctx context.Context, arg db.UpdateCollectionRuleParams) (*db.CollectionRule, error)
 	DeleteCollectionRule(ctx context.Context, id uuid.UUID) error
 	ListUploadLogs(ctx context.Context, arg db.ListUploadLogsParams) ([]*db.UploadLog, error)
 	CountUploadLogs(ctx context.Context, f db.CountUploadLogsFilter) (int64, error)
@@ -734,13 +735,34 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 }
 
 // updateRuleRequest is the body expected by PUT /api/v1/agents/:id/rules/:rid.
+// The endpoint serves two shapes:
+//   - status-only toggle: {"status":"active"|"inactive"} — enable/disable.
+//   - full-field edit (CC-9): when Name is non-empty, every content field below
+//     is applied. Status is derived from Enabled (defaulting to active).
+//
+// The two are distinguished by the presence of Name, which the toggle never
+// sends, keeping the enable/disable path backward compatible.
 type updateRuleRequest struct {
-	Status string `json:"status" binding:"required"`
+	Status string `json:"status"`
+
+	Name             string          `json:"name"`
+	BucketID         string          `json:"bucket_id"`
+	Mode             string          `json:"mode"`
+	BasePath         string          `json:"base_path"`
+	PathPattern      string          `json:"path_pattern"`
+	DestPathTemplate string          `json:"dest_path_template"`
+	Recursive        bool            `json:"recursive"`
+	CronExpr         string          `json:"cron_expr"`
+	RunOnceOnStart   bool            `json:"run_once_on_start"`
+	AppendMode       string          `json:"append_mode"`
+	Enabled          *bool           `json:"enabled"`
+	Metadata         json.RawMessage `json:"metadata"`
 }
 
-// UpdateRule handles PUT /api/v1/agents/:id/rules/:rid.
-// Only the rule status (active/inactive) can be changed via REST.
-// A rule becoming active triggers re-dispatch; inactive triggers cancel.
+// UpdateRule handles PUT /api/v1/agents/:id/rules/:rid. It either changes only
+// the rule status or applies a full-field edit (see updateRuleRequest). Either
+// way, an active result is re-dispatched (the Agent hot-reloads the watcher) and
+// an inactive result is cancelled.
 func (h *AgentsHandler) UpdateRule(c *gin.Context) {
 	if h.db == nil {
 		middleware.NotImplemented(c)
@@ -758,7 +780,16 @@ func (h *AgentsHandler) UpdateRule(c *gin.Context) {
 		return
 	}
 
-	status := db.RuleStatus(req.Status)
+	if req.Name != "" {
+		h.updateRuleFull(c, rid, req)
+		return
+	}
+	h.updateRuleStatus(c, rid, req.Status)
+}
+
+// updateRuleStatus applies an enable/disable toggle.
+func (h *AgentsHandler) updateRuleStatus(c *gin.Context, rid uuid.UUID, statusStr string) {
+	status := db.RuleStatus(statusStr)
 	switch status {
 	case db.RuleStatusActive, db.RuleStatusInactive:
 	default:
@@ -777,19 +808,109 @@ func (h *AgentsHandler) UpdateRule(c *gin.Context) {
 		return
 	}
 
-	if h.dispatcher != nil {
-		switch status {
-		case db.RuleStatusActive:
-			if err := h.dispatcher.DispatchRule(c.Request.Context(), rule); err != nil {
-				h.logger.Warn("re-dispatch rule on activate", zap.Error(err))
-			}
-		case db.RuleStatusInactive:
-			if err := h.dispatcher.DispatchRuleCancel(c.Request.Context(), rid.String(), rule.AgentID.String()); err != nil {
-				h.logger.Warn("cancel rule on deactivate", zap.Error(err))
-			}
+	h.redispatchRule(c.Request.Context(), rule, status)
+	c.JSON(http.StatusOK, toRuleResponse(rule))
+}
+
+// updateRuleFull applies a full-field edit of a collection rule.
+func (h *AgentsHandler) updateRuleFull(c *gin.Context, rid uuid.UUID, req updateRuleRequest) {
+	// All content fields are required for a full update.
+	missing := map[string]string{
+		"name":               req.Name,
+		"bucket_id":          req.BucketID,
+		"mode":               req.Mode,
+		"base_path":          req.BasePath,
+		"path_pattern":       req.PathPattern,
+		"dest_path_template": req.DestPathTemplate,
+	}
+	for field, val := range missing {
+		if val == "" {
+			middleware.RespondError(c, http.StatusUnprocessableEntity, "VALIDATION_ERROR",
+				field+" is required for a full rule update", nil)
+			return
 		}
 	}
+
+	bucketID, err := uuid.Parse(req.BucketID)
+	if err != nil {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_BUCKET_ID", "invalid bucket_id", nil)
+		return
+	}
+
+	mode := strings.ToLower(req.Mode)
+	switch db.UploadMode(mode) {
+	case db.UploadModeWatch, db.UploadModeScheduled:
+	default:
+		middleware.RespondError(c, http.StatusUnprocessableEntity, "VALIDATION_ERROR",
+			"mode must be 'watch' or 'scheduled'", nil)
+		return
+	}
+
+	status := db.RuleStatusActive
+	if req.Enabled != nil && !*req.Enabled {
+		status = db.RuleStatusInactive
+	}
+	appendMode := req.AppendMode
+	if appendMode == "" {
+		appendMode = "overwrite"
+	}
+	metadata := req.Metadata
+	if len(metadata) == 0 {
+		metadata = json.RawMessage(`{}`)
+	}
+
+	params := db.UpdateCollectionRuleParams{
+		ID:               rid,
+		BucketID:         bucketID,
+		Name:             req.Name,
+		Mode:             db.UploadMode(mode),
+		BasePath:         req.BasePath,
+		PathPattern:      req.PathPattern,
+		DestPathTemplate: req.DestPathTemplate,
+		Recursive:        req.Recursive,
+		Status:           status,
+		RunOnceOnStart:   req.RunOnceOnStart,
+		AppendMode:       appendMode,
+		Metadata:         metadata,
+	}
+	if req.CronExpr != "" {
+		params.CronExpr = sql.NullString{String: req.CronExpr, Valid: true}
+	}
+
+	rule, err := h.db.UpdateCollectionRule(c.Request.Context(), params)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "rule not found", nil)
+			return
+		}
+		h.logger.Error("update rule", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update rule", nil)
+		return
+	}
+
+	// Re-dispatch so an active rule's content change hot-reloads on the Agent
+	// (offline agents pick it up via SyncRulesOnConnect on reconnect).
+	h.redispatchRule(c.Request.Context(), rule, status)
 	c.JSON(http.StatusOK, toRuleResponse(rule))
+}
+
+// redispatchRule pushes the rule to its Agent when active, or cancels it when
+// inactive. Dispatch failures are logged, not surfaced, since the DB write has
+// already succeeded and the Agent reconciles on reconnect.
+func (h *AgentsHandler) redispatchRule(ctx context.Context, rule *db.CollectionRule, status db.RuleStatus) {
+	if h.dispatcher == nil {
+		return
+	}
+	switch status {
+	case db.RuleStatusActive:
+		if err := h.dispatcher.DispatchRule(ctx, rule); err != nil {
+			h.logger.Warn("re-dispatch rule", zap.Error(err))
+		}
+	case db.RuleStatusInactive:
+		if err := h.dispatcher.DispatchRuleCancel(ctx, rule.ID.String(), rule.AgentID.String()); err != nil {
+			h.logger.Warn("cancel rule dispatch", zap.Error(err))
+		}
+	}
 }
 
 // DeleteRule handles DELETE /api/v1/agents/:id/rules/:rid.

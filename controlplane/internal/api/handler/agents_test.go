@@ -24,21 +24,22 @@ import (
 // ── mocks ─────────────────────────────────────────────────────────────────────
 
 type mockAgentsDB struct {
-	agents       []*db.Agent
-	listErr      error
-	agent        *db.Agent
-	getErr       error
-	rules        []*db.CollectionRule
-	rulesErr     error
-	rule         *db.CollectionRule
-	ruleGetErr   error
-	createErr    error
-	updateErr    error
-	deleteErr    error
-	logs         []*db.UploadLog
-	logsErr      error
-	logsCount    int64
-	countLogsErr error
+	agents        []*db.Agent
+	listErr       error
+	agent         *db.Agent
+	getErr        error
+	rules         []*db.CollectionRule
+	rulesErr      error
+	rule          *db.CollectionRule
+	ruleGetErr    error
+	createErr     error
+	updateErr     error
+	fullUpdateErr error
+	deleteErr     error
+	logs          []*db.UploadLog
+	logsErr       error
+	logsCount     int64
+	countLogsErr  error
 }
 
 func (m *mockAgentsDB) ListAgents(_ context.Context, _ uuid.UUID) ([]*db.Agent, error) {
@@ -88,6 +89,29 @@ func (m *mockAgentsDB) UpdateCollectionRuleStatus(_ context.Context, id uuid.UUI
 		Metadata:  json.RawMessage(`{}`),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
+	}, nil
+}
+func (m *mockAgentsDB) UpdateCollectionRule(_ context.Context, arg db.UpdateCollectionRuleParams) (*db.CollectionRule, error) {
+	if m.fullUpdateErr != nil {
+		return nil, m.fullUpdateErr
+	}
+	return &db.CollectionRule{
+		ID:               arg.ID,
+		AgentID:          uuid.New(),
+		BucketID:         arg.BucketID,
+		Name:             arg.Name,
+		Mode:             arg.Mode,
+		Status:           arg.Status,
+		BasePath:         arg.BasePath,
+		PathPattern:      arg.PathPattern,
+		DestPathTemplate: arg.DestPathTemplate,
+		Recursive:        arg.Recursive,
+		CronExpr:         arg.CronExpr,
+		RunOnceOnStart:   arg.RunOnceOnStart,
+		AppendMode:       arg.AppendMode,
+		Metadata:         arg.Metadata,
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
 	}, nil
 }
 func (m *mockAgentsDB) DeleteCollectionRule(_ context.Context, _ uuid.UUID) error { return m.deleteErr }
@@ -480,6 +504,79 @@ func TestAgentsHandler_UpdateRule_NotFound(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPut, "/api/v1/agents/"+uuid.New().String()+"/rules/"+uuid.New().String(), bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func putRule(t *testing.T, h *handler.AgentsHandler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPut,
+		"/api/v1/agents/"+uuid.New().String()+"/rules/"+uuid.New().String(), bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	return w
+}
+
+func fullRuleBody(t *testing.T) string {
+	t.Helper()
+	return `{"name":"edited","bucket_id":"` + uuid.New().String() +
+		`","mode":"scheduled","base_path":"/data2","path_pattern":"*.csv",` +
+		`"dest_path_template":"out/{filename}","recursive":true,"cron_expr":"0 * * * *",` +
+		`"run_once_on_start":true,"append_mode":"tail","enabled":true}`
+}
+
+func TestAgentsHandler_UpdateRule_FullUpdate_Success(t *testing.T) {
+	dispatcher := &mockDispatcher{}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, dispatcher, nil, newTestLogger())
+	w := putRule(t, h, fullRuleBody(t))
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "edited", body["name"])
+	assert.Equal(t, "scheduled", body["mode"])
+	assert.Equal(t, "tail", body["append_mode"])
+}
+
+func TestAgentsHandler_UpdateRule_FullUpdate_Disable(t *testing.T) {
+	// enabled:false must map to inactive status and trigger a cancel dispatch.
+	dispatcher := &mockDispatcher{}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, dispatcher, nil, newTestLogger())
+	body := `{"name":"edited","bucket_id":"` + uuid.New().String() +
+		`","mode":"watch","base_path":"/d","path_pattern":"*","dest_path_template":"x/","enabled":false}`
+	w := putRule(t, h, body)
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, false, resp["enabled"])
+}
+
+func TestAgentsHandler_UpdateRule_FullUpdate_MissingField(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	// name present (→ full-update path) but base_path missing.
+	body := `{"name":"edited","bucket_id":"` + uuid.New().String() +
+		`","mode":"watch","path_pattern":"*","dest_path_template":"x/"}`
+	w := putRule(t, h, body)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+}
+
+func TestAgentsHandler_UpdateRule_FullUpdate_InvalidMode(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	body := `{"name":"edited","bucket_id":"` + uuid.New().String() +
+		`","mode":"bogus","base_path":"/d","path_pattern":"*","dest_path_template":"x/"}`
+	w := putRule(t, h, body)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+}
+
+func TestAgentsHandler_UpdateRule_FullUpdate_InvalidBucketID(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	body := `{"name":"edited","bucket_id":"not-a-uuid","mode":"watch","base_path":"/d","path_pattern":"*","dest_path_template":"x/"}`
+	w := putRule(t, h, body)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestAgentsHandler_UpdateRule_FullUpdate_NotFound(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{fullUpdateErr: sql.ErrNoRows}, nil, nil, nil, newTestLogger())
+	w := putRule(t, h, fullRuleBody(t))
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 

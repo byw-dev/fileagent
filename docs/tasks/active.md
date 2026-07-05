@@ -5,16 +5,17 @@
 
 ---
 
-## 当前任务：CC-8/9（webui，视使用价值）或 optional proto→buf（下一步）
+## 当前任务：CC-9 采集规则原地编辑（拆两 PR，后端已提交，webui = Part 2）
 
 **所属冲刺**：core-completeness（核心模块补完备）
-**上一项已收官**：**CC-7** ✅（事件动作）——发现 `nats_publish` 也是空心的，遂**真正实现**：
-`NATSActionConfig{subject}` + `Engine.WithPublisher` + `dispatchNATS`（发布到 subject、失败进重试）；
-API 拒绝非 `webhook`/`nats_publish` 的 action_type + 校验 config；webui 恢复 nats_publish、去掉 kafka。
-live-e2e 通过。设计 §5.9 + D-019，本 PR 提交中。
-**下一候选**：CC-8（Agent 重命名）/ CC-9（采集规则原地编辑）——纯 webui 功能增量，视真实使用价值人工决定；
-或 optional proto→Go 复现性 follow-up（迁移 buf）。Tier B 健壮性缺口（CC-4/5/6/7）已全部收官。
-**权威 backlog**：[`docs/tasks/core-completeness.md`](core-completeness.md) Tier C（CC-8~10）
+**上一项已收官**：**CC-7** ✅（事件动作 nats_publish 实现 + kafka 拒绝，D-019，PR #55 已合并）。
+**进行中 CC-9**：拆成两 PR 控制评审轮次——
+- **Part 1（后端，本 PR）**：sqlc `UpdateCollectionRule` + `PUT .../rules/{rid}` 双形态
+  （status-only 向后兼容 + 含 `name` 时全字段更新，缺字段/非法 mode `422`、非法 bucket `400`）+ active
+  结果重新 dispatch 热重载。live-e2e 通过，设计 §5.11.2 + D-020。**提交中。**
+- **Part 2（webui，下一 PR）**：规则列表加「编辑」入口 + RuleForm 增 edit 模式（回填已有值、标题改「编辑」、
+  提交调 `updateRule`）+ 编辑路由 `/agents/:id/rules/:rid/edit`。
+**权威 backlog**：`docs/tasks/backlog.md` T4-6 子任务表 + [`core-completeness.md`](core-completeness.md) CC-9。
 
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
 > bucket policy 对本系统冗余（MinIO 默认私有，访问全走 STS/presigned IAM）。待有 staging workflow 再做。

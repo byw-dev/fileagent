@@ -770,3 +770,35 @@ nats_publish**，`kafka_publish` 拒绝（系统固定基础设施是 NATS，无
 - **也把 nats_publish 当不支持、走 webhook-only**：更省事但放弃了设计 §5.9 既有的 NATS 事件总线复用能力；
   既然基础设施就是 NATS，做实 nats_publish 成本低、价值真实（人工决策 2026-07-05 选 A）。
 - **迁移删除 kafka_publish enum 值**：Postgres enum 删值需重建类型 + 转换列，风险高、收益低；API 层拒绝即可。
+
+---
+
+## D-020：采集规则原地编辑 —— PUT 双形态（状态切换 + 全字段编辑）（CC-9 后端）
+
+**决策日期**：2026-07-05
+**影响范围**：controlplane（`db/queries/rules.sql` + sqlc 生成、`api/handler/agents` UpdateRule）
+**背景**：`docs/tasks/backlog.md` T4-6 / core-completeness CC-9
+
+### 背景
+
+`PUT /api/v1/agents/:id/rules/:rid` 原本只支持 `{status}` 启用/停用，规则内容改不了、须删除重建
+（丢失规则 ID 与历史上传日志关联）。webui 的 enable/disable 开关已依赖这个 status-only 契约。
+
+### 决策
+
+- **同一 PUT 端点承载两种形态**，用请求体是否含 `name` 区分：无 `name` → 走原 status-only 路径
+  （`UpdateCollectionRuleStatus`，向后兼容开关）；有 `name` → 全字段更新（新增 sqlc `UpdateCollectionRule`）。
+  不新增端点，保持 REST 路径契约不变。
+- **全字段校验**：`name`/`bucket_id`/`mode`/`base_path`/`path_pattern`/`dest_path_template` 必填，
+  缺失 `422 VALIDATION_ERROR`；`mode` 限 `watch`/`scheduled`，否则 `422`；`bucket_id` 非法 `400`。
+  status 由 `enabled` 派生（与创建对称），默认 active。
+- **重新下发**：结果 active → `DispatchRule`（Agent 端 `PushRuleCommand` 内部 stopRule+重启 watcher 热重载，
+  编辑无需先 disable）；inactive → `DispatchRuleCancel`。派发失败只 warn 不阻断（DB 已写成功，Agent 重连
+  经 `SyncRulesOnConnect` 兜底）。**离线允许编辑**（backlog 设计约束）。
+
+### 备选方案（被否决）
+
+- **新增独立 PUT/PATCH 端点做全字段更新**：多一个契约面；用 `name` 存在性分流即可复用同一端点。
+- **PATCH 部分字段合并**：语义更复杂（需读改写、区分"未提供"与"置空"）；规则字段少且 webui 编辑始终提交全量，
+  全量 PUT 更简单可预测。
+- **强制先 disable 再编辑**：Agent 已内置热重载，强制 disable 只增操作步骤无收益（backlog 已论证）。
