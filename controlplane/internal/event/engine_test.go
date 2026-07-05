@@ -139,7 +139,9 @@ func TestWebhookSender_Send_Exhausted(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, db.updates, 1)
-	assert.Contains(t, db.updates[0], "failed")
+	// Exhausted retries transition to the terminal 'dead' status so the retry
+	// scan stops re-selecting the row.
+	assert.Contains(t, db.updates[0], "dead")
 }
 
 func TestMarshalDeliveryPayload(t *testing.T) {

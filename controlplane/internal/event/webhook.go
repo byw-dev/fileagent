@@ -84,13 +84,15 @@ func (w *WebhookSender) Send(ctx context.Context, rec DeliveryRecord) error {
 func (w *WebhookSender) scheduleRetry(ctx context.Context, rec DeliveryRecord, code int32) error {
 	attempt := rec.AttemptNo
 	if attempt >= len(retryBackoffSchedule) {
-		// Exhausted all retries.
-		return w.db.UpdateEventDeliveryStatus(ctx, rec.ID, "failed",
+		// Exhausted all retries — mark terminal ('dead') so the row drops out of
+		// the retry scan. A 'failed' row with a NULL next_retry_at is treated as
+		// "due now" and would be re-selected (and re-sent) every tick forever.
+		return w.db.UpdateEventDeliveryStatus(ctx, rec.ID, deliveryStatusDead,
 			sql.NullInt32{Int32: code, Valid: code != 0},
 			sql.NullTime{},
 		)
 	}
-	next := time.Now().Add(retryBackoffSchedule[attempt])
+	next := time.Now().UTC().Add(retryBackoffSchedule[attempt])
 	return w.db.UpdateEventDeliveryStatus(ctx, rec.ID, "pending",
 		sql.NullInt32{Int32: code, Valid: code != 0},
 		sql.NullTime{Time: next, Valid: true},
