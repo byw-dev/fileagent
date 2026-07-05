@@ -5,7 +5,10 @@
 package api
 
 import (
+	"io/fs"
 	"net/http"
+	"path"
+	"strings"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
@@ -44,6 +47,11 @@ type RouterConfig struct {
 	RateLimiter middleware.RateLimitStore
 	// RateLimitPerMinute is the max authenticated requests per user per minute.
 	RateLimitPerMinute int
+
+	// WebUIFS, when non-nil, is the compiled Web UI (webui/dist) served for all
+	// non-API routes with SPA fallback (see registerSPA). It is nil in the
+	// default pure-API build and non-nil in the tag-`webui` bundled binary.
+	WebUIFS fs.FS
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -178,7 +186,71 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	statsH := handler.NewStatsHandler(cfg.StatsDB, cfg.Logger)
 	v1.GET("/stats/dashboard", statsH.Dashboard)
 
+	// Web UI (single-page app) served from the embedded filesystem, if present.
+	// Registered last so it only handles routes not claimed by the API above.
+	if cfg.WebUIFS != nil {
+		registerSPA(r, cfg.WebUIFS)
+	}
+
 	return r
+}
+
+// registerSPA serves the embedded Web UI (a BrowserRouter single-page app) for
+// every route the API did not claim. Static asset requests are served from
+// fsys; unknown client-side routes fall back to index.html so deep links and
+// hard refreshes work. Unmatched API-shaped paths still return a JSON 404 in
+// the standard error envelope rather than the HTML shell, so a mistyped API
+// call fails loudly instead of silently receiving index.html.
+func registerSPA(r *gin.Engine, fsys fs.FS) {
+	httpFS := http.FS(fsys)
+
+	r.NoRoute(func(c *gin.Context) {
+		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "resource not found", nil)
+			return
+		}
+
+		p := c.Request.URL.Path
+		if strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/internal/") || p == "/healthz" {
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "resource not found", nil)
+			return
+		}
+
+		// Serve a real static file when one exists (e.g. /assets/index-*.js);
+		// otherwise fall back to the SPA shell for client-side routing.
+		if name := strings.TrimPrefix(path.Clean(p), "/"); name != "" && fileExists(fsys, name) {
+			c.FileFromFS(p, httpFS)
+			return
+		}
+		serveIndex(c, fsys)
+	})
+}
+
+// fileExists reports whether name resolves to a regular (non-directory) file in
+// fsys. Directories return false so requests like "/" fall through to the SPA
+// shell rather than yielding a directory listing.
+func fileExists(fsys fs.FS, name string) bool {
+	f, err := fsys.Open(name)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+// serveIndex writes index.html with a 200 status as the SPA fallback. A missing
+// index.html (misconfigured embed) yields a 404 so the failure is visible.
+func serveIndex(c *gin.Context, fsys fs.FS) {
+	data, err := fs.ReadFile(fsys, "index.html")
+	if err != nil {
+		middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "resource not found", nil)
+		return
+	}
+	c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 }
 
 // ginZapLogger returns a Gin middleware that logs each request using zap.

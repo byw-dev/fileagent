@@ -307,7 +307,7 @@ docker compose -f deploy/docker-compose.test.yml down -v
 | Agent 本地持久化 | SQLite，不用其他嵌入式 DB |
 | 多租户 | 第一版单组织，org_id 字段已预留 |
 | Control Plane HA | 第一版单实例，无状态设计为 HA 预留 |
-| 二进制构建与输出 | `make build` → `bin/`，禁止提交编译产物（见 D-003） |
+| 二进制构建与输出 | `make build` → `bin/`（纯 Go）；`make bundle` 产出含 Web UI 的单文件 CP（见 D-022）；禁止提交编译产物（见 D-003） |
 
 ---
 
