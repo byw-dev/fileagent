@@ -36,12 +36,15 @@
 
 ## 4. 无文档的"口头契约"（复发风险最高）
 
-| # | 契约 | 现居住地 |
+> **✅ 已成文（CC-10）**：V-1…V-4 已汇总至 [`docs/design/contracts.md`](../../design/contracts.md)
+> （参考索引，权威仍是代码）。下表「现居住地」为发现时的原始状态，保留作背景。
+
+| # | 契约 | 现居住地（发现时） |
 |---|------|---------|
-| V-1 | 前端 status 大写（RUNNING/PENDING...）↔ DB 小写（online/pending...）双向映射 | 仅存在于 `agents.go:130-148` 代码中 |
-| V-2 | 列表响应信封 `{items,total,next_cursor,has_more}`（T3-2-FIX 统一） | DECISIONS.md D-007 有部分记录，设计 §8.5 只有 files 一例 |
-| V-3 | trollsift 模板变量清单（SYSTEM_TEMPLATE_VARIABLES） | webui `pathTemplate.ts` 与 pkg/trollsift 各自维护，无单一权威表 |
-| V-4 | REST 错误响应格式 | 设计 §5.11 定义了 `{error:{code,...},request_id}`，实际格式未验证、无契约测试 |
+| V-1 | 前端 status 大写（RUNNING/PENDING...）↔ DB 小写（online/pending...）双向映射 | 仅存在于 `agents.go:130-148` 代码中 → 现见 contracts.md §V-1 |
+| V-2 | 列表响应信封 `{items,total,next_cursor,has_more}`（T3-2-FIX 统一） | DECISIONS.md D-007 有部分记录，设计 §8.5 只有 files 一例 → 现见 contracts.md §V-2 |
+| V-3 | trollsift 模板变量清单（SYSTEM_TEMPLATE_VARIABLES） | webui `pathTemplate.ts` 与 pkg/trollsift 各自维护，无单一权威表 → 现见 contracts.md §V-3 |
+| V-4 | REST 错误响应格式 | 设计 §5.11 定义了 `{error:{code,...},request_id}`，实际格式未验证、无契约测试 → 现见 contracts.md §V-4 |
 
 ## 5. 结构性判断
 
