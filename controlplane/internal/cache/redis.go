@@ -123,11 +123,15 @@ return count
 // same expiry (fixed-window rate limiting, system-design.md §5.1 /
 // ratelimit:api:{user_id}).
 //
-// The expiry is applied at Redis EXPIRE's whole-second precision: window is
-// truncated to seconds via integer division (a sub-second window rounds down,
-// and a window below 1s would yield 0 — callers should pass whole-second
-// windows, e.g. the 1-minute API window).
+// The expiry is applied at Redis EXPIRE's whole-second precision. window must
+// be at least one second: it is truncated to seconds via integer division, so
+// a sub-second or non-positive window would yield an EXPIRE of 0 (which deletes
+// the key immediately and breaks the fixed-window semantics). Such a window is
+// rejected with an error rather than silently mis-expiring the counter.
 func (c *Client) IncrWithWindow(ctx context.Context, key string, window time.Duration) (int64, error) {
+	if window < time.Second {
+		return 0, fmt.Errorf("cache: IncrWithWindow requires window >= 1s, got %s", window)
+	}
 	seconds := int(window / time.Second)
 	return fixedWindowScript.Run(ctx, c.rdb, []string{key}, seconds).Int64()
 }

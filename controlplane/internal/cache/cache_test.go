@@ -150,6 +150,19 @@ func TestIncrWithWindow_CountsAndExpires(t *testing.T) {
 	assert.LessOrEqual(t, ttl, time.Minute)
 }
 
+func TestIncrWithWindow_RejectsSubSecondWindow(t *testing.T) {
+	ctx := context.Background()
+	c := newTestClient(t)
+
+	for _, w := range []time.Duration{0, -time.Second, 500 * time.Millisecond} {
+		_, err := c.IncrWithWindow(ctx, "ratelimit:api:bad", w)
+		require.Error(t, err, "window %s must be rejected", w)
+	}
+	// A rejected call must not have created the counter.
+	_, err := c.Get(ctx, "ratelimit:api:bad")
+	assert.True(t, errors.Is(err, ErrNil))
+}
+
 func TestIncrWithWindow_ResetsAfterExpiry(t *testing.T) {
 	ctx := context.Background()
 	mr := miniredis.RunT(t)
