@@ -20,16 +20,16 @@ import (
 // ── Mock EngineStore ──────────────────────────────────────────────────────────
 
 type mockEngineStore struct {
-	rules            []*db.EventRule
-	listErr          error
-	delivery         *db.EventDelivery
-	createDelErr     error
+	rules             []*db.EventRule
+	listErr           error
+	delivery          *db.EventDelivery
+	createDelErr      error
 	pendingDeliveries []*db.EventDelivery
-	pendingErr       error
-	updateErr        error
-	updateCalled     bool
-	ruleByID         *db.EventRule
-	ruleByIDErr      error
+	pendingErr        error
+	updateErr         error
+	updateCalled      bool
+	ruleByID          *db.EventRule
+	ruleByIDErr       error
 }
 
 func (m *mockEngineStore) ListEnabledEventRules(_ context.Context, _ uuid.UUID, _ db.EventType) ([]*db.EventRule, error) {
@@ -281,7 +281,46 @@ func TestUpdateEventDeliveryStatus_DBError(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestUpdateEventDeliveryStatus_SetsDeliveredAtOnSuccess(t *testing.T) {
+	id := "00000000-0000-0000-0000-000000000001"
+
+	// On success, delivered_at (the 7th ExecContext arg) must be set so a
+	// first-attempt webhook success matches nats_publish / retry-success rows.
+	capt := &capturingDBTX{}
+	adapter := event.NewDBAdapter(capt)
+	require.NoError(t, adapter.UpdateEventDeliveryStatus(context.Background(), id, "delivered",
+		sql.NullInt32{}, sql.NullTime{}))
+	delivered := capt.args[6].(sql.NullTime)
+	assert.True(t, delivered.Valid, "delivered_at must be set when status=delivered")
+
+	// Non-success statuses leave delivered_at NULL.
+	capt2 := &capturingDBTX{}
+	adapter2 := event.NewDBAdapter(capt2)
+	require.NoError(t, adapter2.UpdateEventDeliveryStatus(context.Background(), id, "pending",
+		sql.NullInt32{}, sql.NullTime{}))
+	assert.False(t, capt2.args[6].(sql.NullTime).Valid, "delivered_at must stay NULL when not delivered")
+}
+
 // ── DB stubs used only for UpdateEventDeliveryStatus tests ───────────────────
+
+// capturingDBTX records the args of the last ExecContext call.
+type capturingDBTX struct {
+	args []interface{}
+}
+
+func (c *capturingDBTX) ExecContext(_ context.Context, _ string, args ...interface{}) (sql.Result, error) {
+	c.args = args
+	return nil, nil
+}
+func (c *capturingDBTX) PrepareContext(_ context.Context, _ string) (*sql.Stmt, error) {
+	return nil, nil
+}
+func (c *capturingDBTX) QueryContext(_ context.Context, _ string, _ ...interface{}) (*sql.Rows, error) {
+	return nil, nil
+}
+func (c *capturingDBTX) QueryRowContext(_ context.Context, _ string, _ ...interface{}) *sql.Row {
+	return nil
+}
 
 type nilDBTX struct{}
 

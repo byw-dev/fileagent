@@ -538,6 +538,13 @@ func (a *dbAdapter) UpdateEventDeliveryStatus(ctx context.Context, id string, st
 	if err != nil {
 		return fmt.Errorf("event delivery db: invalid id %q: %w", id, err)
 	}
+	// Stamp delivered_at on success so a first-attempt webhook success matches
+	// nats_publish and retry-success deliveries (which set it), keeping the
+	// timestamp consistent across actions and first-attempt vs retry.
+	var deliveredAt sql.NullTime
+	if status == "delivered" {
+		deliveredAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+	}
 	return indexer.UpdateEventDelivery(ctx, a.dbtx, indexer.UpdateEventDeliveryParams{
 		ID:           parsed,
 		Status:       status,
@@ -545,6 +552,6 @@ func (a *dbAdapter) UpdateEventDeliveryStatus(ctx context.Context, id string, st
 		ResponseBody: sql.NullString{},
 		AttemptCount: 0,
 		NextRetryAt:  nextRetryAt,
-		DeliveredAt:  sql.NullTime{},
+		DeliveredAt:  deliveredAt,
 	})
 }
