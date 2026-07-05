@@ -698,3 +698,37 @@ Dashboard 的"今日上传/存储用量/7 日趋势"一直是**前端拿最近 2
 
 - **硬删除 file_entries 行**：丢失审计与历史关联（upload_logs 外键指向 file_entry）；软删除更安全，且设计 §3.3 已有 `deleted` 状态。
 - **从 UI 移除 file_deleted 选项**（另一条 CC-1 路线）：设计 §6.5 本就要求接入 ObjectRemoved，且 DB/事件引擎均已预留，接通比阉割更符合设计意图。
+
+---
+
+## D-018：API 限流 —— 按用户固定窗口 + Redis 计数（CC-4）
+
+**决策日期**：2026-07-05
+**影响范围**：controlplane（`cache`、`api/middleware`、`api/router`、`config`）
+**背景**：`docs/tasks/core-completeness.md` CC-4；报告 01 §1；设计 §5.1 + §3.5 Redis Key 表已要求 `ratelimit:api:{user_id}`
+
+### 背景
+
+设计 §5.1 与 §3.5 Redis Key 表都要求对 API 做限流（`ratelimit:api:{user_id}`，TTL 1 分钟），
+但 `api/middleware/` 只有 `error.go` / `jwt.go`，**无任何限流实现**——键模式在 `cache/keys.go`
+里有 `RateLimitKey` 但从未被调用。
+
+### 决策
+
+- **固定窗口（fixed window）**，非滑动窗口/令牌桶：Redis `INCR` 计数键 `ratelimit:api:{user_id}`，
+  首次自增时 `EXPIRE` 60s。INCR+EXPIRE 用**单条 Lua 脚本**保证原子——防止进程在 INCR 与 EXPIRE
+  之间崩溃留下无 TTL 的键把用户永久挡死。实现为 `cache.Client.IncrWithWindow`。
+- **按用户计数**：中间件在 JWT 之后执行，按 JWT `sub`（user_id）计数，仅作用于 `/api/v1/*`。
+- **上限可配**：`API_RATE_LIMIT_PER_MINUTE`，默认 600（10 req/s/用户）；`<= 0` 关闭（中间件不挂载）。
+- **失败开放（fail open）**：Redis 出错时放行并记 warn，与 JWT 黑名单查询同策略——限流是保护而非
+  强一致门禁，Redis 抖动不应把所有用户挡在门外。无 JWT 声明的请求不计数（同样放行）。
+- **响应头**：每个响应带 `X-RateLimit-Limit` / `X-RateLimit-Remaining`；超限 `429 RATE_LIMITED`
+  + `Retry-After: 60`，错误体走统一信封（含顶层 `request_id`，见 D 之外的 CC-5）。
+
+### 备选方案（被否决）
+
+- **滑动窗口 / 令牌桶**：更平滑但需 sorted-set 或多键/脚本状态；设计明确写的是单 STRING 计数 + 1 分钟 TTL，
+  固定窗口与之一致且实现最简。窗口边界的 2× 突发对私有部署的管理台可接受。
+- **失败关闭（Redis 错即 429）**：一次 Redis 抖动即全站不可用，代价远大于限流被短暂绕过。
+- **对 `/api/auth/login` 也限流**：登录无 user_id，需改为按 IP 计数，属独立的暴力破解防护议题；
+  本次按设计 §3.5（键为 user_id）只做认证后接口，登录防护另行处理。

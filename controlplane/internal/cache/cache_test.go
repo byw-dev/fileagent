@@ -129,6 +129,46 @@ func TestExists(t *testing.T) {
 	assert.Equal(t, int64(0), n)
 }
 
+func TestIncrWithWindow_CountsAndExpires(t *testing.T) {
+	ctx := context.Background()
+	c := newTestClient(t)
+
+	// First increment creates the key and sets the window TTL.
+	n, err := c.IncrWithWindow(ctx, "ratelimit:api:u1", time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
+
+	// Subsequent increments within the window keep counting.
+	n, err = c.IncrWithWindow(ctx, "ratelimit:api:u1", time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), n)
+
+	// The key carries a TTL (the window), not persist-forever.
+	ttl, err := c.rdb.TTL(ctx, "ratelimit:api:u1").Result()
+	require.NoError(t, err)
+	assert.Greater(t, ttl, time.Duration(0))
+	assert.LessOrEqual(t, ttl, time.Minute)
+}
+
+func TestIncrWithWindow_ResetsAfterExpiry(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	logger, _ := zap.NewDevelopment()
+	c, err := New("redis://"+mr.Addr(), logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { c.Close() })
+
+	n, err := c.IncrWithWindow(ctx, "ratelimit:api:u2", time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
+
+	// Fast-forward past the window; the counter must reset to 1.
+	mr.FastForward(2 * time.Minute)
+	n, err = c.IncrWithWindow(ctx, "ratelimit:api:u2", time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
+}
+
 func TestHSetAndHGetAll(t *testing.T) {
 	ctx := context.Background()
 	c := newTestClient(t)

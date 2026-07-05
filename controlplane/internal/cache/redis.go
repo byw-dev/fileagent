@@ -105,6 +105,27 @@ func (c *Client) Exists(ctx context.Context, keys ...string) (int64, error) {
 	return c.rdb.Exists(ctx, keys...).Result()
 }
 
+// fixedWindowScript atomically increments a counter and, only on the first
+// increment (when the key is created), sets its expiry to the window. Doing
+// both in one Lua script prevents a crash between INCR and EXPIRE from leaving
+// a TTL-less key that would rate-limit a user forever.
+var fixedWindowScript = redis.NewScript(`
+local count = redis.call("INCR", KEYS[1])
+if count == 1 then
+	redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+return count
+`)
+
+// IncrWithWindow atomically increments the fixed-window counter at key and
+// returns its new value. On the first increment of a window it sets the key to
+// expire after window, so subsequent increments within the window share the
+// same expiry (fixed-window rate limiting, system-design.md §5.1 /
+// ratelimit:api:{user_id}).
+func (c *Client) IncrWithWindow(ctx context.Context, key string, window time.Duration) (int64, error) {
+	return fixedWindowScript.Run(ctx, c.rdb, []string{key}, int(window.Seconds())).Int64()
+}
+
 // MGet returns the values at the given keys in order; a missing key yields a nil
 // element. It batches many presence lookups into a single round-trip.
 func (c *Client) MGet(ctx context.Context, keys ...string) ([]interface{}, error) {

@@ -62,6 +62,11 @@ type Config struct {
 	// Defaults to "info".
 	LogLevel string
 
+	// APIRateLimitPerMinute is the maximum number of authenticated API requests
+	// a single user may make per minute (fixed window, system-design.md §5.1).
+	// A value <= 0 disables rate limiting. Default 600 (10 req/s per user).
+	APIRateLimitPerMinute int
+
 	// InternalWebhookSecret is the shared secret for MinIO → Control Plane events
 	// (MinIO notify_webhook auth_token). When empty, the /internal/minio-event
 	// endpoint fails closed and rejects every request, since it mutates the file
@@ -140,6 +145,7 @@ func Load() (*Config, error) {
 
 	// ── misc ─────────────────────────────────────────────────────────────────
 	cfg.LogLevel = envString("LOG_LEVEL", "info")
+	cfg.APIRateLimitPerMinute = envInt("API_RATE_LIMIT_PER_MINUTE", 600)
 	cfg.InternalWebhookSecret = os.Getenv("INTERNAL_WEBHOOK_SECRET")
 	cfg.BootstrapAdminUsername = envString("BOOTSTRAP_ADMIN_USERNAME", "admin")
 	cfg.BootstrapAdminPassword = os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
