@@ -333,6 +333,39 @@ func (q *Queries) UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
+const updateAgentName = `-- name: UpdateAgentName :one
+UPDATE agents
+SET name = $2,
+    updated_at = NOW()
+WHERE id = $1
+RETURNING id, org_id, name, fingerprint, status, auth_token_hash, token_expires_at, os_info, ip_address, approved_by, approved_at, revoked_by, revoked_at, last_seen_at, metadata, created_at, updated_at
+`
+
+func (q *Queries) UpdateAgentName(ctx context.Context, iD uuid.UUID, name string) (*Agent, error) {
+	row := q.db.QueryRowContext(ctx, updateAgentName, iD, name)
+	var i Agent
+	err := row.Scan(
+		&i.ID,
+		&i.OrgID,
+		&i.Name,
+		&i.Fingerprint,
+		&i.Status,
+		&i.AuthTokenHash,
+		&i.TokenExpiresAt,
+		&i.OsInfo,
+		&i.IpAddress,
+		&i.ApprovedBy,
+		&i.ApprovedAt,
+		&i.RevokedBy,
+		&i.RevokedAt,
+		&i.LastSeenAt,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return &i, err
+}
+
 const updateAgentStatus = `-- name: UpdateAgentStatus :one
 UPDATE agents
 SET status = $2,

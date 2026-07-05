@@ -12,6 +12,8 @@ import {
   Spin,
   Switch,
   Card,
+  Form,
+  Input,
 } from 'antd'
 import {
   CheckCircleOutlined,
@@ -27,6 +29,7 @@ import {
   getAgent,
   approveAgent,
   revokeAgent,
+  renameAgent,
   listRules,
   deleteRule,
   listDir,
@@ -59,6 +62,10 @@ function AgentDetailPage() {
 
   const [agent, setAgent] = useState<Agent | null>(null)
   const [loadingAgent, setLoadingAgent] = useState(true)
+
+  const [renameOpen, setRenameOpen] = useState(false)
+  const [renaming, setRenaming] = useState(false)
+  const [renameForm] = Form.useForm<{ name: string }>()
 
   const [rules, setRules] = useState<CollectionRule[]>([])
   const [loadingRules, setLoadingRules] = useState(false)
@@ -147,6 +154,29 @@ function AgentDetailPage() {
         }
       },
     })
+  }
+
+  const openRename = () => {
+    if (!agent) return
+    renameForm.setFieldsValue({ name: agent.name })
+    setRenameOpen(true)
+  }
+
+  const handleRename = async () => {
+    if (!agent) return
+    const values = await renameForm.validateFields().catch(() => null)
+    if (!values) return
+    setRenaming(true)
+    try {
+      const updated = await renameAgent(agent.id, values.name.trim())
+      setAgent(updated)
+      setRenameOpen(false)
+      message.success('重命名成功')
+    } catch {
+      message.error('重命名失败，请稍后重试')
+    } finally {
+      setRenaming(false)
+    }
   }
 
   const handleDeleteRule = (rule: CollectionRule) => {
@@ -396,6 +426,14 @@ function AgentDetailPage() {
           <Title level={4} style={{ margin: 0 }}>
             {agent.name}
           </Title>
+          <Button
+            type="text"
+            size="small"
+            icon={<EditOutlined />}
+            aria-label="重命名"
+            title="重命名"
+            onClick={openRename}
+          />
           <AgentStatusBadge status={agent.status} />
         </Space>
         <Space>
@@ -417,6 +455,34 @@ function AgentDetailPage() {
       </Space>
 
       <Tabs activeKey={activeTab} onChange={setActiveTab} items={tabs} />
+
+      <Modal
+        title="重命名采集器"
+        open={renameOpen}
+        onOk={handleRename}
+        onCancel={() => setRenameOpen(false)}
+        confirmLoading={renaming}
+        okText="保存"
+        cancelText="取消"
+        destroyOnHidden
+      >
+        <Form form={renameForm} layout="vertical" preserve={false}>
+          <Form.Item
+            name="name"
+            label="显示名称"
+            rules={[
+              { required: true, whitespace: true, message: '请输入名称' },
+              { max: 64, message: '名称不超过 64 个字符' },
+              {
+                pattern: /^[\p{L}\p{N} ._-]+$/u,
+                message: '仅允许字母、数字、空格及 . _ -',
+              },
+            ]}
+          >
+            <Input placeholder="自定义显示名称" maxLength={64} onPressEnter={handleRename} />
+          </Form.Item>
+        </Form>
+      </Modal>
     </div>
   )
 }

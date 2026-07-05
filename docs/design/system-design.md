@@ -1453,6 +1453,7 @@ NATS 主题规划：
 |--------|---------------------------------|--------------------|
 | GET    | /api/v1/agents                  | 列出所有采集器            |
 | GET    | /api/v1/agents/{id}             | 获取采集器详情            |
+| PATCH  | /api/v1/agents/{id}             | 重命名采集器（super_admin，见下） |
 | POST   | /api/v1/agents/{id}/approve     | 审批通过（super_admin）  |
 | POST   | /api/v1/agents/{id}/revoke      | 吊销采集器（super_admin） |
 | POST   | /api/v1/agents/{id}/list-dir    | 下发列目录指令            |
@@ -1474,6 +1475,13 @@ NATS 主题规划：
 - 两种形态在结果为 active 时都会重新 `DispatchRule`（Agent 收到 `PushRuleCommand` 内部 `stopRule`+重启
   watcher，热重载，无需先 disable）；结果为 inactive 时 `DispatchRuleCancel`。Agent 离线时更新照常写库，
   重连时经 `SyncRulesOnConnect` 自动同步。规则 ID 不变，历史上传日志保持关联。
+
+**`PATCH .../agents/{id}` 重命名（CC-8，super_admin）**：
+
+- body `{"name": "自定义显示名"}`；校验：`TrimSpace` 后非空、长度 ≤ 64 rune、只允许字母（任意语种含中文）/
+  数字/空格/`. _ -`（正则 `^[\p{L}\p{N} ._-]+$`）——排除 `/` 等路径分隔与控制字符，因为 `name` 会注入
+  上传路径模板 `{agent_name}`。违规返回 `422 VALIDATION_ERROR`，规则不存在 `404`，成功返回更新后的 agent。
+- 新名在 Agent **重连**时才反映到路径模板（方案 B 已知约束）；旧名期间已上传对象的路径是写入快照，不追溯修改。
 
 ### 5.11.3 文件管理
 

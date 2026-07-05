@@ -807,3 +807,27 @@ nats_publish**，`kafka_publish` 拒绝（系统固定基础设施是 NATS，无
 - **PATCH 部分字段合并**：语义更复杂（需读改写、区分"未提供"与"置空"）；规则字段少且 webui 编辑始终提交全量，
   全量 PUT 更简单可预测。
 - **强制先 disable 再编辑**：Agent 已内置热重载，强制 disable 只增操作步骤无收益（backlog 已论证）。
+
+---
+
+## D-021：Agent 重命名 —— PATCH 端点 + 路径安全的名称校验（CC-8）
+
+**决策日期**：2026-07-05
+**影响范围**：controlplane（`agents.sql` + sqlc、`api/handler/agents` Rename、router）、webui（Agent 详情）
+**背景**：`docs/tasks/backlog.md` T4-5 / core-completeness CC-8
+
+### 决策
+
+- **`PATCH /api/v1/agents/:id`**，body `{"name": "..."}`，`super_admin`（复用 `RequireRole` 中间件）。
+  新增 sqlc `UpdateAgentName`。用 PATCH（部分更新单字段）而非 PUT，语义贴合"只改显示名"。
+- **名称校验偏严，因 `name` 会注入上传路径模板 `{agent_name}`**：`TrimSpace` 后非空、≤ 64 rune、
+  白名单正则 `^[\p{L}\p{N} ._-]+$`（字母任意语种含中文 / 数字 / 空格 / `. _ -`）。排除 `/`、控制字符等，
+  防止路径注入/对象键损坏。违规 `422 VALIDATION_ERROR`。存储 trim 后的值。
+- **生效时机**：新名在 Agent 重连时才进入路径模板（方案 B 约束）；旧名期间已上传对象路径为写入快照，不追溯。
+
+### 备选方案（被否决）
+
+- **PUT 整个 agent 对象**：agent 多数字段由 Agent 自身上报（hostname/os/version），管理员只应改显示名；
+  PATCH 单字段避免误覆盖上报字段。
+- **宽松校验（仅非空 + 长度）**：`name` 进路径模板，宽松校验会把 `/`、`..`、控制字符带进对象键，
+  有路径注入风险；白名单更安全，且中文显示名仍可用（`\p{L}` 覆盖 CJK）。

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ type AgentsDB interface {
 	ListAgents(ctx context.Context, orgID uuid.UUID) ([]*db.Agent, error)
 	ListAgentsByStatus(ctx context.Context, orgID uuid.UUID, status db.AgentStatus) ([]*db.Agent, error)
 	GetAgentByID(ctx context.Context, id uuid.UUID) (*db.Agent, error)
+	UpdateAgentName(ctx context.Context, id uuid.UUID, name string) (*db.Agent, error)
 	ListCollectionRulesByAgent(ctx context.Context, agentID uuid.UUID) ([]*db.CollectionRule, error)
 	GetCollectionRuleByID(ctx context.Context, id uuid.UUID) (*db.CollectionRule, error)
 	CreateCollectionRule(ctx context.Context, arg db.CreateCollectionRuleParams) (*db.CollectionRule, error)
@@ -283,6 +285,69 @@ func (h *AgentsHandler) Get(c *gin.Context) {
 		}
 		h.logger.Error("get agent", zap.Error(err))
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get agent", nil)
+		return
+	}
+	c.JSON(http.StatusOK, h.toAgentResponseWithOnline(c.Request.Context(), agent))
+}
+
+// maxAgentNameLen caps an agent's custom display name.
+const maxAgentNameLen = 64
+
+// agentNameRe restricts the display name to letters (any script, incl. CJK),
+// digits, spaces, and ._- . It excludes path separators and other special
+// characters because the name is injected into upload path templates
+// ({agent_name}); a "/" or control char there would corrupt object keys.
+var agentNameRe = regexp.MustCompile(`^[\p{L}\p{N} ._-]+$`)
+
+// renameAgentRequest is the body expected by PATCH /api/v1/agents/:id.
+type renameAgentRequest struct {
+	Name string `json:"name" binding:"required"`
+}
+
+// Rename handles PATCH /api/v1/agents/:id — sets an agent's custom display name
+// (super_admin only). The new name takes effect in the agent's path templates
+// on its next reconnect; previously uploaded objects keep their old-name paths.
+func (h *AgentsHandler) Rename(c *gin.Context) {
+	if h.db == nil {
+		middleware.NotImplemented(c)
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
+		return
+	}
+
+	var req renameAgentRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		middleware.RespondError(c, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "name must not be empty", nil)
+		return
+	}
+	if len([]rune(name)) > maxAgentNameLen {
+		middleware.RespondError(c, http.StatusUnprocessableEntity, "VALIDATION_ERROR",
+			"name must be at most 64 characters", nil)
+		return
+	}
+	if !agentNameRe.MatchString(name) {
+		middleware.RespondError(c, http.StatusUnprocessableEntity, "VALIDATION_ERROR",
+			"name may contain only letters, digits, spaces, and . _ -", nil)
+		return
+	}
+
+	agent, err := h.db.UpdateAgentName(c.Request.Context(), id, name)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "agent not found", nil)
+			return
+		}
+		h.logger.Error("rename agent", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to rename agent", nil)
 		return
 	}
 	c.JSON(http.StatusOK, h.toAgentResponseWithOnline(c.Request.Context(), agent))

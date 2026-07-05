@@ -86,6 +86,14 @@ export async function deleteAgent(id: string): Promise<void> {
   await apiClient.delete(`/api/v1/agents/${id}`)
 }
 
+/**
+ * Rename an agent (set a custom display name). super_admin only.
+ */
+export async function renameAgent(id: string, name: string): Promise<Agent> {
+  const response = await apiClient.patch<Agent>(`/api/v1/agents/${id}`, { name })
+  return response.data
+}
+
 /** Collection mode for a rule */
 export type CollectionMode = 'WATCH' | 'SCHEDULED'
 

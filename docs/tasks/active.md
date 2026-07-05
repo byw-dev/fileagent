@@ -5,15 +5,15 @@
 
 ---
 
-## 当前任务：CC-8 / CC-10（下一步，视使用价值）或 optional proto→buf
+## 当前任务：CC-10（隐性契约文档，视价值）或 optional proto→buf
 
 **所属冲刺**：core-completeness（核心模块补完备）
-**上一项已收官**：**CC-9** ✅ 采集规则原地编辑（两 PR）——
-- Part 1 后端（PR #56 合并，D-020）：`PUT .../rules/{rid}` 双形态全字段更新 + IDOR 三键定位。
-- Part 2 webui（本 PR）：规则列表/详情「编辑」入口 + RuleForm edit 模式（三步全回填 + 提交 `updateRule`）+
-  路由 `/agents/:id/rules/:rid/edit`。**浏览器 live-e2e 全程通过。提交中。**
-**下一候选**：CC-8（Agent 重命名，backlog T4-5）/ CC-10（隐性契约文档，如 mode 大小写、status 枚举映射）
-——纯增量/文档，视真实使用价值人工决定；或 optional proto→buf 复现性 follow-up。
+**上一项已收官**：**CC-8** ✅ Agent 重命名（本 PR，D-021）——`PATCH /api/v1/agents/:id`（super_admin）+
+sqlc `UpdateAgentName` + 路径安全名称校验（白名单正则，因 `{agent_name}` 入模板）；webui 详情页铅笔 →
+重命名 Modal。handler 7 测 + webui 3 测；后端 curl + 浏览器 live-e2e 全过。**提交中。**
+**Tier A/B/C 主线基本收官**：CC-1/2/4/5/6/7/8/9 全部完成（CC-3 推后）。
+**剩余候选**：CC-10（隐性契约文档，如 `mode` 大小写、status 枚举映射——CC-9/CC-8 期间已多次踩到）；
+或 optional proto→buf 复现性 follow-up。均视真实价值人工决定。
 **权威 backlog**：`docs/tasks/backlog.md` + [`core-completeness.md`](core-completeness.md)。
 
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），

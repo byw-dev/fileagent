@@ -7,7 +7,7 @@
  * JSX component for the directory-browser modal at line ~347).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { App } from 'antd'
 
@@ -15,11 +15,13 @@ import { App } from 'antd'
 const mockGetAgent = vi.fn()
 const mockListRules = vi.fn()
 const mockListAgentUploadLogs = vi.fn()
+const mockRenameAgent = vi.fn()
 
 vi.mock('../services/agents', () => ({
   getAgent: (...args: unknown[]) => mockGetAgent(...args),
   approveAgent: vi.fn(),
   revokeAgent: vi.fn(),
+  renameAgent: (...args: unknown[]) => mockRenameAgent(...args),
   listRules: (...args: unknown[]) => mockListRules(...args),
   deleteRule: vi.fn(),
   listDir: vi.fn(),
@@ -106,6 +108,33 @@ describe('AgentDetailPage', () => {
       const badges = screen.getAllByText('已审批')
       expect(badges.length).toBeGreaterThan(0)
     })
+  })
+
+  it('renames the agent via the pencil modal', async () => {
+    mockRenameAgent.mockResolvedValue({ ...sampleAgent, name: 'renamed-01' })
+    renderPage()
+    await waitFor(() => expect(screen.getAllByText('edge-agent-01').length).toBeGreaterThan(0))
+
+    fireEvent.click(screen.getByLabelText('重命名'))
+    const input = await screen.findByLabelText('显示名称')
+    expect(input).toHaveValue('edge-agent-01') // prefilled with current name
+    fireEvent.change(input, { target: { value: 'renamed-01' } })
+    fireEvent.click(screen.getByRole('button', { name: /保\s*存/ }))
+
+    await waitFor(() => expect(mockRenameAgent).toHaveBeenCalledWith(AGENT_ID, 'renamed-01'))
+  })
+
+  it('blocks rename submit on empty name (validation)', async () => {
+    renderPage()
+    await waitFor(() => expect(screen.getAllByText('edge-agent-01').length).toBeGreaterThan(0))
+
+    fireEvent.click(screen.getByLabelText('重命名'))
+    const input = await screen.findByLabelText('显示名称')
+    fireEvent.change(input, { target: { value: '   ' } })
+    fireEvent.click(screen.getByRole('button', { name: /保\s*存/ }))
+
+    expect(await screen.findByText('请输入名称')).toBeInTheDocument()
+    expect(mockRenameAgent).not.toHaveBeenCalled()
   })
 
   it('shows a loading spinner before data arrives', () => {

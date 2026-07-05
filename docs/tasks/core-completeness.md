@@ -28,7 +28,7 @@
 
 | ID | 模块 | 缺口 | 来源 |
 |----|------|------|------|
-| **CC-8** | CP + webui | Agent 重命名（管理员设自定义显示名） | backlog T4-5 |
+| **CC-8** ✅ | CP + webui | ~~Agent 重命名（管理员设自定义显示名）~~ | **已完成（本 PR / D-021）**：`PATCH /api/v1/agents/:id`（super_admin）+ sqlc `UpdateAgentName`；名称校验偏严（≤64 rune、白名单 `^[\p{L}\p{N} ._-]+$` 防路径注入，因 `{agent_name}` 入模板）→ `422`。webui 详情页标题加铅笔 → 重命名 Modal（回填/校验/提交 `renameAgent`）。handler 7 测（含非管理员 403）+ webui 3 测；后端 curl + **浏览器 live-e2e** 全过（改名→标题+名称字段刷新→DB 持久化）。backlog T4-5 |
 | **CC-9** ✅ | CP + webui | ~~采集规则原地编辑~~ | **已完成**：Part 1 后端（PR #56 / D-020）——sqlc `UpdateCollectionRule` + `PUT .../rules/{rid}` 双形态（status-only 向后兼容 + 含 `name` 全字段更新，缺字段/非法 mode `422`、非法 bucket `400`、`id+agent_id+org_id` 防 IDOR）+ active 结果热重载。Part 2 webui（本 PR）——规则列表/详情加「编辑」入口 + RuleForm edit 模式（三步全回填、mode 大小写归一、标题/按钮切换、提交调 `updateRule`、Dry-Run 可跳过、保留 enabled）+ 路由 `/agents/:id/rules/:rid/edit`。**浏览器 live-e2e 全程通过**（三步回填 → 改模板 → 保存 → DB 持久化、规则 ID 不变）。backlog T4-6 |
 | **CC-10** | webui | 状态枚举大小写映射等"隐性契约"无文档 | 03 §小结 / 05 §4 |
 
@@ -57,4 +57,4 @@
 
 ## 执行顺序建议
 
-`CC-1 ✅` → `CC-2 ✅` → `CC-6 ✅（离线兜底扫描）` → `CC-3 ⏸️ 推后（低价值）` → `CC-5 ✅（request_id + 未知参数）` → `CC-4 ✅（API 限流）` → `CC-7 ✅（nats_publish 实现 + kafka 拒绝）` → `CC-8/9（视使用价值）/ optional proto→buf`
+`CC-1 ✅` → `CC-2 ✅` → `CC-6 ✅` → `CC-3 ⏸️ 推后` → `CC-5 ✅` → `CC-4 ✅` → `CC-7 ✅` → `CC-9 ✅（规则原地编辑）` → `CC-8 ✅（Agent 重命名）` → `CC-10（隐性契约文档，视价值）/ optional proto→buf`

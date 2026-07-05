@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
+	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
 	"github.com/gin-gonic/gin"
@@ -35,6 +37,7 @@ type mockAgentsDB struct {
 	createErr     error
 	updateErr     error
 	fullUpdateErr error
+	renameErr     error
 	deleteErr     error
 	logs          []*db.UploadLog
 	logsErr       error
@@ -50,6 +53,12 @@ func (m *mockAgentsDB) ListAgentsByStatus(_ context.Context, _ uuid.UUID, _ db.A
 }
 func (m *mockAgentsDB) GetAgentByID(_ context.Context, _ uuid.UUID) (*db.Agent, error) {
 	return m.agent, m.getErr
+}
+func (m *mockAgentsDB) UpdateAgentName(_ context.Context, id uuid.UUID, name string) (*db.Agent, error) {
+	if m.renameErr != nil {
+		return nil, m.renameErr
+	}
+	return &db.Agent{ID: id, Name: name, Status: db.AgentStatusApproved, OsInfo: json.RawMessage(`{}`), Metadata: json.RawMessage(`{}`)}, nil
 }
 func (m *mockAgentsDB) ListCollectionRulesByAgent(_ context.Context, _ uuid.UUID) ([]*db.CollectionRule, error) {
 	return m.rules, m.rulesErr
@@ -206,6 +215,7 @@ func testAgentsRouter(h *handler.AgentsHandler) *gin.Engine {
 	v1 := r.Group("/api/v1")
 	v1.GET("/agents", h.List)
 	v1.GET("/agents/:id", h.Get)
+	v1.PATCH("/agents/:id", h.Rename)
 	v1.POST("/agents/:id/approve", h.Approve)
 	v1.POST("/agents/:id/revoke", h.Revoke)
 	v1.POST("/agents/:id/list-dir", h.ListDir)
@@ -292,6 +302,81 @@ func TestAgentsHandler_Get_NotFound(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String(), nil)
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// ── Rename ────────────────────────────────────────────────────────────────────
+
+func patchAgentName(t *testing.T, h *handler.AgentsHandler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPatch, "/api/v1/agents/"+uuid.New().String(), bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	return w
+}
+
+func TestAgentsHandler_Rename_Success(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	w := patchAgentName(t, h, `{"name":"生产传感器-01"}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "生产传感器-01", body["name"])
+}
+
+func TestAgentsHandler_Rename_TrimsWhitespace(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	w := patchAgentName(t, h, `{"name":"  edge-1  "}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "edge-1", body["name"])
+}
+
+func TestAgentsHandler_Rename_Empty_422(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	// Whitespace-only trims to empty → 422 (binding:required passes on non-empty string).
+	w := patchAgentName(t, h, `{"name":"   "}`)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+}
+
+func TestAgentsHandler_Rename_TooLong_422(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	long := strings.Repeat("a", 65)
+	w := patchAgentName(t, h, `{"name":"`+long+`"}`)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+}
+
+func TestAgentsHandler_Rename_SpecialChars_422(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	// A "/" would corrupt {agent_name} path templates.
+	w := patchAgentName(t, h, `{"name":"bad/name"}`)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+}
+
+func TestAgentsHandler_Rename_NotFound_404(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{renameErr: sql.ErrNoRows}, nil, nil, nil, newTestLogger())
+	w := patchAgentName(t, h, `{"name":"whatever"}`)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestAgentsHandler_Rename_NonAdmin_403(t *testing.T) {
+	// The route is gated by RequireRole("super_admin"); a non-admin caller is
+	// rejected before the handler runs.
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		injectClaims(c, "operator", uuid.New().String(), uuid.New().String())
+		c.Next()
+	})
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	r.PATCH("/api/v1/agents/:id", middleware.RequireRole("super_admin"), h.Rename)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPatch, "/api/v1/agents/"+uuid.New().String(), bytes.NewBufferString(`{"name":"x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
 // ── Approve / Revoke ──────────────────────────────────────────────────────────
