@@ -5,17 +5,16 @@
 
 ---
 
-## 当前任务：CC-9 采集规则原地编辑（拆两 PR，后端已提交，webui = Part 2）
+## 当前任务：CC-8 / CC-10（下一步，视使用价值）或 optional proto→buf
 
 **所属冲刺**：core-completeness（核心模块补完备）
-**上一项已收官**：**CC-7** ✅（事件动作 nats_publish 实现 + kafka 拒绝，D-019，PR #55 已合并）。
-**进行中 CC-9**：拆成两 PR 控制评审轮次——
-- **Part 1（后端，本 PR）**：sqlc `UpdateCollectionRule` + `PUT .../rules/{rid}` 双形态
-  （status-only 向后兼容 + 含 `name` 时全字段更新，缺字段/非法 mode `422`、非法 bucket `400`）+ active
-  结果重新 dispatch 热重载。live-e2e 通过，设计 §5.11.2 + D-020。**提交中。**
-- **Part 2（webui，下一 PR）**：规则列表加「编辑」入口 + RuleForm 增 edit 模式（回填已有值、标题改「编辑」、
-  提交调 `updateRule`）+ 编辑路由 `/agents/:id/rules/:rid/edit`。
-**权威 backlog**：`docs/tasks/backlog.md` T4-6 子任务表 + [`core-completeness.md`](core-completeness.md) CC-9。
+**上一项已收官**：**CC-9** ✅ 采集规则原地编辑（两 PR）——
+- Part 1 后端（PR #56 合并，D-020）：`PUT .../rules/{rid}` 双形态全字段更新 + IDOR 三键定位。
+- Part 2 webui（本 PR）：规则列表/详情「编辑」入口 + RuleForm edit 模式（三步全回填 + 提交 `updateRule`）+
+  路由 `/agents/:id/rules/:rid/edit`。**浏览器 live-e2e 全程通过。提交中。**
+**下一候选**：CC-8（Agent 重命名，backlog T4-5）/ CC-10（隐性契约文档，如 mode 大小写、status 枚举映射）
+——纯增量/文档，视真实使用价值人工决定；或 optional proto→buf 复现性 follow-up。
+**权威 backlog**：`docs/tasks/backlog.md` + [`core-completeness.md`](core-completeness.md)。
 
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
 > bucket policy 对本系统冗余（MinIO 默认私有，访问全走 STS/presigned IAM）。待有 staging workflow 再做。

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { App, Button, Space, Table, Tag, Typography, Switch } from 'antd'
-import { PlusOutlined, DeleteOutlined } from '@ant-design/icons'
+import { PlusOutlined, DeleteOutlined, EditOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { useParams, useNavigate } from 'react-router-dom'
 import { listRules, deleteRule } from '../../services/agents'
@@ -94,16 +94,25 @@ function AgentRulesPage() {
     {
       title: '操作',
       key: 'action',
-      width: 100,
+      width: 160,
       render: (_, rule) => (
-        <Button
-          size="small"
-          danger
-          icon={<DeleteOutlined />}
-          onClick={() => handleDelete(rule)}
-        >
-          删除
-        </Button>
+        <Space size="small">
+          <Button
+            size="small"
+            icon={<EditOutlined />}
+            onClick={() => navigate(`/agents/${id}/rules/${rule.id}/edit`)}
+          >
+            编辑
+          </Button>
+          <Button
+            size="small"
+            danger
+            icon={<DeleteOutlined />}
+            onClick={() => handleDelete(rule)}
+          >
+            删除
+          </Button>
+        </Space>
       ),
     },
   ]

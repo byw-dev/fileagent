@@ -18,6 +18,7 @@ import {
   StopOutlined,
   PlusOutlined,
   DeleteOutlined,
+  EditOutlined,
   FolderOutlined,
 } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
@@ -196,9 +197,16 @@ function AgentDetailPage() {
     {
       title: '操作',
       key: 'action',
-      width: 120,
+      width: 160,
       render: (_, rule) => (
         <Space>
+          <Button
+            size="small"
+            icon={<EditOutlined />}
+            onClick={() => navigate(`/agents/${id}/rules/${rule.id}/edit`)}
+          >
+            编辑
+          </Button>
           <Button
             size="small"
             danger
