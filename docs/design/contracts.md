@@ -58,10 +58,14 @@
 
 | 值 | 说明 |
 |----|------|
-| `overwrite` | 覆盖（**默认**：空字符串会被补齐为 `overwrite`） |
-| `tail`      | 断点续传追加 |
+| `overwrite`  | 每次变更上传整文件（**默认**：空字符串会被补齐为 `overwrite`） |
+| `tail`       | 追踪字节偏移，仅上传新增部分（断点续传） |
+| `close_wait` | 防抖：Write/Create 事件静默一段时间后再整文件上传（写完再传） |
 
-- 默认补齐逻辑：`controlplane/internal/api/handler/agents.go:753` 与 `:937`
+- **值域权威在 Agent watcher**（非 CP：`append_mode` 是自由 TEXT，CP 不做枚举校验，仅默认补齐）：
+  `agent/internal/watcher/watcher.go:44`（`AppendModeOverwrite` / `AppendModeTail` / `AppendModeCloseWait` 常量）
+- webui 选项清单镜像：`webui/src/pages/Agents/RuleForm.tsx:390`（须与 watcher 常量一致）
+- CP 默认补齐逻辑（空→`overwrite`）：`controlplane/internal/api/handler/agents.go:753` 与 `:937`
 
 ### 上传日志状态（upload-log status，前端）
 
