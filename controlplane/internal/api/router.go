@@ -38,6 +38,12 @@ type RouterConfig struct {
 	MinioIndexer  handler.IndexerClient    // nil → minio webhook events are only logged
 	WebhookSecret string                   // shared secret for /internal/minio-event; empty → endpoint rejects all
 	StatsDB       handler.StatsDB          // nil → stats endpoint returns 501
+
+	// RateLimiter backs the per-user API rate-limit middleware. When nil, or
+	// when RateLimitPerMinute <= 0, rate limiting is disabled.
+	RateLimiter middleware.RateLimitStore
+	// RateLimitPerMinute is the max authenticated requests per user per minute.
+	RateLimitPerMinute int
 }
 
 // NewRouter creates and fully configures a *gin.Engine with all routes and
@@ -74,6 +80,13 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	jwtMW := middleware.JWT(cfg.JWTService, cfg.Logger)
 
 	v1 := r.Group("/api/v1", jwtMW)
+
+	// Per-user API rate limiting runs after JWT so the caller's user ID is
+	// known (system-design.md §5.1). Disabled when no limiter is wired or the
+	// configured limit is non-positive.
+	if cfg.RateLimiter != nil && cfg.RateLimitPerMinute > 0 {
+		v1.Use(middleware.RateLimit(cfg.RateLimiter, cfg.RateLimitPerMinute, cfg.Logger))
+	}
 
 	// Users (super_admin only)
 	usersH := handler.NewUsersHandler(cfg.UsersDB, cfg.Logger)
