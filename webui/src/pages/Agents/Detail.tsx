@@ -158,6 +158,9 @@ function AgentDetailPage() {
 
   const openRename = () => {
     if (!agent) return
+    // Reset first so a prior validation error/touched state doesn't carry over
+    // when the modal is reopened, then prefill with the current name.
+    renameForm.resetFields()
     renameForm.setFieldsValue({ name: agent.name })
     setRenameOpen(true)
   }
