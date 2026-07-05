@@ -28,10 +28,15 @@ const EVENT_TYPE_OPTIONS = [
   { label: 'agent_revoked', value: 'agent_revoked' },
 ]
 
-// TODO(CC-7): action_type options are also out of sync — the DB enum is
-// webhook / nats_publish / kafka_publish, "email" is invalid, and kafka_publish
-// is currently a dead action. Only webhook is wired end-to-end today.
-const ACTION_TYPE_OPTIONS = [{ label: 'webhook', value: 'webhook' }]
+// Action types wired end-to-end by the Control Plane event engine (CC-7):
+//   - webhook: POSTs the event payload to a configured URL (with retries).
+//   - nats_publish: re-publishes the payload to a configured NATS subject.
+// kafka_publish exists in the DB enum but has no implementation (no Kafka in the
+// deployment) and is rejected by the API, so it is intentionally not offered.
+const ACTION_TYPE_OPTIONS = [
+  { label: 'webhook', value: 'webhook' },
+  { label: 'nats_publish', value: 'nats_publish' },
+]
 
 /**
  * Create event rule page — form for name, event type, action type,
@@ -130,7 +135,7 @@ function EventCreatePage() {
             label="动作配置（JSON）"
             name="action_config_raw"
             rules={[{ required: true, message: '请填写动作配置' }]}
-            extra='例如 webhook：{"url": "https://example.com/hook", "secret": "abc"}'
+            extra='webhook：{"url": "https://example.com/hook"}；nats_publish：{"subject": "events.custom.sink"}'
           >
             <TextArea rows={4} placeholder='{"url": "..."}' />
           </Form.Item>

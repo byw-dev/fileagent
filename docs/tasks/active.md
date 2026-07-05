@@ -5,14 +5,16 @@
 
 ---
 
-## 当前任务：CC-7（下一步）
+## 当前任务：CC-8/9（webui，视使用价值）或 optional proto→buf（下一步）
 
 **所属冲刺**：core-completeness（核心模块补完备）
-**上一项已收官**：**CC-4** ✅（API 限流）——`/api/v1/*` 按用户固定窗口限流，Redis `ratelimit:api:{user_id}`
-（TTL 60s），`middleware.RateLimit` 超限 `429 RATE_LIMITED`+`Retry-After`+`X-RateLimit-*`；上限
-`API_RATE_LIMIT_PER_MINUTE`（默认 600，`<=0` 关闭），失败开放。设计 §5.1/§5.11 + 附录 C + D-018 已更新，本 PR 提交中。
-**下一候选**：CC-7（`kafka_publish` 死 action 清理：实现或从枚举/UI 移除，并把已可用的 `nats_publish` 放回 webui UI）。
-**权威 backlog 与验收**：[`docs/tasks/core-completeness.md`](core-completeness.md) CC-7（Tier B）
+**上一项已收官**：**CC-7** ✅（事件动作）——发现 `nats_publish` 也是空心的，遂**真正实现**：
+`NATSActionConfig{subject}` + `Engine.WithPublisher` + `dispatchNATS`（发布到 subject、失败进重试）；
+API 拒绝非 `webhook`/`nats_publish` 的 action_type + 校验 config；webui 恢复 nats_publish、去掉 kafka。
+live-e2e 通过。设计 §5.9 + D-019，本 PR 提交中。
+**下一候选**：CC-8（Agent 重命名）/ CC-9（采集规则原地编辑）——纯 webui 功能增量，视真实使用价值人工决定；
+或 optional proto→Go 复现性 follow-up（迁移 buf）。Tier B 健壮性缺口（CC-4/5/6/7）已全部收官。
+**权威 backlog**：[`docs/tasks/core-completeness.md`](core-completeness.md) Tier C（CC-8~10）
 
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
 > bucket policy 对本系统冗余（MinIO 默认私有，访问全走 STS/presigned IAM）。待有 staging workflow 再做。
@@ -30,8 +32,9 @@
 | CC-3 | CP | Bucket Policy + tmp-uploads Lifecycle | ⏸️ 已推后（低价值，见上） |
 | CC-6 | CP | TTL 驱动离线兜底扫描 | ✅ PR #51 |
 | CC-5 | CP | 错误响应 `request_id` + 未知参数拒绝 | ✅ PR #53 |
-| **CC-4** | CP | API 限流（固定窗口，per-user） | ✅ 本 PR |
-| CC-7 | CP + webui | kafka_publish 死 action 清理 | ⬜ **下一步** |
+| CC-4 | CP | API 限流（固定窗口，per-user） | ✅ PR #54 |
+| **CC-7** | CP + webui | nats_publish 实现 + kafka_publish 拒绝 | ✅ 本 PR |
+| CC-8~10 | webui | Agent 重命名 / 规则原地编辑 / 隐性契约文档 | ⬜（视使用价值） |
 | CC-8~10 | webui | Agent 重命名 / 规则原地编辑 / 隐性契约文档 | ⬜（视使用价值） |
 
 前序已收官：**止血冲刺（P0+P1）** G-1…G-5（PR #39–#45，D-012…D-016），

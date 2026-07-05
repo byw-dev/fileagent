@@ -380,6 +380,72 @@ func TestEventRulesHandler_Create_Success(t *testing.T) {
 	assert.Equal(t, http.StatusCreated, w.Code)
 }
 
+func postEventRule(t *testing.T, h *handler.EventRulesHandler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/event-rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testEventRulesRouter(h).ServeHTTP(w, req)
+	return w
+}
+
+func errCode(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	return body["error"].(map[string]interface{})["code"].(string)
+}
+
+func TestEventRulesHandler_Create_NatsPublish_Success(t *testing.T) {
+	h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
+	body := `{"name":"n","event_type":"file_uploaded","action_type":"nats_publish","action_config":{"subject":"events.custom.sink"},"enabled":true}`
+	w := postEventRule(t, h, body)
+	assert.Equal(t, http.StatusCreated, w.Code)
+}
+
+func TestEventRulesHandler_Create_KafkaPublish_Rejected(t *testing.T) {
+	h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
+	body := `{"name":"k","event_type":"file_uploaded","action_type":"kafka_publish","action_config":{"brokers":"x"},"enabled":true}`
+	w := postEventRule(t, h, body)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, "INVALID_ACTION_TYPE", errCode(t, w))
+}
+
+func TestEventRulesHandler_Create_UnknownActionType_Rejected(t *testing.T) {
+	h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
+	body := `{"name":"e","event_type":"file_uploaded","action_type":"email","action_config":{},"enabled":true}`
+	w := postEventRule(t, h, body)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, "INVALID_ACTION_TYPE", errCode(t, w))
+}
+
+func TestEventRulesHandler_Create_WebhookMissingURL_Rejected(t *testing.T) {
+	h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
+	body := `{"name":"w","event_type":"file_uploaded","action_type":"webhook","action_config":{},"enabled":true}`
+	w := postEventRule(t, h, body)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, "INVALID_ACTION_CONFIG", errCode(t, w))
+}
+
+func TestEventRulesHandler_Create_NatsMissingSubject_Rejected(t *testing.T) {
+	h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
+	body := `{"name":"n","event_type":"file_uploaded","action_type":"nats_publish","action_config":{},"enabled":true}`
+	w := postEventRule(t, h, body)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, "INVALID_ACTION_CONFIG", errCode(t, w))
+}
+
+func TestEventRulesHandler_Update_KafkaPublish_Rejected(t *testing.T) {
+	h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
+	body := `{"name":"k","event_type":"file_uploaded","action_type":"kafka_publish","action_config":{},"enabled":true}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPut, "/api/v1/event-rules/"+uuid.New().String(), bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testEventRulesRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, "INVALID_ACTION_TYPE", errCode(t, w))
+}
+
 func TestEventRulesHandler_Create_MissingFields(t *testing.T) {
 	h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
 	body := `{"name":"only-name"}`

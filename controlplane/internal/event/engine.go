@@ -21,6 +21,13 @@ type WebhookActionConfig struct {
 	Headers map[string]string `json:"headers,omitempty"`
 }
 
+// NATSActionConfig is the expected JSON shape of EventRule.ActionConfig for
+// nats_publish actions. Subject is the NATS subject the event payload is
+// re-published to for downstream internal consumers.
+type NATSActionConfig struct {
+	Subject string `json:"subject"`
+}
+
 // NATSListener is the minimal NATS interface needed to subscribe to event subjects.
 type NATSListener interface {
 	// Subscribe registers a callback for messages on subject. The returned
@@ -73,9 +80,18 @@ func (d *dbtxEngineStore) GetEventRuleByID(ctx context.Context, id uuid.UUID) (*
 // Engine routes inbound NATS events to the appropriate rules and creates
 // event_delivery records for webhook and other actions.
 type Engine struct {
-	store  EngineStore
-	sender *WebhookSender
-	logger *zap.Logger
+	store     EngineStore
+	sender    *WebhookSender
+	publisher NATSConn // re-publishes payloads for nats_publish actions; nil until WithPublisher
+	logger    *zap.Logger
+}
+
+// WithPublisher wires the NATS publisher used by nats_publish action rules and
+// returns the Engine for chaining. Without it, nats_publish deliveries fail
+// (and are retried) rather than silently succeeding.
+func (e *Engine) WithPublisher(p NATSConn) *Engine {
+	e.publisher = p
+	return e
 }
 
 // NewEngine creates an Engine backed by the given db.DBTX. This is the
@@ -173,11 +189,11 @@ func (e *Engine) retryWorker(ctx context.Context) {
 // retryBackoffSchedule defines the wait duration before each retry attempt
 // (indexed by attempt number, 1-based). Matches the design spec §5.9.
 var retryBackoffSchedule = []time.Duration{
-	30 * time.Second,  // attempt 1
-	2 * time.Minute,   // attempt 2
-	10 * time.Minute,  // attempt 3
-	30 * time.Minute,  // attempt 4
-	2 * time.Hour,     // attempt 5 — final
+	30 * time.Second, // attempt 1
+	2 * time.Minute,  // attempt 2
+	10 * time.Minute, // attempt 3
+	30 * time.Minute, // attempt 4
+	2 * time.Hour,    // attempt 5 — final
 }
 
 // maxRetryAttempts is the maximum number of retry attempts before giving up.
@@ -211,17 +227,30 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 	if err != nil {
 		return fmt.Errorf("retry: get rule %s: %w", d.EventRuleID, err)
 	}
-	if rule.ActionType != db.ActionTypeWebhook {
-		return nil
-	}
-
-	var cfg WebhookActionConfig
-	if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
-		return fmt.Errorf("retry: parse webhook config: %w", err)
-	}
 
 	newAttemptCount := d.AttemptCount + 1
-	sendErr := postWebhook(ctx, cfg.URL, d.Payload)
+
+	var sendErr error
+	switch rule.ActionType {
+	case db.ActionTypeWebhook:
+		var cfg WebhookActionConfig
+		if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
+			return fmt.Errorf("retry: parse webhook config: %w", err)
+		}
+		sendErr = postWebhook(ctx, cfg.URL, d.Payload)
+	case db.ActionTypeNatsPublish:
+		var cfg NATSActionConfig
+		if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
+			return fmt.Errorf("retry: parse nats config: %w", err)
+		}
+		if cfg.Subject == "" {
+			return fmt.Errorf("retry: nats subject empty for rule %s", rule.ID)
+		}
+		sendErr = e.publishNATS(cfg.Subject, d.Payload)
+	default:
+		// Unknown/unsupported action — nothing to retry.
+		return nil
+	}
 
 	var newStatus string
 	var respCode sql.NullInt32
@@ -290,18 +319,69 @@ func (e *Engine) dispatch(ctx context.Context, rule *db.EventRule, eventType db.
 	case db.ActionTypeWebhook:
 		return e.dispatchWebhook(ctx, rule, eventType, payload)
 	case db.ActionTypeNatsPublish:
-		// NATS re-publish is handled by the publisher; create a delivery record only.
-		_, err := e.store.CreateEventDelivery(ctx, indexer.CreateEventDeliveryParams{
-			EventRuleID: rule.ID,
-			EventType:   eventType,
-			Payload:     payload,
-			Status:      "delivered",
-		})
-		return err
+		return e.dispatchNATS(ctx, rule, eventType, payload)
 	default:
 		e.logger.Warn("engine: unsupported action type", zap.String("action_type", string(rule.ActionType)))
 		return nil
 	}
+}
+
+// dispatchNATS re-publishes the event payload to the rule's configured NATS
+// subject and records the outcome as an event_delivery. On publish failure the
+// delivery is marked failed with a retry schedule so the retry worker re-attempts
+// it, mirroring the webhook lifecycle.
+func (e *Engine) dispatchNATS(ctx context.Context, rule *db.EventRule, eventType db.EventType, payload []byte) error {
+	var cfg NATSActionConfig
+	if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
+		return fmt.Errorf("engine: parse nats config: %w", err)
+	}
+	if cfg.Subject == "" {
+		return fmt.Errorf("engine: nats subject empty for rule %s", rule.ID)
+	}
+
+	delivery, err := e.store.CreateEventDelivery(ctx, indexer.CreateEventDeliveryParams{
+		EventRuleID: rule.ID,
+		EventType:   eventType,
+		Payload:     payload,
+		Status:      "pending",
+	})
+	if err != nil {
+		return fmt.Errorf("engine: create delivery record: %w", err)
+	}
+
+	pubErr := e.publishNATS(cfg.Subject, payload)
+
+	status := "delivered"
+	var deliveredAt, nextRetryAt sql.NullTime
+	if pubErr != nil {
+		e.logger.Warn("engine: nats publish error",
+			zap.String("delivery_id", delivery.ID.String()),
+			zap.String("subject", cfg.Subject),
+			zap.Error(pubErr),
+		)
+		status = "failed"
+		nextRetryAt = sql.NullTime{Time: time.Now().Add(retryBackoffSchedule[0]), Valid: true}
+	} else {
+		deliveredAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+	}
+
+	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
+		ID:           delivery.ID,
+		Status:       status,
+		AttemptCount: 1,
+		NextRetryAt:  nextRetryAt,
+		DeliveredAt:  deliveredAt,
+	})
+}
+
+// publishNATS publishes payload to subject via the wired publisher, returning an
+// error if no publisher is configured (so the delivery is recorded as failed
+// rather than silently dropped).
+func (e *Engine) publishNATS(subject string, payload []byte) error {
+	if e.publisher == nil {
+		return fmt.Errorf("engine: no NATS publisher configured for nats_publish action")
+	}
+	return e.publisher.Publish(subject, payload)
 }
 
 func (e *Engine) dispatchWebhook(ctx context.Context, rule *db.EventRule, eventType db.EventType, payload []byte) error {
