@@ -271,8 +271,14 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 	var newStatus string
 	var deliveredAt sql.NullTime
 	var nextRetryAt sql.NullTime
+	// Default to carrying diagnostics forward (retryDelivery captures no fresh
+	// response code); refreshed with the latest error on failure, cleared on
+	// success so a delivered row does not keep a stale error.
+	respCode := d.ResponseCode
+	respBody := d.ResponseBody
 
 	if sendErr != nil {
+		respBody = sql.NullString{String: sendErr.Error(), Valid: true}
 		if int(newAttemptCount) >= maxRetryAttempts {
 			// Exceeded maximum retries — mark terminal so it drops out of the
 			// retry scan (a 'failed' row with NULL next_retry_at would loop).
@@ -291,6 +297,9 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 	} else {
 		newStatus = "delivered"
 		deliveredAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+		// Clear stale error diagnostics from prior failed attempts.
+		respCode = sql.NullInt32{}
+		respBody = sql.NullString{}
 	}
 
 	e.logger.Debug("engine: retry delivery complete",
@@ -299,13 +308,11 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 		zap.Int32("attempt", newAttemptCount),
 	)
 
-	// retryDelivery does not capture a fresh response code/body, so carry the
-	// existing diagnostics forward rather than NULLing the columns.
 	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
 		ID:           d.ID,
 		Status:       newStatus,
-		ResponseCode: d.ResponseCode,
-		ResponseBody: d.ResponseBody,
+		ResponseCode: respCode,
+		ResponseBody: respBody,
 		AttemptCount: newAttemptCount,
 		NextRetryAt:  nextRetryAt,
 		DeliveredAt:  deliveredAt,
@@ -390,6 +397,7 @@ func (e *Engine) dispatchNATS(ctx context.Context, rule *db.EventRule, eventType
 
 	status := "delivered"
 	var deliveredAt, nextRetryAt sql.NullTime
+	var respBody sql.NullString
 	if pubErr != nil {
 		e.logger.Warn("engine: nats publish error",
 			zap.String("delivery_id", delivery.ID.String()),
@@ -398,6 +406,9 @@ func (e *Engine) dispatchNATS(ctx context.Context, rule *db.EventRule, eventType
 		)
 		status = "failed"
 		nextRetryAt = sql.NullTime{Time: time.Now().UTC().Add(retryBackoffSchedule[0]), Valid: true}
+		// Persist why it failed (incl. the "no publisher configured" case) so
+		// operators can see it on the delivery record.
+		respBody = sql.NullString{String: pubErr.Error(), Valid: true}
 	} else {
 		deliveredAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
 	}
@@ -408,6 +419,7 @@ func (e *Engine) dispatchNATS(ctx context.Context, rule *db.EventRule, eventType
 	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
 		ID:           delivery.ID,
 		Status:       status,
+		ResponseBody: respBody,
 		AttemptCount: 0,
 		NextRetryAt:  nextRetryAt,
 		DeliveredAt:  deliveredAt,

@@ -2,6 +2,7 @@ package event_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -98,6 +99,8 @@ func TestDispatchNATS_PublishError_MarksFailedWithRetry(t *testing.T) {
 	assert.True(t, updated.NextRetryAt.Valid, "failed nats delivery must be scheduled for retry")
 	assert.Equal(t, int32(0), updated.AttemptCount,
 		"initial attempt leaves attempt_count 0; the retry worker increments it")
+	assert.Equal(t, "nats down", updated.ResponseBody.String,
+		"publish error must be persisted to response_body for operator visibility")
 }
 
 func TestDispatchNATS_NoPublisher_MarksFailed(t *testing.T) {
@@ -132,7 +135,11 @@ func TestRetryDelivery_NATSPublish_Republishes(t *testing.T) {
 		onUpdate: func(p indexer.UpdateEventDeliveryParams) { updated = p },
 		ruleByID: natsRule(`{"subject":"events.custom.retry"}`),
 		pendingDeliveries: []*db.EventDelivery{
-			{ID: uuid.New(), Payload: json.RawMessage(`{"file":"b.txt"}`), AttemptCount: 1},
+			{
+				ID: uuid.New(), Payload: json.RawMessage(`{"file":"b.txt"}`), AttemptCount: 1,
+				// Stale diagnostics from a prior failed attempt.
+				ResponseBody: sql.NullString{String: "prior error", Valid: true},
+			},
 		},
 	}
 	engine := newNATSEngine(t, store, pub)
@@ -141,4 +148,6 @@ func TestRetryDelivery_NATSPublish_Republishes(t *testing.T) {
 	require.Equal(t, 1, pub.calls, "retry must re-publish to NATS")
 	assert.Equal(t, "events.custom.retry", pub.subject)
 	assert.Equal(t, "delivered", updated.Status)
+	assert.False(t, updated.ResponseBody.Valid,
+		"a successful retry must clear stale error diagnostics")
 }
