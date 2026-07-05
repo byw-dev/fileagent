@@ -1423,7 +1423,9 @@ NATS 主题规划：
 
 - webhook：HTTP POST，超时 10 秒，2xx 视为成功；nats_publish：publisher 返回 nil 视为成功（`delivered`）。
 - 两种动作失败后共用指数退避重试：30s → 2min → 10min → 30min → 2h，最多 5 次；
-- Background Worker 每 30s 扫描 `next_retry_at <= now()` 的 `pending`/`failed` 记录执行重试。
+- Background Worker 每 30s 扫描 `next_retry_at <= now()` 的 `pending`/`failed` 记录执行重试；
+- 重试耗尽或动作类型不可投递（如历史遗留的 `kafka_publish` 投递）时置**终态 `dead`**，
+  从重试扫描中剔除——避免终态记录（`next_retry_at` 为空被视为"立即到期"）被每 30s 反复重投。
 
 ## 5.10 上传日志记录
 

@@ -199,6 +199,13 @@ var retryBackoffSchedule = []time.Duration{
 // maxRetryAttempts is the maximum number of retry attempts before giving up.
 const maxRetryAttempts = 5
 
+// deliveryStatusDead is the terminal status for a delivery that must never be
+// retried again (retries exhausted, or an unsupported action type). The retry
+// scan only selects 'pending'/'failed', so a 'dead' delivery drops out — without
+// it, a terminal row with a NULL next_retry_at is treated as "due now" and
+// re-processed (re-sent) every tick forever.
+const deliveryStatusDead = "dead"
+
 // ProcessRetries is the exported entry point for the retry worker logic.
 // It is called periodically by the retryWorker ticker, and may also be
 // invoked directly in tests.
@@ -248,8 +255,13 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 		}
 		sendErr = e.publishNATS(cfg.Subject, d.Payload)
 	default:
-		// Unknown/unsupported action — nothing to retry.
-		return nil
+		// Unknown/unsupported action — mark terminal so the retry scan stops
+		// re-selecting it every tick instead of leaving it eligible forever.
+		return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
+			ID:           d.ID,
+			Status:       deliveryStatusDead,
+			AttemptCount: d.AttemptCount,
+		})
 	}
 
 	var newStatus string
@@ -259,15 +271,16 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 
 	if sendErr != nil {
 		if int(newAttemptCount) >= maxRetryAttempts {
-			// Exceeded maximum retries — mark permanently failed.
-			newStatus = "failed"
+			// Exceeded maximum retries — mark terminal so it drops out of the
+			// retry scan (a 'failed' row with NULL next_retry_at would loop).
+			newStatus = deliveryStatusDead
 		} else {
 			newStatus = "failed"
 			idx := int(newAttemptCount) - 1
 			if idx >= len(retryBackoffSchedule) {
 				idx = len(retryBackoffSchedule) - 1
 			}
-			nextRetryAt = sql.NullTime{Time: time.Now().Add(retryBackoffSchedule[idx]), Valid: true}
+			nextRetryAt = sql.NullTime{Time: time.Now().UTC().Add(retryBackoffSchedule[idx]), Valid: true}
 		}
 	} else {
 		newStatus = "delivered"

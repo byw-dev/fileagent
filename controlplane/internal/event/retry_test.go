@@ -155,6 +155,32 @@ func TestProcessRetries_MaxRetries_NoNextRetry(t *testing.T) {
 
 	assert.False(t, capturedParams.NextRetryAt.Valid,
 		"NextRetryAt should not be set after max retries")
+	assert.Equal(t, "dead", capturedParams.Status,
+		"exhausted retries must be marked terminal so the scan stops re-selecting them")
+}
+
+func TestProcessRetries_UnknownActionType_MarkedTerminal(t *testing.T) {
+	logger := newTestLogger()
+	ruleID := uuid.New()
+	// kafka_publish has no implementation; a stale delivery for it must not be
+	// re-scanned every tick — it should be marked terminal ("dead") and drop out.
+	rule := &db.EventRule{ID: ruleID, ActionType: db.ActionTypeKafkaPublish, ActionConfig: []byte(`{}`)}
+	delivery := &db.EventDelivery{ID: uuid.New(), EventRuleID: ruleID, Payload: []byte(`{}`), Status: "failed"}
+
+	var captured indexer.UpdateEventDeliveryParams
+	updateCalled := false
+	store := &capturingEngineStore{
+		pendingDeliveries: []*db.EventDelivery{delivery},
+		ruleByID:          rule,
+		onUpdate:          func(p indexer.UpdateEventDeliveryParams) { captured = p; updateCalled = true },
+	}
+	engine := event.NewEngineWithStore(store, event.NewWebhookSender(&dummyDeliveryDB{}, logger), logger)
+
+	engine.ProcessRetries(context.Background())
+
+	require.True(t, updateCalled, "unknown action delivery must be updated, not left eligible")
+	assert.Equal(t, "dead", captured.Status)
+	assert.False(t, captured.NextRetryAt.Valid)
 }
 
 func TestProcessRetries_RuleNotFound_SkipsDelivery(t *testing.T) {
@@ -177,13 +203,16 @@ func TestProcessRetries_RuleNotFound_SkipsDelivery(t *testing.T) {
 	})
 }
 
-func TestProcessRetries_NonWebhookRule_IsSkipped(t *testing.T) {
+func TestProcessRetries_NatsRuleBadConfig_NoPanic(t *testing.T) {
 	logger := newTestLogger()
 
 	ruleID := uuid.New()
+	// nats_publish rule with an unparseable/empty action_config: the retry must
+	// surface an error and be skipped for this tick without panicking. (The
+	// happy nats retry path is covered in nats_publish_test.go.)
 	rule := &db.EventRule{
 		ID:         ruleID,
-		ActionType: db.ActionTypeNatsPublish, // non-webhook
+		ActionType: db.ActionTypeNatsPublish,
 	}
 	delivery := &db.EventDelivery{
 		ID:          uuid.New(),
