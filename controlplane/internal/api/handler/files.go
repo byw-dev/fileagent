@@ -62,14 +62,14 @@ type fileEntryResponse struct {
 
 func toFileEntryResponse(e *db.FileEntry) fileEntryResponse {
 	r := fileEntryResponse{
-		ID:        e.ID.String(),
-		OrgID:     e.OrgID.String(),
-		BucketID:  e.BucketID.String(),
+		ID:         e.ID.String(),
+		OrgID:      e.OrgID.String(),
+		BucketID:   e.BucketID.String(),
 		StorageKey: e.StoragePath,
-		Filename:  e.FileName,
-		Size:      e.SizeBytes,
-		Status:    strings.ToUpper(string(e.Status)),
-		CreatedAt: e.CreatedAt.UTC().Format(time.RFC3339),
+		Filename:   e.FileName,
+		Size:       e.SizeBytes,
+		Status:     strings.ToUpper(string(e.Status)),
+		CreatedAt:  e.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if e.AgentID.Valid {
 		r.AgentID = e.AgentID.UUID.String()
@@ -98,14 +98,17 @@ func (h *FilesHandler) List(c *gin.Context) {
 		middleware.NotImplemented(c)
 		return
 	}
+	// Reject mistyped/unsupported filters instead of silently ignoring them,
+	// which would return 200 with the filter having no effect (CC-5).
+	if !middleware.RejectUnknownQuery(c, "cursor", "limit", "agent_id", "bucket_id", "file_type_id", "status") {
+		return
+	}
 	orgID := orgIDFromClaims(c)
 	limit := parseLimitParam(c)
 
 	cursorCreatedAt, cursorID, err := decodeCursor(c.Query("cursor"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_CURSOR", "invalid cursor", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_CURSOR", "invalid cursor", nil)
 		return
 	}
 
@@ -149,9 +152,7 @@ func (h *FilesHandler) List(c *gin.Context) {
 	entries, err := h.db.ListFileEntries(c.Request.Context(), params)
 	if err != nil {
 		h.logger.Error("list file entries", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to list files", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list files", nil)
 		return
 	}
 
@@ -163,9 +164,7 @@ func (h *FilesHandler) List(c *gin.Context) {
 	total, err := h.db.CountFileEntries(c.Request.Context(), filter)
 	if err != nil {
 		h.logger.Error("count file entries", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to count files", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to count files", nil)
 		return
 	}
 
@@ -195,23 +194,17 @@ func (h *FilesHandler) Get(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid file id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid file id", nil)
 		return
 	}
 	entry, err := h.db.GetFileEntryByID(c.Request.Context(), id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": middleware.NewErrorBody("NOT_FOUND", "file not found", nil),
-			})
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "file not found", nil)
 			return
 		}
 		h.logger.Error("get file entry", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to get file", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get file", nil)
 		return
 	}
 	c.JSON(http.StatusOK, toFileEntryResponse(entry))
@@ -225,32 +218,24 @@ func (h *FilesHandler) DownloadURL(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid file id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid file id", nil)
 		return
 	}
 	entry, err := h.db.GetFileEntryByID(c.Request.Context(), id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": middleware.NewErrorBody("NOT_FOUND", "file not found", nil),
-			})
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "file not found", nil)
 			return
 		}
 		h.logger.Error("get file for download", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to get file", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get file", nil)
 		return
 	}
 
 	bucket, err := h.db.GetBucketByID(c.Request.Context(), entry.BucketID)
 	if err != nil {
 		h.logger.Error("get bucket for download", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to resolve bucket", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to resolve bucket", nil)
 		return
 	}
 
@@ -258,9 +243,7 @@ func (h *FilesHandler) DownloadURL(c *gin.Context) {
 	url, err := h.minio.PresignedGetObject(c.Request.Context(), bucket.Name, entry.StoragePath, presignTTL)
 	if err != nil {
 		h.logger.Error("presign url", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to generate download URL", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to generate download URL", nil)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"url": url, "expires_in": int(presignTTL.Seconds())})
@@ -280,9 +263,7 @@ func (h *FilesHandler) BatchDownloadURLs(c *gin.Context) {
 
 	var req batchDownloadRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
@@ -376,9 +357,7 @@ func (h *FileTypesHandler) List(c *gin.Context) {
 	types, err := h.db.ListFileTypes(c.Request.Context(), orgID)
 	if err != nil {
 		h.logger.Error("list file types", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to list file types", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list file types", nil)
 		return
 	}
 	resp := make([]fileTypeResponse, 0, len(types))
@@ -405,9 +384,7 @@ func (h *FileTypesHandler) Create(c *gin.Context) {
 
 	var req createFileTypeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
@@ -423,9 +400,7 @@ func (h *FileTypesHandler) Create(c *gin.Context) {
 	ft, err := h.db.CreateFileType(c.Request.Context(), orgID, req.Name, desc, createdBy)
 	if err != nil {
 		h.logger.Error("create file type", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to create file type", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create file type", nil)
 		return
 	}
 	c.JSON(http.StatusCreated, toFileTypeResponse(ft))
@@ -445,17 +420,13 @@ func (h *FileTypesHandler) Update(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid file type id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid file type id", nil)
 		return
 	}
 
 	var req updateFileTypeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
@@ -467,15 +438,11 @@ func (h *FileTypesHandler) Update(c *gin.Context) {
 	ft, err := h.db.UpdateFileType(c.Request.Context(), id, req.Name, desc)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": middleware.NewErrorBody("NOT_FOUND", "file type not found", nil),
-			})
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "file type not found", nil)
 			return
 		}
 		h.logger.Error("update file type", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to update file type", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update file type", nil)
 		return
 	}
 	c.JSON(http.StatusOK, toFileTypeResponse(ft))
@@ -489,16 +456,12 @@ func (h *FileTypesHandler) Delete(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid file type id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid file type id", nil)
 		return
 	}
 	if err := h.db.DeleteFileType(c.Request.Context(), id); err != nil {
 		h.logger.Error("delete file type", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to delete file type", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to delete file type", nil)
 		return
 	}
 	c.Status(http.StatusNoContent)

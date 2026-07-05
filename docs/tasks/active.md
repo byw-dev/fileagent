@@ -5,14 +5,14 @@
 
 ---
 
-## 当前任务：CC-6 — TTL 驱动的离线兜底扫描
+## 当前任务：CC-4 / CC-7（下一步）
 
 **所属冲刺**：core-completeness（核心模块补完备）
-**涉及模块**：controlplane（新增 `internal/worker` OfflineSweeper）
-**缺口**：Agent 在线状态只在 gRPC 流干净断开时置离线；CP 崩溃/重启、TCP 半开时 DB `agents.status`
-残留 online 且 `events.agent.offline` 永不发布。加后台扫描，把"DB=online 但 Redis 在线 key 已过期"的
-Agent 兜底置 offline + 补发离线事件（设计 §5.2）。
-**权威 backlog 与验收**：[`docs/tasks/core-completeness.md`](core-completeness.md) CC-6（Tier B）
+**上一项已收官**：**CC-5** ✅（错误响应补顶层 `request_id` + `GET /api/v1/files` 未知 query 参数
+返回 `400 INVALID_QUERY_PARAM`）——`middleware.RespondError` / `RejectUnknownQuery`，设计 §5.11 已更新，本 PR 提交中。
+**下一候选**：CC-4（API 限流，Redis `ratelimit:api:{user_id}`，设计 §5.1）或 CC-7（`kafka_publish` 死配置
+清理 + 把已可用的 `nats_publish` 放回 webui UI）。
+**权威 backlog 与验收**：[`docs/tasks/core-completeness.md`](core-completeness.md) Tier B（CC-4 / CC-7）
 
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
 > bucket policy 对本系统冗余（MinIO 默认私有，访问全走 STS/presigned IAM）。待有 staging workflow 再做。
@@ -28,8 +28,9 @@ Agent 兜底置 offline + 补发离线事件（设计 §5.2）。
 | CC-1 | CP + webui | `file_deleted` 事件死配置 | ✅ PR #47 / D-017 |
 | CC-2 | Agent | `queue_max_size` 未强制 | ✅ PR #48 |
 | CC-3 | CP | Bucket Policy + tmp-uploads Lifecycle | ⏸️ 已推后（低价值，见上） |
-| **CC-6** | CP | TTL 驱动离线兜底扫描 | ⬜ **进行中** |
-| CC-4 / CC-5 / CC-7 | CP | 限流 / request_id + 未知参数 / kafka_publish | ⬜ |
+| CC-6 | CP | TTL 驱动离线兜底扫描 | ✅ PR #51 |
+| **CC-5** | CP | 错误响应 `request_id` + 未知参数拒绝 | ✅ 本 PR |
+| CC-4 / CC-7 | CP | 限流 / kafka_publish 清理 | ⬜ **下一步** |
 | CC-8~10 | webui | Agent 重命名 / 规则原地编辑 / 隐性契约文档 | ⬜（视使用价值） |
 
 前序已收官：**止血冲刺（P0+P1）** G-1…G-5（PR #39–#45，D-012…D-016），

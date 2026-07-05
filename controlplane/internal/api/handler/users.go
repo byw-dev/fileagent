@@ -73,9 +73,7 @@ func (h *UsersHandler) List(c *gin.Context) {
 	users, err := h.db.ListUsers(c.Request.Context(), orgID)
 	if err != nil {
 		h.logger.Error("list users", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to list users", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list users", nil)
 		return
 	}
 	resp := make([]userResponse, 0, len(users))
@@ -103,9 +101,7 @@ func (h *UsersHandler) Create(c *gin.Context) {
 
 	var req createUserRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
@@ -113,18 +109,14 @@ func (h *UsersHandler) Create(c *gin.Context) {
 	switch role {
 	case db.UserRoleSuperAdmin, db.UserRoleOrgAdmin, db.UserRoleOrgViewer:
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ROLE", "invalid role: "+req.Role, nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ROLE", "invalid role: "+req.Role, nil)
 		return
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		h.logger.Error("bcrypt hash", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to hash password", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to hash password", nil)
 		return
 	}
 
@@ -141,9 +133,7 @@ func (h *UsersHandler) Create(c *gin.Context) {
 	user, err := h.db.CreateUser(c.Request.Context(), params)
 	if err != nil {
 		h.logger.Error("create user", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to create user", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to create user", nil)
 		return
 	}
 	c.JSON(http.StatusCreated, toUserResponse(user))
@@ -164,17 +154,13 @@ func (h *UsersHandler) Update(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid user id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid user id", nil)
 		return
 	}
 
 	var req updateUserRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
@@ -182,9 +168,7 @@ func (h *UsersHandler) Update(c *gin.Context) {
 	switch role {
 	case db.UserRoleSuperAdmin, db.UserRoleOrgAdmin, db.UserRoleOrgViewer:
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ROLE", "invalid role: "+req.Role, nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ROLE", "invalid role: "+req.Role, nil)
 		return
 	}
 
@@ -196,15 +180,11 @@ func (h *UsersHandler) Update(c *gin.Context) {
 	user, err := h.db.UpdateUser(c.Request.Context(), id, req.Username, email, role)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": middleware.NewErrorBody("NOT_FOUND", "user not found", nil),
-			})
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "user not found", nil)
 			return
 		}
 		h.logger.Error("update user", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to update user", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update user", nil)
 		return
 	}
 	c.JSON(http.StatusOK, toUserResponse(user))
@@ -218,23 +198,17 @@ func (h *UsersHandler) Delete(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid user id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid user id", nil)
 		return
 	}
 
 	if err := h.db.DeleteUser(c.Request.Context(), id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, gin.H{
-				"error": middleware.NewErrorBody("NOT_FOUND", "user not found", nil),
-			})
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "user not found", nil)
 			return
 		}
 		h.logger.Error("delete user", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to delete user", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to delete user", nil)
 		return
 	}
 	c.Status(http.StatusNoContent)
@@ -254,43 +228,33 @@ func (h *UsersHandler) UpdatePassword(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_ID", "invalid user id", nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid user id", nil)
 		return
 	}
 
 	var req updatePasswordRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": middleware.NewErrorBody("INVALID_REQUEST", err.Error(), nil),
-		})
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
 
 	claims := middleware.GetClaims(c)
 	callerID := callerIDFromClaims(c)
 	if claims != nil && db.UserRole(claims.Role) != db.UserRoleSuperAdmin && callerID != id {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": middleware.NewErrorBody("FORBIDDEN", "cannot change another user's password", nil),
-		})
+		middleware.RespondError(c, http.StatusForbidden, "FORBIDDEN", "cannot change another user's password", nil)
 		return
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
 		h.logger.Error("bcrypt hash", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to hash password", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to hash password", nil)
 		return
 	}
 
 	if err := h.db.UpdateUserPassword(c.Request.Context(), id, string(hash)); err != nil {
 		h.logger.Error("update password", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": middleware.NewErrorBody("INTERNAL_ERROR", "failed to update password", nil),
-		})
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update password", nil)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "password updated"})

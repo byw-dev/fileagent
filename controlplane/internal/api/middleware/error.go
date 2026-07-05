@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"net/http"
+	"sort"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -40,19 +42,61 @@ type ErrorDetail struct {
 	Detail  interface{} `json:"detail,omitempty"`
 }
 
-// AbortWithError is a helper that terminates the Gin handler chain and writes
-// a standard error response. Use this instead of c.AbortWithStatusJSON so
-// that error format stays consistent across all handlers.
+// AbortWithError terminates the Gin handler chain and writes a standard error
+// response. Use this in middleware (which must stop downstream handlers) so the
+// error format — including the top-level request_id — stays consistent.
 func AbortWithError(c *gin.Context, httpStatus int, code, message string, detail interface{}) {
+	c.AbortWithStatusJSON(httpStatus, newErrorResponse(c, code, message, detail))
+}
+
+// RespondError writes a standard error response without aborting the handler
+// chain. Use this inside handlers (which return immediately after) so every
+// error body carries the same envelope, including the top-level request_id
+// (system-design.md §5.11).
+func RespondError(c *gin.Context, httpStatus int, code, message string, detail interface{}) {
+	c.JSON(httpStatus, newErrorResponse(c, code, message, detail))
+}
+
+// newErrorResponse builds the standard error envelope, pulling the request_id
+// injected by the RequestID middleware from the Gin context.
+func newErrorResponse(c *gin.Context, code, message string, detail interface{}) ErrorResponse {
 	reqID, _ := c.Get("request_id")
-	c.AbortWithStatusJSON(httpStatus, ErrorResponse{
+	return ErrorResponse{
 		Error: ErrorDetail{
 			Code:    code,
 			Message: message,
 			Detail:  detail,
 		},
 		RequestID: asString(reqID),
-	})
+	}
+}
+
+// RejectUnknownQuery inspects the request's query string and rejects any key
+// not present in the allowed set. When an unknown key is found it writes a 400
+// error response listing the offending keys and returns false; the caller must
+// stop processing. It returns true when every query key is allowed.
+//
+// This turns silent no-ops (a mistyped filter that used to return 200 with the
+// filter ignored) into an explicit client error (06 契约瑕疵 / CC-5).
+func RejectUnknownQuery(c *gin.Context, allowed ...string) bool {
+	set := make(map[string]struct{}, len(allowed))
+	for _, k := range allowed {
+		set[k] = struct{}{}
+	}
+	var unknown []string
+	for k := range c.Request.URL.Query() {
+		if _, ok := set[k]; !ok {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) == 0 {
+		return true
+	}
+	sort.Strings(unknown)
+	RespondError(c, http.StatusBadRequest, "INVALID_QUERY_PARAM",
+		"unknown query parameter(s): "+strings.Join(unknown, ", "),
+		gin.H{"unknown_params": unknown})
+	return false
 }
 
 // NotImplemented is a convenience handler that returns 501 with a standard

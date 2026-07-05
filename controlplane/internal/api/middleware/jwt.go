@@ -24,33 +24,25 @@ func JWT(jwtSvc auth.Service, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		raw := c.GetHeader("Authorization")
 		if raw == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": errorBody("MISSING_TOKEN", "Authorization header is required", nil),
-			})
+			AbortWithError(c, http.StatusUnauthorized, "MISSING_TOKEN", "Authorization header is required", nil)
 			return
 		}
 
 		if !strings.HasPrefix(raw, "Bearer ") {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": errorBody("INVALID_TOKEN_SCHEME", "Authorization header must use Bearer scheme", nil),
-			})
+			AbortWithError(c, http.StatusUnauthorized, "INVALID_TOKEN_SCHEME", "Authorization header must use Bearer scheme", nil)
 			return
 		}
 
 		tokenStr := strings.TrimPrefix(raw, "Bearer ")
 		if tokenStr == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": errorBody("EMPTY_TOKEN", "Token is empty", nil),
-			})
+			AbortWithError(c, http.StatusUnauthorized, "EMPTY_TOKEN", "Token is empty", nil)
 			return
 		}
 
 		claims, err := jwtSvc.ValidateToken(tokenStr)
 		if err != nil {
 			logger.Debug("jwt middleware: invalid token", zap.Error(err))
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": errorBody("INVALID_TOKEN", "Token is invalid or expired", nil),
-			})
+			AbortWithError(c, http.StatusUnauthorized, "INVALID_TOKEN", "Token is invalid or expired", nil)
 			return
 		}
 
@@ -61,9 +53,7 @@ func JWT(jwtSvc auth.Service, logger *zap.Logger) gin.HandlerFunc {
 				logger.Warn("jwt middleware: blacklist check error", zap.Error(err))
 				// Fail open on transient Redis errors to avoid locking users out.
 			} else if revoked {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-					"error": errorBody("TOKEN_REVOKED", "Token has been revoked", nil),
-				})
+				AbortWithError(c, http.StatusUnauthorized, "TOKEN_REVOKED", "Token has been revoked", nil)
 				return
 			}
 		}
@@ -94,31 +84,9 @@ func RequireRole(roles ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		claims := GetClaims(c)
 		if claims == nil || !allowed[claims.Role] {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-				"error": errorBody("FORBIDDEN", "Insufficient role", nil),
-			})
+			AbortWithError(c, http.StatusForbidden, "FORBIDDEN", "Insufficient role", nil)
 			return
 		}
 		c.Next()
 	}
-}
-
-// errorBody builds the "error" sub-object used in all API error responses
-// (system-design.md §5.11).
-func errorBody(code, message string, detail interface{}) map[string]interface{} {
-	body := map[string]interface{}{
-		"code":    code,
-		"message": message,
-	}
-	if detail != nil {
-		body["detail"] = detail
-	}
-	return body
-}
-
-// NewErrorBody builds the "error" sub-object used in all API error responses
-// (system-design.md §5.11). It is exported so that handlers in sibling
-// packages can produce consistent error responses.
-func NewErrorBody(code, message string, detail interface{}) map[string]interface{} {
-	return errorBody(code, message, detail)
 }
