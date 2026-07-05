@@ -39,6 +39,13 @@ SET status = $2,
 WHERE id = $1
 RETURNING *;
 
+-- name: UpdateAgentName :one
+UPDATE agents
+SET name = $2,
+    updated_at = NOW()
+WHERE id = $1
+RETURNING *;
+
 -- name: MarkAgentOfflineIfOnline :execrows
 -- Transition an agent to offline only when it is currently online. Returns the
 -- number of rows affected (1 = actually transitioned, 0 = already offline or

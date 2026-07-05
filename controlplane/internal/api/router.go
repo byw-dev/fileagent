@@ -115,6 +115,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	{
 		agents.GET("", agentsH.List)
 		agents.GET("/:id", agentsH.Get)
+		agents.PATCH("/:id", superAdmin, agentsH.Rename)
 		agents.POST("/:id/approve", superAdmin, agentsH.Approve)
 		agents.POST("/:id/revoke", superAdmin, agentsH.Revoke)
 		agents.POST("/:id/list-dir", agentsH.ListDir)
