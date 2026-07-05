@@ -380,12 +380,21 @@ func (e *Engine) dispatch(ctx context.Context, rule *db.EventRule, eventType db.
 // delivery is marked failed with a retry schedule so the retry worker re-attempts
 // it, mirroring the webhook lifecycle.
 func (e *Engine) dispatchNATS(ctx context.Context, rule *db.EventRule, eventType db.EventType, payload []byte) error {
+	// A misconfigured rule (unparseable config / empty subject) can never
+	// deliver. It is already rejected at rule create/update (INVALID_ACTION_*),
+	// so this only guards legacy/hand-edited rows: skip as a no-op with a single
+	// Warn rather than returning an error that HandleEvent logs at Error level
+	// for every matching event.
 	var cfg NATSActionConfig
 	if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
-		return fmt.Errorf("engine: parse nats config: %w", err)
+		e.logger.Warn("engine: skipping nats_publish rule with unparseable config",
+			zap.String("rule_id", rule.ID.String()), zap.Error(err))
+		return nil
 	}
 	if cfg.Subject == "" {
-		return fmt.Errorf("engine: nats subject empty for rule %s", rule.ID)
+		e.logger.Warn("engine: skipping nats_publish rule with empty subject",
+			zap.String("rule_id", rule.ID.String()))
+		return nil
 	}
 
 	delivery, err := e.store.CreateEventDelivery(ctx, inFlightDeliveryParams(rule.ID, eventType, payload))
@@ -453,12 +462,19 @@ func inFlightDeliveryParams(ruleID uuid.UUID, eventType db.EventType, payload []
 }
 
 func (e *Engine) dispatchWebhook(ctx context.Context, rule *db.EventRule, eventType db.EventType, payload []byte) error {
+	// See dispatchNATS: a misconfigured rule is API-rejected at create/update, so
+	// skip legacy/hand-edited bad rows as a no-op with a single Warn instead of a
+	// per-event Error.
 	var cfg WebhookActionConfig
 	if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
-		return fmt.Errorf("engine: parse webhook config: %w", err)
+		e.logger.Warn("engine: skipping webhook rule with unparseable config",
+			zap.String("rule_id", rule.ID.String()), zap.Error(err))
+		return nil
 	}
 	if cfg.URL == "" {
-		return fmt.Errorf("engine: webhook url empty for rule %s", rule.ID)
+		e.logger.Warn("engine: skipping webhook rule with empty url",
+			zap.String("rule_id", rule.ID.String()))
+		return nil
 	}
 
 	delivery, err := e.store.CreateEventDelivery(ctx, inFlightDeliveryParams(rule.ID, eventType, payload))
