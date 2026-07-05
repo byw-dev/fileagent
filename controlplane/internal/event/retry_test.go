@@ -2,6 +2,7 @@ package event_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -165,7 +166,11 @@ func TestProcessRetries_UnknownActionType_MarkedTerminal(t *testing.T) {
 	// kafka_publish has no implementation; a stale delivery for it must not be
 	// re-scanned every tick — it should be marked terminal ("dead") and drop out.
 	rule := &db.EventRule{ID: ruleID, ActionType: db.ActionTypeKafkaPublish, ActionConfig: []byte(`{}`)}
-	delivery := &db.EventDelivery{ID: uuid.New(), EventRuleID: ruleID, Payload: []byte(`{}`), Status: "failed"}
+	delivery := &db.EventDelivery{
+		ID: uuid.New(), EventRuleID: ruleID, Payload: []byte(`{}`), Status: "failed",
+		ResponseCode: sql.NullInt32{Int32: 500, Valid: true},
+		ResponseBody: sql.NullString{String: "boom", Valid: true},
+	}
 
 	var captured indexer.UpdateEventDeliveryParams
 	updateCalled := false
@@ -179,6 +184,33 @@ func TestProcessRetries_UnknownActionType_MarkedTerminal(t *testing.T) {
 	engine.ProcessRetries(context.Background())
 
 	require.True(t, updateCalled, "unknown action delivery must be updated, not left eligible")
+	assert.Equal(t, "dead", captured.Status)
+	assert.False(t, captured.NextRetryAt.Valid)
+	// Diagnostics must be preserved, not cleared, on the terminal transition.
+	assert.Equal(t, int32(500), captured.ResponseCode.Int32)
+	assert.Equal(t, "boom", captured.ResponseBody.String)
+}
+
+func TestProcessRetries_BadNatsConfig_MarkedTerminal(t *testing.T) {
+	logger := newTestLogger()
+	ruleID := uuid.New()
+	// nats_publish rule with an empty subject can never be delivered → terminal.
+	rule := &db.EventRule{ID: ruleID, ActionType: db.ActionTypeNatsPublish, ActionConfig: []byte(`{"subject":""}`)}
+	delivery := &db.EventDelivery{ID: uuid.New(), EventRuleID: ruleID, Payload: []byte(`{}`), Status: "failed"}
+
+	var captured indexer.UpdateEventDeliveryParams
+	updateCalled := false
+	store := &capturingEngineStore{
+		pendingDeliveries: []*db.EventDelivery{delivery},
+		ruleByID:          rule,
+		onUpdate:          func(p indexer.UpdateEventDeliveryParams) { captured = p; updateCalled = true },
+	}
+	engine := event.NewEngineWithStore(store, event.NewWebhookSender(&dummyDeliveryDB{}, logger), logger).
+		WithPublisher(&fakeNATSPublisher{})
+
+	engine.ProcessRetries(context.Background())
+
+	require.True(t, updateCalled, "bad-config delivery must be marked dead, not left eligible")
 	assert.Equal(t, "dead", captured.Status)
 	assert.False(t, captured.NextRetryAt.Valid)
 }

@@ -242,30 +242,33 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 	case db.ActionTypeWebhook:
 		var cfg WebhookActionConfig
 		if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
-			return fmt.Errorf("retry: parse webhook config: %w", err)
+			// Malformed config can never succeed on retry — mark terminal so the
+			// scan stops re-selecting (and re-logging) it every tick forever.
+			e.logger.Warn("retry: parse webhook config, marking dead",
+				zap.String("delivery_id", d.ID.String()), zap.Error(err))
+			return e.markDeliveryDead(ctx, d)
 		}
 		sendErr = postWebhook(ctx, cfg.URL, d.Payload)
 	case db.ActionTypeNatsPublish:
 		var cfg NATSActionConfig
 		if err := json.Unmarshal(rule.ActionConfig, &cfg); err != nil {
-			return fmt.Errorf("retry: parse nats config: %w", err)
+			e.logger.Warn("retry: parse nats config, marking dead",
+				zap.String("delivery_id", d.ID.String()), zap.Error(err))
+			return e.markDeliveryDead(ctx, d)
 		}
 		if cfg.Subject == "" {
-			return fmt.Errorf("retry: nats subject empty for rule %s", rule.ID)
+			e.logger.Warn("retry: nats subject empty, marking dead",
+				zap.String("delivery_id", d.ID.String()), zap.String("rule_id", rule.ID.String()))
+			return e.markDeliveryDead(ctx, d)
 		}
 		sendErr = e.publishNATS(cfg.Subject, d.Payload)
 	default:
-		// Unknown/unsupported action — mark terminal so the retry scan stops
-		// re-selecting it every tick instead of leaving it eligible forever.
-		return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
-			ID:           d.ID,
-			Status:       deliveryStatusDead,
-			AttemptCount: d.AttemptCount,
-		})
+		// Unknown/unsupported action can never be delivered — mark terminal so the
+		// retry scan stops re-selecting it every tick instead of looping forever.
+		return e.markDeliveryDead(ctx, d)
 	}
 
 	var newStatus string
-	var respCode sql.NullInt32
 	var deliveredAt sql.NullTime
 	var nextRetryAt sql.NullTime
 
@@ -296,13 +299,31 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 		zap.Int32("attempt", newAttemptCount),
 	)
 
+	// retryDelivery does not capture a fresh response code/body, so carry the
+	// existing diagnostics forward rather than NULLing the columns.
 	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
 		ID:           d.ID,
 		Status:       newStatus,
-		ResponseCode: respCode,
+		ResponseCode: d.ResponseCode,
+		ResponseBody: d.ResponseBody,
 		AttemptCount: newAttemptCount,
 		NextRetryAt:  nextRetryAt,
 		DeliveredAt:  deliveredAt,
+	})
+}
+
+// markDeliveryDead transitions a delivery to the terminal 'dead' status for
+// failures that can never succeed on retry (unsupported action type,
+// unrecoverable config/validation errors). It preserves the existing
+// response_code/response_body diagnostics and attempt_count, and leaves
+// next_retry_at NULL so the row drops out of the retry scan.
+func (e *Engine) markDeliveryDead(ctx context.Context, d *db.EventDelivery) error {
+	return e.store.UpdateDelivery(ctx, indexer.UpdateEventDeliveryParams{
+		ID:           d.ID,
+		Status:       deliveryStatusDead,
+		ResponseCode: d.ResponseCode,
+		ResponseBody: d.ResponseBody,
+		AttemptCount: d.AttemptCount,
 	})
 }
 
