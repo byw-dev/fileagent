@@ -276,7 +276,10 @@ func (e *Engine) retryDelivery(ctx context.Context, d *db.EventDelivery) error {
 			newStatus = deliveryStatusDead
 		} else {
 			newStatus = "failed"
-			idx := int(newAttemptCount) - 1
+			// The initial failure already used schedule[0] (attempt_count stays 0),
+			// so the delay before the *next* retry is indexed by newAttemptCount,
+			// giving 30s → 2m → 10m → 30m → 2h across the retry sequence.
+			idx := int(newAttemptCount)
 			if idx >= len(retryBackoffSchedule) {
 				idx = len(retryBackoffSchedule) - 1
 			}

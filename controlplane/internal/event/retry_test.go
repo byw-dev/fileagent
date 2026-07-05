@@ -261,14 +261,17 @@ func TestProcessRetries_BadWebhookConfig_Error(t *testing.T) {
 func TestRetryBackoffSchedule_IncreasesOverAttempts(t *testing.T) {
 	// Each attempt's next_retry must be later than the previous.
 	// We verify by checking delivery updates at attempt counts 1–4.
+	// The initial failure already consumed schedule[0] (30s) with attempt_count=0,
+	// so a retry with incoming attempt_count=N schedules the next one at
+	// schedule[N+1], giving 2min → 10min → 30min → 2h.
 	delays := []struct {
-		attemptCount int32 // current attempt count
+		attemptCount int32 // retries already completed
 		minDelay     time.Duration
 	}{
-		{0, 25 * time.Second},   // next = attempt 1 → 30s
-		{1, 100 * time.Second},  // next = attempt 2 → 2min
-		{2, 500 * time.Second},  // next = attempt 3 → 10min
-		{3, 1500 * time.Second}, // next = attempt 4 → 30min
+		{0, 100 * time.Second},  // next retry → 2min
+		{1, 500 * time.Second},  // next retry → 10min
+		{2, 1500 * time.Second}, // next retry → 30min
+		{3, 6000 * time.Second}, // next retry → 2h
 	}
 
 	for _, tc := range delays {
