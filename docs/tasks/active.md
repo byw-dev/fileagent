@@ -5,15 +5,15 @@
 
 ---
 
-## 当前任务：CC-10（隐性契约文档，视价值）或 optional proto→buf
+## 当前任务：core-completeness 冲刺收官（仅剩 optional proto→buf）
 
 **所属冲刺**：core-completeness（核心模块补完备）
-**上一项已收官**：**CC-8** ✅ Agent 重命名（本 PR，D-021）——`PATCH /api/v1/agents/:id`（super_admin）+
-sqlc `UpdateAgentName` + 路径安全名称校验（白名单正则，因 `{agent_name}` 入模板）；webui 详情页铅笔 →
-重命名 Modal。handler 7 测 + webui 3 测；后端 curl + 浏览器 live-e2e 全过。**提交中。**
-**Tier A/B/C 主线基本收官**：CC-1/2/4/5/6/7/8/9 全部完成（CC-3 推后）。
-**剩余候选**：CC-10（隐性契约文档，如 `mode` 大小写、status 枚举映射——CC-9/CC-8 期间已多次踩到）；
-或 optional proto→buf 复现性 follow-up。均视真实价值人工决定。
+**上一项已收官**：**CC-10** ✅ 隐性契约文档（本 PR）——新建 [`docs/design/contracts.md`](../design/contracts.md)
+汇总 V-1…V-4（status/mode/append_mode 枚举大小写映射、列表三种信封、trollsift 变量+LDML 符号表、
+错误响应格式+错误码表），每条指向权威代码 `file:line`；CLAUDE.md 契约块 + system-design §5.11 加指针。
+纯文档、未改业务代码。
+**Tier A/B/C 主线全部收官**：CC-1/2/4/5/6/7/8/9/10 完成（CC-3 推后）。
+**剩余候选**：仅 optional proto→buf 复现性 follow-up（视价值人工决定）。核心补完备冲刺至此收官。
 **权威 backlog**：`docs/tasks/backlog.md` + [`core-completeness.md`](core-completeness.md)。
 
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
@@ -33,8 +33,10 @@ sqlc `UpdateAgentName` + 路径安全名称校验（白名单正则，因 `{agen
 | CC-6 | CP | TTL 驱动离线兜底扫描 | ✅ PR #51 |
 | CC-5 | CP | 错误响应 `request_id` + 未知参数拒绝 | ✅ PR #53 |
 | CC-4 | CP | API 限流（固定窗口，per-user） | ✅ PR #54 |
-| **CC-7** | CP + webui | nats_publish 实现 + kafka_publish 拒绝 | ✅ 本 PR |
-| CC-8~10 | webui | Agent 重命名 / 规则原地编辑 / 隐性契约文档 | ⬜（视使用价值） |
+| **CC-7** | CP + webui | nats_publish 实现 + kafka_publish 拒绝 | ✅ PR #55 |
+| CC-8 | CP + webui | Agent 重命名 | ✅ PR #58 / D-021 |
+| CC-9 | CP + webui | 采集规则原地编辑 | ✅ PR #56–#57 / D-020 |
+| CC-10 | docs | 隐性契约文档（`docs/design/contracts.md`） | ✅ 本 PR |
 
 前序已收官：**止血冲刺（P0+P1）** G-1…G-5（PR #39–#45，D-012…D-016），
 回顾见 [`docs/reports/design-gap-analysis/07-summary.md`](../reports/design-gap-analysis/07-summary.md) §五。

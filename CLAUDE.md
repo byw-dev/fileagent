@@ -143,6 +143,9 @@ fileagent/                        # Monorepo 根目录
 | REST 接口路径 | controlplane + 所有客户端 | 资源类接口统一在 `/api/v1/...`；认证接口统一在 `/api/auth/*`，不得混写 |
 | 文件查询分页 | controlplane + SDK | cursor-based pagination，不得改为 offset-based |
 
+> **隐性契约速查**：状态枚举大小写映射、列表信封形状、trollsift 模板变量、错误响应格式等
+> 跨模块口头约定，已成文于 [`docs/design/contracts.md`](docs/design/contracts.md)（参考索引，权威仍是代码）。
+
 ---
 
 ## 关键实现模式
