@@ -74,6 +74,29 @@
 
 ---
 
+## Follow-up：生产 MinIO 暴露 — 网关反代 + internal/public endpoint 拆分
+
+**来源**：PR #61（T4-3）review。**背景**：当前单一 `MINIO_ENDPOINT` 同时承担 CP↔MinIO 与"交给
+agent/浏览器的客户端 URL"两种角色；all-in-one PoC 只能填一个对内外都可达的地址，导致 CP↔MinIO 绕宿主
+hairpin，且 MinIO 直发 host（非生产做法）。
+
+**目标**：生产形态——MinIO 经 Caddy 反代暴露（TLS，不直发 host），CP 走内网、客户端走网关 URL。
+
+**端点角色**：STS AssumeRole 调用（`internal/storage/sts.go:47`）= internal；STS 返回给 agent 的
+`Endpoint`（`sts.go:76`）= public；presign host（`cmd/server/main.go:202` client → `handler/files.go`，
+本地签名不发网络）= public；建桶 admin（`minioBucketMaker` `main.go:58`）= internal。
+
+**做法**：
+- config 加 `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_USE_SSL`，**缺省回落 = 内网值**（向后兼容）。
+- `sts.go` 加流式 `WithPublicEndpoint(endpoint, useSSL)`（零改现有 5 处 `NewSTSManager` 测试调用点）；
+  AssumeRole 用 internal、返回 payload 用 public。
+- `main.go` 另建 public presign client（本地签名，不发网络，无 hairpin）；内网 client 留给 admin。
+- `deploy/caddy/Caddyfile` 加 `minio.<domain>` 反代站点（TLS）→ `minio:9000`；prod compose 去掉 MinIO
+  host 直发，`MINIO_ENDPOINT=minio:9000`（内网）+ `MINIO_PUBLIC_ENDPOINT=<caddy minio url>`。
+- 测试：sts 单测/集成断言 public 值透出；config 回落单测。
+
+---
+
 ## 已知技术债（低优先级，Phase 4 可处理）
 
 | 描述 | 来源 | 优先级 |

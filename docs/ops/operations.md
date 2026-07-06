@@ -108,6 +108,8 @@ K8s livenessProbe / LB 心跳。**Readiness**（依赖是否 OK）通过实际�
 | Agent 一直不采集 | 处于 PENDING，未在 Web UI 审批 |
 | 下载文件名变成哈希/UUID | 浏览器对跨域 `a.download` 忽略；presign 需带 `response-content-disposition`（已知项） |
 | Agent 显示离线但进程在跑 | 心跳/Redis TTL；CP 有 TTL 驱动的离线兜底扫描（CC-6） |
+| prod compose 里 MinIO 永不 healthy | healthcheck 用镜像内 `mc ready local`；**新版 `minio/minio` 已不再随镜像带 `mc`**（移到 `minio/mc`）。compose 因此 pin 了内置 mc 的版本；若升级镜像，改用 `minio/mc` sidecar 或 mc-free 健康检查（如探 `/minio/health/live`） |
+| 浏览器/agent 无法下载或上传 | presign/STS 里的 MinIO host 不可达：compose 的 `MINIO_PUBLIC_ENDPOINT` 须为对客户端可达的地址（非内网 `minio:9000`）；生产应经网关暴露 MinIO（见部署指南 follow-up） |
 
 ---
 
