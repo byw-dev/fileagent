@@ -28,8 +28,11 @@ Restart=always
 RestartSec=10
 
 # SQLite queue, fingerprint and encrypted token live here (data_dir in the
-# config). StateDirectory creates /var/lib/fileagent owned by the service user.
-StateDirectory=fileagent
+# config). A dedicated StateDirectory (/var/lib/fileagent-agent) avoids clashing
+# with the Control Plane unit's /var/lib/fileagent when both run on one host —
+# they use different users (root vs fileagent), so sharing the directory would
+# cause ownership churn. Point the agent config's data_dir here.
+StateDirectory=fileagent-agent
 
 # The agent logs to stdout/stderr; journald captures it (the config's log.output
 # / rotation fields are not yet wired — rely on journald rotation).

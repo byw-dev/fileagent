@@ -198,8 +198,8 @@ docker compose -f docker-compose.dev.yml ps
 ### 2. 初始化数据库
 
 > 说明：这一步是**可选**的。`controlplane` 启动时会自动执行数据库迁移（`db.Migrate`）。
-> 仅当你希望手动提前迁移，或单独排查迁移问题时，才需要执行下面命令。
-> 若依赖自动迁移，请确保运行环境能访问 `MIGRATIONS_PATH` 指向的 SQL 脚本目录（默认 `./migrations`）。
+> 迁移文件已**嵌入二进制**（`//go:embed`，见 D-023），无需 `MIGRATIONS_PATH`、也无需随二进制分发
+> `migrations/` 目录。仅当你希望手动提前迁移，或单独排查迁移问题时，才需要用下面的 golang-migrate CLI。
 
 ```bash
 export DATABASE_URL="postgres://fileagent:fileagent@localhost:5432/fileagent?sslmode=disable"

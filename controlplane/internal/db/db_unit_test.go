@@ -101,11 +101,13 @@ func TestOpen_InvalidDSN_ReturnsError(t *testing.T) {
 
 func TestMigrate_EmptySource_ReturnsError(t *testing.T) {
 	logger := zap.NewNop()
-	// An empty source FS (no *.sql files) causes iofs.New to fail before any DB
-	// connection is attempted, so this stays a pure unit test.
+	// An empty source FS (no *.sql files) is rejected by Migrate's source
+	// preflight (source.First) before Postgres is dialed, so this stays a pure
+	// unit test — the unreachable DSN is never contacted.
 	err := Migrate("postgres://user:pass@127.0.0.1:19999/nonexistent?sslmode=disable",
 		fstest.MapFS{}, logger)
 	require.Error(t, err)
+	require.Contains(t, err.Error(), "no migrations found")
 }
 
 // ── DB.Ping ───────────────────────────────────────────────────────────────────

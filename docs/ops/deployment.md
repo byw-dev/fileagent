@@ -62,6 +62,10 @@ WEBHOOK_AUTH_TOKEN=<同 INTERNAL_WEBHOOK_SECRET> \
 bash deploy/scripts/init-minio.sh
 ```
 
+> ⚠️ 注意变量同名但格式不同：`init-minio.sh` 的 `MINIO_ENDPOINT` 是 **`mc` 用的完整 URL**（含
+> `http://`/`https://` scheme），而 Control Plane 的同名配置 `MINIO_ENDPOINT` 是 **`host:port`**（无 scheme，
+> 由 `MINIO_USE_SSL` 决定协议）。别把两者的取值互相照搬。
+
 > 需要本机有 `mc`（MinIO Client）。或用容器执行：
 > `docker run --rm --network <compose 网络> -v $PWD/deploy/scripts:/s minio/mc sh /s/init-minio.sh`。
 
