@@ -2,7 +2,7 @@
 #
 # Install:
 #   sudo install -D -m 0755 bin/agent /opt/fileagent/agent
-#   sudo install -D -m 0640 deploy/config/agent.toml.example /etc/fileagent/agent.toml
+#   sudo install -D -m 0640 agent/config.toml.example /etc/fileagent/agent.toml
 #        # then edit server.endpoint and paths
 #   sudo cp deploy/systemd/fileagent-agent.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now fileagent-agent

@@ -893,7 +893,7 @@ Makefile（`bundle` 目标）、构建/分发流程
   `fileagent-agent.service` 落成 §10.3（`StateDirectory` 承载 bootstrap 凭据/agent 队列；因迁移已嵌入，
   无需 `WorkingDirectory` 指向 migrations）。
 - **Windows agent**：`deploy/windows/install-agent.ps1`（NSSM 封装 `agent.exe`，捕获 stdout 到日志文件）+
-  `deploy/config/agent.windows.toml.example`。Makefile 新增 best-effort `build-agent-windows`
+  `agent/config.windows.toml.example`。Makefile 新增 best-effort `build-agent-windows`
   （CGO/mingw；权威产物仍由 CI `build-agent.yml` 出）。
 
 ### 备选方案（被否决）

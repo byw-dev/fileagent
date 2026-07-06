@@ -56,7 +56,7 @@ $ConfigPath = Join-Path $InstallDir 'agent.toml'
 Copy-Item -Path $AgentExe -Destination $TargetExe -Force
 
 if (-not (Test-Path $ConfigPath)) {
-    Write-Warning "No config at '$ConfigPath'. Copy deploy/config/agent.windows.toml.example there and edit server.endpoint before starting the service."
+    Write-Warning "No config at '$ConfigPath'. Copy agent/config.windows.toml.example there and edit server.endpoint before starting the service."
 }
 
 # ── (Re)install the service ─────────────────────────────────────────────────

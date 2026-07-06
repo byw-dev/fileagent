@@ -102,7 +102,7 @@ make bundle          # 产出 bin/controlplane（内嵌 Web UI + 迁移）与 bi
 ```bash
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin fileagent
 sudo install -D -m 0755 bin/controlplane /opt/fileagent/controlplane
-sudo install -D -m 0640 -o fileagent deploy/config/controlplane.env /etc/fileagent/controlplane.env
+sudo install -D -m 0640 -o fileagent controlplane/.env.example /etc/fileagent/controlplane.env
 sudoedit /etc/fileagent/controlplane.env      # 填入真实 DSN / 密钥；无需 MIGRATIONS_PATH
 sudo cp deploy/systemd/controlplane.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -118,7 +118,7 @@ TLS：CP 本身是明文 HTTP(:8080)/gRPC(:9090)，前置 Caddy/nginx 终结 TLS
 
 ```bash
 sudo install -D -m 0755 bin/agent /opt/fileagent/agent
-sudo install -D -m 0640 deploy/config/agent.toml.example /etc/fileagent/agent.toml
+sudo install -D -m 0640 agent/config.toml.example /etc/fileagent/agent.toml
 sudoedit /etc/fileagent/agent.toml            # 填 server.endpoint、watch 路径等
 sudo cp deploy/systemd/fileagent-agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -126,7 +126,7 @@ sudo systemctl enable --now fileagent-agent
 ```
 
 Windows 设备见 [`../../deploy/windows/install-agent.ps1`](../../deploy/windows/install-agent.ps1)
-（NSSM 封装）与 `deploy/config/agent.windows.toml.example`；`agent.exe` 取自 CI
+（NSSM 封装）与 `agent/config.windows.toml.example`；`agent.exe` 取自 CI
 `build-agent.yml` 产物（`agent-windows-amd64`）或 `make build-agent-windows`（需 mingw）。
 
 ---

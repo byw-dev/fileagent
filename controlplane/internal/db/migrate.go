@@ -31,13 +31,16 @@ func Migrate(dsn string, src fs.FS, logger *zap.Logger) error {
 	// Preflight the source before opening the DB: iofs.New succeeds even on an
 	// empty FS, so probe for the first version here. This turns a missing/empty
 	// migration set into a clear error without ever dialing Postgres (keeping
-	// the failure path DB-free and unit-testable).
+	// the failure path DB-free and unit-testable). Close the source on these
+	// early returns — the deferred m.Close() below only exists once m is built.
 	if _, err := source.First(); err != nil {
+		_ = source.Close()
 		return fmt.Errorf("db migrate: no migrations found in source: %w", err)
 	}
 
 	m, err := migrate.NewWithSourceInstance("iofs", source, dsn)
 	if err != nil {
+		_ = source.Close()
 		return fmt.Errorf("db migrate: create migrator: %w", err)
 	}
 	defer func() {

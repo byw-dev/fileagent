@@ -45,8 +45,8 @@ CP **仅从环境变量**读取配置，启动时校验并一次性报出所有�
 ## 2. Agent 配置参考（TOML + 环境变量覆盖）
 
 配置源优先级：`--config` flag → `AGENT_CONFIG` 环境变量 → `./config.toml`。所有字段可被
-`AGENT_*` 环境变量覆盖。模板：`deploy/config/agent.toml.example`（Linux）、
-`deploy/config/agent.windows.toml.example`（Windows）。
+`AGENT_*` 环境变量覆盖。模板：`agent/config.toml.example`（Linux）、
+`agent/config.windows.toml.example`（Windows）。
 
 | 段.字段 | 环境变量 | 默认 | 说明 |
 |---------|----------|------|------|

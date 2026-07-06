@@ -3,7 +3,7 @@
 # Install:
 #   sudo useradd --system --no-create-home --shell /usr/sbin/nologin fileagent
 #   sudo install -D -m 0755 bin/controlplane /opt/fileagent/controlplane
-#   sudo install -D -m 0640 -o fileagent deploy/config/controlplane.env \
+#   sudo install -D -m 0640 -o fileagent controlplane/.env.example \
 #        /etc/fileagent/controlplane.env      # then edit the secrets
 #   sudo cp deploy/systemd/controlplane.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now controlplane
