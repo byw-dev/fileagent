@@ -27,6 +27,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/grpcserver"
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
+	"github.com/byw-dev/fileagent/controlplane/internal/webui"
 	"github.com/byw-dev/fileagent/controlplane/internal/worker"
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -259,6 +260,7 @@ func main() {
 		StatsDB:            queries,
 		RateLimiter:        redisClient,
 		RateLimitPerMinute: cfg.APIRateLimitPerMinute,
+		WebUIFS:            webui.FS(), // nil in pure-API build; embedded assets under `webui` tag
 	})
 
 	httpSrv := &http.Server{

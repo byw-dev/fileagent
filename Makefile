@@ -4,9 +4,11 @@
 # bin/ 已加入 .gitignore，不会提交到 git。
 #
 # 常用命令：
-#   make build            — 构建全部二进制（controlplane + agent）
-#   make build-controlplane — 仅构建 controlplane
+#   make build            — 构建全部二进制（controlplane + agent，纯 Go，不需要 Node）
+#   make build-controlplane — 仅构建 controlplane（纯 API，不含前端）
 #   make build-agent      — 仅构建 agent
+#   make bundle           — 构建含 Web UI 的单文件 controlplane（+ agent）；需 Node 24 / pnpm 11
+#   make build-webui      — 编译 webui 并拷贝 dist 至 controlplane 嵌入目录
 #   make generate         — 重新生成所有代码生成产物（sqlc → controlplane/internal/db）
 #   make test             — 运行全部单元测试
 #   make tidy             — 整理所有模块的 go.mod / go.sum
@@ -17,12 +19,14 @@
 
 BIN_DIR := bin
 
-.PHONY: build build-controlplane build-agent generate generate-sqlc test tidy clean
+WEBUI_EMBED_DIR := controlplane/internal/webui/dist
 
-## build: 构建全部二进制
+.PHONY: build build-controlplane build-agent bundle build-webui build-controlplane-bundle generate generate-sqlc test tidy clean
+
+## build: 构建全部二进制（纯 Go，不含前端）
 build: build-controlplane build-agent
 
-## build-controlplane: 构建 Control Plane 服务
+## build-controlplane: 构建 Control Plane 服务（纯 API，不含前端）
 build-controlplane:
 	@mkdir -p $(BIN_DIR)
 	cd controlplane && go build -o ../$(BIN_DIR)/controlplane ./cmd/server
@@ -31,6 +35,23 @@ build-controlplane:
 build-agent:
 	@mkdir -p $(BIN_DIR)
 	cd agent && go build -o ../$(BIN_DIR)/agent ./cmd/agent
+
+## bundle: 构建含 Web UI 的单文件 controlplane（+ agent）
+bundle: build-webui build-controlplane-bundle build-agent
+
+## build-webui: 编译 webui 并拷贝 dist 至 controlplane 嵌入目录（需 Node 24 / pnpm 11）
+build-webui:
+	cd webui && pnpm install --frozen-lockfile && pnpm build
+	rm -rf $(WEBUI_EMBED_DIR)
+	cp -r webui/dist $(WEBUI_EMBED_DIR)
+
+## build-controlplane-bundle: 以 webui build tag 编译，嵌入前端产物
+#  显式依赖 build-webui：-tags webui 编译需要 $(WEBUI_EMBED_DIR) 已就绪。
+#  写成前置依赖（而非仅靠 bundle 的依赖列表顺序）才能在 make -j 并行下保证
+#  dist/ 先拷贝完成，避免嵌入编译读到不完整/缺失的目录。
+build-controlplane-bundle: build-webui
+	@mkdir -p $(BIN_DIR)
+	cd controlplane && go build -tags webui -o ../$(BIN_DIR)/controlplane ./cmd/server
 
 ## generate: 重新生成所有代码生成产物（工具版本由 tools/ 子模块钉定）
 generate: generate-sqlc

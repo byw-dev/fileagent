@@ -2148,6 +2148,19 @@ groups:
 - 建议配置：8C 16G RAM，500GB SSD
 - MinIO 使用单节点模式（SNSD）
 
+### 单二进制分发（含 Web UI）
+
+Control Plane 支持把编译后的 Web UI（`webui/dist`）**嵌入自身二进制**，运维只需分发一个
+`controlplane` 二进制即可同时提供 REST API 与 Web 管理界面，无需额外部署静态站点或前置代理转发。
+
+- 构建：`make bundle`（编译 webui → 拷入 CP 嵌入目录 → `go build -tags webui`）。默认 `make build`
+  仍产出**纯 API** 二进制（不含前端，`/` 返回 404）。见 [D-022]。
+- 路由：SPA 由 CP 的 HTTP 服务在**同源**下提供——API 全在 `/api/*`、`/internal/*`、`/healthz`，
+  其余路径服务前端静态文件，未命中的客户端路由回退 `index.html`（BrowserRouter）。
+- 同源提供 → **无需 CORS**；webui 的 API base 为相对路径 `/`（`webui/src/services/api.ts`）。
+- 开发期仍分离：webui 走 `pnpm dev` + vite proxy（`/api → :8080`，见 `webui/vite.config.ts`），
+  不使用嵌入产物。
+
 ## 10.2 生产最小化部署（节点规划）
 
 | 节点组       | 数量 | 配置               | 部署服务                                 |

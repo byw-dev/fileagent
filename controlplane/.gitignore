@@ -1,0 +1,3 @@
+# Web UI assets copied in by `make bundle` (Makefile build-webui) and embedded
+# via the `webui` build tag. Build artifact — never committed.
+internal/webui/dist/

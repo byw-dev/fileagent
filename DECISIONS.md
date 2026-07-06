@@ -831,3 +831,37 @@ nats_publish**，`kafka_publish` 拒绝（系统固定基础设施是 NATS，无
   PATCH 单字段避免误覆盖上报字段。
 - **宽松校验（仅非空 + 长度）**：`name` 进路径模板，宽松校验会把 `/`、`..`、控制字符带进对象键，
   有路径注入风险；白名单更安全，且中文显示名仍可用（`\p{L}` 覆盖 CJK）。
+
+---
+
+## D-022：Web UI 嵌入 CP 二进制 —— build tag 双模式 + `make bundle`
+
+**决策日期**：2026-07-05
+**影响范围**：controlplane（新增 `internal/webui` 嵌入包、`api/router` SPA 服务、`cmd/server` 注入）、
+Makefile（`bundle` 目标）、构建/分发流程
+**背景**：简化分发与维护——运维只需一个二进制 + 配置即可跑起完整系统（含 Web 管理界面）
+
+### 决策
+
+- **可选嵌入**：Control Plane 可将 `webui/dist` 经 `//go:embed` 嵌入自身二进制，同源提供 SPA。
+  API 全在 `/api/*`、`/internal/*`、`/healthz`；其余路径服务前端静态文件，未命中的客户端路由
+  （BrowserRouter）回退 `index.html`。同源 → 无需 CORS；webui 的 API base 已是相对路径 `/`。
+- **build tag 双模式**：`internal/webui` 用 `//go:build webui` / `!webui` 两文件门控。
+  默认 `go build`（无 tag）→ `FS()` 返回 nil → 纯 API 二进制，**不需要 dist、`go build ./...` 与
+  CI/单测恒可编译**；`-tags webui` → 嵌入 dist → 含前端二进制。router 不 import 该包，
+  经 `RouterConfig.WebUIFS fs.FS` 由 `main` 注入，保持 router 纯净可测（单测用 `fstest.MapFS`）。
+- **构建流程**：新增 `make bundle`（`build-webui` 编译并拷 dist 进 CP 嵌入目录 → `build-controlplane-bundle`
+  以 `-tags webui` 编译）。**保留 `make build` 为纯 Go**，后端开发者与 CI 不需要 Node。
+  嵌入目录 `controlplane/internal/webui/dist/` 为构建产物，gitignored。
+- **SPA 404 语义**：未命中的 API 形状路径（`/api/`、`/internal/`、`/healthz`）返回统一错误信封
+  `NOT_FOUND`（复用 `middleware.RespondError`），**不喂 index.html**——错拼的 API 调用要显式失败。
+
+### 备选方案（被否决）
+
+- **`make build` 总是打包前端**：分发最省心，但每次后端构建都要 Node 24 + pnpm + vite build（慢），
+  且 CI 纯 Go 流水线需相应改造。独立 `make bundle` 兼顾两者。
+- **不用 build tag、始终 embed**：须提交占位 `index.html`（dist 被 gitignore），否则 `go build` 失败；
+  build tag 更干净，默认路径零负担。
+- **前端独立部署 + 反向代理**：仍是有效的生产形态（§10.4 Caddy），但单二进制对小规模/离线分发更省事，
+  二者并存不冲突。
+- **第三方 gin 静态中间件**：标准库 `embed` + `http.FS` + `c.FileFromFS` 已足够，不引额外依赖。
