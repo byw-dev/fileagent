@@ -246,6 +246,27 @@ cp agent/config.toml.example agent/config.toml
 
 ---
 
+## 生产部署（单二进制分发）
+
+`make bundle` 产出**自包含**的 Control Plane 二进制——Web UI（D-022）与数据库迁移（D-023）均已内嵌，
+分发时**无需**随行 `migrations/` 目录或单独的前端静态站点，迁移在启动时自动应用。
+
+```bash
+make bundle          # bin/controlplane（内嵌 Web UI + 迁移）+ bin/agent
+```
+
+两条部署路径（完整步骤见运维文档）：
+
+- **容器 all-in-one**：`docker compose -f deploy/docker-compose.prod.yml up -d --build`
+  （PG/Redis/NATS/MinIO + CP + Caddy TLS 网关一把梭）。
+- **主机 systemd**：`deploy/systemd/controlplane.service` + `fileagent-agent.service`；
+  Windows agent 见 `deploy/windows/install-agent.ps1`（NSSM）。
+
+📖 **部署指南**：[`docs/ops/deployment.md`](docs/ops/deployment.md) ·
+**运维手册**（配置参考/升级/备份/排障）：[`docs/ops/operations.md`](docs/ops/operations.md)
+
+---
+
 ## 开发
 
 ### 运行单元测试

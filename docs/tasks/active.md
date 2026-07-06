@@ -5,16 +5,18 @@
 
 ---
 
-## 当前任务：core-completeness 冲刺收官（仅剩 optional proto→buf）
+## 当前任务：T4-3 部署脚手架 + 运维文档（进行中）
 
-**所属冲刺**：core-completeness（核心模块补完备）
-**上一项已收官**：**CC-10** ✅ 隐性契约文档（本 PR）——新建 [`docs/design/contracts.md`](../design/contracts.md)
-汇总 V-1…V-4（status/mode/append_mode 枚举大小写映射、列表三种信封、trollsift 变量+LDML 符号表、
-错误响应格式+错误码表），每条指向权威代码 `file:line`；CLAUDE.md 契约块 + system-design §5.11 加指针。
-纯文档、未改业务代码。
-**Tier A/B/C 主线全部收官**：CC-1/2/4/5/6/7/8/9/10 完成（CC-3 推后）。
-**剩余候选**：仅 optional proto→buf 复现性 follow-up（视价值人工决定）。核心补完备冲刺至此收官。
-**权威 backlog**：`docs/tasks/backlog.md` + [`core-completeness.md`](core-completeness.md)。
+**所属阶段**：Phase 4 收尾（core-completeness 冲刺已收官）
+**目标**：闭环 D-022 单二进制分发——把 DB 迁移嵌入二进制（D-023，真正单文件），并把 system-design §10
+的部署蓝图落成可运行产物（Dockerfile / prod compose / Caddyfile / systemd / Windows NSSM）+ 运维文档。
+**产物**：`controlplane/migrations/embed.go`、`controlplane/Dockerfile`、`deploy/docker-compose.prod.yml`、
+`deploy/caddy/Caddyfile`、`deploy/systemd/*.service`、`deploy/windows/install-agent.ps1`、
+`docs/ops/{deployment,operations}.md`；移除 `MIGRATIONS_PATH`。见 DECISIONS D-023。
+
+> **core-completeness 冲刺已收官**：CC-1/2/4/5/6/7/8/9/10 完成（CC-3 推后）；CC-10 隐性契约文档
+> （[`docs/design/contracts.md`](../design/contracts.md)）汇总 V-1…V-4。
+> **剩余候选**：optional proto→buf 复现性 follow-up（视价值人工决定）。
 
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
 > bucket policy 对本系统冗余（MinIO 默认私有，访问全走 STS/presigned IAM）。待有 staging workflow 再做。

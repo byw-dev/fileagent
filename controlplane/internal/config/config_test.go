@@ -67,7 +67,6 @@ func TestLoad_Defaults(t *testing.T) {
 
 	// misc defaults
 	assert.Equal(t, "info", cfg.LogLevel)
-	assert.Equal(t, "migrations", cfg.MigrationsPath)
 	assert.False(t, cfg.MinIOUseSSL)
 	assert.Equal(t, "arn:aws:iam:::role/agent-role", cfg.MinIORoleARN)
 	assert.Equal(t, "admin", cfg.BootstrapAdminUsername)

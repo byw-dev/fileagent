@@ -3,25 +3,32 @@ package db
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 
 	"github.com/golang-migrate/migrate/v4"
 	// The postgres driver for golang-migrate.
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
-	// The file source driver for golang-migrate.
-	_ "github.com/golang-migrate/migrate/v4/source/file"
+	// The iofs source driver reads migrations from an fs.FS (e.g. an embedded
+	// filesystem) instead of the host filesystem.
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"go.uber.org/zap"
 )
 
-// Migrate runs all pending up-migrations from the given source path against
-// the database identified by dsn. It is idempotent: if the schema is already
-// up-to-date, Migrate returns nil without error.
+// Migrate runs all pending up-migrations from src against the database
+// identified by dsn. It is idempotent: if the schema is already up-to-date,
+// Migrate returns nil without error.
 //
-// migrationsPath must be a directory path (e.g. "migrations" or
-// "/app/migrations") containing *.up.sql / *.down.sql files that follow the
-// golang-migrate naming convention.
-func Migrate(dsn, migrationsPath string, logger *zap.Logger) error {
-	source := "file://" + migrationsPath
-	m, err := migrate.New(source, dsn)
+// src is an fs.FS whose root contains *.up.sql / *.down.sql files following the
+// golang-migrate naming convention. In production this is the embedded
+// migrations.FS, so no external migrations directory needs to be shipped with
+// the binary (see DECISIONS.md D-023).
+func Migrate(dsn string, src fs.FS, logger *zap.Logger) error {
+	source, err := iofs.New(src, ".")
+	if err != nil {
+		return fmt.Errorf("db migrate: open migration source: %w", err)
+	}
+
+	m, err := migrate.NewWithSourceInstance("iofs", source, dsn)
 	if err != nil {
 		return fmt.Errorf("db migrate: create migrator: %w", err)
 	}
