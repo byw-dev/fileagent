@@ -46,8 +46,10 @@ build-webui:
 	cp -r webui/dist $(WEBUI_EMBED_DIR)
 
 ## build-controlplane-bundle: 以 webui build tag 编译，嵌入前端产物
-#  前置：必须先跑 build-webui 生成 $(WEBUI_EMBED_DIR)（bundle 目标已保证顺序）。
-build-controlplane-bundle:
+#  显式依赖 build-webui：-tags webui 编译需要 $(WEBUI_EMBED_DIR) 已就绪。
+#  写成前置依赖（而非仅靠 bundle 的依赖列表顺序）才能在 make -j 并行下保证
+#  dist/ 先拷贝完成，避免嵌入编译读到不完整/缺失的目录。
+build-controlplane-bundle: build-webui
 	@mkdir -p $(BIN_DIR)
 	cd controlplane && go build -tags webui -o ../$(BIN_DIR)/controlplane ./cmd/server
 
