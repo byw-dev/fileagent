@@ -60,9 +60,14 @@ if (-not (Test-Path $ConfigPath)) {
 }
 
 # ── (Re)install the service ─────────────────────────────────────────────────
-if (& $NssmExe status $ServiceName 2>$null) {
+# Probe existence by exit code (nssm status exits 0 only when the service
+# exists) rather than by parsing stdout, which some error messages also produce.
+& $NssmExe status $ServiceName 2>$null | Out-Null
+if ($LASTEXITCODE -eq 0) {
     Write-Host "Service '$ServiceName' already exists — reconfiguring."
     & $NssmExe stop $ServiceName | Out-Null
+    # Point the existing service at the freshly copied binary.
+    & $NssmExe set $ServiceName Application $TargetExe
 } else {
     & $NssmExe install $ServiceName $TargetExe '--config' $ConfigPath
 }

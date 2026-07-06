@@ -15,6 +15,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	controlplanedb "github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/migrations"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -49,7 +50,7 @@ func setupIntegrationTestRouter(t *testing.T) (*controlplanedb.DB, *controlplane
 
 	logger := zap.NewNop()
 	dsn := integrationTestDSN(t)
-	require.NoError(t, controlplanedb.Migrate(dsn, "../../../migrations", logger))
+	require.NoError(t, controlplanedb.Migrate(dsn, migrations.FS, logger))
 
 	conn, err := controlplanedb.Open(context.Background(), dsn, logger)
 	require.NoError(t, err)

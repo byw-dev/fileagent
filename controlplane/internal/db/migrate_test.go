@@ -1,6 +1,7 @@
 package db
 
 import (
+	"io/fs"
 	"testing"
 
 	"github.com/golang-migrate/migrate/v4/source/iofs"
@@ -28,13 +29,16 @@ func TestEmbeddedMigrationsReadableByIOFS(t *testing.T) {
 	assert.Greater(t, first, uint(0), "migration versions start at 1")
 
 	// Walk the whole chain via Next() to confirm every version parses and the
-	// files form an unbroken sequence the migrator can traverse.
+	// files form an unbroken sequence the migrator can traverse. The loop must
+	// terminate with ErrNotExist (end of chain); any other error is a real
+	// parse/IO failure and must fail the test rather than silently pass.
 	count := 1
 	v := first
 	for {
 		next, err := src.Next(v)
 		if err != nil {
-			break // ErrNotExist at the end of the chain
+			require.ErrorIs(t, err, fs.ErrNotExist, "traversal must end cleanly, not on a parse/IO error")
+			break
 		}
 		count++
 		v = next
