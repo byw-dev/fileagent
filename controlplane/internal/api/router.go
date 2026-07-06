@@ -240,14 +240,24 @@ func registerSPA(r *gin.Engine, fsys fs.FS) {
 	})
 }
 
+// backendRoots is the set of first path segments the Control Plane owns
+// (REST API, internal hooks, health check). Anything rooted here is a backend
+// route; everything else belongs to the SPA.
+var backendRoots = map[string]bool{"api": true, "internal": true, "healthz": true}
+
 // isAPIPath reports whether a cleaned request path targets a backend endpoint
-// (REST API, internal hooks, or health check) rather than the SPA. Both the
-// bare prefix ("/api") and its subtree ("/api/...") are treated as backend so
-// no server route can be shadowed by the Web UI fallback.
+// rather than the SPA. The rule is a single invariant — the request is backend
+// iff its first path segment is one of backendRoots — so the bare root
+// ("/api"), its subtree ("/api/..."), and deeper paths under any root
+// ("/healthz/foo") are all classified uniformly. This avoids the per-shape
+// special-casing (bare vs trailing-slash vs exact match) that repeatedly leaked
+// backend-shaped paths into the SPA fallback.
 func isAPIPath(p string) bool {
-	return p == "/api" || strings.HasPrefix(p, "/api/") ||
-		p == "/internal" || strings.HasPrefix(p, "/internal/") ||
-		p == "/healthz"
+	seg := strings.TrimPrefix(p, "/")
+	if i := strings.IndexByte(seg, '/'); i >= 0 {
+		seg = seg[:i]
+	}
+	return backendRoots[seg]
 }
 
 // fileExists reports whether name resolves to a regular (non-directory) file in

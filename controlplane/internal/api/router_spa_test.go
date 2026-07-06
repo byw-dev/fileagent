@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"testing"
 	"testing/fstest"
 
@@ -122,6 +123,30 @@ func TestSPA_NormalizedAPIPathStillReturnsJSON404(t *testing.T) {
 			assert.Equal(t, http.StatusNotFound, resp.StatusCode, p)
 			assert.Contains(t, resp.Header.Get("Content-Type"), "application/json", p)
 		}()
+	}
+}
+
+// TestIsAPIPath_Boundary pins the classification invariant directly: a cleaned
+// path is backend iff its first segment is api/internal/healthz. Enumerating
+// the boundary (bare root, subtree, deeper path, and non-backend siblings)
+// verifies the property rather than a handful of examples, so backend-shaped
+// paths can no longer leak into the SPA fallback one case at a time.
+func TestIsAPIPath_Boundary(t *testing.T) {
+	backend := []string{
+		"/api", "/api/", "/api/v1/x",
+		"/internal", "/internal/", "/internal/minio-event",
+		"/healthz", "/healthz/", "/healthz/foo",
+	}
+	spa := []string{
+		"/", "/dashboard", "/agents/123",
+		"/apix", "/api-docs", "/healthzz", "/internalx",
+		"/assets/app.js",
+	}
+	for _, p := range backend {
+		assert.True(t, isAPIPath(path.Clean("/"+p)), "expected backend: %s", p)
+	}
+	for _, p := range spa {
+		assert.False(t, isAPIPath(path.Clean("/"+p)), "expected SPA: %s", p)
 	}
 }
 
