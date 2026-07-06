@@ -94,6 +94,37 @@ func TestSPA_UnknownAPIPathReturnsJSON404(t *testing.T) {
 	assert.NotEmpty(t, body.RequestID, "API 404 must keep the standard error envelope")
 }
 
+func TestSPA_MissingAssetReturns404(t *testing.T) {
+	srv := newSPARouter(t)
+
+	// A URL that looks like a static asset but has no matching file must 404
+	// rather than fall back to the HTML shell (which would break JS/CSS loads).
+	resp, err := http.Get(srv.URL + "/assets/missing-abc123.js")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	assert.NotContains(t, string(body), "<title>fileagent</title>")
+}
+
+func TestSPA_NormalizedAPIPathStillReturnsJSON404(t *testing.T) {
+	srv := newSPARouter(t)
+
+	// Path-normalization tricks must not bypass the API guard and receive the
+	// HTML shell. Go's net/http client cleans "/../api/..", so exercise the
+	// duplicate-slash form which reaches the server as-is.
+	for _, p := range []string{"//api/v1/nonexistent", "/api", "/internal"} {
+		resp, err := http.Get(srv.URL + p)
+		require.NoError(t, err, p)
+		func() {
+			defer resp.Body.Close()
+			assert.Equal(t, http.StatusNotFound, resp.StatusCode, p)
+			assert.Contains(t, resp.Header.Get("Content-Type"), "application/json", p)
+		}()
+	}
+}
+
 func TestSPA_HealthzStillServed(t *testing.T) {
 	srv := newSPARouter(t)
 

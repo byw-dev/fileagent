@@ -210,20 +210,44 @@ func registerSPA(r *gin.Engine, fsys fs.FS) {
 			return
 		}
 
-		p := c.Request.URL.Path
-		if strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/internal/") || p == "/healthz" {
+		// Normalize the path first, then guard: checking the raw path but
+		// serving the cleaned one would let "//api/..", "/../api/.." and
+		// similar tricks slip past the API guard and receive index.html.
+		clean := path.Clean("/" + c.Request.URL.Path)
+		if isAPIPath(clean) {
 			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "resource not found", nil)
 			return
 		}
 
-		// Serve a real static file when one exists (e.g. /assets/index-*.js);
-		// otherwise fall back to the SPA shell for client-side routing.
-		if name := strings.TrimPrefix(path.Clean(p), "/"); name != "" && fileExists(fsys, name) {
-			c.FileFromFS(p, httpFS)
+		// Serve a real static file when one exists (e.g. /assets/index-*.js).
+		name := strings.TrimPrefix(clean, "/")
+		if name != "" && fileExists(fsys, name) {
+			c.FileFromFS(clean, httpFS)
 			return
 		}
+
+		// A path that looks like an asset (has a file extension) but has no
+		// matching file is a genuine 404, not a client-side route. Returning
+		// index.html (200) for a missing .js/.css URL only produces confusing
+		// downstream parse errors, so fail loudly instead.
+		if path.Ext(name) != "" {
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "resource not found", nil)
+			return
+		}
+
+		// Otherwise fall back to the SPA shell for client-side routing.
 		serveIndex(c, fsys)
 	})
+}
+
+// isAPIPath reports whether a cleaned request path targets a backend endpoint
+// (REST API, internal hooks, or health check) rather than the SPA. Both the
+// bare prefix ("/api") and its subtree ("/api/...") are treated as backend so
+// no server route can be shadowed by the Web UI fallback.
+func isAPIPath(p string) bool {
+	return p == "/api" || strings.HasPrefix(p, "/api/") ||
+		p == "/internal" || strings.HasPrefix(p, "/internal/") ||
+		p == "/healthz"
 }
 
 // fileExists reports whether name resolves to a regular (non-directory) file in

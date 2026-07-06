@@ -8,6 +8,7 @@ package webui
 
 import (
 	"embed"
+	"fmt"
 	"io/fs"
 )
 
@@ -20,11 +21,15 @@ var distFS embed.FS
 
 // FS returns the embedded Web UI assets as an fs.FS rooted at dist/, ready to
 // be served by the HTTP router. It is non-nil in tag-`webui` builds.
+//
+// It panics if the embedded dist/ subtree cannot be resolved. That can only
+// happen when the binary was built with -tags webui but without a valid dist/
+// (a broken bundle); failing fast at startup surfaces the packaging error
+// loudly rather than silently shipping a binary that serves no Web UI.
 func FS() fs.FS {
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
-		// Unreachable in practice: dist is embedded at build time.
-		return nil
+		panic(fmt.Sprintf("webui: cannot resolve embedded dist/: %v", err))
 	}
 	return sub
 }
