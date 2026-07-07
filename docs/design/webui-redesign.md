@@ -4,14 +4,14 @@
 > <https://claude.ai/design/p/ee358eac-8672-4a33-8b50-7dcd3d3bc119>
 > （原件是登录态私有的可交互稿；未在仓库内留快照——其自包含导出体积超出导入上限会被截断损坏，本文的
 > token / 定则 / 分页意图即从该稿提炼的可执行摘要。）
-> **数据模型提案（Half B，另文）**：[`webui-metadata-model.md`](./webui-metadata-model.md)
+> **数据模型设计（Half B，另文）**：[`metadata-model.md`](./metadata-model.md)（已拍板 6c，D-025）
 >
 > **权威层级**（同 `CLAUDE.md`）：代码 > `DECISIONS.md` > `system-design.md`。本文件是**设计意图**，
 > 用于指导实现，不覆盖既有契约（proto / migrations / handler 响应体 / REST 路径）。本轮**只落文档、不改代码**；
 > 实现按 `docs/tasks/backlog.md` 的「前端重做实现」track 分期推进。
 
 本轮重做覆盖 webui **既有页面**的视觉与交互统一（不新增后端能力）。新的「元数据 / 数据集」能力属于 Half B，
-涉及 CP/DB/API 契约，见 `webui-metadata-model.md`（提案，待拍板）。
+涉及 CP/DB/API 契约，见 `metadata-model.md`（已拍板 6c，分期实施，D-025）。
 
 ---
 
@@ -142,7 +142,7 @@
 ### 4.9 设置 — `pages/Settings`（含 `Users` / `Profile`）
 - `5b` **用户管理**：仅 super_admin 可见此 Tab；**禁用而非删除**（定则 2 语义）。
 - `5c` **新建用户抽屉**：角色单选带权限说明；初始密码**一次性展示**。
-- （Half B 会在设置下新增「标签词表」`7c` 与「待确认取值队列」`7d`，见 `webui-metadata-model.md`。）
+- （Half B 会在设置下新增「标签词表」`7c` 与「待确认取值队列」`7d`，见 `metadata-model.md`。）
 
 ---
 

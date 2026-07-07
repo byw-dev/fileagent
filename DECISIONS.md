@@ -941,3 +941,41 @@ Makefile（`bundle` 目标）、构建/分发流程
   网关反代留作后续（文档已 gateway 无关地写）。
 - **presigner 复用内网 client**：presign 是本地签名，host 必须等于客户端实际访问地址，复用内网 host 会签出
   不可达 URL。故必须用 public endpoint 单独构造 presign client。
+
+---
+
+## D-025：文件元数据采用混合模型 6c（受控标签 + 数据集，分期）
+
+**决策日期**：2026-07-07
+**影响范围**：controlplane（`internal/indexer` 打标、`internal/api` 词表/待确认/文件筛选、`internal/db` 迁移+查询、
+`classifier.go` 优先级）、webui（round 7 四屏）、SDK（消费方，当前推后）、文档（`system-design.md §3/§5`、
+`docs/design/metadata-model.md`、`contracts.md`）
+**来源**：Claude Design「前端页面重做计划」round 6–7 的信息架构探索；产品拍板选定 6c。
+**权威设计**：[`docs/design/metadata-model.md`](docs/design/metadata-model.md)（Phase 1 工程设计 + Phase 2 留存）。
+
+**背景**：采集数据多维度变种（厂家/型号/站点/传感器/版本 + 加工级别），仅靠 `file_types`（glob）会「类型
+爆炸」。需在**采集规则源头**声明元数据，SDK 按维度消费，并要求对账与历史回溯打标。
+
+### 决策
+
+- **采用混合模型 `6c`**（否决 `6a` 纯文件标签 / `6b` 纯数据集），**分期**：
+  - **Phase 1（现在做）· 受控标签打底**：`tag_keys` 词表 + `tag_values` 受控取值 + `file_tags` + 待确认队列
+    `pending_tag_values` + `tag_audit`；规则在 `collection_rules.metadata JSONB` 声明 `file_type + static_tags +
+    path_tag_map`（**不改 rules 表**）。
+  - **Phase 2（暂缓）· 数据集注册表**：命名的标签组合谓词，薄层不动文件表，承载对账/血缘/SDK 订阅名。设计已在
+    `metadata-model.md` 留存，待明确需求再起。
+- **打标在 CP 侧**：复用现有服务端分类路径（`classifier.go`），在索引处理 `UploadResult` 时打标。**Phase 1 不改
+  `proto/v1/agent.proto`、不改 agent**。
+- **治理**：key 严格受控、value 受控可扩；路径变量提取的未知值进待确认队列由管理员核准（防
+  `tokyo/Tokyo/TYO` 漂移），文件仍入库携带原始值但未核准值不进筛选器/规则可选项。
+- **`file_types` 降级为兜底**：规则声明类型优先，glob 只兜没声明的旧数据（向后兼容）。
+- 路径变量映射**复用 trollsift 模板变量**（`contracts.md` V-3），不另造机制；文件筛选新增可重复 `tag` 查询参数，
+  **保持 cursor 分页**（V-2）不改 offset。
+
+### 备选方案（被否决）
+
+- **`6a` 纯文件标签**：无对账/血缘载体（SDK 需求硬伤）。
+- **`6b` 纯数据集**：长尾/临时数据成本高（逼着先建模后采集），后端 + UI 改动大。
+- **规则声明标签下发到 agent（改 proto）**：Phase 1 打标在 CP 侧即可（路径变量在服务端可从 storage path 抽取），
+  下发标签到 agent 属过度设计；留待 Phase 2 若确有 agent 侧需求再评估。
+- **文件按标签筛选改 offset 分页**：违反 cursor 分页契约；用可重复 `tag` 参数 + `file_tags` join 即可。
