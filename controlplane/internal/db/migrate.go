@@ -33,9 +33,16 @@ func Migrate(dsn string, src fs.FS, logger *zap.Logger) error {
 	// migration set into a clear error without ever dialing Postgres (keeping
 	// the failure path DB-free and unit-testable). Close the source on these
 	// early returns — the deferred m.Close() below only exists once m is built.
+	//
+	// First() reports an empty source as fs.ErrNotExist; anything else (an
+	// invalid migration filename, an IO fault) is a distinct real failure, so
+	// keep the two messages apart to avoid misleading "no migrations" noise.
 	if _, err := source.First(); err != nil {
 		_ = source.Close()
-		return fmt.Errorf("db migrate: no migrations found in source: %w", err)
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("db migrate: no migrations found in source: %w", err)
+		}
+		return fmt.Errorf("db migrate: read migration source: %w", err)
 	}
 
 	m, err := migrate.NewWithSourceInstance("iofs", source, dsn)
