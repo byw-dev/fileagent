@@ -182,6 +182,36 @@ func TestLoad_MinIOSSL(t *testing.T) {
 	assert.True(t, cfg.MinIOUseSSL)
 }
 
+func TestLoad_MinIOPublicEndpoint_DefaultsToInternal(t *testing.T) {
+	env := validEnv()
+	env["MINIO_USE_SSL"] = "true"
+	// Explicitly clear the public vars so a host-set value cannot leak in;
+	// empty is treated as unset and must fall back to the internal values (D-024).
+	env["MINIO_PUBLIC_ENDPOINT"] = ""
+	env["MINIO_PUBLIC_USE_SSL"] = ""
+	setEnv(t, env)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, cfg.MinIOEndpoint, cfg.MinIOPublicEndpoint)
+	assert.Equal(t, cfg.MinIOUseSSL, cfg.MinIOPublicUseSSL)
+}
+
+func TestLoad_MinIOPublicEndpoint_OverrideWins(t *testing.T) {
+	env := validEnv()
+	env["MINIO_USE_SSL"] = "false"
+	env["MINIO_PUBLIC_ENDPOINT"] = "minio.public.example:443"
+	env["MINIO_PUBLIC_USE_SSL"] = "true"
+	setEnv(t, env)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "localhost:9000", cfg.MinIOEndpoint, "internal endpoint unchanged")
+	assert.False(t, cfg.MinIOUseSSL, "internal TLS flag unchanged")
+	assert.Equal(t, "minio.public.example:443", cfg.MinIOPublicEndpoint)
+	assert.True(t, cfg.MinIOPublicUseSSL)
+}
+
 func TestValidate_InvalidLogLevel(t *testing.T) {
 	setEnv(t, validEnv())
 	setEnv(t, map[string]string{"LOG_LEVEL": "verbose"})

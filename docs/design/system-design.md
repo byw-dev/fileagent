@@ -2220,6 +2220,20 @@ control.internal {
 }
 ```
 
+### MinIO endpoint 角色（internal / public 拆分，D-024）
+
+Control Plane 对 MinIO 用**两个**端点，配置项独立，网关无关：
+
+| 角色 | 配置 | 用途 | 可达要求 |
+|------|------|------|----------|
+| **internal** | `MINIO_ENDPOINT` / `MINIO_USE_SSL` | CP 自身调用：STS `AssumeRole`、建桶 admin | 仅需 CP 可达（内网服务名，如 `minio:9000`） |
+| **public** | `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_USE_SSL` | 写入 STS payload 交给 agent；presign 下载 URL 的签名 host | 须对**浏览器 / agent** 可达（宿主 LAN IP 或网关地址） |
+
+`MINIO_PUBLIC_*` 缺省回落到 `MINIO_*`（单端点部署向后兼容）。生产把 MinIO 置于 TLS 网关之后
+（上面的 `minio.example.com` 反代即一例，但**任何**终结代理均可），并将 `MINIO_PUBLIC_ENDPOINT`
+指向网关地址；CP 仍走 internal 端点，流量留在内网、不 hairpin。presign 为本地签名（不发网络），
+故 public 端点只影响 URL 的签名 host，不引入额外网络跳。
+
 ## 10.5 内网 TLS 方案（step-ca）
 
 ```bash

@@ -85,6 +85,18 @@ func TestIssueCredentials_Integration(t *testing.T) {
 	assert.True(t, cred.GetExpiresAt().AsTime().After(time.Now()),
 		"ExpiresAt should be in the future")
 
+	// --- public endpoint override surfaces in the returned payload (D-024) ---
+	// AssumeRole still dials the internal endpoint; only the payload endpoint
+	// handed to the agent reflects the configured public value.
+	pubMgr := NewSTSManager(itMinIOEndpoint, itMinIOUser, itMinIOPassword, itRoleARN, false, logger).
+		WithPublicEndpoint("minio.public.example:443", true)
+	pubCred, err := pubMgr.IssueCredentials(ctx, "agent-integration-public", []BucketAccess{
+		{BucketName: bucket, PathPrefix: "uploads/"},
+	})
+	require.NoError(t, err, "IssueCredentials with public endpoint override")
+	assert.Equal(t, "minio.public.example:443", pubCred.GetEndpoint())
+	assert.True(t, pubCred.GetUseSsl())
+
 	// --- STS credentials can write to the scoped bucket ---
 	stsClient, err := miniogo.New(itMinIOEndpoint, &miniogo.Options{
 		Creds: credentials.NewStaticV4(

@@ -79,6 +79,26 @@ func TestNewSTSManager_ReturnsManager(t *testing.T) {
 	require.NotNil(t, mgr)
 }
 
+func TestNewSTSManager_PublicEndpointDefaultsToInternal(t *testing.T) {
+	// Without WithPublicEndpoint the payload endpoint must mirror the internal
+	// one so single-endpoint deployments keep the pre-split behavior (D-024).
+	mgr := NewSTSManager("minio:9000", "access", "secret", "arn:minio:sts:::role", true, zapNoopLogger())
+	assert.Equal(t, "minio:9000", mgr.publicEndpoint)
+	assert.True(t, mgr.publicUseSSL)
+}
+
+func TestSTSManager_WithPublicEndpoint_OverridesPublicOnly(t *testing.T) {
+	// The public override changes only the client-facing fields; the internal
+	// endpoint used for AssumeRole stays as constructed.
+	mgr := NewSTSManager("minio:9000", "access", "secret", "arn:minio:sts:::role", false, zapNoopLogger()).
+		WithPublicEndpoint("cdn.example.com:443", true)
+
+	assert.Equal(t, "minio:9000", mgr.endpoint, "internal endpoint must be untouched")
+	assert.False(t, mgr.useSSL, "internal TLS flag must be untouched")
+	assert.Equal(t, "cdn.example.com:443", mgr.publicEndpoint)
+	assert.True(t, mgr.publicUseSSL)
+}
+
 func TestSTSManager_IssueCredentials_ReturnsError(t *testing.T) {
 	// No real MinIO — should fail at credential exchange
 	mgr := NewSTSManager("127.0.0.1:19999", "access", "secret", "arn:minio:sts:::role", false, zapNoopLogger())

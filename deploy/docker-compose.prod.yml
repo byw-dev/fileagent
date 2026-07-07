@@ -73,9 +73,11 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
       # DEV/PoC: MinIO is published straight to the host so browsers/agents can
-      # reach it for direct presigned upload/download. Production should instead
-      # front MinIO via the Caddy gateway (§10.4) — see the follow-up in
-      # docs/tasks/backlog.md — and not expose it on the host directly.
+      # reach it via MINIO_PUBLIC_ENDPOINT for direct presigned upload/download.
+      # The CP itself no longer uses this host path — it dials minio:9000 on the
+      # docker network (see MINIO_ENDPOINT / D-024). Production should front MinIO
+      # through a TLS gateway (gateway-agnostic) and set MINIO_PUBLIC_ENDPOINT to
+      # that address instead of publishing MinIO on the host directly.
       - "9000:9000"
       - "9001:9001"
     volumes:
@@ -108,17 +110,21 @@ services:
       DATABASE_URL: postgres://fileagent:${POSTGRES_PASSWORD:-fileagent}@postgres:5432/fileagent?sslmode=disable
       REDIS_URL: redis://redis:6379/0
       NATS_URL: nats://nats:4222
-      # DEV/PoC: one endpoint serves both roles — CP↔MinIO calls AND the host of
-      # the presigned URLs / STS endpoint handed to browsers & agents for direct
-      # transfer (see internal/storage/sts.go:76 and handler/files.go presign).
-      # It must therefore resolve for the CP container, browsers AND agents, so
-      # it can't be the in-network "minio:9000" (unreachable by outside clients).
-      # Set MINIO_PUBLIC_ENDPOINT to a host:port reachable by all of them — on a
-      # single host, the host's LAN IP (MinIO is published on :9000 above).
-      # Trade-off: CP↔MinIO then hairpins out to the host; the production
-      # follow-up removes that by splitting internal vs public endpoints.
-      MINIO_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:?set to a host:port reachable by the CP container AND browsers/agents, e.g. the host LAN IP 192.168.1.10:9000}
+      # Split endpoints (D-024): the CP dials MINIO_ENDPOINT for its own calls
+      # (STS AssumeRole + bucket admin) — keep it on the in-network service name
+      # so CP↔MinIO stays on the docker network (no host hairpin).
+      MINIO_ENDPOINT: minio:9000
       MINIO_USE_SSL: "false"
+      # MINIO_PUBLIC_ENDPOINT is the client-facing host: it is returned to agents
+      # in the STS payload and is the host presigned download URLs are signed for
+      # (see internal/storage/sts.go and handler/files.go). It must be reachable
+      # by browsers AND agents, so it can't be the in-network "minio:9000". On a
+      # single host set it to the host's LAN IP (MinIO is published on :9000
+      # above). In production, front MinIO through your TLS gateway and point
+      # this at that address (gateway-agnostic; see docs/ops/deployment.md) —
+      # then set MINIO_PUBLIC_USE_SSL=true so signed URLs use https.
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:?set to a host:port reachable by browsers/agents, e.g. the host LAN IP 192.168.1.10:9000}
+      MINIO_PUBLIC_USE_SSL: ${MINIO_PUBLIC_USE_SSL:-false}
       # For the all-in-one PoC the CP uses the MinIO root credentials to mint STS
       # tokens. In production create a scoped service account instead.
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}

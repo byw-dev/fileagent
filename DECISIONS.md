@@ -906,3 +906,38 @@ Makefile（`bundle` 目标）、构建/分发流程
   alpine 运行镜像（+ 专用非 root 用户 + `/data` 卷）更适合运维上手。生产可自行换 distroless。
 - **compose 内自动跑 init-minio**：`init-minio.sh` 依赖 bash + mc + 服务重启时序，塞进一次性容器较脆；
   改为文档化的一次性手动步骤（建桶/webhook 只需跑一次）。
+
+---
+
+## D-024：MinIO internal/public endpoint 拆分（消除 CP↔MinIO hairpin）
+
+**决策日期**：2026-07-07
+**影响范围**：controlplane（`internal/config/config.go`、`internal/storage/sts.go`、`cmd/server/main.go`）、
+部署（`deploy/docker-compose.prod.yml`、`controlplane/.env.example`）、运维文档（`docs/ops/`、`system-design.md §10`）
+**来源**：PR #61（T4-3）review（discussion r3529902760）+ `docs/tasks/backlog.md` follow-up。
+
+**背景**：单一 `MINIO_ENDPOINT` 同时承担两种角色——(a) **internal**：CP 自身调用 MinIO
+（STS `AssumeRole`、建桶 admin）；(b) **public**：写入 STS `CredentialsPayload.Endpoint` 交给 agent、
+并作为 presign 下载 URL 的签名 host。all-in-one PoC 只能填一个"对内外都可达"的地址，导致 CP↔MinIO
+绕宿主 hairpin。
+
+### 决策
+
+- **配置拆分**：新增 `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_USE_SSL`，**缺省回落 = 内网
+  `MINIO_ENDPOINT` / `MINIO_USE_SSL`**（单端点部署零改动，向后兼容）。
+- **STS**：`STSManager` 加 `publicEndpoint`/`publicUseSSL`，`NewSTSManager` 默认置为内网值；
+  新增流式 `WithPublicEndpoint(endpoint, useSSL)`（现有 5 处调用点签名不变）。`AssumeRole` 仍走
+  internal，返回给 agent 的 payload 用 public。
+- **presign**：`main.go` 另建一个 public endpoint 的 MinIO client 供 presigner（本地签名、不发网络，
+  只修正 URL 的签名 host）；内网 client 留给建桶 admin。
+- **端点角色**（gateway 无关）：internal = CP↔MinIO（AssumeRole + 建桶）；public = STS payload endpoint +
+  presign host，须对浏览器/agent 可达。prod compose 固定 `MINIO_ENDPOINT=minio:9000`（内网）+
+  必填 `MINIO_PUBLIC_ENDPOINT`（宿主 LAN IP / 网关地址）。
+
+### 备选方案（被否决）
+
+- **一次性上生产网关反代（Caddy `minio.<domain>` 子域 + TLS）**：生产网关未必是 Caddy；MinIO 经网关
+  暴露是 gateway 特定改动，与本次"消除 hairpin 的 Go/config 拆分"解耦。本 PR 只做 gateway 无关的端点拆分，
+  网关反代留作后续（文档已 gateway 无关地写）。
+- **presigner 复用内网 client**：presign 是本地签名，host 必须等于客户端实际访问地址，复用内网 host 会签出
+  不可达 URL。故必须用 public endpoint 单独构造 presign client。

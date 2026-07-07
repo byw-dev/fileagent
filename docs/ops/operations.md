@@ -15,7 +15,7 @@ CP **仅从环境变量**读取配置，启动时校验并一次性报出所有�
 | `DATABASE_URL` | `postgres://user:pass@host:5432/fileagent?sslmode=disable` |
 | `REDIS_URL` | `redis://[:pass@]host:6379/0`（`rediss://` 走 TLS） |
 | `JWT_SECRET` | JWT 签名密钥（HMAC-SHA256），强随机 ≥32 字节 |
-| `MINIO_ENDPOINT` | `host:port`（无 scheme，由 `MINIO_USE_SSL` 决定） |
+| `MINIO_ENDPOINT` | 内网端点，CP 自身调用（STS AssumeRole + 建桶）用；`host:port`（无 scheme，由 `MINIO_USE_SSL` 决定） |
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | CP 访问 MinIO 的凭据（用于签发 STS） |
 | `NATS_URL` | `nats://host:4222`（JetStream 需开启） |
 
@@ -26,7 +26,9 @@ CP **仅从环境变量**读取配置，启动时校验并一次性报出所有�
 | `HTTP_PORT` | `8080` | REST + Web UI 端口 |
 | `GRPC_PORT` | `9090` | Agent gRPC 端口 |
 | `LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
-| `MINIO_USE_SSL` | `false` | MinIO 客户端 TLS |
+| `MINIO_USE_SSL` | `false` | 内网 MinIO 客户端 TLS |
+| `MINIO_PUBLIC_ENDPOINT` | =`MINIO_ENDPOINT` | 面向客户端的端点：写入 STS payload 交给 agent、并作为 presign URL 的 host；须对浏览器/agent 可达（D-024） |
+| `MINIO_PUBLIC_USE_SSL` | =`MINIO_USE_SSL` | public 端点 TLS |
 | `MINIO_ROLE_ARN` | `arn:aws:iam:::role/agent-role` | STS AssumeRole |
 | `JWT_ACCESS_TOKEN_TTL` | `2h` | 用户 access token |
 | `JWT_REFRESH_TOKEN_TTL` | `720h` | 用户 refresh token |
@@ -109,7 +111,7 @@ K8s livenessProbe / LB 心跳。**Readiness**（依赖是否 OK）通过实际�
 | 下载文件名变成哈希/UUID | 浏览器对跨域 `a.download` 忽略；presign 需带 `response-content-disposition`（已知项） |
 | Agent 显示离线但进程在跑 | 心跳/Redis TTL；CP 有 TTL 驱动的离线兜底扫描（CC-6） |
 | prod compose 里 MinIO 永不 healthy | healthcheck 用镜像内 `mc ready local`；**新版 `minio/minio` 已不再随镜像带 `mc`**（移到 `minio/mc`）。compose 因此 pin 了内置 mc 的版本；若升级镜像，改用 `minio/mc` sidecar 或 mc-free 健康检查（如探 `/minio/health/live`） |
-| 浏览器/agent 无法下载或上传 | presign/STS 里的 MinIO host 不可达：compose 的 `MINIO_PUBLIC_ENDPOINT` 须为对客户端可达的地址（非内网 `minio:9000`）；生产应经网关暴露 MinIO（见部署指南 follow-up） |
+| 浏览器/agent 无法下载或上传 | presign/STS 里的 MinIO host 不可达：`MINIO_PUBLIC_ENDPOINT` 须为对客户端可达的地址（非内网 `minio:9000`）。CP 自身走 `MINIO_ENDPOINT`（内网），两者已拆分（D-024）；生产应经 TLS 网关暴露 MinIO 并把 `MINIO_PUBLIC_ENDPOINT` 指向网关地址 |
 
 ---
 
