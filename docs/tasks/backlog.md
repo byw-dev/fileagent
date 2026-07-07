@@ -89,6 +89,42 @@ CP↔MinIO 不再 hairpin。
 
 ---
 
+## 前端重做实现（Half A）
+
+**来源**：Claude Design 项目「前端页面重做计划」（2026-07-07，登录态私有）。设计规范与分页意图已落文档：
+[`docs/design/webui-redesign.md`](../design/webui-redesign.md)。
+
+**性质**：纯前端（webui），**无后端契约改动**——统一既有页面的视觉与交互。
+
+**建议切分**（每页独立 PR + review，实现后对照规范与快照核验）：
+1. **主题 + 骨架**：`webui/src/main.tsx` 注入 `theme={{ token, components }}`（§1 色彩/字号/尺寸）、
+   208px 固定 Sider、统一「圆点 + 文字」状态徽标（升级 `AgentStatusBadge`）、7 条交互定则的通用件
+   （480px 抽屉、危险确认弹窗、顶部单行筛选栏、骨架屏/空态/内联错误）。
+2. **按页**：仪表盘 → 采集器（+ 规则三步抽屉 `2a–2d`）→ 文件（+ 详情抽屉 / 类型树）→ 文件类型 →
+   事件规则（+ 投递历史）→ Bucket → 上传日志 → 登录 / 用户管理。映射见规范 §4。
+
+## 元数据 / 标签 / 数据集能力（epic · 已拍板 6c，D-025）
+
+**来源**：Claude Design round 6–7；已拍板混合模型 `6c`（D-025）。**权威设计**：
+[`docs/design/metadata-model.md`](../design/metadata-model.md)（Phase 1 工程设计 + Phase 2 留存）。
+
+**Phase 1 · 受控标签（已设计，待实现）** —— 纯 CP + webui，**不改 agent / proto**（打标在 CP 侧）。子任务：
+1. 迁移：`tag_keys` / `tag_values` / `file_tags` / `pending_tag_values` / `tag_audit`（只追加）。
+2. sqlc 查询 + `internal/indexer` 打标引擎（静态标签 + 路径变量抽取 + 未登记值入待确认队列 + 幂等）。
+3. `classifier.go` 优先级：规则声明类型 > glob 兜底。
+4. REST：词表 CRUD、待确认 approve/merge/reject、`GET /api/v1/files` 增可重复 `tag` 筛选（扩
+   `RejectUnknownQuery`、保持 cursor 分页）。
+5. 回溯打标 worker（改规则/词表触发）。
+6. webui `7a`–`7d`（规则表单元数据步骤 / 文件页 faceted 筛选 / 标签词表 / 待确认队列）。
+
+每步独立 PR + review；改契约前在 `DECISIONS.md` 记录。
+
+**Phase 2 · 数据集注册表（deferred）** —— 命名标签组合谓词 + 对账/血缘/SDK 订阅名，薄层不动文件表。
+**设计已完整留存**于 `metadata-model.md` 的「Phase 2」章节；出现对账/血缘/SDK 订阅需求时再起，届时补 D- 子决策
+与迁移。
+
+---
+
 ## 已知技术债（低优先级，Phase 4 可处理）
 
 | 描述 | 来源 | 优先级 |

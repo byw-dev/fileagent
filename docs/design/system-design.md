@@ -479,6 +479,12 @@ CREATE TABLE file_entries (
 );
 ```
 
+> **文件元数据 / 标签模型（6c，Phase 1，已拍板 D-025 · 待实现）**：在 `file_types`（粗分类，降级为兜底）之上
+> 引入**受控标签**——`tag_keys` 词表 / `tag_values` 受控取值 / `file_tags`（文件↔key:value）/ `pending_tag_values`
+> 待确认队列 / `tag_audit`。规则在 `collection_rules.metadata` 声明 `file_type + static_tags + path_tag_map`，CP 在
+> 索引阶段打标（不改 agent/proto）。**Phase 2（数据集注册表）暂缓**。完整数据模型与 DDL 草案见
+> [`metadata-model.md`](./metadata-model.md)。
+
 ### 3.3.9 上传日志表
 
 ```sql
@@ -1396,6 +1402,11 @@ func (e *FileIndexer) HandleUploadResult(result *UploadResult) error {
     return err
 }
 ```
+
+> **打标引擎（6c，Phase 1，D-025 · 待实现）**：本引擎将在 `UpsertFileEntry` 后追加打标——从规则 `metadata`
+> 写静态标签、按 `path_tag_map` 从 storage path 用 trollsift 变量抽取路径标签（未登记值进 `pending_tag_values`
+> 待确认队列），幂等写入 `file_tags`；`matchFileType` 改为**规则声明类型优先、glob 兜底**。REST 侧文件查询增
+> 可重复 `tag` 谓词筛选（保持 cursor 分页）。设计见 [`metadata-model.md`](./metadata-model.md)。
 
 ## 5.9 事件规则引擎
 

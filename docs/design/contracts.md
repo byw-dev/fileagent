@@ -199,6 +199,14 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 
 ---
 
+## 规划中（未实现，不作为现行契约）
+
+- **元数据 / 标签（6c Phase 1，D-025）**：将新增若干跨模块契约——待确认取值队列（`pending_tag_values.status`
+  当前设计仅 `pending` 一个活跃态，核准/合并/拒绝即出队，非多态状态机）、文件筛选可重复
+  `tag` 查询参数（保持 cursor 分页 V-2）、规则 `metadata.path_tag_map` 复用 trollsift 变量（V-3）。**设计见**
+  [`metadata-model.md`](./metadata-model.md)；**实现后**再在本文补入带 `file:line` 权威的正式条目（现在写入会与
+  "本文档只记既有契约"原则相悖）。
+
 ## 关联
 
 - 契约文件总规则：`CLAUDE.md`「契约文件」表 + 「文档权威优先级」块

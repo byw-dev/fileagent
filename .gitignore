@@ -164,3 +164,6 @@ root/
 /deploy/config/
 /agent/config.toml
 .claude/settings.local.json
+
+# Claude Design handoff bundles (local design reference; decisions land in docs/design/)
+*-handoff.zip
