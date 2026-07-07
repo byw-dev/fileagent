@@ -1,0 +1,44 @@
+# FileAgent Control Plane — systemd unit (host deployment).
+#
+# Install:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin fileagent
+#   sudo install -D -m 0755 bin/controlplane /opt/fileagent/controlplane
+#   sudo install -D -m 0640 -o fileagent controlplane/.env.example \
+#        /etc/fileagent/controlplane.env      # then edit the secrets
+#   sudo cp deploy/systemd/controlplane.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now controlplane
+#
+# DB migrations are embedded in the binary and applied automatically at startup
+# (D-023) — no migrations directory or migrate CLI needs to be present on the host.
+
+[Unit]
+Description=FileAgent Control Plane
+Documentation=https://github.com/byw-dev/fileagent/blob/master/docs/ops/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fileagent
+Group=fileagent
+EnvironmentFile=/etc/fileagent/controlplane.env
+ExecStart=/opt/fileagent/controlplane
+Restart=on-failure
+RestartSec=5
+
+# The bootstrap admin credentials file (BOOTSTRAP_ADMIN_CREDENTIALS_FILE) is
+# written under this state directory on first start. StateDirectory creates
+# /var/lib/fileagent owned by the service user; set the credentials path and
+# WorkingDirectory to it in controlplane.env / here.
+StateDirectory=fileagent
+WorkingDirectory=/var/lib/fileagent
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

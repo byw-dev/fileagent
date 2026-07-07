@@ -1,0 +1,18 @@
+# Keep the Docker build context small and reproducible.
+# The Web UI is built inside the image (webui-builder stage), so exclude any
+# local node_modules and stale dist; the Go build re-embeds a fresh dist.
+.git
+bin/
+**/node_modules
+webui/dist
+controlplane/internal/webui/dist
+**/coverage.out
+**/coverage.html
+**/*.log
+sdk/
+docs/
+.github/
+# Local state / secrets that must never enter an image.
+**/.env
+**/bootstrap_admin_credentials.txt
+deploy/

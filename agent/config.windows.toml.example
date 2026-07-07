@@ -1,0 +1,35 @@
+# FileAgent Edge Agent — Windows configuration template.
+# Copy to C:\ProgramData\fileagent\agent.toml and adjust values.
+# Paths use the Windows ProgramData location; TOML accepts forward slashes,
+# which avoids backslash-escaping.
+
+[server]
+# gRPC endpoint of the Control Plane (host:port). When fronted by the Caddy
+# gateway this is the gRPC listener (e.g. cp.example.com:9443).
+endpoint = "cp.example.com:9443"
+# Path to the CA certificate that signed the Control Plane's TLS cert. Required
+# when using Caddy's internal CA (export it with `caddy trust` / step-ca).
+tls_ca_cert = "C:/ProgramData/fileagent/ca.pem"
+
+[agent]
+fingerprint_file = "C:/ProgramData/fileagent/fingerprint"
+token_file = "C:/ProgramData/fileagent/token.enc"
+data_dir = "C:/ProgramData/fileagent"
+
+[upload]
+concurrency = 3
+part_size_mb = 64
+queue_max_size = 10000
+retry_max = 10
+
+[metrics]
+enabled = true
+port = 9100
+
+[log]
+# The agent currently logs to stdout/stderr; NSSM captures it to the files
+# configured by install-agent.ps1. These fields are reserved (not yet wired).
+level = "info"
+output = "C:/ProgramData/fileagent/logs/agent.log"
+max_size_mb = 100
+max_backups = 7

@@ -7,6 +7,7 @@
 #   make build            — 构建全部二进制（controlplane + agent，纯 Go，不需要 Node）
 #   make build-controlplane — 仅构建 controlplane（纯 API，不含前端）
 #   make build-agent      — 仅构建 agent
+#   make build-agent-windows — 交叉编译 Windows agent.exe（需 mingw-w64；权威产物见 CI）
 #   make bundle           — 构建含 Web UI 的单文件 controlplane（+ agent）；需 Node 24 / pnpm 11
 #   make build-webui      — 编译 webui 并拷贝 dist 至 controlplane 嵌入目录
 #   make generate         — 重新生成所有代码生成产物（sqlc → controlplane/internal/db）
@@ -21,7 +22,7 @@ BIN_DIR := bin
 
 WEBUI_EMBED_DIR := controlplane/internal/webui/dist
 
-.PHONY: build build-controlplane build-agent bundle build-webui build-controlplane-bundle generate generate-sqlc test tidy clean
+.PHONY: build build-controlplane build-agent build-agent-windows bundle build-webui build-controlplane-bundle generate generate-sqlc test tidy clean
 
 ## build: 构建全部二进制（纯 Go，不含前端）
 build: build-controlplane build-agent
@@ -35,6 +36,18 @@ build-controlplane:
 build-agent:
 	@mkdir -p $(BIN_DIR)
 	cd agent && go build -o ../$(BIN_DIR)/agent ./cmd/agent
+
+## build-agent-windows: 交叉编译 Windows agent.exe（best-effort，见下方说明）
+#  agent 依赖 mattn/go-sqlite3（CGO），从非 Windows 交叉编译需要 mingw-w64 工具链：
+#    macOS:  brew install mingw-w64
+#    Debian: apt-get install gcc-mingw-w64-x86-64
+#  权威 Windows 产物由 CI 生成（.github/workflows/build-agent.yml → agent-windows-amd64）；
+#  本目标仅供本地快速出包。CC 可用环境变量覆盖。
+CC_WINDOWS ?= x86_64-w64-mingw32-gcc
+build-agent-windows:
+	@mkdir -p $(BIN_DIR)
+	cd agent && GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=$(CC_WINDOWS) \
+		go build -o ../$(BIN_DIR)/agent.exe ./cmd/agent
 
 ## bundle: 构建含 Web UI 的单文件 controlplane（+ agent）
 bundle: build-webui build-controlplane-bundle build-agent

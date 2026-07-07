@@ -19,6 +19,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/byw-dev/fileagent/controlplane/migrations"
 )
 
 func testDSN(t *testing.T) string {
@@ -52,12 +54,13 @@ func TestMigrate_IdempotentOnCleanDB(t *testing.T) {
 	dsn := testDSN(t)
 	logger := testLogger(t)
 
-	// First run: apply all migrations.
-	err := Migrate(dsn, "../../migrations", logger)
+	// First run: apply all migrations from the embedded FS (same source the
+	// server uses in production).
+	err := Migrate(dsn, migrations.FS, logger)
 	require.NoError(t, err)
 
 	// Second run: should be a no-op (ErrNoChange handled gracefully).
-	err = Migrate(dsn, "../../migrations", logger)
+	err = Migrate(dsn, migrations.FS, logger)
 	require.NoError(t, err)
 }
 

@@ -25,10 +25,6 @@ type Config struct {
 	// Example: postgres://user:pass@localhost:5432/fileagent?sslmode=disable
 	DatabaseURL string
 
-	// MigrationsPath is the directory that contains golang-migrate SQL files.
-	// Defaults to "migrations" (relative to working directory).
-	MigrationsPath string
-
 	// RedisURL is the Redis connection URL (required).
 	// Example: redis://:password@localhost:6379/0
 	RedisURL string
@@ -104,7 +100,6 @@ func Load() (*Config, error) {
 	if cfg.DatabaseURL == "" {
 		missing = append(missing, "DATABASE_URL")
 	}
-	cfg.MigrationsPath = envString("MIGRATIONS_PATH", "migrations")
 
 	// ── redis ─────────────────────────────────────────────────────────────────
 	cfg.RedisURL = os.Getenv("REDIS_URL")

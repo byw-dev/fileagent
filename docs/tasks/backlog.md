@@ -12,7 +12,7 @@
 |----|------|---------|------|
 | T4-1 | 监控配置 | Prometheus 抓取端点 + Grafana Dashboard 模板 + 告警规则 + Loki/Promtail 日志采集 | ⬜ |
 | T4-2 | CI 配置 | GitHub Actions Workflows：controlplane / agent / webui / sdk-python 四条流水线（lint + test + build） | ⬜ |
-| T4-3 | 部署脚本与文档 | systemd service 文件；Windows 安装脚本（NSSM 封装）；README 快速上手指南；运维手册 | ⬜ |
+| T4-3 | 部署脚本与文档 | 迁移嵌入二进制（D-023）；Dockerfile + prod compose + Caddyfile；systemd service 文件；Windows NSSM 脚本；README 生产部署段；`docs/ops/` 部署+运维手册 | ✅ |
 | T4-4 | Java SDK | OkHttp3 + Jackson + Lombok；JUnit 5 + MockWebServer；功能对齐 Python SDK | ⬜ |
 | T4-5 | Agent 重命名 | 管理员可在 Web UI 为采集器设置自定义显示名；前置依赖：T3-6-BUG-A 已修复 | ⬜ |
 | T4-6 | 采集规则原地编辑 | 在规则列表中增加编辑入口，复用三步创建 Wizard 并回填已有值；后端扩展 PUT 接口支持全字段更新 | ⬜ |
@@ -71,6 +71,29 @@
 - [ ] agent 离线时编辑规则，重连后规则自动同步为新配置
 - [ ] Step 3 Dry-Run 在 edit 模式下可跳过
 - [ ] 编辑时规则 ID 不变，历史上传日志保持关联
+
+---
+
+## Follow-up：生产 MinIO 暴露 — 网关反代 + internal/public endpoint 拆分
+
+**来源**：PR #61（T4-3）review。**背景**：当前单一 `MINIO_ENDPOINT` 同时承担 CP↔MinIO 与"交给
+agent/浏览器的客户端 URL"两种角色；all-in-one PoC 只能填一个对内外都可达的地址，导致 CP↔MinIO 绕宿主
+hairpin，且 MinIO 直发 host（非生产做法）。
+
+**目标**：生产形态——MinIO 经 Caddy 反代暴露（TLS，不直发 host），CP 走内网、客户端走网关 URL。
+
+**端点角色**：STS AssumeRole 调用（`internal/storage/sts.go:47`）= internal；STS 返回给 agent 的
+`Endpoint`（`sts.go:76`）= public；presign host（`cmd/server/main.go:202` client → `handler/files.go`，
+本地签名不发网络）= public；建桶 admin（`minioBucketMaker` `main.go:58`）= internal。
+
+**做法**：
+- config 加 `MINIO_PUBLIC_ENDPOINT` / `MINIO_PUBLIC_USE_SSL`，**缺省回落 = 内网值**（向后兼容）。
+- `sts.go` 加流式 `WithPublicEndpoint(endpoint, useSSL)`（零改现有 5 处 `NewSTSManager` 测试调用点）；
+  AssumeRole 用 internal、返回 payload 用 public。
+- `main.go` 另建 public presign client（本地签名，不发网络，无 hairpin）；内网 client 留给 admin。
+- `deploy/caddy/Caddyfile` 加 `minio.<domain>` 反代站点（TLS）→ `minio:9000`；prod compose 去掉 MinIO
+  host 直发，`MINIO_ENDPOINT=minio:9000`（内网）+ `MINIO_PUBLIC_ENDPOINT=<caddy minio url>`。
+- 测试：sts 单测/集成断言 public 值透出；config 回落单测。
 
 ---
 

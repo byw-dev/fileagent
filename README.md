@@ -198,8 +198,8 @@ docker compose -f docker-compose.dev.yml ps
 ### 2. 初始化数据库
 
 > 说明：这一步是**可选**的。`controlplane` 启动时会自动执行数据库迁移（`db.Migrate`）。
-> 仅当你希望手动提前迁移，或单独排查迁移问题时，才需要执行下面命令。
-> 若依赖自动迁移，请确保运行环境能访问 `MIGRATIONS_PATH` 指向的 SQL 脚本目录（默认 `./migrations`）。
+> 迁移文件已**嵌入二进制**（`//go:embed`，见 D-023），无需 `MIGRATIONS_PATH`、也无需随二进制分发
+> `migrations/` 目录。仅当你希望手动提前迁移，或单独排查迁移问题时，才需要用下面的 golang-migrate CLI。
 
 ```bash
 export DATABASE_URL="postgres://fileagent:fileagent@localhost:5432/fileagent?sslmode=disable"
@@ -243,6 +243,27 @@ cp agent/config.toml.example agent/config.toml
 
 首次启动时，如果数据库中没有用户，controlplane 会自动创建 `admin` 超级管理员，并将一次性凭据写入 `BOOTSTRAP_ADMIN_CREDENTIALS_FILE`。  
 如发生管理员密码丢失，可设置 `BOOTSTRAP_ADMIN_PASSWORD` + `BOOTSTRAP_ADMIN_FORCE_RESET=true` 临时重置，恢复后请立即关闭该开关。
+
+---
+
+## 生产部署（单二进制分发）
+
+`make bundle` 产出**自包含**的 Control Plane 二进制——Web UI（D-022）与数据库迁移（D-023）均已内嵌，
+分发时**无需**随行 `migrations/` 目录或单独的前端静态站点，迁移在启动时自动应用。
+
+```bash
+make bundle          # bin/controlplane（内嵌 Web UI + 迁移）+ bin/agent
+```
+
+两条部署路径（完整步骤见运维文档）：
+
+- **容器 all-in-one**：`docker compose -f deploy/docker-compose.prod.yml up -d --build`
+  （PG/Redis/NATS/MinIO + CP + Caddy TLS 网关一把梭）。
+- **主机 systemd**：`deploy/systemd/controlplane.service` + `fileagent-agent.service`；
+  Windows agent 见 `deploy/windows/install-agent.ps1`（NSSM）。
+
+📖 **部署指南**：[`docs/ops/deployment.md`](docs/ops/deployment.md) ·
+**运维手册**（配置参考/升级/备份/排障）：[`docs/ops/operations.md`](docs/ops/operations.md)
 
 ---
 

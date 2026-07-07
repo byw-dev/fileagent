@@ -1,0 +1,40 @@
+# Caddy reverse proxy for the all-in-one FileAgent deployment.
+#
+# The Control Plane serves the REST API, the internal webhook endpoint, the
+# health check AND the embedded Web UI (SPA) all on a single HTTP port (8080),
+# doing its own /api vs SPA routing internally (see D-022). Caddy therefore just
+# terminates TLS and forwards everything to it — no per-path rules needed here.
+#
+# Agents speak gRPC to a separate port (9090). That is exposed on its own TLS
+# listener so edge agents can dial it with the internal CA.
+#
+# `tls internal` uses Caddy's built-in CA (self-signed) — convenient for a local
+# all-in-one / PoC. In production replace it with a real certificate:
+#   - `tls you@example.com` for automatic Let's Encrypt (public domain), or
+#   - `tls /path/cert.pem /path/key.pem` for a provided cert, or
+#   - point at an internal ACME CA (step-ca) per system-design.md §10.5.
+
+{
+	# Silence the automatic HTTP->HTTPS behavior noise in a PoC; remove in prod.
+	admin off
+}
+
+# ── Web UI + REST API (browser / SDK facing) ────────────────────────────────
+# Replace :443 with your public domain (e.g. fileagent.example.com) in prod.
+:443 {
+	tls internal
+	reverse_proxy controlplane:8080
+}
+
+# Redirect plain HTTP to HTTPS.
+:80 {
+	redir https://{host}{uri} permanent
+}
+
+# ── Agent-facing gRPC ───────────────────────────────────────────────────────
+# Agents point AGENT_SERVER_ENDPOINT at host:9443 and trust the internal CA
+# (export it and set AGENT_SERVER_TLS_CA_CERT). Upstream is HTTP/2 cleartext.
+:9443 {
+	tls internal
+	reverse_proxy h2c://controlplane:9090
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"testing"
+	"testing/fstest"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
@@ -98,12 +99,15 @@ func TestOpen_InvalidDSN_ReturnsError(t *testing.T) {
 
 // ── migrate.go (Migrate) ──────────────────────────────────────────────────────
 
-func TestMigrate_InvalidSource_ReturnsError(t *testing.T) {
+func TestMigrate_EmptySource_ReturnsError(t *testing.T) {
 	logger := zap.NewNop()
-	// A non-existent source directory causes migrate.New to fail.
+	// An empty source FS (no *.sql files) is rejected by Migrate's source
+	// preflight (source.First) before Postgres is dialed, so this stays a pure
+	// unit test — the unreachable DSN is never contacted.
 	err := Migrate("postgres://user:pass@127.0.0.1:19999/nonexistent?sslmode=disable",
-		"/tmp/nonexistent-migrations-dir-xyz", logger)
+		fstest.MapFS{}, logger)
 	require.Error(t, err)
+	require.Contains(t, err.Error(), "no migrations found")
 }
 
 // ── DB.Ping ───────────────────────────────────────────────────────────────────

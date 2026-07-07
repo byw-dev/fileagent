@@ -2152,9 +2152,14 @@ groups:
 
 Control Plane 支持把编译后的 Web UI（`webui/dist`）**嵌入自身二进制**，运维只需分发一个
 `controlplane` 二进制即可同时提供 REST API 与 Web 管理界面，无需额外部署静态站点或前置代理转发。
+数据库迁移同样**嵌入二进制**（`//go:embed`，见 §10.6 / D-023），启动时自动应用——分发时无需随行
+`migrations/` 目录，真正做到"一个二进制 + 一份配置"。
 
 - 构建：`make bundle`（编译 webui → 拷入 CP 嵌入目录 → `go build -tags webui`）。默认 `make build`
-  仍产出**纯 API** 二进制（不含前端，`/` 返回 404）。见 [D-022]。
+  仍产出**纯 API** 二进制（不含前端，`/` 返回 404）。见 [D-022]、[D-023]。
+- 落地产物：`controlplane/Dockerfile`（多阶段，运行镜像不含 migrations/）、
+  `deploy/docker-compose.prod.yml`（全栈 all-in-one）、`deploy/caddy/Caddyfile`；主机部署见
+  `deploy/systemd/*.service`。完整步骤见 `docs/ops/deployment.md`。
 - 路由：SPA 由 CP 的 HTTP 服务在**同源**下提供——API 全在 `/api/*`、`/internal/*`、`/healthz`，
   其余路径服务前端静态文件，未命中的客户端路由回退 `index.html`（BrowserRouter）。
 - 同源提供 → **无需 CORS**；webui 的 API base 为相对路径 `/`（`webui/src/services/api.ts`）。
@@ -2172,48 +2177,11 @@ Control Plane 支持把编译后的 Web UI（`webui/dist`）**嵌入自身二进
 
 ## 10.3 systemd Service 文件
 
-### Control Plane
-
-```ini
-# /etc/systemd/system/controlplane.service
-[Unit]
-Description=FileAgent Control Plane
-After=network-online.target postgresql.service redis.service nats.service
-
-[Service]
-Type=simple
-User=fileagent
-EnvironmentFile=/etc/fileagent/controlplane.env
-ExecStart=/opt/fileagent/controlplane/server
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65536
-NoNewPrivileges=true
-ProtectSystem=strict
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Edge Agent（边缘设备安装）
-
-```ini
-# /etc/systemd/system/fileagent.service
-[Unit]
-Description=FileAgent Edge Collector
-After=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/opt/fileagent/fileagent --config /etc/fileagent/config.toml
-Restart=always
-RestartSec=10
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-```
+> **权威文件**（可直接使用）：`deploy/systemd/controlplane.service` 与
+> `deploy/systemd/fileagent-agent.service`；安装步骤见 `docs/ops/deployment.md` 路径 B。
+> CP 单元 `ExecStart=/opt/fileagent/controlplane`（单二进制，内嵌 Web UI + 迁移，无需
+> `WorkingDirectory` 指向 migrations），`StateDirectory=fileagent` 承载 bootstrap 凭据文件；
+> agent 单元 `StateDirectory` 承载 SQLite 队列/指纹/token，日志由 journald 捕获。
 
 ## 10.4 Caddy 网关配置
 
@@ -2268,16 +2236,24 @@ step ca root > /etc/fileagent/ca-root.crt
 
 ## 10.6 数据库初始化与迁移方案
 
-```bash
-# 首次部署
-migrate -database "$DATABASE_URL" -path ./migrations up
+迁移文件（`controlplane/migrations/*.sql`）经 `//go:embed` **嵌入 CP 二进制**
+（`controlplane/migrations/embed.go`），Control Plane 启动时用 golang-migrate 的 `iofs` source
+**自动应用**（幂等：已最新则 no-op），见 [D-023]。因此：
 
-# 迁移文件命名规范
-migrations/
+- 生产部署**无需** `migrate` CLI，也无需随二进制分发 `migrations/` 目录或设置 `MIGRATIONS_PATH`
+  （该配置项已移除）。
+- 升级只需发布新二进制并重启——新迁移在启动时应用。迁移文件**只追加不改**（契约约束）。
+
+```
+# 迁移文件命名规范（golang-migrate）
+controlplane/migrations/
 ├── 000001_init_schema.up.sql
 ├── 000001_init_schema.down.sql
 └── ...
 ```
+
+> 开发期如需手动操作，仍可用 golang-migrate CLI：
+> `migrate -database "$DATABASE_URL" -path controlplane/migrations up`。
 
 ## 10.7 版本升级策略
 

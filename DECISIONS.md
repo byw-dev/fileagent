@@ -865,3 +865,44 @@ Makefile（`bundle` 目标）、构建/分发流程
 - **前端独立部署 + 反向代理**：仍是有效的生产形态（§10.4 Caddy），但单二进制对小规模/离线分发更省事，
   二者并存不冲突。
 - **第三方 gin 静态中间件**：标准库 `embed` + `http.FS` + `c.FileFromFS` 已足够，不引额外依赖。
+
+---
+
+## D-023：迁移嵌入二进制 + 参考生产部署形态（落成 §10）
+
+**决策日期**：2026-07-06
+**影响范围**：controlplane（`internal/db/migrate.go`、`cmd/server`、`internal/config` 去 `MIGRATIONS_PATH`、
+新增 `migrations/embed.go`）、部署脚手架（`controlplane/Dockerfile`、`deploy/docker-compose.prod.yml`、
+`deploy/caddy/Caddyfile`、`deploy/systemd/*`、`deploy/windows/*`）、运维文档（`docs/ops/`）
+**背景**：D-022 让 `make bundle` 把 Web UI 嵌入二进制，但 CP 启动时仍从**文件系统**读取迁移
+（`file://` + `MIGRATIONS_PATH`），"单二进制"实际仍需随二进制分发 `migrations/` 目录。T4-3 收尾单文件分发
+并把 §10 的部署蓝图落成可运行产物。
+
+### 决策
+
+- **迁移嵌入二进制**：新增 `controlplane/migrations/embed.go`（`//go:embed *.sql`），`db.Migrate` 改用
+  golang-migrate 的 `source/iofs` + `NewWithSourceInstance`，签名从 `(dsn, path, logger)` 改为
+  `(dsn, fs.FS, logger)`，由 `main` 传入嵌入的 `migrations.FS`。**删除 `MIGRATIONS_PATH` 配置**——
+  嵌入后不再需要外部路径，保留 escape-hatch 只会稀释"自包含"的意义。启动时自动幂等应用，日志不变。
+  `migrations/` 位置不变（仍是 §"契约文件"里的迁移目录，只追加不改），仅新增一个 embed 声明文件。
+- **参考生产形态（容器 all-in-one）**：`controlplane/Dockerfile` 多阶段（node 构建 webui → go `-tags webui`
+  静态编译 → alpine 运行镜像；**镜像不含 migrations/**，证明自包含）；`deploy/docker-compose.prod.yml`
+  起全栈（PG/Redis/NATS-JS/MinIO + CP + Caddy）；`deploy/caddy/Caddyfile` 终结 TLS，`/`（含 API+SPA）
+  反代 CP:8080，agent gRPC 走独立 TLS 监听反代 `h2c://CP:9090`。
+- **参考生产形态（主机 systemd）**：`deploy/systemd/controlplane.service` +
+  `fileagent-agent.service` 落成 §10.3（`StateDirectory` 承载 bootstrap 凭据/agent 队列；因迁移已嵌入，
+  无需 `WorkingDirectory` 指向 migrations）。
+- **Windows agent**：`deploy/windows/install-agent.ps1`（NSSM 封装 `agent.exe`，捕获 stdout 到日志文件）+
+  `agent/config.windows.toml.example`。Makefile 新增 best-effort `build-agent-windows`
+  （CGO/mingw；权威产物仍由 CI `build-agent.yml` 出）。
+
+### 备选方案（被否决）
+
+- **保留 `MIGRATIONS_PATH` 作为 override**：与"自包含单文件"目标相悖，且多一条运行时分支；
+  紧急改迁移应走正常发版（迁移只追加）。
+- **迁移目录移入 `internal/db`**：`migrations/` 是既有契约路径（CLAUDE.md 列为迁移目录），迁移会破坏引用；
+  在原地加一个 `embed.go` 更省事、零迁移风险。
+- **distroless 运行镜像**：更小更安全，但无 shell 难以在 all-in-one PoC 里排障 / 读取 bootstrap 凭据；
+  alpine 运行镜像（+ 专用非 root 用户 + `/data` 卷）更适合运维上手。生产可自行换 distroless。
+- **compose 内自动跑 init-minio**：`init-minio.sh` 依赖 bash + mc + 服务重启时序，塞进一次性容器较脆；
+  改为文档化的一次性手动步骤（建桶/webhook 只需跑一次）。

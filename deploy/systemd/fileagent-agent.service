@@ -1,0 +1,42 @@
+# FileAgent Edge Agent — systemd unit (Linux host / edge device).
+#
+# Install:
+#   sudo install -D -m 0755 bin/agent /opt/fileagent/agent
+#   sudo install -D -m 0640 agent/config.toml.example /etc/fileagent/agent.toml
+#        # then edit server.endpoint and paths
+#   sudo cp deploy/systemd/fileagent-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now fileagent-agent
+#
+# On first start the agent registers with the Control Plane and waits for an
+# admin to approve it in the Web UI before it begins collecting (see
+# docs/ops/deployment.md → "Agent enrollment").
+
+[Unit]
+Description=FileAgent Edge Agent
+Documentation=https://github.com/byw-dev/fileagent/blob/master/docs/ops/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The agent watches host paths; run as a user with read access to them. root is
+# the simplest default for collecting arbitrary directories — narrow it down to
+# a dedicated user with ACLs where possible.
+User=root
+ExecStart=/opt/fileagent/agent --config /etc/fileagent/agent.toml
+Restart=always
+RestartSec=10
+
+# SQLite queue, fingerprint and encrypted token live here (data_dir in the
+# config). A dedicated StateDirectory (/var/lib/fileagent-agent) avoids clashing
+# with the Control Plane unit's /var/lib/fileagent when both run on one host —
+# they use different users (root vs fileagent), so sharing the directory would
+# cause ownership churn. Point the agent config's data_dir here.
+StateDirectory=fileagent-agent
+
+# The agent logs to stdout/stderr; journald captures it (the config's log.output
+# / rotation fields are not yet wired — rely on journald rotation).
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

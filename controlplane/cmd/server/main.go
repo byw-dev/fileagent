@@ -29,6 +29,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
 	"github.com/byw-dev/fileagent/controlplane/internal/webui"
 	"github.com/byw-dev/fileagent/controlplane/internal/worker"
+	"github.com/byw-dev/fileagent/controlplane/migrations"
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	natsgo "github.com/nats-io/nats.go"
@@ -103,7 +104,7 @@ func main() {
 	defer logger.Sync() //nolint:errcheck
 
 	// ── Run migrations ───────────────────────────────────────────────────────
-	if err := db.Migrate(cfg.DatabaseURL, cfg.MigrationsPath, logger); err != nil {
+	if err := db.Migrate(cfg.DatabaseURL, migrations.FS, logger); err != nil {
 		logger.Fatal("database migration failed", zap.Error(err))
 	}
 
