@@ -30,11 +30,15 @@
 Phase 0  契约定义      ✅ 100%（5/5）
 Phase 1  基础骨架      ✅ 100%（15/15）
 Phase 2  核心业务逻辑  ✅ 100%（20/20 核心 + 8/8 T2-X 遗留补完）
-Phase 3  集成联调      🔄 进行中（core-completeness 冲刺已收官）
-Phase 4  完善与收尾    🔄 进行中（T4-3 部署脚手架+运维文档 ✅；D-022 单二进制、D-023 迁移嵌入）
+Phase 3  集成联调      🔄 进行中（core-completeness 冲刺 CC-1…CC-10 已收官，CC-3 推后）
+Phase 4  完善与收尾    🔄 进行中（D-022 单二进制#60、D-023 迁移嵌入+T4-3#61、D-024 MinIO 拆分#62、D-025 元数据6c+webui重做设计#63）
 ```
 
-### Phase 3 任务明细（最新状态：2026-05-12）
+> **进度补充（2026-07-07）**：T3-x 主线后插入并收官了止血冲刺（G-1…G-5）与 core-completeness 冲刺
+> （CC-1…CC-10，CC-3 推后）；其后 Phase 4 收尾 D-022…D-025 均已合并（详见 `docs/tasks/changelog.md`）。
+> 当前态与下一步候选见 `docs/tasks/active.md`。
+
+### Phase 3 任务明细（T3-x 主线，2026-05-12）
 
 | 任务 | 状态 |
 |------|------|
@@ -47,7 +51,7 @@ Phase 4  完善与收尾    🔄 进行中（T4-3 部署脚手架+运维文档 �
 | T3-4 `pkg/trollsift` 共享路径模板库 | ✅ 已完成 |
 | T3-5 字段统一 + Bug 修复（DB/proto/agent/CP/WebUI） | ✅ 已完成 |
 | T3-6 Dry-Run 规则测试功能 | ✅ 已完成 |
-| T3-3 Python SDK + Control Plane 联调 | ⬜ 待完成（阻塞于 T3-6） |
+| T3-3 Python SDK + Control Plane 联调 | ⏸️ 已按产品决策推后（2026-07-04；暂无消费方） |
 
 ---
 

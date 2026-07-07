@@ -23,10 +23,14 @@ T3-5 字段统一 + Bug 修复 ✅
     ↓
 T3-6 Dry-Run 规则测试功能 ✅
     ↓
-（插入）止血冲刺 G-1…G-5 ✅ → core-completeness 冲刺 CC-1 ✅ / CC-2 ✅ / CC-3… 进行中
+（插入）止血冲刺 G-1…G-5 ✅ → core-completeness 冲刺 CC-1…CC-10 ✅（CC-3 推后）已收官
+    ↓
+Phase 4 收尾：D-022 单二进制#60 / D-023 迁移嵌入+T4-3#61 / D-024 MinIO 拆分#62 / D-025 元数据6c+webui重做#63 ✅ 已合并
     ↓
 T3-3 Python SDK + Control Plane 联调 ⏸️ 已推后
 ```
+
+> 当前态与下一步候选见 `docs/tasks/active.md`（无进行中实现任务；候选=元数据6c Phase1 / webui 重做 / proto→buf）。
 
 ---
 
