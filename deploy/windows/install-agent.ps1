@@ -81,5 +81,5 @@ if ($LASTEXITCODE -eq 0) {
 & $NssmExe set $ServiceName AppRotateFiles 1
 & $NssmExe set $ServiceName AppRotateBytes 10485760
 
-Write-Host "Installed service '$ServiceName'. Start it with: nssm start $ServiceName"
+Write-Host "Installed service '$ServiceName'. Start it with: & `"$NssmExe`" start $ServiceName  (or: Start-Service $ServiceName)"
 Write-Host "The agent will register with the Control Plane and wait for admin approval in the Web UI."
