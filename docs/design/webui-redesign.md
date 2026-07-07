@@ -41,9 +41,11 @@
 状态一律用**「圆点 + 文字」徽标**；同一状态在任何页面**同色、同词**。既有 `AgentStatusBadge`
 （`webui/src/components/AgentStatusBadge.tsx`）应升级为全站通用徽标并统一取色。
 
-枚举（展示词）：`online` 在线、`offline` 离线、`pending` 待审批、`revoked` 已吊销、`completed` 成功、
-`failed` 失败、`uploading` 上传中、`inactive` 已停用。大小写 / 后端枚举映射以
-[`contracts.md`](./contracts.md) V-1 为权威（如 AgentStatus `online`⇄`RUNNING`）。
+下列小写值是**语义 slug / 展示口径**（每个状态"同色同词"的统一标识），**不等同于 API / DB 的实际枚举值**：
+`online` 在线、`offline` 离线、`pending` 待审批、`revoked` 已吊销、`completed` 成功、`failed` 失败、
+`uploading` 上传中、`inactive` 已停用。**实现时必须按 [`contracts.md`](./contracts.md) V-1 做映射**——现行契约的
+前端枚举是**大写**（如 AgentStatus `RUNNING | OFFLINE | ...`，且有 DB `online` ⇄ 前端 `RUNNING` 的特例）；
+**切勿把这里的小写 slug 直接当成前端/接口枚举值**，否则会与契约不一致。
 
 ### 1.3 字体与字号阶梯（rem，root = 16px）
 
@@ -91,6 +93,10 @@
 
 **现状对齐**：`webui/src/layouts/BasicLayout.tsx` 的 `ProLayout` 已是"固定侧栏 + 流式内容"，实现沿用即可；仅需
 把侧栏按本规范固定为 208px 不可折叠（当前带折叠开关，属实现待改项）。
+
+> **实现前置（重要）**：当前 `webui/src/index.css` 的 `#root` 有 `width: 1126px; margin: 0 auto`（Vite 模板遗留），
+> 会把整个应用**锁死成 1126px 居中列**——大屏下内容区**无法真正流式**。实现期须**去掉 `#root` 的定宽约束**
+> （改为 `width: 100%`），否则即便按本规范改了 ProLayout / token，仍会被根容器宽度限制。
 
 > 本版**不做** rem 化组件尺寸、不加 min-width 断点。若日后需要「浏览器缩放整体等比放大 UI」，再单独评估把组件
 > 尺寸也改用 rem（会偏离 AntD 原生 px token，成本另计）。
