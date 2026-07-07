@@ -143,8 +143,9 @@ CREATE TABLE tag_audit (
 
 - **词表**：`GET/POST/PATCH/DELETE /api/v1/tag-keys`；`GET/POST/DELETE /api/v1/tag-keys/{key}/values`
   （删除取值不动已打标文件，仅阻止后续采集再用；super_admin 写）。
-- **待确认队列**：`GET /api/v1/pending-tag-values`；
-  `POST /api/v1/pending-tag-values/{id}:approve|merge|reject`（merge 触发回溯改写 + 审计）。
+- **待确认队列**：`GET /api/v1/pending-tag-values`；动作用 **path segment**（对齐现有约定，如
+  `POST /api/v1/agents/:id/approve`，见 `controlplane/internal/api/router.go`）——
+  `POST /api/v1/pending-tag-values/{id}/approve`、`/{id}/merge`、`/{id}/reject`（merge 触发回溯改写 + 审计）。
 - **文件按标签筛选**：`GET /api/v1/files` 增**可重复** `tag` 参数——`?tag=site:tokyo&tag=level:raw`（多条 AND）。
   须把 `tag` 加入 `middleware.RejectUnknownQuery` allowlist（`handler/files.go:103`），**保持 cursor 分页与信封
   V-2**；沿用 `db.CountFileEntriesFilter` + list 查询，标签谓词经 `file_tags` join。
