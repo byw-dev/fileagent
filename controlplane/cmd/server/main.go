@@ -189,6 +189,8 @@ func main() {
 
 	ix := indexer.NewIndexer(database, nats, logger)
 
+	// AssumeRole is dialed on the internal endpoint; the endpoint returned to
+	// agents is the client-facing public one (D-024).
 	stsMgr := storage.NewSTSManager(
 		cfg.MinIOEndpoint,
 		cfg.MinIOAccessKey,
@@ -196,15 +198,27 @@ func main() {
 		cfg.MinIORoleARN,
 		cfg.MinIOUseSSL,
 		logger,
-	)
+	).WithPublicEndpoint(cfg.MinIOPublicEndpoint, cfg.MinIOPublicUseSSL)
 
-	// ── Build MinIO client for presigned URLs ────────────────────────────────
-	minioClient, err := miniogo.New(cfg.MinIOEndpoint, &miniogo.Options{
+	// ── Build MinIO clients ───────────────────────────────────────────────────
+	// Admin client on the INTERNAL endpoint (bucket create hits MinIO over the
+	// network, so it must use the in-cluster address to avoid a host hairpin).
+	minioAdminClient, err := miniogo.New(cfg.MinIOEndpoint, &miniogo.Options{
 		Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
 		Secure: cfg.MinIOUseSSL,
 	})
 	if err != nil {
-		logger.Fatal("minio client init failed", zap.Error(err))
+		logger.Fatal("minio admin client init failed", zap.Error(err))
+	}
+	// Presign client on the PUBLIC endpoint. PresignedGetObject signs locally
+	// (no network call), so this only fixes the host the URL is signed for — it
+	// must match the address browsers/agents actually reach (D-024).
+	minioPresignClient, err := miniogo.New(cfg.MinIOPublicEndpoint, &miniogo.Options{
+		Creds:  credentials.NewStaticV4(cfg.MinIOAccessKey, cfg.MinIOSecretKey, ""),
+		Secure: cfg.MinIOPublicUseSSL,
+	})
+	if err != nil {
+		logger.Fatal("minio presign client init failed", zap.Error(err))
 	}
 
 	webhookSender := event.NewWebhookSender(event.NewDBAdapter(database), logger)
@@ -244,9 +258,9 @@ func main() {
 		UsersDB:            queries,
 		FileTypesDB:        queries,
 		FilesDB:            queries,
-		MinIOSigner:        &minioPresigner{client: minioClient},
+		MinIOSigner:        &minioPresigner{client: minioPresignClient},
 		BucketsDB:          queries,
-		MinIOAdmin:         &minioBucketMaker{client: minioClient},
+		MinIOAdmin:         &minioBucketMaker{client: minioAdminClient},
 		EventRulesDB:       queries,
 		UploadLogsDB:       queries,
 		AgentsDB:           queries,

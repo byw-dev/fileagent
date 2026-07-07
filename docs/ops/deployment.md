@@ -29,8 +29,9 @@ Control Plane 启动时会**快速失败**（fail-fast）——任一依赖不�
 一条命令拉起 PG / Redis / NATS / MinIO / Control Plane（含 Web UI）/ Caddy 网关。
 
 > ⚠️ **这是 dev / PoC 形态**，用于快速跑通与本地演示，**不是加固的生产拓扑**：默认口令、且 MinIO 为便利
-> **直接发布到宿主机**。**生产**应经网关（Caddy，§10.4）暴露 MinIO、并拆分 CP↔MinIO（内网）与客户端（公网）
-> 两个 endpoint，使 CP 流量留在内网——已列为 follow-up（`docs/tasks/backlog.md`）。
+> **直接发布到宿主机**。CP↔MinIO（内网 `MINIO_ENDPOINT`）与客户端（公网 `MINIO_PUBLIC_ENDPOINT`）
+> 两个 endpoint **已拆分**（D-024），CP 流量留在内网、不再 hairpin。**生产**还应经 TLS 网关暴露 MinIO
+> 并把 `MINIO_PUBLIC_ENDPOINT` 指向网关地址（网关无关，Caddy/nginx 皆可）而非直接发布到宿主机。
 
 ### A.1 配置
 
@@ -42,9 +43,10 @@ MINIO_ROOT_USER=<改我>
 MINIO_ROOT_PASSWORD=<强随机>
 JWT_SECRET=<强随机，≥32 字节>
 INTERNAL_WEBHOOK_SECRET=<强随机>
-# 必填：MinIO 对外可达地址（host:port）。CP 用它构造交给浏览器/agent 的 presigned/STS URL，
-# 故须对 CP 容器、浏览器、agent 都可达——单机填宿主 LAN IP（MinIO 已发布在 :9000），
-# 不能用内网名 minio:9000。不设则 `docker compose up` 直接报错。
+# 必填：MinIO 对外（客户端）可达地址（host:port）。CP 用它构造交给浏览器/agent 的
+# presigned/STS URL，故须对浏览器、agent 可达——单机填宿主 LAN IP（MinIO 已发布在 :9000），
+# 不能用内网名 minio:9000。不设则 `docker compose up` 直接报错。CP 自身走内网
+# MINIO_ENDPOINT=minio:9000（已在 compose 固定），两端点已拆分（D-024），不再 hairpin。
 MINIO_PUBLIC_ENDPOINT=192.168.1.10:9000
 # 可选：固定首个管理员口令（留空则 CP 随机生成并写入凭据文件）
 BOOTSTRAP_ADMIN_PASSWORD=<留空或指定>

@@ -43,10 +43,21 @@ type Config struct {
 	AgentTokenTTL time.Duration
 
 	// MinIO configuration.
-	MinIOEndpoint  string // required, e.g. "minio.internal:9000"
+	//
+	// MinIOEndpoint is the INTERNAL endpoint the Control Plane itself dials for
+	// CP↔MinIO calls (STS AssumeRole + bucket-create admin). On a docker network
+	// this is the in-cluster service name, e.g. "minio:9000".
+	MinIOEndpoint  string // required, e.g. "minio:9000"
 	MinIOAccessKey string // required
 	MinIOSecretKey string // required
 	MinIOUseSSL    bool   // default false
+	// MinIOPublicEndpoint is the client-facing endpoint handed to agents in the
+	// STS CredentialsPayload and used as the host that presigned URLs are signed
+	// for. It must be reachable by browsers/agents (unlike the internal endpoint).
+	// Defaults to MinIOEndpoint when MINIO_PUBLIC_ENDPOINT is unset (backward
+	// compatible with single-endpoint deployments). See DECISIONS.md D-024.
+	MinIOPublicEndpoint string
+	MinIOPublicUseSSL   bool // defaults to MinIOUseSSL
 	// MinIORoleARN is the STS AssumeRole ARN used when issuing Agent credentials.
 	MinIORoleARN string
 
@@ -130,6 +141,11 @@ func Load() (*Config, error) {
 		missing = append(missing, "MINIO_SECRET_KEY")
 	}
 	cfg.MinIOUseSSL = envBool("MINIO_USE_SSL", false)
+	// Public (client-facing) endpoint falls back to the internal values so
+	// single-endpoint deployments keep working unchanged (D-024). Read these
+	// after MinIOEndpoint/MinIOUseSSL so the fallback observes them.
+	cfg.MinIOPublicEndpoint = envString("MINIO_PUBLIC_ENDPOINT", cfg.MinIOEndpoint)
+	cfg.MinIOPublicUseSSL = envBool("MINIO_PUBLIC_USE_SSL", cfg.MinIOUseSSL)
 	cfg.MinIORoleARN = envString("MINIO_ROLE_ARN", "arn:aws:iam:::role/agent-role")
 
 	// ── nats ──────────────────────────────────────────────────────────────────
