@@ -5,7 +5,16 @@
 
 ---
 
-## 当前：无进行中的实现任务（最近落地为设计/文档）
+## 当前选定 track：Web UI 重做实现（Half A）— 已规划，待写码
+
+**权威追踪**：[`webui-redesign-impl.md`](webui-redesign-impl.md)（`WR-1` 地基 → `WR-2` 文件类型样板页 →
+`WR-3…WR-9` 逐页 → `WR-10` 收尾；每个 WR-x 独立 PR）。设计见 [`docs/design/webui-redesign.md`](../design/webui-redesign.md)。
+**采在现有 `webui/` 基线上改造，不重写**。截至 2026-07-09 仅完成规划 + 文档落地，**尚未写 webui 代码**；
+推进范围由后续 session 选定。验收清单来自对远端一版的实机核验（"皮对骨错"：无抽屉 / 徽标三套 / 时间格式错 / 暗色闪烁）。
+
+---
+
+## 背景：近期落地为设计/文档
 
 **所属阶段**：Phase 3 — 集成联调（Phase 4 收尾事项已合并）。**core-completeness 冲刺已全部收官**，其后一批 Phase 4 项也已合并：
 
@@ -17,12 +26,13 @@
 | MinIO internal/public endpoint 拆分 | #62 | D-024 |
 | 元数据模型 6c 拍板 + Web UI 重做设计 | #63 | D-025 |
 
-**下一步候选（人工择一，无默认）**：
+**已选定 track**：**Web UI 重做实现（Half A）**（见顶部），追踪
+[`webui-redesign-impl.md`](webui-redesign-impl.md)。
+
+**其余候选（未排期）**：
 1. **元数据 6c Phase 1 实现**（受控标签：词表/`file_tags`/待确认队列 + CP 打标引擎）——设计见
    [`docs/design/metadata-model.md`](../design/metadata-model.md)；epic 拆分见 [`backlog.md`](backlog.md)。
-2. **Web UI 重做实现**（主题 token + 布局骨架 → 逐页）——设计见
-   [`docs/design/webui-redesign.md`](../design/webui-redesign.md)。
-3. 可选 **proto→buf** 复现性 follow-up。
+2. 可选 **proto→buf** 复现性 follow-up。
 
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
 > bucket policy 对本系统冗余（MinIO 默认私有，访问全走 STS/presigned IAM）。待有 staging workflow 再做。
