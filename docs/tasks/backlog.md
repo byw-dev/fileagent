@@ -55,7 +55,7 @@ CP↔MinIO 不再 hairpin。
 
 已从"待规划"升级为**当前选定 track**，详细分期（`WR-1` 地基 → `WR-2` 文件类型样板页 → `WR-3…WR-9` 逐页 → `WR-10` 收尾）、
 远端版核验得出的验收清单、暗色闪烁修复，均落于权威追踪文件
-[`webui-redesign-impl.md`](webui-redesign-impl.md)。实施采**在现有基线上改造（非重写）**。
+[`webui-redesign-impl.md`](webui-redesign-impl.md)。实施采用**在现有基线上改造（非重写）**。
 
 ## 元数据 / 标签 / 数据集能力（epic · 已拍板 6c，D-025）
 

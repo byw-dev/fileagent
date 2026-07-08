@@ -100,7 +100,7 @@
 ---
 
 ## 验证（每阶段收尾执行）
-- `pnpm --dir webui dev` 起本地；CP 在 `:8080`（`deploy/config/controlplane.env`，admin/见 `bootstrap_admin_credentials.txt`）。
+- `pnpm --dir webui dev` 起本地；CP 在 `:8080`。CP 配置文件 `deploy/config/controlplane.env` 是 **gitignored**（不在仓库，需从 `controlplane/.env.example` 自建）。登录凭据：本地 dev 建议在该 env 里设固定 `BOOTSTRAP_ADMIN_PASSWORD` + `BOOTSTRAP_ADMIN_FORCE_RESET=true` 拿确定密码；否则首启生成随机密码写入 `BOOTSTRAP_ADMIN_CREDENTIALS_FILE` 指向的文件（默认是**进程工作目录相对**的 `bootstrap_admin_credentials.txt`，易因 CWD 不同而找错）。
 - 库中已有种子数据便于走查：**4 采集器**（online/offline/pending/revoked）、**4 文件**（completed×2/failed/uploading）、
   **2 上传日志**（completed/failed 带 error+retry）、**2 事件规则**（webhook 启用 / nats_publish 停用）、**2 文件类型**（各带 glob）。
 - **暗色模式下**实机走查：无白→黑→白闪烁；抽屉承载增删改；徽标全站同色同词圆点+文字；时间 `MM-DD HH:mm`+tooltip；
