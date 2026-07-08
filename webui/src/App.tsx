@@ -28,10 +28,19 @@ const SettingsPage = lazy(() => import('./pages/Settings'))
 const SettingsUsersPage = lazy(() => import('./pages/Settings/Users'))
 const ProfilePage = lazy(() => import('./pages/Settings/Profile'))
 
-/** Full-screen centered loading spinner shown during lazy page loads. */
+/** Full-screen centered loading spinner shown during lazy page loads.
+ * Opaque bg-page background so the lazy fallback never exposes the UA canvas. */
 function PageLoader() {
   return (
-    <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh' }}>
+    <div
+      style={{
+        display: 'flex',
+        justifyContent: 'center',
+        alignItems: 'center',
+        minHeight: '100vh',
+        background: '#F5F6F8',
+      }}
+    >
       <Spin size="large" />
     </div>
   )
