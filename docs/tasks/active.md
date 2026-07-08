@@ -7,7 +7,7 @@
 
 ## 当前：无进行中的实现任务（最近落地为设计/文档）
 
-**所属阶段**：Phase 4 收尾。**core-completeness 冲刺已全部收官**，其后一批 Phase 4 项也已合并：
+**所属阶段**：Phase 3 — 集成联调（Phase 4 收尾事项已合并）。**core-completeness 冲刺已全部收官**，其后一批 Phase 4 项也已合并：
 
 | 里程碑 | PR | 决策 |
 |--------|----|------|
@@ -19,7 +19,7 @@
 
 **下一步候选（人工择一，无默认）**：
 1. **元数据 6c Phase 1 实现**（受控标签：词表/`file_tags`/待确认队列 + CP 打标引擎）——设计见
-   [`docs/design/metadata-model.md`](../design/metadata-model.md)；epic 拆分见 `backlog.md`。
+   [`docs/design/metadata-model.md`](../design/metadata-model.md)；epic 拆分见 [`backlog.md`](backlog.md)。
 2. **Web UI 重做实现**（主题 token + 布局骨架 → 逐页）——设计见
    [`docs/design/webui-redesign.md`](../design/webui-redesign.md)。
 3. 可选 **proto→buf** 复现性 follow-up。
