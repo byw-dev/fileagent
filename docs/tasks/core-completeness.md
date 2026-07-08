@@ -57,4 +57,11 @@
 
 ## 执行顺序建议
 
-`CC-1 ✅` → `CC-2 ✅` → `CC-6 ✅` → `CC-3 ⏸️ 推后` → `CC-5 ✅` → `CC-4 ✅` → `CC-7 ✅` → `CC-9 ✅（规则原地编辑）` → `CC-8 ✅（Agent 重命名）` → `CC-10 ✅（隐性契约文档 → docs/design/contracts.md）` → 剩 optional proto→buf
+`CC-1 ✅` → `CC-2 ✅` → `CC-6 ✅` → `CC-3 ⏸️ 推后` → `CC-5 ✅` → `CC-4 ✅` → `CC-7 ✅` → `CC-9 ✅（规则原地编辑）` → `CC-8 ✅（Agent 重命名）` → `CC-10 ✅（隐性契约文档 → docs/design/contracts.md）`
+
+---
+
+> **冲刺收官（2026-07-05）**：core-completeness 全部完成（CC-3 推后）。其后进入 **Phase 4 收尾**，已合并
+> **D-022**（webui 嵌入单二进制 #60）、**D-023**（迁移嵌入 + T4-3 部署脚手架 #61）、**D-024**（MinIO 端点拆分 #62）、
+> **D-025**（元数据 6c 拍板 + webui 重做设计 #63）。当前态与下一步候选见 `docs/tasks/active.md`；未排期工作见
+> `docs/tasks/backlog.md`（含元数据 6c Phase 1 实现 epic、webui 重做实现 track）。
