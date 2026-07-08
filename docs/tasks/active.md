@@ -1,7 +1,7 @@
 # active.md — 当前执行入口（轻量）
 
 > **当前阶段**：Phase 3 — 集成联调（已插入两轮收尾冲刺）
-> **Agent 主要输入文件**：本文件 + `docs/tasks/core-completeness.md`
+> **Agent 主要输入文件**：本文件 + [`core-completeness.md`](core-completeness.md)
 
 ---
 
@@ -56,16 +56,16 @@
 - **T3-3 Python SDK + Control Plane 联调** / T4-4 Java SDK：暂无消费方，CP 契约维护好则后期单独开发风险低。
 - G-8/G-9 契约单一权威 / OpenAPI 工具化、Prometheus 指标（T4-1）、结构性文档重构。
 
-理由与全清单见 `docs/tasks/core-completeness.md` 文末"明确推后"。
+理由与全清单见 [`core-completeness.md`](core-completeness.md) 文末"明确推后"。
 
 ---
 
 ## 关联入口
 
-- 当前冲刺 backlog：`docs/tasks/core-completeness.md`
-- Phase 3 主线（含已完成 T3-x）：`docs/tasks/phases/phase-3.md`
-- 采集规则重构规格：`docs/tasks/phases/phase-3-rft.md`
-- 已关闭 Bug：`docs/tasks/bugs/closed.md`
-- 未排期工作：`docs/tasks/backlog.md`
-- 历史归档：`docs/tasks/archive/`
-- 专项报告：`docs/reports/`
+- 当前冲刺 backlog：[`core-completeness.md`](core-completeness.md)
+- Phase 3 主线（含已完成 T3-x）：[`phases/phase-3.md`](phases/phase-3.md)
+- 采集规则重构规格：[`phases/phase-3-rft.md`](phases/phase-3-rft.md)
+- 已关闭 Bug：[`bugs/closed.md`](bugs/closed.md)
+- 未排期工作：[`backlog.md`](backlog.md)
+- 历史归档：[`archive/`](archive/)
+- 专项报告：[`docs/reports/`](../reports/)
