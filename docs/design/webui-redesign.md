@@ -15,7 +15,7 @@
 
 ---
 
-## 1. 设计 Token（与 AntD 5 `ConfigProvider` token 一一对应）
+## 1. 设计 Token（对齐 AntD 5 `ConfigProvider` token — 多数全局 token 一一对应，少数为组件级 token）
 
 现状：`webui/src/main.tsx` 仅传 `locale={zhCN}` 的裸 `ConfigProvider`，**无任何主题定制**。实现期应在此处注入
 `theme={{ token, components }}`，使下列 token 成为全站单一事实来源。
@@ -30,16 +30,36 @@
 | 次要文本 | text-2 | `#646A73` | `colorTextSecondary` |
 | 弱文本 / 占位 | text-3 | `#8F959E` | `colorTextTertiary` / `colorTextPlaceholder` |
 | 边框 | border | `#E3E6EB` | `colorBorder` / `colorBorderSecondary` |
+| 分隔线（比 border 更浅） | divider | `#EEF0F3` | `colorSplit`（表格行 / 卡片内 / 侧栏分区分隔） |
 | 页面背景 | bg-page | `#F5F6F8` | `colorBgLayout` |
+| 表头 / 淡底 | subtle-bg | `#FAFBFC` | `Table.headerBg`（组件级；只读浅底块亦用） |
+| 导航文字（介于 text-1/2） | nav-text | `#4E5561` | `Menu.itemColor`（组件级） |
 
 **状态语义色**（取自 mockup 调色板，用于状态徽标 / 结果提示）：成功 `#1B8A5A`（浅底 `#E8F6EF`）=
 `colorSuccess`；警告 `#B27409`（浅底 `#FCF3E3`）= `colorWarning`；危险 `#D64545`（浅底 `#FBEDED`）=
 `colorError`。
 
+> **注**：徽标里的**圆点**取比文字**更亮**一档的同族色（见 §1.2 三元组表），与 AntD 语义 token（上面这三个，
+> 用于按钮 / Alert 等）**解耦**——语义 token 用 §1.1 值，徽标用 §1.2 的 {底 / 文字 / 圆点} 三元组。
+
 ### 1.2 状态语义（全站唯一映射）
 
-状态一律用**「圆点 + 文字」徽标**；同一状态在任何页面**同色、同词**。既有 `AgentStatusBadge`
-（`webui/src/components/AgentStatusBadge.tsx`）应升级为全站通用徽标并统一取色。
+状态一律用**徽标**：**浅底泡泡 + 亮圆点 + 深调文字**（不是裸的圆点+文字——泡泡是 mockup 的渲染口径，
+§1.1 的"浅底"即泡泡底）。同一状态在任何页面**同色、同词、同形**。既有 `AgentStatusBadge`
+（`webui/src/components/AgentStatusBadge.tsx`）应升级为全站通用 `StatusBadge` 并统一取色。
+
+**泡泡几何**（复刻 mockup 内联样式）：`display:inline-flex; align-items:center; gap:6px; height:22px;
+padding:0 9px; border-radius:11px; font-size:0.75rem`；内层圆点 `width/height:6px; border-radius:50%`。
+
+**每个 tone 的三色**（`底 bg` / `文字 text`，深调 / `圆点 dot`，亮调——**点色≠字色**）：
+
+| tone | 底 bg | 文字 text | 圆点 dot | 用于（语义 slug） |
+|------|-------|----------|---------|------------------|
+| success | `#E8F6EF` | `#1B8A5A` | `#22A06B` | 在线 online / 成功 completed / 生效 active / 已投递 |
+| neutral | `#F2F3F5` | `#646A73` | `#8F959E` | 离线 offline / 已删除 / 已停用 inactive |
+| warning | `#FCF3E3` | `#B27409` | `#D98D0B` | 待审批 pending |
+| error | `#FBEDED` | `#C03D3D` | `#D64545` | 已吊销 revoked / 失败 failed / 已终止 dead |
+| processing | `#EBF1FD` | `#2F6BE0` | `#3D7BE8` | 上传中 uploading / 待投递 / 已审批 approved（processing 无 mockup 参考，按规律派生） |
 
 下列小写值是**语义 slug / 展示口径**（每个状态"同色同词"的统一标识），**不等同于 API / DB 的实际枚举值**：
 `online` 在线、`offline` 离线、`pending` 待审批、`revoked` 已吊销、`completed` 成功、`failed` 失败、
