@@ -15,7 +15,7 @@
 
 ---
 
-## 1. 设计 Token（与 AntD 5 `ConfigProvider` token 一一对应）
+## 1. 设计 Token（对齐 AntD 5 `ConfigProvider` token — 多数全局 token 一一对应，少数为组件级 token）
 
 现状：`webui/src/main.tsx` 仅传 `locale={zhCN}` 的裸 `ConfigProvider`，**无任何主题定制**。实现期应在此处注入
 `theme={{ token, components }}`，使下列 token 成为全站单一事实来源。
@@ -30,10 +30,10 @@
 | 次要文本 | text-2 | `#646A73` | `colorTextSecondary` |
 | 弱文本 / 占位 | text-3 | `#8F959E` | `colorTextTertiary` / `colorTextPlaceholder` |
 | 边框 | border | `#E3E6EB` | `colorBorder` / `colorBorderSecondary` |
-| 分隔线 | divider | `#EEF0F3` | 比 border 更浅，用于表格行分隔 / 卡片内分隔 / 侧栏分区 |
+| 分隔线（比 border 更浅） | divider | `#EEF0F3` | `colorSplit`（表格行 / 卡片内 / 侧栏分区分隔） |
 | 页面背景 | bg-page | `#F5F6F8` | `colorBgLayout` |
-| 表头 / 淡底 | subtle-bg | `#FAFBFC` | 表格表头底、只读浅底块 |
-| 导航文字 | nav-text | `#4E5561` | 侧栏导航项默认文字（介于 text-1/text-2） |
+| 表头 / 淡底 | subtle-bg | `#FAFBFC` | `Table.headerBg`（组件级；只读浅底块亦用） |
+| 导航文字（介于 text-1/2） | nav-text | `#4E5561` | `Menu.itemColor`（组件级） |
 
 **状态语义色**（取自 mockup 调色板，用于状态徽标 / 结果提示）：成功 `#1B8A5A`（浅底 `#E8F6EF`）=
 `colorSuccess`；警告 `#B27409`（浅底 `#FCF3E3`）= `colorWarning`；危险 `#D64545`（浅底 `#FBEDED`）=
