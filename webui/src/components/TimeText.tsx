@@ -17,7 +17,12 @@ interface TimeTextProps {
 function TimeText({ value, relative = false, fallback = '-' }: TimeTextProps) {
   const display = relative ? formatRelative(value, fallback) : formatTime(value, fallback)
   if (display === fallback) return <>{fallback}</>
-  return <Tooltip title={formatTimeFull(value)}>{display}</Tooltip>
+  // Wrap in a <span> so Tooltip has a real element child to attach refs/handlers to.
+  return (
+    <Tooltip title={formatTimeFull(value, fallback)}>
+      <span>{display}</span>
+    </Tooltip>
+  )
 }
 
 export default TimeText

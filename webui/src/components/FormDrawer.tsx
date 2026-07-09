@@ -47,6 +47,8 @@ function FormDrawer({
       onClose={onClose}
       width={width}
       maskClosable={!loading}
+      closable={!loading}
+      keyboard={!loading}
       destroyOnHidden
       footer={
         hideFooter ? undefined : (
