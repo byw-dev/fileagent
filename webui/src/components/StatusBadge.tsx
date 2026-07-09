@@ -1,16 +1,16 @@
-import { statusColors } from '../theme'
+import { statusBadgeTones } from '../theme'
 
 /**
- * StatusBadge — the site-wide status indicator: a colored dot + label
- * (§1.2 「圆点 + 文字」). One value maps to one color + one word everywhere
- * ("同色同词，全站唯一映射").
+ * StatusBadge — the site-wide status indicator: a light-tinted pill with a
+ * brighter dot + deeper label (§1.2 浅底泡泡 + 亮圆点 + 深调文字). One value maps
+ * to one color + one word everywhere ("同色同词，全站唯一映射").
  *
  * Status values follow the REST contract (docs/design/contracts.md V-1):
  * agent / file / upload-log statuses arrive UPPER-CASE from the API; event
  * delivery statuses arrive lower-case. Lookup is case-insensitive.
  */
 
-type Tone = keyof typeof statusColors // 'success' | 'warning' | 'error' | 'neutral' | 'processing'
+type Tone = keyof typeof statusBadgeTones // 'success' | 'warning' | 'error' | 'neutral' | 'processing'
 
 interface Meta {
   label: string
@@ -64,7 +64,7 @@ function StatusBadge({ status, domain }: StatusBadgeProps) {
   const meta: Meta =
     (domain && OVERRIDE[domain]?.[key]) ??
     BASE[key] ?? { label: status ? String(status) : '-', tone: 'neutral' }
-  const dot = statusColors[meta.tone].color
+  const tone = statusBadgeTones[meta.tone]
 
   return (
     <span
@@ -72,9 +72,14 @@ function StatusBadge({ status, domain }: StatusBadgeProps) {
         display: 'inline-flex',
         alignItems: 'center',
         gap: 6,
+        height: 22,
+        padding: '0 9px',
+        borderRadius: 11,
         fontSize: '0.75rem',
-        lineHeight: 1.5,
+        lineHeight: 1,
         whiteSpace: 'nowrap',
+        backgroundColor: tone.bg,
+        color: tone.text,
       }}
     >
       <span
@@ -82,11 +87,11 @@ function StatusBadge({ status, domain }: StatusBadgeProps) {
           width: 6,
           height: 6,
           borderRadius: '50%',
-          backgroundColor: dot,
+          backgroundColor: tone.dot,
           flex: 'none',
         }}
       />
-      <span style={{ color: '#1F2329' }}>{meta.label}</span>
+      {meta.label}
     </span>
   )
 }
