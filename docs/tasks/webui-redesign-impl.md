@@ -56,14 +56,17 @@
 > 用 track 本地前缀 **`WR-x`**（WebUI Redesign，仿 core-completeness 的 `CC-x`），避开与全局 Phase（现 3/4）冲突。
 > **WR-1 必须先合**（后续每页依赖）；**WR-2 文件类型为样板页，评审定型抽屉/徽标/时间模式后再铺开 WR-3…WR-9**。
 
-### WR-1 — 地基 ⬜
+### WR-1 — 地基 🔄（实现完成，PR `feat/wr-1-foundation` 待评审合并）
 全站单一事实来源，后续每页依赖：
-- [ ] 主题 token：`src/main.tsx` 注入 `ConfigProvider theme={{ token, components }}`（§1.1 色彩 / §1.3 字号 / §1.4 尺寸）
-- [ ] 重写 `src/index.css` + 暗色闪烁修复：删 Vite 模板；`color-scheme:light` + `html,body,#root{background:#F5F6F8}`；base 16px；去 `#root` 1126px 锁 & `text-align:center`。`App.tsx` PageLoader 给浅底 + 骨架
-- [ ] 固定侧栏：`src/layouts/BasicLayout.tsx` 208px 不可折叠、去 `collapsed` 开关、内容区流式
-- [ ] 统一徽标 `src/components/StatusBadge.tsx`（升级 `AgentStatusBadge`）：圆点+文字，覆盖 agent/file/upload 三域，按 contracts.md **V-1** 映射，同色同词
-- [ ] 时间 util `src/utils/time.ts`（`formatTime`）：`MM-DD HH:mm` + tooltip 完整 + 相对心跳 + 空值安全（修 `Invalid Date`），替换 ~18 处 `toLocaleString`
-- [ ] 共享外壳：`FormDrawer`(480px 承载新建/编辑)、`confirmDanger`(红实心+后果+可选输入名确认)、统一 `EmptyState`/内联错误/骨架
+- [x] 主题 token：`src/theme.ts` + `src/main.tsx` 注入 `ConfigProvider theme`（§1.1 色彩 / §1.3 字号 / §1.4 尺寸）
+- [x] 重写 `src/index.css` + 暗色闪烁修复：删 Vite 模板；`color-scheme:light`（+ `index.html` meta）+ `html,body,#root{background:#F5F6F8}`；base 16px；去 `#root` 1126px 锁 & `text-align:center`。`App.tsx` PageLoader 给浅底
+- [x] 固定侧栏：`src/layouts/BasicLayout.tsx` 208px 不可折叠（`collapsedButtonRender={false}`）、内容区流式
+- [x] 统一徽标 `src/components/StatusBadge.tsx`（覆盖 agent/file/upload/rule/delivery，按 contracts.md **V-1** 大写映射）——**浅底泡泡 + 亮圆点 + 深调文字**（复刻 mockup，点色≠字色；见修正后的 §1.2 三元组表）；`AgentStatusBadge` 改为薄包装 → 采集器/仪表盘等既有页自动升级；含单测
+- [x] **对 mockup 核验后追加的 token 微差**（PR #67 已回补规范）：`theme.ts` 加 `statusBadgeTones{bg,text,dot}`；`Table.headerBg #FAFBFC`、`Table.borderColor #EEF0F3` + `colorSplit #EEF0F3`（分隔线更浅）、`Menu.itemColor #4E5561`（导航文字）
+- [x] 时间 util `src/utils/time.ts`（`formatTime`/`formatTimeFull`/`formatRelative`）+ `TimeText` 组件（`MM-DD HH:mm` + hover 完整 + 相对心跳 + 空值安全）**就绪，含单测**。各页 `toLocaleString` 调用点在**各自页面 WR** 接入（`Invalid Date` 修复随 WR-4 文件页落地）——避免地基 PR 反复触碰 15 个页面文件
+- [x] 共享外壳：`FormDrawer`(480px)、`DangerConfirmModal`(红实心+后果+可选输入名确认 4f) + `useDangerConfirm` hook(简单危险确认)、`EmptyState`(一句话+主操作)
+
+> **实机验证（暗色模式）**：`html/body/#root` 背景 `#F5F6F8`（`color-scheme:light`），**无白→黑→白闪烁**；侧栏 208px 无折叠开关；主色 `#2F6BE0`（Tab ink）；状态徽标为**浅底泡泡**（采集器页自动升级，逐色比对 mockup）；base 16px。build + 90 tests + lint（新文件）通过。
 
 ### WR-2 — 文件类型（样板页，评审定型） ⬜
 用最简单 CRUD 把抽屉/徽标/时间模式跑通定型：

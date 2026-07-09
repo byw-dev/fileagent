@@ -161,6 +161,9 @@ root/
 
 # Local runtime config & secrets (never commit — machine-specific / sensitive)
 /controlplane/bootstrap_admin_credentials.txt
+# CP writes this to its CWD; when run from repo root it lands here (regenerated each start).
+bootstrap_admin_credentials.txt
+bootstrap_admin_credentials.txt.*
 /deploy/config/
 /agent/config.toml
 .claude/settings.local.json

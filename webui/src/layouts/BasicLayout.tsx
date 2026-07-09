@@ -1,4 +1,3 @@
-import { useState } from 'react'
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { ProLayout, DefaultFooter } from '@ant-design/pro-components'
 import {
@@ -76,7 +75,6 @@ function BasicLayout() {
   const location = useLocation()
   const navigate = useNavigate()
   const { user, logout } = useAuthStore()
-  const [collapsed, setCollapsed] = useState(false)
 
   const handleLogout = () => {
     logout()
@@ -108,17 +106,19 @@ function BasicLayout() {
       menuItemRender={(item, dom) => (
         <Link to={item.path ?? '/'}>{dom}</Link>
       )}
-      collapsed={collapsed}
-      onCollapse={setCollapsed}
+      // Fixed 208px sidebar, not collapsible (§1.4 / §3).
+      siderWidth={208}
+      collapsed={false}
+      collapsedButtonRender={false}
       avatarProps={{
         src: undefined,
         title: (
           <Dropdown menu={{ items: avatarDropdownItems }} placement="bottomRight">
             <span style={{ cursor: 'pointer' }}>
-              <Avatar size="small" style={{ marginRight: 8, backgroundColor: '#1677ff' }}>
+              <Avatar size="small" style={{ marginRight: 8, backgroundColor: '#2F6BE0' }}>
                 {user?.username?.[0]?.toUpperCase() ?? 'U'}
               </Avatar>
-              {!collapsed && user?.username}
+              {user?.username}
             </span>
           </Dropdown>
         ),

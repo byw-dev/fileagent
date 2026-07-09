@@ -1,33 +1,20 @@
-import { Tag } from 'antd'
-import type { TagProps } from 'antd'
+import StatusBadge from './StatusBadge'
 
-/** Supported agent status values. */
-export type AgentStatus =
-  | 'PENDING'
-  | 'APPROVED'
-  | 'RUNNING'
-  | 'OFFLINE'
-  | 'REVOKED'
-
-const STATUS_CONFIG: Record<AgentStatus, { color: TagProps['color']; label: string }> = {
-  PENDING: { color: 'gold', label: '待审批' },
-  APPROVED: { color: 'blue', label: '已审批' },
-  RUNNING: { color: 'green', label: '运行中' },
-  OFFLINE: { color: 'default', label: '离线' },
-  REVOKED: { color: 'red', label: '已吊销' },
-}
+/** Supported agent status values (frontend upper-case; see contracts.md V-1). */
+export type AgentStatus = 'PENDING' | 'APPROVED' | 'RUNNING' | 'OFFLINE' | 'REVOKED'
 
 interface AgentStatusBadgeProps {
   /** Agent status string. */
-  status: AgentStatus
+  status: AgentStatus | string
 }
 
 /**
- * AgentStatusBadge — renders a colored Ant Design Tag for an agent status.
+ * AgentStatusBadge — thin wrapper over the site-wide {@link StatusBadge}, kept
+ * for backward compatibility with existing agent call sites. New code should
+ * use `<StatusBadge>` directly.
  */
 function AgentStatusBadge({ status }: AgentStatusBadgeProps) {
-  const config = STATUS_CONFIG[status] ?? { color: 'default', label: status }
-  return <Tag color={config.color}>{config.label}</Tag>
+  return <StatusBadge status={status} domain="agent" />
 }
 
 export default AgentStatusBadge
