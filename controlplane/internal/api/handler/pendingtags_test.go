@@ -35,7 +35,7 @@ func (m *mockPendingDB) ListPendingTagValues(_ context.Context, _ uuid.UUID) ([]
 func (m *mockPendingDB) GetPendingTagValue(_ context.Context, _ uuid.UUID, _ uuid.UUID) (*db.PendingTagValue, error) {
 	return m.getRow, m.getErr
 }
-func (m *mockPendingDB) CreateTagValueIfAbsent(_ context.Context, _ uuid.UUID, _ string) (int64, error) {
+func (m *mockPendingDB) CreateTagValueIfAbsent(_ context.Context, _ uuid.UUID, _ string, _ uuid.UUID) (int64, error) {
 	m.createCalled = true
 	if m.createErr != nil {
 		return 0, m.createErr
@@ -144,4 +144,24 @@ func TestPending_Reject_Forbidden_NonSuperAdmin(t *testing.T) {
 	w := httptest.NewRecorder()
 	testPendingRouter(h, "org_viewer").ServeHTTP(w, req(http.MethodPost, "/api/v1/pending-tag-values/"+uuid.New().String()+"/reject", ""))
 	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestPending_Approve_RaceDeleted_404(t *testing.T) {
+	id := uuid.New()
+	// Row exists at resolve time but delete affects 0 rows (concurrently resolved).
+	mockDB := &mockPendingDB{
+		getRow:     &db.PendingTagValue{ID: id, OrgID: testTagOrgID, TagKeyID: uuid.New(), ExtractedValue: "tokyo"},
+		deleteRows: 0,
+	}
+	h := handler.NewPendingTagValuesHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testPendingRouter(h, "super_admin").ServeHTTP(w, req(http.MethodPost, "/api/v1/pending-tag-values/"+id.String()+"/approve", ""))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestPending_Reject_InvalidID(t *testing.T) {
+	h := handler.NewPendingTagValuesHandler(&mockPendingDB{}, newTestLogger())
+	w := httptest.NewRecorder()
+	testPendingRouter(h, "super_admin").ServeHTTP(w, req(http.MethodPost, "/api/v1/pending-tag-values/not-a-uuid/reject", ""))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 }

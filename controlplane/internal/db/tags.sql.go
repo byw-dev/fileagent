@@ -73,12 +73,14 @@ func (q *Queries) CreateTagValue(ctx context.Context, tagKeyID uuid.UUID, value 
 
 const createTagValueIfAbsent = `-- name: CreateTagValueIfAbsent :execrows
 INSERT INTO tag_values (tag_key_id, value)
-VALUES ($1, $2)
+SELECT k.id, $2 FROM tag_keys k WHERE k.id = $1 AND k.org_id = $3
 ON CONFLICT (tag_key_id, value) DO NOTHING
 `
 
-func (q *Queries) CreateTagValueIfAbsent(ctx context.Context, tagKeyID uuid.UUID, value string) (int64, error) {
-	result, err := q.db.ExecContext(ctx, createTagValueIfAbsent, tagKeyID, value)
+// Inserts only when the tag key belongs to the org, so a corrupted pending row
+// (tag_key_id pointing at another org's key) cannot promote a value cross-tenant.
+func (q *Queries) CreateTagValueIfAbsent(ctx context.Context, iD uuid.UUID, value string, orgID uuid.UUID) (int64, error) {
+	result, err := q.db.ExecContext(ctx, createTagValueIfAbsent, iD, value, orgID)
 	if err != nil {
 		return 0, err
 	}
@@ -176,7 +178,7 @@ const listPendingTagValues = `-- name: ListPendingTagValues :many
 SELECT p.id, p.tag_key_id, k.key, p.extracted_value, p.source, p.source_rule_id,
        p.hit_count, p.suggested_value, p.first_seen_at
 FROM pending_tag_values p
-JOIN tag_keys k ON k.id = p.tag_key_id
+JOIN tag_keys k ON k.id = p.tag_key_id AND k.org_id = p.org_id
 WHERE p.org_id = $1 AND p.status = 'pending'
 ORDER BY p.hit_count DESC, p.first_seen_at ASC
 `

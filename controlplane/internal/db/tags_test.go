@@ -169,7 +169,7 @@ func TestGetPendingTagValue(t *testing.T) {
 func TestCreateTagValueIfAbsent(t *testing.T) {
 	q, mock, _ := newTestQueries(t)
 	mock.ExpectExec("INSERT INTO tag_values").WillReturnResult(sqlmock.NewResult(0, 1))
-	rows, err := q.CreateTagValueIfAbsent(context.Background(), uuid.New(), "tokyo")
+	rows, err := q.CreateTagValueIfAbsent(context.Background(), uuid.New(), "tokyo", uuid.New())
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), rows)
 }

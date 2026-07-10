@@ -19,7 +19,7 @@ import (
 type PendingTagValuesDB interface {
 	ListPendingTagValues(ctx context.Context, orgID uuid.UUID) ([]*db.ListPendingTagValuesRow, error)
 	GetPendingTagValue(ctx context.Context, id uuid.UUID, orgID uuid.UUID) (*db.PendingTagValue, error)
-	CreateTagValueIfAbsent(ctx context.Context, tagKeyID uuid.UUID, value string) (int64, error)
+	CreateTagValueIfAbsent(ctx context.Context, tagKeyID uuid.UUID, value string, orgID uuid.UUID) (int64, error)
 	DeletePendingTagValue(ctx context.Context, id uuid.UUID, orgID uuid.UUID) (int64, error)
 }
 
@@ -121,14 +121,20 @@ func (h *PendingTagValuesHandler) Approve(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if _, err := h.db.CreateTagValueIfAbsent(c.Request.Context(), p.TagKeyID, p.ExtractedValue); err != nil {
+	if _, err := h.db.CreateTagValueIfAbsent(c.Request.Context(), p.TagKeyID, p.ExtractedValue, p.OrgID); err != nil {
 		h.logger.Error("approve: create tag value", zap.Error(err))
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to approve value", nil)
 		return
 	}
-	if _, err := h.db.DeletePendingTagValue(c.Request.Context(), p.ID, p.OrgID); err != nil {
+	rows, err := h.db.DeletePendingTagValue(c.Request.Context(), p.ID, p.OrgID)
+	if err != nil {
 		h.logger.Error("approve: delete pending value", zap.Error(err))
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to approve value", nil)
+		return
+	}
+	if rows == 0 {
+		// The row was resolved concurrently between resolvePending and here.
+		middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "pending value not found", nil)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"key_id": p.TagKeyID.String(), "value": p.ExtractedValue})

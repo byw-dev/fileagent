@@ -49,7 +49,7 @@ DELETE FROM tag_values WHERE id = $1 AND tag_key_id = $2;
 SELECT p.id, p.tag_key_id, k.key, p.extracted_value, p.source, p.source_rule_id,
        p.hit_count, p.suggested_value, p.first_seen_at
 FROM pending_tag_values p
-JOIN tag_keys k ON k.id = p.tag_key_id
+JOIN tag_keys k ON k.id = p.tag_key_id AND k.org_id = p.org_id
 WHERE p.org_id = $1 AND p.status = 'pending'
 ORDER BY p.hit_count DESC, p.first_seen_at ASC;
 
@@ -61,8 +61,10 @@ WHERE id = $1 AND org_id = $2
 LIMIT 1;
 
 -- name: CreateTagValueIfAbsent :execrows
+-- Inserts only when the tag key belongs to the org, so a corrupted pending row
+-- (tag_key_id pointing at another org's key) cannot promote a value cross-tenant.
 INSERT INTO tag_values (tag_key_id, value)
-VALUES ($1, $2)
+SELECT k.id, $2 FROM tag_keys k WHERE k.id = $1 AND k.org_id = $3
 ON CONFLICT (tag_key_id, value) DO NOTHING;
 
 -- name: DeletePendingTagValue :execrows
