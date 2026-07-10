@@ -133,14 +133,20 @@ func (h *TagKeysHandler) Create(c *gin.Context) {
 		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
 		return
 	}
-	if !isValidTagKey(req.Key) {
+	key := strings.TrimSpace(req.Key)
+	if !isValidTagKey(key) {
 		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "key must be 1-64 chars of [a-z0-9_]", nil)
+		return
+	}
+	label := strings.TrimSpace(req.Label)
+	if label == "" {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "label must not be empty", nil)
 		return
 	}
 	k, err := h.db.CreateTagKey(c.Request.Context(), db.CreateTagKeyParams{
 		OrgID:                orgIDFromClaims(c),
-		Key:                  req.Key,
-		Label:                req.Label,
+		Key:                  key,
+		Label:                label,
 		ValueControlled:      boolOr(req.ValueControlled, true),
 		RequiredAtCollection: boolOr(req.RequiredAtCollection, false),
 		AllowPathVar:         boolOr(req.AllowPathVar, true),
@@ -174,7 +180,10 @@ func (h *TagKeysHandler) Update(c *gin.Context) {
 		return
 	}
 	orgID := orgIDFromClaims(c)
-	key := c.Param("key")
+	key, ok := h.validKeyParam(c)
+	if !ok {
+		return
+	}
 
 	existing, err := h.db.GetTagKey(c.Request.Context(), orgID, key)
 	if err != nil {
@@ -195,11 +204,12 @@ func (h *TagKeysHandler) Update(c *gin.Context) {
 
 	label := existing.Label
 	if req.Label != nil {
-		if *req.Label == "" {
+		trimmed := strings.TrimSpace(*req.Label)
+		if trimmed == "" {
 			middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "label must not be empty", nil)
 			return
 		}
-		label = *req.Label
+		label = trimmed
 	}
 
 	k, err := h.db.UpdateTagKey(c.Request.Context(), db.UpdateTagKeyParams{
@@ -227,7 +237,10 @@ func (h *TagKeysHandler) Delete(c *gin.Context) {
 		return
 	}
 	orgID := orgIDFromClaims(c)
-	key := c.Param("key")
+	key, ok := h.validKeyParam(c)
+	if !ok {
+		return
+	}
 
 	existing, err := h.db.GetTagKey(c.Request.Context(), orgID, key)
 	if err != nil {
@@ -252,10 +265,27 @@ func (h *TagKeysHandler) Delete(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// resolveKey loads a tag key by (org, :key), writing the appropriate error and
-// returning ok=false when it is missing.
+// validKeyParam validates the :key path param against the tag-key naming rule,
+// writing a 400 and returning ok=false on violation. Validating up front gives a
+// clear 400 (rather than a misleading 404) and avoids a pointless DB lookup.
+func (h *TagKeysHandler) validKeyParam(c *gin.Context) (string, bool) {
+	key := c.Param("key")
+	if !isValidTagKey(key) {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "key must be 1-64 chars of [a-z0-9_]", nil)
+		return "", false
+	}
+	return key, true
+}
+
+// resolveKey validates the :key path param, then loads the tag key by (org, key),
+// writing the appropriate error and returning ok=false when it is invalid or
+// missing.
 func (h *TagKeysHandler) resolveKey(c *gin.Context) (*db.TagKey, bool) {
-	k, err := h.db.GetTagKey(c.Request.Context(), orgIDFromClaims(c), c.Param("key"))
+	key, ok := h.validKeyParam(c)
+	if !ok {
+		return nil, false
+	}
+	k, err := h.db.GetTagKey(c.Request.Context(), orgIDFromClaims(c), key)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "tag key not found", nil)

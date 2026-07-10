@@ -300,3 +300,33 @@ func TestTagKeys_Update_EmptyLabel(t *testing.T) {
 	testTagKeysRouter(h, "super_admin").ServeHTTP(w, req(http.MethodPatch, "/api/v1/tag-keys/site", `{"label":""}`))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
+
+func TestTagKeys_Create_WhitespaceLabel_Rejected(t *testing.T) {
+	h := handler.NewTagKeysHandler(&mockTagKeysDB{}, newTestLogger())
+	w := httptest.NewRecorder()
+	testTagKeysRouter(h, "super_admin").ServeHTTP(w, req(http.MethodPost, "/api/v1/tag-keys", `{"key":"site","label":"   "}`))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestTagKeys_Update_InvalidKeyParam_400(t *testing.T) {
+	// Invalid :key must 400 up front, before any DB lookup.
+	mockDB := &mockTagKeysDB{getErr: sql.ErrNoRows}
+	h := handler.NewTagKeysHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testTagKeysRouter(h, "super_admin").ServeHTTP(w, req(http.MethodPatch, "/api/v1/tag-keys/Bad!", `{"label":"x"}`))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestTagKeys_Delete_InvalidKeyParam_400(t *testing.T) {
+	h := handler.NewTagKeysHandler(&mockTagKeysDB{}, newTestLogger())
+	w := httptest.NewRecorder()
+	testTagKeysRouter(h, "super_admin").ServeHTTP(w, req(http.MethodDelete, "/api/v1/tag-keys/Bad!", ""))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestTagKeys_Values_InvalidKeyParam_400(t *testing.T) {
+	h := handler.NewTagKeysHandler(&mockTagKeysDB{}, newTestLogger())
+	w := httptest.NewRecorder()
+	testTagKeysRouter(h, "super_admin").ServeHTTP(w, req(http.MethodPost, "/api/v1/tag-keys/Bad!/values", `{"value":"x"}`))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
