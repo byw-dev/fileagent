@@ -1033,6 +1033,19 @@ MT-4a 端点（sqlc `tags.sql` + `handler/tagkeys.go`，注入 `RouterConfig.Tag
   删取值不动已打标文件（仅阻止后续采集/选用，设计原则）。删 key 级联删其 `tag_values`/`file_tags`（schema `ON DELETE CASCADE`）。
 - 创建 key 的布尔标志用指针区分「未传」与 `false`，未传取 schema 默认（`value_controlled=true`/`allow_path_var=true`/`required_at_collection=false`）。
 
+### 落地记录（MT-4b，待确认取值队列 list/approve/reject）
+
+`handler/pendingtags.go` + sqlc（`ListPendingTagValues` join `tag_keys` 出 key 名、`GetPendingTagValue`、
+`CreateTagValueIfAbsent`（`ON CONFLICT DO NOTHING`）、`DeletePendingTagValue`）+ 注入 `RouterConfig.PendingTagsDB`：
+- `GET /api/v1/pending-tag-values`（任意登录读，按 `hit_count DESC, first_seen_at ASC` 排）、
+  `POST /:id/approve`、`POST /:id/reject`（**super_admin**）。
+- **approve** = 把 `extracted_value` 提升进该 key 的 `tag_values` + 删 pending 行。文件已带原始值故**无需重写 file_tags**，
+  提升只是让该值成为合法词表/筛选项。两步**顺序非事务**：删失败则行仍留队，重试幂等（value 插入是 DO NOTHING），自愈。
+- **reject** = 只删 pending 行（不进词表）；已打标文件不动（设计）。
+- 全部按 `org_id` 收窄（`GetPendingTagValue`/`DeletePendingTagValue` 带 org 谓词，防跨租户）。`rows==0`/`ErrNoRows`→404。
+- **merge 未做**（依赖 MT-5 回溯 worker：把 tokyo 并入 Tokyo 需重写 file_tags + 审计），随 MT-5 落。
+- 真 PG 验证 join 列表 + approve 提升+删除 + reject。
+
 ### 落地记录（MT-3，路径变量抽取 + 待确认队列）
 
 CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_template` **trollsift 反解** storage path

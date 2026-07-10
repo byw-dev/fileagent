@@ -134,3 +134,50 @@ func TestDeleteTagKey_DBError(t *testing.T) {
 	_, err := q.DeleteTagKey(context.Background(), uuid.New(), "x")
 	require.Error(t, err)
 }
+
+var pendingListColumns = []string{
+	"id", "tag_key_id", "key", "extracted_value", "source",
+	"source_rule_id", "hit_count", "suggested_value", "first_seen_at",
+}
+
+func TestListPendingTagValues(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	id, keyID := uuid.New(), uuid.New()
+	rows := sqlmock.NewRows(pendingListColumns).AddRow(
+		id.String(), keyID.String(), "site", "tokyo", "path_var", nil, int32(2), "Tokyo", time.Now().UTC())
+	mock.ExpectQuery("FROM pending_tag_values").WillReturnRows(rows)
+	got, err := q.ListPendingTagValues(context.Background(), uuid.New())
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "tokyo", got[0].ExtractedValue)
+	assert.Equal(t, "site", got[0].Key)
+}
+
+func TestGetPendingTagValue(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	id, orgID, keyID := uuid.New(), uuid.New(), uuid.New()
+	cols := []string{"id", "org_id", "tag_key_id", "extracted_value", "source",
+		"source_rule_id", "hit_count", "suggested_value", "status", "first_seen_at"}
+	mock.ExpectQuery("FROM pending_tag_values").WillReturnRows(
+		sqlmock.NewRows(cols).AddRow(id.String(), orgID.String(), keyID.String(), "tokyo",
+			"path_var", nil, int32(1), nil, "pending", time.Now().UTC()))
+	got, err := q.GetPendingTagValue(context.Background(), id, orgID)
+	require.NoError(t, err)
+	assert.Equal(t, "tokyo", got.ExtractedValue)
+}
+
+func TestCreateTagValueIfAbsent(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectExec("INSERT INTO tag_values").WillReturnResult(sqlmock.NewResult(0, 1))
+	rows, err := q.CreateTagValueIfAbsent(context.Background(), uuid.New(), "tokyo")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), rows)
+}
+
+func TestDeletePendingTagValue(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectExec("DELETE FROM pending_tag_values").WillReturnResult(sqlmock.NewResult(0, 1))
+	rows, err := q.DeletePendingTagValue(context.Background(), uuid.New(), uuid.New())
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), rows)
+}
