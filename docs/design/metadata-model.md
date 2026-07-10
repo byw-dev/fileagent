@@ -149,6 +149,13 @@ CREATE TABLE tag_audit (
 - **文件按标签筛选**：`GET /api/v1/files` 增**可重复** `tag` 参数——`?tag=site:tokyo&tag=level:raw`（多条 AND）。
   须把 `tag` 加入 `middleware.RejectUnknownQuery` allowlist（`handler/files.go:103`），**保持 cursor 分页与信封
   V-2**；沿用 `db.CountFileEntriesFilter` + list 查询，标签谓词经 `file_tags` join。
+- **手动 / 批量打标**（2026-07-10 补充——初稿遗漏：`file_tags.source` 有 `manual`/`api` 且建了 `tag_audit`，
+  却没有对应写入端点；且**历史数据批量入库后需人工补标**，这是最近期的真实场景）：
+  - `PUT /api/v1/files/{id}/tags`：整体设置单文件标签（body `{ "tags": { "site": "tokyo", ... } }`；
+    value 为 `null` 表示清除该 key）。source=`manual`，写 `tag_audit`（action=`set`/`clear`）。
+  - `POST /api/v1/files/batch-tag`：按**与 `GET /files` 相同的筛选谓词**（含 `tag`）圈定文件集，统一
+    set/clear 指定标签；异步走回溯打标 worker 同一通道，写 `tag_audit`。
+  - 治理一致：受控 key 的未登记值同样进 `pending_tag_values`，不绕过词表。权限 super_admin（同词表）。
 - 响应 / 错误信封沿用 V-2 / V-4；分页**不得**改为 offset（契约）。
 
 ## P1.4 `file_types` 语义变更
@@ -158,34 +165,67 @@ CREATE TABLE tag_audit (
 
 ## P1.5 webui（round 7，UI 意图见 `webui-redesign.md` §4）
 
-`7a` 规则表单「元数据」步骤 · `7b` 文件页 faceted 筛选（`?tag=` 谓词）· `7c` 设置·标签词表 · `7d` 待确认队列。
+`7a` 规则表单「元数据」步骤 · `7b` 文件页 faceted 筛选（`?tag=` 谓词）+ **批量选中打标**（服务于历史数据人工补标）
+· `7c` 设置·标签词表 · `7d` 待确认队列。
 
 ## P1.6 迁移与测试
 
 - **迁移**：新增 `0000NN_metadata_tags.up/down.sql`（**只追加**，序号接现有最大号；不改既有迁移）。
 - **测试**：indexer 打标（静态 + 路径变量 + 未登记值入队 + 幂等）；classifier 优先级（声明类型 > glob）；
-  词表 / 待确认 handler 正常 + 权限 + 校验路径；files `tag` 筛选与 cursor 分页共存；回溯任务批量正确性。
+  词表 / 待确认 handler 正常 + 权限 + 校验路径；files `tag` 筛选与 cursor 分页共存；回溯任务批量正确性；
+  手动 / 批量打标（set/clear、未登记值入队、审计落表、非 super_admin 403）。
 
 ## P1.7 子任务拆分（供实现 PR 消费）
 
-迁移 → sqlc 查询 → indexer 打标引擎 → 词表/待确认/文件筛选 API → 回溯打标 worker → webui `7a–7d`。
+迁移 → sqlc 查询 → indexer 打标引擎 → 词表/待确认/文件筛选/手动批量打标 API → 回溯打标 worker → webui `7a–7d`。
 （每步独立 PR + review；改动契约前在 `DECISIONS.md` 记录。）
+**实施追踪**：[`docs/tasks/metadata-phase1.md`](../tasks/metadata-phase1.md)（MT-1…MT-6）。
 
 ---
 
-# Phase 2 · 数据集注册表（设计留存，暂缓实施）
+# Phase 2 · 数据集注册表 + 衍生数据/血缘（设计留存，暂缓实施）
 
 > 不在当前实施范围。**完整设计在此留存**，Phase 1 落地后再起；届时补 `DECISIONS.md` 子决策 + 迁移。
+> 血缘与衍生数据入口部分为 **2026-07-10 修订**（原设计只有数据集级血缘，见 D-025 补充记录）。
+
+## P2.1 数据集注册表
 
 **数据集 = 命名并固化的标签组合（谓词）**，如
 `tokyo-pressure-raw ≔ file_type:pressure ∧ site:tokyo ∧ level:raw`。
 
 - **薄层，不动文件表**：数据集只是查询的「视图 + 元信息」；`file_entries` / `file_tags` 零改动。
 - **DRAFT 表**：`datasets`（id, org_id, name, predicate JSONB, owner_user_id, sdk_subscription_name,
-  expected_arrivals JSONB[对账], created_at）；`dataset_lineage`（dataset_id, derived_from_dataset_id）。
-- **能力**：对账（应到未到——按 predicate 期望 vs 实到 `file_tags`）、血缘（`derived_from`）、SDK 订阅名。
+  expected_arrivals JSONB[对账], created_at）。
+- **能力**：对账（应到未到——按 predicate 期望 vs 实到 `file_tags`）、SDK 订阅名。
 - **API（草案）**：`/api/v1/datasets` CRUD + `/api/v1/datasets/{id}/reconcile`；文件页「另存为数据集」由
   `7b` 的标签谓词直接固化。
 - **SDK**（当前推后 T3-3/T4-4）：按数据集订阅 / 按标签拉取是主要消费场景。
 
-**触发 Phase 2 的信号**：出现明确的对账 / 血缘 / SDK 订阅需求。在此之前只打标、不建数据集。
+## P2.2 衍生数据入口（2026-07-10 定向）
+
+ETL（订正质控 / 计算衍生产品）是**未来的 SDK 消费方**：向 CP 查询有哪些数据 → 拉取 → 加工 → 回写。
+**衍生文件禁止直连 MinIO 读写**（否则元数据失控）；写入路径**镜像 agent 的数据面模式**：
+
+1. SDK 向 CP 申请**上传会话** → CP 发 STS 短期凭据（复用现有 STS manager 模式）；
+2. SDK 直传 MinIO（文件内容照旧**不过 CP**，符合架构原则）；
+3. SDK 回报**注册**：携带 tags / `level` / 所属 run（见 P2.3），source=`api`，受同一套词表治理
+   （未登记值入 `pending_tag_values`）。
+
+> minio-event 通知（D-014）只做对账兜底，不承担衍生数据打标——**注册即打标**。
+
+## P2.3 血缘 = 加工批次（run）模型（2026-07-10 修订，取代原「数据集级血缘」）
+
+原设计的 `dataset_lineage`（数据集 ← 数据集）表达不了「这个衍生文件从哪些文件来」；而逐条维护
+文件↔文件边又过于繁琐（输入输出关系有 1:1 / 1:n / n:1）。**采用 run 模型**（参考 OpenLineage 的
+job/run 思路）：血缘载体是**一次加工运行**，文件级精度可推导，ETL 侧零额外申报：
+
+- SDK 拉取数据时开 **run 上下文**，自动记录「本次拉了哪些 `file_entry_id`」；
+- ETL 注册输出文件时挂在同一 run 上；
+- `输出文件 → run → 输入文件集合` 即文件级血缘，1:1 / 1:n / n:1 统一表达。
+
+**DRAFT 表（纯追加，不动 Phase 1 任何表）**：
+`lineage_runs`（id, org_id, name/job 标识, started_at, finished_at, created_by）、
+`run_inputs`（run_id, file_entry_id）、输出文件注册时带 `run_id`（`file_entries` 加可空列或旁表，届时定）。
+
+**触发 Phase 2 的信号**：出现明确的对账 / SDK 订阅需求，或 ETL 开始建设（需要衍生数据入口 + 血缘）。
+在此之前只打标、不建数据集；历史数据入库用 Phase 1 的规则声明 + 批量打标即可覆盖。

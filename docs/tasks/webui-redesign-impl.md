@@ -1,5 +1,12 @@
 # webui-redesign-impl.md — Web UI 重做实现（Half A）
 
+> **⏸️ 状态（2026-07-10）：WR-2…WR-10 暂停。** WR-1 地基已合并（PR #66/#67），其产出（token /
+> `StatusBadge` / 时间 util / `FormDrawer` 等共享外壳）由元数据 track 复用。暂停理由（价值优先决策）：
+> WR 是给已能用的页面像素级换皮、不产出核心价值；先建元数据/标签核心（见
+> [`metadata-phase1.md`](metadata-phase1.md)）。WR-2 一轮未提交的 mock 尝试已回退干净。
+> **恢复方法**：按「从 mockup 回补规范再落码」教训执行——`webui-redesign.md` 是 mockup 的有损摘要，
+> 实现每页前先从本地 mockup HTML 提取精确样式回填规范，再写代码。
+>
 > **性质**：纯前端（`webui/`），**无后端契约改动**——统一既有页面的视觉与交互。
 > **设计权威**：[`docs/design/webui-redesign.md`](../design/webui-redesign.md)（token / 7 条交互定则 / 分页意图 §1–§5）。
 > **隐性契约**：[`docs/design/contracts.md`](../design/contracts.md) **V-1 状态枚举映射**（前端大写、DB `online`⇄前端 `RUNNING`）。

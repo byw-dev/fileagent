@@ -979,3 +979,17 @@ Makefile（`bundle` 目标）、构建/分发流程
 - **规则声明标签下发到 agent（改 proto）**：Phase 1 打标在 CP 侧即可（路径变量在服务端可从 storage path 抽取），
   下发标签到 agent 属过度设计；留待 Phase 2 若确有 agent 侧需求再评估。
 - **文件按标签筛选改 offset 分页**：违反 cursor 分页契约；用可重复 `tag` 参数 + `file_tags` join 即可。
+
+### 补充（2026-07-10，产品讨论后修订设计，未动已实现代码）
+
+1. **Phase 1 补手动/批量打标 API**（初稿遗漏）：`file_tags.source` 定义了 `manual`/`api` 且建了 `tag_audit`，
+   但 P1.3 没有写入端点。补 `PUT /api/v1/files/{id}/tags` + `POST /api/v1/files/batch-tag`（按 files 同款
+   筛选谓词圈选）。**直接动因**：将有一批历史数据文件入库需人工补标。
+2. **Phase 2 血缘从「数据集级」改为「run 模型」**：原 `dataset_lineage`（数据集←数据集）表达不了文件级来源，
+   逐条维护文件↔文件边又繁琐（1:1/1:n/n:1 混存）。改为记录**一次加工运行**（`lineage_runs`/`run_inputs`，
+   参考 OpenLineage）：SDK 拉取时自动记输入、注册输出时挂 run，文件级血缘可推导、ETL 零额外申报。
+3. **明确衍生数据入口**（原设计未回答）：ETL 是未来 SDK 消费方，**禁止直连 MinIO 读写**；写入镜像 agent
+   数据面（CP 发 STS → 直传 → 注册携带 tags/level/run_id，source=`api`，受同一词表治理）。minio-event
+   只做对账兜底。ETL 在系统第一阶段建设完成前不存在，故仅落设计（`metadata-model.md` P2.2/P2.3）。
+4. **实施排期**：Phase 1 提为当前 track（MT-1…MT-6，追踪 `docs/tasks/metadata-phase1.md`），WR-2…10 暂停
+   让位（价值优先）。MT-1+MT-2 薄纵切起手。
