@@ -175,10 +175,10 @@ func (q *Queries) GetTagKey(ctx context.Context, orgID uuid.UUID, key string) (*
 }
 
 const listPendingTagValues = `-- name: ListPendingTagValues :many
-SELECT p.id, p.tag_key_id, k.key, p.extracted_value, p.source, p.source_rule_id,
-       p.hit_count, p.suggested_value, p.first_seen_at
+SELECT p.id, p.tag_key_id, COALESCE(k.key, '') AS key, p.extracted_value, p.source,
+       p.source_rule_id, p.hit_count, p.suggested_value, p.first_seen_at
 FROM pending_tag_values p
-JOIN tag_keys k ON k.id = p.tag_key_id AND k.org_id = p.org_id
+LEFT JOIN tag_keys k ON k.id = p.tag_key_id AND k.org_id = p.org_id
 WHERE p.org_id = $1 AND p.status = 'pending'
 ORDER BY p.hit_count DESC, p.first_seen_at ASC
 `
@@ -195,6 +195,10 @@ type ListPendingTagValuesRow struct {
 	FirstSeenAt    time.Time      `db:"first_seen_at" json:"first_seen_at"`
 }
 
+// LEFT JOIN + COALESCE so a corrupted/org-mismatched pending row (tag_key_id not
+// matching the org — not prevented by any composite FK) still surfaces for
+// operational cleanup with an empty key name, rather than being silently hidden.
+// The org-scoped ON clause keeps a cross-tenant key name from leaking.
 func (q *Queries) ListPendingTagValues(ctx context.Context, orgID uuid.UUID) ([]*ListPendingTagValuesRow, error) {
 	rows, err := q.db.QueryContext(ctx, listPendingTagValues, orgID)
 	if err != nil {
