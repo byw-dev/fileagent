@@ -88,7 +88,7 @@ func (h *PendingTagValuesHandler) List(c *gin.Context) {
 func (h *PendingTagValuesHandler) resolvePending(c *gin.Context) (*db.PendingTagValue, bool) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid id", nil)
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid pending tag value id", nil)
 		return nil, false
 	}
 	p, err := h.db.GetPendingTagValue(c.Request.Context(), id, orgIDFromClaims(c))
@@ -150,7 +150,7 @@ func (h *PendingTagValuesHandler) Reject(c *gin.Context) {
 	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid id", nil)
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid pending tag value id", nil)
 		return
 	}
 	rows, err := h.db.DeletePendingTagValue(c.Request.Context(), id, orgIDFromClaims(c))
