@@ -48,34 +48,29 @@ CP↔MinIO 不再 hairpin。
 
 ---
 
-## 前端重做实现（Half A）→ 已排期，见专项追踪文件
+## 前端重做实现（Half A）→ ⏸️ 已暂停（WR-1 已合并，WR-2…10 让位元数据 track）
 
 **来源**：Claude Design 项目「前端页面重做计划」（2026-07-07，登录态私有）。设计规范：
 [`docs/design/webui-redesign.md`](../design/webui-redesign.md)。**性质**：纯前端（webui），无后端契约改动。
 
-已从"待规划"升级为**当前选定 track**，详细分期（`WR-1` 地基 → `WR-2` 文件类型样板页 → `WR-3…WR-9` 逐页 → `WR-10` 收尾）、
-远端版核验得出的验收清单、暗色闪烁修复，均落于权威追踪文件
+**WR-1 地基已合并**（PR #66/#67：主题 token / 暗色闪烁修复 / 固定侧栏 / `StatusBadge` / 时间 util / 共享外壳），
+被元数据 track 的 MT-6 复用。**WR-2…WR-10 于 2026-07-10 暂停**（价值优先：先建元数据核心，见
+[`metadata-phase1.md`](metadata-phase1.md)）。分期、验收清单、恢复方法均在权威追踪文件
 [`webui-redesign-impl.md`](webui-redesign-impl.md)。实施采用**在现有基线上改造（非重写）**。
 
-## 元数据 / 标签 / 数据集能力（epic · 已拍板 6c，D-025）
+## 元数据 / 标签 / 数据集能力（epic · 已拍板 6c，D-025）→ Phase 1 已排期，见专项追踪文件
 
-**来源**：Claude Design round 6–7；已拍板混合模型 `6c`（D-025）。**权威设计**：
+**来源**：Claude Design round 6–7；已拍板混合模型 `6c`（D-025 + 2026-07-10 补充）。**权威设计**：
 [`docs/design/metadata-model.md`](../design/metadata-model.md)（Phase 1 工程设计 + Phase 2 留存）。
 
-**Phase 1 · 受控标签（已设计，待实现）** —— 纯 CP + webui，**不改 agent / proto**（打标在 CP 侧）。子任务：
-1. 迁移：`tag_keys` / `tag_values` / `file_tags` / `pending_tag_values` / `tag_audit`（只追加）。
-2. sqlc 查询 + `internal/indexer` 打标引擎（静态标签 + 路径变量抽取 + 未登记值入待确认队列 + 幂等）。
-3. `classifier.go` 优先级：规则声明类型 > glob 兜底。
-4. REST：词表 CRUD、待确认 approve/merge/reject、`GET /api/v1/files` 增可重复 `tag` 筛选（扩
-   `RejectUnknownQuery`、保持 cursor 分页）。
-5. 回溯打标 worker（改规则/词表触发）。
-6. webui `7a`–`7d`（规则表单元数据步骤 / 文件页 faceted 筛选 / 标签词表 / 待确认队列）。
+**Phase 1 · 受控标签**已从"待规划"升级为**当前选定 track**（2026-07-10 价值优先决策，WR-2…10 暂停让位）：
+任务拆分 **MT-1…MT-6**、验收要点、执行纪律均落于权威追踪文件
+[`metadata-phase1.md`](metadata-phase1.md)。起手 MT-1+MT-2 薄纵切。
 
-每步独立 PR + review；改契约前在 `DECISIONS.md` 记录。
-
-**Phase 2 · 数据集注册表（deferred）** —— 命名标签组合谓词 + 对账/血缘/SDK 订阅名，薄层不动文件表。
-**设计已完整留存**于 `metadata-model.md` 的「Phase 2」章节；出现对账/血缘/SDK 订阅需求时再起，届时补 D- 子决策
-与迁移。
+**Phase 2 · 数据集注册表 + 衍生数据入口 + 血缘 run 模型（deferred）** —— 薄层不动文件表。
+**设计已完整留存**于 `metadata-model.md` P2.1–P2.3（2026-07-10 修订：血缘从数据集级改为 run 模型；
+衍生数据 = 未来 ETL 经 SDK/CP 注册，禁止直连 MinIO）；出现对账/SDK 订阅需求或 ETL 起建时再起，届时补
+D- 子决策与迁移。
 
 ---
 

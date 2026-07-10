@@ -330,16 +330,17 @@ docker compose -f deploy/docker-compose.test.yml down -v
 部署脚手架/运维文档 T4-3（PR #61）、**D-024** MinIO internal/public endpoint 拆分（PR #62）、
 **D-025** 元数据模型 6c 拍板 + Web UI 重做设计（PR #63）。
 
-**当前无进行中的实现任务**（最近落地的是设计/文档）。下一步候选（人工择一）：
-① **元数据 6c Phase 1 实现**（受控标签，设计见 `docs/design/metadata-model.md`）；
-② **Web UI 重做实现**（设计见 `docs/design/webui-redesign.md`）；③ 可选 proto→buf 复现性 follow-up。
+**当前 track（2026-07-10 拍板，价值优先）**：**元数据 6c Phase 1 实现**（受控标签，MT-1…MT-6，
+追踪 `docs/tasks/metadata-phase1.md`，设计见 `docs/design/metadata-model.md`）。
+Web UI 重做（WR-2…10）**已暂停**让位（WR-1 地基已合并可复用，见 `docs/tasks/webui-redesign-impl.md`）；
+可选 proto→buf 复现性 follow-up 未排期。
 
 **已按产品决策推后**（2026-07-04）：**T3-3（Python SDK）/ T4-4（Java SDK）**——暂无消费方；
 契约单一权威/OpenAPI 校验（G-8/G-9）、结构性文档重构（design 去重指针化、CLAUDE.md 减肥）、
 Prometheus 指标（T4-1）、Agent `disks`/`upload_bps` 遥测、存储物理用量。止血冲刺回顾见
 `docs/reports/design-gap-analysis/07-summary.md` §五。
 
-当前任务与状态以 `docs/tasks/active.md` + `docs/tasks/core-completeness.md` 为准；
+当前任务与状态以 `docs/tasks/active.md` + `docs/tasks/metadata-phase1.md` 为准；
 `TASK_LIST.md` 提供总索引。
 
 > **文档权威优先级**（层级从高到低）：

@@ -1,16 +1,21 @@
 # active.md — 当前执行入口（轻量）
 
 > **当前阶段**：Phase 3 — 集成联调（已插入两轮收尾冲刺）
-> **Agent 主要输入文件**：本文件 + [`core-completeness.md`](core-completeness.md)
+> **Agent 主要输入文件**：本文件 + [`metadata-phase1.md`](metadata-phase1.md)
 
 ---
 
-## 当前选定 track：Web UI 重做实现（Half A）— 已规划，待写码
+## 当前选定 track：元数据 6c Phase 1 实现（受控标签）— MT-1…MT-6
 
-**权威追踪**：[`webui-redesign-impl.md`](webui-redesign-impl.md)（`WR-1` 地基 → `WR-2` 文件类型样板页 →
-`WR-3…WR-9` 逐页 → `WR-10` 收尾；每个 WR-x 独立 PR）。设计见 [`docs/design/webui-redesign.md`](../design/webui-redesign.md)。
-**采在现有 `webui/` 基线上改造，不重写**。截至 2026-07-09 仅完成规划 + 文档落地，**尚未写 webui 代码**；
-推进范围由后续 session 选定。验收清单来自对远端一版的实机核验（"皮对骨错"：无抽屉 / 徽标三套 / 时间格式错 / 暗色闪烁）。
+**权威追踪**：[`metadata-phase1.md`](metadata-phase1.md)。设计：[`docs/design/metadata-model.md`](../design/metadata-model.md)
+（D-025 + 2026-07-10 补充：手动/批量打标 API、Phase 2 血缘 run 模型、衍生数据入口）。
+**起手**：MT-1 + MT-2 薄纵切（迁移 + static_tags 打标 + `?tag=` 筛选，核心闭环）。
+纯 CP + webui，**不改 agent / proto**；每个 MT-x 独立 PR off master + review + 人工合并。
+
+**⏸️ 前一 track「Web UI 重做实现（Half A）」已暂停**（2026-07-10 价值优先决策）：WR-1 地基已合并（PR #66/#67）
+并被本 track 复用（token / `StatusBadge` / 时间 util / 共享外壳）；WR-2…WR-10 暂停，追踪与恢复方法见
+[`webui-redesign-impl.md`](webui-redesign-impl.md)。理由：WR 是给已能用的页面换皮，不产出核心价值；
+给文件维护元数据/标签才是采集系统的核心，而这套还没建。
 
 ---
 
@@ -26,12 +31,10 @@
 | MinIO internal/public endpoint 拆分 | #62 | D-024 |
 | 元数据模型 6c 拍板 + Web UI 重做设计 | #63 | D-025 |
 
-**已选定 track**：**Web UI 重做实现（Half A）**（见顶部），追踪
-[`webui-redesign-impl.md`](webui-redesign-impl.md)。
+**已选定 track**：**元数据 6c Phase 1 实现**（见顶部），追踪 [`metadata-phase1.md`](metadata-phase1.md)。
 
 **其余候选（未排期）**：
-1. **元数据 6c Phase 1 实现**（受控标签：词表/`file_tags`/待确认队列 + CP 打标引擎）——设计见
-   [`docs/design/metadata-model.md`](../design/metadata-model.md)；epic 拆分见 [`backlog.md`](backlog.md)。
+1. **Web UI 重做实现 WR-2…WR-10**（⏸️ 已暂停，恢复条件与方法见 [`webui-redesign-impl.md`](webui-redesign-impl.md)）。
 2. 可选 **proto→buf** 复现性 follow-up。
 
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
@@ -72,7 +75,8 @@
 
 ## 关联入口
 
-- 当前冲刺 backlog：[`core-completeness.md`](core-completeness.md)
+- 当前 track 追踪：[`metadata-phase1.md`](metadata-phase1.md)
+- 前一冲刺（已收官）：[`core-completeness.md`](core-completeness.md)
 - Phase 3 主线（含已完成 T3-x）：[`phases/phase-3.md`](phases/phase-3.md)
 - 采集规则重构规格：[`phases/phase-3-rft.md`](phases/phase-3-rft.md)
 - 已关闭 Bug：[`bugs/closed.md`](bugs/closed.md)
