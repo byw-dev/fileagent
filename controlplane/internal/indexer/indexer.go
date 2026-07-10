@@ -378,13 +378,17 @@ func (ix *Indexer) applyStaticTags(ctx context.Context, fileEntryID uuid.UUID, t
 
 // templateVarName extracts the variable name from a path_tag_map reference such
 // as "{site}" or "{site:fmt}". It returns "" for anything that is not a single
-// bare {var} reference.
+// bare {var} reference — including multi-placeholder shapes like "{a}{b}", where
+// a leftover brace in the inner content signals more than one placeholder.
 func templateVarName(ref string) string {
 	ref = strings.TrimSpace(ref)
 	if len(ref) < 3 || ref[0] != '{' || ref[len(ref)-1] != '}' {
 		return ""
 	}
 	inner := ref[1 : len(ref)-1]
+	if strings.ContainsAny(inner, "{}") {
+		return ""
+	}
 	if i := strings.IndexByte(inner, ':'); i >= 0 {
 		inner = inner[:i]
 	}

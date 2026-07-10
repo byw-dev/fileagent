@@ -838,4 +838,6 @@ func TestTemplateVarName(t *testing.T) {
 	assert.Equal(t, "", templateVarName("site"))
 	assert.Equal(t, "", templateVarName(""))
 	assert.Equal(t, "", templateVarName("{}"))
+	assert.Equal(t, "", templateVarName("{a}{b}")) // multi-placeholder rejected
+	assert.Equal(t, "", templateVarName("{a}x{b}"))
 }
