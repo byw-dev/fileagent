@@ -18,14 +18,14 @@ var tagKeyColumns = []string{
 
 func tagKeyRow(id, orgID uuid.UUID, key string) *sqlmock.Rows {
 	return sqlmock.NewRows(tagKeyColumns).AddRow(
-		id, orgID, key, "Label", true, false, true, false, time.Now().UTC(),
+		id.String(), orgID.String(), key, "Label", true, false, true, false, time.Now().UTC(),
 	)
 }
 
 var tagValueColumns = []string{"id", "tag_key_id", "value", "created_at"}
 
 func tagValueRow(id, keyID uuid.UUID, value string) *sqlmock.Rows {
-	return sqlmock.NewRows(tagValueColumns).AddRow(id, keyID, value, time.Now().UTC())
+	return sqlmock.NewRows(tagValueColumns).AddRow(id.String(), keyID.String(), value, time.Now().UTC())
 }
 
 func TestListTagKeys(t *testing.T) {

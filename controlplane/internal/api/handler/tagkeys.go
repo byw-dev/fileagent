@@ -315,11 +315,11 @@ func (h *TagKeysHandler) ListValues(c *gin.Context) {
 		middleware.NotImplemented(c)
 		return
 	}
-	key, ok := h.resolveKey(c)
+	tagKey, ok := h.resolveKey(c)
 	if !ok {
 		return
 	}
-	values, err := h.db.ListTagValues(c.Request.Context(), key.ID)
+	values, err := h.db.ListTagValues(c.Request.Context(), tagKey.ID)
 	if err != nil {
 		h.logger.Error("list tag values", zap.Error(err))
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to list tag values", nil)
@@ -343,7 +343,7 @@ func (h *TagKeysHandler) CreateValue(c *gin.Context) {
 		middleware.NotImplemented(c)
 		return
 	}
-	key, ok := h.resolveKey(c)
+	tagKey, ok := h.resolveKey(c)
 	if !ok {
 		return
 	}
@@ -357,7 +357,7 @@ func (h *TagKeysHandler) CreateValue(c *gin.Context) {
 		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "value must not be empty", nil)
 		return
 	}
-	v, err := h.db.CreateTagValue(c.Request.Context(), key.ID, value)
+	v, err := h.db.CreateTagValue(c.Request.Context(), tagKey.ID, value)
 	if err != nil {
 		if isUniqueViolation(err) {
 			middleware.RespondError(c, http.StatusConflict, "ALREADY_EXISTS", "value already exists", nil)
@@ -378,7 +378,7 @@ func (h *TagKeysHandler) DeleteValue(c *gin.Context) {
 		middleware.NotImplemented(c)
 		return
 	}
-	key, ok := h.resolveKey(c)
+	tagKey, ok := h.resolveKey(c)
 	if !ok {
 		return
 	}
@@ -387,7 +387,7 @@ func (h *TagKeysHandler) DeleteValue(c *gin.Context) {
 		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid value id", nil)
 		return
 	}
-	rows, err := h.db.DeleteTagValue(c.Request.Context(), vid, key.ID)
+	rows, err := h.db.DeleteTagValue(c.Request.Context(), vid, tagKey.ID)
 	if err != nil {
 		h.logger.Error("delete tag value", zap.Error(err))
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to delete tag value", nil)
