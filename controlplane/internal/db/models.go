@@ -429,6 +429,14 @@ type FileEntry struct {
 	UpdatedAt    time.Time      `db:"updated_at" json:"updated_at"`
 }
 
+type FileTag struct {
+	FileEntryID uuid.UUID `db:"file_entry_id" json:"file_entry_id"`
+	Key         string    `db:"key" json:"key"`
+	Value       string    `db:"value" json:"value"`
+	Source      string    `db:"source" json:"source"`
+	CreatedAt   time.Time `db:"created_at" json:"created_at"`
+}
+
 type FileType struct {
 	ID          uuid.UUID      `db:"id" json:"id"`
 	OrgID       uuid.UUID      `db:"org_id" json:"org_id"`
@@ -453,6 +461,51 @@ type Organization struct {
 	Metadata    json.RawMessage `db:"metadata" json:"metadata"`
 	CreatedAt   time.Time       `db:"created_at" json:"created_at"`
 	UpdatedAt   time.Time       `db:"updated_at" json:"updated_at"`
+}
+
+type PendingTagValue struct {
+	ID             uuid.UUID      `db:"id" json:"id"`
+	OrgID          uuid.UUID      `db:"org_id" json:"org_id"`
+	TagKeyID       uuid.UUID      `db:"tag_key_id" json:"tag_key_id"`
+	ExtractedValue string         `db:"extracted_value" json:"extracted_value"`
+	Source         string         `db:"source" json:"source"`
+	SourceRuleID   uuid.NullUUID  `db:"source_rule_id" json:"source_rule_id"`
+	HitCount       int32          `db:"hit_count" json:"hit_count"`
+	SuggestedValue sql.NullString `db:"suggested_value" json:"suggested_value"`
+	Status         string         `db:"status" json:"status"`
+	FirstSeenAt    time.Time      `db:"first_seen_at" json:"first_seen_at"`
+}
+
+type TagAudit struct {
+	ID          uuid.UUID      `db:"id" json:"id"`
+	OrgID       uuid.UUID      `db:"org_id" json:"org_id"`
+	FileEntryID uuid.NullUUID  `db:"file_entry_id" json:"file_entry_id"`
+	Key         string         `db:"key" json:"key"`
+	OldValue    sql.NullString `db:"old_value" json:"old_value"`
+	NewValue    sql.NullString `db:"new_value" json:"new_value"`
+	Action      string         `db:"action" json:"action"`
+	ActorUserID uuid.NullUUID  `db:"actor_user_id" json:"actor_user_id"`
+	Source      string         `db:"source" json:"source"`
+	CreatedAt   time.Time      `db:"created_at" json:"created_at"`
+}
+
+type TagKey struct {
+	ID                   uuid.UUID `db:"id" json:"id"`
+	OrgID                uuid.UUID `db:"org_id" json:"org_id"`
+	Key                  string    `db:"key" json:"key"`
+	Label                string    `db:"label" json:"label"`
+	ValueControlled      bool      `db:"value_controlled" json:"value_controlled"`
+	RequiredAtCollection bool      `db:"required_at_collection" json:"required_at_collection"`
+	AllowPathVar         bool      `db:"allow_path_var" json:"allow_path_var"`
+	SystemReserved       bool      `db:"system_reserved" json:"system_reserved"`
+	CreatedAt            time.Time `db:"created_at" json:"created_at"`
+}
+
+type TagValue struct {
+	ID        uuid.UUID `db:"id" json:"id"`
+	TagKeyID  uuid.UUID `db:"tag_key_id" json:"tag_key_id"`
+	Value     string    `db:"value" json:"value"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
 }
 
 type UploadLog struct {

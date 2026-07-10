@@ -6,12 +6,46 @@ package db
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
 
 // ── ListFileEntries ───────────────────────────────────────────────────────────
+
+// FileTagFilter is a single key:value predicate applied to file_tags. Multiple
+// filters combine with AND (a file must carry every requested tag).
+type FileTagFilter struct {
+	Key   string
+	Value string
+}
+
+// tagFilterClause appends the SQL fragment (and bind args) that restricts
+// file_entries to rows carrying all of the given tag predicates. It returns the
+// empty string when there are no predicates. Because file_tags is keyed on
+// (file_entry_id, key), each (key,value) pair matches at most one row per file,
+// so HAVING COUNT(*) = N enforces AND semantics across the N predicates.
+func tagFilterClause(tags []FileTagFilter, args *[]interface{}) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(" AND id IN (SELECT file_entry_id FROM file_tags WHERE (key, value) IN (")
+	for i, t := range tags {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		*args = append(*args, t.Key, t.Value)
+		fmt.Fprintf(&b, "($%d, $%d)", len(*args)-1, len(*args))
+	}
+	b.WriteString(") GROUP BY file_entry_id HAVING COUNT(*) = ")
+	b.WriteString(strconv.Itoa(len(tags)))
+	b.WriteString(")")
+	return b.String()
+}
 
 // ListFileEntriesParams holds parameters for ListFileEntries.
 type ListFileEntriesParams struct {
@@ -20,13 +54,14 @@ type ListFileEntriesParams struct {
 	BucketID   uuid.NullUUID
 	FileTypeID uuid.NullUUID
 	Status     NullFileStatus
+	Tags       []FileTagFilter
 	// Cursor pagination: items with (created_at, id) < (CursorCreatedAt, CursorID)
 	CursorCreatedAt sql.NullTime
 	CursorID        uuid.NullUUID
 	Limit           int32
 }
 
-const listFileEntriesSQL = `
+const listFileEntriesSelect = `
 SELECT id, org_id, file_type_id, agent_id, rule_id, bucket_id,
        storage_path, original_path, file_name, size_bytes,
        sha256, etag, content_type, file_mtime, status, uploaded_at,
@@ -37,14 +72,11 @@ WHERE org_id = $1
   AND ($3::UUID IS NULL OR bucket_id = $3)
   AND ($4::UUID IS NULL OR file_type_id = $4)
   AND ($5::file_status IS NULL OR status = $5)
-  AND ($6::TIMESTAMPTZ IS NULL OR (created_at, id) < ($6, $7::UUID))
-ORDER BY created_at DESC, id DESC
-LIMIT $8
-`
+  AND ($6::TIMESTAMPTZ IS NULL OR (created_at, id) < ($6, $7::UUID))`
 
 // ListFileEntries returns a cursor-paginated list of file entries with optional filters.
 func (q *Queries) ListFileEntries(ctx context.Context, arg ListFileEntriesParams) ([]*FileEntry, error) {
-	rows, err := q.db.QueryContext(ctx, listFileEntriesSQL,
+	args := []interface{}{
 		arg.OrgID,
 		arg.AgentID,
 		arg.BucketID,
@@ -52,8 +84,14 @@ func (q *Queries) ListFileEntries(ctx context.Context, arg ListFileEntriesParams
 		arg.Status,
 		arg.CursorCreatedAt,
 		arg.CursorID,
-		arg.Limit,
-	)
+	}
+	var sb strings.Builder
+	sb.WriteString(listFileEntriesSelect)
+	sb.WriteString(tagFilterClause(arg.Tags, &args))
+	args = append(args, arg.Limit)
+	fmt.Fprintf(&sb, "\nORDER BY created_at DESC, id DESC\nLIMIT $%d", len(args))
+
+	rows, err := q.db.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -293,30 +331,79 @@ type CountFileEntriesFilter struct {
 	BucketID   uuid.NullUUID
 	FileTypeID uuid.NullUUID
 	Status     NullFileStatus
+	Tags       []FileTagFilter
 }
 
-const countFileEntriesSQL = `
+const countFileEntriesSelect = `
 SELECT COUNT(*)
 FROM file_entries
 WHERE org_id = $1
   AND ($2::UUID IS NULL OR agent_id = $2)
   AND ($3::UUID IS NULL OR bucket_id = $3)
   AND ($4::UUID IS NULL OR file_type_id = $4)
-  AND ($5::file_status IS NULL OR status = $5)
-`
+  AND ($5::file_status IS NULL OR status = $5)`
 
 // CountFileEntries returns the total number of file entries matching the
 // given optional filters (no cursor/limit applied).
 func (q *Queries) CountFileEntries(ctx context.Context, f CountFileEntriesFilter) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countFileEntriesSQL,
+	args := []interface{}{
 		f.OrgID,
 		f.AgentID,
 		f.BucketID,
 		f.FileTypeID,
 		f.Status,
-	)
+	}
+	var sb strings.Builder
+	sb.WriteString(countFileEntriesSelect)
+	sb.WriteString(tagFilterClause(f.Tags, &args))
+
+	row := q.db.QueryRowContext(ctx, sb.String(), args...)
 	var n int64
 	return n, row.Scan(&n)
+}
+
+// ── ListFileTagsByFileIDs ─────────────────────────────────────────────────────
+
+// ListFileTagsByFileIDs returns the tags of each file in ids, keyed by file
+// entry id then tag key. Files without tags are simply absent from the map. It
+// uses a dynamic IN list (lib/pq has no first-class array binding here) and
+// returns an empty map for an empty input.
+func (q *Queries) ListFileTagsByFileIDs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]map[string]string, error) {
+	out := make(map[uuid.UUID]map[string]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	args := make([]interface{}, len(ids))
+	var sb strings.Builder
+	sb.WriteString("SELECT file_entry_id, key, value FROM file_tags WHERE file_entry_id IN (")
+	for i, id := range ids {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		fmt.Fprintf(&sb, "$%d", i+1)
+		args[i] = id
+	}
+	sb.WriteString(") ORDER BY key")
+
+	rows, err := q.db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var fid uuid.UUID
+		var key, value string
+		if err := rows.Scan(&fid, &key, &value); err != nil {
+			return nil, err
+		}
+		m := out[fid]
+		if m == nil {
+			m = make(map[string]string)
+			out[fid] = m
+		}
+		m[key] = value
+	}
+	return out, rows.Err()
 }
 
 // ── CountUploadLogs ───────────────────────────────────────────────────────────

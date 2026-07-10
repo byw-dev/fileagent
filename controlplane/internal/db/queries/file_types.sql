@@ -10,6 +10,12 @@ FROM file_types
 WHERE id = $1
 LIMIT 1;
 
+-- name: GetFileTypeByName :one
+SELECT id, org_id, name, description, created_by, created_at
+FROM file_types
+WHERE org_id = $1 AND name = $2
+LIMIT 1;
+
 -- name: CreateFileType :one
 INSERT INTO file_types (org_id, name, description, created_by)
 VALUES ($1, $2, $3, $4)

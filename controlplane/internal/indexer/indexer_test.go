@@ -3,6 +3,8 @@ package indexer
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,13 +46,22 @@ type mockIndexerStore struct {
 	uploadLogErr error
 	typeRules    []*db.FileTypeRule
 	typeRulesErr error
+
+	ruleMeta       json.RawMessage
+	ruleMetaErr    error
+	fileTypeByName map[string]uuid.UUID
+	fileTypeErr    error
+	upsertedTags   []UpsertFileTagParams
+	upsertTagErr   error
+	lastUpsert     UpsertFileEntryParams
 }
 
 func (m *mockIndexerStore) GetBucketByName(_ context.Context, _ uuid.UUID, _ string) (*db.Bucket, error) {
 	return m.bucket, m.bucketErr
 }
 
-func (m *mockIndexerStore) UpsertFileEntry(_ context.Context, _ UpsertFileEntryParams) (*db.FileEntry, error) {
+func (m *mockIndexerStore) UpsertFileEntry(_ context.Context, params UpsertFileEntryParams) (*db.FileEntry, error) {
+	m.lastUpsert = params
 	return m.fileEntry, m.upsertErr
 }
 
@@ -64,6 +75,25 @@ func (m *mockIndexerStore) CreateUploadLog(_ context.Context, _ CreateUploadLogP
 
 func (m *mockIndexerStore) ListFileTypeRules(_ context.Context) ([]*db.FileTypeRule, error) {
 	return m.typeRules, m.typeRulesErr
+}
+
+func (m *mockIndexerStore) GetRuleMetadata(_ context.Context, _, _ uuid.UUID) (json.RawMessage, error) {
+	return m.ruleMeta, m.ruleMetaErr
+}
+
+func (m *mockIndexerStore) GetFileTypeIDByName(_ context.Context, _ uuid.UUID, name string) (uuid.UUID, error) {
+	if m.fileTypeErr != nil {
+		return uuid.Nil, m.fileTypeErr
+	}
+	return m.fileTypeByName[name], nil
+}
+
+func (m *mockIndexerStore) UpsertFileTag(_ context.Context, params UpsertFileTagParams) error {
+	if m.upsertTagErr != nil {
+		return m.upsertTagErr
+	}
+	m.upsertedTags = append(m.upsertedTags, params)
+	return nil
 }
 
 // ── Legacy DBTX mock (kept for tests that use it directly) ──────────────────
@@ -501,4 +531,153 @@ func TestIndexDeletion_BucketError(t *testing.T) {
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 	err := ix.IndexDeletion(context.Background(), "data-sensor", "k")
 	require.Error(t, err)
+}
+
+// ── MT-2: tagging engine ───────────────────────────────────────────────────────
+
+// newTagResult builds a successful UploadResult carrying a rule id.
+func newTagResult(ruleID uuid.UUID, storagePath string) *agentv1.UploadResult {
+	return &agentv1.UploadResult{
+		RuleId:      ruleID.String(),
+		StoragePath: storagePath,
+		Bucket:      "test-bucket",
+		SizeBytes:   1,
+		Success:     true,
+		UploadedAt:  timestamppb.New(time.Now()),
+	}
+}
+
+func TestHandleUploadResult_AppliesStaticTags(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/p.csv")
+	store := &mockIndexerStore{
+		bucket:    bucket,
+		fileEntry: fe,
+		uploadLog: newUploadLog(),
+		ruleMeta:  json.RawMessage(`{"static_tags":{"vendor":"omron","site":"tokyo"}}`),
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	require.NoError(t, err)
+
+	require.Len(t, store.upsertedTags, 2)
+	got := map[string]UpsertFileTagParams{}
+	for _, tag := range store.upsertedTags {
+		got[tag.Key] = tag
+		assert.Equal(t, fe.ID, tag.FileEntryID)
+		assert.Equal(t, "rule_static", tag.Source)
+	}
+	assert.Equal(t, "omron", got["vendor"].Value)
+	assert.Equal(t, "tokyo", got["site"].Value)
+}
+
+func TestHandleUploadResult_NoRuleMetadata_NoTags(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/p.csv")
+	store := &mockIndexerStore{
+		bucket:    bucket,
+		fileEntry: fe,
+		uploadLog: newUploadLog(),
+		// ruleMeta nil → GetRuleMetadata returns empty → no tags.
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	require.NoError(t, err)
+	assert.Empty(t, store.upsertedTags)
+}
+
+func TestHandleUploadResult_MalformedMetadata_DegradesGracefully(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/p.csv")
+	store := &mockIndexerStore{
+		bucket:    bucket,
+		fileEntry: fe,
+		uploadLog: newUploadLog(),
+		ruleMeta:  json.RawMessage(`{not valid json`),
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	require.NoError(t, err)
+	assert.Empty(t, store.upsertedTags)
+}
+
+func TestHandleUploadResult_DeclaredFileTypeOverridesGlob(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/p.csv")
+	declaredID := uuid.New()
+	globID := uuid.New()
+	store := &mockIndexerStore{
+		bucket:         bucket,
+		fileEntry:      fe,
+		uploadLog:      newUploadLog(),
+		ruleMeta:       json.RawMessage(`{"file_type":"pressure"}`),
+		fileTypeByName: map[string]uuid.UUID{"pressure": declaredID},
+		// A glob rule that would otherwise match, to prove the declaration wins.
+		typeRules: []*db.FileTypeRule{{ID: uuid.New(), FileTypeID: globID, PathPattern: "*.csv"}},
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	require.NoError(t, err)
+	require.True(t, store.lastUpsert.FileTypeID.Valid)
+	assert.Equal(t, declaredID, store.lastUpsert.FileTypeID.UUID)
+}
+
+func TestHandleUploadResult_DeclaredFileTypeNotFound_FallsBackToGlob(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/p.csv")
+	globID := uuid.New()
+	store := &mockIndexerStore{
+		bucket:         bucket,
+		fileEntry:      fe,
+		uploadLog:      newUploadLog(),
+		ruleMeta:       json.RawMessage(`{"file_type":"unknown"}`),
+		fileTypeByName: map[string]uuid.UUID{}, // "unknown" resolves to uuid.Nil
+		typeRules:      []*db.FileTypeRule{{ID: uuid.New(), FileTypeID: globID, PathPattern: "*.csv"}},
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	require.NoError(t, err)
+	require.True(t, store.lastUpsert.FileTypeID.Valid)
+	assert.Equal(t, globID, store.lastUpsert.FileTypeID.UUID)
+}
+
+func TestHandleUploadResult_TagUpsertError_DoesNotFailIndexing(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/p.csv")
+	store := &mockIndexerStore{
+		bucket:       bucket,
+		fileEntry:    fe,
+		uploadLog:    newUploadLog(),
+		ruleMeta:     json.RawMessage(`{"static_tags":{"vendor":"omron"}}`),
+		upsertTagErr: assert.AnError,
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	require.NoError(t, err)
+}
+
+func TestHandleUploadResult_SkipsOverlongStaticTag(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/p.csv")
+	longValue := strings.Repeat("x", 129) // exceeds VARCHAR(128)
+	store := &mockIndexerStore{
+		bucket:    bucket,
+		fileEntry: fe,
+		uploadLog: newUploadLog(),
+		ruleMeta:  json.RawMessage(`{"static_tags":{"vendor":"omron","note":"` + longValue + `"}}`),
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	require.NoError(t, err)
+
+	// The overlong "note" tag is skipped; the valid "vendor" tag still lands.
+	require.Len(t, store.upsertedTags, 1)
+	assert.Equal(t, "vendor", store.upsertedTags[0].Key)
 }

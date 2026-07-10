@@ -1,0 +1,9 @@
+BEGIN;
+
+DROP TABLE IF EXISTS tag_audit;
+DROP TABLE IF EXISTS pending_tag_values;
+DROP TABLE IF EXISTS file_tags;
+DROP TABLE IF EXISTS tag_values;
+DROP TABLE IF EXISTS tag_keys;
+
+COMMIT;

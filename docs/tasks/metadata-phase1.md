@@ -13,8 +13,8 @@
 
 | ID | 模块 | 内容 | 验收要点 | 状态 |
 |----|------|------|----------|------|
-| **MT-1** | CP 迁移 + sqlc | 新增 5 表：`tag_keys` / `tag_values` / `file_tags` / `pending_tag_values` / `tag_audit`（DDL 见设计 P1.1；**只追加**，序号接现有最大号）+ `queries/*.sql` + `make generate` | 迁移 up/down 干净；sqlc 无漂移（CI `git status --porcelain`） | ⬜ |
-| **MT-2** | CP indexer + API | 打标引擎第一斩：规则 `metadata.file_type` + `static_tags`（source=`rule_static`）在 `UploadResult` 索引时落 `file_tags`（幂等 on-conflict）；classifier 优先级=声明类型>glob；文件响应带 `tags`；`GET /api/v1/files` 增可重复 `tag` 参数（扩 `RejectUnknownQuery`，**保持 cursor 分页 V-2**） | **核心闭环**：建规则声明 static_tags → 上传 → 文件带标签 → `?tag=k:v` 能筛出；既有 glob 部署行为不变 | ⬜ |
+| **MT-1** | CP 迁移 + sqlc | 新增 5 表：`tag_keys` / `tag_values` / `file_tags` / `pending_tag_values` / `tag_audit`（DDL 见设计 P1.1；**只追加**，序号接现有最大号）+ `queries/*.sql` + `make generate` | 迁移 up/down 干净；sqlc 无漂移（CI `git status --porcelain`） | 🔄 PR（`000004`，+`GetFileTypeByName`；词表 CRUD sqlc 留 MT-4） |
+| **MT-2** | CP indexer + API | 打标引擎第一斩：规则 `metadata.file_type` + `static_tags`（source=`rule_static`）在 `UploadResult` 索引时落 `file_tags`（幂等 on-conflict）；classifier 优先级=声明类型>glob；文件响应带 `tags`；`GET /api/v1/files` 增可重复 `tag` 参数（扩 `RejectUnknownQuery`，**保持 cursor 分页 V-2**） | **核心闭环**：建规则声明 static_tags → 上传 → 文件带标签 → `?tag=k:v` 能筛出；既有 glob 部署行为不变 | 🔄 PR（indexer 打标 + files `tags`/`tag` 筛选；单测覆盖；契约细节记 D-025 落地记录） |
 | **MT-3** | CP indexer | 路径变量抽取（`path_tag_map`，复用 trollsift 变量 V-3，source=`path_var`）；受控 key 未登记值：`file_tags` 写原始值 + upsert `pending_tag_values`（hit_count / suggested_value）；幂等 | 未核准值不进筛选器/规则可选项；重复 UploadResult 不重复打标 | ⬜ |
 | **MT-4** | CP API | 词表 CRUD（`/api/v1/tag-keys` + `/api/v1/tag-keys/{key}/values`）；待确认队列 `GET /api/v1/pending-tag-values` + 动作端点 `POST /api/v1/pending-tag-values/{id}/approve`、`/{id}/merge`、`/{id}/reject`；**手动/批量打标**：`PUT /api/v1/files/{id}/tags` + `POST /api/v1/files/batch-tag`（source=`manual`，写 `tag_audit`，未登记值同样入队）。全部 super_admin 写 | merge 触发回溯改写 + 审计；批量打标按 `GET /files` 同款谓词圈选（服务历史数据人工补标） | ⬜ |
 | **MT-5** | CP worker | 回溯打标：改规则声明 / 词表（新增取值、merge）触发后台任务（复用 `internal/worker` 模式），按 org/规则批量重算 `file_tags` + 写 `tag_audit` | 批量正确性 + 幂等；MT-4 的 merge 与 batch-tag 复用同一通道 | ⬜ |
