@@ -1019,6 +1019,20 @@ Makefile（`bundle` 目标）、构建/分发流程
   回溯 worker（MT-5）、webui（MT-6）。tag `source` 优先级（rule_static vs manual/path_var 的覆盖策略）
   随 MT-3/MT-4 再定，本刀只有 rule_static。
 
+### 落地记录（MT-4a，标签词表 CRUD）
+
+**MT-4 拆分**（2026-07-11 产品决策）：`merge`（回溯改写）与 `batch-tag`（异步）依赖 MT-5 回溯 worker，
+故 MT-4 先做**同步部分**，分两刀：**MT-4a** 词表 CRUD（本刀）；**MT-4b** 待确认 list/approve/reject +
+单文件 `PUT /files/{id}/tags`；merge/batch-tag 随 MT-5 落。
+
+MT-4a 端点（sqlc `tags.sql` + `handler/tagkeys.go`，注入 `RouterConfig.TagKeysDB`）：
+- `GET /api/v1/tag-keys`（任意登录读）、`POST`（建）、`PATCH /:key`（改 label/flags，**key 不可改**——是 `file_tags` 引用的身份）、
+  `DELETE /:key`；`GET/POST /:key/values`、`DELETE /:key/values/:vid`（按**取值 id** 删，避开取值含特殊字符的路径编码问题）。
+- **写全部 super_admin**（`RequireRole`），读开放给任意登录用户（对齐 file-types）。
+- `key` 校验 `[a-z0-9_]{1,64}`；`(org_id,key)` / `(tag_key_id,value)` 唯一冲突→**409**；`system_reserved` key 拒删→409；
+  删取值不动已打标文件（仅阻止后续采集/选用，设计原则）。删 key 级联删其 `tag_values`/`file_tags`（schema `ON DELETE CASCADE`）。
+- 创建 key 的布尔标志用指针区分「未传」与 `false`，未传取 schema 默认（`value_controlled=true`/`allow_path_var=true`/`required_at_collection=false`）。
+
 ### 落地记录（MT-3，路径变量抽取 + 待确认队列）
 
 CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_template` **trollsift 反解** storage path
