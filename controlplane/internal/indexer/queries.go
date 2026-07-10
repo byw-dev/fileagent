@@ -309,23 +309,31 @@ func ListFileTypeRules(ctx context.Context, dbtx db.DBTX) ([]*db.FileTypeRule, e
 	return rules, rows.Err()
 }
 
-// ── GetRuleMetadata ──────────────────────────────────────────────────────────
+// ── GetRuleTagInfo ───────────────────────────────────────────────────────────
 
-const getRuleMetadataSQL = `
-SELECT metadata FROM collection_rules WHERE id = $1 AND org_id = $2 LIMIT 1
+// RuleTagInfo is the subset of a collection rule the tagging engine needs: the
+// metadata declaration plus the dest_path_template that the storage path was
+// rendered from (needed to reverse-extract path variables).
+type RuleTagInfo struct {
+	Metadata         json.RawMessage
+	DestPathTemplate string
+}
+
+const getRuleTagInfoSQL = `
+SELECT metadata, dest_path_template FROM collection_rules WHERE id = $1 AND org_id = $2 LIMIT 1
 `
 
-// GetRuleMetadata returns the metadata JSONB of a collection rule scoped to an
-// org, so an agent that sends an arbitrary rule UUID cannot read another
-// tenant's rule (defense-in-depth). It returns sql.ErrNoRows when no such rule
-// exists in the org, so callers can treat it as "no declaration".
-func GetRuleMetadata(ctx context.Context, dbtx db.DBTX, orgID, ruleID uuid.UUID) (json.RawMessage, error) {
-	row := dbtx.QueryRowContext(ctx, getRuleMetadataSQL, ruleID, orgID)
-	var meta json.RawMessage
-	if err := row.Scan(&meta); err != nil {
-		return nil, err
+// GetRuleTagInfo returns a rule's metadata + dest_path_template scoped to an org,
+// so an agent that sends an arbitrary rule UUID cannot read another tenant's rule
+// (defense-in-depth). It returns sql.ErrNoRows when no such rule exists in the
+// org, so callers can treat it as "no declaration".
+func GetRuleTagInfo(ctx context.Context, dbtx db.DBTX, orgID, ruleID uuid.UUID) (RuleTagInfo, error) {
+	row := dbtx.QueryRowContext(ctx, getRuleTagInfoSQL, ruleID, orgID)
+	var info RuleTagInfo
+	if err := row.Scan(&info.Metadata, &info.DestPathTemplate); err != nil {
+		return RuleTagInfo{}, err
 	}
-	return meta, nil
+	return info, nil
 }
 
 // ── GetFileTypeIDByName ──────────────────────────────────────────────────────
@@ -373,6 +381,120 @@ ON CONFLICT (file_entry_id, key) DO UPDATE SET
 func UpsertFileTag(ctx context.Context, dbtx db.DBTX, arg UpsertFileTagParams) error {
 	_, err := dbtx.ExecContext(ctx, upsertFileTagSQL,
 		arg.FileEntryID, arg.Key, arg.Value, arg.Source)
+	return err
+}
+
+// ── InsertFileTagIfAbsent ────────────────────────────────────────────────────
+
+// insertFileTagIfAbsentSQL does NOT overwrite an existing (file_entry_id, key):
+// an explicit tag (e.g. a rule static_tag) wins over a path-extracted one, and a
+// re-processed UploadResult is a no-op. The RETURNING row is present only when a
+// new row was inserted, which the caller uses to gate one-time side effects
+// (e.g. bumping a pending value's hit_count).
+const insertFileTagIfAbsentSQL = `
+INSERT INTO file_tags (file_entry_id, key, value, source)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (file_entry_id, key) DO NOTHING
+RETURNING file_entry_id
+`
+
+// InsertFileTagIfAbsent inserts a file tag only when the (file_entry_id, key) is
+// not already set, returning inserted=true when a new row was created.
+func InsertFileTagIfAbsent(ctx context.Context, dbtx db.DBTX, arg UpsertFileTagParams) (bool, error) {
+	row := dbtx.QueryRowContext(ctx, insertFileTagIfAbsentSQL,
+		arg.FileEntryID, arg.Key, arg.Value, arg.Source)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ── Tag vocabulary lookups (governance) ──────────────────────────────────────
+
+const getTagKeyByNameSQL = `
+SELECT id, value_controlled FROM tag_keys WHERE org_id = $1 AND key = $2 LIMIT 1
+`
+
+// TagKeyInfo identifies a controlled tag key for governance checks.
+type TagKeyInfo struct {
+	ID              uuid.UUID
+	ValueControlled bool
+}
+
+// GetTagKeyByName looks up a tag key by (org, key). found=false (nil error) when
+// the key is not registered as a vocabulary key.
+func GetTagKeyByName(ctx context.Context, dbtx db.DBTX, orgID uuid.UUID, key string) (TagKeyInfo, bool, error) {
+	row := dbtx.QueryRowContext(ctx, getTagKeyByNameSQL, orgID, key)
+	var info TagKeyInfo
+	if err := row.Scan(&info.ID, &info.ValueControlled); err != nil {
+		if err == sql.ErrNoRows {
+			return TagKeyInfo{}, false, nil
+		}
+		return TagKeyInfo{}, false, err
+	}
+	return info, true, nil
+}
+
+const tagValueExistsSQL = `
+SELECT EXISTS (SELECT 1 FROM tag_values WHERE tag_key_id = $1 AND value = $2)
+`
+
+// TagValueExists reports whether value is a registered value of the tag key.
+func TagValueExists(ctx context.Context, dbtx db.DBTX, tagKeyID uuid.UUID, value string) (bool, error) {
+	var exists bool
+	err := dbtx.QueryRowContext(ctx, tagValueExistsSQL, tagKeyID, value).Scan(&exists)
+	return exists, err
+}
+
+const findSimilarTagValueSQL = `
+SELECT value FROM tag_values
+WHERE tag_key_id = $1 AND lower(value) = lower($2)
+LIMIT 1
+`
+
+// FindSimilarTagValue returns a registered value that differs from value only by
+// case (the common tokyo/Tokyo drift), for use as a suggested_value. It returns
+// "" when there is no such near-match.
+func FindSimilarTagValue(ctx context.Context, dbtx db.DBTX, tagKeyID uuid.UUID, value string) (string, error) {
+	var v string
+	err := dbtx.QueryRowContext(ctx, findSimilarTagValueSQL, tagKeyID, value).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
+}
+
+// ── UpsertPendingTagValue ────────────────────────────────────────────────────
+
+// UpsertPendingTagValueParams holds the parameters for UpsertPendingTagValue.
+type UpsertPendingTagValueParams struct {
+	OrgID          uuid.UUID
+	TagKeyID       uuid.UUID
+	ExtractedValue string
+	Source         string
+	SourceRuleID   uuid.NullUUID
+	SuggestedValue sql.NullString
+}
+
+// upsertPendingTagValueSQL bumps hit_count on repeat sightings of the same
+// unregistered value, keeping a single queue row per (tag_key_id, value).
+const upsertPendingTagValueSQL = `
+INSERT INTO pending_tag_values (org_id, tag_key_id, extracted_value, source, source_rule_id, suggested_value)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (tag_key_id, extracted_value) DO UPDATE SET
+    hit_count = pending_tag_values.hit_count + 1
+`
+
+// UpsertPendingTagValue queues an unregistered controlled value for admin review,
+// incrementing hit_count when it has been seen before.
+func UpsertPendingTagValue(ctx context.Context, dbtx db.DBTX, arg UpsertPendingTagValueParams) error {
+	_, err := dbtx.ExecContext(ctx, upsertPendingTagValueSQL,
+		arg.OrgID, arg.TagKeyID, arg.ExtractedValue, arg.Source, arg.SourceRuleID, arg.SuggestedValue)
 	return err
 }
 

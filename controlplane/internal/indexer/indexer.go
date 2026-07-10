@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/bootstrap"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/pkg/trollsift"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -29,9 +31,14 @@ type IndexerStore interface {
 	MarkFileEntryDeleted(ctx context.Context, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error)
 	CreateUploadLog(ctx context.Context, params CreateUploadLogParams) (*db.UploadLog, error)
 	ListFileTypeRules(ctx context.Context) ([]*db.FileTypeRule, error)
-	GetRuleMetadata(ctx context.Context, orgID, ruleID uuid.UUID) (json.RawMessage, error)
+	GetRuleTagInfo(ctx context.Context, orgID, ruleID uuid.UUID) (RuleTagInfo, error)
 	GetFileTypeIDByName(ctx context.Context, orgID uuid.UUID, name string) (uuid.UUID, error)
 	UpsertFileTag(ctx context.Context, params UpsertFileTagParams) error
+	InsertFileTagIfAbsent(ctx context.Context, params UpsertFileTagParams) (bool, error)
+	GetTagKeyByName(ctx context.Context, orgID uuid.UUID, key string) (TagKeyInfo, bool, error)
+	TagValueExists(ctx context.Context, tagKeyID uuid.UUID, value string) (bool, error)
+	FindSimilarTagValue(ctx context.Context, tagKeyID uuid.UUID, value string) (string, error)
+	UpsertPendingTagValue(ctx context.Context, params UpsertPendingTagValueParams) error
 }
 
 // dbtxIndexerStore adapts db.DBTX to IndexerStore.
@@ -64,9 +71,9 @@ func (d *dbtxIndexerStore) ListFileTypeRules(ctx context.Context) ([]*db.FileTyp
 	return ListFileTypeRules(ctx, d.dbtx)
 }
 
-// GetRuleMetadata delegates to the package-level function.
-func (d *dbtxIndexerStore) GetRuleMetadata(ctx context.Context, orgID, ruleID uuid.UUID) (json.RawMessage, error) {
-	return GetRuleMetadata(ctx, d.dbtx, orgID, ruleID)
+// GetRuleTagInfo delegates to the package-level function.
+func (d *dbtxIndexerStore) GetRuleTagInfo(ctx context.Context, orgID, ruleID uuid.UUID) (RuleTagInfo, error) {
+	return GetRuleTagInfo(ctx, d.dbtx, orgID, ruleID)
 }
 
 // GetFileTypeIDByName delegates to the package-level function.
@@ -77,6 +84,31 @@ func (d *dbtxIndexerStore) GetFileTypeIDByName(ctx context.Context, orgID uuid.U
 // UpsertFileTag delegates to the package-level function.
 func (d *dbtxIndexerStore) UpsertFileTag(ctx context.Context, params UpsertFileTagParams) error {
 	return UpsertFileTag(ctx, d.dbtx, params)
+}
+
+// InsertFileTagIfAbsent delegates to the package-level function.
+func (d *dbtxIndexerStore) InsertFileTagIfAbsent(ctx context.Context, params UpsertFileTagParams) (bool, error) {
+	return InsertFileTagIfAbsent(ctx, d.dbtx, params)
+}
+
+// GetTagKeyByName delegates to the package-level function.
+func (d *dbtxIndexerStore) GetTagKeyByName(ctx context.Context, orgID uuid.UUID, key string) (TagKeyInfo, bool, error) {
+	return GetTagKeyByName(ctx, d.dbtx, orgID, key)
+}
+
+// TagValueExists delegates to the package-level function.
+func (d *dbtxIndexerStore) TagValueExists(ctx context.Context, tagKeyID uuid.UUID, value string) (bool, error) {
+	return TagValueExists(ctx, d.dbtx, tagKeyID, value)
+}
+
+// FindSimilarTagValue delegates to the package-level function.
+func (d *dbtxIndexerStore) FindSimilarTagValue(ctx context.Context, tagKeyID uuid.UUID, value string) (string, error) {
+	return FindSimilarTagValue(ctx, d.dbtx, tagKeyID, value)
+}
+
+// UpsertPendingTagValue delegates to the package-level function.
+func (d *dbtxIndexerStore) UpsertPendingTagValue(ctx context.Context, params UpsertPendingTagValueParams) error {
+	return UpsertPendingTagValue(ctx, d.dbtx, params)
 }
 
 // Indexer processes upload results from agents and maintains the file index.
@@ -127,12 +159,13 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 		}
 	}
 
-	// Load the rule's metadata declaration (file_type / static_tags). Best
-	// effort: a missing or malformed declaration degrades to glob-only
-	// classification with no static tags.
+	// Load the rule's metadata declaration (file_type / static_tags / path_tag_map)
+	// and dest_path_template. Best effort: a missing or malformed declaration
+	// degrades to glob-only classification with no tags.
 	var ruleMeta ruleMetadata
+	var destTemplate string
 	if ruleID.Valid {
-		ruleMeta = ix.loadRuleMetadata(ctx, orgID, ruleID.UUID)
+		ruleMeta, destTemplate = ix.loadRuleMetadata(ctx, orgID, ruleID.UUID)
 	}
 
 	// Classify file type: a rule-declared file_type takes priority over the
@@ -183,6 +216,10 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 	// fail indexing (mirrors upload-log handling).
 	ix.applyStaticTags(ctx, fileEntry.ID, ruleMeta.StaticTags)
 
+	// Extract path-variable tags (source=path_var) from the storage path.
+	// Runs after static tags and does not overwrite them (explicit wins).
+	ix.applyPathVarTags(ctx, orgID, fileEntry.ID, result.GetStoragePath(), destTemplate, ruleMeta.PathTagMap, ruleID)
+
 	// Create upload log.
 	logStatus := "completed"
 	var errMsg sql.NullString
@@ -223,8 +260,15 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 	return nil
 }
 
-// tagSourceRuleStatic marks tags written from a rule's static_tags declaration.
-const tagSourceRuleStatic = "rule_static"
+// Tag source markers record how a file_tag was derived.
+const (
+	tagSourceRuleStatic = "rule_static" // from a rule's static_tags declaration
+	tagSourcePathVar    = "path_var"    // extracted from a storage-path variable
+)
+
+// pendingSourcePathVar marks a pending value discovered during live indexing
+// (as opposed to a historical backfill).
+const pendingSourcePathVar = "path_var"
 
 // Tag key/value length limits mirror the file_tags column widths (VARCHAR(64) /
 // VARCHAR(128)). Overlong values are skipped before the insert so a misconfigured
@@ -235,36 +279,37 @@ const (
 )
 
 // ruleMetadata is the declared shape of collection_rules.metadata consumed by
-// the tagging engine (metadata model 6c, Phase 1). PathTagMap is parsed but not
-// yet consumed here — path-variable extraction lands in MT-3.
+// the tagging engine (metadata model 6c, Phase 1). PathTagMap maps a tag key to
+// a path-template variable reference (e.g. {"site": "{site}"}).
 type ruleMetadata struct {
 	FileType   string            `json:"file_type"`
 	StaticTags map[string]string `json:"static_tags"`
 	PathTagMap map[string]string `json:"path_tag_map"`
 }
 
-// loadRuleMetadata fetches and parses a rule's metadata declaration. It returns
-// a zero-value ruleMetadata (logging non-ErrNoRows failures) when the rule is
-// missing or its metadata cannot be parsed, so indexing degrades gracefully.
-func (ix *Indexer) loadRuleMetadata(ctx context.Context, orgID, ruleID uuid.UUID) ruleMetadata {
+// loadRuleMetadata fetches and parses a rule's metadata declaration and returns
+// its dest_path_template. It returns a zero-value ruleMetadata (logging
+// non-ErrNoRows failures) when the rule is missing or its metadata cannot be
+// parsed, so indexing degrades gracefully.
+func (ix *Indexer) loadRuleMetadata(ctx context.Context, orgID, ruleID uuid.UUID) (ruleMetadata, string) {
 	var meta ruleMetadata
-	raw, err := ix.store.GetRuleMetadata(ctx, orgID, ruleID)
+	info, err := ix.store.GetRuleTagInfo(ctx, orgID, ruleID)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			ix.logger.Warn("indexer: load rule metadata",
 				zap.String("rule_id", ruleID.String()), zap.Error(err))
 		}
-		return meta
+		return meta, ""
 	}
-	if len(raw) == 0 {
-		return meta
+	if len(info.Metadata) == 0 {
+		return meta, info.DestPathTemplate
 	}
-	if err := json.Unmarshal(raw, &meta); err != nil {
+	if err := json.Unmarshal(info.Metadata, &meta); err != nil {
 		ix.logger.Warn("indexer: parse rule metadata",
 			zap.String("rule_id", ruleID.String()), zap.Error(err))
-		return ruleMetadata{}
+		return ruleMetadata{}, info.DestPathTemplate
 	}
-	return meta
+	return meta, info.DestPathTemplate
 }
 
 // classifyFileType resolves the file type for a storage path. A non-empty
@@ -293,6 +338,20 @@ func (ix *Indexer) classifyFileType(ctx context.Context, orgID uuid.UUID, storag
 	return id
 }
 
+// tagWithinLimits reports whether a tag key/value fits the file_tags columns
+// (VARCHAR 64/128 by character). Rune count matches VARCHAR(n) semantics; it logs
+// and returns false for overlong values so a misconfigured rule cannot spam a DB
+// length error on every upload.
+func (ix *Indexer) tagWithinLimits(fileEntryID uuid.UUID, key, value string) bool {
+	if utf8.RuneCountInString(key) > maxTagKeyLen || utf8.RuneCountInString(value) > maxTagValueLen {
+		ix.logger.Warn("indexer: skip overlong tag",
+			zap.String("file_entry_id", fileEntryID.String()),
+			zap.String("key", key))
+		return false
+	}
+	return true
+}
+
 // applyStaticTags writes rule-declared static tags to file_tags with
 // source=rule_static. Empty keys/values are skipped; per-tag failures are
 // logged but do not fail indexing.
@@ -301,12 +360,7 @@ func (ix *Indexer) applyStaticTags(ctx context.Context, fileEntryID uuid.UUID, t
 		if key == "" || value == "" {
 			continue
 		}
-		// Rune count matches VARCHAR(n) character semantics; skip overlong tags
-		// rather than letting every upload hit a DB length error.
-		if utf8.RuneCountInString(key) > maxTagKeyLen || utf8.RuneCountInString(value) > maxTagValueLen {
-			ix.logger.Warn("indexer: skip overlong static tag",
-				zap.String("file_entry_id", fileEntryID.String()),
-				zap.String("key", key))
+		if !ix.tagWithinLimits(fileEntryID, key, value) {
 			continue
 		}
 		if err := ix.store.UpsertFileTag(ctx, UpsertFileTagParams{
@@ -319,6 +373,116 @@ func (ix *Indexer) applyStaticTags(ctx context.Context, fileEntryID uuid.UUID, t
 				zap.String("file_entry_id", fileEntryID.String()),
 				zap.String("key", key), zap.Error(err))
 		}
+	}
+}
+
+// templateVarName extracts the variable name from a path_tag_map reference such
+// as "{site}" or "{site:fmt}". It returns "" for anything that is not a single
+// bare {var} reference.
+func templateVarName(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if len(ref) < 3 || ref[0] != '{' || ref[len(ref)-1] != '}' {
+		return ""
+	}
+	inner := ref[1 : len(ref)-1]
+	if i := strings.IndexByte(inner, ':'); i >= 0 {
+		inner = inner[:i]
+	}
+	return strings.TrimSpace(inner)
+}
+
+// applyPathVarTags extracts tag values from the storage path via the rule's
+// dest_path_template (trollsift reverse-parse) and writes them with
+// source=path_var. It runs after static tags and does NOT overwrite an existing
+// (file, key) — an explicit static tag wins. For a controlled key whose value is
+// not yet in the vocabulary, the raw value is still recorded but is queued in
+// pending_tag_values for admin review. Best effort throughout: any failure is
+// logged without failing indexing.
+func (ix *Indexer) applyPathVarTags(ctx context.Context, orgID, fileEntryID uuid.UUID, storagePath, destTemplate string, pathTagMap map[string]string, ruleID uuid.NullUUID) {
+	if len(pathTagMap) == 0 || destTemplate == "" {
+		return
+	}
+	parser, err := trollsift.New(destTemplate)
+	if err != nil {
+		ix.logger.Warn("indexer: parse dest_path_template",
+			zap.String("template", destTemplate), zap.Error(err))
+		return
+	}
+	vals, err := parser.Parse(storagePath)
+	if err != nil {
+		// The stored object may not match the template (e.g. legacy/hand-placed);
+		// skip path-var extraction rather than failing the index.
+		ix.logger.Warn("indexer: storage path does not match template",
+			zap.String("storage_path", storagePath), zap.Error(err))
+		return
+	}
+	for key, ref := range pathTagMap {
+		varName := templateVarName(ref)
+		if key == "" || varName == "" {
+			continue
+		}
+		val, ok := vals[varName]
+		if !ok {
+			ix.logger.Warn("indexer: path_tag_map variable not present in path",
+				zap.String("key", key), zap.String("var", varName))
+			continue
+		}
+		value := val.Raw
+		if value == "" || !ix.tagWithinLimits(fileEntryID, key, value) {
+			continue
+		}
+		inserted, err := ix.store.InsertFileTagIfAbsent(ctx, UpsertFileTagParams{
+			FileEntryID: fileEntryID, Key: key, Value: value, Source: tagSourcePathVar,
+		})
+		if err != nil {
+			ix.logger.Warn("indexer: insert path_var tag",
+				zap.String("file_entry_id", fileEntryID.String()),
+				zap.String("key", key), zap.Error(err))
+			continue
+		}
+		// Only queue governance on a fresh insert, so a re-processed UploadResult
+		// (row already present) does not inflate pending hit_count.
+		if inserted {
+			ix.maybeQueuePendingValue(ctx, orgID, key, value, ruleID)
+		}
+	}
+}
+
+// maybeQueuePendingValue queues an extracted value for admin review when its key
+// is a controlled vocabulary key and the value is not yet registered. Uncontrolled
+// or unknown keys are left as-is (the raw tag is already recorded). Best effort.
+func (ix *Indexer) maybeQueuePendingValue(ctx context.Context, orgID uuid.UUID, key, value string, ruleID uuid.NullUUID) {
+	keyInfo, found, err := ix.store.GetTagKeyByName(ctx, orgID, key)
+	if err != nil {
+		ix.logger.Warn("indexer: lookup tag key", zap.String("key", key), zap.Error(err))
+		return
+	}
+	if !found || !keyInfo.ValueControlled {
+		return // not a controlled key → no vocabulary governance
+	}
+	exists, err := ix.store.TagValueExists(ctx, keyInfo.ID, value)
+	if err != nil {
+		ix.logger.Warn("indexer: check tag value", zap.String("key", key), zap.Error(err))
+		return
+	}
+	if exists {
+		return // already an approved value
+	}
+	suggested, err := ix.store.FindSimilarTagValue(ctx, keyInfo.ID, value)
+	if err != nil {
+		ix.logger.Warn("indexer: find similar tag value", zap.String("key", key), zap.Error(err))
+		// proceed with no suggestion
+	}
+	if err := ix.store.UpsertPendingTagValue(ctx, UpsertPendingTagValueParams{
+		OrgID:          orgID,
+		TagKeyID:       keyInfo.ID,
+		ExtractedValue: value,
+		Source:         pendingSourcePathVar,
+		SourceRuleID:   ruleID,
+		SuggestedValue: sql.NullString{String: suggested, Valid: suggested != ""},
+	}); err != nil {
+		ix.logger.Warn("indexer: queue pending tag value",
+			zap.String("key", key), zap.Error(err))
 	}
 }
 
