@@ -422,6 +422,7 @@ func TestGetRuleTagInfo_NotFound(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 	_, err := GetRuleTagInfo(context.Background(), mockDB, uuid.New(), uuid.New())
 	require.ErrorIs(t, err, sql.ErrNoRows)
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestInsertFileTagIfAbsent_InsertedAndConflict(t *testing.T) {
@@ -447,15 +448,16 @@ func TestInsertFileTagIfAbsent_InsertedAndConflict(t *testing.T) {
 func TestGetTagKeyByName_FoundAndMissing(t *testing.T) {
 	mockDB, mock := newMockDB(t)
 	id := uuid.New()
-	mock.ExpectQuery("SELECT id, value_controlled FROM tag_keys").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "value_controlled"}).AddRow(id, true))
+	mock.ExpectQuery("SELECT id, value_controlled, allow_path_var FROM tag_keys").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "value_controlled", "allow_path_var"}).AddRow(id, true, true))
 	info, found, err := GetTagKeyByName(context.Background(), mockDB, uuid.New(), "site")
 	require.NoError(t, err)
 	assert.True(t, found)
 	assert.Equal(t, id, info.ID)
 	assert.True(t, info.ValueControlled)
+	assert.True(t, info.AllowPathVar)
 
-	mock.ExpectQuery("SELECT id, value_controlled FROM tag_keys").WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery("SELECT id, value_controlled, allow_path_var FROM tag_keys").WillReturnError(sql.ErrNoRows)
 	_, found, err = GetTagKeyByName(context.Background(), mockDB, uuid.New(), "nope")
 	require.NoError(t, err)
 	assert.False(t, found)

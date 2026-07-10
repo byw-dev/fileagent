@@ -1027,6 +1027,8 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 
 - **path_var 不覆盖既有标签**：用 `INSERT ... ON CONFLICT (file_entry_id,key) DO NOTHING RETURNING`——显式
   `static_tags` 优先于路径推断；`RETURNING` 是否有行即「本次是否新插入」信号。（rule_static 仍用 DO UPDATE 覆盖。）
+- **`allow_path_var` 治理**：已登记 key 若 `allow_path_var=false`（显式禁止路径变量映射），path_var **完全跳过**——
+  既不写 `file_tags` 也无入队副作用。未登记 key 默认允许（写标签，不受词表治理）。
 - **待确认队列治理**：仅当 key 是**受控** `tag_key`（`value_controlled=true`）且值不在 `tag_values` 时，
   除照写 `file_tags`（原始值）外，upsert `pending_tag_values`（`ON CONFLICT (tag_key_id,extracted_value)` 增 `hit_count`）。
   非受控 / 未登记 key 只写标签、不入队。`suggested_value` = 大小写近似的既有取值（`lower(value)=lower(?)`；

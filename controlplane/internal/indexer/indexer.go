@@ -435,6 +435,19 @@ func (ix *Indexer) applyPathVarTags(ctx context.Context, orgID, fileEntryID uuid
 		if value == "" || !ix.tagWithinLimits(fileEntryID, key, value) {
 			continue
 		}
+
+		// Look up the vocabulary key once for governance. A registered key may
+		// explicitly forbid path-variable mapping (allow_path_var=false), in which
+		// case path extraction must not populate it at all — no tag, no queue.
+		keyInfo, found, err := ix.store.GetTagKeyByName(ctx, orgID, key)
+		if err != nil {
+			ix.logger.Warn("indexer: lookup tag key", zap.String("key", key), zap.Error(err))
+			continue
+		}
+		if found && !keyInfo.AllowPathVar {
+			continue
+		}
+
 		inserted, err := ix.store.InsertFileTagIfAbsent(ctx, UpsertFileTagParams{
 			FileEntryID: fileEntryID, Key: key, Value: value, Source: tagSourcePathVar,
 		})
@@ -445,25 +458,18 @@ func (ix *Indexer) applyPathVarTags(ctx context.Context, orgID, fileEntryID uuid
 			continue
 		}
 		// Only queue governance on a fresh insert, so a re-processed UploadResult
-		// (row already present) does not inflate pending hit_count.
-		if inserted {
-			ix.maybeQueuePendingValue(ctx, orgID, key, value, ruleID)
+		// (row already present) does not inflate pending hit_count. Uncontrolled or
+		// unregistered keys carry the raw value without vocabulary governance.
+		if inserted && found && keyInfo.ValueControlled {
+			ix.queuePendingIfUnregistered(ctx, orgID, keyInfo, key, value, ruleID)
 		}
 	}
 }
 
-// maybeQueuePendingValue queues an extracted value for admin review when its key
-// is a controlled vocabulary key and the value is not yet registered. Uncontrolled
-// or unknown keys are left as-is (the raw tag is already recorded). Best effort.
-func (ix *Indexer) maybeQueuePendingValue(ctx context.Context, orgID uuid.UUID, key, value string, ruleID uuid.NullUUID) {
-	keyInfo, found, err := ix.store.GetTagKeyByName(ctx, orgID, key)
-	if err != nil {
-		ix.logger.Warn("indexer: lookup tag key", zap.String("key", key), zap.Error(err))
-		return
-	}
-	if !found || !keyInfo.ValueControlled {
-		return // not a controlled key → no vocabulary governance
-	}
+// queuePendingIfUnregistered queues an extracted value for admin review when it
+// is not yet a registered value of a controlled key. keyInfo is the already
+// looked-up vocabulary key. Best effort: failures are logged, not fatal.
+func (ix *Indexer) queuePendingIfUnregistered(ctx context.Context, orgID uuid.UUID, keyInfo TagKeyInfo, key, value string, ruleID uuid.NullUUID) {
 	exists, err := ix.store.TagValueExists(ctx, keyInfo.ID, value)
 	if err != nil {
 		ix.logger.Warn("indexer: check tag value", zap.String("key", key), zap.Error(err))

@@ -417,13 +417,14 @@ func InsertFileTagIfAbsent(ctx context.Context, dbtx db.DBTX, arg UpsertFileTagP
 // ── Tag vocabulary lookups (governance) ──────────────────────────────────────
 
 const getTagKeyByNameSQL = `
-SELECT id, value_controlled FROM tag_keys WHERE org_id = $1 AND key = $2 LIMIT 1
+SELECT id, value_controlled, allow_path_var FROM tag_keys WHERE org_id = $1 AND key = $2 LIMIT 1
 `
 
-// TagKeyInfo identifies a controlled tag key for governance checks.
+// TagKeyInfo identifies a registered tag key for governance checks.
 type TagKeyInfo struct {
 	ID              uuid.UUID
 	ValueControlled bool
+	AllowPathVar    bool
 }
 
 // GetTagKeyByName looks up a tag key by (org, key). found=false (nil error) when
@@ -431,7 +432,7 @@ type TagKeyInfo struct {
 func GetTagKeyByName(ctx context.Context, dbtx db.DBTX, orgID uuid.UUID, key string) (TagKeyInfo, bool, error) {
 	row := dbtx.QueryRowContext(ctx, getTagKeyByNameSQL, orgID, key)
 	var info TagKeyInfo
-	if err := row.Scan(&info.ID, &info.ValueControlled); err != nil {
+	if err := row.Scan(&info.ID, &info.ValueControlled, &info.AllowPathVar); err != nil {
 		if err == sql.ErrNoRows {
 			return TagKeyInfo{}, false, nil
 		}

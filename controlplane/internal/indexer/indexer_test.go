@@ -772,7 +772,7 @@ func TestHandleUploadResult_PathVar_UnregisteredControlledValue_Queued(t *testin
 	keyID := uuid.New()
 	store := pathVarStore(bucket, fe,
 		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
-	store.tagKeys = map[string]TagKeyInfo{"site": {ID: keyID, ValueControlled: true}}
+	store.tagKeys = map[string]TagKeyInfo{"site": {ID: keyID, ValueControlled: true, AllowPathVar: true}}
 	store.existingValues = map[string]bool{} // tokyo not registered
 	store.similarValue = "Tokyo"             // case drift suggestion
 
@@ -793,7 +793,7 @@ func TestHandleUploadResult_PathVar_RegisteredValue_NotQueued(t *testing.T) {
 	fe := newFileEntry(bucket.ID, "data/tokyo/p.csv")
 	store := pathVarStore(bucket, fe,
 		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
-	store.tagKeys = map[string]TagKeyInfo{"site": {ID: uuid.New(), ValueControlled: true}}
+	store.tagKeys = map[string]TagKeyInfo{"site": {ID: uuid.New(), ValueControlled: true, AllowPathVar: true}}
 	store.existingValues = map[string]bool{"tokyo": true} // already approved
 
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
@@ -817,13 +817,29 @@ func TestHandleUploadResult_PathVar_UncontrolledKey_NotQueued(t *testing.T) {
 	assert.Empty(t, store.pendingUpserts) // but not queued
 }
 
+func TestHandleUploadResult_PathVar_AllowPathVarFalse_Skipped(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "data/tokyo/p.csv")
+	store := pathVarStore(bucket, fe,
+		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
+	// Key is registered but explicitly forbids path-variable mapping.
+	store.tagKeys = map[string]TagKeyInfo{"site": {ID: uuid.New(), ValueControlled: true, AllowPathVar: false}}
+	store.existingValues = map[string]bool{}
+
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	require.NoError(t, err)
+	assert.Empty(t, store.insertedTags)   // no tag written
+	assert.Empty(t, store.pendingUpserts) // no queue side effect
+}
+
 func TestHandleUploadResult_PathVar_NotInserted_NotQueued(t *testing.T) {
 	bucket := newBucket()
 	fe := newFileEntry(bucket.ID, "data/tokyo/p.csv")
 	store := pathVarStore(bucket, fe,
 		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
 	store.insertReturns = false // key already set (e.g. static tag or re-index)
-	store.tagKeys = map[string]TagKeyInfo{"site": {ID: uuid.New(), ValueControlled: true}}
+	store.tagKeys = map[string]TagKeyInfo{"site": {ID: uuid.New(), ValueControlled: true, AllowPathVar: true}}
 	store.existingValues = map[string]bool{}
 
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
