@@ -46,6 +46,29 @@ func NewFilesHandler(filesDB FilesDB, minio MinIOPresigner, logger *zap.Logger) 
 	return &FilesHandler{db: filesDB, minio: minio, logger: logger}
 }
 
+// fetchOwnedEntry loads a file entry and confirms it belongs to the caller's
+// org (GetFileEntryByID selects by id only). It writes the response and returns
+// ok=false when the entry is missing, unreadable, or owned by another org.
+// Cross-org access is reported as 404 (not 403) so a caller cannot probe another
+// tenant's file IDs.
+func (h *FilesHandler) fetchOwnedEntry(c *gin.Context, id uuid.UUID) (*db.FileEntry, bool) {
+	entry, err := h.db.GetFileEntryByID(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "file not found", nil)
+			return nil, false
+		}
+		h.logger.Error("get file entry", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get file", nil)
+		return nil, false
+	}
+	if entry.OrgID != orgIDFromClaims(c) {
+		middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "file not found", nil)
+		return nil, false
+	}
+	return entry, true
+}
+
 // fileEntryResponse is the outbound JSON shape for a file entry.
 type fileEntryResponse struct {
 	ID           string            `json:"id"`
@@ -223,14 +246,8 @@ func (h *FilesHandler) Get(c *gin.Context) {
 		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid file id", nil)
 		return
 	}
-	entry, err := h.db.GetFileEntryByID(c.Request.Context(), id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "file not found", nil)
-			return
-		}
-		h.logger.Error("get file entry", zap.Error(err))
-		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get file", nil)
+	entry, ok := h.fetchOwnedEntry(c, id)
+	if !ok {
 		return
 	}
 	tagsByFile, err := h.db.ListFileTagsByFileIDs(c.Request.Context(), []uuid.UUID{entry.ID})
@@ -303,14 +320,8 @@ func (h *FilesHandler) DownloadURL(c *gin.Context) {
 		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid file id", nil)
 		return
 	}
-	entry, err := h.db.GetFileEntryByID(c.Request.Context(), id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "file not found", nil)
-			return
-		}
-		h.logger.Error("get file for download", zap.Error(err))
-		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get file", nil)
+	entry, ok := h.fetchOwnedEntry(c, id)
+	if !ok {
 		return
 	}
 
@@ -364,6 +375,12 @@ func (h *FilesHandler) BatchDownloadURLs(c *gin.Context) {
 		}
 		entry, err := h.db.GetFileEntryByID(c.Request.Context(), id)
 		if err != nil {
+			result = append(result, urlItem{ID: rawID, Err: "not found"})
+			continue
+		}
+		// Do not hand out a presigned URL for another org's object; report it as
+		// not found rather than leaking existence across tenants.
+		if entry.OrgID != orgIDFromClaims(c) {
 			result = append(result, urlItem{ID: rawID, Err: "not found"})
 			continue
 		}

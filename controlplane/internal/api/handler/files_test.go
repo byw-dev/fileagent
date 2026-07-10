@@ -248,12 +248,16 @@ func TestFileTypesHandler_Delete_DBError(t *testing.T) {
 
 // ── FilesHandler tests ────────────────────────────────────────────────────────
 
+// testFilesOrgID is the caller org injected by testFilesRouter; sample entries
+// share it so org-ownership checks pass on the success paths.
+var testFilesOrgID = uuid.New()
+
 func testFilesRouter(h *handler.FilesHandler) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(middleware.RequestID())
 	r.Use(func(c *gin.Context) {
-		injectClaims(c, "org_admin", uuid.New().String(), uuid.New().String())
+		injectClaims(c, "org_admin", testFilesOrgID.String(), uuid.New().String())
 		c.Next()
 	})
 	v1 := r.Group("/api/v1")
@@ -267,7 +271,7 @@ func testFilesRouter(h *handler.FilesHandler) *gin.Engine {
 func newSampleEntry() *db.FileEntry {
 	return &db.FileEntry{
 		ID:           uuid.New(),
-		OrgID:        uuid.New(),
+		OrgID:        testFilesOrgID,
 		AgentID:      uuid.NullUUID{UUID: uuid.New(), Valid: true},
 		BucketID:     uuid.New(),
 		StoragePath:  "uploads/file.txt",
@@ -379,6 +383,27 @@ func TestFilesHandler_Get_NotFound(t *testing.T) {
 	h := handler.NewFilesHandler(&mockFilesDB{getErr: sql.ErrNoRows}, nil, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files/"+uuid.New().String(), nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestFilesHandler_Get_CrossOrg_Returns404(t *testing.T) {
+	entry := newSampleEntry()
+	entry.OrgID = uuid.New() // belongs to a different org than the caller
+	h := handler.NewFilesHandler(&mockFilesDB{entry: entry}, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files/"+entry.ID.String(), nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestFilesHandler_DownloadURL_CrossOrg_Returns404(t *testing.T) {
+	entry := newSampleEntry()
+	entry.OrgID = uuid.New()
+	presigner := &mockPresigner{url: "https://minio/presigned"}
+	h := handler.NewFilesHandler(&mockFilesDB{entry: entry}, presigner, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files/"+entry.ID.String()+"/download-url", nil)
 	testFilesRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }

@@ -1001,6 +1001,9 @@ Makefile（`bundle` 目标）、构建/分发流程
 
 - **文件响应新增 `tags`**：形如 `"tags": {"vendor":"omron","site":"tokyo"}`（key→value 对象，`omitempty`；
   与 `file_tags` 主键 `(file_entry_id,key)`「每 key 至多一值」一致）。`GET /api/v1/files` 与 `GET /files/{id}` 均带。
+- **单文件读取按 org 收窄**：`GetFileEntryByID` 仅按 id 查，故 `GET /files/{id}`、`/download-url`、
+  `batch-download-urls` 在 handler 层校验 `entry.org_id == 调用者 org`，跨 org 一律 **404**（不泄露存在性）。
+  纵深防御（v1 单组织尚不可利用，但与 `GetRuleMetadata` org 收窄一致）。
 - **`GET /api/v1/files` 可重复 `tag` 参数**：`?tag=key:value`，多条 **AND**（`file_tags` join +
   `HAVING COUNT(*)=N`）；已并入 `RejectUnknownQuery` allowlist；畸形值（缺 `:` 或空 key/value）返回 **400**
   `INVALID_QUERY_PARAM`（不静默忽略，同 CC-5）。因 `file_tags` 主键 `(file_entry_id,key)`「每 key 至多一值」，
