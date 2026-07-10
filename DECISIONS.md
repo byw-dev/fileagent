@@ -1003,7 +1003,7 @@ Makefile（`bundle` 目标）、构建/分发流程
   与 `file_tags` 主键 `(file_entry_id,key)`「每 key 至多一值」一致）。`GET /api/v1/files` 与 `GET /files/{id}` 均带。
 - **单文件读取按 org 收窄**：`GetFileEntryByID` 仅按 id 查，故 `GET /files/{id}`、`/download-url`、
   `batch-download-urls` 在 handler 层校验 `entry.org_id == 调用者 org`，跨 org 一律 **404**（不泄露存在性）。
-  纵深防御（v1 单组织尚不可利用，但与 `GetRuleMetadata` org 收窄一致）。
+  纵深防御（v1 单组织尚不可利用，但与规则查询的 org 收窄一致）。
 - **`GET /api/v1/files` 可重复 `tag` 参数**：`?tag=key:value`，多条 **AND**（`file_tags` join +
   `HAVING COUNT(*)=N`）；已并入 `RejectUnknownQuery` allowlist；畸形值（缺 `:` 或空 key/value）返回 **400**
   `INVALID_QUERY_PARAM`（不静默忽略，同 CC-5）。因 `file_tags` 主键 `(file_entry_id,key)`「每 key 至多一值」，
@@ -1013,7 +1013,8 @@ Makefile（`bundle` 目标）、构建/分发流程
   on-conflict `(file_entry_id,key)` 覆盖，重复 `UploadResult` 幂等。声明 `file_type`（名字）经
   `GetFileTypeIDByName` 解析并**优先于 glob**，未解析则回落 glob（既有部署行为不变）。best-effort：
   规则 metadata 缺失/畸形或单条标签写失败仅告警，不使索引失败；超长 key/value（VARCHAR 64/128）
-  预校验跳过，避免每次上传都撞 DB 长度错误刷日志。`GetRuleMetadata` 按 `org_id` 收窄（防跨租户读规则，纵深防御）。
+  预校验跳过，避免每次上传都撞 DB 长度错误刷日志。规则查询按 `org_id` 收窄（防跨租户读规则，纵深防御；
+  MT-2 时名为 `GetRuleMetadata`，MT-3 起并入 `GetRuleTagInfo` 一并返回 `dest_path_template`）。
 - **本刀不含**：路径变量抽取 `path_tag_map` + 待确认队列（MT-3）、词表/手动批量打标 API（MT-4）、
   回溯 worker（MT-5）、webui（MT-6）。tag `source` 优先级（rule_static vs manual/path_var 的覆盖策略）
   随 MT-3/MT-4 再定，本刀只有 rule_static。
