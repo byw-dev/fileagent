@@ -46,6 +46,7 @@ func NewTagKeysHandler(tagKeysDB TagKeysDB, logger *zap.Logger) *TagKeysHandler 
 // tagKeyResponse is the outbound JSON shape for a tag key.
 type tagKeyResponse struct {
 	ID                   string `json:"id"`
+	OrgID                string `json:"org_id"`
 	Key                  string `json:"key"`
 	Label                string `json:"label"`
 	ValueControlled      bool   `json:"value_controlled"`
@@ -58,6 +59,7 @@ type tagKeyResponse struct {
 func toTagKeyResponse(k *db.TagKey) tagKeyResponse {
 	return tagKeyResponse{
 		ID:                   k.ID.String(),
+		OrgID:                k.OrgID.String(),
 		Key:                  k.Key,
 		Label:                k.Label,
 		ValueControlled:      k.ValueControlled,
