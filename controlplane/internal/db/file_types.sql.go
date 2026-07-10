@@ -67,6 +67,27 @@ func (q *Queries) GetFileTypeByID(ctx context.Context, id uuid.UUID) (*FileType,
 	return &i, err
 }
 
+const getFileTypeByName = `-- name: GetFileTypeByName :one
+SELECT id, org_id, name, description, created_by, created_at
+FROM file_types
+WHERE org_id = $1 AND name = $2
+LIMIT 1
+`
+
+func (q *Queries) GetFileTypeByName(ctx context.Context, orgID uuid.UUID, name string) (*FileType, error) {
+	row := q.db.QueryRowContext(ctx, getFileTypeByName, orgID, name)
+	var i FileType
+	err := row.Scan(
+		&i.ID,
+		&i.OrgID,
+		&i.Name,
+		&i.Description,
+		&i.CreatedBy,
+		&i.CreatedAt,
+	)
+	return &i, err
+}
+
 const listFileTypes = `-- name: ListFileTypes :many
 SELECT id, org_id, name, description, created_by, created_at
 FROM file_types

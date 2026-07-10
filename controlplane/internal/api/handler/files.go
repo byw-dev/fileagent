@@ -22,6 +22,9 @@ type FilesDB interface {
 	GetFileEntryByID(ctx context.Context, id uuid.UUID) (*db.FileEntry, error)
 	// GetBucketByID is used to resolve a bucket UUID to its MinIO bucket name.
 	GetBucketByID(ctx context.Context, id uuid.UUID) (*db.Bucket, error)
+	// ListFileTagsByFileIDs returns the tags of each file, keyed by file id then
+	// tag key. Used to attach tags to file responses.
+	ListFileTagsByFileIDs(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]map[string]string, error)
 }
 
 // MinIOPresigner generates presigned download URLs for stored objects.
@@ -44,23 +47,24 @@ func NewFilesHandler(filesDB FilesDB, minio MinIOPresigner, logger *zap.Logger) 
 
 // fileEntryResponse is the outbound JSON shape for a file entry.
 type fileEntryResponse struct {
-	ID           string `json:"id"`
-	OrgID        string `json:"org_id"`
-	AgentID      string `json:"agent_id,omitempty"`
-	BucketID     string `json:"bucket_id"`
-	FileTypeID   string `json:"file_type_id,omitempty"`
-	StorageKey   string `json:"storage_key"`
-	OriginalPath string `json:"original_path,omitempty"`
-	Filename     string `json:"filename"`
-	Size         int64  `json:"size"`
-	SHA256       string `json:"sha256,omitempty"`
-	MimeType     string `json:"mime_type,omitempty"`
-	Status       string `json:"status"`
-	UploadedAt   string `json:"uploaded_at,omitempty"`
-	CreatedAt    string `json:"created_at"`
+	ID           string            `json:"id"`
+	OrgID        string            `json:"org_id"`
+	AgentID      string            `json:"agent_id,omitempty"`
+	BucketID     string            `json:"bucket_id"`
+	FileTypeID   string            `json:"file_type_id,omitempty"`
+	StorageKey   string            `json:"storage_key"`
+	OriginalPath string            `json:"original_path,omitempty"`
+	Filename     string            `json:"filename"`
+	Size         int64             `json:"size"`
+	SHA256       string            `json:"sha256,omitempty"`
+	MimeType     string            `json:"mime_type,omitempty"`
+	Status       string            `json:"status"`
+	UploadedAt   string            `json:"uploaded_at,omitempty"`
+	CreatedAt    string            `json:"created_at"`
+	Tags         map[string]string `json:"tags,omitempty"`
 }
 
-func toFileEntryResponse(e *db.FileEntry) fileEntryResponse {
+func toFileEntryResponse(e *db.FileEntry, tags map[string]string) fileEntryResponse {
 	r := fileEntryResponse{
 		ID:         e.ID.String(),
 		OrgID:      e.OrgID.String(),
@@ -70,6 +74,7 @@ func toFileEntryResponse(e *db.FileEntry) fileEntryResponse {
 		Size:       e.SizeBytes,
 		Status:     strings.ToUpper(string(e.Status)),
 		CreatedAt:  e.CreatedAt.UTC().Format(time.RFC3339),
+		Tags:       tags,
 	}
 	if e.AgentID.Valid {
 		r.AgentID = e.AgentID.UUID.String()
@@ -100,7 +105,7 @@ func (h *FilesHandler) List(c *gin.Context) {
 	}
 	// Reject mistyped/unsupported filters instead of silently ignoring them,
 	// which would return 200 with the filter having no effect (CC-5).
-	if !middleware.RejectUnknownQuery(c, "cursor", "limit", "agent_id", "bucket_id", "file_type_id", "status") {
+	if !middleware.RejectUnknownQuery(c, "cursor", "limit", "agent_id", "bucket_id", "file_type_id", "status", "tag") {
 		return
 	}
 	orgID := orgIDFromClaims(c)
@@ -112,10 +117,17 @@ func (h *FilesHandler) List(c *gin.Context) {
 		return
 	}
 
+	// Parse repeatable tag predicates (?tag=key:value), combined with AND.
+	tags, ok := parseTagFilters(c)
+	if !ok {
+		return
+	}
+
 	// Collect optional filters for both list and count.
-	filter := db.CountFileEntriesFilter{OrgID: orgID}
+	filter := db.CountFileEntriesFilter{OrgID: orgID, Tags: tags}
 	params := db.ListFileEntriesParams{
 		OrgID:           orgID,
+		Tags:            tags,
 		CursorCreatedAt: cursorCreatedAt,
 		CursorID:        cursorID,
 		Limit:           limit + 1, // fetch one extra to detect has_more
@@ -168,9 +180,22 @@ func (h *FilesHandler) List(c *gin.Context) {
 		return
 	}
 
+	// Batch-fetch tags for the page so responses carry their tags without an
+	// N+1 query per file.
+	ids := make([]uuid.UUID, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.ID)
+	}
+	tagsByFile, err := h.db.ListFileTagsByFileIDs(c.Request.Context(), ids)
+	if err != nil {
+		h.logger.Error("list file tags", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to load tags", nil)
+		return
+	}
+
 	resp := make([]fileEntryResponse, 0, len(entries))
 	for _, e := range entries {
-		resp = append(resp, toFileEntryResponse(e))
+		resp = append(resp, toFileEntryResponse(e, tagsByFile[e.ID]))
 	}
 
 	var nextCursor string
@@ -207,7 +232,35 @@ func (h *FilesHandler) Get(c *gin.Context) {
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to get file", nil)
 		return
 	}
-	c.JSON(http.StatusOK, toFileEntryResponse(entry))
+	tagsByFile, err := h.db.ListFileTagsByFileIDs(c.Request.Context(), []uuid.UUID{entry.ID})
+	if err != nil {
+		h.logger.Error("get file tags", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to load tags", nil)
+		return
+	}
+	c.JSON(http.StatusOK, toFileEntryResponse(entry, tagsByFile[entry.ID]))
+}
+
+// parseTagFilters parses repeatable ?tag=key:value query parameters into tag
+// predicates. It writes a 400 and returns ok=false on a malformed value (empty
+// key, or missing ':'), turning a silent no-op filter into an explicit client
+// error (consistent with RejectUnknownQuery / CC-5).
+func parseTagFilters(c *gin.Context) ([]db.FileTagFilter, bool) {
+	raw := c.QueryArray("tag")
+	if len(raw) == 0 {
+		return nil, true
+	}
+	filters := make([]db.FileTagFilter, 0, len(raw))
+	for _, t := range raw {
+		key, value, found := strings.Cut(t, ":")
+		if !found || key == "" || value == "" {
+			middleware.RespondError(c, http.StatusBadRequest, "INVALID_QUERY_PARAM",
+				"tag must be formatted as key:value", gin.H{"tag": t})
+			return nil, false
+		}
+		filters = append(filters, db.FileTagFilter{Key: key, Value: value})
+	}
+	return filters, true
 }
 
 // DownloadURL handles GET /api/v1/files/:id/download-url.

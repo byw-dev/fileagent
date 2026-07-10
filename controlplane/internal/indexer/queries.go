@@ -6,6 +6,7 @@ package indexer
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"time"
 
@@ -306,6 +307,72 @@ func ListFileTypeRules(ctx context.Context, dbtx db.DBTX) ([]*db.FileTypeRule, e
 		rules = append(rules, &r)
 	}
 	return rules, rows.Err()
+}
+
+// ── GetRuleMetadata ──────────────────────────────────────────────────────────
+
+const getRuleMetadataSQL = `
+SELECT metadata FROM collection_rules WHERE id = $1 LIMIT 1
+`
+
+// GetRuleMetadata returns the metadata JSONB of a collection rule. It returns
+// sql.ErrNoRows when the rule does not exist so callers can treat a missing
+// rule as "no declaration".
+func GetRuleMetadata(ctx context.Context, dbtx db.DBTX, ruleID uuid.UUID) (json.RawMessage, error) {
+	row := dbtx.QueryRowContext(ctx, getRuleMetadataSQL, ruleID)
+	var meta json.RawMessage
+	if err := row.Scan(&meta); err != nil {
+		return nil, err
+	}
+	return meta, nil
+}
+
+// ── GetFileTypeIDByName ──────────────────────────────────────────────────────
+
+const getFileTypeIDByNameSQL = `
+SELECT id FROM file_types WHERE org_id = $1 AND name = $2 LIMIT 1
+`
+
+// GetFileTypeIDByName resolves a declared file-type name to its id within an
+// org. It returns uuid.Nil (with a nil error) when no file type matches, so the
+// caller can fall back to glob classification.
+func GetFileTypeIDByName(ctx context.Context, dbtx db.DBTX, orgID uuid.UUID, name string) (uuid.UUID, error) {
+	row := dbtx.QueryRowContext(ctx, getFileTypeIDByNameSQL, orgID, name)
+	var id uuid.UUID
+	if err := row.Scan(&id); err != nil {
+		if err == sql.ErrNoRows {
+			return uuid.Nil, nil
+		}
+		return uuid.Nil, err
+	}
+	return id, nil
+}
+
+// ── UpsertFileTag ────────────────────────────────────────────────────────────
+
+// UpsertFileTagParams holds the parameters for UpsertFileTag.
+type UpsertFileTagParams struct {
+	FileEntryID uuid.UUID
+	Key         string
+	Value       string
+	Source      string
+}
+
+// upsertFileTagSQL is idempotent on the (file_entry_id, key) primary key: a
+// repeated UploadResult re-applies the same tag rather than duplicating it.
+const upsertFileTagSQL = `
+INSERT INTO file_tags (file_entry_id, key, value, source)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (file_entry_id, key) DO UPDATE SET
+    value  = EXCLUDED.value,
+    source = EXCLUDED.source
+`
+
+// UpsertFileTag inserts or updates a single file tag.
+func UpsertFileTag(ctx context.Context, dbtx db.DBTX, arg UpsertFileTagParams) error {
+	_, err := dbtx.ExecContext(ctx, upsertFileTagSQL,
+		arg.FileEntryID, arg.Key, arg.Value, arg.Source)
+	return err
 }
 
 // ── CreateEventDelivery ──────────────────────────────────────────────────────

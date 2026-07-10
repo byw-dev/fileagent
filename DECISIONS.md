@@ -993,3 +993,21 @@ Makefile（`bundle` 目标）、构建/分发流程
    只做对账兜底。ETL 在系统第一阶段建设完成前不存在，故仅落设计（`metadata-model.md` P2.2/P2.3）。
 4. **实施排期**：Phase 1 提为当前 track（MT-1…MT-6，追踪 `docs/tasks/metadata-phase1.md`），WR-2…10 暂停
    让位（价值优先）。MT-1+MT-2 薄纵切起手。
+
+### 落地记录（MT-1 + MT-2，薄纵切第一刀）
+
+迁移 `000004_metadata_tags`（5 表，只追加）+ indexer 打标 `static_tags`/声明 `file_type` 优先 + 文件按标签筛选。
+固化以下**契约细节**（D-025 大盘之下的具体形状）：
+
+- **文件响应新增 `tags`**：形如 `"tags": {"vendor":"omron","site":"tokyo"}`（key→value 对象，`omitempty`；
+  与 `file_tags` 主键 `(file_entry_id,key)`「每 key 至多一值」一致）。`GET /api/v1/files` 与 `GET /files/{id}` 均带。
+- **`GET /api/v1/files` 可重复 `tag` 参数**：`?tag=key:value`，多条 **AND**（`file_tags` join +
+  `HAVING COUNT(*)=N`）；已并入 `RejectUnknownQuery` allowlist；畸形值（缺 `:` 或空 key/value）返回 **400**
+  `INVALID_QUERY_PARAM`（不静默忽略，同 CC-5）。**cursor 分页与信封 V-2 不变**。
+- **打标落点**：CP `internal/indexer` 在 `UpsertFileEntry` 后写 `file_tags`（source=`rule_static`），
+  on-conflict `(file_entry_id,key)` 覆盖，重复 `UploadResult` 幂等。声明 `file_type`（名字）经
+  `GetFileTypeIDByName` 解析并**优先于 glob**，未解析则回落 glob（既有部署行为不变）。best-effort：
+  规则 metadata 缺失/畸形或单条标签写失败仅告警，不使索引失败。
+- **本刀不含**：路径变量抽取 `path_tag_map` + 待确认队列（MT-3）、词表/手动批量打标 API（MT-4）、
+  回溯 worker（MT-5）、webui（MT-6）。tag `source` 优先级（rule_static vs manual/path_var 的覆盖策略）
+  随 MT-3/MT-4 再定，本刀只有 rule_static。

@@ -28,6 +28,9 @@ type IndexerStore interface {
 	MarkFileEntryDeleted(ctx context.Context, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error)
 	CreateUploadLog(ctx context.Context, params CreateUploadLogParams) (*db.UploadLog, error)
 	ListFileTypeRules(ctx context.Context) ([]*db.FileTypeRule, error)
+	GetRuleMetadata(ctx context.Context, ruleID uuid.UUID) (json.RawMessage, error)
+	GetFileTypeIDByName(ctx context.Context, orgID uuid.UUID, name string) (uuid.UUID, error)
+	UpsertFileTag(ctx context.Context, params UpsertFileTagParams) error
 }
 
 // dbtxIndexerStore adapts db.DBTX to IndexerStore.
@@ -58,6 +61,21 @@ func (d *dbtxIndexerStore) CreateUploadLog(ctx context.Context, params CreateUpl
 // ListFileTypeRules delegates to the package-level function.
 func (d *dbtxIndexerStore) ListFileTypeRules(ctx context.Context) ([]*db.FileTypeRule, error) {
 	return ListFileTypeRules(ctx, d.dbtx)
+}
+
+// GetRuleMetadata delegates to the package-level function.
+func (d *dbtxIndexerStore) GetRuleMetadata(ctx context.Context, ruleID uuid.UUID) (json.RawMessage, error) {
+	return GetRuleMetadata(ctx, d.dbtx, ruleID)
+}
+
+// GetFileTypeIDByName delegates to the package-level function.
+func (d *dbtxIndexerStore) GetFileTypeIDByName(ctx context.Context, orgID uuid.UUID, name string) (uuid.UUID, error) {
+	return GetFileTypeIDByName(ctx, d.dbtx, orgID, name)
+}
+
+// UpsertFileTag delegates to the package-level function.
+func (d *dbtxIndexerStore) UpsertFileTag(ctx context.Context, params UpsertFileTagParams) error {
+	return UpsertFileTag(ctx, d.dbtx, params)
 }
 
 // Indexer processes upload results from agents and maintains the file index.
@@ -100,13 +118,6 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 		return fmt.Errorf("indexer: get bucket %q: %w", result.GetBucket(), err)
 	}
 
-	// Classify file type.
-	fileTypeID, err := ix.classifier.Classify(ctx, result.GetStoragePath())
-	if err != nil {
-		ix.logger.Warn("indexer: classify file failed", zap.Error(err))
-		fileTypeID = uuid.Nil
-	}
-
 	// Parse rule ID if provided.
 	var ruleID uuid.NullUUID
 	if ruleStr := result.GetRuleId(); ruleStr != "" {
@@ -114,6 +125,18 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 			ruleID = uuid.NullUUID{UUID: id, Valid: true}
 		}
 	}
+
+	// Load the rule's metadata declaration (file_type / static_tags). Best
+	// effort: a missing or malformed declaration degrades to glob-only
+	// classification with no static tags.
+	var ruleMeta ruleMetadata
+	if ruleID.Valid {
+		ruleMeta = ix.loadRuleMetadata(ctx, ruleID.UUID)
+	}
+
+	// Classify file type: a rule-declared file_type takes priority over the
+	// glob file_type_rules, which remain the fallback for undeclared data.
+	fileTypeID := ix.classifyFileType(ctx, orgID, result.GetStoragePath(), ruleMeta.FileType)
 
 	// Determine file status.
 	fileStatus := db.FileStatusCompleted
@@ -154,6 +177,11 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 		return fmt.Errorf("indexer: upsert file entry: %w", err)
 	}
 
+	// Apply rule-declared static tags (source=rule_static), idempotent on
+	// (file_entry_id, key). Best effort: a tag failure is logged but does not
+	// fail indexing (mirrors upload-log handling).
+	ix.applyStaticTags(ctx, fileEntry.ID, ruleMeta.StaticTags)
+
 	// Create upload log.
 	logStatus := "completed"
 	var errMsg sql.NullString
@@ -192,6 +220,89 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 		zap.String("status", string(fileStatus)),
 	)
 	return nil
+}
+
+// tagSourceRuleStatic marks tags written from a rule's static_tags declaration.
+const tagSourceRuleStatic = "rule_static"
+
+// ruleMetadata is the declared shape of collection_rules.metadata consumed by
+// the tagging engine (metadata model 6c, Phase 1). PathTagMap is parsed but not
+// yet consumed here — path-variable extraction lands in MT-3.
+type ruleMetadata struct {
+	FileType   string            `json:"file_type"`
+	StaticTags map[string]string `json:"static_tags"`
+	PathTagMap map[string]string `json:"path_tag_map"`
+}
+
+// loadRuleMetadata fetches and parses a rule's metadata declaration. It returns
+// a zero-value ruleMetadata (logging non-ErrNoRows failures) when the rule is
+// missing or its metadata cannot be parsed, so indexing degrades gracefully.
+func (ix *Indexer) loadRuleMetadata(ctx context.Context, ruleID uuid.UUID) ruleMetadata {
+	var meta ruleMetadata
+	raw, err := ix.store.GetRuleMetadata(ctx, ruleID)
+	if err != nil {
+		if err != sql.ErrNoRows {
+			ix.logger.Warn("indexer: load rule metadata",
+				zap.String("rule_id", ruleID.String()), zap.Error(err))
+		}
+		return meta
+	}
+	if len(raw) == 0 {
+		return meta
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		ix.logger.Warn("indexer: parse rule metadata",
+			zap.String("rule_id", ruleID.String()), zap.Error(err))
+		return ruleMetadata{}
+	}
+	return meta
+}
+
+// classifyFileType resolves the file type for a storage path. A non-empty
+// declared file-type name (from rule metadata) takes priority and is resolved to
+// its id within the org; otherwise, or when the name does not resolve, it falls
+// back to glob file_type_rules. Returns uuid.Nil when nothing matches.
+func (ix *Indexer) classifyFileType(ctx context.Context, orgID uuid.UUID, storagePath, declared string) uuid.UUID {
+	if declared != "" {
+		id, err := ix.store.GetFileTypeIDByName(ctx, orgID, declared)
+		switch {
+		case err != nil:
+			ix.logger.Warn("indexer: resolve declared file_type",
+				zap.String("file_type", declared), zap.Error(err))
+		case id != uuid.Nil:
+			return id
+		default:
+			ix.logger.Warn("indexer: declared file_type not found, falling back to glob",
+				zap.String("file_type", declared))
+		}
+	}
+	id, err := ix.classifier.Classify(ctx, storagePath)
+	if err != nil {
+		ix.logger.Warn("indexer: classify file failed", zap.Error(err))
+		return uuid.Nil
+	}
+	return id
+}
+
+// applyStaticTags writes rule-declared static tags to file_tags with
+// source=rule_static. Empty keys/values are skipped; per-tag failures are
+// logged but do not fail indexing.
+func (ix *Indexer) applyStaticTags(ctx context.Context, fileEntryID uuid.UUID, tags map[string]string) {
+	for key, value := range tags {
+		if key == "" || value == "" {
+			continue
+		}
+		if err := ix.store.UpsertFileTag(ctx, UpsertFileTagParams{
+			FileEntryID: fileEntryID,
+			Key:         key,
+			Value:       value,
+			Source:      tagSourceRuleStatic,
+		}); err != nil {
+			ix.logger.Warn("indexer: upsert static tag",
+				zap.String("file_entry_id", fileEntryID.String()),
+				zap.String("key", key), zap.Error(err))
+		}
+	}
 }
 
 func (ix *Indexer) publishFileUploaded(fe *db.FileEntry, agentID uuid.UUID, result *agentv1.UploadResult) {

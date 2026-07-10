@@ -68,9 +68,13 @@ type mockFilesDB struct {
 	getErr     error
 	bucket     *db.Bucket
 	bucketErr  error
+	tagsByFile map[uuid.UUID]map[string]string
+	tagsErr    error
+	lastList   db.ListFileEntriesParams
 }
 
-func (m *mockFilesDB) ListFileEntries(_ context.Context, _ db.ListFileEntriesParams) ([]*db.FileEntry, error) {
+func (m *mockFilesDB) ListFileEntries(_ context.Context, arg db.ListFileEntriesParams) ([]*db.FileEntry, error) {
+	m.lastList = arg
 	return m.entries, m.listErr
 }
 func (m *mockFilesDB) CountFileEntries(_ context.Context, _ db.CountFileEntriesFilter) (int64, error) {
@@ -87,6 +91,9 @@ func (m *mockFilesDB) GetBucketByID(_ context.Context, _ uuid.UUID) (*db.Bucket,
 		return m.bucket, nil
 	}
 	return &db.Bucket{ID: uuid.New(), Name: "data-sensor"}, nil
+}
+func (m *mockFilesDB) ListFileTagsByFileIDs(_ context.Context, _ []uuid.UUID) (map[uuid.UUID]map[string]string, error) {
+	return m.tagsByFile, m.tagsErr
 }
 
 // ── mock MinIOPresigner ───────────────────────────────────────────────────────
@@ -494,4 +501,78 @@ type capturingPresigner struct {
 func (m *capturingPresigner) PresignedGetObject(_ context.Context, bucket, _ string, _ time.Duration) (string, error) {
 	m.lastBucket = bucket
 	return m.url, nil
+}
+
+// ── MT-2: file tags ────────────────────────────────────────────────────────────
+
+func TestFilesHandler_List_TagsInResponse(t *testing.T) {
+	entry := newSampleEntry()
+	mockDB := &mockFilesDB{
+		entries:    []*db.FileEntry{entry},
+		countTotal: 1,
+		tagsByFile: map[uuid.UUID]map[string]string{
+			entry.ID: {"vendor": "omron", "site": "tokyo"},
+		},
+	}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	item := body["items"].([]interface{})[0].(map[string]interface{})
+	tags := item["tags"].(map[string]interface{})
+	assert.Equal(t, "omron", tags["vendor"])
+	assert.Equal(t, "tokyo", tags["site"])
+}
+
+func TestFilesHandler_List_TagFilterParsed(t *testing.T) {
+	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countTotal: 1}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files?tag=site:tokyo&tag=level:raw", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, mockDB.lastList.Tags, 2)
+	assert.Equal(t, db.FileTagFilter{Key: "site", Value: "tokyo"}, mockDB.lastList.Tags[0])
+	assert.Equal(t, db.FileTagFilter{Key: "level", Value: "raw"}, mockDB.lastList.Tags[1])
+}
+
+func TestFilesHandler_List_MalformedTag_Returns400(t *testing.T) {
+	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countTotal: 1}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files?tag=novalue", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestFilesHandler_List_TagsDBError(t *testing.T) {
+	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countTotal: 1, tagsErr: assert.AnError}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestFilesHandler_Get_TagsInResponse(t *testing.T) {
+	entry := newSampleEntry()
+	mockDB := &mockFilesDB{
+		entry:      entry,
+		tagsByFile: map[uuid.UUID]map[string]string{entry.ID: {"vendor": "omron"}},
+	}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files/"+entry.ID.String(), nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	tags := body["tags"].(map[string]interface{})
+	assert.Equal(t, "omron", tags["vendor"])
 }
