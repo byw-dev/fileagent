@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -241,6 +242,10 @@ func (h *FilesHandler) Get(c *gin.Context) {
 	c.JSON(http.StatusOK, toFileEntryResponse(entry, tagsByFile[entry.ID]))
 }
 
+// maxTagFilters bounds the number of distinct tag predicates a single files
+// query may carry, guarding against oversized generated SQL.
+const maxTagFilters = 20
+
 // parseTagFilters parses repeatable ?tag=key:value query parameters into tag
 // predicates, combined with AND. It writes a 400 and returns ok=false on a
 // malformed value (empty key, or missing ':'), turning a silent no-op filter
@@ -263,6 +268,14 @@ func parseTagFilters(c *gin.Context) ([]db.FileTagFilter, bool) {
 		if !found || key == "" || value == "" {
 			middleware.RespondError(c, http.StatusBadRequest, "INVALID_QUERY_PARAM",
 				"tag must be formatted as key:value", gin.H{"tag": t})
+			return nil, false
+		}
+		// Bound the number of distinct predicates: each adds two bind params and
+		// expands the generated IN-list, so an unbounded request would produce
+		// very large SQL and excessive DB work (availability guard).
+		if _, ok := seen[key]; !ok && len(filters) >= maxTagFilters {
+			middleware.RespondError(c, http.StatusBadRequest, "INVALID_QUERY_PARAM",
+				"too many tag filters (max "+strconv.Itoa(maxTagFilters)+")", nil)
 			return nil, false
 		}
 		if prev, ok := seen[key]; ok {

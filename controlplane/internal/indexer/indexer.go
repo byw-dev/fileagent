@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/bootstrap"
@@ -28,7 +29,7 @@ type IndexerStore interface {
 	MarkFileEntryDeleted(ctx context.Context, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error)
 	CreateUploadLog(ctx context.Context, params CreateUploadLogParams) (*db.UploadLog, error)
 	ListFileTypeRules(ctx context.Context) ([]*db.FileTypeRule, error)
-	GetRuleMetadata(ctx context.Context, ruleID uuid.UUID) (json.RawMessage, error)
+	GetRuleMetadata(ctx context.Context, orgID, ruleID uuid.UUID) (json.RawMessage, error)
 	GetFileTypeIDByName(ctx context.Context, orgID uuid.UUID, name string) (uuid.UUID, error)
 	UpsertFileTag(ctx context.Context, params UpsertFileTagParams) error
 }
@@ -64,8 +65,8 @@ func (d *dbtxIndexerStore) ListFileTypeRules(ctx context.Context) ([]*db.FileTyp
 }
 
 // GetRuleMetadata delegates to the package-level function.
-func (d *dbtxIndexerStore) GetRuleMetadata(ctx context.Context, ruleID uuid.UUID) (json.RawMessage, error) {
-	return GetRuleMetadata(ctx, d.dbtx, ruleID)
+func (d *dbtxIndexerStore) GetRuleMetadata(ctx context.Context, orgID, ruleID uuid.UUID) (json.RawMessage, error) {
+	return GetRuleMetadata(ctx, d.dbtx, orgID, ruleID)
 }
 
 // GetFileTypeIDByName delegates to the package-level function.
@@ -131,7 +132,7 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 	// classification with no static tags.
 	var ruleMeta ruleMetadata
 	if ruleID.Valid {
-		ruleMeta = ix.loadRuleMetadata(ctx, ruleID.UUID)
+		ruleMeta = ix.loadRuleMetadata(ctx, orgID, ruleID.UUID)
 	}
 
 	// Classify file type: a rule-declared file_type takes priority over the
@@ -225,6 +226,14 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 // tagSourceRuleStatic marks tags written from a rule's static_tags declaration.
 const tagSourceRuleStatic = "rule_static"
 
+// Tag key/value length limits mirror the file_tags column widths (VARCHAR(64) /
+// VARCHAR(128)). Overlong values are skipped before the insert so a misconfigured
+// rule cannot spam a DB error + warning on every single upload.
+const (
+	maxTagKeyLen   = 64
+	maxTagValueLen = 128
+)
+
 // ruleMetadata is the declared shape of collection_rules.metadata consumed by
 // the tagging engine (metadata model 6c, Phase 1). PathTagMap is parsed but not
 // yet consumed here — path-variable extraction lands in MT-3.
@@ -237,9 +246,9 @@ type ruleMetadata struct {
 // loadRuleMetadata fetches and parses a rule's metadata declaration. It returns
 // a zero-value ruleMetadata (logging non-ErrNoRows failures) when the rule is
 // missing or its metadata cannot be parsed, so indexing degrades gracefully.
-func (ix *Indexer) loadRuleMetadata(ctx context.Context, ruleID uuid.UUID) ruleMetadata {
+func (ix *Indexer) loadRuleMetadata(ctx context.Context, orgID, ruleID uuid.UUID) ruleMetadata {
 	var meta ruleMetadata
-	raw, err := ix.store.GetRuleMetadata(ctx, ruleID)
+	raw, err := ix.store.GetRuleMetadata(ctx, orgID, ruleID)
 	if err != nil {
 		if err != sql.ErrNoRows {
 			ix.logger.Warn("indexer: load rule metadata",
@@ -290,6 +299,14 @@ func (ix *Indexer) classifyFileType(ctx context.Context, orgID uuid.UUID, storag
 func (ix *Indexer) applyStaticTags(ctx context.Context, fileEntryID uuid.UUID, tags map[string]string) {
 	for key, value := range tags {
 		if key == "" || value == "" {
+			continue
+		}
+		// Rune count matches VARCHAR(n) character semantics; skip overlong tags
+		// rather than letting every upload hit a DB length error.
+		if utf8.RuneCountInString(key) > maxTagKeyLen || utf8.RuneCountInString(value) > maxTagValueLen {
+			ix.logger.Warn("indexer: skip overlong static tag",
+				zap.String("file_entry_id", fileEntryID.String()),
+				zap.String("key", key))
 			continue
 		}
 		if err := ix.store.UpsertFileTag(ctx, UpsertFileTagParams{

@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -568,6 +570,20 @@ func TestFilesHandler_List_ConflictingTagKey_Returns400(t *testing.T) {
 	w := httptest.NewRecorder()
 	// Two values for one key can never both match (one value per file×key).
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files?tag=site:tokyo&tag=site:osaka", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestFilesHandler_List_TooManyTagFilters_Returns400(t *testing.T) {
+	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countTotal: 1}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	// 21 distinct keys exceeds the max of 20.
+	q := make([]string, 0, 21)
+	for i := 0; i < 21; i++ {
+		q = append(q, "tag=k"+strconv.Itoa(i)+":v")
+	}
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files?"+strings.Join(q, "&"), nil)
 	testFilesRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }

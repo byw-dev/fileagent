@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,7 +77,7 @@ func (m *mockIndexerStore) ListFileTypeRules(_ context.Context) ([]*db.FileTypeR
 	return m.typeRules, m.typeRulesErr
 }
 
-func (m *mockIndexerStore) GetRuleMetadata(_ context.Context, _ uuid.UUID) (json.RawMessage, error) {
+func (m *mockIndexerStore) GetRuleMetadata(_ context.Context, _, _ uuid.UUID) (json.RawMessage, error) {
 	return m.ruleMeta, m.ruleMetaErr
 }
 
@@ -659,4 +660,24 @@ func TestHandleUploadResult_TagUpsertError_DoesNotFailIndexing(t *testing.T) {
 
 	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
 	require.NoError(t, err)
+}
+
+func TestHandleUploadResult_SkipsOverlongStaticTag(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "uploads/p.csv")
+	longValue := strings.Repeat("x", 129) // exceeds VARCHAR(128)
+	store := &mockIndexerStore{
+		bucket:    bucket,
+		fileEntry: fe,
+		uploadLog: newUploadLog(),
+		ruleMeta:  json.RawMessage(`{"static_tags":{"vendor":"omron","note":"` + longValue + `"}}`),
+	}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	require.NoError(t, err)
+
+	// The overlong "note" tag is skipped; the valid "vendor" tag still lands.
+	require.Len(t, store.upsertedTags, 1)
+	assert.Equal(t, "vendor", store.upsertedTags[0].Key)
 }

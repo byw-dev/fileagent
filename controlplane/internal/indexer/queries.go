@@ -312,14 +312,15 @@ func ListFileTypeRules(ctx context.Context, dbtx db.DBTX) ([]*db.FileTypeRule, e
 // ── GetRuleMetadata ──────────────────────────────────────────────────────────
 
 const getRuleMetadataSQL = `
-SELECT metadata FROM collection_rules WHERE id = $1 LIMIT 1
+SELECT metadata FROM collection_rules WHERE id = $1 AND org_id = $2 LIMIT 1
 `
 
-// GetRuleMetadata returns the metadata JSONB of a collection rule. It returns
-// sql.ErrNoRows when the rule does not exist so callers can treat a missing
-// rule as "no declaration".
-func GetRuleMetadata(ctx context.Context, dbtx db.DBTX, ruleID uuid.UUID) (json.RawMessage, error) {
-	row := dbtx.QueryRowContext(ctx, getRuleMetadataSQL, ruleID)
+// GetRuleMetadata returns the metadata JSONB of a collection rule scoped to an
+// org, so an agent that sends an arbitrary rule UUID cannot read another
+// tenant's rule (defense-in-depth). It returns sql.ErrNoRows when no such rule
+// exists in the org, so callers can treat it as "no declaration".
+func GetRuleMetadata(ctx context.Context, dbtx db.DBTX, orgID, ruleID uuid.UUID) (json.RawMessage, error) {
+	row := dbtx.QueryRowContext(ctx, getRuleMetadataSQL, ruleID, orgID)
 	var meta json.RawMessage
 	if err := row.Scan(&meta); err != nil {
 		return nil, err
