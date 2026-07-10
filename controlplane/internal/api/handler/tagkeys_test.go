@@ -330,3 +330,21 @@ func TestTagKeys_Values_InvalidKeyParam_400(t *testing.T) {
 	testTagKeysRouter(h, "super_admin").ServeHTTP(w, req(http.MethodPost, "/api/v1/tag-keys/Bad!/values", `{"value":"x"}`))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
+
+func TestTagKeys_Update_RaceDeleted_404(t *testing.T) {
+	// Key exists at check time but UpdateTagKey finds no row (deleted in between).
+	mockDB := &mockTagKeysDB{getKey: &db.TagKey{ID: uuid.New(), Key: "site", Label: "Old"}, updateErr: sql.ErrNoRows}
+	h := handler.NewTagKeysHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testTagKeysRouter(h, "super_admin").ServeHTTP(w, req(http.MethodPatch, "/api/v1/tag-keys/site", `{"label":"New"}`))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestTagKeys_Delete_RaceZeroRows_404(t *testing.T) {
+	// Key exists at check time but DeleteTagKey affects 0 rows (deleted in between).
+	mockDB := &mockTagKeysDB{getKey: &db.TagKey{ID: uuid.New(), Key: "site"}, deleteRows: 0}
+	h := handler.NewTagKeysHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testTagKeysRouter(h, "super_admin").ServeHTTP(w, req(http.MethodDelete, "/api/v1/tag-keys/site", ""))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}

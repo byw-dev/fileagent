@@ -221,6 +221,11 @@ func (h *TagKeysHandler) Update(c *gin.Context) {
 		AllowPathVar:         boolOr(req.AllowPathVar, existing.AllowPathVar),
 	})
 	if err != nil {
+		// The row may have been deleted between the GetTagKey check and here.
+		if errors.Is(err, sql.ErrNoRows) {
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "tag key not found", nil)
+			return
+		}
 		h.logger.Error("update tag key", zap.Error(err))
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update tag key", nil)
 		return
@@ -257,9 +262,15 @@ func (h *TagKeysHandler) Delete(c *gin.Context) {
 		return
 	}
 
-	if _, err := h.db.DeleteTagKey(c.Request.Context(), orgID, key); err != nil {
+	rows, err := h.db.DeleteTagKey(c.Request.Context(), orgID, key)
+	if err != nil {
 		h.logger.Error("delete tag key", zap.Error(err))
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to delete tag key", nil)
+		return
+	}
+	if rows == 0 {
+		// Raced with another delete between the GetTagKey check and here.
+		middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "tag key not found", nil)
 		return
 	}
 	c.Status(http.StatusNoContent)
