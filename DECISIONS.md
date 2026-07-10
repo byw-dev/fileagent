@@ -1003,7 +1003,8 @@ Makefile（`bundle` 目标）、构建/分发流程
   与 `file_tags` 主键 `(file_entry_id,key)`「每 key 至多一值」一致）。`GET /api/v1/files` 与 `GET /files/{id}` 均带。
 - **`GET /api/v1/files` 可重复 `tag` 参数**：`?tag=key:value`，多条 **AND**（`file_tags` join +
   `HAVING COUNT(*)=N`）；已并入 `RejectUnknownQuery` allowlist；畸形值（缺 `:` 或空 key/value）返回 **400**
-  `INVALID_QUERY_PARAM`（不静默忽略，同 CC-5）。**cursor 分页与信封 V-2 不变**。
+  `INVALID_QUERY_PARAM`（不静默忽略，同 CC-5）。因 `file_tags` 主键 `(file_entry_id,key)`「每 key 至多一值」，
+  完全相同的 `tag` 去重折叠；同 key 不同值必然无解，**返回 400**（而非静默返回空集）。**cursor 分页与信封 V-2 不变**。
 - **打标落点**：CP `internal/indexer` 在 `UpsertFileEntry` 后写 `file_tags`（source=`rule_static`），
   on-conflict `(file_entry_id,key)` 覆盖，重复 `UploadResult` 幂等。声明 `file_type`（名字）经
   `GetFileTypeIDByName` 解析并**优先于 glob**，未解析则回落 glob（既有部署行为不变）。best-effort：

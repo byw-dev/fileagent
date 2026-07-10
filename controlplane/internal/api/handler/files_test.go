@@ -550,6 +550,28 @@ func TestFilesHandler_List_MalformedTag_Returns400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+func TestFilesHandler_List_DuplicateExactTag_Collapsed(t *testing.T) {
+	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countTotal: 1}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	// Same key:value twice must collapse to a single predicate, not inflate N.
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files?tag=site:tokyo&tag=site:tokyo", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, mockDB.lastList.Tags, 1)
+	assert.Equal(t, db.FileTagFilter{Key: "site", Value: "tokyo"}, mockDB.lastList.Tags[0])
+}
+
+func TestFilesHandler_List_ConflictingTagKey_Returns400(t *testing.T) {
+	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countTotal: 1}
+	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	// Two values for one key can never both match (one value per file×key).
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/files?tag=site:tokyo&tag=site:osaka", nil)
+	testFilesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 func TestFilesHandler_List_TagsDBError(t *testing.T) {
 	mockDB := &mockFilesDB{entries: []*db.FileEntry{newSampleEntry()}, countTotal: 1, tagsErr: assert.AnError}
 	h := handler.NewFilesHandler(mockDB, nil, newTestLogger())

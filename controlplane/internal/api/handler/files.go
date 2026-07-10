@@ -242,15 +242,22 @@ func (h *FilesHandler) Get(c *gin.Context) {
 }
 
 // parseTagFilters parses repeatable ?tag=key:value query parameters into tag
-// predicates. It writes a 400 and returns ok=false on a malformed value (empty
-// key, or missing ':'), turning a silent no-op filter into an explicit client
-// error (consistent with RejectUnknownQuery / CC-5).
+// predicates, combined with AND. It writes a 400 and returns ok=false on a
+// malformed value (empty key, or missing ':'), turning a silent no-op filter
+// into an explicit client error (consistent with RejectUnknownQuery / CC-5).
+//
+// Because file_tags is keyed on (file_entry_id, key), a file carries at most one
+// value per key, so the AND filter (HAVING COUNT(*) = N) only makes sense with
+// distinct keys. Exact duplicate predicates are collapsed; two different values
+// for the same key can never both match, so they are rejected with a 400 rather
+// than silently returning zero results.
 func parseTagFilters(c *gin.Context) ([]db.FileTagFilter, bool) {
 	raw := c.QueryArray("tag")
 	if len(raw) == 0 {
 		return nil, true
 	}
 	filters := make([]db.FileTagFilter, 0, len(raw))
+	seen := make(map[string]string, len(raw))
 	for _, t := range raw {
 		key, value, found := strings.Cut(t, ":")
 		if !found || key == "" || value == "" {
@@ -258,6 +265,15 @@ func parseTagFilters(c *gin.Context) ([]db.FileTagFilter, bool) {
 				"tag must be formatted as key:value", gin.H{"tag": t})
 			return nil, false
 		}
+		if prev, ok := seen[key]; ok {
+			if prev != value {
+				middleware.RespondError(c, http.StatusBadRequest, "INVALID_QUERY_PARAM",
+					"conflicting values for tag key: "+key, gin.H{"key": key})
+				return nil, false
+			}
+			continue // exact duplicate — already included
+		}
+		seen[key] = value
 		filters = append(filters, db.FileTagFilter{Key: key, Value: value})
 	}
 	return filters, true
