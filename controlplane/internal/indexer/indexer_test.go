@@ -47,13 +47,24 @@ type mockIndexerStore struct {
 	typeRules    []*db.FileTypeRule
 	typeRulesErr error
 
-	ruleMeta       json.RawMessage
-	ruleMetaErr    error
-	fileTypeByName map[string]uuid.UUID
-	fileTypeErr    error
-	upsertedTags   []UpsertFileTagParams
-	upsertTagErr   error
-	lastUpsert     UpsertFileEntryParams
+	ruleMeta         json.RawMessage
+	destPathTemplate string
+	ruleMetaErr      error
+	fileTypeByName   map[string]uuid.UUID
+	fileTypeErr      error
+	upsertedTags     []UpsertFileTagParams
+	upsertTagErr     error
+	lastUpsert       UpsertFileEntryParams
+
+	// path-var / pending-queue (MT-3)
+	insertedTags   []UpsertFileTagParams
+	insertReturns  bool // whether InsertFileTagIfAbsent reports a fresh insert
+	insertTagErr   error
+	tagKeys        map[string]TagKeyInfo // key → controlled key info
+	existingValues map[string]bool       // "value" → registered in tag_values
+	similarValue   string
+	pendingUpserts []UpsertPendingTagValueParams
+	pendingErr     error
 }
 
 func (m *mockIndexerStore) GetBucketByName(_ context.Context, _ uuid.UUID, _ string) (*db.Bucket, error) {
@@ -77,8 +88,40 @@ func (m *mockIndexerStore) ListFileTypeRules(_ context.Context) ([]*db.FileTypeR
 	return m.typeRules, m.typeRulesErr
 }
 
-func (m *mockIndexerStore) GetRuleMetadata(_ context.Context, _, _ uuid.UUID) (json.RawMessage, error) {
-	return m.ruleMeta, m.ruleMetaErr
+func (m *mockIndexerStore) GetRuleTagInfo(_ context.Context, _, _ uuid.UUID) (RuleTagInfo, error) {
+	if m.ruleMetaErr != nil {
+		return RuleTagInfo{}, m.ruleMetaErr
+	}
+	return RuleTagInfo{Metadata: m.ruleMeta, DestPathTemplate: m.destPathTemplate}, nil
+}
+
+func (m *mockIndexerStore) InsertFileTagIfAbsent(_ context.Context, params UpsertFileTagParams) (bool, error) {
+	if m.insertTagErr != nil {
+		return false, m.insertTagErr
+	}
+	m.insertedTags = append(m.insertedTags, params)
+	return m.insertReturns, nil
+}
+
+func (m *mockIndexerStore) GetTagKeyByName(_ context.Context, _ uuid.UUID, key string) (TagKeyInfo, bool, error) {
+	info, ok := m.tagKeys[key]
+	return info, ok, nil
+}
+
+func (m *mockIndexerStore) TagValueExists(_ context.Context, _ uuid.UUID, value string) (bool, error) {
+	return m.existingValues[value], nil
+}
+
+func (m *mockIndexerStore) FindSimilarTagValue(_ context.Context, _ uuid.UUID, _ string) (string, error) {
+	return m.similarValue, nil
+}
+
+func (m *mockIndexerStore) UpsertPendingTagValue(_ context.Context, params UpsertPendingTagValueParams) error {
+	if m.pendingErr != nil {
+		return m.pendingErr
+	}
+	m.pendingUpserts = append(m.pendingUpserts, params)
+	return nil
 }
 
 func (m *mockIndexerStore) GetFileTypeIDByName(_ context.Context, _ uuid.UUID, name string) (uuid.UUID, error) {
@@ -680,4 +723,137 @@ func TestHandleUploadResult_SkipsOverlongStaticTag(t *testing.T) {
 	// The overlong "note" tag is skipped; the valid "vendor" tag still lands.
 	require.Len(t, store.upsertedTags, 1)
 	assert.Equal(t, "vendor", store.upsertedTags[0].Key)
+}
+
+// ── MT-3: path-variable extraction + pending-value queue ────────────────────────
+
+func pathVarStore(bucket *db.Bucket, fe *db.FileEntry, meta, destTemplate string) *mockIndexerStore {
+	return &mockIndexerStore{
+		bucket:           bucket,
+		fileEntry:        fe,
+		uploadLog:        newUploadLog(),
+		ruleMeta:         json.RawMessage(meta),
+		destPathTemplate: destTemplate,
+		insertReturns:    true, // default: treat as a fresh insert
+	}
+}
+
+func TestHandleUploadResult_ExtractsPathVarTag(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "data/tokyo/p.csv")
+	store := pathVarStore(bucket, fe,
+		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	require.NoError(t, err)
+
+	require.Len(t, store.insertedTags, 1)
+	assert.Equal(t, "site", store.insertedTags[0].Key)
+	assert.Equal(t, "tokyo", store.insertedTags[0].Value)
+	assert.Equal(t, "path_var", store.insertedTags[0].Source)
+}
+
+func TestHandleUploadResult_PathVar_TemplateMismatch_NoTag(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "totally/different/path.csv")
+	store := pathVarStore(bucket, fe,
+		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "totally/different/path.csv"))
+	require.NoError(t, err)
+	assert.Empty(t, store.insertedTags)
+}
+
+func TestHandleUploadResult_PathVar_UnregisteredControlledValue_Queued(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "data/tokyo/p.csv")
+	keyID := uuid.New()
+	store := pathVarStore(bucket, fe,
+		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
+	store.tagKeys = map[string]TagKeyInfo{"site": {ID: keyID, ValueControlled: true, AllowPathVar: true}}
+	store.existingValues = map[string]bool{} // tokyo not registered
+	store.similarValue = "Tokyo"             // case drift suggestion
+
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	require.NoError(t, err)
+
+	require.Len(t, store.pendingUpserts, 1)
+	p := store.pendingUpserts[0]
+	assert.Equal(t, keyID, p.TagKeyID)
+	assert.Equal(t, "tokyo", p.ExtractedValue)
+	assert.True(t, p.SuggestedValue.Valid)
+	assert.Equal(t, "Tokyo", p.SuggestedValue.String)
+}
+
+func TestHandleUploadResult_PathVar_RegisteredValue_NotQueued(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "data/tokyo/p.csv")
+	store := pathVarStore(bucket, fe,
+		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
+	store.tagKeys = map[string]TagKeyInfo{"site": {ID: uuid.New(), ValueControlled: true, AllowPathVar: true}}
+	store.existingValues = map[string]bool{"tokyo": true} // already approved
+
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	require.NoError(t, err)
+	assert.Empty(t, store.pendingUpserts)
+}
+
+func TestHandleUploadResult_PathVar_UncontrolledKey_NotQueued(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "data/tokyo/p.csv")
+	store := pathVarStore(bucket, fe,
+		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
+	// "site" not registered as a controlled key at all.
+	store.tagKeys = map[string]TagKeyInfo{}
+
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	require.NoError(t, err)
+	require.Len(t, store.insertedTags, 1) // tag still recorded
+	assert.Empty(t, store.pendingUpserts) // but not queued
+}
+
+func TestHandleUploadResult_PathVar_AllowPathVarFalse_Skipped(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "data/tokyo/p.csv")
+	store := pathVarStore(bucket, fe,
+		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
+	// Key is registered but explicitly forbids path-variable mapping.
+	store.tagKeys = map[string]TagKeyInfo{"site": {ID: uuid.New(), ValueControlled: true, AllowPathVar: false}}
+	store.existingValues = map[string]bool{}
+
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	require.NoError(t, err)
+	assert.Empty(t, store.insertedTags)   // no tag written
+	assert.Empty(t, store.pendingUpserts) // no queue side effect
+}
+
+func TestHandleUploadResult_PathVar_NotInserted_NotQueued(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "data/tokyo/p.csv")
+	store := pathVarStore(bucket, fe,
+		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
+	store.insertReturns = false // key already set (e.g. static tag or re-index)
+	store.tagKeys = map[string]TagKeyInfo{"site": {ID: uuid.New(), ValueControlled: true, AllowPathVar: true}}
+	store.existingValues = map[string]bool{}
+
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	require.NoError(t, err)
+	assert.Empty(t, store.pendingUpserts) // idempotent: no re-queue on non-insert
+}
+
+func TestTemplateVarName(t *testing.T) {
+	assert.Equal(t, "site", templateVarName("{site}"))
+	assert.Equal(t, "ts", templateVarName("{ts:yyyy}"))
+	assert.Equal(t, "", templateVarName("site"))
+	assert.Equal(t, "", templateVarName(""))
+	assert.Equal(t, "", templateVarName("{}"))
+	assert.Equal(t, "", templateVarName("{a}{b}")) // multi-placeholder rejected
+	assert.Equal(t, "", templateVarName("{a}x{b}"))
 }

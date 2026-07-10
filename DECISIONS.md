@@ -1003,7 +1003,7 @@ Makefile（`bundle` 目标）、构建/分发流程
   与 `file_tags` 主键 `(file_entry_id,key)`「每 key 至多一值」一致）。`GET /api/v1/files` 与 `GET /files/{id}` 均带。
 - **单文件读取按 org 收窄**：`GetFileEntryByID` 仅按 id 查，故 `GET /files/{id}`、`/download-url`、
   `batch-download-urls` 在 handler 层校验 `entry.org_id == 调用者 org`，跨 org 一律 **404**（不泄露存在性）。
-  纵深防御（v1 单组织尚不可利用，但与 `GetRuleMetadata` org 收窄一致）。
+  纵深防御（v1 单组织尚不可利用，但与规则查询的 org 收窄一致）。
 - **`GET /api/v1/files` 可重复 `tag` 参数**：`?tag=key:value`，多条 **AND**（`file_tags` join +
   `HAVING COUNT(*)=N`）；已并入 `RejectUnknownQuery` allowlist；畸形值（缺 `:` 或空 key/value）返回 **400**
   `INVALID_QUERY_PARAM`（不静默忽略，同 CC-5）。因 `file_tags` 主键 `(file_entry_id,key)`「每 key 至多一值」，
@@ -1013,7 +1013,30 @@ Makefile（`bundle` 目标）、构建/分发流程
   on-conflict `(file_entry_id,key)` 覆盖，重复 `UploadResult` 幂等。声明 `file_type`（名字）经
   `GetFileTypeIDByName` 解析并**优先于 glob**，未解析则回落 glob（既有部署行为不变）。best-effort：
   规则 metadata 缺失/畸形或单条标签写失败仅告警，不使索引失败；超长 key/value（VARCHAR 64/128）
-  预校验跳过，避免每次上传都撞 DB 长度错误刷日志。`GetRuleMetadata` 按 `org_id` 收窄（防跨租户读规则，纵深防御）。
+  预校验跳过，避免每次上传都撞 DB 长度错误刷日志。规则查询按 `org_id` 收窄（防跨租户读规则，纵深防御；
+  MT-2 时名为 `GetRuleMetadata`，MT-3 起并入 `GetRuleTagInfo` 一并返回 `dest_path_template`）。
 - **本刀不含**：路径变量抽取 `path_tag_map` + 待确认队列（MT-3）、词表/手动批量打标 API（MT-4）、
   回溯 worker（MT-5）、webui（MT-6）。tag `source` 优先级（rule_static vs manual/path_var 的覆盖策略）
   随 MT-3/MT-4 再定，本刀只有 rule_static。
+
+### 落地记录（MT-3，路径变量抽取 + 待确认队列）
+
+CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_template` **trollsift 反解** storage path
+抽取 `path_tag_map` 变量，写 `file_tags`（source=`path_var`）。controlplane 新依赖 `pkg/trollsift`（require+replace，
+镜像 agent）。固化以下语义：
+
+- **path_var 不覆盖既有标签**：用 `INSERT ... ON CONFLICT (file_entry_id,key) DO NOTHING RETURNING`——显式
+  `static_tags` 优先于路径推断；`RETURNING` 是否有行即「本次是否新插入」信号。（rule_static 仍用 DO UPDATE 覆盖。）
+- **`allow_path_var` 治理**：已登记 key 若 `allow_path_var=false`（显式禁止路径变量映射），path_var **完全跳过**——
+  既不写 `file_tags` 也无入队副作用。未登记 key 默认允许（写标签，不受词表治理）。
+- **待确认队列治理**：仅当 key 是**受控** `tag_key`（`value_controlled=true`）且值不在 `tag_values` 时，
+  除照写 `file_tags`（原始值）外，upsert `pending_tag_values`（`ON CONFLICT (tag_key_id,extracted_value)` 增 `hit_count`）。
+  非受控 / 未登记 key 只写标签、不入队。`suggested_value` = 大小写近似的既有取值（`lower(value)=lower(?)`；
+  pg_trgm 模糊留待后续）。
+- **幂等**：`pending_tag_values.hit_count` **仅在 file_tag 新插入时** +1（靠上面的 `RETURNING` 信号门控），
+  重复 `UploadResult`（行已存在）不重复入队、不重复打标。
+- **best-effort**：模板解析失败 / storage path 不匹配模板 / 变量缺失 / 各步 DB 错误一律告警，不使索引失败。
+- **path_tag_map 形状**：`{"site":"{site}"}`——值为单个 `{var}` 引用（支持 `{var:fmt}`，取 `var`），
+  非此形状跳过。变量名复用 trollsift 模板（V-3）。
+- 校验：单测（抽取 / 模板不匹配 / 受控未登记入队 + suggested / 已登记不入队 / 非受控不入队 / 非新插入不入队）
+  + 新查询 sqlmock 测 + **真 PG 逐条 SQL 校验**（DO NOTHING 的插入/冲突信号、pending hit_count 1→2、大小写近似）。

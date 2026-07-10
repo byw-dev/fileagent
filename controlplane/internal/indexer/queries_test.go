@@ -375,3 +375,126 @@ func TestMarkFileEntryDeleted_NotFound(t *testing.T) {
 	_, err := MarkFileEntryDeleted(context.Background(), mockDB, uuid.New(), "missing")
 	require.ErrorIs(t, err, sql.ErrNoRows)
 }
+
+// ── MT-2/MT-3 tag queries ───────────────────────────────────────────────────────
+
+func TestUpsertFileTag_Success(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	mock.ExpectExec("INSERT INTO file_tags").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	err := UpsertFileTag(context.Background(), mockDB, UpsertFileTagParams{
+		FileEntryID: uuid.New(), Key: "vendor", Value: "omron", Source: "rule_static"})
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetFileTypeIDByName_FoundAndMissing(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	id := uuid.New()
+	mock.ExpectQuery("SELECT id FROM file_types").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(id))
+	got, err := GetFileTypeIDByName(context.Background(), mockDB, uuid.New(), "pressure")
+	require.NoError(t, err)
+	assert.Equal(t, id, got)
+
+	mock.ExpectQuery("SELECT id FROM file_types").WillReturnError(sql.ErrNoRows)
+	got, err = GetFileTypeIDByName(context.Background(), mockDB, uuid.New(), "nope")
+	require.NoError(t, err)
+	assert.Equal(t, uuid.Nil, got)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetRuleTagInfo_Success(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	mock.ExpectQuery("SELECT metadata, dest_path_template FROM collection_rules").
+		WillReturnRows(sqlmock.NewRows([]string{"metadata", "dest_path_template"}).
+			AddRow([]byte(`{"file_type":"pressure"}`), "data/{site}/{filename}"))
+	info, err := GetRuleTagInfo(context.Background(), mockDB, uuid.New(), uuid.New())
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"file_type":"pressure"}`, string(info.Metadata))
+	assert.Equal(t, "data/{site}/{filename}", info.DestPathTemplate)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetRuleTagInfo_NotFound(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	mock.ExpectQuery("SELECT metadata, dest_path_template FROM collection_rules").
+		WillReturnError(sql.ErrNoRows)
+	_, err := GetRuleTagInfo(context.Background(), mockDB, uuid.New(), uuid.New())
+	require.ErrorIs(t, err, sql.ErrNoRows)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestInsertFileTagIfAbsent_InsertedAndConflict(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	// Fresh insert returns the file_entry_id.
+	fid := uuid.New()
+	mock.ExpectQuery("INSERT INTO file_tags").
+		WillReturnRows(sqlmock.NewRows([]string{"file_entry_id"}).AddRow(fid))
+	inserted, err := InsertFileTagIfAbsent(context.Background(), mockDB, UpsertFileTagParams{
+		FileEntryID: fid, Key: "site", Value: "tokyo", Source: "path_var"})
+	require.NoError(t, err)
+	assert.True(t, inserted)
+
+	// Conflict → DO NOTHING → no row.
+	mock.ExpectQuery("INSERT INTO file_tags").WillReturnError(sql.ErrNoRows)
+	inserted, err = InsertFileTagIfAbsent(context.Background(), mockDB, UpsertFileTagParams{
+		FileEntryID: fid, Key: "site", Value: "tokyo", Source: "path_var"})
+	require.NoError(t, err)
+	assert.False(t, inserted)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetTagKeyByName_FoundAndMissing(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	id := uuid.New()
+	mock.ExpectQuery("SELECT id, value_controlled, allow_path_var FROM tag_keys").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "value_controlled", "allow_path_var"}).AddRow(id, true, true))
+	info, found, err := GetTagKeyByName(context.Background(), mockDB, uuid.New(), "site")
+	require.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, id, info.ID)
+	assert.True(t, info.ValueControlled)
+	assert.True(t, info.AllowPathVar)
+
+	mock.ExpectQuery("SELECT id, value_controlled, allow_path_var FROM tag_keys").WillReturnError(sql.ErrNoRows)
+	_, found, err = GetTagKeyByName(context.Background(), mockDB, uuid.New(), "nope")
+	require.NoError(t, err)
+	assert.False(t, found)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestTagValueExists(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	mock.ExpectQuery("SELECT EXISTS").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	ok, err := TagValueExists(context.Background(), mockDB, uuid.New(), "tokyo")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestFindSimilarTagValue_MatchAndNone(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	mock.ExpectQuery("SELECT value FROM tag_values").
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow("Tokyo"))
+	v, err := FindSimilarTagValue(context.Background(), mockDB, uuid.New(), "tokyo")
+	require.NoError(t, err)
+	assert.Equal(t, "Tokyo", v)
+
+	mock.ExpectQuery("SELECT value FROM tag_values").WillReturnError(sql.ErrNoRows)
+	v, err = FindSimilarTagValue(context.Background(), mockDB, uuid.New(), "osaka")
+	require.NoError(t, err)
+	assert.Equal(t, "", v)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestUpsertPendingTagValue_Success(t *testing.T) {
+	mockDB, mock := newMockDB(t)
+	mock.ExpectExec("INSERT INTO pending_tag_values").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	err := UpsertPendingTagValue(context.Background(), mockDB, UpsertPendingTagValueParams{
+		OrgID: uuid.New(), TagKeyID: uuid.New(), ExtractedValue: "tokyo", Source: "path_var"})
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
