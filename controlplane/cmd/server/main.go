@@ -257,6 +257,7 @@ func main() {
 		AuthDB:             handler.NewQueriesAuthDB(queries),
 		UsersDB:            queries,
 		FileTypesDB:        queries,
+		TagKeysDB:          queries,
 		FilesDB:            queries,
 		MinIOSigner:        &minioPresigner{client: minioPresignClient},
 		BucketsDB:          queries,

@@ -69,6 +69,8 @@ func TestProtectedRoutes_NoToken_Returns401(t *testing.T) {
 		{"GET", "/api/v1/agents"},
 		{"GET", "/api/v1/files"},
 		{"GET", "/api/v1/file-types"},
+		{"GET", "/api/v1/tag-keys"},
+		{"GET", "/api/v1/tag-keys/site/values"},
 		{"GET", "/api/v1/buckets"},
 		{"GET", "/api/v1/event-rules"},
 		{"GET", "/api/v1/upload-logs"},

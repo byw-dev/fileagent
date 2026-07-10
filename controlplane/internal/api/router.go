@@ -25,6 +25,7 @@ type RouterConfig struct {
 	AuthDB        handler.AuthDB // nil → auth routes return 501
 	UsersDB       handler.UsersDB
 	FileTypesDB   handler.FileTypesDB
+	TagKeysDB     handler.TagKeysDB
 	FilesDB       handler.FilesDB
 	MinIOSigner   handler.MinIOPresigner
 	BucketsDB     handler.BucketsDB
@@ -153,6 +154,20 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		fileTypes.POST("", fileTypesH.Create)
 		fileTypes.PUT("/:id", fileTypesH.Update)
 		fileTypes.DELETE("/:id", fileTypesH.Delete)
+	}
+
+	// Tag-key vocabulary + tag values (metadata 6c). Reads open to any
+	// authenticated user; writes are super_admin only.
+	tagKeysH := handler.NewTagKeysHandler(cfg.TagKeysDB, cfg.Logger)
+	tagKeys := v1.Group("/tag-keys")
+	{
+		tagKeys.GET("", tagKeysH.List)
+		tagKeys.POST("", superAdmin, tagKeysH.Create)
+		tagKeys.PATCH("/:key", superAdmin, tagKeysH.Update)
+		tagKeys.DELETE("/:key", superAdmin, tagKeysH.Delete)
+		tagKeys.GET("/:key/values", tagKeysH.ListValues)
+		tagKeys.POST("/:key/values", superAdmin, tagKeysH.CreateValue)
+		tagKeys.DELETE("/:key/values/:vid", superAdmin, tagKeysH.DeleteValue)
 	}
 
 	// Buckets
