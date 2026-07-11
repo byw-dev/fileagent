@@ -181,3 +181,60 @@ func TestDeletePendingTagValue(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), rows)
 }
+
+func TestGetFileTagValue(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectQuery("SELECT value FROM file_tags").
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow("tokyo"))
+	v, err := q.GetFileTagValue(context.Background(), uuid.New(), "site")
+	require.NoError(t, err)
+	assert.Equal(t, "tokyo", v)
+}
+
+func TestSetFileTag(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectExec("INSERT INTO file_tags").WillReturnResult(sqlmock.NewResult(0, 1))
+	err := q.SetFileTag(context.Background(), uuid.New(), "site", "tokyo", "manual")
+	require.NoError(t, err)
+}
+
+func TestDeleteFileTag(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectExec("DELETE FROM file_tags").WillReturnResult(sqlmock.NewResult(0, 1))
+	rows, err := q.DeleteFileTag(context.Background(), uuid.New(), "site")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), rows)
+}
+
+func TestTagValueExists_Query(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectQuery("SELECT EXISTS").WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+	ok, err := q.TagValueExists(context.Background(), uuid.New(), "tokyo")
+	require.NoError(t, err)
+	assert.True(t, ok)
+}
+
+func TestFindSimilarTagValue_Query(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectQuery("SELECT value FROM tag_values").
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow("Tokyo"))
+	v, err := q.FindSimilarTagValue(context.Background(), uuid.New(), "tokyo")
+	require.NoError(t, err)
+	assert.Equal(t, "Tokyo", v)
+}
+
+func TestUpsertPendingTagValueManual(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectExec("INSERT INTO pending_tag_values").WillReturnResult(sqlmock.NewResult(0, 1))
+	err := q.UpsertPendingTagValueManual(context.Background(), UpsertPendingTagValueManualParams{
+		OrgID: uuid.New(), TagKeyID: uuid.New(), ExtractedValue: "tokyo", Source: "manual"})
+	require.NoError(t, err)
+}
+
+func TestCreateTagAudit(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectExec("INSERT INTO tag_audit").WillReturnResult(sqlmock.NewResult(0, 1))
+	err := q.CreateTagAudit(context.Background(), CreateTagAuditParams{
+		OrgID: uuid.New(), Key: "site", Action: "set", Source: "manual"})
+	require.NoError(t, err)
+}

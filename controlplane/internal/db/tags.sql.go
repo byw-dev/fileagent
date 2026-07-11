@@ -13,6 +13,36 @@ import (
 	"github.com/google/uuid"
 )
 
+const createTagAudit = `-- name: CreateTagAudit :exec
+INSERT INTO tag_audit (org_id, file_entry_id, key, old_value, new_value, action, actor_user_id, source)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+`
+
+type CreateTagAuditParams struct {
+	OrgID       uuid.UUID      `db:"org_id" json:"org_id"`
+	FileEntryID uuid.NullUUID  `db:"file_entry_id" json:"file_entry_id"`
+	Key         string         `db:"key" json:"key"`
+	OldValue    sql.NullString `db:"old_value" json:"old_value"`
+	NewValue    sql.NullString `db:"new_value" json:"new_value"`
+	Action      string         `db:"action" json:"action"`
+	ActorUserID uuid.NullUUID  `db:"actor_user_id" json:"actor_user_id"`
+	Source      string         `db:"source" json:"source"`
+}
+
+func (q *Queries) CreateTagAudit(ctx context.Context, arg CreateTagAuditParams) error {
+	_, err := q.db.ExecContext(ctx, createTagAudit,
+		arg.OrgID,
+		arg.FileEntryID,
+		arg.Key,
+		arg.OldValue,
+		arg.NewValue,
+		arg.Action,
+		arg.ActorUserID,
+		arg.Source,
+	)
+	return err
+}
+
 const createTagKey = `-- name: CreateTagKey :one
 INSERT INTO tag_keys (org_id, key, label, value_controlled, required_at_collection, allow_path_var)
 VALUES ($1, $2, $3, $4, $5, $6)
@@ -87,6 +117,18 @@ func (q *Queries) CreateTagValueIfAbsent(ctx context.Context, iD uuid.UUID, valu
 	return result.RowsAffected()
 }
 
+const deleteFileTag = `-- name: DeleteFileTag :execrows
+DELETE FROM file_tags WHERE file_entry_id = $1 AND key = $2
+`
+
+func (q *Queries) DeleteFileTag(ctx context.Context, fileEntryID uuid.UUID, key string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteFileTag, fileEntryID, key)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const deletePendingTagValue = `-- name: DeletePendingTagValue :execrows
 DELETE FROM pending_tag_values WHERE id = $1 AND org_id = $2
 `
@@ -121,6 +163,28 @@ func (q *Queries) DeleteTagValue(ctx context.Context, iD uuid.UUID, tagKeyID uui
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const findSimilarTagValue = `-- name: FindSimilarTagValue :one
+SELECT value FROM tag_values WHERE tag_key_id = $1 AND lower(value) = lower($2) LIMIT 1
+`
+
+func (q *Queries) FindSimilarTagValue(ctx context.Context, tagKeyID uuid.UUID, lower string) (string, error) {
+	row := q.db.QueryRowContext(ctx, findSimilarTagValue, tagKeyID, lower)
+	var value string
+	err := row.Scan(&value)
+	return value, err
+}
+
+const getFileTagValue = `-- name: GetFileTagValue :one
+SELECT value FROM file_tags WHERE file_entry_id = $1 AND key = $2 LIMIT 1
+`
+
+func (q *Queries) GetFileTagValue(ctx context.Context, fileEntryID uuid.UUID, key string) (string, error) {
+	row := q.db.QueryRowContext(ctx, getFileTagValue, fileEntryID, key)
+	var value string
+	err := row.Scan(&value)
+	return value, err
 }
 
 const getPendingTagValue = `-- name: GetPendingTagValue :one
@@ -308,6 +372,33 @@ func (q *Queries) ListTagValues(ctx context.Context, tagKeyID uuid.UUID) ([]*Tag
 	return items, nil
 }
 
+const setFileTag = `-- name: SetFileTag :exec
+INSERT INTO file_tags (file_entry_id, key, value, source)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (file_entry_id, key) DO UPDATE SET value = EXCLUDED.value, source = EXCLUDED.source
+`
+
+func (q *Queries) SetFileTag(ctx context.Context, fileEntryID uuid.UUID, key string, value string, source string) error {
+	_, err := q.db.ExecContext(ctx, setFileTag,
+		fileEntryID,
+		key,
+		value,
+		source,
+	)
+	return err
+}
+
+const tagValueExists = `-- name: TagValueExists :one
+SELECT EXISTS (SELECT 1 FROM tag_values WHERE tag_key_id = $1 AND value = $2)
+`
+
+func (q *Queries) TagValueExists(ctx context.Context, tagKeyID uuid.UUID, value string) (bool, error) {
+	row := q.db.QueryRowContext(ctx, tagValueExists, tagKeyID, value)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const updateTagKey = `-- name: UpdateTagKey :one
 UPDATE tag_keys
 SET label = $3,
@@ -350,4 +441,29 @@ func (q *Queries) UpdateTagKey(ctx context.Context, arg UpdateTagKeyParams) (*Ta
 		&i.CreatedAt,
 	)
 	return &i, err
+}
+
+const upsertPendingTagValueManual = `-- name: UpsertPendingTagValueManual :exec
+INSERT INTO pending_tag_values (org_id, tag_key_id, extracted_value, source, suggested_value)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (tag_key_id, extracted_value) DO UPDATE SET hit_count = pending_tag_values.hit_count + 1
+`
+
+type UpsertPendingTagValueManualParams struct {
+	OrgID          uuid.UUID      `db:"org_id" json:"org_id"`
+	TagKeyID       uuid.UUID      `db:"tag_key_id" json:"tag_key_id"`
+	ExtractedValue string         `db:"extracted_value" json:"extracted_value"`
+	Source         string         `db:"source" json:"source"`
+	SuggestedValue sql.NullString `db:"suggested_value" json:"suggested_value"`
+}
+
+func (q *Queries) UpsertPendingTagValueManual(ctx context.Context, arg UpsertPendingTagValueManualParams) error {
+	_, err := q.db.ExecContext(ctx, upsertPendingTagValueManual,
+		arg.OrgID,
+		arg.TagKeyID,
+		arg.ExtractedValue,
+		arg.Source,
+		arg.SuggestedValue,
+	)
+	return err
 }
