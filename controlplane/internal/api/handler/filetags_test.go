@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
@@ -25,6 +26,7 @@ type mockFileTagsDB struct {
 	similar     string
 
 	setCalls     []string
+	setValues    map[string]string
 	deleteCalls  []string
 	auditCalls   []db.CreateTagAuditParams
 	pendingCalls []db.UpsertPendingTagValueManualParams
@@ -45,8 +47,12 @@ func (m *mockFileTagsDB) GetFileTagValue(_ context.Context, _ uuid.UUID, key str
 	}
 	return "", sql.ErrNoRows
 }
-func (m *mockFileTagsDB) SetFileTag(_ context.Context, _ uuid.UUID, key, _ string, _ string) error {
+func (m *mockFileTagsDB) SetFileTag(_ context.Context, _ uuid.UUID, key, value string, _ string) error {
 	m.setCalls = append(m.setCalls, key)
+	if m.setValues == nil {
+		m.setValues = map[string]string{}
+	}
+	m.setValues[key] = value
 	return nil
 }
 func (m *mockFileTagsDB) DeleteFileTag(_ context.Context, _ uuid.UUID, key string) (int64, error) {
@@ -136,6 +142,35 @@ func TestFileTags_Set_UnregisteredValue_Queued(t *testing.T) {
 	assert.Equal(t, "manual", mockDB.pendingCalls[0].Source)
 }
 
+func TestFileTags_Set_TrimsValue(t *testing.T) {
+	// A padded value is trimmed before persisting/matching, matching the
+	// controlled-vocabulary path (CreateValue trims): the registered "tokyo"
+	// must be recognized and not queued as unregistered.
+	entry := fileInOrg()
+	mockDB := &mockFileTagsDB{
+		entry:       entry,
+		tagKeys:     map[string]*db.TagKey{"site": controlledKey()},
+		valueExists: map[string]bool{"tokyo": true},
+	}
+	h := handler.NewFileTagsHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testFileTagsRouter(h, "super_admin").ServeHTTP(w, putTags(entry.ID.String(), `{"tags":{"site":"  tokyo  "}}`))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "tokyo", mockDB.setValues["site"])
+	assert.Empty(t, mockDB.pendingCalls) // recognized as registered → not queued
+}
+
+func TestFileTags_Set_ValueTooLong_400(t *testing.T) {
+	entry := fileInOrg()
+	mockDB := &mockFileTagsDB{entry: entry, tagKeys: map[string]*db.TagKey{"site": controlledKey()}}
+	h := handler.NewFileTagsHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	long := strings.Repeat("x", 129) // 129 runes > maxManualTagValueLen (128)
+	testFileTagsRouter(h, "super_admin").ServeHTTP(w, putTags(entry.ID.String(), `{"tags":{"site":"`+long+`"}}`))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Empty(t, mockDB.setCalls) // rejected up front, nothing applied
+}
+
 func TestFileTags_Clear_Success(t *testing.T) {
 	entry := fileInOrg()
 	mockDB := &mockFileTagsDB{
@@ -150,6 +185,19 @@ func TestFileTags_Clear_Success(t *testing.T) {
 	require.Len(t, mockDB.auditCalls, 1)
 	assert.Equal(t, "clear", mockDB.auditCalls[0].Action)
 	assert.Equal(t, "tokyo", mockDB.auditCalls[0].OldValue.String)
+}
+
+func TestFileTags_Response_EmptyTagsIsObject(t *testing.T) {
+	// ListFileTagsByFileIDs omits files without tags, so tagsByFile[id] is nil.
+	// The response must still carry "tags":{} (a stable object), never null.
+	entry := fileInOrg()
+	mockDB := &mockFileTagsDB{entry: entry, oldValues: map[string]string{"site": "tokyo"}}
+	h := handler.NewFileTagsHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testFileTagsRouter(h, "super_admin").ServeHTTP(w, putTags(entry.ID.String(), `{"tags":{"site":null}}`))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"tags":{}`)
+	assert.NotContains(t, w.Body.String(), `"tags":null`)
 }
 
 func TestFileTags_Clear_Absent_NoAudit(t *testing.T) {

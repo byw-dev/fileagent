@@ -106,8 +106,12 @@ func (h *FileTagsHandler) SetTags(c *gin.Context) {
 
 	// Validate up front: every set-key must be a registered tag key with an
 	// in-range value; clears are unconstrained (a tag with an unregistered key
-	// may exist from path extraction and must remain clearable).
+	// may exist from path extraction and must remain clearable). Set values are
+	// trimmed here so what we persist/match matches the controlled vocabulary
+	// path (TagKeysHandler.CreateValue also trims), avoiding drift and false
+	// "unregistered" pending rows.
 	setKeys := make(map[string]*db.TagKey)
+	setValues := make(map[string]string)
 	for key, val := range req.Tags {
 		if !isValidTagKey(key) {
 			middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "invalid tag key: "+key, nil)
@@ -116,8 +120,8 @@ func (h *FileTagsHandler) SetTags(c *gin.Context) {
 		if val == nil {
 			continue // clear
 		}
-		value := *val
-		if strings.TrimSpace(value) == "" {
+		value := strings.TrimSpace(*val)
+		if value == "" {
 			middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "value must not be empty for key: "+key, nil)
 			return
 		}
@@ -136,6 +140,7 @@ func (h *FileTagsHandler) SetTags(c *gin.Context) {
 			return
 		}
 		setKeys[key] = tagKey
+		setValues[key] = value
 	}
 
 	actor := actorNullUUID(c)
@@ -152,7 +157,7 @@ func (h *FileTagsHandler) SetTags(c *gin.Context) {
 			}
 			continue
 		}
-		if err := h.setTag(c, orgID, entry.ID, setKeys[key], key, *val, actor); err != nil {
+		if err := h.setTag(c, orgID, entry.ID, setKeys[key], key, setValues[key], actor); err != nil {
 			middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to set tag", nil)
 			return
 		}
@@ -165,12 +170,18 @@ func (h *FileTagsHandler) SetTags(c *gin.Context) {
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to load tags", nil)
 		return
 	}
+	tags := tagsByFile[entry.ID]
+	if tags == nil {
+		// Keep the response shape stable ({..., "tags": {}}) when the file has no
+		// tags left; ListFileTagsByFileIDs omits files without tags.
+		tags = map[string]string{}
+	}
 	sort.Strings(setDone)
 	sort.Strings(clearedDone)
 	c.JSON(http.StatusOK, gin.H{
 		"set":     setDone,
 		"cleared": clearedDone,
-		"tags":    tagsByFile[entry.ID],
+		"tags":    tags,
 	})
 }
 

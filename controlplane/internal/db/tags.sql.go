@@ -446,7 +446,9 @@ func (q *Queries) UpdateTagKey(ctx context.Context, arg UpdateTagKeyParams) (*Ta
 const upsertPendingTagValueManual = `-- name: UpsertPendingTagValueManual :exec
 INSERT INTO pending_tag_values (org_id, tag_key_id, extracted_value, source, suggested_value)
 VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (tag_key_id, extracted_value) DO UPDATE SET hit_count = pending_tag_values.hit_count + 1
+ON CONFLICT (tag_key_id, extracted_value) DO UPDATE SET
+    hit_count = pending_tag_values.hit_count + 1,
+    suggested_value = COALESCE(pending_tag_values.suggested_value, EXCLUDED.suggested_value)
 `
 
 type UpsertPendingTagValueManualParams struct {
@@ -457,6 +459,9 @@ type UpsertPendingTagValueManualParams struct {
 	SuggestedValue sql.NullString `db:"suggested_value" json:"suggested_value"`
 }
 
+// Bump hit_count on repeat sightings, and backfill suggested_value if a
+// case-insensitive match was found this time but the existing queue row had none
+// (e.g. the matching tag_value was created after the row was first queued).
 func (q *Queries) UpsertPendingTagValueManual(ctx context.Context, arg UpsertPendingTagValueManualParams) error {
 	_, err := q.db.ExecContext(ctx, upsertPendingTagValueManual,
 		arg.OrgID,

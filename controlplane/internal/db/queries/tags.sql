@@ -92,9 +92,14 @@ SELECT EXISTS (SELECT 1 FROM tag_values WHERE tag_key_id = $1 AND value = $2);
 SELECT value FROM tag_values WHERE tag_key_id = $1 AND lower(value) = lower($2) LIMIT 1;
 
 -- name: UpsertPendingTagValueManual :exec
+-- Bump hit_count on repeat sightings, and backfill suggested_value if a
+-- case-insensitive match was found this time but the existing queue row had none
+-- (e.g. the matching tag_value was created after the row was first queued).
 INSERT INTO pending_tag_values (org_id, tag_key_id, extracted_value, source, suggested_value)
 VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (tag_key_id, extracted_value) DO UPDATE SET hit_count = pending_tag_values.hit_count + 1;
+ON CONFLICT (tag_key_id, extracted_value) DO UPDATE SET
+    hit_count = pending_tag_values.hit_count + 1,
+    suggested_value = COALESCE(pending_tag_values.suggested_value, EXCLUDED.suggested_value);
 
 -- name: CreateTagAudit :exec
 INSERT INTO tag_audit (org_id, file_entry_id, key, old_value, new_value, action, actor_user_id, source)
