@@ -7,6 +7,8 @@ package db
 
 import (
 	"context"
+	"database/sql"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -69,6 +71,34 @@ func (q *Queries) CreateTagValue(ctx context.Context, tagKeyID uuid.UUID, value 
 	return &i, err
 }
 
+const createTagValueIfAbsent = `-- name: CreateTagValueIfAbsent :execrows
+INSERT INTO tag_values (tag_key_id, value)
+SELECT k.id, $2 FROM tag_keys k WHERE k.id = $1 AND k.org_id = $3
+ON CONFLICT (tag_key_id, value) DO NOTHING
+`
+
+// Inserts only when the tag key belongs to the org, so a corrupted pending row
+// (tag_key_id pointing at another org's key) cannot promote a value cross-tenant.
+func (q *Queries) CreateTagValueIfAbsent(ctx context.Context, iD uuid.UUID, value string, orgID uuid.UUID) (int64, error) {
+	result, err := q.db.ExecContext(ctx, createTagValueIfAbsent, iD, value, orgID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const deletePendingTagValue = `-- name: DeletePendingTagValue :execrows
+DELETE FROM pending_tag_values WHERE id = $1 AND org_id = $2
+`
+
+func (q *Queries) DeletePendingTagValue(ctx context.Context, iD uuid.UUID, orgID uuid.UUID) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deletePendingTagValue, iD, orgID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const deleteTagKey = `-- name: DeleteTagKey :execrows
 DELETE FROM tag_keys WHERE org_id = $1 AND key = $2
 `
@@ -91,6 +121,32 @@ func (q *Queries) DeleteTagValue(ctx context.Context, iD uuid.UUID, tagKeyID uui
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+const getPendingTagValue = `-- name: GetPendingTagValue :one
+SELECT id, org_id, tag_key_id, extracted_value, source, source_rule_id,
+       hit_count, suggested_value, status, first_seen_at
+FROM pending_tag_values
+WHERE id = $1 AND org_id = $2
+LIMIT 1
+`
+
+func (q *Queries) GetPendingTagValue(ctx context.Context, iD uuid.UUID, orgID uuid.UUID) (*PendingTagValue, error) {
+	row := q.db.QueryRowContext(ctx, getPendingTagValue, iD, orgID)
+	var i PendingTagValue
+	err := row.Scan(
+		&i.ID,
+		&i.OrgID,
+		&i.TagKeyID,
+		&i.ExtractedValue,
+		&i.Source,
+		&i.SourceRuleID,
+		&i.HitCount,
+		&i.SuggestedValue,
+		&i.Status,
+		&i.FirstSeenAt,
+	)
+	return &i, err
 }
 
 const getTagKey = `-- name: GetTagKey :one
@@ -116,6 +172,64 @@ func (q *Queries) GetTagKey(ctx context.Context, orgID uuid.UUID, key string) (*
 		&i.CreatedAt,
 	)
 	return &i, err
+}
+
+const listPendingTagValues = `-- name: ListPendingTagValues :many
+SELECT p.id, p.tag_key_id, COALESCE(k.key, '') AS key, p.extracted_value, p.source,
+       p.source_rule_id, p.hit_count, p.suggested_value, p.first_seen_at
+FROM pending_tag_values p
+LEFT JOIN tag_keys k ON k.id = p.tag_key_id AND k.org_id = p.org_id
+WHERE p.org_id = $1 AND p.status = 'pending'
+ORDER BY p.hit_count DESC, p.first_seen_at ASC
+`
+
+type ListPendingTagValuesRow struct {
+	ID             uuid.UUID      `db:"id" json:"id"`
+	TagKeyID       uuid.UUID      `db:"tag_key_id" json:"tag_key_id"`
+	Key            string         `db:"key" json:"key"`
+	ExtractedValue string         `db:"extracted_value" json:"extracted_value"`
+	Source         string         `db:"source" json:"source"`
+	SourceRuleID   uuid.NullUUID  `db:"source_rule_id" json:"source_rule_id"`
+	HitCount       int32          `db:"hit_count" json:"hit_count"`
+	SuggestedValue sql.NullString `db:"suggested_value" json:"suggested_value"`
+	FirstSeenAt    time.Time      `db:"first_seen_at" json:"first_seen_at"`
+}
+
+// LEFT JOIN + COALESCE so a corrupted/org-mismatched pending row (tag_key_id not
+// matching the org — not prevented by any composite FK) still surfaces for
+// operational cleanup with an empty key name, rather than being silently hidden.
+// The org-scoped ON clause keeps a cross-tenant key name from leaking.
+func (q *Queries) ListPendingTagValues(ctx context.Context, orgID uuid.UUID) ([]*ListPendingTagValuesRow, error) {
+	rows, err := q.db.QueryContext(ctx, listPendingTagValues, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []*ListPendingTagValuesRow{}
+	for rows.Next() {
+		var i ListPendingTagValuesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TagKeyID,
+			&i.Key,
+			&i.ExtractedValue,
+			&i.Source,
+			&i.SourceRuleID,
+			&i.HitCount,
+			&i.SuggestedValue,
+			&i.FirstSeenAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, &i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listTagKeys = `-- name: ListTagKeys :many

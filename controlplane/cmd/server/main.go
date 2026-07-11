@@ -258,6 +258,7 @@ func main() {
 		UsersDB:            queries,
 		FileTypesDB:        queries,
 		TagKeysDB:          queries,
+		PendingTagsDB:      queries,
 		FilesDB:            queries,
 		MinIOSigner:        &minioPresigner{client: minioPresignClient},
 		BucketsDB:          queries,

@@ -26,6 +26,7 @@ type RouterConfig struct {
 	UsersDB       handler.UsersDB
 	FileTypesDB   handler.FileTypesDB
 	TagKeysDB     handler.TagKeysDB
+	PendingTagsDB handler.PendingTagValuesDB
 	FilesDB       handler.FilesDB
 	MinIOSigner   handler.MinIOPresigner
 	BucketsDB     handler.BucketsDB
@@ -168,6 +169,17 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		tagKeys.GET("/:key/values", tagKeysH.ListValues)
 		tagKeys.POST("/:key/values", superAdmin, tagKeysH.CreateValue)
 		tagKeys.DELETE("/:key/values/:vid", superAdmin, tagKeysH.DeleteValue)
+	}
+
+	// Pending tag-value review queue (metadata 6c). List open to any
+	// authenticated user; approve/reject are super_admin only. (The `merge`
+	// action lands with the retro-tagging worker in MT-5.)
+	pendingH := handler.NewPendingTagValuesHandler(cfg.PendingTagsDB, cfg.Logger)
+	pending := v1.Group("/pending-tag-values")
+	{
+		pending.GET("", pendingH.List)
+		pending.POST("/:id/approve", superAdmin, pendingH.Approve)
+		pending.POST("/:id/reject", superAdmin, pendingH.Reject)
 	}
 
 	// Buckets
