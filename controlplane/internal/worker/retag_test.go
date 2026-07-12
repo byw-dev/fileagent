@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -258,6 +259,17 @@ func TestRetag_BatchTag_SetAndClear(t *testing.T) {
 	assert.True(t, m.doneCalled)
 	assert.Equal(t, int32(5), m.doneAffected) // 3 set + 2 cleared
 	assert.False(t, m.failCalled)
+}
+
+func TestRetag_BatchTag_AffectedCountClampedToInt32(t *testing.T) {
+	// A count beyond int32 range is capped, never overflowed into a negative.
+	org := uuid.New()
+	spec := retag.BatchTagSpec{Tags: map[string]*string{"vendor": strptr("omron")}}
+	m := &mockRetagDB{queue: []*db.RetagJob{batchJob(t, org, spec)}, batchSetAff: int64(math.MaxInt32) + 100}
+	w := NewRetagWorker(m, zap.NewNop())
+	w.DrainOnce(context.Background())
+	assert.True(t, m.doneCalled)
+	assert.Equal(t, int32(math.MaxInt32), m.doneAffected)
 }
 
 func TestRetag_BatchTag_ApplyError_MarksFailed(t *testing.T) {

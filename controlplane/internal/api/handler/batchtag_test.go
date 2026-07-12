@@ -176,6 +176,16 @@ func TestBatchTag_BadFilterTagPredicate_400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+func TestBatchTag_InvalidStatus_400(t *testing.T) {
+	// An unknown status is rejected up front rather than failing async post-202.
+	mockDB := &mockBatchTagDB{tagKeys: map[string]*db.TagKey{"vendor": {ID: uuid.New(), Key: "vendor"}}}
+	h := handler.NewBatchTagHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testBatchTagRouter(h, "super_admin").ServeHTTP(w, batchTag(`{"filter":{"status":"bogus"},"tags":{"vendor":"omron"}}`))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Empty(t, mockDB.enqueuedKind)
+}
+
 func TestBatchTag_Forbidden_NonSuperAdmin(t *testing.T) {
 	h := handler.NewBatchTagHandler(&mockBatchTagDB{}, newTestLogger())
 	w := httptest.NewRecorder()

@@ -158,6 +158,12 @@ func (h *BatchTagHandler) Submit(c *gin.Context) {
 // UUID fields must parse when present; tag predicates reuse the GET /files parser.
 func (h *BatchTagHandler) parseFilter(c *gin.Context, f batchTagFilterReq) (retag.BatchTagFilter, bool) {
 	out := retag.BatchTagFilter{Status: f.Status}
+	// Reject an unknown status up front: it would otherwise enqueue a job that
+	// only fails asynchronously when cast to the file_status enum in SQL.
+	if f.Status != "" && !db.FileStatus(f.Status).Valid() {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "invalid status", nil)
+		return out, false
+	}
 	for _, field := range []struct {
 		name, val string
 		dst       *string

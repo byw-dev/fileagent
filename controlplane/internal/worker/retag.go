@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -120,7 +121,7 @@ func (w *RetagWorker) runMerge(ctx context.Context, job *db.RetagJob) {
 				zap.String("job_id", job.ID.String()), zap.Error(err))
 		}
 	}
-	if err := w.db.MarkRetagJobDone(ctx, job.ID, int32(affected)); err != nil {
+	if err := w.db.MarkRetagJobDone(ctx, job.ID, clampInt32(affected)); err != nil {
 		// The merge already applied (and is idempotent). Leaving the job in
 		// `running` would strand it — ClaimNextRetagJob only picks `pending`, so it
 		// is never retried, and /retag-jobs polling hangs. Record the bookkeeping
@@ -189,7 +190,7 @@ func (w *RetagWorker) runBatchTag(ctx context.Context, job *db.RetagJob) {
 		}
 		total += n
 	}
-	if err := w.db.MarkRetagJobDone(ctx, job.ID, int32(total)); err != nil {
+	if err := w.db.MarkRetagJobDone(ctx, job.ID, clampInt32(total)); err != nil {
 		w.fail(ctx, job, fmt.Errorf("batch applied but marking job done failed: %w", err))
 		return
 	}
@@ -230,6 +231,16 @@ func batchFilter(orgID uuid.UUID, f retag.BatchTagFilter) (db.BatchTagFilter, er
 		out.Tags = append(out.Tags, db.FileTagFilter{Key: t.Key, Value: t.Value})
 	}
 	return out, nil
+}
+
+// clampInt32 caps a non-negative row count to MaxInt32 before it is stored in the
+// int-typed retag_jobs.affected_count, so an extreme batch cannot overflow into a
+// negative/incorrect count. Realistic batches never approach this bound.
+func clampInt32(n int64) int32 {
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int32(n)
 }
 
 // fail records cause on the job. It is a no-op on shutdown so a cancelled context
