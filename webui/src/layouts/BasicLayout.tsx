@@ -62,6 +62,7 @@ const menuData: MenuDataItem[] = [
     icon: <SettingOutlined />,
     children: [
       { path: '/settings/users', name: '用户管理' },
+      { path: '/settings/tag-keys', name: '标签词表' },
       { path: '/settings/profile', name: '个人信息' },
     ],
   },
