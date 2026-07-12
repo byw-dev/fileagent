@@ -1,4 +1,5 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import useSWR from 'swr'
 import { App, Button, Drawer, Form, Input, Modal, Space, Switch, Tag, Typography } from 'antd'
 import { PlusOutlined, TagsOutlined } from '@ant-design/icons'
 import { ProTable } from '@ant-design/pro-components'
@@ -247,7 +248,9 @@ function TagKeysPage() {
   )
 }
 
-/** Drawer that lists and edits a key's controlled values. */
+/** Drawer that lists and edits a key's controlled values. The body is a separate
+ * component keyed by the tag key, so opening a different key remounts it with a
+ * clean slate — no stale values flash and no state is set during render. */
 function ValuesDrawer({
   tagKey,
   canWrite,
@@ -257,42 +260,38 @@ function ValuesDrawer({
   canWrite: boolean
   onClose: () => void
 }) {
+  return (
+    <Drawer title={tagKey ? `取值：${tagKey.key}` : '取值'} open={tagKey !== null} onClose={onClose} width={420}>
+      {tagKey && <ValuesPanel key={tagKey.key} keyName={tagKey.key} canWrite={canWrite} />}
+    </Drawer>
+  )
+}
+
+/** The values list + editor for a single tag key. Mounted fresh per key. Data is
+ * fetched via SWR (the project HTTP pattern) so there is no manual state sync. */
+function ValuesPanel({ keyName, canWrite }: { keyName: string; canWrite: boolean }) {
   const { message } = App.useApp()
-  const [values, setValues] = useState<TagValue[]>([])
-  const [loading, setLoading] = useState(false)
+  const {
+    data: values = [],
+    isLoading: loading,
+    mutate,
+    error,
+  } = useSWR(['tag-values', keyName], () => listTagValues(keyName))
   const [newValue, setNewValue] = useState('')
   const [adding, setAdding] = useState(false)
-  const [loadedKey, setLoadedKey] = useState<string | null>(null)
 
-  const load = async (key: string) => {
-    setLoading(true)
-    try {
-      setValues(await listTagValues(key))
-    } catch {
-      message.error('加载取值失败')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  // Load whenever the drawer opens for a new key; reset when it closes.
-  const open = tagKey !== null
-  if (open && tagKey && loadedKey !== tagKey.key) {
-    setLoadedKey(tagKey.key)
-    void load(tagKey.key)
-  } else if (!open && loadedKey !== null) {
-    setLoadedKey(null)
-  }
+  useEffect(() => {
+    if (error) message.error('加载取值失败')
+  }, [error, message])
 
   const add = async () => {
-    if (!tagKey) return
     const v = newValue.trim()
     if (!v) return
     setAdding(true)
     try {
-      await createTagValue(tagKey.key, v)
+      await createTagValue(keyName, v)
       setNewValue('')
-      await load(tagKey.key)
+      await mutate()
     } catch (err) {
       const status = (err as { response?: { status?: number } }).response?.status
       message.error(status === 409 ? '取值已存在' : '添加失败')
@@ -302,17 +301,16 @@ function ValuesDrawer({
   }
 
   const remove = async (val: TagValue) => {
-    if (!tagKey) return
     try {
-      await deleteTagValue(tagKey.key, val.id)
-      await load(tagKey.key)
+      await deleteTagValue(keyName, val.id)
+      await mutate()
     } catch {
       message.error('删除失败')
     }
   }
 
   return (
-    <Drawer title={tagKey ? `取值：${tagKey.key}` : '取值'} open={open} onClose={onClose} width={420}>
+    <>
       {canWrite && (
         <Space.Compact style={{ width: '100%', marginBottom: 16 }}>
           <Input
@@ -344,7 +342,7 @@ function ValuesDrawer({
           ))}
         </Space>
       )}
-    </Drawer>
+    </>
   )
 }
 
