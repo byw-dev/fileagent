@@ -75,6 +75,7 @@ func TestProtectedRoutes_NoToken_Returns401(t *testing.T) {
 		{"POST", "/api/v1/pending-tag-values/00000000-0000-0000-0000-000000000000/merge"},
 		{"GET", "/api/v1/retag-jobs/00000000-0000-0000-0000-000000000000"},
 		{"PUT", "/api/v1/files/00000000-0000-0000-0000-000000000000/tags"},
+		{"POST", "/api/v1/files/batch-tag"},
 		{"GET", "/api/v1/buckets"},
 		{"GET", "/api/v1/event-rules"},
 		{"GET", "/api/v1/upload-logs"},

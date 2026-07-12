@@ -274,7 +274,14 @@ const maxTagFilters = 20
 // for the same key can never both match, so they are rejected with a 400 rather
 // than silently returning zero results.
 func parseTagFilters(c *gin.Context) ([]db.FileTagFilter, bool) {
-	raw := c.QueryArray("tag")
+	return parseTagPredicates(c, c.QueryArray("tag"))
+}
+
+// parseTagPredicates parses key:value tag predicates (from a query array or a
+// request body) into AND-combined filters, applying the same validation as
+// parseTagFilters (format, distinct-key, count bound). It is shared by GET /files
+// and the batch-tag selection filter.
+func parseTagPredicates(c *gin.Context, raw []string) ([]db.FileTagFilter, bool) {
 	if len(raw) == 0 {
 		return nil, true
 	}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +30,12 @@ type mockRetagDB struct {
 
 	deletedPending []uuid.UUID
 	deleteErr      error
+
+	batchSetParams   []db.BatchSetFileTagParams
+	batchClearParams []db.BatchClearFileTagParams
+	batchSetAff      int64
+	batchClearAff    int64
+	batchErr         error
 
 	claimErr error
 
@@ -70,6 +77,18 @@ func (m *mockRetagDB) DeletePendingTagValue(_ context.Context, id uuid.UUID, _ u
 	defer m.mu.Unlock()
 	m.deletedPending = append(m.deletedPending, id)
 	return 1, m.deleteErr
+}
+func (m *mockRetagDB) BatchSetFileTag(_ context.Context, p db.BatchSetFileTagParams) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.batchSetParams = append(m.batchSetParams, p)
+	return m.batchSetAff, m.batchErr
+}
+func (m *mockRetagDB) BatchClearFileTag(_ context.Context, p db.BatchClearFileTagParams) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.batchClearParams = append(m.batchClearParams, p)
+	return m.batchClearAff, m.batchErr
 }
 func (m *mockRetagDB) MarkRetagJobDone(_ context.Context, id uuid.UUID, affectedCount int32) error {
 	m.mu.Lock()
@@ -178,7 +197,7 @@ func TestRetag_Merge_BadSpec_MarksFailed(t *testing.T) {
 }
 
 func TestRetag_UnknownKind_MarksFailed(t *testing.T) {
-	job := &db.RetagJob{ID: uuid.New(), OrgID: uuid.New(), Kind: "batch_tag", Spec: json.RawMessage(`{}`)}
+	job := &db.RetagJob{ID: uuid.New(), OrgID: uuid.New(), Kind: "rule_retag", Spec: json.RawMessage(`{}`)}
 	m := &mockRetagDB{queue: []*db.RetagJob{job}}
 	w := NewRetagWorker(m, zap.NewNop())
 	w.DrainOnce(context.Background())
@@ -208,6 +227,99 @@ func TestRetag_Merge_DeletePendingFails_StillDone(t *testing.T) {
 	w.DrainOnce(context.Background())
 	assert.True(t, m.doneCalled)
 	assert.False(t, m.failCalled)
+}
+
+func batchJob(t *testing.T, orgID uuid.UUID, spec retag.BatchTagSpec) *db.RetagJob {
+	t.Helper()
+	raw, err := json.Marshal(spec)
+	require.NoError(t, err)
+	return &db.RetagJob{ID: uuid.New(), OrgID: orgID, Kind: retag.KindBatchTag, Spec: raw, Status: "running"}
+}
+
+func strptr(s string) *string { return &s }
+
+func TestRetag_BatchTag_SetAndClear(t *testing.T) {
+	org := uuid.New()
+	spec := retag.BatchTagSpec{
+		Filter: retag.BatchTagFilter{Status: "completed", Tags: []retag.TagPredicate{{Key: "site", Value: "tokyo"}}},
+		Tags:   map[string]*string{"vendor": strptr("omron"), "obsolete": nil},
+	}
+	m := &mockRetagDB{queue: []*db.RetagJob{batchJob(t, org, spec)}, batchSetAff: 3, batchClearAff: 2}
+	w := NewRetagWorker(m, zap.NewNop())
+	w.DrainOnce(context.Background())
+
+	require.Len(t, m.batchSetParams, 1)
+	assert.Equal(t, "vendor", m.batchSetParams[0].Key)
+	assert.Equal(t, "omron", m.batchSetParams[0].Value)
+	assert.Equal(t, org, m.batchSetParams[0].Filter.OrgID)
+	assert.Equal(t, db.FileStatus("completed"), m.batchSetParams[0].Filter.Status.FileStatus)
+	require.Len(t, m.batchSetParams[0].Filter.Tags, 1)
+	require.Len(t, m.batchClearParams, 1)
+	assert.Equal(t, "obsolete", m.batchClearParams[0].Key)
+	assert.True(t, m.doneCalled)
+	assert.Equal(t, int32(5), m.doneAffected) // 3 set + 2 cleared
+	assert.False(t, m.failCalled)
+}
+
+func TestRetag_BatchTag_AffectedCountClampedToInt32(t *testing.T) {
+	// A count beyond int32 range is capped, never overflowed into a negative.
+	org := uuid.New()
+	spec := retag.BatchTagSpec{Tags: map[string]*string{"vendor": strptr("omron")}}
+	m := &mockRetagDB{queue: []*db.RetagJob{batchJob(t, org, spec)}, batchSetAff: int64(math.MaxInt32) + 100}
+	w := NewRetagWorker(m, zap.NewNop())
+	w.DrainOnce(context.Background())
+	assert.True(t, m.doneCalled)
+	assert.Equal(t, int32(math.MaxInt32), m.doneAffected)
+}
+
+func TestRetag_BatchTag_ApplyError_MarksFailed(t *testing.T) {
+	org := uuid.New()
+	spec := retag.BatchTagSpec{Tags: map[string]*string{"vendor": strptr("omron")}}
+	m := &mockRetagDB{queue: []*db.RetagJob{batchJob(t, org, spec)}, batchErr: errors.New("db down")}
+	w := NewRetagWorker(m, zap.NewNop())
+	w.DrainOnce(context.Background())
+	assert.True(t, m.failCalled)
+	assert.Contains(t, m.failedMsg, "batch_tag apply key")
+	assert.False(t, m.doneCalled)
+}
+
+func TestRetag_BatchTag_BadFilterUUID_MarksFailed(t *testing.T) {
+	org := uuid.New()
+	spec := retag.BatchTagSpec{
+		Filter: retag.BatchTagFilter{AgentID: "not-a-uuid"},
+		Tags:   map[string]*string{"vendor": strptr("omron")},
+	}
+	m := &mockRetagDB{queue: []*db.RetagJob{batchJob(t, org, spec)}}
+	w := NewRetagWorker(m, zap.NewNop())
+	w.DrainOnce(context.Background())
+	assert.True(t, m.failCalled)
+	assert.Contains(t, m.failedMsg, "batch_tag filter")
+	assert.Empty(t, m.batchSetParams) // never reached the apply
+}
+
+func TestRetag_BatchTag_InvalidStatus_MarksFailed(t *testing.T) {
+	// A corrupted spec status is rejected defensively rather than failing at the
+	// SQL enum cast.
+	org := uuid.New()
+	spec := retag.BatchTagSpec{
+		Filter: retag.BatchTagFilter{Status: "bogus"},
+		Tags:   map[string]*string{"vendor": strptr("omron")},
+	}
+	m := &mockRetagDB{queue: []*db.RetagJob{batchJob(t, org, spec)}}
+	w := NewRetagWorker(m, zap.NewNop())
+	w.DrainOnce(context.Background())
+	assert.True(t, m.failCalled)
+	assert.Contains(t, m.failedMsg, "invalid status")
+	assert.Empty(t, m.batchSetParams)
+}
+
+func TestRetag_BatchTag_BadSpec_MarksFailed(t *testing.T) {
+	job := &db.RetagJob{ID: uuid.New(), OrgID: uuid.New(), Kind: retag.KindBatchTag, Spec: json.RawMessage(`{bad`)}
+	m := &mockRetagDB{queue: []*db.RetagJob{job}}
+	w := NewRetagWorker(m, zap.NewNop())
+	w.DrainOnce(context.Background())
+	assert.True(t, m.failCalled)
+	assert.Contains(t, m.failedMsg, "decode batch_tag spec")
 }
 
 func TestRetag_DrainOnce_CancelledContext(t *testing.T) {
