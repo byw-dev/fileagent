@@ -115,10 +115,11 @@ func (w *RetagWorker) runMerge(ctx context.Context, job *db.RetagJob) {
 		}
 	}
 	if err := w.db.MarkRetagJobDone(ctx, job.ID, int32(affected)); err != nil {
-		if ctx.Err() == nil {
-			w.logger.Warn("retag: mark job done failed",
-				zap.String("job_id", job.ID.String()), zap.Error(err))
-		}
+		// The merge already applied (and is idempotent). Leaving the job in
+		// `running` would strand it — ClaimNextRetagJob only picks `pending`, so it
+		// is never retried, and /retag-jobs polling hangs. Record the bookkeeping
+		// failure so the state is observable and an operator can recover.
+		w.fail(ctx, job, fmt.Errorf("merge applied but marking job done failed: %w", err))
 		return
 	}
 	w.logger.Info("retag merge done",

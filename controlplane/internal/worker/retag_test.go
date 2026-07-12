@@ -169,6 +169,19 @@ func TestRetag_UnknownKind_MarksFailed(t *testing.T) {
 	assert.Contains(t, m.failedMsg, "unknown retag job kind")
 }
 
+func TestRetag_Merge_MarkDoneFails_MarksFailed(t *testing.T) {
+	// The merge applied but the bookkeeping write failed. The job must not be left
+	// stranded in `running` (never re-claimed) — it is marked failed for visibility.
+	org := uuid.New()
+	job := mergeJob(t, org, retag.MergeSpec{TagKeyID: uuid.New(), FromValue: "x", ToValue: "y", PendingID: uuid.New()})
+	m := &mockRetagDB{queue: []*db.RetagJob{job}, mergeAff: 2, doneErr: errors.New("mark down")}
+	w := NewRetagWorker(m, zap.NewNop())
+	w.DrainOnce(context.Background())
+	assert.True(t, m.failCalled)
+	assert.Equal(t, job.ID, m.failedID)
+	assert.Contains(t, m.failedMsg, "marking job done failed")
+}
+
 func TestRetag_Merge_DeletePendingFails_StillDone(t *testing.T) {
 	// Dropping the pending row is best-effort: its failure must not fail the job.
 	org := uuid.New()
