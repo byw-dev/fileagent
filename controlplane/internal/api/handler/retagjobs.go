@@ -23,7 +23,8 @@ type RetagJobsDB interface {
 // RetagJobsHandler exposes read-only status of retro-tagging jobs (metadata 6c,
 // Phase 1 — MT-5). Jobs are enqueued by actions such as pending-value merge and
 // executed asynchronously by worker.RetagWorker; this lets a client poll for
-// completion. Listing is open to any authenticated user (scoped to their org).
+// completion via GET-by-id. Reads are open to any authenticated user, each
+// scoped to the caller's org.
 type RetagJobsHandler struct {
 	db     RetagJobsDB
 	logger *zap.Logger

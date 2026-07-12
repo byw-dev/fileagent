@@ -55,7 +55,7 @@ func (m *mockPendingDB) DeletePendingTagValue(_ context.Context, _ uuid.UUID, _ 
 	m.deleteCalled = true
 	return m.deleteRows, m.deleteErr
 }
-func (m *mockPendingDB) TagValueExists(_ context.Context, _ uuid.UUID, _ string) (bool, error) {
+func (m *mockPendingDB) TagValueExistsInOrg(_ context.Context, _ uuid.UUID, _ string, _ uuid.UUID) (bool, error) {
 	return m.valueOK, m.valueErr
 }
 func (m *mockPendingDB) EnqueueRetagJob(_ context.Context, _ uuid.UUID, kind string, spec json.RawMessage, actor uuid.NullUUID) (*db.RetagJob, error) {

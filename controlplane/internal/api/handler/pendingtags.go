@@ -25,7 +25,7 @@ type PendingTagValuesDB interface {
 	GetPendingTagValue(ctx context.Context, id uuid.UUID, orgID uuid.UUID) (*db.PendingTagValue, error)
 	CreateTagValueIfAbsent(ctx context.Context, tagKeyID uuid.UUID, value string, orgID uuid.UUID) (int64, error)
 	DeletePendingTagValue(ctx context.Context, id uuid.UUID, orgID uuid.UUID) (int64, error)
-	TagValueExists(ctx context.Context, tagKeyID uuid.UUID, value string) (bool, error)
+	TagValueExistsInOrg(ctx context.Context, tagKeyID uuid.UUID, value string, orgID uuid.UUID) (bool, error)
 	EnqueueRetagJob(ctx context.Context, orgID uuid.UUID, kind string, spec json.RawMessage, actorUserID uuid.NullUUID) (*db.RetagJob, error)
 }
 
@@ -193,7 +193,11 @@ func (h *PendingTagValuesHandler) Merge(c *gin.Context) {
 		return
 	}
 
-	exists, err := h.db.TagValueExists(c.Request.Context(), p.TagKeyID, into)
+	// Scope the existence check to the caller's org: a corrupted pending row whose
+	// tag_key_id points at another org's key must not validate against that org's
+	// vocabulary (and would otherwise enqueue a job the worker no-ops while still
+	// dropping the queue row). An out-of-org key yields exists=false → 400 here.
+	exists, err := h.db.TagValueExistsInOrg(c.Request.Context(), p.TagKeyID, into, p.OrgID)
 	if err != nil {
 		h.logger.Error("merge: check target value", zap.Error(err))
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to validate merge target", nil)

@@ -88,6 +88,17 @@ DELETE FROM file_tags WHERE file_entry_id = $1 AND key = $2;
 -- name: TagValueExists :one
 SELECT EXISTS (SELECT 1 FROM tag_values WHERE tag_key_id = $1 AND value = $2);
 
+-- name: TagValueExistsInOrg :one
+-- Like TagValueExists but joins tag_keys to require the key belongs to the org,
+-- so a corrupted pending_tag_values row (tag_key_id pointing at another org's
+-- key — not prevented by any composite FK) cannot validate a merge target
+-- against another tenant's vocabulary.
+SELECT EXISTS (
+    SELECT 1 FROM tag_values tv
+    JOIN tag_keys tk ON tk.id = tv.tag_key_id
+    WHERE tv.tag_key_id = $1 AND tv.value = $2 AND tk.org_id = $3
+);
+
 -- name: FindSimilarTagValue :one
 SELECT value FROM tag_values WHERE tag_key_id = $1 AND lower(value) = lower($2) LIMIT 1;
 
