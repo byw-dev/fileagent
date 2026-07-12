@@ -476,6 +476,21 @@ type PendingTagValue struct {
 	FirstSeenAt    time.Time      `db:"first_seen_at" json:"first_seen_at"`
 }
 
+type RetagJob struct {
+	ID            uuid.UUID       `db:"id" json:"id"`
+	OrgID         uuid.UUID       `db:"org_id" json:"org_id"`
+	Kind          string          `db:"kind" json:"kind"`
+	Spec          json.RawMessage `db:"spec" json:"spec"`
+	Status        string          `db:"status" json:"status"`
+	Attempts      int32           `db:"attempts" json:"attempts"`
+	AffectedCount int32           `db:"affected_count" json:"affected_count"`
+	LastError     sql.NullString  `db:"last_error" json:"last_error"`
+	ActorUserID   uuid.NullUUID   `db:"actor_user_id" json:"actor_user_id"`
+	CreatedAt     time.Time       `db:"created_at" json:"created_at"`
+	StartedAt     sql.NullTime    `db:"started_at" json:"started_at"`
+	FinishedAt    sql.NullTime    `db:"finished_at" json:"finished_at"`
+}
+
 type TagAudit struct {
 	ID          uuid.UUID      `db:"id" json:"id"`
 	OrgID       uuid.UUID      `db:"org_id" json:"org_id"`

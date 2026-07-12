@@ -3,6 +3,7 @@ package handler_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,9 +12,11 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/retag"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type mockPendingDB struct {
@@ -24,9 +27,15 @@ type mockPendingDB struct {
 	createErr  error
 	deleteRows int64
 	deleteErr  error
+	valueOK    bool  // TagValueExists result
+	valueErr   error // TagValueExists error
+	enqueueErr error
 
-	createCalled bool
-	deleteCalled bool
+	createCalled  bool
+	deleteCalled  bool
+	enqueuedKind  string
+	enqueuedSpec  json.RawMessage
+	enqueuedActor uuid.NullUUID
 }
 
 func (m *mockPendingDB) ListPendingTagValues(_ context.Context, _ uuid.UUID) ([]*db.ListPendingTagValuesRow, error) {
@@ -46,6 +55,18 @@ func (m *mockPendingDB) DeletePendingTagValue(_ context.Context, _ uuid.UUID, _ 
 	m.deleteCalled = true
 	return m.deleteRows, m.deleteErr
 }
+func (m *mockPendingDB) TagValueExistsInOrg(_ context.Context, _ uuid.UUID, _ string, _ uuid.UUID) (bool, error) {
+	return m.valueOK, m.valueErr
+}
+func (m *mockPendingDB) EnqueueRetagJob(_ context.Context, _ uuid.UUID, kind string, spec json.RawMessage, actor uuid.NullUUID) (*db.RetagJob, error) {
+	if m.enqueueErr != nil {
+		return nil, m.enqueueErr
+	}
+	m.enqueuedKind = kind
+	m.enqueuedSpec = spec
+	m.enqueuedActor = actor
+	return &db.RetagJob{ID: uuid.New(), Kind: kind, Status: "pending"}, nil
+}
 
 func testPendingRouter(h *handler.PendingTagValuesHandler, role string) *gin.Engine {
 	gin.SetMode(gin.TestMode)
@@ -58,8 +79,19 @@ func testPendingRouter(h *handler.PendingTagValuesHandler, role string) *gin.Eng
 	g := r.Group("/api/v1/pending-tag-values")
 	g.GET("", h.List)
 	g.POST("/:id/approve", superAdmin, h.Approve)
+	g.POST("/:id/merge", superAdmin, h.Merge)
 	g.POST("/:id/reject", superAdmin, h.Reject)
 	return r
+}
+
+// pendingValueRow returns a queued value whose canonical "Tokyo" is the suggested
+// match, used by the merge tests.
+func pendingValueRow(id uuid.UUID) *db.PendingTagValue {
+	return &db.PendingTagValue{
+		ID: id, OrgID: testTagOrgID, TagKeyID: uuid.New(),
+		ExtractedValue: "tokyo",
+		SuggestedValue: sql.NullString{String: "Tokyo", Valid: true},
+	}
 }
 
 func pendingRow() *db.ListPendingTagValuesRow {
@@ -164,4 +196,90 @@ func TestPending_Reject_InvalidID(t *testing.T) {
 	w := httptest.NewRecorder()
 	testPendingRouter(h, "super_admin").ServeHTTP(w, req(http.MethodPost, "/api/v1/pending-tag-values/not-a-uuid/reject", ""))
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func mergeReq(id, body string) *http.Request {
+	return req(http.MethodPost, "/api/v1/pending-tag-values/"+id+"/merge", body)
+}
+
+func TestPending_Merge_Success_ExplicitTarget(t *testing.T) {
+	id := uuid.New()
+	mockDB := &mockPendingDB{getRow: pendingValueRow(id), valueOK: true}
+	h := handler.NewPendingTagValuesHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testPendingRouter(h, "super_admin").ServeHTTP(w, mergeReq(id.String(), `{"into":"Tokyo"}`))
+	assert.Equal(t, http.StatusAccepted, w.Code) // enqueued, runs async
+	assert.Equal(t, "merge", mockDB.enqueuedKind)
+	// Spec folds the queued value into the canonical target.
+	var spec retag.MergeSpec
+	require.NoError(t, json.Unmarshal(mockDB.enqueuedSpec, &spec))
+	assert.Equal(t, "tokyo", spec.FromValue)
+	assert.Equal(t, "Tokyo", spec.ToValue)
+}
+
+func TestPending_Merge_DefaultsToSuggested(t *testing.T) {
+	id := uuid.New()
+	mockDB := &mockPendingDB{getRow: pendingValueRow(id), valueOK: true}
+	h := handler.NewPendingTagValuesHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	// Empty body → fall back to suggested_value ("Tokyo").
+	testPendingRouter(h, "super_admin").ServeHTTP(w, mergeReq(id.String(), ``))
+	assert.Equal(t, http.StatusAccepted, w.Code)
+	var spec retag.MergeSpec
+	require.NoError(t, json.Unmarshal(mockDB.enqueuedSpec, &spec))
+	assert.Equal(t, "Tokyo", spec.ToValue)
+}
+
+func TestPending_Merge_NoTargetNoSuggestion_400(t *testing.T) {
+	id := uuid.New()
+	row := pendingValueRow(id)
+	row.SuggestedValue = sql.NullString{} // no suggestion, and no body target
+	mockDB := &mockPendingDB{getRow: row}
+	h := handler.NewPendingTagValuesHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testPendingRouter(h, "super_admin").ServeHTTP(w, mergeReq(id.String(), ``))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Empty(t, mockDB.enqueuedKind) // nothing enqueued
+}
+
+func TestPending_Merge_TargetEqualsValue_400(t *testing.T) {
+	id := uuid.New()
+	mockDB := &mockPendingDB{getRow: pendingValueRow(id), valueOK: true}
+	h := handler.NewPendingTagValuesHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testPendingRouter(h, "super_admin").ServeHTTP(w, mergeReq(id.String(), `{"into":"tokyo"}`))
+	assert.Equal(t, http.StatusBadRequest, w.Code) // use approve, not merge
+	assert.Empty(t, mockDB.enqueuedKind)
+}
+
+func TestPending_Merge_UnregisteredTarget_400(t *testing.T) {
+	id := uuid.New()
+	mockDB := &mockPendingDB{getRow: pendingValueRow(id), valueOK: false} // target not in vocab
+	h := handler.NewPendingTagValuesHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testPendingRouter(h, "super_admin").ServeHTTP(w, mergeReq(id.String(), `{"into":"Osaka"}`))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Empty(t, mockDB.enqueuedKind)
+}
+
+func TestPending_Merge_Forbidden_NonSuperAdmin(t *testing.T) {
+	h := handler.NewPendingTagValuesHandler(&mockPendingDB{}, newTestLogger())
+	w := httptest.NewRecorder()
+	testPendingRouter(h, "org_admin").ServeHTTP(w, mergeReq(uuid.New().String(), `{"into":"Tokyo"}`))
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestPending_Merge_NotFound(t *testing.T) {
+	mockDB := &mockPendingDB{getErr: sql.ErrNoRows}
+	h := handler.NewPendingTagValuesHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	testPendingRouter(h, "super_admin").ServeHTTP(w, mergeReq(uuid.New().String(), `{"into":"Tokyo"}`))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestPending_Merge_NilDB_501(t *testing.T) {
+	h := handler.NewPendingTagValuesHandler(nil, newTestLogger())
+	w := httptest.NewRecorder()
+	testPendingRouter(h, "super_admin").ServeHTTP(w, mergeReq(uuid.New().String(), `{"into":"Tokyo"}`))
+	assert.Equal(t, http.StatusNotImplemented, w.Code)
 }

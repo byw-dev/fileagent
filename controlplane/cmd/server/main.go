@@ -249,6 +249,10 @@ func main() {
 	offlineSweeper := worker.NewOfflineSweeper(queries, redisClient, nats, bootstrap.DefaultOrgID, logger)
 	go offlineSweeper.Run(ctx, 0)
 
+	// Retro-tagging worker drains the retag_jobs outbox (e.g. pending-value merge).
+	retagWorker := worker.NewRetagWorker(queries, logger)
+	go retagWorker.Run(ctx, 0)
+
 	// ── Build HTTP router ────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
 		JWTSecret:          cfg.JWTSecret,
@@ -259,6 +263,7 @@ func main() {
 		FileTypesDB:        queries,
 		TagKeysDB:          queries,
 		PendingTagsDB:      queries,
+		RetagJobsDB:        queries,
 		FileTagsDB:         queries,
 		FilesDB:            queries,
 		MinIOSigner:        &minioPresigner{client: minioPresignClient},

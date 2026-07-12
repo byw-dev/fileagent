@@ -3,12 +3,16 @@ package handler
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/retag"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -21,6 +25,8 @@ type PendingTagValuesDB interface {
 	GetPendingTagValue(ctx context.Context, id uuid.UUID, orgID uuid.UUID) (*db.PendingTagValue, error)
 	CreateTagValueIfAbsent(ctx context.Context, tagKeyID uuid.UUID, value string, orgID uuid.UUID) (int64, error)
 	DeletePendingTagValue(ctx context.Context, id uuid.UUID, orgID uuid.UUID) (int64, error)
+	TagValueExistsInOrg(ctx context.Context, tagKeyID uuid.UUID, value string, orgID uuid.UUID) (bool, error)
+	EnqueueRetagJob(ctx context.Context, orgID uuid.UUID, kind string, spec json.RawMessage, actorUserID uuid.NullUUID) (*db.RetagJob, error)
 }
 
 // PendingTagValuesHandler serves the "pending tag values" review queue: values
@@ -138,6 +144,88 @@ func (h *PendingTagValuesHandler) Approve(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"key_id": p.TagKeyID.String(), "value": p.ExtractedValue})
+}
+
+// mergeRequest is the body for POST /pending-tag-values/:id/merge. `into` is the
+// canonical value to fold the queued value into; when omitted it defaults to the
+// row's suggested_value (the case-insensitive match that put it in the queue).
+type mergeRequest struct {
+	Into string `json:"into"`
+}
+
+// Merge handles POST /api/v1/pending-tag-values/:id/merge. It folds a queued
+// (typically typo'd) value into an existing canonical value: every already-tagged
+// file carrying the raw value is rewritten to `into` and the queue row is
+// removed. Because that rewrite can touch many files, it is enqueued as a retag
+// job drained by worker.RetagWorker; the endpoint returns 202 with the job id.
+//
+// `into` must already be a registered value for the key (merge canonicalises;
+// promoting a brand-new value is what approve is for) and must differ from the
+// queued value.
+func (h *PendingTagValuesHandler) Merge(c *gin.Context) {
+	if h.db == nil {
+		middleware.NotImplemented(c)
+		return
+	}
+	p, ok := h.resolvePending(c)
+	if !ok {
+		return
+	}
+
+	// The body is optional: with none, `into` defaults to the suggested value.
+	var req mergeRequest
+	if c.Request.Body != nil {
+		if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+			middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
+			return
+		}
+	}
+	into := strings.TrimSpace(req.Into)
+	if into == "" && p.SuggestedValue.Valid {
+		into = p.SuggestedValue.String // default to the suggested canonical value
+	}
+	if into == "" {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "merge target `into` is required (no suggested value to default to)", nil)
+		return
+	}
+	if into == p.ExtractedValue {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", "merge target must differ from the queued value; use approve to accept it as-is", nil)
+		return
+	}
+
+	// Scope the existence check to the caller's org: a corrupted pending row whose
+	// tag_key_id points at another org's key must not validate against that org's
+	// vocabulary (and would otherwise enqueue a job the worker no-ops while still
+	// dropping the queue row). An out-of-org key yields exists=false → 400 here.
+	exists, err := h.db.TagValueExistsInOrg(c.Request.Context(), p.TagKeyID, into, p.OrgID)
+	if err != nil {
+		h.logger.Error("merge: check target value", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to validate merge target", nil)
+		return
+	}
+	if !exists {
+		middleware.RespondError(c, http.StatusBadRequest, "UNREGISTERED_MERGE_TARGET", "merge target not in vocabulary: "+into, nil)
+		return
+	}
+
+	spec, err := json.Marshal(retag.MergeSpec{
+		TagKeyID:  p.TagKeyID,
+		FromValue: p.ExtractedValue,
+		ToValue:   into,
+		PendingID: p.ID,
+	})
+	if err != nil { // unreachable for a fixed struct, but stay explicit
+		h.logger.Error("merge: marshal spec", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to enqueue merge", nil)
+		return
+	}
+	job, err := h.db.EnqueueRetagJob(c.Request.Context(), p.OrgID, retag.KindMerge, spec, actorNullUUID(c))
+	if err != nil {
+		h.logger.Error("merge: enqueue retag job", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to enqueue merge", nil)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"job_id": job.ID.String(), "status": job.Status, "into": into})
 }
 
 // Reject handles POST /api/v1/pending-tag-values/:id/reject. It removes the value

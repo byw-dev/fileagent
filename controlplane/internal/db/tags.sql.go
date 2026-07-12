@@ -399,6 +399,25 @@ func (q *Queries) TagValueExists(ctx context.Context, tagKeyID uuid.UUID, value 
 	return exists, err
 }
 
+const tagValueExistsInOrg = `-- name: TagValueExistsInOrg :one
+SELECT EXISTS (
+    SELECT 1 FROM tag_values tv
+    JOIN tag_keys tk ON tk.id = tv.tag_key_id
+    WHERE tv.tag_key_id = $1 AND tv.value = $2 AND tk.org_id = $3
+)
+`
+
+// Like TagValueExists but joins tag_keys to require the key belongs to the org,
+// so a corrupted pending_tag_values row (tag_key_id pointing at another org's
+// key — not prevented by any composite FK) cannot validate a merge target
+// against another tenant's vocabulary.
+func (q *Queries) TagValueExistsInOrg(ctx context.Context, tagKeyID uuid.UUID, value string, orgID uuid.UUID) (bool, error) {
+	row := q.db.QueryRowContext(ctx, tagValueExistsInOrg, tagKeyID, value, orgID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const updateTagKey = `-- name: UpdateTagKey :one
 UPDATE tag_keys
 SET label = $3,

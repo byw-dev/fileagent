@@ -1,0 +1,5 @@
+BEGIN;
+
+DROP TABLE IF EXISTS retag_jobs;
+
+COMMIT;

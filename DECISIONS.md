@@ -1046,6 +1046,31 @@ MT-4a 端点（sqlc `tags.sql` + `handler/tagkeys.go`，注入 `RouterConfig.Tag
   不绕过词表——与 path_var 同。响应 200 返回 `{set, cleared, tags}`（tags=改后该文件全量标签）。
 - 真 PG 验证 set（file_tag+audit+pending）+ clear（删+audit，共 2 审计行）。
 
+### 落地记录（MT-5a，回溯打标 worker 地基 + pending merge）
+
+**MT-5 拆分**（2026-07-11 拍板）：MT-5a = 回溯任务 outbox + worker + 接线 `merge` 为首个 job 类型；
+`batch-tag` 与规则改动回溯随 **MT-5b** 复用同一通道落。
+
+- **新表** `retag_jobs`（迁移 `000005`，只追加）：outbox 队列（`id/org_id/kind/spec JSONB/status/attempts/
+  affected_count/last_error/actor_user_id/时间戳`）。单 CP 实例消费；`idx_retag_jobs_pending` 部分索引按
+  `created_at` 取最老 pending。**触发信号**：merge/batch_tag/rule_retag 均入此表，重活离请求路径异步跑。
+- **sqlc**（`queries/retag.sql`）：`EnqueueRetagJob`、`GetRetagJob`、`ClaimNextRetagJob`（`UPDATE...WHERE id=(SELECT..
+  FOR UPDATE SKIP LOCKED)` 原子领取，置 running+attempts+1）、`MarkRetagJobDone/Failed`、`MergeTagValue`
+  （**单条 CTE**：`tk` 从 `tag_keys` 解 key 名并校验 org 归属 → `updated` 把该 org 下 `file_tags` 中 `from_value`
+  改写为 `to_value` 并 `RETURNING` → 逐文件插 `tag_audit`(action=`merge`,source=`retro`)。`:execrows`=改写文件数。
+  幂等：重跑无 `from_value` 行则改写 0、审计 0）。
+- **worker** `internal/worker/retag.go`（复用 offline_sweeper 的 ticker 模式，默认 5s poll，启动先 `DrainOnce`
+  清积压）：`ClaimNextRetagJob` 领取 → 按 `kind` 分派 → `runMerge` 调 `MergeTagValue` + 删 pending 行（best-effort，
+  失败不失败 job）+ `MarkRetagJobDone(affected)`；解码/未知 kind/执行错→`MarkRetagJobFailed`。main.go `go retagWorker.Run`。
+- **契约**（新端点）：`POST /api/v1/pending-tag-values/{id}/merge`（**super_admin**）——body `{"into":"Tokyo"}` 可选，
+  缺省用该行 `suggested_value`；`into` 必须**已登记**（`TagValueExists`，未登记→400 `UNREGISTERED_MERGE_TARGET`；
+  merge 只做规范化，新值提升是 approve 的事）且≠原值（否则 400，提示用 approve）。校验过 `EnqueueRetagJob` 入队，
+  **返回 202** `{job_id,status,into}`（异步）。新增只读 `GET /api/v1/retag-jobs/{id}`（任意登录，按 org 收窄，
+  跨 org→404）供轮询状态。job kind/spec 契约在 `internal/retag`（enqueuer 与 worker 共享，互不 import）。
+- **共享通道对齐设计**：merge 不同步执行而走 worker，与后续 batch-tag 复用同一 outbox（设计 §P1.2(5)）。
+- 真 PG15 验证：merge `tokyo→Tokyo` 改写 2 文件 + 2 审计行、`osaka` 不动；**重跑幂等**（0 改写/0 新审计）；
+  **跨 org 隔离**（异 org 领域的 merge 改写 0）；迁移 `000005` up/down 往返干净。
+
 ### 落地记录（MT-4b，待确认取值队列 list/approve/reject）
 
 `handler/pendingtags.go` + sqlc（`ListPendingTagValues` join `tag_keys` 出 key 名、`GetPendingTagValue`、
