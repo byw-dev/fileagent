@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
@@ -32,6 +33,8 @@ const defaultRetagPollInterval = 5 * time.Second
 type RetagJobsDB interface {
 	ClaimNextRetagJob(ctx context.Context) (*db.RetagJob, error)
 	MergeTagValue(ctx context.Context, arg db.MergeTagValueParams) (int64, error)
+	BatchSetFileTag(ctx context.Context, p db.BatchSetFileTagParams) (int64, error)
+	BatchClearFileTag(ctx context.Context, p db.BatchClearFileTagParams) (int64, error)
 	DeletePendingTagValue(ctx context.Context, id uuid.UUID, orgID uuid.UUID) (int64, error)
 	MarkRetagJobDone(ctx context.Context, id uuid.UUID, affectedCount int32) error
 	MarkRetagJobFailed(ctx context.Context, id uuid.UUID, lastError sql.NullString) error
@@ -80,6 +83,8 @@ func (w *RetagWorker) runJob(ctx context.Context, job *db.RetagJob) {
 	switch job.Kind {
 	case retag.KindMerge:
 		w.runMerge(ctx, job)
+	case retag.KindBatchTag:
+		w.runBatchTag(ctx, job)
 	default:
 		w.fail(ctx, job, fmt.Errorf("unknown retag job kind %q", job.Kind))
 	}
@@ -128,6 +133,103 @@ func (w *RetagWorker) runMerge(ctx context.Context, job *db.RetagJob) {
 		zap.String("from", spec.FromValue),
 		zap.String("to", spec.ToValue),
 		zap.Int64("affected", affected))
+}
+
+// Batch tagging writes file_tags.source=manual and tag_audit action/source to
+// mirror single-file manual tagging (it is an admin action, just applied in bulk
+// and executed asynchronously).
+const (
+	batchTagSource   = "manual"
+	batchActionSet   = "set"
+	batchActionClear = "clear"
+	batchAuditSource = "manual"
+)
+
+// runBatchTag executes a batch_tag job: apply each key's set/clear to every file
+// matching the spec's filter, summing changed-file counts across keys. Governance
+// (registered key, pending queue for unregistered controlled values) is enforced
+// at enqueue, so the executor only applies. A key is processed at most once.
+func (w *RetagWorker) runBatchTag(ctx context.Context, job *db.RetagJob) {
+	var spec retag.BatchTagSpec
+	if err := json.Unmarshal(job.Spec, &spec); err != nil {
+		w.fail(ctx, job, fmt.Errorf("decode batch_tag spec: %w", err))
+		return
+	}
+	filter, err := batchFilter(job.OrgID, spec.Filter)
+	if err != nil {
+		w.fail(ctx, job, fmt.Errorf("batch_tag filter: %w", err))
+		return
+	}
+
+	var total int64
+	// Deterministic order so audit/logs are stable and tests are reproducible.
+	keys := make([]string, 0, len(spec.Tags))
+	for k := range spec.Tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		val := spec.Tags[key]
+		var n int64
+		var err error
+		if val == nil {
+			n, err = w.db.BatchClearFileTag(ctx, db.BatchClearFileTagParams{
+				Filter: filter, Key: key,
+				Action: batchActionClear, AuditSource: batchAuditSource, ActorUserID: job.ActorUserID,
+			})
+		} else {
+			n, err = w.db.BatchSetFileTag(ctx, db.BatchSetFileTagParams{
+				Filter: filter, Key: key, Value: *val, Source: batchTagSource,
+				Action: batchActionSet, AuditSource: batchAuditSource, ActorUserID: job.ActorUserID,
+			})
+		}
+		if err != nil {
+			w.fail(ctx, job, fmt.Errorf("batch_tag apply key %q: %w", key, err))
+			return
+		}
+		total += n
+	}
+	if err := w.db.MarkRetagJobDone(ctx, job.ID, int32(total)); err != nil {
+		w.fail(ctx, job, fmt.Errorf("batch applied but marking job done failed: %w", err))
+		return
+	}
+	w.logger.Info("retag batch_tag done",
+		zap.String("job_id", job.ID.String()),
+		zap.Int("keys", len(keys)), zap.Int64("changed", total))
+}
+
+// batchFilter converts a JSON-friendly BatchTagFilter (org from the job) into the
+// db selection filter, parsing UUIDs/status/tag predicates. Malformed values are
+// errors (they are validated at enqueue, so this is a defensive guard).
+func batchFilter(orgID uuid.UUID, f retag.BatchTagFilter) (db.BatchTagFilter, error) {
+	out := db.BatchTagFilter{OrgID: orgID}
+	parseNU := func(s string) (uuid.NullUUID, error) {
+		if s == "" {
+			return uuid.NullUUID{}, nil
+		}
+		id, err := uuid.Parse(s)
+		if err != nil {
+			return uuid.NullUUID{}, err
+		}
+		return uuid.NullUUID{UUID: id, Valid: true}, nil
+	}
+	var err error
+	if out.AgentID, err = parseNU(f.AgentID); err != nil {
+		return out, fmt.Errorf("agent_id: %w", err)
+	}
+	if out.BucketID, err = parseNU(f.BucketID); err != nil {
+		return out, fmt.Errorf("bucket_id: %w", err)
+	}
+	if out.FileTypeID, err = parseNU(f.FileTypeID); err != nil {
+		return out, fmt.Errorf("file_type_id: %w", err)
+	}
+	if f.Status != "" {
+		out.Status = db.NullFileStatus{FileStatus: db.FileStatus(f.Status), Valid: true}
+	}
+	for _, t := range f.Tags {
+		out.Tags = append(out.Tags, db.FileTagFilter{Key: t.Key, Value: t.Value})
+	}
+	return out, nil
 }
 
 // fail records cause on the job. It is a no-op on shutdown so a cancelled context

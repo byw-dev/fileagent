@@ -1071,6 +1071,33 @@ MT-4a 端点（sqlc `tags.sql` + `handler/tagkeys.go`，注入 `RouterConfig.Tag
 - 真 PG15 验证：merge `tokyo→Tokyo` 改写 2 文件 + 2 审计行、`osaka` 不动；**重跑幂等**（0 改写/0 新审计）；
   **跨 org 隔离**（异 org 领域的 merge 改写 0）；迁移 `000005` up/down 往返干净。
 
+### 落地记录（MT-5b，批量打标 POST /files/batch-tag）
+
+MT-5b = 复用 MT-5a 的 retag_jobs 通道做**批量打标**（按 `GET /files` 谓词圈选文件集，统一 set/clear 标签）。
+**规则改动回溯推后**（低价值/推测性，体量≈MT-2；批量打标已覆盖历史数据人工补标的近期真实需求）。
+
+- **契约**（新端点）：`POST /api/v1/files/batch-tag`（**super_admin**），body
+  `{"filter":{agent_id,bucket_id,file_type_id,status,tags:["site:tokyo"]}, "tags":{"vendor":"omron","obsolete":null}}`。
+  filter = 与 `GET /files` 同款谓词（复用 `parseTagPredicates`，同 maxTagFilters/去重/冲突校验）；tags = 应用的
+  set(string)/clear(null) 映射。**前置校验**（同单文件 PUT）：key 格式合法且 set-key 已登记（未登记→400
+  `UNKNOWN_TAG_KEY`）、value TrimSpace 后非空 ≤128 rune；受控未登记值 upsert `pending_tag_values`（source=manual，
+  每 key 一次——值对全体文件相同，不绕过词表）。校验过入队 `batch_tag` job，**返回 202** `{job_id,status}`（异步）。
+- **spec 契约**在 `internal/retag`（`BatchTagSpec`{Filter,Tags}）：filter 用 JSON 友好型（UUID/status 为 string，
+  tag 谓词已解析为 `[]TagPredicate`），worker 侧 `batchFilter` 反解为 `db.BatchTagFilter`。
+- **执行查询**（**手写**，`internal/db/batchtag_queries.go`，因谓词含可选过滤 + 动态 tag-AND 子句，sqlc 表达不了；
+  复用 `tagFilterClause` 与 `GET /files` 完全同款选择语义）：
+  - `BatchSetFileTag`：单条 CTE——`sel`（选中文件）→ `before`（LEFT JOIN 取旧值快照）→ `upsert`（
+    `INSERT..ON CONFLICT DO UPDATE SET .. WHERE value IS DISTINCT FROM EXCLUDED.value`，只改变化行）→
+    逐文件写 `tag_audit`（`WHERE old IS DISTINCT FROM new`，action=set/source=manual）。`:execrows`=**变更文件数**。
+  - `BatchClearFileTag`：`sel` → `DELETE .. USING sel RETURNING` → 逐删文件写 audit（action=clear）。execrows=清除数。
+  - 均**幂等**：重跑改写/删除/审计 0 行。file_tags.source=manual、audit.source=manual（管理员批量动作，仅异步执行）。
+- **worker** `runBatchTag`：解 spec → `batchFilter` 反解（畸形 UUID→fail）→ 按 key 排序逐个 set/clear（复用同一
+  MarkDone-失败→fail 兜底）→ affected 求和写 MarkDone。unknown kind 仍 fail。
+- 单测：worker batch set+clear/apply 错→fail/坏 filter→fail/坏 spec→fail（88%）；handler set/trim/clear/未登记值入队/
+  未登记 key 400/非法 key/空值/坏 filter UUID/坏 filter 谓词/非受控 key 不入队/enqueue 错 500/403/501；db sqlmock；
+  保护路由 401 纳入 batch-tag。**集成测试**（`-tags=integration`，真 PG15）：site:tokyo 圈选 set vendor→2 文件（osaka 不动）
+  + 2 审计、重跑幂等 0、clear→2、再 clear→0。
+
 ### 落地记录（MT-4b，待确认取值队列 list/approve/reject）
 
 `handler/pendingtags.go` + sqlc（`ListPendingTagValues` join `tag_keys` 出 key 名、`GetPendingTagValue`、

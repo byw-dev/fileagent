@@ -29,6 +29,7 @@ type RouterConfig struct {
 	PendingTagsDB handler.PendingTagValuesDB
 	RetagJobsDB   handler.RetagJobsDB
 	FileTagsDB    handler.FileTagsDB
+	BatchTagDB    handler.BatchTagDB
 	FilesDB       handler.FilesDB
 	MinIOSigner   handler.MinIOPresigner
 	BucketsDB     handler.BucketsDB
@@ -144,6 +145,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	fileTypesH := handler.NewFileTypesHandler(cfg.FileTypesDB, cfg.Logger)
 
 	fileTagsH := handler.NewFileTagsHandler(cfg.FileTagsDB, cfg.Logger)
+	batchTagH := handler.NewBatchTagHandler(cfg.BatchTagDB, cfg.Logger)
 
 	files := v1.Group("/files")
 	{
@@ -153,6 +155,8 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		files.POST("/batch-download-urls", filesH.BatchDownloadURLs)
 		// Manual single-file tagging (metadata 6c); super_admin only.
 		files.PUT("/:id/tags", superAdmin, fileTagsH.SetTags)
+		// Bulk tagging by GET /files predicate (metadata 6c, async); super_admin only.
+		files.POST("/batch-tag", superAdmin, batchTagH.Submit)
 	}
 
 	fileTypes := v1.Group("/file-types")

@@ -265,6 +265,7 @@ func main() {
 		PendingTagsDB:      queries,
 		RetagJobsDB:        queries,
 		FileTagsDB:         queries,
+		BatchTagDB:         queries,
 		FilesDB:            queries,
 		MinIOSigner:        &minioPresigner{client: minioPresignClient},
 		BucketsDB:          queries,
