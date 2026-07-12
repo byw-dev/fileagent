@@ -27,6 +27,7 @@ type RouterConfig struct {
 	FileTypesDB   handler.FileTypesDB
 	TagKeysDB     handler.TagKeysDB
 	PendingTagsDB handler.PendingTagValuesDB
+	RetagJobsDB   handler.RetagJobsDB
 	FileTagsDB    handler.FileTagsDB
 	FilesDB       handler.FilesDB
 	MinIOSigner   handler.MinIOPresigner
@@ -177,15 +178,21 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	}
 
 	// Pending tag-value review queue (metadata 6c). List open to any
-	// authenticated user; approve/reject are super_admin only. (The `merge`
-	// action lands with the retro-tagging worker in MT-5.)
+	// authenticated user; approve/merge/reject are super_admin only. `merge`
+	// enqueues a retro-tagging job (worker.RetagWorker) and returns 202.
 	pendingH := handler.NewPendingTagValuesHandler(cfg.PendingTagsDB, cfg.Logger)
 	pending := v1.Group("/pending-tag-values")
 	{
 		pending.GET("", pendingH.List)
 		pending.POST("/:id/approve", superAdmin, pendingH.Approve)
+		pending.POST("/:id/merge", superAdmin, pendingH.Merge)
 		pending.POST("/:id/reject", superAdmin, pendingH.Reject)
 	}
+
+	// Retro-tagging job status (metadata 6c). Read-only; scoped to the caller's
+	// org. Jobs are enqueued by actions like pending-value merge and run async.
+	retagJobsH := handler.NewRetagJobsHandler(cfg.RetagJobsDB, cfg.Logger)
+	v1.GET("/retag-jobs/:id", retagJobsH.Get)
 
 	// Buckets
 	bucketsH := handler.NewBucketsHandler(cfg.BucketsDB, cfg.MinIOAdmin, cfg.Logger)
