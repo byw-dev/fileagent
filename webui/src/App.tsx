@@ -27,6 +27,7 @@ const LogsPage = lazy(() => import('./pages/Logs'))
 const SettingsPage = lazy(() => import('./pages/Settings'))
 const SettingsUsersPage = lazy(() => import('./pages/Settings/Users'))
 const SettingsTagKeysPage = lazy(() => import('./pages/Settings/TagKeys'))
+const SettingsPendingTagsPage = lazy(() => import('./pages/Settings/PendingTags'))
 const ProfilePage = lazy(() => import('./pages/Settings/Profile'))
 
 /** Full-screen centered loading spinner shown during lazy page loads.
@@ -103,6 +104,7 @@ function App() {
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/settings/users" element={<SettingsUsersPage />} />
               <Route path="/settings/tag-keys" element={<SettingsTagKeysPage />} />
+              <Route path="/settings/pending-tags" element={<SettingsPendingTagsPage />} />
               <Route path="/settings/profile" element={<ProfilePage />} />
             </Route>
           </Route>
