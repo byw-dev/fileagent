@@ -53,6 +53,14 @@ func TestClaimNextRetagJob(t *testing.T) {
 	assert.Equal(t, "running", job.Status)
 }
 
+func TestRequeueRunningRetagJobs(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectExec("UPDATE retag_jobs SET status = 'pending'").WillReturnResult(sqlmock.NewResult(0, 2))
+	n, err := q.RequeueRunningRetagJobs(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), n)
+}
+
 func TestMarkRetagJobDone(t *testing.T) {
 	q, mock, _ := newTestQueries(t)
 	mock.ExpectExec("UPDATE retag_jobs").WillReturnResult(sqlmock.NewResult(0, 1))

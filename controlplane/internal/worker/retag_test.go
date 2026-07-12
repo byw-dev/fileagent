@@ -41,6 +41,9 @@ type mockRetagDB struct {
 	failedID   uuid.UUID
 	failedMsg  string
 	failCalled bool
+
+	requeued      int64
+	requeueCalled bool
 }
 
 func (m *mockRetagDB) ClaimNextRetagJob(_ context.Context) (*db.RetagJob, error) {
@@ -82,11 +85,25 @@ func (m *mockRetagDB) MarkRetagJobFailed(_ context.Context, id uuid.UUID, lastEr
 	return nil
 }
 
+func (m *mockRetagDB) RequeueRunningRetagJobs(_ context.Context) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.requeueCalled = true
+	return m.requeued, nil
+}
+
 // doneCalls returns how many jobs were marked done (race-safe for Run tests).
 func (m *mockRetagDB) doneCalls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.doneCount
+}
+
+// requeueDone reports whether startup requeue ran (race-safe for Run tests).
+func (m *mockRetagDB) requeueDone() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.requeueCalled
 }
 
 func mergeJob(t *testing.T, orgID uuid.UUID, spec retag.MergeSpec) *db.RetagJob {
@@ -225,6 +242,18 @@ func TestRetag_Run_StopsOnContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not stop after context cancel")
 	}
+}
+
+func TestRetag_Run_RequeuesStaleOnStartup(t *testing.T) {
+	// A job left `running` by a prior crashed process is reset to pending on
+	// startup so it is re-claimed rather than stranded forever.
+	m := &mockRetagDB{requeued: 1}
+	w := NewRetagWorker(m, zap.NewNop())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx, 10*time.Millisecond)
+	require.Eventually(t, m.requeueDone, 2*time.Second, 10*time.Millisecond,
+		"worker should requeue stale running jobs on startup")
 }
 
 func TestRetag_Run_DrainsOnTick(t *testing.T) {

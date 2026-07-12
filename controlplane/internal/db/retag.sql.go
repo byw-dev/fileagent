@@ -180,3 +180,20 @@ func (q *Queries) MergeTagValue(ctx context.Context, arg MergeTagValueParams) (i
 	}
 	return result.RowsAffected()
 }
+
+const requeueRunningRetagJobs = `-- name: RequeueRunningRetagJobs :execrows
+UPDATE retag_jobs SET status = 'pending', started_at = NULL WHERE status = 'running'
+`
+
+// Single-instance CP crash recovery: on worker startup any job left in `running`
+// is a leftover from a stopped/crashed process (no worker is in-flight yet), so
+// reset it to pending for re-claim. Merge execution is idempotent, so re-running a
+// partially-completed job is safe. Without this a job claimed when the process
+// stopped would be stranded forever (ClaimNextRetagJob only selects `pending`).
+func (q *Queries) RequeueRunningRetagJobs(ctx context.Context) (int64, error) {
+	result, err := q.db.ExecContext(ctx, requeueRunningRetagJobs)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}

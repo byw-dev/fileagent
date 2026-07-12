@@ -39,8 +39,9 @@ func NewRetagJobsHandler(retagDB RetagJobsDB, logger *zap.Logger) *RetagJobsHand
 // retagJobResponse is the outbound JSON shape for a retag job's status.
 //
 // The raw last_error (wrapped driver/SQL errors) is deliberately omitted: status
-// already tells a client whether the job failed, and the detailed cause is kept
-// to server logs rather than exposed to every authenticated user in the org.
+// already tells a client whether the job failed, and the detailed cause is left
+// in server logs and the retag_jobs.last_error column rather than exposed to
+// every authenticated user in the org.
 type retagJobResponse struct {
 	ID            string `json:"id"`
 	Kind          string `json:"kind"`

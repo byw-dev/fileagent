@@ -35,6 +35,7 @@ type RetagJobsDB interface {
 	DeletePendingTagValue(ctx context.Context, id uuid.UUID, orgID uuid.UUID) (int64, error)
 	MarkRetagJobDone(ctx context.Context, id uuid.UUID, affectedCount int32) error
 	MarkRetagJobFailed(ctx context.Context, id uuid.UUID, lastError sql.NullString) error
+	RequeueRunningRetagJobs(ctx context.Context) (int64, error)
 }
 
 // RetagWorker executes retag jobs on a single Control Plane instance (the v1
@@ -145,6 +146,22 @@ func (w *RetagWorker) fail(ctx context.Context, job *db.RetagJob, cause error) {
 	}
 }
 
+// requeueStale resets jobs left in `running` back to `pending` so they are
+// re-claimed. Safe on a single-instance CP because a just-started worker has
+// nothing in flight; merge execution is idempotent, so re-running is harmless.
+func (w *RetagWorker) requeueStale(ctx context.Context) {
+	n, err := w.db.RequeueRunningRetagJobs(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			w.logger.Warn("retag: requeue stale running jobs failed", zap.Error(err))
+		}
+		return
+	}
+	if n > 0 {
+		w.logger.Info("retag: requeued stale running jobs", zap.Int64("count", n))
+	}
+}
+
 // Run drains the queue on a ticker until ctx is cancelled. A non-positive
 // interval falls back to defaultRetagPollInterval. It drains once on startup so a
 // backlog left by a restart is handled without waiting for the first tick.
@@ -155,6 +172,9 @@ func (w *RetagWorker) Run(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	w.logger.Info("retag worker started", zap.Duration("interval", interval))
+	// Recover jobs stranded in `running` by a previous stopped/crashed process
+	// (single-instance CP, so nothing is in-flight at startup) before draining.
+	w.requeueStale(ctx)
 	w.DrainOnce(ctx)
 	for {
 		select {

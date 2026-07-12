@@ -26,6 +26,14 @@ WHERE id = (
 RETURNING id, org_id, kind, spec, status, attempts, affected_count,
           last_error, actor_user_id, created_at, started_at, finished_at;
 
+-- name: RequeueRunningRetagJobs :execrows
+-- Single-instance CP crash recovery: on worker startup any job left in `running`
+-- is a leftover from a stopped/crashed process (no worker is in-flight yet), so
+-- reset it to pending for re-claim. Merge execution is idempotent, so re-running a
+-- partially-completed job is safe. Without this a job claimed when the process
+-- stopped would be stranded forever (ClaimNextRetagJob only selects `pending`).
+UPDATE retag_jobs SET status = 'pending', started_at = NULL WHERE status = 'running';
+
 -- name: MarkRetagJobDone :exec
 UPDATE retag_jobs
 SET status = 'done', affected_count = $2, finished_at = NOW()
