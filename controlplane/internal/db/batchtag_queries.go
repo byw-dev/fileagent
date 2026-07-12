@@ -76,8 +76,11 @@ func (q *Queries) BatchSetFileTag(ctx context.Context, p BatchSetFileTagParams) 
 	auditSrcPos := len(args)
 
 	// `before` snapshots each selected file's current value for Key (CTEs read the
-	// pre-update snapshot), so audit old_value is accurate and the change filter
-	// (old IS DISTINCT FROM new) skips unchanged files.
+	// pre-update snapshot) so audit old_value is accurate. The upsert writes a row
+	// only when the value OR the source actually changes — so a batch-tag also
+	// claims an already-same-value tag as manual — and its RETURNING drives both
+	// the audit rows and the returned count, keeping them in step. Unchanged files
+	// (same value AND source) are skipped, so re-runs are no-ops.
 	query := fmt.Sprintf(`WITH %s,
 before AS (
     SELECT s.id AS fid, ft.value AS old_value
@@ -89,13 +92,14 @@ upsert AS (
     SELECT id, $%d, $%d, $%d FROM sel
     ON CONFLICT (file_entry_id, key) DO UPDATE SET value = EXCLUDED.value, source = EXCLUDED.source
         WHERE file_tags.value IS DISTINCT FROM EXCLUDED.value
+           OR file_tags.source IS DISTINCT FROM EXCLUDED.source
+    RETURNING file_entry_id AS fid
 )
 INSERT INTO tag_audit (org_id, file_entry_id, key, old_value, new_value, action, actor_user_id, source)
-SELECT $1, b.fid, $%d, b.old_value, $%d, $%d, $%d, $%d
-FROM before b
-WHERE b.old_value IS DISTINCT FROM $%d`,
+SELECT $1, u.fid, $%d, b.old_value, $%d, $%d, $%d, $%d
+FROM upsert u JOIN before b ON b.fid = u.fid`,
 		sel, keyPos, keyPos, valPos, srcPos,
-		keyPos, valPos, actionPos, actorPos, auditSrcPos, valPos)
+		keyPos, valPos, actionPos, actorPos, auditSrcPos)
 
 	res, err := q.db.ExecContext(ctx, query, args...)
 	if err != nil {

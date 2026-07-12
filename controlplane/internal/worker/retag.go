@@ -225,7 +225,11 @@ func batchFilter(orgID uuid.UUID, f retag.BatchTagFilter) (db.BatchTagFilter, er
 		return out, fmt.Errorf("file_type_id: %w", err)
 	}
 	if f.Status != "" {
-		out.Status = db.NullFileStatus{FileStatus: db.FileStatus(f.Status), Valid: true}
+		st := db.FileStatus(f.Status)
+		if !st.Valid() {
+			return out, fmt.Errorf("invalid status %q", f.Status)
+		}
+		out.Status = db.NullFileStatus{FileStatus: st, Valid: true}
 	}
 	for _, t := range f.Tags {
 		out.Tags = append(out.Tags, db.FileTagFilter{Key: t.Key, Value: t.Value})

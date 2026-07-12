@@ -297,6 +297,22 @@ func TestRetag_BatchTag_BadFilterUUID_MarksFailed(t *testing.T) {
 	assert.Empty(t, m.batchSetParams) // never reached the apply
 }
 
+func TestRetag_BatchTag_InvalidStatus_MarksFailed(t *testing.T) {
+	// A corrupted spec status is rejected defensively rather than failing at the
+	// SQL enum cast.
+	org := uuid.New()
+	spec := retag.BatchTagSpec{
+		Filter: retag.BatchTagFilter{Status: "bogus"},
+		Tags:   map[string]*string{"vendor": strptr("omron")},
+	}
+	m := &mockRetagDB{queue: []*db.RetagJob{batchJob(t, org, spec)}}
+	w := NewRetagWorker(m, zap.NewNop())
+	w.DrainOnce(context.Background())
+	assert.True(t, m.failCalled)
+	assert.Contains(t, m.failedMsg, "invalid status")
+	assert.Empty(t, m.batchSetParams)
+}
+
 func TestRetag_BatchTag_BadSpec_MarksFailed(t *testing.T) {
 	job := &db.RetagJob{ID: uuid.New(), OrgID: uuid.New(), Kind: retag.KindBatchTag, Spec: json.RawMessage(`{bad`)}
 	m := &mockRetagDB{queue: []*db.RetagJob{job}}

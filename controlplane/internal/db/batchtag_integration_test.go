@@ -50,13 +50,18 @@ func TestBatchTagQueries_Integration(t *testing.T) {
 		require.NoError(t, err)
 		return id
 	}
-	mkFile("a/1", "tokyo")
+	f1 := mkFile("a/1", "tokyo")
 	mkFile("a/2", "tokyo")
 	mkFile("a/3", "osaka")
+	// f1 already carries vendor=omron from path extraction: the batch set must
+	// still claim it as manual (source-only change), counting + auditing it.
+	_, err = raw.ExecContext(ctx,
+		`INSERT INTO file_tags (file_entry_id, key, value, source) VALUES ($1,'vendor','omron','path_var')`, f1)
+	require.NoError(t, err)
 
 	tokyoFilter := BatchTagFilter{OrgID: org, Tags: []FileTagFilter{{Key: "site", Value: "tokyo"}}}
 
-	// Batch set vendor=omron on site:tokyo files → f1, f2 only.
+	// Batch set vendor=omron on site:tokyo files → f1 (source flip) + f2 (insert).
 	n, err := q.BatchSetFileTag(ctx, BatchSetFileTagParams{
 		Filter: tokyoFilter, Key: "vendor", Value: "omron",
 		Source: "manual", Action: "set", AuditSource: "manual",
@@ -72,6 +77,12 @@ func TestBatchTagQueries_Integration(t *testing.T) {
 		return c
 	}
 	assert.Equal(t, 2, countVendor("omron")) // f1, f2 tagged; f3 (osaka) not
+
+	// f1's source was rewritten from path_var to manual by the batch operation.
+	var f1Source string
+	require.NoError(t, raw.QueryRowContext(ctx,
+		`SELECT source FROM file_tags WHERE file_entry_id=$1 AND key='vendor'`, f1).Scan(&f1Source))
+	assert.Equal(t, "manual", f1Source)
 
 	var auditSet int
 	require.NoError(t, raw.QueryRowContext(ctx,
