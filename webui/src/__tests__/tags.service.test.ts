@@ -41,25 +41,26 @@ describe('services/tags', () => {
     expect(result.key).toBe('site')
   })
 
-  it('updateTagKey PATCHes the key path (key-encoded)', async () => {
-    mockPatch.mockResolvedValue({ data: { key: 'site', label: 'New' } })
+  it('updateTagKey PATCHes the encoded key path', async () => {
+    mockPatch.mockResolvedValue({ data: { key: 'a/b', label: 'New' } })
     const { updateTagKey } = await import('../services/tags')
-    await updateTagKey('site', { label: 'New' })
-    expect(mockPatch).toHaveBeenCalledWith('/api/v1/tag-keys/site', { label: 'New' })
+    // A key with a reserved char proves encodeURIComponent is applied.
+    await updateTagKey('a/b', { label: 'New' })
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/tag-keys/a%2Fb', { label: 'New' })
   })
 
-  it('deleteTagKey DELETEs the key path', async () => {
+  it('deleteTagKey DELETEs the encoded key path', async () => {
     mockDelete.mockResolvedValue({ data: {} })
     const { deleteTagKey } = await import('../services/tags')
-    await deleteTagKey('site')
-    expect(mockDelete).toHaveBeenCalledWith('/api/v1/tag-keys/site')
+    await deleteTagKey('a/b')
+    expect(mockDelete).toHaveBeenCalledWith('/api/v1/tag-keys/a%2Fb')
   })
 
-  it('listTagValues unwraps items for a key', async () => {
+  it('listTagValues unwraps items for a key (encoded)', async () => {
     mockGet.mockResolvedValue({ data: { items: [{ id: 'v1', value: 'tokyo' }], total: 1 } })
     const { listTagValues } = await import('../services/tags')
-    const result = await listTagValues('site')
-    expect(mockGet).toHaveBeenCalledWith('/api/v1/tag-keys/site/values')
+    const result = await listTagValues('a/b')
+    expect(mockGet).toHaveBeenCalledWith('/api/v1/tag-keys/a%2Fb/values')
     expect(result[0].value).toBe('tokyo')
   })
 

@@ -285,6 +285,7 @@ function ValuesPanel({ keyName, canWrite }: { keyName: string; canWrite: boolean
   }, [error, message])
 
   const add = async () => {
+    if (adding) return // guard against repeated Enter presses / double-submit
     const v = newValue.trim()
     if (!v) return
     setAdding(true)
