@@ -73,3 +73,34 @@ ON CONFLICT (tag_key_id, value) DO NOTHING;
 
 -- name: DeletePendingTagValue :execrows
 DELETE FROM pending_tag_values WHERE id = $1 AND org_id = $2;
+
+-- name: GetFileTagValue :one
+SELECT value FROM file_tags WHERE file_entry_id = $1 AND key = $2 LIMIT 1;
+
+-- name: SetFileTag :exec
+INSERT INTO file_tags (file_entry_id, key, value, source)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (file_entry_id, key) DO UPDATE SET value = EXCLUDED.value, source = EXCLUDED.source;
+
+-- name: DeleteFileTag :execrows
+DELETE FROM file_tags WHERE file_entry_id = $1 AND key = $2;
+
+-- name: TagValueExists :one
+SELECT EXISTS (SELECT 1 FROM tag_values WHERE tag_key_id = $1 AND value = $2);
+
+-- name: FindSimilarTagValue :one
+SELECT value FROM tag_values WHERE tag_key_id = $1 AND lower(value) = lower($2) LIMIT 1;
+
+-- name: UpsertPendingTagValueManual :exec
+-- Bump hit_count on repeat sightings, and backfill suggested_value if a
+-- case-insensitive match was found this time but the existing queue row had none
+-- (e.g. the matching tag_value was created after the row was first queued).
+INSERT INTO pending_tag_values (org_id, tag_key_id, extracted_value, source, suggested_value)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (tag_key_id, extracted_value) DO UPDATE SET
+    hit_count = pending_tag_values.hit_count + 1,
+    suggested_value = COALESCE(pending_tag_values.suggested_value, EXCLUDED.suggested_value);
+
+-- name: CreateTagAudit :exec
+INSERT INTO tag_audit (org_id, file_entry_id, key, old_value, new_value, action, actor_user_id, source)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8);

@@ -1033,6 +1033,19 @@ MT-4a 端点（sqlc `tags.sql` + `handler/tagkeys.go`，注入 `RouterConfig.Tag
   删取值不动已打标文件（仅阻止后续采集/选用，设计原则）。删 key 级联删其 `tag_values`/`file_tags`（schema `ON DELETE CASCADE`）。
 - 创建 key 的布尔标志用指针区分「未传」与 `false`，未传取 schema 默认（`value_controlled=true`/`allow_path_var=true`/`required_at_collection=false`）。
 
+### 落地记录（MT-4c，手动单文件打标）
+
+`handler/filetags.go` + sqlc（`GetFileTagValue`/`SetFileTag`/`DeleteFileTag`/`TagValueExists`/`FindSimilarTagValue`/
+`UpsertPendingTagValueManual`/`CreateTagAudit`）+ 注入 `RouterConfig.FileTagsDB`：
+- `PUT /api/v1/files/{id}/tags`（**super_admin**），body `{"tags":{"site":"tokyo","vendor":null}}`——string=set，null=clear，
+  key 缺省=不动。source=`manual`，每次改写 `tag_audit`（action=`set`/`clear`，`actor_user_id`=调用者）。
+- **前置校验**（改动前一次性）：文件属调用者 org（跨 org→404）；set-key 必须**格式合法且已登记** tag_key
+  （honoring「key 严格受控」，未登记→400 `UNKNOWN_TAG_KEY`）；value 非空且 ≤128 rune。clear 不要求登记（
+  路径变量可能给未登记 key 打过标，需可清）。校验全过再逐 key 应用（**顺序非事务**，仅基础设施错误才半应用）。
+- **治理一致**：受控 key 的未登记值除照写 file_tag 外入 `pending_tag_values`（source=`manual`，suggested=大小写近似），
+  不绕过词表——与 path_var 同。响应 200 返回 `{set, cleared, tags}`（tags=改后该文件全量标签）。
+- 真 PG 验证 set（file_tag+audit+pending）+ clear（删+audit，共 2 审计行）。
+
 ### 落地记录（MT-4b，待确认取值队列 list/approve/reject）
 
 `handler/pendingtags.go` + sqlc（`ListPendingTagValues` join `tag_keys` 出 key 名、`GetPendingTagValue`、
