@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { toRuleMetadata, metadataToFormFields } from '../pages/Agents/ruleMetadata'
+import { toRuleMetadata, metadataToFormFields, PATH_VAR_RE } from '../pages/Agents/ruleMetadata'
 
 describe('RuleForm metadata conversion', () => {
   it('toRuleMetadata builds the metadata object, trimming keys/values and dropping empties', () => {
@@ -39,6 +39,15 @@ describe('RuleForm metadata conversion', () => {
     expect(fields.file_type).toBe('')
     expect(fields.static_tags).toEqual([])
     expect(fields.path_tag_map).toEqual([])
+  })
+
+  it('PATH_VAR_RE accepts a single {var} / {var:fmt} and rejects other forms', () => {
+    expect(PATH_VAR_RE.test('{site}')).toBe(true)
+    expect(PATH_VAR_RE.test('{time:yyyy/MM/dd}')).toBe(true)
+    expect(PATH_VAR_RE.test('site')).toBe(false) // no braces
+    expect(PATH_VAR_RE.test('{site}/{x}')).toBe(false) // more than one variable
+    expect(PATH_VAR_RE.test('prefix-{site}')).toBe(false) // extra text
+    expect(PATH_VAR_RE.test('{}')).toBe(false) // empty
   })
 
   it('round-trips metadata through form fields and back', () => {

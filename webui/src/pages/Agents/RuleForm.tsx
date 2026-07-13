@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
+import useSWR from 'swr'
 import {
   App,
   Typography,
@@ -22,7 +23,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { createRule, updateRule, listRules, testRule } from '../../services/agents'
 import type { CollectionMode, TestRuleFileResult } from '../../services/agents'
 import { listTagKeys } from '../../services/tags'
-import { toRuleMetadata, metadataToFormFields } from './ruleMetadata'
+import { toRuleMetadata, metadataToFormFields, PATH_VAR_RE } from './ruleMetadata'
 import type { StaticTagRow, PathTagRow } from './ruleMetadata'
 import apiClient from '../../services/api'
 import {
@@ -75,12 +76,6 @@ interface RuleFormValues {
   path_tag_map?: PathTagRow[]
 }
 
-/** Load tag keys as select options (shared by the static-tags / path-map rows). */
-async function tagKeyOptions() {
-  const keys = await listTagKeys()
-  return keys.map((k) => ({ label: `${k.key}（${k.label}）`, value: k.key }))
-}
-
 /**
  * Agent rule creation form — 3-step ProForm.
  * Step 1: Basic config (name, mode, target bucket).
@@ -110,6 +105,23 @@ function AgentRuleFormPage() {
   const isEdit = Boolean(rid)
   const navigate = useNavigate()
   const { message } = App.useApp()
+
+  // Load the tag-key vocabulary once (SWR-cached) rather than per-select. Static
+  // tags may use any key; path-tag-map only keys that allow path-variable mapping
+  // (the indexer skips allow_path_var=false keys, so offering them would create a
+  // rule that silently does nothing).
+  const { data: tagKeys = [] } = useSWR('tag-keys', listTagKeys)
+  const staticKeyOptions = useMemo(
+    () => tagKeys.map((k) => ({ label: `${k.key}（${k.label}）`, value: k.key })),
+    [tagKeys],
+  )
+  const pathKeyOptions = useMemo(
+    () =>
+      tagKeys
+        .filter((k) => k.allow_path_var)
+        .map((k) => ({ label: `${k.key}（${k.label}）`, value: k.key })),
+    [tagKeys],
+  )
 
   // In edit mode the existing rule is fetched before rendering the form so the
   // steps can be prefilled; creation starts from DEFAULT_VALUES immediately.
@@ -611,7 +623,7 @@ function AgentRuleFormPage() {
                 placeholder="标签键"
                 width="sm"
                 showSearch
-                request={tagKeyOptions}
+                options={staticKeyOptions}
                 rules={[{ required: true, message: '请选择标签键' }]}
               />
               <ProFormText
@@ -625,7 +637,7 @@ function AgentRuleFormPage() {
           <ProFormList
             name="path_tag_map"
             label="路径标签映射"
-            tooltip="把上传路径模板中的变量映射到标签键，例如变量 {site} → 标签键 site"
+            tooltip="把上传路径模板中的变量映射到标签键，例如变量 {site} → 标签键 site（仅列出允许路径变量的键）"
             creatorButtonProps={{ creatorButtonText: '添加路径标签' }}
             copyIconProps={false}
           >
@@ -635,14 +647,17 @@ function AgentRuleFormPage() {
                 placeholder="标签键"
                 width="sm"
                 showSearch
-                request={tagKeyOptions}
+                options={pathKeyOptions}
                 rules={[{ required: true, message: '请选择标签键' }]}
               />
               <ProFormText
                 name="template"
                 placeholder="路径变量，例如 {site}"
                 width="md"
-                rules={[{ required: true, whitespace: true, message: '请输入路径变量' }]}
+                rules={[
+                  { required: true, whitespace: true, message: '请输入路径变量' },
+                  { pattern: PATH_VAR_RE, message: '需为单个模板变量，例如 {site} 或 {site:fmt}' },
+                ]}
               />
             </Space>
           </ProFormList>

@@ -1,5 +1,9 @@
 import type { RuleMetadata } from '../../services/agents'
 
+/** A path-tag-map template must be a single trollsift variable — {var} or
+ * {var:fmt}. The indexer ignores any other form, so it is validated up front. */
+export const PATH_VAR_RE = /^\{[a-zA-Z_][a-zA-Z0-9_]*(:[^{}]+)?\}$/
+
 /** One static-tag row in the rule form (a fixed key→value applied to every file). */
 export interface StaticTagRow {
   key: string
