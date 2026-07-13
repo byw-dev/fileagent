@@ -97,7 +97,6 @@ export async function renameAgent(id: string, name: string): Promise<Agent> {
 /** Collection mode for a rule */
 export type CollectionMode = 'WATCH' | 'SCHEDULED'
 
-/** Collection rule entity */
 /** Rule metadata declaration (metadata 6c) stored in collection_rules.metadata.
  * file_type = declared coarse type (overrides glob); static_tags = fixed tags on
  * every collected file; path_tag_map = tag key → path-template variable. */
@@ -107,6 +106,7 @@ export interface RuleMetadata {
   path_tag_map?: Record<string, string>
 }
 
+/** Collection rule entity */
 export interface CollectionRule {
   id: string
   agent_id: string
