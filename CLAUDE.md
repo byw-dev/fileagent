@@ -333,8 +333,9 @@ docker compose -f deploy/docker-compose.test.yml down -v
 **上一 track 已收官（2026-07-14）**：**元数据 6c Phase 1**（受控标签，MT-1…MT-6，PR #69–#79）——全链路完成
 （迁移 5 表 + `retag_jobs` → indexer 打标 → 词表/待确认/单文件·批量打标 API → 回溯 worker → 四屏 UI 7a–7d）。
 追踪 `docs/tasks/metadata-phase1.md`，落地 `DECISIONS.md` D-025 各「落地记录」，架构回填 `system-design.md` §3.3.8/§5.8。
-**当前 track：待定**——候选：恢复 **Web UI 重做（WR-2…10）**（之前为 Phase 1 让位暂停，WR-1 地基已合并可复用，见
-`docs/tasks/webui-redesign-impl.md`）／可选 **proto→buf** 复现性 follow-up ／ Phase 2（数据集/血缘，按信号触发）。
+**当前 track（2026-07-14 拍板）**：恢复 **Web UI 重做（WR-2…10）**——纯前端统一既有页面视觉/交互，WR-1 地基已合并可复用。
+追踪 `docs/tasks/webui-redesign-impl.md`（含 2026-07-14 规格校准：规则表单保留整页 4 步、Phase-1 元数据 4 屏折入 WR-3/4/8）。
+顺序 WR-2 样板页 → WR-9 → WR-5/6/7 → WR-3/4/8 → WR-10。未排期：proto→buf ／ Phase 2（按信号触发）。
 
 **已按产品决策推后**（2026-07-04）：**T3-3（Python SDK）/ T4-4（Java SDK）**——暂无消费方；
 契约单一权威/OpenAPI 校验（G-8/G-9）、结构性文档重构（design 去重指针化、CLAUDE.md 减肥）、
