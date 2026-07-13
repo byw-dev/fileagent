@@ -16,7 +16,7 @@ import { ProTable } from '@ant-design/pro-components'
 import type { ProColumns, ActionType } from '@ant-design/pro-components'
 import { useNavigate } from 'react-router-dom'
 import useSWR from 'swr'
-import { listFiles, getFileDownloadUrl, batchTagFiles } from '../../services/files'
+import { listFiles, getFileDownloadUrl, batchTagFiles, FILE_STATUS_COLOR } from '../../services/files'
 import type { FileEntry, BatchTagFilter, FileStatusFilter } from '../../services/files'
 import { listTagKeys, listTagValues } from '../../services/tags'
 import useAuthStore from '../../store/auth'
@@ -76,13 +76,15 @@ function FilesPage() {
     }
   }
 
+  // Only update state; the table re-requests via its `params` prop (which
+  // includes filterRange). A manual reload here would fire an extra request with
+  // the previous range read from the stale closure.
   const handleRangeChange: RangePickerProps['onChange'] = (_, dateStrings) => {
     if (dateStrings[0] && dateStrings[1]) {
       setFilterRange([dateStrings[0], dateStrings[1]])
     } else {
       setFilterRange(null)
     }
-    actionRef.current?.reload()
   }
 
   // The table re-requests when the `params` prop (which includes filterTags)
@@ -141,15 +143,9 @@ function FilesPage() {
       dataIndex: 'status',
       key: 'status',
       width: 90,
-      render: (_, file) => {
-        const colorMap: Record<string, string> = {
-          COMPLETED: 'green',
-          UPLOADING: 'gold',
-          FAILED: 'red',
-          DELETED: 'default',
-        }
-        return <Tag color={colorMap[file.status] ?? 'default'}>{file.status}</Tag>
-      },
+      render: (_, file) => (
+        <Tag color={FILE_STATUS_COLOR[file.status] ?? 'default'}>{file.status}</Tag>
+      ),
     },
     {
       title: '上传时间',
@@ -183,23 +179,20 @@ function FilesPage() {
           prefix={<SearchOutlined />}
           value={filterFilename}
           onChange={(e) => setFilterFilename(e.target.value)}
-          onPressEnter={() => actionRef.current?.reload()}
           style={{ width: 200 }}
           allowClear
         />
         <Select
           value={filterStatus}
-          onChange={(v) => {
-            setFilterStatus(v)
-            actionRef.current?.reload()
-          }}
+          onChange={setFilterStatus}
           options={STATUS_OPTIONS}
           style={{ width: 120 }}
           placeholder="状态筛选"
         />
         <RangePicker showTime={false} onChange={handleRangeChange} placeholder={['开始日期', '结束日期']} />
         <TagFacetPicker onAdd={addTagFilter} />
-        <BatchDownload fileIds={selectedRowKeys as string[]} />
+        {/* rowKey is the string `id`; convert explicitly rather than casting. */}
+        <BatchDownload fileIds={selectedRowKeys.map(String)} />
         {isSuperAdmin && (
           <Button icon={<TagsOutlined />} onClick={() => setBatchOpen(true)}>
             批量打标

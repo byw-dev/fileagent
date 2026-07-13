@@ -24,6 +24,15 @@ export interface FileEntry {
   tags?: Record<string, string>
 }
 
+/** AntD Tag colors for each (uppercased) file status. Single source of truth so
+ * the list and detail pages stay in sync with the FileEntry.status enum. */
+export const FILE_STATUS_COLOR: Record<FileEntry['status'], string> = {
+  COMPLETED: 'green',
+  UPLOADING: 'gold',
+  FAILED: 'red',
+  DELETED: 'default',
+}
+
 /** Query parameters for listing files */
 export interface ListFilesParams {
   agent_id?: string
