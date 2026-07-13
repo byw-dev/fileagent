@@ -37,9 +37,9 @@ Phase 4  完善与收尾    🔄 进行中（D-022 单二进制#60、D-023 迁�
 > **进度补充（2026-07-07）**：T3-x 主线后插入并收官了止血冲刺（G-1…G-5）与 core-completeness 冲刺
 > （CC-1…CC-10，CC-3 推后）；其后 Phase 4 收尾 D-022…D-025 均已合并（详见 `docs/tasks/changelog.md`）。
 >
-> **当前 track（2026-07-10）**：**元数据 6c Phase 1 实现**（MT-1…MT-6，追踪
-> `docs/tasks/metadata-phase1.md`）；Web UI 重做 WR-2…10 暂停（WR-1 已合并 #66/#67，见
-> `docs/tasks/webui-redesign-impl.md`）。当前态见 `docs/tasks/active.md`。
+> **元数据 6c Phase 1 已收官（2026-07-14）**：MT-1…MT-6 全部合并（PR #69–#79），追踪
+> `docs/tasks/metadata-phase1.md`。**下一 track 待定**：恢复 Web UI 重做 WR-2…10（暂停中，WR-1 已合并
+> #66/#67，见 `docs/tasks/webui-redesign-impl.md`）／ proto→buf ／ Phase 2（按信号）。当前态见 `docs/tasks/active.md`。
 
 ### Phase 3 任务明细（T3-x 主线，2026-05-12）
 

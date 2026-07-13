@@ -479,11 +479,13 @@ CREATE TABLE file_entries (
 );
 ```
 
-> **文件元数据 / 标签模型（6c，Phase 1，已拍板 D-025 · 待实现）**：在 `file_types`（粗分类，降级为兜底）之上
+> **文件元数据 / 标签模型（6c，Phase 1 · 已实现，D-025，PR #69–#79）**：在 `file_types`（粗分类，降级为兜底）之上
 > 引入**受控标签**——`tag_keys` 词表 / `tag_values` 受控取值 / `file_tags`（文件↔key:value）/ `pending_tag_values`
-> 待确认队列 / `tag_audit`。规则在 `collection_rules.metadata` 声明 `file_type + static_tags + path_tag_map`，CP 在
-> 索引阶段打标（不改 agent/proto）。**Phase 2（数据集注册表）暂缓**。完整数据模型与 DDL 草案见
-> [`metadata-model.md`](./metadata-model.md)。
+> 待确认队列 / `tag_audit` 审计（迁移 `000004`），及回溯任务 outbox `retag_jobs`（迁移 `000005`）。规则在
+> `collection_rules.metadata` 声明 `file_type + static_tags + path_tag_map`，CP 在索引阶段打标（不改 agent/proto）。
+> 治理：**key 严格受控、value 受控可扩**，路径变量抽到的未登记值进待确认队列，核准/并入/拒绝后才进筛选器与规则可选项。
+> **Phase 2（数据集注册表 / 衍生数据 / 血缘 run 模型）设计留存、按信号触发**。完整数据模型 DDL 见
+> [`metadata-model.md`](./metadata-model.md)，落地细节见 `DECISIONS.md` D-025 各「落地记录」。
 
 ### 3.3.9 上传日志表
 
@@ -1403,10 +1405,12 @@ func (e *FileIndexer) HandleUploadResult(result *UploadResult) error {
 }
 ```
 
-> **打标引擎（6c，Phase 1，D-025 · 待实现）**：本引擎将在 `UpsertFileEntry` 后追加打标——从规则 `metadata`
-> 写静态标签、按 `path_tag_map` 从 storage path 用 trollsift 变量抽取路径标签（未登记值进 `pending_tag_values`
-> 待确认队列），幂等写入 `file_tags`；`matchFileType` 改为**规则声明类型优先、glob 兜底**。REST 侧文件查询增
-> 可重复 `tag` 谓词筛选（保持 cursor 分页）。设计见 [`metadata-model.md`](./metadata-model.md)。
+> **打标引擎（6c，Phase 1 · 已实现，D-025，PR #69–#75）**：`internal/indexer` 在 `UpsertFileEntry` 后打标——从规则
+> `metadata` 写静态标签（source=`rule_static`）、按 `path_tag_map` 从 storage path 用 trollsift 反解抽取路径标签
+> （source=`path_var`，未登记值进 `pending_tag_values` 待确认队列），幂等写入 `file_tags`；classifier 改为**规则声明
+> 类型优先、glob 兜底**。REST 侧：文件查询增可重复 `tag` 谓词筛选（保持 cursor 分页）；词表 CRUD、待确认队列
+> approve/merge/reject、单文件 `PUT /files/{id}/tags` 与 `POST /files/batch-tag`（super_admin）；merge / batch-tag 走
+> 回溯 worker（`worker.RetagWorker` 消费 `retag_jobs`）异步改写 + 审计。设计见 [`metadata-model.md`](./metadata-model.md)。
 
 ## 5.9 事件规则引擎
 
