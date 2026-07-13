@@ -618,7 +618,7 @@ function AgentRuleFormPage() {
                 name="value"
                 placeholder="取值（未登记的受控取值将入待确认队列）"
                 width="md"
-                rules={[{ required: true, message: '请输入取值' }]}
+                rules={[{ required: true, whitespace: true, message: '请输入取值' }]}
               />
             </Space>
           </ProFormList>
@@ -642,7 +642,7 @@ function AgentRuleFormPage() {
                 name="template"
                 placeholder="路径变量，例如 {site}"
                 width="md"
-                rules={[{ required: true, message: '请输入路径变量' }]}
+                rules={[{ required: true, whitespace: true, message: '请输入路径变量' }]}
               />
             </Space>
           </ProFormList>

@@ -27,13 +27,17 @@ export function toRuleMetadata(values: RuleMetadataFields): RuleMetadata {
 
   const staticTags: Record<string, string> = {}
   for (const row of values.static_tags ?? []) {
-    if (row?.key && row.value?.trim()) staticTags[row.key] = row.value.trim()
+    const key = row?.key?.trim()
+    const value = row?.value?.trim()
+    if (key && value) staticTags[key] = value
   }
   if (Object.keys(staticTags).length > 0) meta.static_tags = staticTags
 
   const pathMap: Record<string, string> = {}
   for (const row of values.path_tag_map ?? []) {
-    if (row?.key && row.template?.trim()) pathMap[row.key] = row.template.trim()
+    const key = row?.key?.trim()
+    const template = row?.template?.trim()
+    if (key && template) pathMap[key] = template
   }
   if (Object.keys(pathMap).length > 0) meta.path_tag_map = pathMap
 

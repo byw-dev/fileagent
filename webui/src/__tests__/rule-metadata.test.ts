@@ -2,15 +2,15 @@ import { describe, it, expect } from 'vitest'
 import { toRuleMetadata, metadataToFormFields } from '../pages/Agents/ruleMetadata'
 
 describe('RuleForm metadata conversion', () => {
-  it('toRuleMetadata builds the metadata object, trimming and dropping empties', () => {
+  it('toRuleMetadata builds the metadata object, trimming keys/values and dropping empties', () => {
     const meta = toRuleMetadata({
       file_type: '  pressure  ',
       static_tags: [
-        { key: 'vendor', value: ' omron ' },
-        { key: 'bad', value: '   ' }, // dropped: empty value
-        { key: '', value: 'x' }, // dropped: no key
+        { key: ' vendor ', value: ' omron ' }, // key + value both trimmed
+        { key: 'bad', value: '   ' }, // dropped: whitespace-only value
+        { key: '  ', value: 'x' }, // dropped: whitespace-only key
       ],
-      path_tag_map: [{ key: 'site', template: '{site}' }],
+      path_tag_map: [{ key: ' site ', template: ' {site} ' }],
     })
     expect(meta).toEqual({
       file_type: 'pressure',
