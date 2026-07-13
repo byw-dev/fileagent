@@ -49,7 +49,10 @@ export function toRuleMetadata(values: RuleMetadataFields): RuleMetadata {
   const meta: RuleMetadata = {}
   if (values.file_type?.trim()) meta.file_type = values.file_type.trim()
 
-  const staticTags: Record<string, string> = {}
+  // Null-prototype maps: keys come from tenant-controlled data, so assigning a
+  // key like `__proto__` must create an own property rather than touch the
+  // prototype (prototype-pollution hardening). JSON serialization is unaffected.
+  const staticTags: Record<string, string> = Object.create(null)
   for (const row of values.static_tags ?? []) {
     const key = row?.key?.trim()
     const value = row?.value?.trim()
@@ -57,7 +60,7 @@ export function toRuleMetadata(values: RuleMetadataFields): RuleMetadata {
   }
   if (Object.keys(staticTags).length > 0) meta.static_tags = staticTags
 
-  const pathMap: Record<string, string> = {}
+  const pathMap: Record<string, string> = Object.create(null)
   for (const row of values.path_tag_map ?? []) {
     const key = row?.key?.trim()
     const template = row?.template?.trim()
