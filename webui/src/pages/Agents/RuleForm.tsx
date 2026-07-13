@@ -57,7 +57,7 @@ interface Bucket {
   name: string
 }
 
-/** Flat form values merged by StepsForm.onFinish across all 3 steps. */
+/** Flat form values merged by StepsForm.onFinish across all 4 steps. */
 interface RuleFormValues {
   name: string
   mode: CollectionMode
@@ -77,10 +77,11 @@ interface RuleFormValues {
 }
 
 /**
- * Agent rule creation form — 3-step ProForm.
+ * Agent rule creation form — 4-step ProForm.
  * Step 1: Basic config (name, mode, target bucket).
  * Step 2: Source path config (Watch vs Scheduled fields differ).
  * Step 3: Upload path template with live preview.
+ * Step 4: Metadata (6c) — declared file type + static/path-derived tags.
  */
 /** Default form values used for creation and as the base for editing. */
 const DEFAULT_VALUES: RuleFormValues = {

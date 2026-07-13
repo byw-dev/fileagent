@@ -52,13 +52,13 @@ export function toRuleMetadata(values: RuleMetadataFields): RuleMetadata {
  * sorted by key so the display is deterministic regardless of the source object's
  * key order (e.g. Go map marshaling), avoiding noisy edit/save churn. */
 export function metadataToFormFields(meta?: RuleMetadata): Required<RuleMetadataFields> {
-  const byKey = <T,>(o: Record<string, T>, make: (k: string, v: T) => unknown) =>
+  const byKey = <R>(o: Record<string, string>, make: (key: string, value: string) => R): R[] =>
     Object.keys(o)
       .sort()
       .map((k) => make(k, o[k]))
   return {
     file_type: meta?.file_type ?? '',
-    static_tags: byKey(meta?.static_tags ?? {}, (key, value) => ({ key, value })) as StaticTagRow[],
-    path_tag_map: byKey(meta?.path_tag_map ?? {}, (key, template) => ({ key, template })) as PathTagRow[],
+    static_tags: byKey(meta?.static_tags ?? {}, (key, value) => ({ key, value })),
+    path_tag_map: byKey(meta?.path_tag_map ?? {}, (key, template) => ({ key, template })),
   }
 }
