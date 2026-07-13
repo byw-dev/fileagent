@@ -1,6 +1,11 @@
 import apiClient from './api'
 
-/** File entry entity */
+/** The raw file_status enum used by status filters and batch selection. The
+ * backend casts these to the file_status enum, so they must be lowercase. Note
+ * the file *response* uppercases them (see FileEntry.status). */
+export type FileStatusFilter = 'uploading' | 'completed' | 'failed' | 'deleted'
+
+/** File entry entity. `status` is the uppercased form the API returns. */
 export interface FileEntry {
   id: string
   agent_id: string
@@ -12,7 +17,7 @@ export interface FileEntry {
   size: number
   sha256: string
   mime_type: string
-  status: 'PENDING' | 'INDEXED' | 'ERROR'
+  status: 'UPLOADING' | 'COMPLETED' | 'FAILED' | 'DELETED'
   uploaded_at: string
   indexed_at?: string | null
   /** Controlled tags attached to the file (metadata 6c), key → value. */
@@ -24,7 +29,7 @@ export interface ListFilesParams {
   agent_id?: string
   file_type_id?: string
   bucket_id?: string
-  status?: string
+  status?: FileStatusFilter
   cursor?: string
   limit?: number
   filename?: string
@@ -60,7 +65,7 @@ export interface BatchTagFilter {
   agent_id?: string
   bucket_id?: string
   file_type_id?: string
-  status?: string
+  status?: FileStatusFilter
   tags?: string[]
 }
 

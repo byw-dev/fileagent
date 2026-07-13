@@ -17,7 +17,7 @@ import type { ProColumns, ActionType } from '@ant-design/pro-components'
 import { useNavigate } from 'react-router-dom'
 import useSWR from 'swr'
 import { listFiles, getFileDownloadUrl, batchTagFiles } from '../../services/files'
-import type { FileEntry, BatchTagFilter } from '../../services/files'
+import type { FileEntry, BatchTagFilter, FileStatusFilter } from '../../services/files'
 import { listTagKeys, listTagValues } from '../../services/tags'
 import useAuthStore from '../../store/auth'
 import BatchDownload from '../../components/BatchDownload'
@@ -34,11 +34,14 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`
 }
 
-const STATUS_OPTIONS = [
+// Values are the raw file_status enum the backend filter expects (lowercase);
+// the table renders the uppercased form the API returns.
+const STATUS_OPTIONS: { label: string; value: FileStatusFilter | '' }[] = [
   { label: '全部', value: '' },
-  { label: '已索引', value: 'INDEXED' },
-  { label: '待处理', value: 'PENDING' },
-  { label: '错误', value: 'ERROR' },
+  { label: '已完成', value: 'completed' },
+  { label: '上传中', value: 'uploading' },
+  { label: '失败', value: 'failed' },
+  { label: '已删除', value: 'deleted' },
 ]
 
 /**
@@ -53,7 +56,7 @@ function FilesPage() {
   const { message } = App.useApp()
 
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
-  const [filterStatus, setFilterStatus] = useState('')
+  const [filterStatus, setFilterStatus] = useState<FileStatusFilter | ''>('')
   const [filterFilename, setFilterFilename] = useState('')
   const [filterRange, setFilterRange] = useState<[string, string] | null>(null)
   const [filterTags, setFilterTags] = useState<string[]>([])
@@ -82,15 +85,20 @@ function FilesPage() {
     actionRef.current?.reload()
   }
 
+  // The table re-requests when the `params` prop (which includes filterTags)
+  // changes, so these only update state — a manual reload here would fire an
+  // extra request with the stale filter first.
   const addTagFilter = (kv: string) => {
-    if (!filterTags.includes(kv)) {
-      setFilterTags([...filterTags, kv])
-      actionRef.current?.reload()
-    }
+    const key = kv.slice(0, kv.indexOf(':'))
+    setFilterTags((prev) => {
+      // Two values for the same key can never both match (AND semantics) and the
+      // backend rejects it, so replace any existing predicate for this key.
+      const others = prev.filter((t) => t.slice(0, t.indexOf(':')) !== key)
+      return [...others, kv]
+    })
   }
   const removeTagFilter = (kv: string) => {
-    setFilterTags(filterTags.filter((t) => t !== kv))
-    actionRef.current?.reload()
+    setFilterTags((prev) => prev.filter((t) => t !== kv))
   }
 
   const columns: ProColumns<FileEntry>[] = [
@@ -134,7 +142,12 @@ function FilesPage() {
       key: 'status',
       width: 90,
       render: (_, file) => {
-        const colorMap: Record<string, string> = { INDEXED: 'green', PENDING: 'gold', ERROR: 'red' }
+        const colorMap: Record<string, string> = {
+          COMPLETED: 'green',
+          UPLOADING: 'gold',
+          FAILED: 'red',
+          DELETED: 'default',
+        }
         return <Tag color={colorMap[file.status] ?? 'default'}>{file.status}</Tag>
       },
     },
@@ -311,7 +324,7 @@ function BatchTagModal({
   onDone,
 }: {
   open: boolean
-  status: string
+  status: FileStatusFilter | ''
   tags: string[]
   onClose: () => void
   onDone: () => void
