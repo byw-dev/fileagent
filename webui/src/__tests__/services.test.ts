@@ -183,14 +183,39 @@ describe('services/files – extended coverage', () => {
     vi.clearAllMocks()
   })
 
-  it('listFiles calls GET /api/v1/files', async () => {
+  it('listFiles calls GET /api/v1/files with repeat-array param serialization', async () => {
     mockGet.mockResolvedValue({
       data: { items: [], total: 0, next_cursor: null },
     })
     const { listFiles } = await import('../services/files')
     const result = await listFiles()
-    expect(mockGet).toHaveBeenCalledWith('/api/v1/files', { params: undefined })
+    // indexes: null makes the `tag` array serialize as tag=a&tag=b (backend contract).
+    expect(mockGet).toHaveBeenCalledWith('/api/v1/files', {
+      params: undefined,
+      paramsSerializer: { indexes: null },
+    })
     expect(result.total).toBe(0)
+  })
+
+  it('listFiles forwards repeatable tag predicates', async () => {
+    mockGet.mockResolvedValue({ data: { items: [], total: 0, next_cursor: null } })
+    const { listFiles } = await import('../services/files')
+    await listFiles({ tag: ['site:tokyo', 'level:raw'] })
+    expect(mockGet).toHaveBeenCalledWith('/api/v1/files', {
+      params: { tag: ['site:tokyo', 'level:raw'] },
+      paramsSerializer: { indexes: null },
+    })
+  })
+
+  it('batchTagFiles POSTs filter + tags to /files/batch-tag', async () => {
+    mockPost.mockResolvedValue({ data: { job_id: 'j1', status: 'pending' } })
+    const { batchTagFiles } = await import('../services/files')
+    const res = await batchTagFiles({ status: 'completed', tags: ['site:tokyo'] }, { vendor: 'omron', obsolete: null })
+    expect(mockPost).toHaveBeenCalledWith('/api/v1/files/batch-tag', {
+      filter: { status: 'completed', tags: ['site:tokyo'] },
+      tags: { vendor: 'omron', obsolete: null },
+    })
+    expect(res.job_id).toBe('j1')
   })
 
   it('getFileDownloadUrl calls GET /api/v1/files/:id/download-url', async () => {

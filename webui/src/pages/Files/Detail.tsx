@@ -12,16 +12,10 @@ import {
 } from 'antd'
 import { DownloadOutlined, CopyOutlined } from '@ant-design/icons'
 import { useParams, useNavigate } from 'react-router-dom'
-import { getFile, getFileDownloadUrl } from '../../services/files'
+import { getFile, getFileDownloadUrl, FILE_STATUS_COLOR } from '../../services/files'
 import type { FileEntry } from '../../services/files'
 
 const { Title, Text } = Typography
-
-const STATUS_COLOR: Record<string, string> = {
-  INDEXED: 'green',
-  PENDING: 'gold',
-  ERROR: 'red',
-}
 
 /** Format bytes to human-readable size */
 function formatBytes(bytes: number): string {
@@ -97,7 +91,7 @@ function FileDetailPage() {
         <Space>
           <Button onClick={() => navigate('/files')}>← 返回列表</Button>
           <Title level={4} style={{ margin: 0 }}>{file.filename}</Title>
-          <Tag color={STATUS_COLOR[file.status] ?? 'default'}>{file.status}</Tag>
+          <Tag color={FILE_STATUS_COLOR[file.status] ?? 'default'}>{file.status}</Tag>
         </Space>
         <Button
           type="primary"
