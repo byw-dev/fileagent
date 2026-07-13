@@ -657,7 +657,11 @@ type collectionRuleResponse struct {
 	Recursive        bool   `json:"recursive"`
 	AppendMode       string `json:"append_mode"`
 	CronExpr         string `json:"cron_expr,omitempty"`
-	CreatedAt        string `json:"created_at"`
+	// Metadata is the rule's declared metadata (file_type / static_tags /
+	// path_tag_map, metadata 6c). Returned so the rule form can round-trip it on
+	// edit — without it an update would overwrite the stored metadata with {}.
+	Metadata  json.RawMessage `json:"metadata,omitempty"`
+	CreatedAt string          `json:"created_at"`
 }
 
 func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
@@ -674,6 +678,7 @@ func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 		DestPathTemplate: r.DestPathTemplate,
 		Recursive:        r.Recursive,
 		AppendMode:       r.AppendMode,
+		Metadata:         r.Metadata,
 		CreatedAt:        r.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if r.CronExpr.Valid {

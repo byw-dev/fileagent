@@ -11,10 +11,19 @@ import {
   Spin,
   Empty,
 } from 'antd'
-import { StepsForm, ProFormText, ProFormSelect, ProFormSwitch } from '@ant-design/pro-components'
+import {
+  StepsForm,
+  ProFormText,
+  ProFormSelect,
+  ProFormSwitch,
+  ProFormList,
+} from '@ant-design/pro-components'
 import { useParams, useNavigate } from 'react-router-dom'
 import { createRule, updateRule, listRules, testRule } from '../../services/agents'
 import type { CollectionMode, TestRuleFileResult } from '../../services/agents'
+import { listTagKeys } from '../../services/tags'
+import { toRuleMetadata, metadataToFormFields } from './ruleMetadata'
+import type { StaticTagRow, PathTagRow } from './ruleMetadata'
 import apiClient from '../../services/api'
 import {
   renderPathPreview,
@@ -60,6 +69,16 @@ interface RuleFormValues {
   append_mode?: string
   enabled?: boolean
   dest_path_template: string
+  // Metadata step (6c). Maps are edited as arrays of rows, converted on submit.
+  file_type?: string
+  static_tags?: StaticTagRow[]
+  path_tag_map?: PathTagRow[]
+}
+
+/** Load tag keys as select options (shared by the static-tags / path-map rows). */
+async function tagKeyOptions() {
+  const keys = await listTagKeys()
+  return keys.map((k) => ({ label: `${k.key}（${k.label}）`, value: k.key }))
 }
 
 /**
@@ -81,6 +100,9 @@ const DEFAULT_VALUES: RuleFormValues = {
   append_mode: 'overwrite',
   enabled: true,
   dest_path_template: '/{agent_name}/{time:yyyy/MM/dd}/{filename}',
+  file_type: '',
+  static_tags: [],
+  path_tag_map: [],
 }
 
 function AgentRuleFormPage() {
@@ -133,6 +155,7 @@ function AgentRuleFormPage() {
           append_mode: rule.append_mode || 'overwrite',
           enabled: rule.enabled,
           dest_path_template: rule.dest_path_template,
+          ...metadataToFormFields(rule.metadata),
         })
         setMode(ruleMode)
         setBasePath(rule.base_path)
@@ -227,6 +250,9 @@ function AgentRuleFormPage() {
         // Editing preserves the rule's enabled state (managed via the list
         // toggle); creation defaults to enabled.
         enabled: isEdit ? (initial.enabled ?? true) : true,
+        // Declared metadata (6c). Always sent so an edit round-trips it rather
+        // than the backend defaulting a missing value to {}.
+        metadata: toRuleMetadata(values),
       }
       if (isEdit && rid) {
         await updateRule(agentId, rid, payload)
@@ -277,7 +303,8 @@ function AgentRuleFormPage() {
                 </Button>
               )
             }
-            if (props.step === 1) {
+            // Middle steps (source path, upload path): back + next.
+            if (props.step === 1 || props.step === 2) {
               return (
                 <Space>
                   <Button onClick={() => props.onPre?.()}>上一步</Button>
@@ -287,7 +314,7 @@ function AgentRuleFormPage() {
                 </Space>
               )
             }
-            // Last step (step 2)
+            // Last step (step 3: metadata): back + submit.
             return (
               <Space>
                 <Button onClick={() => props.onPre?.()}>上一步</Button>
@@ -555,6 +582,70 @@ function AgentRuleFormPage() {
               ),
             }]}
           />
+        </StepsForm.StepForm>
+
+        {/* Step 4: Metadata (6c) — declared file type + static/path-derived tags */}
+        <StepsForm.StepForm<RuleFormValues> name="step4" title="元数据" initialValues={initial}>
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="声明该规则采集文件的元数据"
+            description="声明类型优先于按扩展名的兜底分类；静态标签打在每个文件上；路径标签从上传路径模板变量提取取值。"
+          />
+          <ProFormText
+            name="file_type"
+            label="声明类型"
+            placeholder="例如 pressure / vibration（留空则按扩展名兜底）"
+            tooltip="规则声明的粗分类，优先于 glob 兜底"
+          />
+          <ProFormList
+            name="static_tags"
+            label="静态标签"
+            creatorButtonProps={{ creatorButtonText: '添加静态标签' }}
+            copyIconProps={false}
+          >
+            <Space align="baseline">
+              <ProFormSelect
+                name="key"
+                placeholder="标签键"
+                width="sm"
+                showSearch
+                request={tagKeyOptions}
+                rules={[{ required: true, message: '请选择标签键' }]}
+              />
+              <ProFormText
+                name="value"
+                placeholder="取值（未登记的受控取值将入待确认队列）"
+                width="md"
+                rules={[{ required: true, message: '请输入取值' }]}
+              />
+            </Space>
+          </ProFormList>
+          <ProFormList
+            name="path_tag_map"
+            label="路径标签映射"
+            tooltip="把上传路径模板中的变量映射到标签键，例如变量 {site} → 标签键 site"
+            creatorButtonProps={{ creatorButtonText: '添加路径标签' }}
+            copyIconProps={false}
+          >
+            <Space align="baseline">
+              <ProFormSelect
+                name="key"
+                placeholder="标签键"
+                width="sm"
+                showSearch
+                request={tagKeyOptions}
+                rules={[{ required: true, message: '请选择标签键' }]}
+              />
+              <ProFormText
+                name="template"
+                placeholder="路径变量，例如 {site}"
+                width="md"
+                rules={[{ required: true, message: '请输入路径变量' }]}
+              />
+            </Space>
+          </ProFormList>
         </StepsForm.StepForm>
       </StepsForm>
     </div>

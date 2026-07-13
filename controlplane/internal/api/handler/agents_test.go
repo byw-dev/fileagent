@@ -534,12 +534,16 @@ func TestAgentsHandler_ListDir_NilRegistry_Returns501(t *testing.T) {
 // ── ListRules ─────────────────────────────────────────────────────────────────
 
 func TestAgentsHandler_ListRules_Success(t *testing.T) {
-	rule := &db.CollectionRule{ID: uuid.New(), AgentID: uuid.New(), Status: db.RuleStatusActive, Metadata: json.RawMessage(`{}`), CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	// Metadata must round-trip in the response so the rule form can prefill it on
+	// edit (otherwise an update overwrites the stored metadata with {}).
+	meta := json.RawMessage(`{"file_type":"pressure","static_tags":{"vendor":"omron"}}`)
+	rule := &db.CollectionRule{ID: uuid.New(), AgentID: uuid.New(), Status: db.RuleStatusActive, Metadata: meta, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	h := handler.NewAgentsHandler(&mockAgentsDB{rules: []*db.CollectionRule{rule}}, nil, nil, nil, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/rules", nil)
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), `"metadata":{"file_type":"pressure"`)
 }
 
 // ── CreateRule ────────────────────────────────────────────────────────────────
