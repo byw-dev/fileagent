@@ -1,17 +1,19 @@
 import type { RuleMetadata } from '../../services/agents'
 
-/** A path-tag-map template must be a single trollsift variable — {var} or
- * {var:fmt}. Inner whitespace is allowed to match the backend's templateVarName
- * (which trims inside the braces), e.g. "{ site }". Validated up front because the
- * indexer ignores any other form. */
-export const PATH_VAR_RE = /^\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*(:[^{}]+)?\}$/
-
-/** Extract the variable name from a single {var} / {var:fmt} reference (mirrors
- * the backend templateVarName), or '' if it is not a valid single reference. */
+/** Extract the variable name from a single {var} / {var:fmt} reference, or '' if
+ * it is not a valid single reference. Mirrors the backend templateVarName
+ * (controlplane/internal/indexer/indexer.go): outer-trim, require a single
+ * {...} with no inner braces, drop the format after the first ':', inner-trim.
+ * Deliberately does NOT restrict the name to [a-zA-Z_][a-zA-Z0-9_]* — the backend
+ * and path template accept any non-empty name, so the UI must not be stricter. */
 export function templateVarName(ref: string): string {
   const trimmed = ref.trim()
-  if (!PATH_VAR_RE.test(trimmed)) return ''
-  return trimmed.slice(1, -1).split(':')[0].trim()
+  if (trimmed.length < 3 || trimmed[0] !== '{' || trimmed[trimmed.length - 1] !== '}') return ''
+  let inner = trimmed.slice(1, -1)
+  if (inner.includes('{') || inner.includes('}')) return ''
+  const colon = inner.indexOf(':')
+  if (colon >= 0) inner = inner.slice(0, colon)
+  return inner.trim()
 }
 
 /** All variable names referenced by a path template like /{a}/{b:fmt}/{c}. */

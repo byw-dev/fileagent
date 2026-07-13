@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest'
 import {
   toRuleMetadata,
   metadataToFormFields,
-  PATH_VAR_RE,
   templateVarName,
   pathTemplateVars,
 } from '../pages/Agents/ruleMetadata'
@@ -56,21 +55,20 @@ describe('RuleForm metadata conversion', () => {
     expect(fields.path_tag_map).toEqual([])
   })
 
-  it('PATH_VAR_RE accepts a single {var} / {var:fmt} (incl. inner whitespace) and rejects other forms', () => {
-    expect(PATH_VAR_RE.test('{site}')).toBe(true)
-    expect(PATH_VAR_RE.test('{time:yyyy/MM/dd}')).toBe(true)
-    expect(PATH_VAR_RE.test('{ site }')).toBe(true) // inner whitespace, like the backend
-    expect(PATH_VAR_RE.test('site')).toBe(false) // no braces
-    expect(PATH_VAR_RE.test('{site}/{x}')).toBe(false) // more than one variable
-    expect(PATH_VAR_RE.test('prefix-{site}')).toBe(false) // extra text
-    expect(PATH_VAR_RE.test('{}')).toBe(false) // empty
-  })
-
-  it('templateVarName extracts the variable name (trimming, dropping format)', () => {
+  it('templateVarName mirrors the backend (any non-empty name, no charset whitelist)', () => {
     expect(templateVarName('{site}')).toBe('site')
     expect(templateVarName(' { site } ')).toBe('site') // outer + inner whitespace
-    expect(templateVarName('{time:yyyy/MM/dd}')).toBe('time')
-    expect(templateVarName('not-a-var')).toBe('')
+    expect(templateVarName('{time:yyyy/MM/dd}')).toBe('time') // format dropped
+    // Names the backend accepts but a [a-zA-Z_]... regex would wrongly reject:
+    expect(templateVarName('{123}')).toBe('123')
+    expect(templateVarName('{my-var}')).toBe('my-var')
+    expect(templateVarName('{a.b}')).toBe('a.b')
+    // Invalid forms:
+    expect(templateVarName('site')).toBe('') // no braces
+    expect(templateVarName('{site}/{x}')).toBe('') // inner braces / more than one
+    expect(templateVarName('prefix-{site}')).toBe('') // extra text
+    expect(templateVarName('{}')).toBe('') // empty
+    expect(templateVarName('{ }')).toBe('') // whitespace-only name
   })
 
   it('pathTemplateVars collects variable names from a path template', () => {
