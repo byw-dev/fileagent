@@ -23,7 +23,13 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { createRule, updateRule, listRules, testRule } from '../../services/agents'
 import type { CollectionMode, TestRuleFileResult } from '../../services/agents'
 import { listTagKeys } from '../../services/tags'
-import { toRuleMetadata, metadataToFormFields, templateVarName, pathTemplateVars } from './ruleMetadata'
+import {
+  toRuleMetadata,
+  metadataToFormFields,
+  templateVarName,
+  pathTemplateVars,
+  firstDuplicateKey,
+} from './ruleMetadata'
 import type { StaticTagRow, PathTagRow } from './ruleMetadata'
 import apiClient from '../../services/api'
 import {
@@ -245,6 +251,17 @@ function AgentRuleFormPage() {
   const handleFinish = async (values: RuleFormValues): Promise<boolean> => {
     if (!agentId) {
       message.error('采集器 ID 缺失，请刷新页面后重试')
+      return false
+    }
+    // Reject duplicate metadata keys — they would silently collapse to one entry.
+    const dupStatic = firstDuplicateKey(values.static_tags)
+    if (dupStatic) {
+      message.error(`静态标签存在重复的键：${dupStatic}`)
+      return false
+    }
+    const dupPath = firstDuplicateKey(values.path_tag_map)
+    if (dupPath) {
+      message.error(`路径标签映射存在重复的键：${dupPath}`)
       return false
     }
     setSubmitting(true)

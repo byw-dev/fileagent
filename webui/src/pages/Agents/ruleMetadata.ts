@@ -45,6 +45,20 @@ export interface RuleMetadataFields {
   path_tag_map?: PathTagRow[]
 }
 
+/** Returns the first key (trimmed) that appears more than once across the rows,
+ * or '' if all keys are unique. Duplicate keys would silently collapse in the
+ * Record<string,string> map (last write wins), so callers reject them up front. */
+export function firstDuplicateKey(rows: { key?: string }[] | undefined): string {
+  const seen = new Set<string>()
+  for (const row of rows ?? []) {
+    const key = row?.key?.trim()
+    if (!key) continue
+    if (seen.has(key)) return key
+    seen.add(key)
+  }
+  return ''
+}
+
 /** Convert the metadata step's row arrays into the RuleMetadata object stored on
  * the rule, dropping incomplete rows and omitting empty sections. */
 export function toRuleMetadata(values: RuleMetadataFields): RuleMetadata {

@@ -4,6 +4,7 @@ import {
   metadataToFormFields,
   templateVarName,
   pathTemplateVars,
+  firstDuplicateKey,
 } from '../pages/Agents/ruleMetadata'
 
 describe('RuleForm metadata conversion', () => {
@@ -69,6 +70,13 @@ describe('RuleForm metadata conversion', () => {
     expect(templateVarName('prefix-{site}')).toBe('') // extra text
     expect(templateVarName('{}')).toBe('') // empty
     expect(templateVarName('{ }')).toBe('') // whitespace-only name
+  })
+
+  it('firstDuplicateKey detects duplicate (trimmed) keys, ignoring blanks', () => {
+    expect(firstDuplicateKey([{ key: 'a' }, { key: 'b' }])).toBe('')
+    expect(firstDuplicateKey([{ key: 'a' }, { key: ' a ' }])).toBe('a') // trim before compare
+    expect(firstDuplicateKey([{ key: '' }, { key: '  ' }])).toBe('') // blanks are not dupes
+    expect(firstDuplicateKey(undefined)).toBe('')
   })
 
   it('pathTemplateVars collects variable names from a path template', () => {
