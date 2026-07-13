@@ -1,11 +1,15 @@
 # webui-redesign-impl.md — Web UI 重做实现（Half A）
 
-> **⏸️ 状态（2026-07-10）：WR-2…WR-10 暂停。** WR-1 地基已合并（PR #66/#67），其产出（token /
-> `StatusBadge` / 时间 util / `FormDrawer` 等共享外壳）由元数据 track 复用。暂停理由（价值优先决策）：
-> WR 是给已能用的页面像素级换皮、不产出核心价值；先建元数据/标签核心（见
-> [`metadata-phase1.md`](metadata-phase1.md)）。WR-2 一轮未提交的 mock 尝试已回退干净。
+> **▶️ 状态（2026-07-14）：恢复 WR track。** 元数据 6c Phase 1（MT-1…6，PR #69–#79）已收官，恢复本 track。
+> WR-1 地基已合并（PR #66/#67），其产出（token / `StatusBadge` / 时间 util / `FormDrawer` 等共享外壳）已被元数据
+> track 复用。恢复前做了一次**规格校准**（本次更新）：Phase 1 的 4 个元数据屏（7a–7d）改动/新增了 WR-3/4/8
+> 触及的页面，故修订这三项（见下方各任务与「规格校准记录」），WR-2/5/6/7/9/10 基本原样。
 > **恢复方法**：按「从 mockup 回补规范再落码」教训执行——`webui-redesign.md` 是 mockup 的有损摘要，
-> 实现每页前先从本地 mockup HTML 提取精确样式回填规范，再写代码。
+> 实现每页前先从本地 mockup HTML（`docs/design/mockups/project/*.html`，gitignore·仅本地）提取精确样式回填规范，再写代码。
+> WR-2 一轮未提交的 mock 尝试已回退干净。
+>
+> **▸ 建议实现顺序**：WR-2（样板页定型）→ WR-9（仪表盘，后端已就绪）→ WR-5/6/7（Phase-1 未触及）→
+> WR-3（+7a 润色）→ WR-4（+7b）→ WR-8（+7c/7d）→ WR-10（收尾）。
 >
 > **性质**：纯前端（`webui/`），**无后端契约改动**——统一既有页面的视觉与交互。
 > **设计权威**：[`docs/design/webui-redesign.md`](../design/webui-redesign.md)（token / 7 条交互定则 / 分页意图 §1–§5）。
@@ -63,7 +67,7 @@
 > 用 track 本地前缀 **`WR-x`**（WebUI Redesign，仿 core-completeness 的 `CC-x`），避开与全局 Phase（现 3/4）冲突。
 > **WR-1 必须先合**（后续每页依赖）；**WR-2 文件类型为样板页，评审定型抽屉/徽标/时间模式后再铺开 WR-3…WR-9**。
 
-### WR-1 — 地基 🔄（实现完成，PR `feat/wr-1-foundation` 待评审合并）
+### WR-1 — 地基 ✅（已合并 PR #66/#67）
 全站单一事实来源，后续每页依赖：
 - [x] 主题 token：`src/theme.ts` + `src/main.tsx` 注入 `ConfigProvider theme`（§1.1 色彩 / §1.3 字号 / §1.4 尺寸）
 - [x] 重写 `src/index.css` + 暗色闪烁修复：删 Vite 模板；`color-scheme:light`（+ `index.html` meta）+ `html,body,#root{background:#F5F6F8}`；base 16px；去 `#root` 1126px 锁 & `text-align:center`。`App.tsx` PageLoader 给浅底
@@ -80,12 +84,20 @@
 - [ ] `src/pages/FileTypes/index.tsx`：接徽标/时间/单行筛选/操作列右对齐
 - [ ] 新建/编辑 → `FormDrawer`（删 `/file-types/create` 整页路由 + `Create.tsx`），glob 规则可排序 + 优先级 + 试匹配（3c）
 - [ ] 删除确认弹窗 + 输入名称确认（4f）
+- 注：`file_types` 已按 D-025 降级为**兜底粗分类**（变种维度走标签，规则声明类型优先于 glob）；glob 编辑器工作不变。
 
-### WR-3 — 采集器 ⬜
-- [ ] 待审批置顶横幅(1c)、行内审批/吊销走 `confirmDanger`、采集规则三步**抽屉**(2a-2d，复用现有 `RuleForm` 内核 + dry-run)、详情 tabs 保留、**修列表/详情状态口径 bug**
+### WR-3 — 采集器 ⬜（2026-07-14 校准）
+- [ ] 待审批置顶横幅(1c)、行内审批/吊销走 `useDangerConfirm`、详情 tabs 保留、**修列表/详情状态口径 bug**
+- [ ] **规则表单保持整页 4 步 `StepsForm`**（**不**抽屉化）——作为定则 1 的合理例外：Phase 1（MT-6d）已把它建成
+      4 步整页（基本/源路径/上传路径/元数据，含 dry-run + 实时预览 + 动态列表），历 10 轮 review 稳定，复用现有 `RuleForm` 内核。
+      本片只做 **WR token / `StatusBadge` / `TimeText` 润色** + 润色 **7a 元数据步**（静态标签/路径映射行的视觉与空态）。
+      〔原规格「三步抽屉」已废——决策见「规格校准记录」〕
 
-### WR-4 — 文件 ⬜
-- [ ] 勾选批量下载(复用 `BatchDownload`)、详情 480px 抽屉(3a，替代整页)、类型树变体(4g 可选)、**修 Invalid Date**
+### WR-4 — 文件 ⬜（2026-07-14 校准）
+- [ ] 勾选批量下载(复用 `BatchDownload`)、类型树变体(4g 可选)、**修 Invalid Date**（`Files/index.tsx:155` 裸 `toLocaleString` 换 `TimeText`）
+- [ ] 文件详情 480px 抽屉(3a)——注：当前 `Files/Detail` **仅有路由无实现**，为**新建**（非「替代整页」）
+- [ ] **对齐 Phase-1 标签 UI 到 WR 范式（7b）**：`Files/index.tsx` 现有标签列 / faceted 筛选（`TagFacetPicker`）/ 批量打标弹窗
+      为「够用一致」建；本片对齐——标签列/筛选 chip 化统一、批量打标改 `FormDrawer`、空态/危险确认、token 色。**不回退**标签功能。
 
 ### WR-5 — 事件规则 ⬜
 - [ ] 编辑抽屉(4b 动作二选一联动必填)、投递历史抽屉(4c dead 终态 / 失败行展开响应体)、行内启停
@@ -96,8 +108,11 @@
 ### WR-7 — Bucket ⬜
 - [ ] 登记视图、创建仅 super_admin(4d)、通知配置状态可见
 
-### WR-8 — 设置 ⬜
+### WR-8 — 设置 ⬜（2026-07-14 校准）
 - [ ] 用户管理 tab(5b super_admin，禁用而非删除)、新建用户抽屉(5c 初始密码一次性)、登录页(5a)核对
+- [ ] **7c 标签词表**（`Settings/TagKeys`）+ **7d 待确认取值**（`Settings/PendingTags`）润色到 WR 一致性：
+      `StatusBadge`（来源/状态）/`TimeText`（首次出现）/token 色/空态一句话+主操作/危险确认（拒绝、删除键）；
+      取值抽屉与 merge 弹窗对齐 `FormDrawer`/交互定则。〔均 Phase-1「够用一致」建，本片折入润色〕
 
 ### WR-9 — 仪表盘 ⬜
 - [ ] 去硬编码色、卡片 + 骨架、接服务端聚合(1b，端点已存在 · commit f6f659f)
@@ -108,6 +123,19 @@
 - [ ] 对照 `webui-redesign.md` 逐条核销；如有行为偏差同步 `system-design.md`
 
 ---
+
+## 规格校准记录（2026-07-14，恢复 track 前）
+
+Phase 1（元数据 6c，MT-1…6，PR #69–#79）在 WR-2…10 暂停期间落了 4 个元数据屏（7a–7d），改动/新增了 WR-3/4/8
+触及的页面。恢复本 track 前做一次校准（用户拍板）：
+
+1. **规则表单保留整页 4 步**（修订 WR-3，废原「三步抽屉」）。理由：MT-6d 已把规则表单建成 4 步整页 `StepsForm`
+   （含 dry-run + 实时路径预览 + `ProFormList` 动态列表），历 10 轮 review 稳定；复杂多步向导塞进 480px 抽屉体验更差、
+   churn 大。定则 1（增删改走抽屉）对**复杂多步向导**放行例外——与文末「决策」一致（三步向导是要保留的非表现层资产）。
+2. **元数据 4 屏顺手润色，折入 WR-3/4/8**（不新增 WR 项）：7a→WR-3、7b→WR-4、7c+7d→WR-8。理由：追求全站一致；
+   4 屏为「够用一致」建（直接用 ProTable/ProFormList，标签色 ad-hoc、未全接 `TimeText`/`StatusBadge`），轻度对齐即可。
+3. **其余不变**：WR-2（补 file_types 降级注记）、WR-5/6/7/9/10 规格原样。WR 仍**纯前端、无后端契约改动**
+   （Phase 1 已加的 rule 响应 `metadata` 字段本 track 不涉及）。
 
 ## 验证（每阶段收尾执行）
 - `pnpm --dir webui dev` 起本地；CP 在 `:8080`。CP 配置文件 `deploy/config/controlplane.env` 是 **gitignored**（不在仓库，需从 `controlplane/.env.example` 自建）。登录凭据：本地 dev 建议在该 env 里设固定 `BOOTSTRAP_ADMIN_PASSWORD` + `BOOTSTRAP_ADMIN_FORCE_RESET=true` 拿确定密码；否则首启生成随机密码写入 `BOOTSTRAP_ADMIN_CREDENTIALS_FILE` 指向的文件（默认是**进程工作目录相对**的 `bootstrap_admin_credentials.txt`，易因 CWD 不同而找错）。

@@ -11,10 +11,12 @@
 **权威追踪**：[`metadata-phase1.md`](metadata-phase1.md)（含收官 banner）。落地：`DECISIONS.md` D-025 各「落地记录」；
 架构回填：`system-design.md` §3.3.8/§5.8。**推后**：规则改动回溯（低价值）；Phase 2（数据集/血缘）按信号触发。
 
-## ⏭️ 下一 track：待定（候选见下方「其余候选」）
+## ▶️ 当前 track（2026-07-14 拍板）：恢复 Web UI 重做（WR-2…10）
 
-Phase 1 收尾（本文档同步）后，下一 track 由产品决策：**恢复 WR-2…10 Web UI 重做**（之前为 Phase 1 让位暂停，
-WR-1 地基已合并可复用）／ **proto→buf** 复现性 follow-up ／ Phase 2（触发信号出现时）。
+Phase 1 收官后恢复 WR track（之前为 Phase 1 让位暂停，WR-1 地基已合并可复用）。**追踪**：
+[`webui-redesign-impl.md`](webui-redesign-impl.md)（含 2026-07-14 规格校准：规则表单保留整页 4 步、元数据 4 屏折入 WR-3/4/8）。
+**顺序**：WR-2 样板页 → WR-9 → WR-5/6/7 → WR-3/4/8 → WR-10。纯前端、无后端契约改动；每片独立 PR + review。
+**其余候选（未排期）**：proto→buf 复现性 follow-up ／ Phase 2（数据集/血缘，触发信号出现时）。
 
 **⏸️ 前一 track「Web UI 重做实现（Half A）」已暂停**（2026-07-10 价值优先决策）：WR-1 地基已合并（PR #66/#67）
 并被本 track 复用（token / `StatusBadge` / 时间 util / 共享外壳）；WR-2…WR-10 暂停，追踪与恢复方法见
