@@ -17,8 +17,6 @@ const AgentLogsPage = lazy(() => import('./pages/Agents/Logs'))
 const FilesPage = lazy(() => import('./pages/Files'))
 const FileDetailPage = lazy(() => import('./pages/Files/Detail'))
 const FileTypesPage = lazy(() => import('./pages/FileTypes'))
-const FileTypeCreatePage = lazy(() => import('./pages/FileTypes/Create'))
-const FileTypeDetailPage = lazy(() => import('./pages/FileTypes/Detail'))
 const BucketsPage = lazy(() => import('./pages/Buckets'))
 const EventsPage = lazy(() => import('./pages/Events'))
 const EventCreatePage = lazy(() => import('./pages/Events/Create'))
@@ -86,8 +84,6 @@ function App() {
 
               {/* File types */}
               <Route path="/file-types" element={<FileTypesPage />} />
-              <Route path="/file-types/create" element={<FileTypeCreatePage />} />
-              <Route path="/file-types/:id" element={<FileTypeDetailPage />} />
 
               {/* Buckets */}
               <Route path="/buckets" element={<BucketsPage />} />

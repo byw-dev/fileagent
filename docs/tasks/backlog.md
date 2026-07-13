@@ -82,3 +82,18 @@ D- 子决策与迁移。
 | `append_mode=tail` 断点续传的 SQLite schema migration（当前直接修改 schema const） | P3-P4 | ⚪ P3 |
 | 前后端 JSON 契约应引入 OpenAPI spec 自动校验，避免再次出现 T3-2-FIX 类问题 | T3-2-FIX 根本原因复盘 | ⚪ P3 |
 | Web UI 页面使用 MSW（Mock Service Worker）补充真实 API 格式的集成测试 | T3-2-FIX 根本原因复盘 | ⚪ P3 |
+
+---
+
+## file_types glob 规则管理（后端 + 前端）
+
+**来源**：WR-2 落地（2026-07-14）发现——mockup 的 file_types「glob 规则编辑器（可排序 + 优先级 + 试匹配，3c）」
+**无后端支撑**：`file_type_rules` 表仅被 indexer classifier 只读（`ListFileTypeRules`），靠迁移/种子存在，无任何 REST 端点；
+WR 禁改后端，故从 WR-2 拆出。
+
+**内容**（真有「配兜底分类规则」需求时再做）：
+- CP：`file_type_rules` CRUD 端点（按 org，绑定 file_type，pattern/priority）+「试匹配」端点（给定 storage path 返回命中类型）+ sqlc 查询/迁移。
+- webui：file_types 详情/编辑抽屉内嵌 glob 规则编辑器（可排序拖拽 + 优先级 + 试匹配预览）。
+
+**优先级**：⚪ 低。D-025 已把 `file_types` 降级为**兜底粗分类**，变种维度走标签；兜底 glob 规则很少变、可迁移/种子管理，
+UI 现价值低。触发信号：出现「需在 UI 配/调兜底 glob 规则」的真实需求。

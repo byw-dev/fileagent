@@ -79,12 +79,15 @@
 
 > **实机验证（暗色模式）**：`html/body/#root` 背景 `#F5F6F8`（`color-scheme:light`），**无白→黑→白闪烁**；侧栏 208px 无折叠开关；主色 `#2F6BE0`（Tab ink）；状态徽标为**浅底泡泡**（采集器页自动升级，逐色比对 mockup）；base 16px。build + 90 tests + lint（新文件）通过。
 
-### WR-2 — 文件类型（样板页，评审定型） ⬜
-用最简单 CRUD 把抽屉/徽标/时间模式跑通定型：
-- [ ] `src/pages/FileTypes/index.tsx`：接徽标/时间/单行筛选/操作列右对齐
-- [ ] 新建/编辑 → `FormDrawer`（删 `/file-types/create` 整页路由 + `Create.tsx`），glob 规则可排序 + 优先级 + 试匹配（3c）
-- [ ] 删除确认弹窗 + 输入名称确认（4f）
-- 注：`file_types` 已按 D-025 降级为**兜底粗分类**（变种维度走标签，规则声明类型优先于 glob）；glob 编辑器工作不变。
+### WR-2 — 文件类型（样板页，评审定型） ✅（PR 待评审）
+用最简单 CRUD 把抽屉/时间/筛选/危险确认范式跑通定型：
+- [x] `src/pages/FileTypes/index.tsx`：`TimeText` 创建时间 / 单行名称筛选 / 操作列右对齐 / 空态 `EmptyState`
+- [x] 新建/编辑 → `FormDrawer`（删 `/file-types/create` + `/file-types/:id` 整页路由 + `Create.tsx` + `Detail.tsx`；
+      详情/新建/编辑全折进抽屉，名称点击即开编辑）
+- [x] 删除 → `DangerConfirmModal` 红实心 + 输入名称确认（4f）
+- 注：`file_types` 已按 D-025 降级为**兜底粗分类**（变种维度走标签，规则声明类型优先于 glob）；本页无状态字段，不涉及徽标。
+- **⚠️ glob 规则编辑器（原 3c）已从本项拆出** → `backlog.md`（**无后端**：`file_type_rules` 无 REST 端点，需先建
+      CRUD + 试匹配端点，破坏 WR「纯前端」前提；且 glob 现为低价值兜底）。2026-07-14 用户拍板 descope + 后续按需再做。
 
 ### WR-3 — 采集器 ⬜（2026-07-14 校准）
 - [ ] 待审批置顶横幅(1c)、行内审批/吊销走 `useDangerConfirm`、详情 tabs 保留、**修列表/详情状态口径 bug**
