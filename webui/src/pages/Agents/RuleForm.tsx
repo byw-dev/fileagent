@@ -23,7 +23,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { createRule, updateRule, listRules, testRule } from '../../services/agents'
 import type { CollectionMode, TestRuleFileResult } from '../../services/agents'
 import { listTagKeys } from '../../services/tags'
-import { toRuleMetadata, metadataToFormFields, PATH_VAR_RE } from './ruleMetadata'
+import { toRuleMetadata, metadataToFormFields, templateVarName, pathTemplateVars } from './ruleMetadata'
 import type { StaticTagRow, PathTagRow } from './ruleMetadata'
 import apiClient from '../../services/api'
 import {
@@ -664,12 +664,21 @@ function AgentRuleFormPage() {
                 rules={[
                   { required: true, whitespace: true, message: '请输入路径变量' },
                   {
-                    // Validate the trimmed value — it is stored trimmed, so the UI
-                    // must not reject " {site} " that toRuleMetadata would accept.
-                    validator: (_, value?: string) =>
-                      !value?.trim() || PATH_VAR_RE.test(value.trim())
-                        ? Promise.resolve()
-                        : Promise.reject(new Error('需为单个模板变量，例如 {site} 或 {site:fmt}')),
+                    // Validate the trimmed value (it is stored trimmed) as a single
+                    // {var}/{var:fmt}, and require that var to appear in the upload
+                    // path template — the indexer skips path vars not present there,
+                    // so the mapping would silently do nothing.
+                    validator: (_, value?: string) => {
+                      const name = templateVarName(value ?? '')
+                      if (!value?.trim()) return Promise.resolve()
+                      if (!name) {
+                        return Promise.reject(new Error('需为单个模板变量，例如 {site} 或 {site:fmt}'))
+                      }
+                      if (!pathTemplateVars(pathTemplate).has(name)) {
+                        return Promise.reject(new Error(`变量 {${name}} 未出现在上传路径模板中，将不会生效`))
+                      }
+                      return Promise.resolve()
+                    },
                   },
                 ]}
               />

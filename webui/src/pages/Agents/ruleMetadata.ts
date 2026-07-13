@@ -1,8 +1,28 @@
 import type { RuleMetadata } from '../../services/agents'
 
 /** A path-tag-map template must be a single trollsift variable — {var} or
- * {var:fmt}. The indexer ignores any other form, so it is validated up front. */
-export const PATH_VAR_RE = /^\{[a-zA-Z_][a-zA-Z0-9_]*(:[^{}]+)?\}$/
+ * {var:fmt}. Inner whitespace is allowed to match the backend's templateVarName
+ * (which trims inside the braces), e.g. "{ site }". Validated up front because the
+ * indexer ignores any other form. */
+export const PATH_VAR_RE = /^\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*(:[^{}]+)?\}$/
+
+/** Extract the variable name from a single {var} / {var:fmt} reference (mirrors
+ * the backend templateVarName), or '' if it is not a valid single reference. */
+export function templateVarName(ref: string): string {
+  const trimmed = ref.trim()
+  if (!PATH_VAR_RE.test(trimmed)) return ''
+  return trimmed.slice(1, -1).split(':')[0].trim()
+}
+
+/** All variable names referenced by a path template like /{a}/{b:fmt}/{c}. */
+export function pathTemplateVars(template: string): Set<string> {
+  const vars = new Set<string>()
+  for (const m of template.matchAll(/\{([^{}]+)\}/g)) {
+    const name = m[1].split(':')[0].trim()
+    if (name) vars.add(name)
+  }
+  return vars
+}
 
 /** One static-tag row in the rule form (a fixed key→value applied to every file). */
 export interface StaticTagRow {
