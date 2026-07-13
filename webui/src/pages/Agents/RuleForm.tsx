@@ -596,8 +596,11 @@ function AgentRuleFormPage() {
           />
         </StepsForm.StepForm>
 
-        {/* Step 4: Metadata (6c) — declared file type + static/path-derived tags */}
-        <StepsForm.StepForm<RuleFormValues> name="step4" title="元数据" initialValues={initial}>
+        {/* Step 4: Metadata (6c) — declared file type + static/path-derived tags.
+            Uses per-field initialValue like the earlier steps; a StepForm-level
+            initialValues with the full object would let this step contribute (and
+            overwrite) earlier steps' fields when StepsForm merges values. */}
+        <StepsForm.StepForm<RuleFormValues> name="step4" title="元数据">
           <Alert
             type="info"
             showIcon
@@ -610,10 +613,12 @@ function AgentRuleFormPage() {
             label="声明类型"
             placeholder="例如 pressure / vibration（留空则按扩展名兜底）"
             tooltip="规则声明的粗分类，优先于 glob 兜底"
+            initialValue={initial.file_type}
           />
           <ProFormList
             name="static_tags"
             label="静态标签"
+            initialValue={initial.static_tags}
             creatorButtonProps={{ creatorButtonText: '添加静态标签' }}
             copyIconProps={false}
           >
@@ -637,6 +642,7 @@ function AgentRuleFormPage() {
           <ProFormList
             name="path_tag_map"
             label="路径标签映射"
+            initialValue={initial.path_tag_map}
             tooltip="把上传路径模板中的变量映射到标签键，例如变量 {site} → 标签键 site（仅列出允许路径变量的键）"
             creatorButtonProps={{ creatorButtonText: '添加路径标签' }}
             copyIconProps={false}

@@ -34,6 +34,15 @@ describe('RuleForm metadata conversion', () => {
     expect(fields.path_tag_map).toEqual([{ key: 'site', template: '{site}' }])
   })
 
+  it('metadataToFormFields sorts rows by key for deterministic display', () => {
+    const fields = metadataToFormFields({
+      static_tags: { vendor: 'omron', line: 'A', bay: '3' },
+      path_tag_map: { site: '{site}', level: '{level}' },
+    })
+    expect(fields.static_tags.map((r) => r.key)).toEqual(['bay', 'line', 'vendor'])
+    expect(fields.path_tag_map.map((r) => r.key)).toEqual(['level', 'site'])
+  })
+
   it('metadataToFormFields yields empty defaults for undefined metadata', () => {
     const fields = metadataToFormFields(undefined)
     expect(fields.file_type).toBe('')
