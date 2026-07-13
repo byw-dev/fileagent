@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
+import useSWR from 'swr'
 import {
   App,
   Typography,
@@ -11,10 +12,25 @@ import {
   Spin,
   Empty,
 } from 'antd'
-import { StepsForm, ProFormText, ProFormSelect, ProFormSwitch } from '@ant-design/pro-components'
+import {
+  StepsForm,
+  ProFormText,
+  ProFormSelect,
+  ProFormSwitch,
+  ProFormList,
+} from '@ant-design/pro-components'
 import { useParams, useNavigate } from 'react-router-dom'
 import { createRule, updateRule, listRules, testRule } from '../../services/agents'
 import type { CollectionMode, TestRuleFileResult } from '../../services/agents'
+import { listTagKeys } from '../../services/tags'
+import {
+  toRuleMetadata,
+  metadataToFormFields,
+  templateVarName,
+  pathTemplateVars,
+  firstDuplicateKey,
+} from './ruleMetadata'
+import type { StaticTagRow, PathTagRow } from './ruleMetadata'
 import apiClient from '../../services/api'
 import {
   renderPathPreview,
@@ -47,7 +63,7 @@ interface Bucket {
   name: string
 }
 
-/** Flat form values merged by StepsForm.onFinish across all 3 steps. */
+/** Flat form values merged by StepsForm.onFinish across all 4 steps. */
 interface RuleFormValues {
   name: string
   mode: CollectionMode
@@ -60,13 +76,18 @@ interface RuleFormValues {
   append_mode?: string
   enabled?: boolean
   dest_path_template: string
+  // Metadata step (6c). Maps are edited as arrays of rows, converted on submit.
+  file_type?: string
+  static_tags?: StaticTagRow[]
+  path_tag_map?: PathTagRow[]
 }
 
 /**
- * Agent rule creation form — 3-step ProForm.
+ * Agent rule creation form — 4-step ProForm.
  * Step 1: Basic config (name, mode, target bucket).
  * Step 2: Source path config (Watch vs Scheduled fields differ).
  * Step 3: Upload path template with live preview.
+ * Step 4: Metadata (6c) — declared file type + static/path-derived tags.
  */
 /** Default form values used for creation and as the base for editing. */
 const DEFAULT_VALUES: RuleFormValues = {
@@ -81,6 +102,9 @@ const DEFAULT_VALUES: RuleFormValues = {
   append_mode: 'overwrite',
   enabled: true,
   dest_path_template: '/{agent_name}/{time:yyyy/MM/dd}/{filename}',
+  file_type: '',
+  static_tags: [],
+  path_tag_map: [],
 }
 
 function AgentRuleFormPage() {
@@ -88,6 +112,23 @@ function AgentRuleFormPage() {
   const isEdit = Boolean(rid)
   const navigate = useNavigate()
   const { message } = App.useApp()
+
+  // Load the tag-key vocabulary once (SWR-cached) rather than per-select. Static
+  // tags may use any key; path-tag-map only keys that allow path-variable mapping
+  // (the indexer skips allow_path_var=false keys, so offering them would create a
+  // rule that silently does nothing).
+  const { data: tagKeys = [] } = useSWR('tag-keys', listTagKeys)
+  const staticKeyOptions = useMemo(
+    () => tagKeys.map((k) => ({ label: `${k.key}（${k.label}）`, value: k.key })),
+    [tagKeys],
+  )
+  const pathKeyOptions = useMemo(
+    () =>
+      tagKeys
+        .filter((k) => k.allow_path_var)
+        .map((k) => ({ label: `${k.key}（${k.label}）`, value: k.key })),
+    [tagKeys],
+  )
 
   // In edit mode the existing rule is fetched before rendering the form so the
   // steps can be prefilled; creation starts from DEFAULT_VALUES immediately.
@@ -133,6 +174,7 @@ function AgentRuleFormPage() {
           append_mode: rule.append_mode || 'overwrite',
           enabled: rule.enabled,
           dest_path_template: rule.dest_path_template,
+          ...metadataToFormFields(rule.metadata),
         })
         setMode(ruleMode)
         setBasePath(rule.base_path)
@@ -211,6 +253,17 @@ function AgentRuleFormPage() {
       message.error('采集器 ID 缺失，请刷新页面后重试')
       return false
     }
+    // Reject duplicate metadata keys — they would silently collapse to one entry.
+    const dupStatic = firstDuplicateKey(values.static_tags)
+    if (dupStatic) {
+      message.error(`静态标签存在重复的键：${dupStatic}`)
+      return false
+    }
+    const dupPath = firstDuplicateKey(values.path_tag_map)
+    if (dupPath) {
+      message.error(`路径标签映射存在重复的键：${dupPath}`)
+      return false
+    }
     setSubmitting(true)
     try {
       const payload = {
@@ -227,6 +280,9 @@ function AgentRuleFormPage() {
         // Editing preserves the rule's enabled state (managed via the list
         // toggle); creation defaults to enabled.
         enabled: isEdit ? (initial.enabled ?? true) : true,
+        // Declared metadata (6c). Always sent so an edit round-trips it rather
+        // than the backend defaulting a missing value to {}.
+        metadata: toRuleMetadata(values),
       }
       if (isEdit && rid) {
         await updateRule(agentId, rid, payload)
@@ -277,7 +333,8 @@ function AgentRuleFormPage() {
                 </Button>
               )
             }
-            if (props.step === 1) {
+            // Middle steps (source path, upload path): back + next.
+            if (props.step === 1 || props.step === 2) {
               return (
                 <Space>
                   <Button onClick={() => props.onPre?.()}>上一步</Button>
@@ -287,7 +344,7 @@ function AgentRuleFormPage() {
                 </Space>
               )
             }
-            // Last step (step 2)
+            // Last step (step 3: metadata): back + submit.
             return (
               <Space>
                 <Button onClick={() => props.onPre?.()}>上一步</Button>
@@ -555,6 +612,95 @@ function AgentRuleFormPage() {
               ),
             }]}
           />
+        </StepsForm.StepForm>
+
+        {/* Step 4: Metadata (6c) — declared file type + static/path-derived tags.
+            Uses per-field initialValue like the earlier steps; a StepForm-level
+            initialValues with the full object would let this step contribute (and
+            overwrite) earlier steps' fields when StepsForm merges values. */}
+        <StepsForm.StepForm<RuleFormValues> name="step4" title="元数据">
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="声明该规则采集文件的元数据"
+            description="声明类型优先于按扩展名的兜底分类；静态标签打在每个文件上；路径标签从上传路径模板变量提取取值。"
+          />
+          <ProFormText
+            name="file_type"
+            label="声明类型"
+            placeholder="例如 pressure / vibration（留空则按扩展名兜底）"
+            tooltip="规则声明的粗分类，优先于 glob 兜底"
+            initialValue={initial.file_type}
+          />
+          <ProFormList
+            name="static_tags"
+            label="静态标签"
+            initialValue={initial.static_tags}
+            creatorButtonProps={{ creatorButtonText: '添加静态标签' }}
+            copyIconProps={false}
+          >
+            <Space align="baseline">
+              <ProFormSelect
+                name="key"
+                placeholder="标签键"
+                width="sm"
+                showSearch
+                options={staticKeyOptions}
+                rules={[{ required: true, message: '请选择标签键' }]}
+              />
+              <ProFormText
+                name="value"
+                placeholder="取值（未登记的受控取值将入待确认队列）"
+                width="md"
+                rules={[{ required: true, whitespace: true, message: '请输入取值' }]}
+              />
+            </Space>
+          </ProFormList>
+          <ProFormList
+            name="path_tag_map"
+            label="路径标签映射"
+            initialValue={initial.path_tag_map}
+            tooltip="把上传路径模板中的变量映射到标签键，例如变量 {site} → 标签键 site（仅列出允许路径变量的键）"
+            creatorButtonProps={{ creatorButtonText: '添加路径标签' }}
+            copyIconProps={false}
+          >
+            <Space align="baseline">
+              <ProFormSelect
+                name="key"
+                placeholder="标签键"
+                width="sm"
+                showSearch
+                options={pathKeyOptions}
+                rules={[{ required: true, message: '请选择标签键' }]}
+              />
+              <ProFormText
+                name="template"
+                placeholder="路径变量，例如 {site}"
+                width="md"
+                rules={[
+                  { required: true, whitespace: true, message: '请输入路径变量' },
+                  {
+                    // Validate the trimmed value (it is stored trimmed) as a single
+                    // {var}/{var:fmt}, and require that var to appear in the upload
+                    // path template — the indexer skips path vars not present there,
+                    // so the mapping would silently do nothing.
+                    validator: (_, value?: string) => {
+                      const name = templateVarName(value ?? '')
+                      if (!value?.trim()) return Promise.resolve()
+                      if (!name) {
+                        return Promise.reject(new Error('需为单个模板变量，例如 {site} 或 {site:fmt}'))
+                      }
+                      if (!pathTemplateVars(pathTemplate).has(name)) {
+                        return Promise.reject(new Error(`变量 {${name}} 未出现在上传路径模板中，将不会生效`))
+                      }
+                      return Promise.resolve()
+                    },
+                  },
+                ]}
+              />
+            </Space>
+          </ProFormList>
         </StepsForm.StepForm>
       </StepsForm>
     </div>

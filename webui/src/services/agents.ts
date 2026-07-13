@@ -97,6 +97,15 @@ export async function renameAgent(id: string, name: string): Promise<Agent> {
 /** Collection mode for a rule */
 export type CollectionMode = 'WATCH' | 'SCHEDULED'
 
+/** Rule metadata declaration (metadata 6c) stored in collection_rules.metadata.
+ * file_type = declared coarse type (overrides glob); static_tags = fixed tags on
+ * every collected file; path_tag_map = tag key → path-template variable. */
+export interface RuleMetadata {
+  file_type?: string
+  static_tags?: Record<string, string>
+  path_tag_map?: Record<string, string>
+}
+
 /** Collection rule entity */
 export interface CollectionRule {
   id: string
@@ -112,6 +121,7 @@ export interface CollectionRule {
   recursive: boolean
   append_mode: string
   enabled: boolean
+  metadata?: RuleMetadata
   created_at: string
 }
 
@@ -128,6 +138,7 @@ export interface CollectionRulePayload {
   recursive: boolean
   append_mode?: string
   enabled?: boolean
+  metadata?: RuleMetadata
 }
 
 /** Directory listing item */

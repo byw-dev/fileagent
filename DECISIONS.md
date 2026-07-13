@@ -1071,6 +1071,25 @@ MT-4a 端点（sqlc `tags.sql` + `handler/tagkeys.go`，注入 `RouterConfig.Tag
 - 真 PG15 验证：merge `tokyo→Tokyo` 改写 2 文件 + 2 审计行、`osaka` 不动；**重跑幂等**（0 改写/0 新审计）；
   **跨 org 隔离**（异 org 领域的 merge 改写 0）；迁移 `000005` up/down 往返干净。
 
+### 落地记录（MT-6，webui 四屏 7a–7d）
+
+元数据 6c Phase 1 前端，按屏拆分：**MT-6a** `7c` 标签词表（PR #76）、**MT-6b** `7d` 待确认队列（PR #77）、
+**MT-6c** `7b` 文件页标签筛选+批量打标（PR #78）、**MT-6d** `7a` 规则表单元数据步骤。用 WR-1 既有组件「够用一致」。
+数据拉取统一走 SWR（规避 `react-hooks/set-state-in-effect`——master 已有 8 处该 lint 违规且无 CI 门控）。
+
+- **7c**（`Settings/TagKeys`）：标签键 ProTable + 新建/编辑弹窗 + 取值抽屉（SWR）。
+- **7d**（`Settings/PendingTags`）：待确认取值 list + approve/merge/reject；merge 走 Select 选**已登记**目标值（默认疑似）。
+- **7b**（`Files`）：标签列 + faceted 筛选（key/value Select，取值仅列已登记，合治理）+ super_admin 批量打标弹窗
+  （按当前**状态+标签**谓词圈选，文件名/日期不参与）。顺带修既有 `FileEntry.status` 类型/`STATUS_OPTIONS` 用错值
+  （响应大写 `COMPLETED`，筛选/批量用 lowercase `file_status` 枚举）——新增 `FileStatusFilter` 类型 + 共享 `FILE_STATUS_COLOR`。
+- **7d/7b 契约**：`tag` 谓词 axios 用 `paramsSerializer:{indexes:null}` 序列化为 `tag=a&tag=b`。
+- **7a**（`Agents/RuleForm` 加第 4 步「元数据」）：声明 `file_type` + 静态标签（key Select+value）+ 路径标签映射
+  （key Select + 模板变量），写入 `collection_rules.metadata` JSONB。转换逻辑抽到 `Agents/ruleMetadata.ts`（单测 5 例）。
+- **CP 契约增量（MT-6d）**：`collectionRuleResponse` 加 `metadata` 字段（`toRuleResponse` 回填 `r.Metadata`）。
+  **必需**——否则编辑规则时前端读不到既有 metadata，`updateRule` 会把缺省 metadata 落成 `{}` **抹掉**声明。additive、安全。
+- 全部 **live 验证**（真 CP+浏览器 chrome-devtools）：7c 词表增删；7d merge/approve/reject 出队；7b facet site:tokyo→3、
+  批量 vendor=omron worker changed 3、状态筛选；7a 建规则（元数据入库正确）→编辑预填三段→保存不抹除。
+
 ### 落地记录（MT-5b，批量打标 POST /files/batch-tag）
 
 MT-5b = 复用 MT-5a 的 retag_jobs 通道做**批量打标**（按 `GET /files` 谓词圈选文件集，统一 set/clear 标签）。
