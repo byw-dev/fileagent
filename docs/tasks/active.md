@@ -5,12 +5,16 @@
 
 ---
 
-## 当前选定 track：元数据 6c Phase 1 实现（受控标签）— MT-1…MT-6
+## ✅ 上一 track 已收官：元数据 6c Phase 1（受控标签）— MT-1…MT-6（PR #69–#79，2026-07-14）
 
-**权威追踪**：[`metadata-phase1.md`](metadata-phase1.md)。设计：[`docs/design/metadata-model.md`](../design/metadata-model.md)
-（D-025 + 2026-07-10 补充：手动/批量打标 API、Phase 2 血缘 run 模型、衍生数据入口）。
-**起手**：MT-1 + MT-2 薄纵切（迁移 + static_tags 打标 + `?tag=` 筛选，核心闭环）。
-纯 CP + webui，**不改 agent / proto**；每个 MT-x 独立 PR off master + review + 人工合并。
+全链路完成：迁移（5 表 + `retag_jobs`）→ indexer 打标 → 词表/待确认/单文件·批量打标 API → 回溯 worker → 四屏 UI（7a–7d）。
+**权威追踪**：[`metadata-phase1.md`](metadata-phase1.md)（含收官 banner）。落地：`DECISIONS.md` D-025 各「落地记录」；
+架构回填：`system-design.md` §3.3.8/§5.8。**推后**：规则改动回溯（低价值）；Phase 2（数据集/血缘）按信号触发。
+
+## ⏭️ 下一 track：待定（候选见下方「其余候选」）
+
+Phase 1 收尾（本文档同步）后，下一 track 由产品决策：**恢复 WR-2…10 Web UI 重做**（之前为 Phase 1 让位暂停，
+WR-1 地基已合并可复用）／ **proto→buf** 复现性 follow-up ／ Phase 2（触发信号出现时）。
 
 **⏸️ 前一 track「Web UI 重做实现（Half A）」已暂停**（2026-07-10 价值优先决策）：WR-1 地基已合并（PR #66/#67）
 并被本 track 复用（token / `StatusBadge` / 时间 util / 共享外壳）；WR-2…WR-10 暂停，追踪与恢复方法见
