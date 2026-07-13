@@ -543,7 +543,20 @@ func TestAgentsHandler_ListRules_Success(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+uuid.New().String()+"/rules", nil)
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Body.String(), `"metadata":{"file_type":"pressure"`)
+	// Assert the metadata structurally (not a raw substring) so the test is
+	// resilient to key ordering / formatting.
+	var body struct {
+		Items []struct {
+			Metadata struct {
+				FileType   string            `json:"file_type"`
+				StaticTags map[string]string `json:"static_tags"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Len(t, body.Items, 1)
+	assert.Equal(t, "pressure", body.Items[0].Metadata.FileType)
+	assert.Equal(t, "omron", body.Items[0].Metadata.StaticTags["vendor"])
 }
 
 // ── CreateRule ────────────────────────────────────────────────────────────────

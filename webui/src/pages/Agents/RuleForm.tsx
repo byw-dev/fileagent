@@ -662,7 +662,14 @@ function AgentRuleFormPage() {
                 width="md"
                 rules={[
                   { required: true, whitespace: true, message: '请输入路径变量' },
-                  { pattern: PATH_VAR_RE, message: '需为单个模板变量，例如 {site} 或 {site:fmt}' },
+                  {
+                    // Validate the trimmed value — it is stored trimmed, so the UI
+                    // must not reject " {site} " that toRuleMetadata would accept.
+                    validator: (_, value?: string) =>
+                      !value?.trim() || PATH_VAR_RE.test(value.trim())
+                        ? Promise.resolve()
+                        : Promise.reject(new Error('需为单个模板变量，例如 {site} 或 {site:fmt}')),
+                  },
                 ]}
               />
             </Space>
