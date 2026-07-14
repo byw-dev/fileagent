@@ -58,6 +58,14 @@ export function DangerConfirmModal({
       cancelText="取消"
       confirmLoading={loading}
       okButtonProps={{ danger: true, disabled: !okEnabled }}
+      // While the danger action is in flight, lock every dismiss path (cancel
+      // button / mask / Esc / close icon) so the modal stays open until the
+      // request settles — mirrors FormDrawer, avoids "looks cancelled but the
+      // delete still completed" (交互定则 2).
+      cancelButtonProps={{ disabled: loading }}
+      maskClosable={!loading}
+      keyboard={!loading}
+      closable={!loading}
       afterClose={() => setTyped('')}
       destroyOnHidden
     >

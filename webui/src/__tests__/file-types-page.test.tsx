@@ -51,10 +51,11 @@ describe('FileTypesPage (WR-2)', () => {
     await waitFor(() => expect(listFileTypesMock).toHaveBeenCalledTimes(1))
   })
 
-  it('opens the create FormDrawer on 新建类型', () => {
+  it('opens the create FormDrawer on 新建类型', async () => {
     renderPage()
     fireEvent.click(screen.getByRole('button', { name: /新建类型/ }))
-    // FormDrawer (portal) renders the create title.
-    expect(screen.getByText('新建文件类型')).toBeInTheDocument()
+    // FormDrawer content renders via a portal and mounts asynchronously
+    // (Drawer open animation) — await it rather than asserting synchronously.
+    expect(await screen.findByText('新建文件类型')).toBeInTheDocument()
   })
 })
