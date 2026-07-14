@@ -57,7 +57,14 @@ function FileTypesPage() {
   }
 
   const submit = async () => {
-    const values = await form.validateFields()
+    let values: FileTypeFormValues
+    try {
+      values = await form.validateFields()
+    } catch {
+      // Validation errors are surfaced inline by the form fields; abort silently
+      // so the rejected validateFields promise never escapes as unhandled.
+      return
+    }
     setSubmitting(true)
     try {
       if (editing) {
