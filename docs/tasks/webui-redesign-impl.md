@@ -86,6 +86,9 @@
       详情/新建/编辑全折进抽屉，名称点击即开编辑）
 - [x] 删除 → `DangerConfirmModal` 红实心 + 输入名称确认（4f）
 - 注：`file_types` 已按 D-025 降级为**兜底粗分类**（变种维度走标签，规则声明类型优先于 glob）；本页无状态字段，不涉及徽标。
+- **范式（评审定型）**：表格内可点元素（名称/操作列）用 `Button type="link"`（`padding:0;height:auto` 保持链接外观）
+      而非无 `href` 的 `<a onClick>`／`Typography.Link`——后者键盘不可聚焦（a11y）。**WR-3/WR-4 同步**：`Agents/index`·`Agents/Pending`·
+      `Files/index` 的操作/名称列仍是 `<a onClick>`，在各自切片一并替换。
 - **⚠️ glob 规则编辑器（原 3c）已从本项拆出** → `backlog.md`（**无后端**：`file_type_rules` 无 REST 端点，需先建
       CRUD + 试匹配端点，破坏 WR「纯前端」前提；且 glob 现为低价值兜底）。2026-07-14 用户拍板 descope + 后续按需再做。
 

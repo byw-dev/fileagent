@@ -104,7 +104,13 @@ function FileTypesPage() {
       title: '名称',
       dataIndex: 'name',
       key: 'name',
-      render: (_, ft) => <a onClick={() => openEdit(ft)}>{ft.name}</a>,
+      // Button type="link" (renders <button>) keeps the name keyboard-focusable
+      // and operable; padding reset makes it visually identical to an inline link.
+      render: (_, ft) => (
+        <Button type="link" style={{ padding: 0, height: 'auto' }} onClick={() => openEdit(ft)}>
+          {ft.name}
+        </Button>
+      ),
     },
     {
       title: '描述',
@@ -127,10 +133,17 @@ function FileTypesPage() {
       align: 'right',
       render: (_, ft) => (
         <Space size="middle">
-          <a onClick={() => openEdit(ft)}>编辑</a>
-          <Typography.Link type="danger" onClick={() => setDeleteTarget(ft)}>
+          <Button type="link" style={{ padding: 0, height: 'auto' }} onClick={() => openEdit(ft)}>
+            编辑
+          </Button>
+          <Button
+            type="link"
+            danger
+            style={{ padding: 0, height: 'auto' }}
+            onClick={() => setDeleteTarget(ft)}
+          >
             删除
-          </Typography.Link>
+          </Button>
         </Space>
       ),
     },
