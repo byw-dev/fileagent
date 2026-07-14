@@ -79,7 +79,7 @@
 
 > **实机验证（暗色模式）**：`html/body/#root` 背景 `#F5F6F8`（`color-scheme:light`），**无白→黑→白闪烁**；侧栏 208px 无折叠开关；主色 `#2F6BE0`（Tab ink）；状态徽标为**浅底泡泡**（采集器页自动升级，逐色比对 mockup）；base 16px。build + 90 tests + lint（新文件）通过。
 
-### WR-2 — 文件类型（样板页，评审定型） ✅（PR 待评审）
+### WR-2 — 文件类型（样板页，评审定型） ✅（PR #82，评审中）
 用最简单 CRUD 把抽屉/时间/筛选/危险确认范式跑通定型：
 - [x] `src/pages/FileTypes/index.tsx`：`TimeText` 创建时间 / 单行名称筛选 / 操作列右对齐 / 空态 `EmptyState`
 - [x] 新建/编辑 → `FormDrawer`（删 `/file-types/create` + `/file-types/:id` 整页路由 + `Create.tsx` + `Detail.tsx`；
