@@ -229,6 +229,10 @@ function FileTypesPage() {
           form={form}
           layout="vertical"
           preserve={false}
+          // onFinish makes Enter-in-input submit work for keyboard users; it fires
+          // only after validation passes, so submit's own validateFields is a
+          // cheap no-op there. The footer button still calls submit directly.
+          onFinish={submit}
           initialValues={{ name: editing?.name ?? '', description: editing?.description ?? '' }}
         >
           <Form.Item
