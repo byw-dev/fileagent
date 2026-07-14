@@ -120,7 +120,7 @@
       `StatusBadge`（来源/状态）/`TimeText`（首次出现）/token 色/空态一句话+主操作/危险确认（拒绝、删除键）；
       取值抽屉与 merge 弹窗对齐 `FormDrawer`/交互定则。〔均 Phase-1「够用一致」建，本片折入润色〕
 
-### WR-9 — 仪表盘 ✅（PR 待开）
+### WR-9 — 仪表盘 ✅（本 PR）
 - [x] 去硬编码色：统计卡强调色 + 折线 stroke + 网格线改走 `theme.useToken()`（`colorSuccess`/`colorPrimary`/`colorSplit`），不再 `#52c41a`/`#1677ff`
 - [x] 骨架屏加载（定则 6）：四张统计卡 + 图表卡 + 采集器卡 + 日志卡改 `Card loading`（骨架），去掉 `Spin` 转圈
 - [x] 套 WR 范式：日志状态列改 `StatusBadge`（`domain="upload"`，扩了 `SUCCESS`/upload `PENDING` 映射）、上传时间改 `TimeText`、三处空态改 `EmptyState`
