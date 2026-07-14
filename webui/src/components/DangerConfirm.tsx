@@ -57,7 +57,10 @@ export function DangerConfirmModal({
       okText={okText}
       cancelText="取消"
       confirmLoading={loading}
-      okButtonProps={{ danger: true, disabled: !okEnabled }}
+      // Disable OK while in-flight too: confirmLoading only swaps in a spinner but
+      // leaves the button clickable, so a double-click could fire onConfirm twice
+      // (e.g. double-delete) before state propagates.
+      okButtonProps={{ danger: true, disabled: !okEnabled || loading }}
       // While the danger action is in flight, lock every dismiss path (cancel
       // button / mask / Esc / close icon) so the modal stays open until the
       // request settles — mirrors FormDrawer, avoids "looks cancelled but the

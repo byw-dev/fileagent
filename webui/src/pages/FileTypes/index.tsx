@@ -34,6 +34,10 @@ interface FileTypeFormValues {
  */
 function FileTypesPage() {
   const actionRef = useRef<ActionType | undefined>(undefined)
+  // Cached full list: filtering is client-side, so typing in the filter box must
+  // not re-hit the API on every keystroke. Invalidated (set to null) after any
+  // create/update/delete so the next reload refetches.
+  const cacheRef = useRef<FileType[] | null>(null)
   const { message } = App.useApp()
 
   const [filterName, setFilterName] = useState('')
@@ -75,6 +79,7 @@ function FileTypesPage() {
         message.success('已创建文件类型')
       }
       setDrawerOpen(false)
+      cacheRef.current = null
       actionRef.current?.reload()
     } catch (err) {
       const status = (err as { response?: { status?: number } }).response?.status
@@ -91,6 +96,7 @@ function FileTypesPage() {
       await deleteFileType(deleteTarget.id)
       message.success('已删除')
       setDeleteTarget(null)
+      cacheRef.current = null
       actionRef.current?.reload()
     } catch {
       message.error('删除失败')
@@ -196,7 +202,12 @@ function FileTypesPage() {
         params={{ filterName }}
         request={async () => {
           try {
-            const all = await listFileTypes()
+            // Fetch once and reuse the cache; keystrokes re-run request (params
+            // change) but only re-filter the cached list, no extra API calls.
+            if (!cacheRef.current) {
+              cacheRef.current = await listFileTypes()
+            }
+            const all = cacheRef.current
             const data = filterName
               ? all.filter((ft) => ft.name.toLowerCase().includes(filterName.toLowerCase()))
               : all
