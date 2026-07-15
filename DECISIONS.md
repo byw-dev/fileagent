@@ -1151,3 +1151,39 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
   非此形状跳过。变量名复用 trollsift 模板（V-3）。
 - 校验：单测（抽取 / 模板不匹配 / 受控未登记入队 + suggested / 已登记不入队 / 非受控不入队 / 非新插入不入队）
   + 新查询 sqlmock 测 + **真 PG 逐条 SQL 校验**（DO NOTHING 的插入/冲突信号、pending hit_count 1→2、大小写近似）。
+
+---
+
+## D-026：事件投递响应补充诊断字段（WR-5，additive）
+
+**决策日期**：2026-07-15
+**影响范围**：controlplane（`internal/api/handler/events.go` 投递响应）、webui（`services/events.ts` + 投递抽屉）
+**来源**：WR-5 事件规则页重做，规范 4c「失败行可展开响应体」需要投递失败原因，但当前 REST 投递响应未投影这些字段。
+
+### 决策
+
+`GET /api/v1/event-rules/{id}/deliveries` 的投递响应 `eventDeliveryResponse` **纯追加**四个字段，均来自
+已存在的 `db.EventDelivery` 模型（数据早已入库，仅未对外投影）：
+
+- `response_code`（int，webhook 最后一次尝试的 HTTP 状态；nats_publish / 未尝试时**省略**）
+- `response_body`（string，最后一次尝试的响应体 / 错误文本；无则省略）
+- `next_retry_at`（RFC3339，下次重试时刻；已投递 / 已终止 dead 后省略）
+- `delivered_at`（RFC3339，最终成功时刻；失败 / dead 时省略）
+
+均带 `omitempty`——**向后兼容**：老客户端忽略新字段，缺失字段按「无」处理，不破坏既有形状。
+
+### 为何允许这次后端改动（WR track 名义「纯前端」）
+
+- 数据**已存在**于 `EventDelivery` 模型（`response_code`/`response_body`/`next_retry_at`/`delivered_at`），
+  只是 handler 响应结构体没投影；补齐是 2 行映射 + struct 字段，**非新建端点 / 新表**。
+- 与 WR-2 的 glob 编辑器 descope 形成对比：那里需要**从零建后端 CRUD + 试匹配端点**（破坏纯前端前提，价值低），
+  故推后；这里是让**已实现的重试生命周期**（CC-7 / D-019）对 UI 可见，投入极小、让 4c 成为真功能而非空壳。
+- 产品 2026-07-15 拍板「小幅补后端字段」。
+
+### 落地记录
+
+- `events.go`：`eventDeliveryResponse` 加 4 字段 + `toEventDeliveryResponse` 按 `Valid` 门控映射（nats_publish /
+  未尝试时省略）。
+- 测试：`events_test.go` 加 `ListDeliveries_ExposesResponseFields`（failed webhook 带 code/body/next_retry）+
+  `ListDeliveries_OmitsAbsentResponseFields`（pending 全省略）。
+- 前端：`EventDelivery` 加可选字段；投递抽屉 failed/dead 行 `expandable` 展开 HTTP 状态 / 下次重试 / 响应体。

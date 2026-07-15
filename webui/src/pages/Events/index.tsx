@@ -1,23 +1,41 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { App, Button, Space, Typography, Tag, Switch } from 'antd'
-import { PlusOutlined, DeleteOutlined, UnorderedListOutlined } from '@ant-design/icons'
+import { PlusOutlined } from '@ant-design/icons'
 import { ProTable } from '@ant-design/pro-components'
 import type { ProColumns, ActionType } from '@ant-design/pro-components'
-import { useNavigate } from 'react-router-dom'
-import { useRef } from 'react'
 import { listEventRules, deleteEventRule, updateEventRule } from '../../services/events'
 import type { EventRule } from '../../services/events'
+import { DangerConfirmModal } from '../../components/DangerConfirm'
+import TimeText from '../../components/TimeText'
+import RuleFormDrawer from './RuleFormDrawer'
+import DeliveriesDrawer from './DeliveriesDrawer'
 
 const { Title } = Typography
 
 /**
- * Event rules list page — shows all event rules with create, toggle and delete actions.
+ * Event rules list page (WR-5). Create/edit run in a 480px drawer (交互定则 1),
+ * delivery history opens in a drawer (4c), the enable switch toggles inline
+ * (4a), and delete uses the danger-confirm modal (交互定则 2).
  */
 function EventsPage() {
-  const navigate = useNavigate()
   const actionRef = useRef<ActionType | undefined>(undefined)
+  const { message } = App.useApp()
+
   const [togglingId, setTogglingId] = useState<string | null>(null)
-  const { modal, message } = App.useApp()
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [editing, setEditing] = useState<EventRule | null>(null)
+  const [deliveriesFor, setDeliveriesFor] = useState<EventRule | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<EventRule | null>(null)
+  const [deleting, setDeleting] = useState(false)
+
+  const openCreate = () => {
+    setEditing(null)
+    setDrawerOpen(true)
+  }
+  const openEdit = (rule: EventRule) => {
+    setEditing(rule)
+    setDrawerOpen(true)
+  }
 
   const handleToggle = async (rule: EventRule, enabled: boolean) => {
     setTogglingId(rule.id)
@@ -30,7 +48,7 @@ function EventsPage() {
         action_config: rule.action_config,
         enabled,
       })
-      message.success(enabled ? '规则已启用' : '规则已禁用')
+      message.success(enabled ? '规则已启用' : '规则已停用')
       actionRef.current?.reload()
     } catch {
       message.error('操作失败')
@@ -39,21 +57,19 @@ function EventsPage() {
     }
   }
 
-  const handleDelete = (rule: EventRule) => {
-    modal.confirm({
-      title: `删除事件规则：${rule.name}`,
-      content: '确认删除该规则？相关投递记录将不再触发。',
-      okType: 'danger',
-      onOk: async () => {
-        try {
-          await deleteEventRule(rule.id)
-          message.success('删除成功')
-          actionRef.current?.reload()
-        } catch {
-          message.error('删除失败')
-        }
-      },
-    })
+  const confirmDelete = async () => {
+    if (!deleteTarget) return
+    setDeleting(true)
+    try {
+      await deleteEventRule(deleteTarget.id)
+      message.success('已删除')
+      setDeleteTarget(null)
+      actionRef.current?.reload()
+    } catch {
+      message.error('删除失败')
+    } finally {
+      setDeleting(false)
+    }
   }
 
   const columns: ProColumns<EventRule>[] = [
@@ -62,26 +78,31 @@ function EventsPage() {
       dataIndex: 'name',
       key: 'name',
       ellipsis: true,
+      render: (_, rule) => (
+        <Button type="link" style={{ padding: 0, height: 'auto' }} onClick={() => openEdit(rule)}>
+          {rule.name}
+        </Button>
+      ),
     },
     {
       title: '事件类型',
       dataIndex: 'event_type',
       key: 'event_type',
       width: 160,
-      render: (_, rule) => <Tag color="blue">{rule.event_type}</Tag>,
+      render: (_, rule) => <Tag>{rule.event_type}</Tag>,
     },
     {
       title: '动作类型',
       dataIndex: 'action_type',
       key: 'action_type',
       width: 140,
-      render: (_, rule) => <Tag color="purple">{rule.action_type}</Tag>,
+      render: (_, rule) => <Tag>{rule.action_type}</Tag>,
     },
     {
       title: '状态',
       dataIndex: 'enabled',
       key: 'enabled',
-      width: 90,
+      width: 80,
       render: (_, rule) => (
         <Switch
           checked={rule.enabled}
@@ -95,27 +116,28 @@ function EventsPage() {
       title: '创建时间',
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 170,
-      render: (_, rule) => new Date(rule.created_at).toLocaleString('zh-CN'),
+      width: 150,
+      render: (_, rule) => <TimeText value={rule.created_at} />,
     },
     {
       title: '操作',
       key: 'action',
-      width: 170,
+      width: 140,
+      align: 'right',
       render: (_, rule) => (
-        <Space>
+        <Space size="middle">
           <Button
-            size="small"
-            icon={<UnorderedListOutlined />}
-            onClick={() => navigate(`/events/${rule.id}/deliveries`)}
+            type="link"
+            style={{ padding: 0, height: 'auto' }}
+            onClick={() => setDeliveriesFor(rule)}
           >
             投递记录
           </Button>
           <Button
-            size="small"
+            type="link"
             danger
-            icon={<DeleteOutlined />}
-            onClick={() => handleDelete(rule)}
+            style={{ padding: 0, height: 'auto' }}
+            onClick={() => setDeleteTarget(rule)}
           >
             删除
           </Button>
@@ -128,11 +150,7 @@ function EventsPage() {
     <div>
       <Space style={{ marginBottom: 16, justifyContent: 'space-between', width: '100%' }}>
         <Title level={3} style={{ margin: 0 }}>事件规则</Title>
-        <Button
-          type="primary"
-          icon={<PlusOutlined />}
-          onClick={() => navigate('/events/create')}
-        >
+        <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
           新建规则
         </Button>
       </Space>
@@ -142,7 +160,8 @@ function EventsPage() {
         columns={columns}
         rowKey="id"
         search={false}
-        pagination={{ pageSize: 20 }}
+        options={false}
+        pagination={{ pageSize: 20, hideOnSinglePage: true }}
         request={async () => {
           try {
             const data = await listEventRules()
@@ -151,6 +170,27 @@ function EventsPage() {
             return { data: [], success: false, total: 0 }
           }
         }}
+      />
+
+      <RuleFormDrawer
+        open={drawerOpen}
+        editing={editing}
+        onClose={() => setDrawerOpen(false)}
+        onSaved={() => {
+          setDrawerOpen(false)
+          actionRef.current?.reload()
+        }}
+      />
+
+      <DeliveriesDrawer rule={deliveriesFor} onClose={() => setDeliveriesFor(null)} />
+
+      <DangerConfirmModal
+        open={deleteTarget !== null}
+        title={deleteTarget ? `删除事件规则：${deleteTarget.name}` : '删除事件规则'}
+        content="删除后该规则不再触发，相关投递记录保留。此操作不可撤销。"
+        loading={deleting}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={confirmDelete}
       />
     </div>
   )

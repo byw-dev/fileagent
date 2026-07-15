@@ -19,6 +19,14 @@ export interface EventDelivery {
   event_rule_id: string
   status: string
   attempt_count: number
+  /** HTTP status of the last webhook attempt (absent for nats_publish / not-yet-attempted). */
+  response_code?: number
+  /** Response body / error text of the last attempt (absent when none). */
+  response_body?: string
+  /** Next scheduled retry (absent once delivered / dead). */
+  next_retry_at?: string
+  /** When the delivery finally succeeded (absent for failed / dead). */
+  delivered_at?: string
   created_at: string
 }
 

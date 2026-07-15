@@ -416,17 +416,38 @@ type eventDeliveryResponse struct {
 	EventRuleID  string `json:"event_rule_id"`
 	Status       string `json:"status"`
 	AttemptCount int32  `json:"attempt_count"`
+	// Response fields are populated for HTTP-style deliveries (webhook) and let
+	// the UI expand a failed/dead row to show why it failed. Nullable in the DB;
+	// omitted when absent (e.g. nats_publish has no HTTP code/body). Additive to
+	// the contract — see DECISIONS.md D-026.
+	ResponseCode int32  `json:"response_code,omitempty"`
+	ResponseBody string `json:"response_body,omitempty"`
+	NextRetryAt  string `json:"next_retry_at,omitempty"`
+	DeliveredAt  string `json:"delivered_at,omitempty"`
 	CreatedAt    string `json:"created_at"`
 }
 
 func toEventDeliveryResponse(d *db.EventDelivery) eventDeliveryResponse {
-	return eventDeliveryResponse{
+	r := eventDeliveryResponse{
 		ID:           d.ID.String(),
 		EventRuleID:  d.EventRuleID.String(),
 		Status:       d.Status,
 		AttemptCount: d.AttemptCount,
 		CreatedAt:    d.CreatedAt.UTC().Format(time.RFC3339),
 	}
+	if d.ResponseCode.Valid {
+		r.ResponseCode = d.ResponseCode.Int32
+	}
+	if d.ResponseBody.Valid {
+		r.ResponseBody = d.ResponseBody.String
+	}
+	if d.NextRetryAt.Valid {
+		r.NextRetryAt = d.NextRetryAt.Time.UTC().Format(time.RFC3339)
+	}
+	if d.DeliveredAt.Valid {
+		r.DeliveredAt = d.DeliveredAt.Time.UTC().Format(time.RFC3339)
+	}
+	return r
 }
 
 // ListDeliveries handles GET /api/v1/event-rules/:id/deliveries.
