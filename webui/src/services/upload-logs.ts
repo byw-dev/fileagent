@@ -9,6 +9,14 @@ export interface UploadLog {
   size: number
   status: 'SUCCESS' | 'FAILED' | 'PENDING'
   error_message: string | null
+  /** Number of retries the agent made (retry trail, 4e). */
+  retry_count: number
+  /** Bytes transferred so far (partial on failure). */
+  bytes_transferred: number
+  /** When the upload attempt started (absent for legacy rows). */
+  started_at?: string
+  /** When the upload finished (absent while in-flight). */
+  finished_at?: string
   uploaded_at: string
 }
 

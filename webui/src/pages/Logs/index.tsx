@@ -1,25 +1,21 @@
-import { useState } from 'react'
-import { Select, Space, Typography, Tag } from 'antd'
+import { useRef, useState } from 'react'
+import { Space, Tag, Typography, Descriptions } from 'antd'
 import { ProTable } from '@ant-design/pro-components'
 import type { ProColumns, ActionType } from '@ant-design/pro-components'
-import { useRef } from 'react'
 import { listUploadLogs } from '../../services/upload-logs'
 import type { UploadLog } from '../../services/upload-logs'
+import StatusBadge from '../../components/StatusBadge'
+import TimeText from '../../components/TimeText'
 
-const { Title } = Typography
+const { Title, Text } = Typography
+const { CheckableTag } = Tag
 
-const STATUS_OPTIONS = [
+const STATUS_FILTERS = [
   { label: '全部', value: '' },
   { label: '成功', value: 'SUCCESS' },
   { label: '失败', value: 'FAILED' },
   { label: '待处理', value: 'PENDING' },
 ]
-
-const STATUS_COLOR: Record<string, string> = {
-  SUCCESS: 'green',
-  FAILED: 'red',
-  PENDING: 'gold',
-}
 
 /** Format bytes to human-readable size */
 function formatBytes(bytes: number): string {
@@ -30,7 +26,9 @@ function formatBytes(bytes: number): string {
 }
 
 /**
- * Global upload logs page — shows all upload logs with status filter.
+ * Global upload logs page (WR-6). Status filter is a single-line chip row
+ * (4e / 交互定则 3); status uses the site-wide badge; failed rows expand to show
+ * the error and retry trail (retry count / transferred bytes / timing).
  */
 function LogsPage() {
   const actionRef = useRef<ActionType | undefined>(undefined)
@@ -62,23 +60,14 @@ function LogsPage() {
       dataIndex: 'status',
       key: 'status',
       width: 100,
-      render: (_, log) => (
-        <Tag color={STATUS_COLOR[log.status] ?? 'default'}>{log.status}</Tag>
-      ),
+      render: (_, log) => <StatusBadge status={log.status} domain="upload" />,
     },
     {
       title: '上传时间',
       dataIndex: 'uploaded_at',
       key: 'uploaded_at',
-      width: 170,
-      render: (_, log) => new Date(log.uploaded_at).toLocaleString('zh-CN'),
-    },
-    {
-      title: '错误信息',
-      dataIndex: 'error_message',
-      key: 'error_message',
-      ellipsis: true,
-      render: (_, log) => log.error_message ?? '—',
+      width: 150,
+      render: (_, log) => <TimeText value={log.uploaded_at} />,
     },
   ]
 
@@ -86,17 +75,20 @@ function LogsPage() {
     <div>
       <Title level={3} style={{ marginBottom: 16 }}>上传日志</Title>
 
-      <Space style={{ marginBottom: 16 }}>
-        <Select
-          value={filterStatus}
-          onChange={(v) => {
-            setFilterStatus(v)
-            actionRef.current?.reload()
-          }}
-          options={STATUS_OPTIONS}
-          style={{ width: 120 }}
-          placeholder="状态筛选"
-        />
+      {/* Single-line chip filter (4e / 交互定则 3). */}
+      <Space style={{ marginBottom: 16 }} size={4}>
+        {STATUS_FILTERS.map((f) => (
+          <CheckableTag
+            key={f.value}
+            checked={filterStatus === f.value}
+            onChange={() => {
+              setFilterStatus(f.value)
+              actionRef.current?.reload()
+            }}
+          >
+            {f.label}
+          </CheckableTag>
+        ))}
       </Space>
 
       <ProTable<UploadLog>
@@ -104,12 +96,31 @@ function LogsPage() {
         columns={columns}
         rowKey="id"
         search={false}
+        options={false}
         pagination={{ pageSize: 20 }}
+        expandable={{
+          // Failed rows carry an error + retry trail worth expanding.
+          rowExpandable: (log) => log.status === 'FAILED',
+          expandedRowRender: (log) => (
+            <Descriptions size="small" column={1} style={{ margin: 0 }}>
+              <Descriptions.Item label="错误信息">
+                {log.error_message || <Text type="secondary">—</Text>}
+              </Descriptions.Item>
+              <Descriptions.Item label="重试次数">{log.retry_count}</Descriptions.Item>
+              <Descriptions.Item label="已传输">
+                {formatBytes(log.bytes_transferred)} / {formatBytes(log.size)}
+              </Descriptions.Item>
+              <Descriptions.Item label="开始 / 结束">
+                <TimeText value={log.started_at} /> → <TimeText value={log.finished_at} />
+              </Descriptions.Item>
+            </Descriptions>
+          ),
+        }}
         request={async () => {
           try {
-            const params: Record<string, unknown> = { limit: 100 }
+            const params: Parameters<typeof listUploadLogs>[0] = { limit: 100 }
             if (filterStatus) params.status = filterStatus
-            const data = await listUploadLogs(params as Parameters<typeof listUploadLogs>[0])
+            const data = await listUploadLogs(params)
             return { data: data.items, success: true, total: data.total }
           } catch {
             return { data: [], success: false, total: 0 }

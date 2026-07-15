@@ -608,6 +608,43 @@ func TestUploadLogsHandler_List_Success(t *testing.T) {
 	assert.Equal(t, false, body["has_more"])
 }
 
+// A failed upload log exposes the retry-trail fields (retry_count, transferred
+// bytes, timing) so the UI can expand the row (D-027, additive fields).
+func TestUploadLogsHandler_List_ExposesRetryTrail(t *testing.T) {
+	started := time.Now()
+	log := &db.UploadLog{
+		ID:               uuid.New(),
+		OrgID:            uuid.New(),
+		AgentID:          uuid.New(),
+		StoragePath:      "uploads/big.bin",
+		SizeBytes:        2048,
+		BytesTransferred: 512,
+		Status:           "failed",
+		ErrorMessage:     sql.NullString{String: "connection reset", Valid: true},
+		RetryCount:       3,
+		StartedAt:        started,
+		FinishedAt:       sql.NullTime{Time: started.Add(time.Minute), Valid: true},
+		CreatedAt:        started,
+	}
+	h := handler.NewUploadLogsHandler(&mockUploadLogsDB{logs: []*db.UploadLog{log}, logsCount: 1}, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/upload-logs", nil)
+	testUploadLogsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body struct {
+		Items []map[string]interface{} `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Len(t, body.Items, 1)
+	item := body.Items[0]
+	assert.Equal(t, float64(3), item["retry_count"])
+	assert.Equal(t, float64(512), item["bytes_transferred"])
+	assert.Equal(t, "connection reset", item["error_message"])
+	assert.NotEmpty(t, item["started_at"])
+	assert.NotEmpty(t, item["finished_at"])
+}
+
 func TestUploadLogsHandler_List_HasMore(t *testing.T) {
 	// Simulate limit=1 with 2 entries (limit+1) returned by mock.
 	logs := []*db.UploadLog{newSampleLog(), newSampleLog()}

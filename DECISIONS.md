@@ -1187,3 +1187,37 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 - 测试：`events_test.go` 加 `ListDeliveries_ExposesResponseFields`（failed webhook 带 code/body/next_retry）+
   `ListDeliveries_OmitsAbsentResponseFields`（pending 全省略）。
 - 前端：`EventDelivery` 加可选字段；投递抽屉 failed/dead 行 `expandable` 展开 HTTP 状态 / 下次重试 / 响应体。
+
+---
+
+## D-027：上传日志响应补充重试轨迹字段（WR-6，additive）
+
+**决策日期**：2026-07-15
+**影响范围**：controlplane（`internal/api/handler/events.go` 上传日志响应）、webui（`services/upload-logs.ts` + 日志页失败行展开）
+**来源**：WR-6 上传日志页重做，规范 4e「失败行内嵌错误 + 重试轨迹」需要重试次数/传输进度/时序，但当前 REST 响应未投影这些字段。
+
+### 决策
+
+`GET /api/v1/upload-logs` 的 `uploadLogResponse` **纯追加**四个字段，均来自已存在的 `db.UploadLog` 模型
+（数据早已入库，仅未对外投影）：
+
+- `retry_count`（int，agent 重试次数）
+- `bytes_transferred`（int64，已传字节；失败时为部分进度）
+- `started_at`（RFC3339，尝试开始时刻；`omitempty`）
+- `finished_at`（RFC3339，结束时刻；进行中省略）
+
+`retry_count`/`bytes_transferred` 无 `omitempty`（0 是有效值、语义明确）；两个时间戳 `omitempty`。**向后兼容**：
+老客户端忽略新字段。
+
+### 为何允许（与 D-026 同类）
+
+数据**已在** `UploadLog` 模型（`retry_count`/`bytes_transferred`/`started_at`/`finished_at`），handler 响应未投影；
+补齐是 struct 字段 + 映射行，**非新端点/新表**。等价于 D-026 的投递响应补字段——让**已有的重试/传输状态**对 UI 可见，
+使 4e「失败行展开重试轨迹」成真功能而非空壳。沿用产品对 WR-5「小幅补后端字段」的同一裁量。
+
+### 落地记录
+
+- `events.go`：`uploadLogResponse` 加 4 字段 + `toUploadLogResponse` 映射（`finished_at` 按 `Valid` 门控）。
+- 测试：`events_test.go` 加 `List_ExposesRetryTrail`（failed log 带 retry_count/bytes_transferred/timing）。
+- 前端：`UploadLog` 加字段；日志页状态筛选改 chip（`CheckableTag`）、状态列 `StatusBadge domain=upload`、时间 `TimeText`、
+  **failed 行 `expandable`** 展开 错误信息 / 重试次数 / 已传输 X/Y / 开始→结束。
