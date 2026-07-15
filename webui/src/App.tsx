@@ -19,8 +19,6 @@ const FileDetailPage = lazy(() => import('./pages/Files/Detail'))
 const FileTypesPage = lazy(() => import('./pages/FileTypes'))
 const BucketsPage = lazy(() => import('./pages/Buckets'))
 const EventsPage = lazy(() => import('./pages/Events'))
-const EventCreatePage = lazy(() => import('./pages/Events/Create'))
-const EventDeliveriesPage = lazy(() => import('./pages/Events/Deliveries'))
 const LogsPage = lazy(() => import('./pages/Logs'))
 const SettingsPage = lazy(() => import('./pages/Settings'))
 const SettingsUsersPage = lazy(() => import('./pages/Settings/Users'))
@@ -88,10 +86,8 @@ function App() {
               {/* Buckets */}
               <Route path="/buckets" element={<BucketsPage />} />
 
-              {/* Events */}
+              {/* Events (create/edit + deliveries are drawers on the list, WR-5) */}
               <Route path="/events" element={<EventsPage />} />
-              <Route path="/events/create" element={<EventCreatePage />} />
-              <Route path="/events/:id/deliveries" element={<EventDeliveriesPage />} />
 
               {/* Logs */}
               <Route path="/logs" element={<LogsPage />} />

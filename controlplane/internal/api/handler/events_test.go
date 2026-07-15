@@ -507,6 +507,71 @@ func TestEventRulesHandler_ListDeliveries_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+// A failed webhook delivery carries response_code/response_body/next_retry_at so
+// the UI can expand the row and explain the failure (D-026, additive fields).
+func TestEventRulesHandler_ListDeliveries_ExposesResponseFields(t *testing.T) {
+	retryAt := time.Now().Add(time.Minute)
+	delivery := &db.EventDelivery{
+		ID:           uuid.New(),
+		EventRuleID:  uuid.New(),
+		EventType:    db.EventTypeFileUploaded,
+		Payload:      json.RawMessage(`{}`),
+		Status:       "failed",
+		AttemptCount: 2,
+		ResponseCode: sql.NullInt32{Int32: 500, Valid: true},
+		ResponseBody: sql.NullString{String: "upstream error", Valid: true},
+		NextRetryAt:  sql.NullTime{Time: retryAt, Valid: true},
+		CreatedAt:    time.Now(),
+	}
+	h := handler.NewEventRulesHandler(&mockEventRulesDB{deliveries: []*db.EventDelivery{delivery}}, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/event-rules/"+delivery.EventRuleID.String()+"/deliveries", nil)
+	testEventRulesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body struct {
+		Items []map[string]interface{} `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Len(t, body.Items, 1)
+	item := body.Items[0]
+	assert.Equal(t, float64(500), item["response_code"])
+	assert.Equal(t, "upstream error", item["response_body"])
+	assert.NotEmpty(t, item["next_retry_at"])
+	// delivered_at is nil for a failed delivery → omitted.
+	_, hasDelivered := item["delivered_at"]
+	assert.False(t, hasDelivered)
+}
+
+// nats_publish / not-yet-attempted deliveries have no HTTP response fields; they
+// must be omitted rather than serialized as zero values.
+func TestEventRulesHandler_ListDeliveries_OmitsAbsentResponseFields(t *testing.T) {
+	delivery := &db.EventDelivery{
+		ID:          uuid.New(),
+		EventRuleID: uuid.New(),
+		EventType:   db.EventTypeFileUploaded,
+		Payload:     json.RawMessage(`{}`),
+		Status:      "pending",
+		CreatedAt:   time.Now(),
+	}
+	h := handler.NewEventRulesHandler(&mockEventRulesDB{deliveries: []*db.EventDelivery{delivery}}, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/event-rules/"+delivery.EventRuleID.String()+"/deliveries", nil)
+	testEventRulesRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var body struct {
+		Items []map[string]interface{} `json:"items"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Len(t, body.Items, 1)
+	item := body.Items[0]
+	for _, k := range []string{"response_code", "response_body", "next_retry_at", "delivered_at"} {
+		_, ok := item[k]
+		assert.Falsef(t, ok, "expected %s to be omitted", k)
+	}
+}
+
 func TestEventRulesHandler_ListDeliveries_InvalidID(t *testing.T) {
 	h := handler.NewEventRulesHandler(&mockEventRulesDB{}, newTestLogger())
 	w := httptest.NewRecorder()

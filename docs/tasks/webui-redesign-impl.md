@@ -105,8 +105,13 @@
 - [ ] **对齐 Phase-1 标签 UI 到 WR 范式（7b）**：`Files/index.tsx` 现有标签列 / faceted 筛选（`TagFacetPicker`）/ 批量打标弹窗
       为「够用一致」建；本片对齐——标签列/筛选 chip 化统一、批量打标改 `FormDrawer`、空态/危险确认、token 色。**不回退**标签功能。
 
-### WR-5 — 事件规则 ⬜
-- [ ] 编辑抽屉(4b 动作二选一联动必填)、投递历史抽屉(4c dead 终态 / 失败行展开响应体)、行内启停
+### WR-5 — 事件规则 ✅（本 PR）
+- [x] 新建/编辑 → `RuleFormDrawer`（480px 抽屉，交互定则 1；删 `/events/create` 整页 + `Create.tsx`）；名称点击即开编辑
+- [x] **4b 动作二选一联动必填**：动作配置不再裸 JSON——选 webhook 显 `url`（`type:url` 校验）、选 nats_publish 显 `subject`，`shouldUpdate` 联动切换必填
+- [x] **4c 投递历史抽屉**：`DeliveriesDrawer`（删 `/events/:id/deliveries` 整页 + `Deliveries.tsx`）；状态走 `StatusBadge domain=delivery`（含终态 `dead`）；**failed/dead 行 `expandable` 展开** HTTP 状态 / 下次重试 / 响应体
+- [x] 行内启停（`Switch` 直改，4a，原已具备保留）、删除 → `DangerConfirmModal`、创建时间 → `TimeText`
+- [x] **小幅补后端字段（D-026，additive）**：投递响应追加 `response_code`/`response_body`/`next_retry_at`/`delivered_at`（数据已在 `EventDelivery` 模型，仅未投影；`omitempty` 向后兼容）——让 4c「展开响应体」成真功能而非空壳。**本项为 WR track 唯一后端触碰**，理由见 D-026
+- 测试：`events-page.test.tsx`（列表/创建抽屉默认 webhook 字段/投递抽屉）+ Go `ListDeliveries_ExposesResponseFields`/`_OmitsAbsentResponseFields`
 
 ### WR-6 — 上传日志 ⬜
 - [ ] 状态 chip 筛选(4e)、失败行内嵌错误 + 重试轨迹

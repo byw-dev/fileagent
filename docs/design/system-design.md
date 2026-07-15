@@ -1795,8 +1795,6 @@ mc event add myminio/data-sensor primary \
 /file-types/:id
 /buckets
 /events
-/events/create
-/events/:id/deliveries
 /logs
 /settings
 /settings/users
