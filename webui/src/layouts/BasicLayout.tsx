@@ -11,7 +11,7 @@ import {
   SettingOutlined,
   LogoutOutlined,
 } from '@ant-design/icons'
-import { Dropdown, Avatar } from 'antd'
+import { Dropdown, Avatar, theme } from 'antd'
 import type { MenuDataItem } from '@ant-design/pro-components'
 import useAuthStore from '../store/auth'
 
@@ -77,6 +77,7 @@ function BasicLayout() {
   const location = useLocation()
   const navigate = useNavigate()
   const { user, logout } = useAuthStore()
+  const { token } = theme.useToken()
 
   const handleLogout = () => {
     logout()
@@ -117,7 +118,7 @@ function BasicLayout() {
         title: (
           <Dropdown menu={{ items: avatarDropdownItems }} placement="bottomRight">
             <span style={{ cursor: 'pointer' }}>
-              <Avatar size="small" style={{ marginRight: 8, backgroundColor: '#2F6BE0' }}>
+              <Avatar size="small" style={{ marginRight: 8, backgroundColor: token.colorPrimary }}>
                 {user?.username?.[0]?.toUpperCase() ?? 'U'}
               </Avatar>
               {user?.username}

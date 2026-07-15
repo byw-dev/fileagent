@@ -28,6 +28,7 @@ const BASE: Record<string, Meta> = {
   // File / upload-log (ToUpper at REST boundary)
   UPLOADING: { label: '上传中', tone: 'processing' },
   COMPLETED: { label: '成功', tone: 'success' },
+  SUCCESS: { label: '成功', tone: 'success' }, // upload-log success enum
   FAILED: { label: '失败', tone: 'error' },
   DELETED: { label: '已删除', tone: 'neutral' },
   // Collection-rule status
@@ -45,6 +46,9 @@ export type StatusDomain = 'agent' | 'file' | 'upload' | 'rule' | 'delivery'
 const OVERRIDE: Partial<Record<StatusDomain, Record<string, Meta>>> = {
   delivery: {
     PENDING: { label: '待投递', tone: 'processing' },
+  },
+  upload: {
+    PENDING: { label: '待处理', tone: 'processing' }, // not agent 待审批
   },
 }
 

@@ -79,7 +79,7 @@
 
 > **实机验证（暗色模式）**：`html/body/#root` 背景 `#F5F6F8`（`color-scheme:light`），**无白→黑→白闪烁**；侧栏 208px 无折叠开关；主色 `#2F6BE0`（Tab ink）；状态徽标为**浅底泡泡**（采集器页自动升级，逐色比对 mockup）；base 16px。build + 90 tests + lint（新文件）通过。
 
-### WR-2 — 文件类型（样板页，评审定型） ✅（PR #82，评审中）
+### WR-2 — 文件类型（样板页，评审定型） ✅（已合并 PR #82）
 用最简单 CRUD 把抽屉/时间/筛选/危险确认范式跑通定型：
 - [x] `src/pages/FileTypes/index.tsx`：`TimeText` 创建时间 / 单行名称筛选 / 操作列右对齐 / 空态 `EmptyState`
 - [x] 新建/编辑 → `FormDrawer`（删 `/file-types/create` + `/file-types/:id` 整页路由 + `Create.tsx` + `Detail.tsx`；
@@ -120,8 +120,12 @@
       `StatusBadge`（来源/状态）/`TimeText`（首次出现）/token 色/空态一句话+主操作/危险确认（拒绝、删除键）；
       取值抽屉与 merge 弹窗对齐 `FormDrawer`/交互定则。〔均 Phase-1「够用一致」建，本片折入润色〕
 
-### WR-9 — 仪表盘 ⬜
-- [ ] 去硬编码色、卡片 + 骨架、接服务端聚合(1b，端点已存在 · commit f6f659f)
+### WR-9 — 仪表盘 ✅（本 PR）
+- [x] 去硬编码色：统计卡强调色 + 折线 stroke + 网格线改走 `theme.useToken()`（`colorSuccess`/`colorPrimary`/`colorSplit`），不再 `#52c41a`/`#1677ff`
+- [x] 骨架屏加载（定则 6）：四张统计卡 + 图表卡 + 采集器卡 + 日志卡改 `Card loading`（骨架），去掉 `Spin` 转圈
+- [x] 套 WR 范式：日志状态列改 `StatusBadge`（`domain="upload"`，扩了 `SUCCESS`/upload `PENDING` 映射）、上传时间改 `TimeText`、三处空态改 `EmptyState`
+- [x] 接服务端聚合(1b，端点已存在 · commit f6f659f)——WR-1 前既已接 `getDashboardStats`，本片保留
+- 注：无 mockup 专屏，遵 `webui-redesign.md` §1.1 token + 定则 6。含 `dashboard-page.test.tsx` 冒烟（骨架→内容 + 聚合被调）
 
 ### WR-10 — 收尾 ⬜
 - [ ] 全站 Chrome DevTools 实机走查（见「验证」）

@@ -1,4 +1,4 @@
-import { Row, Col, Card, Statistic, Table, Typography, Tag, Spin, Empty } from 'antd'
+import { Row, Col, Card, Statistic, Table, Typography, theme } from 'antd'
 import {
   RobotOutlined,
   UploadOutlined,
@@ -21,6 +21,9 @@ import { listUploadLogs } from '../../services/upload-logs'
 import type { UploadLog } from '../../services/upload-logs'
 import { getDashboardStats } from '../../services/stats'
 import AgentStatusBadge from '../../components/AgentStatusBadge'
+import StatusBadge from '../../components/StatusBadge'
+import TimeText from '../../components/TimeText'
+import EmptyState from '../../components/EmptyState'
 
 const { Title } = Typography
 
@@ -51,30 +54,26 @@ const uploadLogColumns: ColumnsType<UploadLog> = [
     dataIndex: 'status',
     key: 'status',
     width: 90,
-    render: (status: string) => {
-      const colorMap: Record<string, string> = {
-        SUCCESS: 'green',
-        FAILED: 'red',
-        PENDING: 'gold',
-      }
-      return <Tag color={colorMap[status] ?? 'default'}>{status}</Tag>
-    },
+    render: (status: string) => <StatusBadge status={status} domain="upload" />,
   },
   {
     title: '上传时间',
     dataIndex: 'uploaded_at',
     key: 'uploaded_at',
-    width: 170,
-    render: (t: string) => new Date(t).toLocaleString('zh-CN'),
+    width: 150,
+    render: (t: string) => <TimeText value={t} />,
   },
 ]
 
 /**
  * Dashboard page — shows system overview with stat cards, 7-day upload trend,
  * agent status list and recent 20 upload logs. SWR auto-refreshes every 30s.
+ * Loading uses card skeletons (交互定则 6, 不用转圈); accent colors come from
+ * theme tokens (§1.1, 不硬编码).
  */
 function DashboardPage() {
   const SWR_OPTS = { refreshInterval: 30_000 }
+  const { token } = theme.useToken()
 
   // Real aggregates from the Control Plane (replaces the earlier client-side
   // approximations derived from a 20-row upload-logs sample).
@@ -117,51 +116,43 @@ function DashboardPage() {
       {/* Stat cards */}
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
         <Col xs={24} sm={12} lg={6}>
-          <Card>
-            <Spin spinning={loadingStats}>
-              <Statistic
-                title="在线采集器"
-                value={onlineCount}
-                suffix={`/ ${totalCount}`}
-                prefix={<RobotOutlined />}
-                valueStyle={{ color: '#52c41a' }}
-              />
-            </Spin>
+          <Card loading={loadingStats}>
+            <Statistic
+              title="在线采集器"
+              value={onlineCount}
+              suffix={`/ ${totalCount}`}
+              prefix={<RobotOutlined />}
+              valueStyle={{ color: token.colorSuccess }}
+            />
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
-          <Card>
-            <Spin spinning={loadingStats}>
-              <Statistic
-                title="今日上传"
-                value={todayUploads}
-                suffix="个"
-                prefix={<UploadOutlined />}
-                valueStyle={{ color: '#1677ff' }}
-              />
-            </Spin>
+          <Card loading={loadingStats}>
+            <Statistic
+              title="今日上传"
+              value={todayUploads}
+              suffix="个"
+              prefix={<UploadOutlined />}
+              valueStyle={{ color: token.colorPrimary }}
+            />
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
-          <Card>
-            <Spin spinning={loadingStats}>
-              <Statistic
-                title="总文件数"
-                value={totalFiles}
-                prefix={<FileOutlined />}
-              />
-            </Spin>
+          <Card loading={loadingStats}>
+            <Statistic
+              title="总文件数"
+              value={totalFiles}
+              prefix={<FileOutlined />}
+            />
           </Card>
         </Col>
         <Col xs={24} sm={12} lg={6}>
-          <Card>
-            <Spin spinning={loadingStats}>
-              <Statistic
-                title="存储用量"
-                value={formatBytes(totalStorage)}
-                prefix={<CloudServerOutlined />}
-              />
-            </Spin>
+          <Card loading={loadingStats}>
+            <Statistic
+              title="存储用量"
+              value={formatBytes(totalStorage)}
+              prefix={<CloudServerOutlined />}
+            />
           </Card>
         </Col>
       </Row>
@@ -169,69 +160,64 @@ function DashboardPage() {
       {/* Chart + Agent status list */}
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
         <Col xs={24} lg={14}>
-          <Card title="近7日上传量趋势">
-            <Spin spinning={loadingStats}>
-              {trendData.every((d) => d.count === 0) ? (
-                <Empty description="暂无上传数据" style={{ padding: 40 }} />
-              ) : (
-                <ResponsiveContainer width="100%" height={240}>
-                  <LineChart data={trendData}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="date" />
-                    <YAxis allowDecimals={false} />
-                    <Tooltip />
-                    <Line
-                      type="monotone"
-                      dataKey="count"
-                      name="上传数"
-                      stroke="#1677ff"
-                      strokeWidth={2}
-                      dot={{ r: 3 }}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              )}
-            </Spin>
+          <Card title="近7日上传量趋势" loading={loadingStats}>
+            {trendData.every((d) => d.count === 0) ? (
+              <EmptyState description="暂无上传数据" />
+            ) : (
+              <ResponsiveContainer width="100%" height={240}>
+                <LineChart data={trendData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={token.colorSplit} />
+                  <XAxis dataKey="date" />
+                  <YAxis allowDecimals={false} />
+                  <Tooltip />
+                  <Line
+                    type="monotone"
+                    dataKey="count"
+                    name="上传数"
+                    stroke={token.colorPrimary}
+                    strokeWidth={2}
+                    dot={{ r: 3 }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
           </Card>
         </Col>
         <Col xs={24} lg={10}>
-          <Card title="采集器在线状态">
-            <Spin spinning={loadingAgents}>
-              {agents.length === 0 ? (
-                <Empty description="暂无采集器" />
-              ) : (
-                <Table
-                  dataSource={agents.slice(0, 8)}
-                  rowKey="id"
-                  size="small"
-                  pagination={false}
-                  columns={[
-                    { title: '名称', dataIndex: 'name', key: 'name', ellipsis: true },
-                    {
-                      title: '状态',
-                      dataIndex: 'status',
-                      key: 'status',
-                      width: 90,
-                      render: (s) => <AgentStatusBadge status={s} />,
-                    },
-                  ]}
-                />
-              )}
-            </Spin>
+          <Card title="采集器在线状态" loading={loadingAgents}>
+            {agents.length === 0 ? (
+              <EmptyState description="暂无采集器" />
+            ) : (
+              <Table
+                dataSource={agents.slice(0, 8)}
+                rowKey="id"
+                size="small"
+                pagination={false}
+                columns={[
+                  { title: '名称', dataIndex: 'name', key: 'name', ellipsis: true },
+                  {
+                    title: '状态',
+                    dataIndex: 'status',
+                    key: 'status',
+                    width: 90,
+                    render: (s) => <AgentStatusBadge status={s} />,
+                  },
+                ]}
+              />
+            )}
           </Card>
         </Col>
       </Row>
 
       {/* Recent upload logs */}
-      <Card title="最近上传日志（最新20条）">
+      <Card title="最近上传日志（最新20条）" loading={loadingLogs}>
         <Table<UploadLog>
           dataSource={logsData?.items ?? []}
           columns={uploadLogColumns}
           rowKey="id"
-          loading={loadingLogs}
           pagination={false}
           size="small"
-          locale={{ emptyText: '暂无上传记录' }}
+          locale={{ emptyText: <EmptyState description="暂无上传记录" /> }}
         />
       </Card>
     </div>
