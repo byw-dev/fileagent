@@ -17,8 +17,9 @@ const STATUS_FILTERS = [
   { label: '待处理', value: 'PENDING' },
 ]
 
-/** Format bytes to human-readable size */
-function formatBytes(bytes: number): string {
+/** Format bytes to human-readable size; '—' for missing/invalid input. */
+function formatBytes(bytes?: number): string {
+  if (bytes == null || !Number.isFinite(bytes)) return '—'
   if (bytes === 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   const i = Math.floor(Math.log(bytes) / Math.log(1024))
@@ -106,7 +107,9 @@ function LogsPage() {
               <Descriptions.Item label="错误信息">
                 {log.error_message || <Text type="secondary">—</Text>}
               </Descriptions.Item>
-              <Descriptions.Item label="重试次数">{log.retry_count}</Descriptions.Item>
+              <Descriptions.Item label="重试次数">
+                {log.retry_count ?? <Text type="secondary">—</Text>}
+              </Descriptions.Item>
               <Descriptions.Item label="已传输">
                 {formatBytes(log.bytes_transferred)} / {formatBytes(log.size)}
               </Descriptions.Item>
