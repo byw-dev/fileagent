@@ -171,6 +171,9 @@ func (q *Queries) GetFileEntryByID(ctx context.Context, id uuid.UUID) (*FileEntr
 type ListUploadLogsParams struct {
 	OrgID   uuid.UUID
 	AgentID uuid.NullUUID
+	// Status filters by upload-log status (stored lower-case: completed/failed);
+	// callers should normalize case. Null/empty = no status filter.
+	Status sql.NullString
 	// Cursor pagination
 	CursorCreatedAt sql.NullTime
 	CursorID        uuid.NullUUID
@@ -184,16 +187,19 @@ SELECT id, org_id, agent_id, file_entry_id, rule_id,
 FROM upload_logs
 WHERE org_id = $1
   AND ($2::UUID IS NULL OR agent_id = $2)
-  AND ($3::TIMESTAMPTZ IS NULL OR (created_at, id) < ($3, $4::UUID))
+  AND ($3::TEXT IS NULL OR status = $3)
+  AND ($4::TIMESTAMPTZ IS NULL OR (created_at, id) < ($4, $5::UUID))
 ORDER BY created_at DESC, id DESC
-LIMIT $5
+LIMIT $6
 `
 
-// ListUploadLogs returns a cursor-paginated list of upload logs, optionally filtered by agent.
+// ListUploadLogs returns a cursor-paginated list of upload logs, optionally
+// filtered by agent and status.
 func (q *Queries) ListUploadLogs(ctx context.Context, arg ListUploadLogsParams) ([]*UploadLog, error) {
 	rows, err := q.db.QueryContext(ctx, listUploadLogsSQL,
 		arg.OrgID,
 		arg.AgentID,
+		arg.Status,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.Limit,
@@ -412,6 +418,8 @@ func (q *Queries) ListFileTagsByFileIDs(ctx context.Context, ids []uuid.UUID) (m
 type CountUploadLogsFilter struct {
 	OrgID   uuid.UUID
 	AgentID uuid.NullUUID
+	// Status filters by upload-log status (stored lower-case); Null = no filter.
+	Status sql.NullString
 }
 
 const countUploadLogsSQL = `
@@ -419,12 +427,13 @@ SELECT COUNT(*)
 FROM upload_logs
 WHERE org_id = $1
   AND ($2::UUID IS NULL OR agent_id = $2)
+  AND ($3::TEXT IS NULL OR status = $3)
 `
 
 // CountUploadLogs returns the total number of upload log entries matching the
 // given optional filters (no cursor/limit applied).
 func (q *Queries) CountUploadLogs(ctx context.Context, f CountUploadLogsFilter) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countUploadLogsSQL, f.OrgID, f.AgentID)
+	row := q.db.QueryRowContext(ctx, countUploadLogsSQL, f.OrgID, f.AgentID, f.Status)
 	var n int64
 	return n, row.Scan(&n)
 }

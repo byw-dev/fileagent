@@ -7,7 +7,9 @@ export interface UploadLog {
   file_id: string | null
   filename: string
   size: number
-  status: 'SUCCESS' | 'FAILED' | 'PENDING'
+  // Upload logs are terminal: the CP creates them only after an upload result,
+  // so the only values are completed/failed (upper-cased at the REST boundary).
+  status: 'COMPLETED' | 'FAILED'
   error_message: string | null
   /** Number of retries the agent made (retry trail, 4e). */
   retry_count: number

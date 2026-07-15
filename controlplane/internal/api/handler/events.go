@@ -606,6 +606,13 @@ func (h *UploadLogsHandler) List(c *gin.Context) {
 			filter.AgentID = nid
 		}
 	}
+	// Status filter: clients send the display (upper-case) form; the column is
+	// stored lower-case, so normalize before matching. Empty = no filter.
+	if v := c.Query("status"); v != "" {
+		ns := sql.NullString{String: strings.ToLower(v), Valid: true}
+		params.Status = ns
+		filter.Status = ns
+	}
 
 	logs, err := h.db.ListUploadLogs(c.Request.Context(), params)
 	if err != nil {

@@ -118,7 +118,9 @@
 - [x] 状态列 → `StatusBadge domain=upload`、上传时间 → `TimeText`
 - [x] **失败行内嵌错误 + 重试轨迹**：`FAILED` 行 `expandable` 展开 错误信息 / 重试次数 / 已传输 X/Y / 开始→结束
 - [x] **小幅补后端字段（D-027，additive）**：上传日志响应追加 `retry_count`/`bytes_transferred`/`started_at`/`finished_at`（数据已在 `UploadLog` 模型仅未投影）——与 D-026 同类，让 4e 重试轨迹成真功能
-- 测试：`logs-page.test.tsx`（chip 筛选改 status 参数）+ Go `List_ExposesRetryTrail`
+- [x] **状态过滤补齐 + taxonomy 修正（D-028）**：实测发现 chip 过滤「完全失效」——① 后端从未实现 status 过滤（List/Count 加 `status` 条件 + handler 读参 ToLower 归一）；② 前端取值错（成功=`SUCCESS`→改 `COMPLETED`，真实枚举 completed/failed）；③ 去掉不存在的「待处理」态（upload_logs 是终态记录）。清掉 WR-9 误加的 `StatusBadge` 假映射
+- [x] 失败行展开对缺失字段优雅降级（`formatBytes` 防 `NaN undefined`）
+- 测试：`logs-page.test.tsx`（chip 改 status 参数）+ Go `List_ExposesRetryTrail` / `List_StatusFilterNormalized` / `List_NoStatusFilter` / db 层 `*_WithStatusFilter`
 
 ### WR-7 — Bucket ⬜
 - [ ] 登记视图、创建仅 super_admin(4d)、通知配置状态可见

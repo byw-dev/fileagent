@@ -111,12 +111,17 @@ type mockUploadLogsDB struct {
 	countLogsErr error
 	log          *db.UploadLog
 	getErr       error
+	// Captured params from the last List/Count call for assertions.
+	gotListParams  db.ListUploadLogsParams
+	gotCountFilter db.CountUploadLogsFilter
 }
 
-func (m *mockUploadLogsDB) ListUploadLogs(_ context.Context, _ db.ListUploadLogsParams) ([]*db.UploadLog, error) {
+func (m *mockUploadLogsDB) ListUploadLogs(_ context.Context, p db.ListUploadLogsParams) ([]*db.UploadLog, error) {
+	m.gotListParams = p
 	return m.logs, m.listErr
 }
-func (m *mockUploadLogsDB) CountUploadLogs(_ context.Context, _ db.CountUploadLogsFilter) (int64, error) {
+func (m *mockUploadLogsDB) CountUploadLogs(_ context.Context, f db.CountUploadLogsFilter) (int64, error) {
+	m.gotCountFilter = f
 	return m.logsCount, m.countLogsErr
 }
 func (m *mockUploadLogsDB) GetUploadLogByID(_ context.Context, _ uuid.UUID) (*db.UploadLog, error) {
@@ -643,6 +648,31 @@ func TestUploadLogsHandler_List_ExposesRetryTrail(t *testing.T) {
 	assert.Equal(t, "connection reset", item["error_message"])
 	assert.NotEmpty(t, item["started_at"])
 	assert.NotEmpty(t, item["finished_at"])
+}
+
+// The status query param (sent upper-case by the UI) is normalized to lower-case
+// and threaded into both the list query and the count filter.
+func TestUploadLogsHandler_List_StatusFilterNormalized(t *testing.T) {
+	m := &mockUploadLogsDB{logs: []*db.UploadLog{newSampleLog()}, logsCount: 1}
+	h := handler.NewUploadLogsHandler(m, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/upload-logs?status=FAILED", nil)
+	testUploadLogsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, sql.NullString{String: "failed", Valid: true}, m.gotListParams.Status)
+	assert.Equal(t, sql.NullString{String: "failed", Valid: true}, m.gotCountFilter.Status)
+}
+
+// No status param → no status filter on either query.
+func TestUploadLogsHandler_List_NoStatusFilter(t *testing.T) {
+	m := &mockUploadLogsDB{logs: []*db.UploadLog{newSampleLog()}, logsCount: 1}
+	h := handler.NewUploadLogsHandler(m, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/upload-logs", nil)
+	testUploadLogsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.False(t, m.gotListParams.Status.Valid)
+	assert.False(t, m.gotCountFilter.Status.Valid)
 }
 
 func TestUploadLogsHandler_List_HasMore(t *testing.T) {

@@ -10,11 +10,13 @@ import TimeText from '../../components/TimeText'
 const { Title, Text } = Typography
 const { CheckableTag } = Tag
 
+// Upload logs are terminal (completed/failed only) — there is no pending state,
+// so the filter offers just those two plus 全部. Values match the API status
+// (upper-case); the CP normalizes case server-side.
 const STATUS_FILTERS = [
   { label: '全部', value: '' },
-  { label: '成功', value: 'SUCCESS' },
+  { label: '成功', value: 'COMPLETED' },
   { label: '失败', value: 'FAILED' },
-  { label: '待处理', value: 'PENDING' },
 ]
 
 /** Format bytes to human-readable size; '—' for missing/invalid input. */

@@ -1221,3 +1221,36 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 - 测试：`events_test.go` 加 `List_ExposesRetryTrail`（failed log 带 retry_count/bytes_transferred/timing）。
 - 前端：`UploadLog` 加字段；日志页状态筛选改 chip（`CheckableTag`）、状态列 `StatusBadge domain=upload`、时间 `TimeText`、
   **failed 行 `expandable`** 展开 错误信息 / 重试次数 / 已传输 X/Y / 开始→结束。
+
+---
+
+## D-028：上传日志状态过滤补齐 + 修正状态取值（WR-6 后续）
+
+**决策日期**：2026-07-15
+**影响范围**：controlplane（`internal/db` List/Count 查询、`internal/api/handler` List）、webui（日志页 chip 取值 + 服务层类型 + `StatusBadge`）
+**来源**：WR-6 实测发现上传日志的状态筛选「完全失效」。排查出三处叠加缺陷。
+
+### 背景（三处叠加缺陷）
+
+1. **后端从未实现 status 过滤**：`ListUploadLogs`/`CountUploadLogs` 的 `WHERE` 只有 org + agent + cursor，handler 也没读
+   `status` 查询参数——前端一直发 `status` 但后端一律忽略（WR-6 之前就存在的洞）。
+2. **前端状态取值错误**：`upload_logs.status` 真实值只有 `completed`/`failed`（indexer `indexer.go:224-227` 写死，
+   响应 ToUpper 成 `COMPLETED`/`FAILED`）。但前端把「成功」映射成 `SUCCESS`，永远匹配不上；服务层类型
+   `'SUCCESS'|'FAILED'|'PENDING'` 是虚构的。
+3. **「待处理」态不存在**：upload_logs 是收到上传结果后才创建的**终态**记录，无「进行中/待处理」；无任何代码路径
+   产生 pending 上传日志（进行中的是 `file_entries.uploading`，那是文件不是日志）。
+
+### 决策（产品 2026-07-15 拍板）
+
+- **后端补 status 过滤**：`ListUploadLogsParams`/`CountUploadLogsFilter` 加 `Status sql.NullString`，两条 SQL 的 WHERE
+  加 `($n::TEXT IS NULL OR status = $n)`；handler 读 `?status=`、**ToLower 归一**后传入（前端传 UPPER，列存 lower）。
+  空参数 = 不过滤。已有 `idx_upload_logs_status` 索引，**零迁移**；cursor 分页不变。
+- **前端修正 taxonomy**：chip 只留 `全部 / 成功(COMPLETED) / 失败(FAILED)`，**去掉「待处理」**；服务层类型改
+  `'COMPLETED' | 'FAILED'`。清掉 WR-9 时误加的 `StatusBadge` 假映射（`SUCCESS` BASE 项、upload 域 `PENDING` 覆盖）。
+
+### 落地记录
+
+- `read_queries.go`：List/Count 加 Status 参数 + WHERE；`events.go` handler 读参归一。
+- 测试：db 层 `TestListUploadLogs_WithStatusFilter`/`TestCountUploadLogs_WithStatusFilter`（sqlmock 断言 status arg）；
+  handler 层 `List_StatusFilterNormalized`（FAILED→failed 归一 + 传入 List/Count）/`List_NoStatusFilter`。
+- 实机验证：`?status=COMPLETED`→1、`?status=FAILED`→1、`?status=failed`（小写）→1、无参→2，`total` 同步。
