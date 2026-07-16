@@ -541,17 +541,29 @@ type uploadLogResponse struct {
 	Status       string `json:"status"`
 	Size         int64  `json:"size"`
 	ErrorMessage string `json:"error_message,omitempty"`
-	UploadedAt   string `json:"uploaded_at"`
+	// Retry trail fields let a failed row expand to show why/when it failed
+	// (retry count, transferred bytes, timing). All already in the UploadLog
+	// model; additive to the contract — see DECISIONS.md D-027.
+	RetryCount       int32  `json:"retry_count"`
+	BytesTransferred int64  `json:"bytes_transferred"`
+	// started_at is NOT NULL and always set → always present. finished_at is
+	// nullable (null until the upload reaches a terminal state) → omitempty.
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	UploadedAt string `json:"uploaded_at"`
 }
 
 func toUploadLogResponse(l *db.UploadLog) uploadLogResponse {
 	r := uploadLogResponse{
-		ID:          l.ID.String(),
-		AgentID:     l.AgentID.String(),
-		StoragePath: l.StoragePath,
-		Status:      strings.ToUpper(l.Status),
-		Size:        l.SizeBytes,
-		UploadedAt:  l.CreatedAt.UTC().Format(time.RFC3339),
+		ID:               l.ID.String(),
+		AgentID:          l.AgentID.String(),
+		StoragePath:      l.StoragePath,
+		Status:           strings.ToUpper(l.Status),
+		Size:             l.SizeBytes,
+		RetryCount:       l.RetryCount,
+		BytesTransferred: l.BytesTransferred,
+		StartedAt:        l.StartedAt.UTC().Format(time.RFC3339),
+		UploadedAt:       l.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if l.StoragePath != "" {
 		r.Filename = path.Base(l.StoragePath)
@@ -561,6 +573,9 @@ func toUploadLogResponse(l *db.UploadLog) uploadLogResponse {
 	}
 	if l.ErrorMessage.Valid {
 		r.ErrorMessage = l.ErrorMessage.String
+	}
+	if l.FinishedAt.Valid {
+		r.FinishedAt = l.FinishedAt.Time.UTC().Format(time.RFC3339)
 	}
 	return r
 }
@@ -592,6 +607,13 @@ func (h *UploadLogsHandler) List(c *gin.Context) {
 			params.AgentID = nid
 			filter.AgentID = nid
 		}
+	}
+	// Status filter: clients send the display (upper-case) form; the column is
+	// stored lower-case, so normalize before matching. Empty = no filter.
+	if v := c.Query("status"); v != "" {
+		ns := sql.NullString{String: strings.ToLower(v), Valid: true}
+		params.Status = ns
+		filter.Status = ns
 	}
 
 	logs, err := h.db.ListUploadLogs(c.Request.Context(), params)

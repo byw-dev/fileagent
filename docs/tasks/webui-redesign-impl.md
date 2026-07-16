@@ -113,8 +113,14 @@
 - [x] **小幅补后端字段（D-026，additive）**：投递响应追加 `response_code`/`response_body`/`next_retry_at`/`delivered_at`（数据已在 `EventDelivery` 模型，仅未投影；`omitempty` 向后兼容）——让 4c「展开响应体」成真功能而非空壳。**本项为 WR track 唯一后端触碰**，理由见 D-026
 - 测试：`events-page.test.tsx`（列表/创建抽屉默认 webhook 字段/投递抽屉）+ Go `ListDeliveries_ExposesResponseFields`/`_OmitsAbsentResponseFields`
 
-### WR-6 — 上传日志 ⬜
-- [ ] 状态 chip 筛选(4e)、失败行内嵌错误 + 重试轨迹
+### WR-6 — 上传日志 ✅（本 PR）
+- [x] **状态 chip 筛选(4e)**：下拉 `Select` → 单行 `CheckableTag` chip 行（全部/成功/失败，交互定则 3；「待处理」态不存在，见下 D-028）
+- [x] 状态列 → `StatusBadge domain=upload`、上传时间 → `TimeText`
+- [x] **失败行内嵌错误 + 重试轨迹**：`FAILED` 行 `expandable` 展开 错误信息 / 重试次数 / 已传输 X/Y / 开始→结束
+- [x] **小幅补后端字段（D-027，additive）**：上传日志响应追加 `retry_count`/`bytes_transferred`/`started_at`/`finished_at`（数据已在 `UploadLog` 模型仅未投影）——与 D-026 同类，让 4e 重试轨迹成真功能
+- [x] **状态过滤补齐 + taxonomy 修正（D-028）**：实测发现 chip 过滤「完全失效」——① 后端从未实现 status 过滤（List/Count 加 `status` 条件 + handler 读参 ToLower 归一）；② 前端取值错（成功=`SUCCESS`→改 `COMPLETED`，真实枚举 completed/failed）；③ 去掉不存在的「待处理」态（upload_logs 是终态记录）。清掉 WR-9 误加的 `StatusBadge` 假映射
+- [x] 失败行展开对缺失字段优雅降级（`formatBytes` 防 `NaN undefined`）
+- 测试：`logs-page.test.tsx`（chip 改 status 参数）+ Go `List_ExposesRetryTrail` / `List_StatusFilterNormalized` / `List_NoStatusFilter` / db 层 `*_WithStatusFilter`
 
 ### WR-7 — Bucket ⬜
 - [ ] 登记视图、创建仅 super_admin(4d)、通知配置状态可见

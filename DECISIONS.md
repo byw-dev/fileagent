@@ -1170,7 +1170,9 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 - `next_retry_at`（RFC3339，下次重试时刻；已投递 / 已终止 dead 后省略）
 - `delivered_at`（RFC3339，最终成功时刻；失败 / dead 时省略）
 
-均带 `omitempty`——**向后兼容**：老客户端忽略新字段，缺失字段按「无」处理，不破坏既有形状。
+均带 `omitempty`——**因这些字段本就可空/不适用**（nats_publish 无 HTTP code、未投递无 `delivered_at` 等），
+省略即「无」。注：系统未发布、前后端同版一起部署，**无旧客户端兼容诉求**；这里的 `omitempty` 只表达字段可空，
+不是为兼容不存在的老 CP。
 
 ### 为何允许这次后端改动（WR track 名义「纯前端」）
 
@@ -1187,3 +1189,71 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 - 测试：`events_test.go` 加 `ListDeliveries_ExposesResponseFields`（failed webhook 带 code/body/next_retry）+
   `ListDeliveries_OmitsAbsentResponseFields`（pending 全省略）。
 - 前端：`EventDelivery` 加可选字段；投递抽屉 failed/dead 行 `expandable` 展开 HTTP 状态 / 下次重试 / 响应体。
+
+---
+
+## D-027：上传日志响应补充重试轨迹字段（WR-6，additive）
+
+**决策日期**：2026-07-15
+**影响范围**：controlplane（`internal/api/handler/events.go` 上传日志响应）、webui（`services/upload-logs.ts` + 日志页失败行展开）
+**来源**：WR-6 上传日志页重做，规范 4e「失败行内嵌错误 + 重试轨迹」需要重试次数/传输进度/时序，但当前 REST 响应未投影这些字段。
+
+### 决策
+
+`GET /api/v1/upload-logs` 的 `uploadLogResponse` **纯追加**四个字段，均来自已存在的 `db.UploadLog` 模型
+（数据早已入库，仅未对外投影）：
+
+- `retry_count`（int，agent 重试次数）
+- `bytes_transferred`（int64，已传字节；失败时为部分进度）
+- `started_at`（RFC3339，尝试开始时刻）
+- `finished_at`（RFC3339，结束时刻；`NULL` 直到终态 → `omitempty`）
+
+`retry_count`/`bytes_transferred`/`started_at` **无 `omitempty`、恒返回**（对应 `UploadLog` 的非空列——
+`started_at` 是 `NOT NULL`，`retry_count`/`bytes_transferred` 为 0 也是有效值、语义明确）；仅 `finished_at` 可空、
+`omitempty`。前端 `UploadLog` 类型据此如实标注（前三者必有、`finished_at?` 可选）——前后端同版部署，**无旧 CP 兼容诉求**。
+
+### 为何允许（与 D-026 同类）
+
+数据**已在** `UploadLog` 模型（`retry_count`/`bytes_transferred`/`started_at`/`finished_at`），handler 响应未投影；
+补齐是 struct 字段 + 映射行，**非新端点/新表**。等价于 D-026 的投递响应补字段——让**已有的重试/传输状态**对 UI 可见，
+使 4e「失败行展开重试轨迹」成真功能而非空壳。沿用产品对 WR-5「小幅补后端字段」的同一裁量。
+
+### 落地记录
+
+- `events.go`：`uploadLogResponse` 加 4 字段 + `toUploadLogResponse` 映射（`finished_at` 按 `Valid` 门控）。
+- 测试：`events_test.go` 加 `List_ExposesRetryTrail`（failed log 带 retry_count/bytes_transferred/timing）。
+- 前端：`UploadLog` 加字段；日志页状态筛选改 chip（`CheckableTag`）、状态列 `StatusBadge domain=upload`、时间 `TimeText`、
+  **failed 行 `expandable`** 展开 错误信息 / 重试次数 / 已传输 X/Y / 开始→结束。
+
+---
+
+## D-028：上传日志状态过滤补齐 + 修正状态取值（WR-6 后续）
+
+**决策日期**：2026-07-15
+**影响范围**：controlplane（`internal/db` List/Count 查询、`internal/api/handler` List）、webui（日志页 chip 取值 + 服务层类型 + `StatusBadge`）
+**来源**：WR-6 实测发现上传日志的状态筛选「完全失效」。排查出三处叠加缺陷。
+
+### 背景（三处叠加缺陷）
+
+1. **后端从未实现 status 过滤**：`ListUploadLogs`/`CountUploadLogs` 的 `WHERE` 只有 org + agent + cursor，handler 也没读
+   `status` 查询参数——前端一直发 `status` 但后端一律忽略（WR-6 之前就存在的洞）。
+2. **前端状态取值错误**：`upload_logs.status` 真实值只有 `completed`/`failed`（indexer `indexer.go:224-227` 写死，
+   响应 ToUpper 成 `COMPLETED`/`FAILED`）。但前端把「成功」映射成 `SUCCESS`，永远匹配不上；服务层类型
+   `'SUCCESS'|'FAILED'|'PENDING'` 是虚构的。
+3. **「待处理」态不存在**：upload_logs 是收到上传结果后才创建的**终态**记录，无「进行中/待处理」；无任何代码路径
+   产生 pending 上传日志（进行中的是 `file_entries.uploading`，那是文件不是日志）。
+
+### 决策（产品 2026-07-15 拍板）
+
+- **后端补 status 过滤**：`ListUploadLogsParams`/`CountUploadLogsFilter` 加 `Status sql.NullString`，两条 SQL 的 WHERE
+  加 `($n::TEXT IS NULL OR status = $n)`；handler 读 `?status=`、**ToLower 归一**后传入（前端传 UPPER，列存 lower）。
+  空参数 = 不过滤。已有 `idx_upload_logs_status` 索引，**零迁移**；cursor 分页不变。
+- **前端修正 taxonomy**：chip 只留 `全部 / 成功(COMPLETED) / 失败(FAILED)`，**去掉「待处理」**；服务层类型改
+  `'COMPLETED' | 'FAILED'`。清掉 WR-9 时误加的 `StatusBadge` 假映射（`SUCCESS` BASE 项、upload 域 `PENDING` 覆盖）。
+
+### 落地记录
+
+- `read_queries.go`：List/Count 加 Status 参数 + WHERE；`events.go` handler 读参归一。
+- 测试：db 层 `TestListUploadLogs_WithStatusFilter`/`TestCountUploadLogs_WithStatusFilter`（sqlmock 断言 status arg）；
+  handler 层 `List_StatusFilterNormalized`（FAILED→failed 归一 + 传入 List/Count）/`List_NoStatusFilter`。
+- 实机验证：`?status=COMPLETED`→1、`?status=FAILED`→1、`?status=failed`（小写）→1、无参→2，`total` 同步。

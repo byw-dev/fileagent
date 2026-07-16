@@ -4,18 +4,35 @@ import apiClient from './api'
 export interface UploadLog {
   id: string
   agent_id: string
-  file_id: string | null
+  /** Linked file entry; omitempty on the backend → absent (undefined) when none. */
+  file_id?: string
   filename: string
   size: number
-  status: 'SUCCESS' | 'FAILED' | 'PENDING'
-  error_message: string | null
+  // Upload logs are terminal: the CP creates them only after an upload result,
+  // so the only values are completed/failed (upper-cased at the REST boundary).
+  status: 'COMPLETED' | 'FAILED'
+  /** Error text on failure; omitempty on the backend → absent when none. */
+  error_message?: string
+  // Retry-trail fields (4e / D-027). Frontend and controlplane ship together, so
+  // these mirror the live JSON exactly: retry_count / bytes_transferred /
+  // started_at map to NOT-NULL columns and are always present; finished_at is
+  // omitempty (absent → undefined, never an explicit null).
+  /** Number of retries the agent made. */
+  retry_count: number
+  /** Bytes transferred (partial on failure). */
+  bytes_transferred: number
+  /** When the upload attempt started (NOT NULL). */
+  started_at: string
+  /** When the upload finished; omitempty → absent (undefined) when unset. */
+  finished_at?: string
   uploaded_at: string
 }
 
 /** Query parameters for listing upload logs */
 export interface ListUploadLogsParams {
   agent_id?: string
-  status?: string
+  /** Only the real upload-log statuses are filterable (case-normalized server-side). */
+  status?: UploadLog['status']
   cursor?: string
   limit?: number
   since?: string

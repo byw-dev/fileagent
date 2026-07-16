@@ -246,6 +246,42 @@ func TestListUploadLogs_WithAgentFilter(t *testing.T) {
 	require.Len(t, result, 1)
 }
 
+func TestListUploadLogs_WithStatusFilter(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	orgID := uuid.New()
+	id := uuid.New()
+
+	// Assert the (lower-case) status value is threaded as the 3rd query arg.
+	mock.ExpectQuery("SELECT.*FROM upload_logs").
+		WithArgs(orgID, sqlmock.AnyArg(), sql.NullString{String: "failed", Valid: true},
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(uploadLogRow(id, orgID, uuid.New()))
+
+	result, err := q.ListUploadLogs(context.Background(), ListUploadLogsParams{
+		OrgID:  orgID,
+		Status: sql.NullString{String: "failed", Valid: true},
+		Limit:  10,
+	})
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+}
+
+func TestCountUploadLogs_WithStatusFilter(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	orgID := uuid.New()
+
+	mock.ExpectQuery("SELECT COUNT.*FROM upload_logs").
+		WithArgs(orgID, sqlmock.AnyArg(), sql.NullString{String: "completed", Valid: true}).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(7)))
+
+	n, err := q.CountUploadLogs(context.Background(), CountUploadLogsFilter{
+		OrgID:  orgID,
+		Status: sql.NullString{String: "completed", Valid: true},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(7), n)
+}
+
 func TestListUploadLogs_WithCursor(t *testing.T) {
 	q, mock, _ := newTestQueries(t)
 	now := time.Now().UTC()
