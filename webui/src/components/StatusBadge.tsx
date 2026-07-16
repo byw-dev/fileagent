@@ -25,11 +25,13 @@ const BASE: Record<string, Meta> = {
   RUNNING: { label: '在线', tone: 'success' },
   OFFLINE: { label: '离线', tone: 'neutral' },
   REVOKED: { label: '已吊销', tone: 'error' },
-  // File / upload-log (ToUpper at REST boundary): completed/failed/uploading.
-  UPLOADING: { label: '上传中', tone: 'processing' },
+  // File vs upload-log (ToUpper at REST boundary) — distinct value sets:
+  //   file:       uploading / completed / failed / deleted
+  //   upload-log: completed / failed only (terminal records, no uploading/deleted)
+  UPLOADING: { label: '上传中', tone: 'processing' }, // file only
   COMPLETED: { label: '成功', tone: 'success' },
   FAILED: { label: '失败', tone: 'error' },
-  DELETED: { label: '已删除', tone: 'neutral' },
+  DELETED: { label: '已删除', tone: 'neutral' }, // file only
   // Collection-rule status
   ACTIVE: { label: '生效', tone: 'success' },
   INACTIVE: { label: '已停用', tone: 'neutral' },
