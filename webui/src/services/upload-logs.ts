@@ -11,18 +11,17 @@ export interface UploadLog {
   // so the only values are completed/failed (upper-cased at the REST boundary).
   status: 'COMPLETED' | 'FAILED'
   error_message: string | null
-  // Retry-trail fields (4e / D-027). The current controlplane always sends
-  // retry_count / bytes_transferred / started_at (started_at is NOT NULL);
-  // finished_at is nullable. All are optional here only for resilience against
-  // an older controlplane that predates these projected fields — the UI degrades
-  // gracefully to "—" when a key is missing.
+  // Retry-trail fields (4e / D-027). Frontend and controlplane ship together, so
+  // these mirror the live contract exactly: retry_count / bytes_transferred /
+  // started_at map to NOT-NULL columns and are always present; only finished_at
+  // is nullable (null until the log's terminal state is recorded).
   /** Number of retries the agent made. */
-  retry_count?: number
+  retry_count: number
   /** Bytes transferred (partial on failure). */
-  bytes_transferred?: number
-  /** When the upload attempt started. */
-  started_at?: string
-  /** When the upload finished (null until terminal). */
+  bytes_transferred: number
+  /** When the upload attempt started (NOT NULL). */
+  started_at: string
+  /** When the upload finished; null until terminal. */
   finished_at?: string
   uploaded_at: string
 }

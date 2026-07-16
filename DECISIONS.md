@@ -1170,7 +1170,9 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 - `next_retry_at`（RFC3339，下次重试时刻；已投递 / 已终止 dead 后省略）
 - `delivered_at`（RFC3339，最终成功时刻；失败 / dead 时省略）
 
-均带 `omitempty`——**向后兼容**：老客户端忽略新字段，缺失字段按「无」处理，不破坏既有形状。
+均带 `omitempty`——**因这些字段本就可空/不适用**（nats_publish 无 HTTP code、未投递无 `delivered_at` 等），
+省略即「无」。注：系统未发布、前后端同版一起部署，**无旧客户端兼容诉求**；这里的 `omitempty` 只表达字段可空，
+不是为兼容不存在的老 CP。
 
 ### 为何允许这次后端改动（WR track 名义「纯前端」）
 
@@ -1206,9 +1208,9 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 - `started_at`（RFC3339，尝试开始时刻）
 - `finished_at`（RFC3339，结束时刻；`NULL` 直到终态 → `omitempty`）
 
-`retry_count`/`bytes_transferred`/`started_at` **无 `omitempty`、恒返回**（前三者对应 `UploadLog` 的非空列——
+`retry_count`/`bytes_transferred`/`started_at` **无 `omitempty`、恒返回**（对应 `UploadLog` 的非空列——
 `started_at` 是 `NOT NULL`，`retry_count`/`bytes_transferred` 为 0 也是有效值、语义明确）；仅 `finished_at` 可空、
-`omitempty`。**向后兼容**：老客户端忽略新字段。
+`omitempty`。前端 `UploadLog` 类型据此如实标注（前三者必有、`finished_at?` 可选）——前后端同版部署，**无旧 CP 兼容诉求**。
 
 ### 为何允许（与 D-026 同类）
 
