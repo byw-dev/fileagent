@@ -546,9 +546,11 @@ type uploadLogResponse struct {
 	// model; additive to the contract — see DECISIONS.md D-027.
 	RetryCount       int32  `json:"retry_count"`
 	BytesTransferred int64  `json:"bytes_transferred"`
-	StartedAt        string `json:"started_at,omitempty"`
-	FinishedAt       string `json:"finished_at,omitempty"`
-	UploadedAt       string `json:"uploaded_at"`
+	// started_at is NOT NULL and always set → always present. finished_at is
+	// nullable (null until the upload reaches a terminal state) → omitempty.
+	StartedAt  string `json:"started_at"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	UploadedAt string `json:"uploaded_at"`
 }
 
 func toUploadLogResponse(l *db.UploadLog) uploadLogResponse {

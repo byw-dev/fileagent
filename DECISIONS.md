@@ -1203,11 +1203,12 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 
 - `retry_count`（int，agent 重试次数）
 - `bytes_transferred`（int64，已传字节；失败时为部分进度）
-- `started_at`（RFC3339，尝试开始时刻；`omitempty`）
-- `finished_at`（RFC3339，结束时刻；进行中省略）
+- `started_at`（RFC3339，尝试开始时刻）
+- `finished_at`（RFC3339，结束时刻；`NULL` 直到终态 → `omitempty`）
 
-`retry_count`/`bytes_transferred` 无 `omitempty`（0 是有效值、语义明确）；两个时间戳 `omitempty`。**向后兼容**：
-老客户端忽略新字段。
+`retry_count`/`bytes_transferred`/`started_at` **无 `omitempty`、恒返回**（前三者对应 `UploadLog` 的非空列——
+`started_at` 是 `NOT NULL`，`retry_count`/`bytes_transferred` 为 0 也是有效值、语义明确）；仅 `finished_at` 可空、
+`omitempty`。**向后兼容**：老客户端忽略新字段。
 
 ### 为何允许（与 D-026 同类）
 

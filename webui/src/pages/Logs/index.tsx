@@ -1,7 +1,7 @@
-import { useRef, useState } from 'react'
+import { useState } from 'react'
 import { Space, Tag, Typography, Descriptions } from 'antd'
 import { ProTable } from '@ant-design/pro-components'
-import type { ProColumns, ActionType } from '@ant-design/pro-components'
+import type { ProColumns } from '@ant-design/pro-components'
 import { listUploadLogs } from '../../services/upload-logs'
 import type { UploadLog } from '../../services/upload-logs'
 import StatusBadge from '../../components/StatusBadge'
@@ -34,7 +34,6 @@ function formatBytes(bytes?: number): string {
  * the error and retry trail (retry count / transferred bytes / timing).
  */
 function LogsPage() {
-  const actionRef = useRef<ActionType | undefined>(undefined)
   const [filterStatus, setFilterStatus] = useState('')
 
   const columns: ProColumns<UploadLog>[] = [
@@ -84,10 +83,10 @@ function LogsPage() {
           <CheckableTag
             key={f.value}
             checked={filterStatus === f.value}
-            onChange={() => {
-              setFilterStatus(f.value)
-              actionRef.current?.reload()
-            }}
+            // ProTable re-requests on params change (params={{ filterStatus }});
+            // no manual reload — that would fire an extra request with the stale
+            // value before the state update lands.
+            onChange={() => setFilterStatus(f.value)}
           >
             {f.label}
           </CheckableTag>
@@ -95,7 +94,6 @@ function LogsPage() {
       </Space>
 
       <ProTable<UploadLog>
-        actionRef={actionRef}
         columns={columns}
         rowKey="id"
         search={false}

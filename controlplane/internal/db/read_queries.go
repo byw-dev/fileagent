@@ -172,7 +172,8 @@ type ListUploadLogsParams struct {
 	OrgID   uuid.UUID
 	AgentID uuid.NullUUID
 	// Status filters by upload-log status (stored lower-case: completed/failed);
-	// callers should normalize case. Null/empty = no status filter.
+	// callers should normalize case. Only Valid=false disables the filter — a
+	// Valid empty string would match status = '' (the handler never sets that).
 	Status sql.NullString
 	// Cursor pagination
 	CursorCreatedAt sql.NullTime
@@ -418,7 +419,8 @@ func (q *Queries) ListFileTagsByFileIDs(ctx context.Context, ids []uuid.UUID) (m
 type CountUploadLogsFilter struct {
 	OrgID   uuid.UUID
 	AgentID uuid.NullUUID
-	// Status filters by upload-log status (stored lower-case); Null = no filter.
+	// Status filters by upload-log status (stored lower-case); only Valid=false
+	// disables the filter (a Valid empty string would match status = '').
 	Status sql.NullString
 }
 
