@@ -10,10 +10,13 @@ import TimeText from '../../components/TimeText'
 const { Title, Text } = Typography
 const { CheckableTag } = Tag
 
+/** '' = 全部 (no filter); otherwise a real upload-log status. */
+type StatusFilter = '' | UploadLog['status']
+
 // Upload logs are terminal (completed/failed only) — there is no pending state,
 // so the filter offers just those two plus 全部. Values match the API status
 // (upper-case); the CP normalizes case server-side.
-const STATUS_FILTERS = [
+const STATUS_FILTERS: { label: string; value: StatusFilter }[] = [
   { label: '全部', value: '' },
   { label: '成功', value: 'COMPLETED' },
   { label: '失败', value: 'FAILED' },
@@ -33,7 +36,7 @@ function formatBytes(bytes: number): string {
  * the error and retry trail (retry count / transferred bytes / timing).
  */
 function LogsPage() {
-  const [filterStatus, setFilterStatus] = useState('')
+  const [filterStatus, setFilterStatus] = useState<StatusFilter>('')
 
   const columns: ProColumns<UploadLog>[] = [
     {

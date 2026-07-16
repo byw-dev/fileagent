@@ -31,7 +31,8 @@ export interface UploadLog {
 /** Query parameters for listing upload logs */
 export interface ListUploadLogsParams {
   agent_id?: string
-  status?: string
+  /** Only the real upload-log statuses are filterable (case-normalized server-side). */
+  status?: UploadLog['status']
   cursor?: string
   limit?: number
   since?: string
