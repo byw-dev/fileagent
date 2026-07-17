@@ -122,8 +122,12 @@
 - [x] 失败行展开对缺失字段优雅降级（`formatBytes` 防 `NaN undefined`）
 - 测试：`logs-page.test.tsx`（chip 改 status 参数）+ Go `List_ExposesRetryTrail` / `List_StatusFilterNormalized` / `List_NoStatusFilter` / db 层 `*_WithStatusFilter`
 
-### WR-7 — Bucket ⬜
-- [ ] 登记视图、创建仅 super_admin(4d)、通知配置状态可见
+### WR-7 — Bucket ✅（本 PR）
+- [x] 登记视图：`Card>Table` → `ProTable`（read-only 列表）；名称/描述/创建时间；空态 `EmptyState`、时间 `TimeText`
+- [x] 创建仅 super_admin(4d)：保留角色门控；新建 `Modal` → `FormDrawer`（480px，交互定则 1）+ `onFinish` 回车提交 + bucket 名校验
+- [x] 服务层 `Bucket.description` 后端 `omitempty` → 改可选 `?: string`（如实匹配 JSON）
+- **⚠️「通知配置状态可见」descope**：MinIO 事件通知是**部署级全局配置**（`notify_webhook` / `init-minio.sh`），CP 不按 bucket 存通知状态，`bucketResponse` 无相关字段——无后端数据，同 WR-2 glob 处理，注记于页面 JSDoc
+- 测试：`buckets-page.test.tsx`（super_admin 见新建/开抽屉、非 super_admin 隐藏、列表请求）
 
 ### WR-8 — 设置 ⬜（2026-07-14 校准）
 - [ ] 用户管理 tab(5b super_admin，禁用而非删除)、新建用户抽屉(5c 初始密码一次性)、登录页(5a)核对
