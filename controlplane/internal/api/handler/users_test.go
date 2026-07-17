@@ -30,8 +30,10 @@ type mockUsersDB struct {
 	getErr    error
 	createErr error
 	updateErr error
+	activeErr error
 	deleteErr error
 	pwdErr    error
+	gotActive *bool // captures the last UpdateUserActive value
 }
 
 func (m *mockUsersDB) ListUsers(_ context.Context, _ uuid.UUID) ([]*db.User, error) {
@@ -69,6 +71,10 @@ func (m *mockUsersDB) UpdateUser(_ context.Context, id uuid.UUID, username strin
 		CreatedAt: time.Now(),
 	}, nil
 }
+func (m *mockUsersDB) UpdateUserActive(_ context.Context, _ uuid.UUID, isActive bool) error {
+	m.gotActive = &isActive
+	return m.activeErr
+}
 func (m *mockUsersDB) DeleteUser(_ context.Context, _ uuid.UUID) error { return m.deleteErr }
 func (m *mockUsersDB) UpdateUserPassword(_ context.Context, _ uuid.UUID, _ string) error {
 	return m.pwdErr
@@ -104,6 +110,7 @@ func testRouter(h *handler.UsersHandler) *gin.Engine {
 	v1.GET("/users", h.List)
 	v1.POST("/users", h.Create)
 	v1.PUT("/users/:id", h.Update)
+	v1.PUT("/users/:id/active", h.SetActive)
 	v1.DELETE("/users/:id", h.Delete)
 	v1.PUT("/users/:id/password", h.UpdatePassword)
 	return r
@@ -317,3 +324,58 @@ func TestUsersHandler_PasswordTooShort(t *testing.T) {
 
 // Ensure middleware package is used (import check).
 var _ = middleware.GetClaims
+
+// ── SetActive (5b 禁用而非删除) ────────────────────────────────────────────────
+
+func TestUsersHandler_SetActive_Disable(t *testing.T) {
+	target := uuid.New()
+	mockDB := &mockUsersDB{getUser: &db.User{
+		ID: target, OrgID: uuid.New(), Username: "bob", Role: db.UserRoleOrgViewer, IsActive: false, CreatedAt: time.Now(),
+	}}
+	h := handler.NewUsersHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPut, "/api/v1/users/"+target.String()+"/active", bytes.NewReader([]byte(`{"is_active":false}`)))
+	req.Header.Set("Content-Type", "application/json")
+	testRouter(h).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.NotNil(t, mockDB.gotActive)
+	assert.False(t, *mockDB.gotActive)
+	var body map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, false, body["is_active"])
+}
+
+func TestUsersHandler_SetActive_MissingField(t *testing.T) {
+	mockDB := &mockUsersDB{}
+	h := handler.NewUsersHandler(mockDB, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPut, "/api/v1/users/"+uuid.New().String()+"/active", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("Content-Type", "application/json")
+	testRouter(h).ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Nil(t, mockDB.gotActive)
+}
+
+func TestUsersHandler_SetActive_CannotDisableSelf(t *testing.T) {
+	self := uuid.New()
+	mockDB := &mockUsersDB{}
+	h := handler.NewUsersHandler(mockDB, newTestLogger())
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		injectClaims(c, "super_admin", uuid.New().String(), self.String())
+		c.Next()
+	})
+	r.PUT("/api/v1/users/:id/active", h.SetActive)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPut, "/api/v1/users/"+self.String()+"/active", bytes.NewReader([]byte(`{"is_active":false}`)))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Nil(t, mockDB.gotActive) // guard fires before the DB call
+}

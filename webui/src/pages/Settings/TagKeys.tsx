@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import useSWR from 'swr'
-import { App, Button, Drawer, Form, Input, Modal, Space, Switch, Tag, Typography } from 'antd'
+import { App, Button, Drawer, Form, Input, Space, Switch, Tag, Typography } from 'antd'
 import { PlusOutlined, TagsOutlined } from '@ant-design/icons'
 import { ProTable } from '@ant-design/pro-components'
 import type { ProColumns, ActionType } from '@ant-design/pro-components'
@@ -15,6 +15,9 @@ import {
   deleteTagValue,
 } from '../../services/tags'
 import type { TagKey, TagValue } from '../../services/tags'
+import FormDrawer from '../../components/FormDrawer'
+import EmptyState from '../../components/EmptyState'
+import { useDangerConfirm } from '../../hooks/useDangerConfirm'
 
 const { Title, Text } = Typography
 
@@ -35,7 +38,8 @@ interface KeyFormValues {
 function TagKeysPage() {
   const user = useAuthStore((s) => s.user)
   const isSuperAdmin = user?.role === 'super_admin'
-  const { modal, message } = App.useApp()
+  const { message } = App.useApp()
+  const dangerConfirm = useDangerConfirm()
   const actionRef = useRef<ActionType | undefined>(undefined)
 
   const [keyModalOpen, setKeyModalOpen] = useState(false)
@@ -70,7 +74,12 @@ function TagKeysPage() {
   }
 
   const submitKey = async () => {
-    const values = await keyForm.validateFields()
+    let values: KeyFormValues
+    try {
+      values = await keyForm.validateFields()
+    } catch {
+      return
+    }
     setSubmitting(true)
     try {
       if (editing) {
@@ -96,10 +105,10 @@ function TagKeysPage() {
   }
 
   const handleDelete = (k: TagKey) => {
-    modal.confirm({
+    dangerConfirm({
       title: `删除标签键：${k.key}`,
-      content: '删除后不影响已打标文件，但该键将不能再用于采集与筛选。确认删除？',
-      okType: 'danger',
+      content: '删除后不影响已打标文件，但该键将不能再用于采集与筛选。',
+      okText: '删除',
       onOk: async () => {
         try {
           await deleteTagKey(k.key)
@@ -193,6 +202,7 @@ function TagKeysPage() {
         search={false}
         pagination={false}
         options={false}
+        locale={{ emptyText: <EmptyState description="还没有标签键" /> }}
         request={async () => {
           try {
             const data = await listTagKeys()
@@ -203,15 +213,14 @@ function TagKeysPage() {
         }}
       />
 
-      <Modal
+      <FormDrawer
         open={keyModalOpen}
         title={editing ? `编辑标签键：${editing.key}` : '新建标签键'}
-        confirmLoading={submitting}
-        onOk={submitKey}
-        onCancel={() => setKeyModalOpen(false)}
-        destroyOnHidden
+        loading={submitting}
+        onSubmit={submitKey}
+        onClose={() => setKeyModalOpen(false)}
       >
-        <Form form={keyForm} layout="vertical" preserve={false}>
+        <Form form={keyForm} layout="vertical" preserve={false} onFinish={submitKey}>
           <Form.Item
             name="key"
             label="键"
@@ -241,7 +250,7 @@ function TagKeysPage() {
             <Switch />
           </Form.Item>
         </Form>
-      </Modal>
+      </FormDrawer>
 
       <ValuesDrawer tagKey={valuesKey} canWrite={isSuperAdmin} onClose={() => setValuesKey(null)} />
     </div>

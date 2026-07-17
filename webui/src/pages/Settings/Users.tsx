@@ -1,28 +1,22 @@
-import { useState } from 'react'
-import {
-  App,
-  Button,
-  Form,
-  Input,
-  Modal,
-  Select,
-  Space,
-  Tag,
-  Typography,
-} from 'antd'
-import { PlusOutlined, EditOutlined, DeleteOutlined, KeyOutlined } from '@ant-design/icons'
+import { useRef, useState } from 'react'
+import { App, Button, Form, Input, Select, Space, Tag, Typography } from 'antd'
+import { PlusOutlined } from '@ant-design/icons'
 import { ProTable } from '@ant-design/pro-components'
 import type { ProColumns, ActionType } from '@ant-design/pro-components'
-import { useRef } from 'react'
 import {
   listUsers,
   createUser,
   updateUser,
-  deleteUser,
+  setUserActive,
   updateUserPassword,
 } from '../../services/users'
 import type { ManagedUser } from '../../services/users'
 import useAuthStore from '../../store/auth'
+import FormDrawer from '../../components/FormDrawer'
+import StatusBadge from '../../components/StatusBadge'
+import TimeText from '../../components/TimeText'
+import EmptyState from '../../components/EmptyState'
+import { useDangerConfirm } from '../../hooks/useDangerConfirm'
 
 const { Title } = Typography
 
@@ -38,15 +32,22 @@ const ROLE_COLOR: Record<string, string> = {
   org_viewer: 'green',
 }
 
+const ROLE_LABEL: Record<string, string> = {
+  super_admin: '超级管理员',
+  org_admin: '组织管理员',
+  org_viewer: '只读成员',
+}
+
 /**
- * User management page (super_admin only) — list, create, edit, delete users
- * and reset their passwords.
+ * User management page (super_admin only, 5b/5c). Create/edit/reset-password run
+ * in the site-wide drawer (交互定则 1); users are disabled/enabled rather than
+ * hard-deleted (5b, danger confirm); MM-DD HH:mm times.
  */
 function SettingsUsersPage() {
   const currentUser = useAuthStore((s) => s.user)
   const isSuperAdmin = currentUser?.role === 'super_admin'
-  const { modal, message } = App.useApp()
-
+  const { message } = App.useApp()
+  const dangerConfirm = useDangerConfirm()
   const actionRef = useRef<ActionType | undefined>(undefined)
 
   const [createOpen, setCreateOpen] = useState(false)
@@ -67,12 +68,13 @@ function SettingsUsersPage() {
     )
   }
 
-  const handleCreate = async (values: {
-    username: string
-    email?: string
-    password: string
-    role: string
-  }) => {
+  const submitCreate = async () => {
+    let values: { username: string; email?: string; password: string; role: string }
+    try {
+      values = await createForm.validateFields()
+    } catch {
+      return
+    }
     setSubmitting(true)
     try {
       await createUser(values)
@@ -87,8 +89,14 @@ function SettingsUsersPage() {
     }
   }
 
-  const handleEdit = async (values: { username?: string; email?: string; role?: string }) => {
+  const submitEdit = async () => {
     if (!editTarget) return
+    let values: { username?: string; email?: string; role?: string }
+    try {
+      values = await editForm.validateFields()
+    } catch {
+      return
+    }
     setSubmitting(true)
     try {
       await updateUser(editTarget.id, values)
@@ -102,25 +110,14 @@ function SettingsUsersPage() {
     }
   }
 
-  const handleDelete = (user: ManagedUser) => {
-    modal.confirm({
-      title: `删除用户：${user.username}`,
-      content: '确认删除该用户？此操作不可撤销。',
-      okType: 'danger',
-      onOk: async () => {
-        try {
-          await deleteUser(user.id)
-          message.success('用户已删除')
-          actionRef.current?.reload()
-        } catch {
-          message.error('删除失败')
-        }
-      },
-    })
-  }
-
-  const handlePasswordChange = async (values: { password: string; confirm: string }) => {
+  const submitPassword = async () => {
     if (!pwTarget) return
+    let values: { password: string; confirm: string }
+    try {
+      values = await pwForm.validateFields()
+    } catch {
+      return
+    }
     if (values.password !== values.confirm) {
       message.error('两次密码输入不一致')
       return
@@ -138,12 +135,37 @@ function SettingsUsersPage() {
     }
   }
 
+  const toggleActive = (u: ManagedUser) => {
+    if (u.is_active) {
+      dangerConfirm({
+        title: `禁用用户：${u.username}`,
+        content: '禁用后该用户无法登录，但账号与历史记录保留，可随时重新启用。',
+        okText: '禁用',
+        onOk: async () => {
+          try {
+            await setUserActive(u.id, false)
+            message.success('已禁用')
+            actionRef.current?.reload()
+          } catch {
+            message.error('操作失败')
+          }
+        },
+      })
+    } else {
+      void (async () => {
+        try {
+          await setUserActive(u.id, true)
+          message.success('已启用')
+          actionRef.current?.reload()
+        } catch {
+          message.error('操作失败')
+        }
+      })()
+    }
+  }
+
   const columns: ProColumns<ManagedUser>[] = [
-    {
-      title: '用户名',
-      dataIndex: 'username',
-      key: 'username',
-    },
+    { title: '用户名', dataIndex: 'username', key: 'username' },
     {
       title: '邮箱',
       dataIndex: 'email',
@@ -155,35 +177,32 @@ function SettingsUsersPage() {
       dataIndex: 'role',
       key: 'role',
       width: 130,
-      render: (_, u) => (
-        <Tag color={ROLE_COLOR[u.role] ?? 'default'}>{u.role}</Tag>
-      ),
+      render: (_, u) => <Tag color={ROLE_COLOR[u.role] ?? 'default'}>{ROLE_LABEL[u.role] ?? u.role}</Tag>,
     },
     {
       title: '状态',
       dataIndex: 'is_active',
       key: 'is_active',
-      width: 80,
-      render: (_, u) => (
-        <Tag color={u.is_active ? 'green' : 'red'}>{u.is_active ? '活跃' : '禁用'}</Tag>
-      ),
+      width: 90,
+      render: (_, u) => <StatusBadge status={u.is_active ? 'ACTIVE' : 'INACTIVE'} domain="user" />,
     },
     {
       title: '创建时间',
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 170,
-      render: (_, u) => new Date(u.created_at).toLocaleString('zh-CN'),
+      width: 150,
+      render: (_, u) => <TimeText value={u.created_at} />,
     },
     {
       title: '操作',
       key: 'action',
-      width: 200,
+      width: 170,
+      align: 'right',
       render: (_, u) => (
-        <Space>
+        <Space size="middle">
           <Button
-            size="small"
-            icon={<EditOutlined />}
+            type="link"
+            style={{ padding: 0, height: 'auto' }}
             onClick={() => {
               editForm.setFieldsValue({ username: u.username, email: u.email, role: u.role })
               setEditTarget(u)
@@ -191,21 +210,17 @@ function SettingsUsersPage() {
           >
             编辑
           </Button>
-          <Button
-            size="small"
-            icon={<KeyOutlined />}
-            onClick={() => setPwTarget(u)}
-          >
+          <Button type="link" style={{ padding: 0, height: 'auto' }} onClick={() => setPwTarget(u)}>
             改密
           </Button>
           <Button
-            size="small"
-            danger
-            icon={<DeleteOutlined />}
+            type="link"
+            danger={u.is_active}
+            style={{ padding: 0, height: 'auto' }}
             disabled={u.id === currentUser?.id}
-            onClick={() => handleDelete(u)}
+            onClick={() => toggleActive(u)}
           >
-            删除
+            {u.is_active ? '禁用' : '启用'}
           </Button>
         </Space>
       ),
@@ -216,11 +231,7 @@ function SettingsUsersPage() {
     <div>
       <Space style={{ marginBottom: 16, justifyContent: 'space-between', width: '100%' }}>
         <Title level={3} style={{ margin: 0 }}>用户管理</Title>
-        <Button
-          type="primary"
-          icon={<PlusOutlined />}
-          onClick={() => setCreateOpen(true)}
-        >
+        <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>
           新建用户
         </Button>
       </Space>
@@ -230,7 +241,9 @@ function SettingsUsersPage() {
         columns={columns}
         rowKey="id"
         search={false}
-        pagination={{ pageSize: 20 }}
+        options={false}
+        pagination={{ pageSize: 20, hideOnSinglePage: true }}
+        locale={{ emptyText: <EmptyState description="还没有用户" /> }}
         request={async () => {
           try {
             const data = await listUsers()
@@ -241,55 +254,45 @@ function SettingsUsersPage() {
         }}
       />
 
-      {/* Create user modal */}
-      <Modal
-        title="新建用户"
+      {/* Create user drawer (5c) */}
+      <FormDrawer
         open={createOpen}
-        onCancel={() => { setCreateOpen(false); createForm.resetFields() }}
-        onOk={() => createForm.submit()}
-        confirmLoading={submitting}
-        okText="创建"
-        cancelText="取消"
+        title="新建用户"
+        onClose={() => setCreateOpen(false)}
+        onSubmit={submitCreate}
+        loading={submitting}
+        submitText="创建"
       >
-        <Form form={createForm} layout="vertical" onFinish={handleCreate}>
-          <Form.Item
-            label="用户名"
-            name="username"
-            rules={[{ required: true, message: '请输入用户名' }]}
-          >
+        <Form form={createForm} layout="vertical" preserve={false} onFinish={submitCreate}>
+          <Form.Item label="用户名" name="username" rules={[{ required: true, message: '请输入用户名' }]}>
             <Input maxLength={32} />
           </Form.Item>
           <Form.Item label="邮箱" name="email">
             <Input type="email" maxLength={128} />
           </Form.Item>
           <Form.Item
-            label="密码"
+            label="初始密码"
             name="password"
             rules={[{ required: true, min: 8, message: '密码至少 8 位' }]}
+            extra="初始密码由管理员设置，请一次性妥善告知用户，用户可自行修改。"
           >
             <Input.Password />
           </Form.Item>
-          <Form.Item
-            label="角色"
-            name="role"
-            rules={[{ required: true, message: '请选择角色' }]}
-          >
+          <Form.Item label="角色" name="role" rules={[{ required: true, message: '请选择角色' }]}>
             <Select options={ROLE_OPTIONS} />
           </Form.Item>
         </Form>
-      </Modal>
+      </FormDrawer>
 
-      {/* Edit user modal */}
-      <Modal
-        title={`编辑用户：${editTarget?.username}`}
+      {/* Edit user drawer */}
+      <FormDrawer
         open={!!editTarget}
-        onCancel={() => setEditTarget(null)}
-        onOk={() => editForm.submit()}
-        confirmLoading={submitting}
-        okText="保存"
-        cancelText="取消"
+        title={`编辑用户：${editTarget?.username ?? ''}`}
+        onClose={() => setEditTarget(null)}
+        onSubmit={submitEdit}
+        loading={submitting}
       >
-        <Form form={editForm} layout="vertical" onFinish={handleEdit}>
+        <Form form={editForm} layout="vertical" preserve={false} onFinish={submitEdit}>
           <Form.Item label="用户名" name="username">
             <Input maxLength={32} />
           </Form.Item>
@@ -300,35 +303,26 @@ function SettingsUsersPage() {
             <Select options={ROLE_OPTIONS} />
           </Form.Item>
         </Form>
-      </Modal>
+      </FormDrawer>
 
-      {/* Change password modal */}
-      <Modal
-        title={`修改密码：${pwTarget?.username}`}
+      {/* Reset password drawer */}
+      <FormDrawer
         open={!!pwTarget}
-        onCancel={() => { setPwTarget(null); pwForm.resetFields() }}
-        onOk={() => pwForm.submit()}
-        confirmLoading={submitting}
-        okText="确认修改"
-        cancelText="取消"
+        title={`修改密码：${pwTarget?.username ?? ''}`}
+        onClose={() => setPwTarget(null)}
+        onSubmit={submitPassword}
+        loading={submitting}
+        submitText="确认修改"
       >
-        <Form form={pwForm} layout="vertical" onFinish={handlePasswordChange}>
-          <Form.Item
-            label="新密码"
-            name="password"
-            rules={[{ required: true, min: 8, message: '密码至少 8 位' }]}
-          >
+        <Form form={pwForm} layout="vertical" preserve={false} onFinish={submitPassword}>
+          <Form.Item label="新密码" name="password" rules={[{ required: true, min: 8, message: '密码至少 8 位' }]}>
             <Input.Password />
           </Form.Item>
-          <Form.Item
-            label="确认密码"
-            name="confirm"
-            rules={[{ required: true, message: '请再次输入密码' }]}
-          >
+          <Form.Item label="确认密码" name="confirm" rules={[{ required: true, message: '请再次输入密码' }]}>
             <Input.Password />
           </Form.Item>
         </Form>
-      </Modal>
+      </FormDrawer>
     </div>
   )
 }

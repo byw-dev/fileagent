@@ -1257,3 +1257,29 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 - 测试：db 层 `TestListUploadLogs_WithStatusFilter`/`TestCountUploadLogs_WithStatusFilter`（sqlmock 断言 status arg）；
   handler 层 `List_StatusFilterNormalized`（FAILED→failed 归一 + 传入 List/Count）/`List_NoStatusFilter`。
 - 实机验证：`?status=COMPLETED`→1、`?status=FAILED`→1、`?status=failed`（小写）→1、无参→2，`total` 同步。
+
+---
+
+## D-029：用户禁用/启用端点（WR-8 5b「禁用而非删除」，additive）
+
+**决策日期**：2026-07-17
+**影响范围**：controlplane（`internal/api/handler/users.go` + `router.go`）、webui（`services/users.ts` + `Settings/Users`）
+**来源**：WR-8 用户管理，规范 5b 要求「禁用而非删除」（软禁用，保账号与审计），但后端 `users.is_active` 有字段
+（响应也返回）却**无 setter**——`UpdateUser` 只接受 username/email/role，仅有硬 `DeleteUser`。
+
+### 决策（产品 2026-07-17 拍板「小幅补后端」）
+
+新增 `PUT /api/v1/users/:id/active`（super_admin，与 `/password` 子资源同款风格），body `{"is_active": bool}`：
+
+- 复用**已存在**的 sqlc 查询 `UpdateUserActive`（`users.sql.go`，数据/查询早已生成，仅未接 handler/路由）——非新表/新查询。
+- `is_active` 用 `*bool` + `binding:"required"`：拒绝缺字段，同时允许显式 `false`（禁用）。
+- **不能禁用自己**：`!is_active && callerID == :id` → 400 `CANNOT_DISABLE_SELF`，避免把自己锁出。
+- 写后 `GetUserByID` 回读：`UpdateUserActive` 是 `:exec` 无 not-found 信号，回读既能返回刷新后的 user 又能对不存在 id 返 404。
+- 硬 `DeleteUser` 端点**保留**（未删），但 **UI 不再暴露硬删**，改为禁用/启用（活跃可禁、已禁可启，危险确认仅用于禁用）。
+
+### 落地记录
+
+- `users.go`：`SetActive` handler + `UsersDB` 接口加 `UpdateUserActive`；`router.go` 注册 `PUT /users/:id/active`。
+- 测试：`SetActive_Disable`（is_active=false 透传 + 回读 body）/`_MissingField`（400）/`_CannotDisableSelf`（自禁 400、DB 未被调）。
+- 前端：`setUserActive(id, isActive)`；`Settings/Users` 操作列 删除 → 禁用/启用（`useDangerConfirm`，自禁按钮禁用）。
+- 实机：自我禁用→400、缺字段→400。

@@ -18,6 +18,7 @@ vi.mock('../services/users', () => ({
   listUsers: () => listUsersMock(),
   createUser: vi.fn(),
   updateUser: vi.fn(),
+  setUserActive: vi.fn(),
   deleteUser: vi.fn(),
   updateUserPassword: (...args: unknown[]) => updateUserPasswordMock(...args),
 }))

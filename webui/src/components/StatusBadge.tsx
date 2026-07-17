@@ -41,12 +41,17 @@ const BASE: Record<string, Meta> = {
 }
 
 /** Domain of the status value — refines the few values that collide across domains. */
-export type StatusDomain = 'agent' | 'file' | 'upload' | 'rule' | 'delivery'
+export type StatusDomain = 'agent' | 'file' | 'upload' | 'rule' | 'delivery' | 'user'
 
 /** Per-domain overrides for ambiguous values (e.g. delivery PENDING = 待投递, not 待审批). */
 const OVERRIDE: Partial<Record<StatusDomain, Record<string, Meta>>> = {
   delivery: {
     PENDING: { label: '待投递', tone: 'processing' },
+  },
+  // User active flag: 活跃 / 已禁用 (rule's 生效 / 已停用 reads wrong for accounts).
+  user: {
+    ACTIVE: { label: '活跃', tone: 'success' },
+    INACTIVE: { label: '已禁用', tone: 'neutral' },
   },
 }
 

@@ -135,11 +135,14 @@
 - **⚠️「通知配置状态可见」descope**：MinIO 事件通知是**部署级全局配置**（`notify_webhook` / `init-minio.sh`），CP 不按 bucket 存通知状态，`bucketResponse` 无相关字段——无后端数据，同 WR-2 glob 处理，注记于页面 JSDoc
 - 测试：`buckets-page.test.tsx`（super_admin 见新建/开抽屉、非 super_admin 隐藏、列表请求）
 
-### WR-8 — 设置 ⬜（2026-07-14 校准）
-- [ ] 用户管理 tab(5b super_admin，禁用而非删除)、新建用户抽屉(5c 初始密码一次性)、登录页(5a)核对
-- [ ] **7c 标签词表**（`Settings/TagKeys`）+ **7d 待确认取值**（`Settings/PendingTags`）润色到 WR 一致性：
-      `StatusBadge`（来源/状态）/`TimeText`（首次出现）/token 色/空态一句话+主操作/危险确认（拒绝、删除键）；
-      取值抽屉与 merge 弹窗对齐 `FormDrawer`/交互定则。〔均 Phase-1「够用一致」建，本片折入润色〕
+### WR-8 — 设置 ✅（本 PR）
+- [x] **用户管理(5b/5c)**：新建/编辑/改密全部 Modal → `FormDrawer`（交互定则 1）；状态列 `StatusBadge domain=user`（活跃/已禁用，新增 user 域）；创建时间 `TimeText`；操作列 `Button type=link` 右对齐 + `EmptyState`
+- [x] **5b 禁用而非删除**：操作列硬删除 → **禁用/启用**（`useDangerConfirm` 仅用于禁用，自禁按钮 disabled）。**含小幅补后端 D-029**：新增 `PUT /users/:id/active`（复用已存在 sqlc `UpdateUserActive`，`*bool` required、不能禁自己、回读返 404）
+- [x] **5c 新建用户抽屉**：初始密码由管理员设置（后端即此形态），extra 文案提示「一次性妥善告知用户」
+- [x] **5a 登录页核对**：用户名+密码 → 双 Token，无 OIDC UI——现状已合规，未改
+- [x] **7c 标签词表**：键 create/edit `Modal` → `FormDrawer`；删除 → `useDangerConfirm`；`EmptyState`；取值抽屉已是 Drawer 保留
+- [x] **7d 待确认取值**：首次出现 `TimeText`；拒绝 → `useDangerConfirm`；merge `Modal` → `FormDrawer`；`EmptyState`
+- 测试：Go `SetActive_*` 3 例；前端 settings-pages 补 `setUserActive` mock（既有 131 绿）
 
 ### WR-9 — 仪表盘 ✅（本 PR）
 - [x] 去硬编码色：统计卡强调色 + 折线 stroke + 网格线改走 `theme.useToken()`（`colorSuccess`/`colorPrimary`/`colorSplit`），不再 `#52c41a`/`#1677ff`
