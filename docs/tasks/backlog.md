@@ -114,3 +114,18 @@ status/tag 服务端预筛后）内客户端过滤**，止血且不 400。
 
 **优先级**：⚪ 低（当前列表 limit 100 + 客户端分页，客户端过滤与 UI 展示范围一致；无真实大数据集）。触发信号：单类目文件 > 100
 且需按名/日期精确检索。
+
+---
+
+## 抽取 + 加固共享 formatBytes（跨页去重）
+
+**来源**：WR-4 评审（2026-07-17）第七轮——`formatBytes` 在 ~6 个页面（Dashboard / Logs / Files/index /
+FileDetailDrawer / Agents/Detail / Agents/Logs）各自复制；单位表 `['B','KB','MB','GB','TB']` 只到 TB，
+理论上 ≥1PB 会输出 `X undefined`，且未防非有限/负输入。
+
+**现状判断**：`size`/`bytes_transferred` 均为后端非负有限 int64，边缘采集单文件 ≥1PB 不现实，故当前无实际影响。
+
+**内容**（若做 UI 一致性清理时）：抽 `src/utils/formatBytes.ts`（clamp 单位下标到最后一档 + 非有限/负值回退 `-`），
+6 处改为引用，去掉重复定义。
+
+**优先级**：⚪ 低（纯健壮性/去重，无真实触发场景）。
