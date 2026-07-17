@@ -6,6 +6,8 @@ import { useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { listAgents, approveAgent } from '../../services/agents'
 import type { Agent } from '../../services/agents'
+import TimeText from '../../components/TimeText'
+import EmptyState from '../../components/EmptyState'
 
 const { Title } = Typography
 
@@ -39,7 +41,13 @@ function AgentsPendingPage() {
       dataIndex: 'name',
       key: 'name',
       render: (_, agent) => (
-        <a onClick={() => navigate(`/agents/${agent.id}`)}>{agent.name}</a>
+        <Button
+          type="link"
+          style={{ padding: 0, height: 'auto' }}
+          onClick={() => navigate(`/agents/${agent.id}`)}
+        >
+          {agent.name}
+        </Button>
       ),
     },
     {
@@ -63,8 +71,8 @@ function AgentsPendingPage() {
       title: '注册时间',
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 170,
-      render: (_, agent) => new Date(agent.created_at).toLocaleString('zh-CN'),
+      width: 150,
+      render: (_, agent) => <TimeText value={agent.created_at} />,
     },
     {
       title: '操作',
@@ -94,7 +102,9 @@ function AgentsPendingPage() {
         columns={columns}
         rowKey="id"
         search={false}
-        pagination={{ pageSize: 20 }}
+        options={false}
+        pagination={{ pageSize: 20, hideOnSinglePage: true }}
+        locale={{ emptyText: <EmptyState description="没有待审批的采集器" /> }}
         request={async () => {
           try {
             const data = await listAgents({ status: 'PENDING', limit: 100 })
