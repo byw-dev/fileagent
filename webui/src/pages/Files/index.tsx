@@ -13,6 +13,7 @@ import StatusBadge from '../../components/StatusBadge'
 import TimeText from '../../components/TimeText'
 import EmptyState from '../../components/EmptyState'
 import FormDrawer from '../../components/FormDrawer'
+import { useDangerConfirm } from '../../hooks/useDangerConfirm'
 import FileDetailDrawer from './FileDetailDrawer'
 import type { RangePickerProps } from 'antd/es/date-picker'
 
@@ -307,6 +308,7 @@ function BatchTagDrawer({
   onDone: () => void
 }) {
   const { message } = App.useApp()
+  const dangerConfirm = useDangerConfirm()
   const { data: keys = [] } = useSWR('tag-keys', listTagKeys)
   const [key, setKey] = useState<string | undefined>()
   const [mode, setMode] = useState<'set' | 'clear'>('set')
@@ -318,16 +320,8 @@ function BatchTagDrawer({
     listFiles({ status: status || undefined, tag: tags.length ? tags : undefined, limit: 1 }),
   )
 
-  const submit = async () => {
-    if (submitting) return
-    if (!key) {
-      message.error('请选择标签键')
-      return
-    }
-    if (mode === 'set' && !value.trim()) {
-      message.error('请填写要设置的取值')
-      return
-    }
+  const apply = async () => {
+    if (!key) return
     setSubmitting(true)
     try {
       const filter: BatchTagFilter = {}
@@ -342,6 +336,30 @@ function BatchTagDrawer({
     } finally {
       setSubmitting(false)
     }
+  }
+
+  const submit = () => {
+    if (submitting) return
+    if (!key) {
+      message.error('请选择标签键')
+      return
+    }
+    if (mode === 'set' && !value.trim()) {
+      message.error('请填写要设置的取值')
+      return
+    }
+    // No filter = 全量变更: require an explicit danger confirm before applying,
+    // since it retags every file via an async worker and can't be undone per-file.
+    if (!status && tags.length === 0) {
+      dangerConfirm({
+        title: '对全部文件应用标签？',
+        content: '未添加任何筛选，本次打标将作用于全部文件，由后台任务执行且无法逐一撤销。',
+        okText: '仍然应用',
+        onOk: apply,
+      })
+      return
+    }
+    void apply()
   }
 
   return (
