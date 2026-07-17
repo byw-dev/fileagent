@@ -92,12 +92,14 @@
 - **⚠️ glob 规则编辑器（原 3c）已从本项拆出** → `backlog.md`（**无后端**：`file_type_rules` 无 REST 端点，需先建
       CRUD + 试匹配端点，破坏 WR「纯前端」前提；且 glob 现为低价值兜底）。2026-07-14 用户拍板 descope + 后续按需再做。
 
-### WR-3 — 采集器 ⬜（2026-07-14 校准）
-- [ ] 待审批置顶横幅(1c)、行内审批/吊销走 `useDangerConfirm`、详情 tabs 保留、**修列表/详情状态口径 bug**
-- [ ] **规则表单保持整页 4 步 `StepsForm`**（**不**抽屉化）——作为定则 1 的合理例外：Phase 1（MT-6d）已把它建成
-      4 步整页（基本/源路径/上传路径/元数据，含 dry-run + 实时预览 + 动态列表），历 10 轮 review 稳定，复用现有 `RuleForm` 内核。
-      本片只做 **WR token / `StatusBadge` / `TimeText` 润色** + 润色 **7a 元数据步**（静态标签/路径映射行的视觉与空态）。
-      〔原规格「三步抽屉」已废——决策见「规格校准记录」〕
+### WR-3 — 采集器 ✅（本 PR）
+- [x] **待审批置顶横幅(1c)**：删状态 Tabs，改顶部 `Alert` 横幅（`有 N 个采集器待审批` + 去审批），pending 数走轻量 SWR（limit 1 取 total）
+- [x] **修列表/详情状态口径 bug**：`AgentStatusBadge` 加 `isOnline` 入参，RUNNING/OFFLINE 阶段由**实时 `is_online`**定 在线/离线（`effectiveAgentStatus`）；列表/详情共用同一口径；详情去掉冗余「实时在线」行（已并入徽标）
+- [x] **行内审批/吊销**：吊销走 `useDangerConfirm`（红实心，定则 2）；审批走普通 confirm（非危险）；名称/操作改 `Button type=link`（a11y）
+- [x] **润色**：list/pending/detail/logs 全部 `StatusBadge`(agent/upload) + `TimeText`（最后心跳用相对时间，定则 5）+ `EmptyState`；`Agents/Logs` 顺带 useEffect→SWR
+- [x] **详情 tabs 保留**（基本/规则/日志/目录）；详情日志状态列修正为 `StatusBadge domain=upload`（原 SUCCESS 假枚举）
+- [x] 测试 `agents-page.test.tsx`（横幅有无 + **RUNNING+is_online=false 渲染离线**的口径修复断言）
+- **规则表单保持整页 4 步 `StepsForm`**（不抽屉化，定则 1 例外，2026-07-14 校准）——本 PR **不动** `RuleForm`（稳定 26KB、历 10 轮 review）。7a 元数据步的视觉润色**推后**：现存唯一 WR nit 是 2d 上传路径预览卡的 `#f5f5f5` 硬编码 bg（非 7a、纯装饰、预存），为避免动稳定表单引入回归而不在本片处理
 
 ### WR-4 — 文件 ⬜（2026-07-14 校准）
 - [ ] 勾选批量下载(复用 `BatchDownload`)、类型树变体(4g 可选)、**修 Invalid Date**（`Files/index.tsx:155` 裸 `toLocaleString` 换 `TimeText`）

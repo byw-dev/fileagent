@@ -1,8 +1,11 @@
-import { useState, useEffect } from 'react'
-import { Button, Space, Table, Tag, Typography, message } from 'antd'
+import { Button, Space, Table, Typography, App } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { useParams, useNavigate } from 'react-router-dom'
+import useSWR from 'swr'
 import { listAgentUploadLogs } from '../../services/agents'
+import StatusBadge from '../../components/StatusBadge'
+import TimeText from '../../components/TimeText'
+import EmptyState from '../../components/EmptyState'
 
 const { Title } = Typography
 
@@ -13,12 +16,6 @@ type UploadLogRow = {
   status: string
   uploaded_at: string
   error_message?: string
-}
-
-const STATUS_COLOR: Record<string, string> = {
-  SUCCESS: 'green',
-  FAILED: 'red',
-  PENDING: 'gold',
 }
 
 /** Format bytes to human-readable size */
@@ -35,18 +32,15 @@ function formatBytes(bytes: number): string {
 function AgentLogsPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
+  const { message } = App.useApp()
 
-  const [logs, setLogs] = useState<UploadLogRow[]>([])
-  const [loading, setLoading] = useState(true)
-
-  useEffect(() => {
-    if (!id) return
-    setLoading(true)
-    listAgentUploadLogs(id, { limit: 100 })
-      .then((data) => setLogs(data.items as UploadLogRow[]))
-      .catch(() => message.error('获取上传日志失败'))
-      .finally(() => setLoading(false))
-  }, [id])
+  const { data, isLoading } = useSWR(
+    id ? ['agent-logs', id] : null,
+    () => listAgentUploadLogs(id!, { limit: 100 }),
+    { onError: () => message.error('获取上传日志失败') },
+  )
+  const logs = (data?.items ?? []) as UploadLogRow[]
+  const loading = isLoading
 
   const columns: ColumnsType<UploadLogRow> = [
     {
@@ -67,14 +61,14 @@ function AgentLogsPage() {
       dataIndex: 'status',
       key: 'status',
       width: 100,
-      render: (v: string) => <Tag color={STATUS_COLOR[v] ?? 'default'}>{v}</Tag>,
+      render: (v: string) => <StatusBadge status={v} domain="upload" />,
     },
     {
       title: '上传时间',
       dataIndex: 'uploaded_at',
       key: 'uploaded_at',
-      width: 170,
-      render: (v: string) => new Date(v).toLocaleString('zh-CN'),
+      width: 150,
+      render: (v: string) => <TimeText value={v} />,
     },
     {
       title: '错误信息',
@@ -99,7 +93,7 @@ function AgentLogsPage() {
         rowKey="id"
         loading={loading}
         pagination={{ pageSize: 20 }}
-        locale={{ emptyText: '暂无上传记录' }}
+        locale={{ emptyText: <EmptyState description="暂无上传记录" /> }}
       />
     </div>
   )

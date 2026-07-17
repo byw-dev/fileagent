@@ -38,6 +38,8 @@ import {
 import type { Agent, CollectionRule } from '../../services/agents'
 import type { UploadLog } from '../../services/upload-logs'
 import AgentStatusBadge from '../../components/AgentStatusBadge'
+import StatusBadge from '../../components/StatusBadge'
+import TimeText from '../../components/TimeText'
 import DirectoryTree from '../../components/DirectoryTree'
 import type { DirEntry } from '../../components/DirectoryTree'
 
@@ -267,21 +269,14 @@ function AgentDetailPage() {
       dataIndex: 'status',
       key: 'status',
       width: 90,
-      render: (_, row) => {
-        const colorMap: Record<string, string> = {
-          SUCCESS: 'green',
-          FAILED: 'red',
-          PENDING: 'gold',
-        }
-        return <Tag color={colorMap[row.status] ?? 'default'}>{row.status}</Tag>
-      },
+      render: (_, row) => <StatusBadge status={row.status} domain="upload" />,
     },
     {
       title: '上传时间',
       dataIndex: 'uploaded_at',
       key: 'uploaded_at',
-      width: 170,
-      render: (_, row) => new Date(row.uploaded_at).toLocaleString('zh-CN'),
+      width: 150,
+      render: (_, row) => <TimeText value={row.uploaded_at} />,
     },
   ]
 
@@ -315,20 +310,15 @@ function AgentDetailPage() {
             <Descriptions.Item label="操作系统">{agent.os_type}</Descriptions.Item>
             <Descriptions.Item label="版本">{agent.agent_version}</Descriptions.Item>
             <Descriptions.Item label="状态">
-              <AgentStatusBadge status={agent.status} />
-            </Descriptions.Item>
-            <Descriptions.Item label="实时在线">
-              {agent.is_online
-                ? <Tag color="green">在线</Tag>
-                : <Tag color="default">离线</Tag>}
+              {/* Effective status (badge already reflects is_online) — no
+                  separate 实时在线 row, so list and detail never disagree. */}
+              <AgentStatusBadge status={agent.status} isOnline={agent.is_online} />
             </Descriptions.Item>
             <Descriptions.Item label="最后心跳">
-              {agent.last_seen_at
-                ? new Date(agent.last_seen_at).toLocaleString('zh-CN')
-                : '-'}
+              <TimeText value={agent.last_seen_at} relative />
             </Descriptions.Item>
             <Descriptions.Item label="注册时间">
-              {new Date(agent.created_at).toLocaleString('zh-CN')}
+              <TimeText value={agent.created_at} />
             </Descriptions.Item>
           </Descriptions>
         </Card>
@@ -437,7 +427,7 @@ function AgentDetailPage() {
             title="重命名"
             onClick={openRename}
           />
-          <AgentStatusBadge status={agent.status} />
+          <AgentStatusBadge status={agent.status} isOnline={agent.is_online} />
         </Space>
         <Space>
           {canApprove && (
