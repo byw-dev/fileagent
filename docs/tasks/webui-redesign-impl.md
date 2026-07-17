@@ -151,9 +151,10 @@
 - [x] 接服务端聚合(1b，端点已存在 · commit f6f659f)——WR-1 前既已接 `getDashboardStats`，本片保留
 - 注：无 mockup 专屏，遵 `webui-redesign.md` §1.1 token + 定则 6。含 `dashboard-page.test.tsx` 冒烟（骨架→内容 + 聚合被调）
 
-### WR-10 — 收尾 ⬜
+### WR-10 — 收尾 🔵（进行中）
+- [x] **Vitest 覆盖核心 store/service ≥ 80%**（本 PR）：`services 64%→92.6%`、`api.ts 57%→81%`、`store 100%`（总 131→160 测）。
+      新增 `services-more.test.ts`（agents 生命周期 / files getFile·deleteFile / buckets / events / file-types / users 的真实调用断言——原先这些 service 只在页面测试里被 mock、真码从不执行）+ `api.test.ts` 补 401 刷新成功·重试路径
 - [ ] 全站 Chrome DevTools 实机走查（见「验证」）
-- [ ] Vitest 覆盖核心 store/service ≥ 80%
 - [ ] 对照 `webui-redesign.md` 逐条核销；如有行为偏差同步 `system-design.md`
 
 ---
