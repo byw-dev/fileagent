@@ -5,7 +5,8 @@ export interface Bucket {
   id: string
   org_id: string
   name: string
-  description: string | null
+  /** omitempty on the backend → absent (undefined) when none. */
+  description?: string
   created_at: string
 }
 
