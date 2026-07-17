@@ -55,12 +55,20 @@ function FileDetailDrawer({ fileId, onClose }: FileDetailDrawerProps) {
 
   const copyLink = async () => {
     if (!file) return
+    // Separate the two failure modes so a clipboard error (permission / insecure
+    // context) isn't misreported as a link-fetch failure.
+    let url: string
     try {
-      const { url } = await getFileDownloadUrl(file.id)
+      ;({ url } = await getFileDownloadUrl(file.id))
+    } catch {
+      message.error('获取下载链接失败')
+      return
+    }
+    try {
       await navigator.clipboard.writeText(url)
       message.success('下载链接已复制')
     } catch {
-      message.error('获取下载链接失败')
+      message.error('复制失败，请手动复制链接')
     }
   }
 

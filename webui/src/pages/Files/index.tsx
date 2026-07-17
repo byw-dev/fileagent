@@ -234,8 +234,15 @@ function FilesPage() {
             if (filterRange) {
               const [from, to] = filterRange
               rows = rows.filter((f) => {
-                const d = (f.uploaded_at ?? '').slice(0, 10)
-                return d >= from && d <= to
+                if (!f.uploaded_at) return false
+                // Compare by LOCAL calendar day (matching how TimeText renders the
+                // time) so files near midnight aren't filtered by a different UTC day.
+                const dt = new Date(f.uploaded_at)
+                const y = dt.getFullYear()
+                const m = String(dt.getMonth() + 1).padStart(2, '0')
+                const d = String(dt.getDate()).padStart(2, '0')
+                const local = `${y}-${m}-${d}`
+                return local >= from && local <= to
               })
             }
             return { data: rows, success: true, total: rows.length }
