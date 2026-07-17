@@ -212,12 +212,15 @@ function FilesPage() {
           try {
             // Only status/tag go to the server (the rest 400s). Cache the result
             // keyed by those so client-side filename/date filtering is free.
-            const serverKey = JSON.stringify({ filterStatus, filterTags })
+            // Sort the tag predicates so the key (and request) are order-stable —
+            // {A,B} and {B,A} are the same AND-filter and must hit the same cache.
+            const sortedTags = [...filterTags].sort()
+            const serverKey = JSON.stringify({ filterStatus, filterTags: sortedTags })
             let items = cacheRef.current?.key === serverKey ? cacheRef.current.items : null
             if (!items) {
               const params: Record<string, unknown> = { limit: 100 }
               if (filterStatus) params.status = filterStatus
-              if (filterTags.length > 0) params.tag = filterTags
+              if (sortedTags.length > 0) params.tag = sortedTags
               const data = await listFiles(params as Parameters<typeof listFiles>[0])
               items = data.items
               cacheRef.current = { key: serverKey, items }
