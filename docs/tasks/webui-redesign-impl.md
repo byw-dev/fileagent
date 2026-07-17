@@ -101,11 +101,13 @@
 - [x] 测试 `agents-page.test.tsx`（横幅有无 + **RUNNING+is_online=false 渲染离线**的口径修复断言）
 - **规则表单保持整页 4 步 `StepsForm`**（不抽屉化，定则 1 例外，2026-07-14 校准）——本 PR **不动** `RuleForm`（稳定 26KB、历 10 轮 review）。7a 元数据步的视觉润色**推后**：现存唯一 WR nit 是 2d 上传路径预览卡的 `#f5f5f5` 硬编码 bg（非 7a、纯装饰、预存），为避免动稳定表单引入回归而不在本片处理
 
-### WR-4 — 文件 ⬜（2026-07-14 校准）
-- [ ] 勾选批量下载(复用 `BatchDownload`)、类型树变体(4g 可选)、**修 Invalid Date**（`Files/index.tsx:155` 裸 `toLocaleString` 换 `TimeText`）
-- [ ] 文件详情 480px 抽屉(3a)——注：当前 `Files/Detail` **仅有路由无实现**，为**新建**（非「替代整页」）
-- [ ] **对齐 Phase-1 标签 UI 到 WR 范式（7b）**：`Files/index.tsx` 现有标签列 / faceted 筛选（`TagFacetPicker`）/ 批量打标弹窗
-      为「够用一致」建；本片对齐——标签列/筛选 chip 化统一、批量打标改 `FormDrawer`、空态/危险确认、token 色。**不回退**标签功能。
+### WR-4 — 文件 ✅（本 PR）
+- [x] **修 Invalid Date**：list + detail 的 `uploaded_at`/`indexed_at` 裸 `toLocaleString` → `TimeText`（空值安全）
+- [x] **勾选批量下载(1d)**：选中即出选择工具条（已选 N 项 + `BatchDownload` + 清除选择），复用 `BatchDownload`
+- [x] **文件详情 480px 抽屉(3a)**：新增 `FileDetailDrawer`（SWR 取数 + `StatusBadge`/`TimeText` + 下载/复制链接），从列表文件名点击打开；**删** `/files/:id` 整页路由 + `Files/Detail.tsx`（原注「仅路由无实现」已过期——实为整页改抽屉）
+- [x] **7b 标签 UI 对齐**：状态列 `Tag`(FILE_STATUS_COLOR) → `StatusBadge domain=file`（删 `FILE_STATUS_COLOR`）；文件标签列 chip 中性化（值标签 vs 蓝色可关闭的「筛选」chip 区分）；**批量打标 `Modal` → `FormDrawer`**；空态 `EmptyState`；文件名 `<a onClick>` → `Button type=link`(a11y)。**未回退**标签功能（faceted 筛选/批量打标保留）
+- 类型树变体(4g，可选) **未做**：标注为可选，未纳入本片
+- 测试 `files-page.test.tsx`（列表 + 文件名开详情抽屉 + 非 super_admin 隐藏批量打标）
 
 ### WR-5 — 事件规则 ✅（本 PR）
 - [x] 新建/编辑 → `RuleFormDrawer`（480px 抽屉，交互定则 1；删 `/events/create` 整页 + `Create.tsx`）；名称点击即开编辑
