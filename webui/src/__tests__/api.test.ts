@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import axios from 'axios'
 
 describe('api client – base configuration', () => {
   it('should export an axios instance with required methods', async () => {
@@ -149,5 +150,51 @@ describe('api client – response interceptor (401 handling)', () => {
     expect(hrefSetter).toHaveBeenCalledWith('/login')
 
     apiClient.defaults.adapter = originalAdapter
+  })
+
+  it('refreshes the token on 401 and retries the original request', async () => {
+    localStorage.setItem(
+      'fileagent-auth',
+      JSON.stringify({ state: { accessToken: 'old', refreshToken: 'refresh-1' } }),
+    )
+
+    const { default: apiClient } = await import('../services/api')
+
+    // The refresh call uses the standalone axios.post (not apiClient).
+    const postSpy = vi
+      .spyOn(axios, 'post')
+      .mockResolvedValue({ data: { access_token: 'new-access', refresh_token: 'new-refresh' } })
+
+    // First call 401s; the retried call (after refresh) succeeds.
+    let calls = 0
+    const adapterSpy = vi.fn().mockImplementation((config) => {
+      calls += 1
+      if (calls === 1) {
+        return Promise.reject({
+          response: { status: 401 },
+          config: { ...config, _retry: false },
+          isAxiosError: true,
+        })
+      }
+      return Promise.resolve({ data: { ok: true }, status: 200, statusText: 'OK', headers: {}, config })
+    })
+    const originalAdapter = apiClient.defaults.adapter
+    apiClient.defaults.adapter = adapterSpy
+
+    const res = await apiClient.get('/protected')
+
+    expect(res.data).toEqual({ ok: true })
+    expect(postSpy).toHaveBeenCalledWith(
+      expect.stringContaining('/api/auth/refresh'),
+      { refresh_token: 'refresh-1' },
+      expect.anything(),
+    )
+    // Rotated tokens are persisted back to localStorage.
+    const stored = JSON.parse(localStorage.getItem('fileagent-auth')!)
+    expect(stored.state.accessToken).toBe('new-access')
+    expect(stored.state.refreshToken).toBe('new-refresh')
+
+    apiClient.defaults.adapter = originalAdapter
+    postSpy.mockRestore()
   })
 })
