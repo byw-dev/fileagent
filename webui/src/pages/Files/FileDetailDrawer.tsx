@@ -68,7 +68,9 @@ function FileDetailDrawer({ fileId, onClose }: FileDetailDrawerProps) {
       await navigator.clipboard.writeText(url)
       message.success('下载链接已复制')
     } catch {
-      message.error('复制失败，请手动复制链接')
+      // The URL isn't shown in the drawer, so don't tell the user to copy it
+      // manually — report the actual cause (clipboard blocked / insecure context).
+      message.error('复制失败：浏览器剪贴板不可用，请改用「下载」')
     }
   }
 

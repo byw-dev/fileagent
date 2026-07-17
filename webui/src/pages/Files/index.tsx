@@ -349,9 +349,14 @@ function BatchTagDrawer({
   const [value, setValue] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
+  // Order-stable tag predicates: sorting keeps the SWR key and request identical
+  // regardless of insertion order, and spreading the array (vs join) avoids key
+  // collisions when a tag value contains the separator.
+  const sortedTags = [...tags].sort()
+
   // Preview the blast radius: count files matching the same predicate.
-  const { data: preview } = useSWR(open ? ['batch-count', status, tags.join(',')] : null, () =>
-    listFiles({ status: status || undefined, tag: tags.length ? tags : undefined, limit: 1 }),
+  const { data: preview } = useSWR(open ? ['batch-count', status, ...sortedTags] : null, () =>
+    listFiles({ status: status || undefined, tag: sortedTags.length ? sortedTags : undefined, limit: 1 }),
   )
 
   const apply = async () => {
@@ -360,7 +365,7 @@ function BatchTagDrawer({
     try {
       const filter: BatchTagFilter = {}
       if (status) filter.status = status
-      if (tags.length) filter.tags = tags
+      if (sortedTags.length) filter.tags = sortedTags
       await batchTagFiles(filter, { [key]: mode === 'set' ? value.trim() : null })
       message.success('已提交批量打标任务，将在后台执行')
       onDone()
