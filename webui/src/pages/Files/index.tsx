@@ -45,6 +45,12 @@ const STATUS_OPTIONS: { label: string; value: FileStatusFilter | '' }[] = [
  */
 function FilesPage() {
   const actionRef = useRef<ActionType | undefined>(undefined)
+  // Server-side filters (status/tag) are cached by key so typing in the
+  // client-side filename filter / picking a date range doesn't refetch. The
+  // backend's GET /files only supports status/tag/agent/bucket/file_type (it 400s
+  // on unknown params), so filename/date are applied client-side over the loaded
+  // page. Server-side filename/date is a backlog follow-up.
+  const cacheRef = useRef<{ key: string; items: FileEntry[] } | null>(null)
   const user = useAuthStore((s) => s.user)
   const isSuperAdmin = user?.role === 'super_admin'
 
@@ -204,16 +210,32 @@ function FilesPage() {
         locale={{ emptyText: <EmptyState description="没有匹配的文件" /> }}
         request={async () => {
           try {
-            const params: Record<string, unknown> = { limit: 100 }
-            if (filterStatus) params.status = filterStatus
-            if (filterFilename) params.filename = filterFilename
-            if (filterRange) {
-              params.since = filterRange[0]
-              params.until = filterRange[1]
+            // Only status/tag go to the server (the rest 400s). Cache the result
+            // keyed by those so client-side filename/date filtering is free.
+            const serverKey = JSON.stringify({ filterStatus, filterTags })
+            let items = cacheRef.current?.key === serverKey ? cacheRef.current.items : null
+            if (!items) {
+              const params: Record<string, unknown> = { limit: 100 }
+              if (filterStatus) params.status = filterStatus
+              if (filterTags.length > 0) params.tag = filterTags
+              const data = await listFiles(params as Parameters<typeof listFiles>[0])
+              items = data.items
+              cacheRef.current = { key: serverKey, items }
             }
-            if (filterTags.length > 0) params.tag = filterTags
-            const data = await listFiles(params as Parameters<typeof listFiles>[0])
-            return { data: data.items, success: true, total: data.total }
+            // Client-side filename substring + date-range (on uploaded_at date).
+            let rows = items
+            if (filterFilename) {
+              const q = filterFilename.toLowerCase()
+              rows = rows.filter((f) => f.filename.toLowerCase().includes(q))
+            }
+            if (filterRange) {
+              const [from, to] = filterRange
+              rows = rows.filter((f) => {
+                const d = (f.uploaded_at ?? '').slice(0, 10)
+                return d >= from && d <= to
+              })
+            }
+            return { data: rows, success: true, total: rows.length }
           } catch {
             return { data: [], success: false, total: 0 }
           }
@@ -231,6 +253,7 @@ function FilesPage() {
           onClose={() => setBatchOpen(false)}
           onDone={() => {
             setBatchOpen(false)
+            cacheRef.current = null // tags changed → drop cached page
             actionRef.current?.reload()
           }}
         />

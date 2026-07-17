@@ -35,16 +35,17 @@ vi.mock('@ant-design/pro-components', async () => {
     ProTable: ({
       request,
       columns,
+      params,
     }: {
       request?: () => Promise<{ data?: FileEntry[] }>
       columns: Array<{ render?: (v: unknown, row: FileEntry) => React.ReactNode; key: string }>
+      params?: Record<string, unknown>
     }) => {
       const [rows, setRows] = ReactModule.useState<FileEntry[]>([])
-      const requested = ReactModule.useRef(false)
-      if (!requested.current) {
-        requested.current = true
+      // Re-run request when params change (like the real ProTable).
+      ReactModule.useEffect(() => {
         void request?.().then((r) => setRows(r.data ?? []))
-      }
+      }, [JSON.stringify(params)])
       return (
         <div data-testid="mock-pro-table">
           {rows.map((row) => (
@@ -115,5 +116,28 @@ describe('FilesPage (WR-4)', () => {
     renderPage()
     await waitFor(() => expect(listFilesMock).toHaveBeenCalled())
     expect(screen.queryByRole('button', { name: /批量打标/ })).not.toBeInTheDocument()
+  })
+
+  it('never sends the backend-unsupported filename param and filters client-side', async () => {
+    const files: FileEntry[] = [
+      { ...sampleFile, id: 'f1', filename: 'app.log' },
+      { ...sampleFile, id: 'f2', filename: 'data.parquet' },
+    ]
+    listFilesMock.mockResolvedValue({ items: files, total: 2, next_cursor: null, has_more: false })
+    renderPage()
+    expect(await screen.findByRole('button', { name: 'app.log' })).toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText('文件名搜索'), { target: { value: 'parquet' } })
+
+    // Client-side filter narrows the list to the matching file…
+    await waitFor(() => expect(screen.getByRole('button', { name: 'data.parquet' })).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: 'app.log' })).not.toBeInTheDocument()
+    // …and no request ever carried `filename`/`since`/`until` (would 400 server-side).
+    for (const call of listFilesMock.mock.calls) {
+      const p = (call[0] ?? {}) as Record<string, unknown>
+      expect(p).not.toHaveProperty('filename')
+      expect(p).not.toHaveProperty('since')
+      expect(p).not.toHaveProperty('until')
+    }
   })
 })

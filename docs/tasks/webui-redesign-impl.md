@@ -107,7 +107,9 @@
 - [x] **文件详情 480px 抽屉(3a)**：新增 `FileDetailDrawer`（SWR 取数 + `StatusBadge`/`TimeText` + 下载/复制链接），从列表文件名点击打开；**删** `/files/:id` 整页路由 + `Files/Detail.tsx`（原注「仅路由无实现」已过期——实为整页改抽屉）
 - [x] **7b 标签 UI 对齐**：状态列 `Tag`(FILE_STATUS_COLOR) → `StatusBadge domain=file`（删 `FILE_STATUS_COLOR`）；文件标签列 chip 中性化（值标签 vs 蓝色可关闭的「筛选」chip 区分）；**批量打标 `Modal` → `FormDrawer`**；空态 `EmptyState`；文件名 `<a onClick>` → `Button type=link`(a11y)。**未回退**标签功能（faceted 筛选/批量打标保留）
 - 类型树变体(4g，可选) **未做**：标注为可选，未纳入本片
-- 测试 `files-page.test.tsx`（列表 + 文件名开详情抽屉 + 非 super_admin 隐藏批量打标）
+- **修 filename/日期筛选 400（review 二轮）**：`GET /files` 只允许 status/tag 等，发 `filename`/`since`/`until` 会被 `RejectUnknownQuery` 打 400（预存 bug）。改为只发 status/tag 到服务端（结果按其缓存），filename/日期在已加载页内**客户端过滤**；服务端版进 `backlog.md`
+- **批量打标全量二次确认（review 一轮）**：无筛选=全量时 `submit` 先经 `useDangerConfirm`（定则 2）
+- 测试 `files-page.test.tsx`（列表 + 文件名开详情抽屉 + 非 super_admin 隐藏批量打标 + **不发 filename/since/until 且客户端过滤生效**）
 
 ### WR-5 — 事件规则 ✅（本 PR）
 - [x] 新建/编辑 → `RuleFormDrawer`（480px 抽屉，交互定则 1；删 `/events/create` 整页 + `Create.tsx`）；名称点击即开编辑
