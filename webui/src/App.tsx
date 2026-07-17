@@ -15,7 +15,6 @@ const AgentRulesPage = lazy(() => import('./pages/Agents/Rules'))
 const AgentRuleFormPage = lazy(() => import('./pages/Agents/RuleForm'))
 const AgentLogsPage = lazy(() => import('./pages/Agents/Logs'))
 const FilesPage = lazy(() => import('./pages/Files'))
-const FileDetailPage = lazy(() => import('./pages/Files/Detail'))
 const FileTypesPage = lazy(() => import('./pages/FileTypes'))
 const BucketsPage = lazy(() => import('./pages/Buckets'))
 const EventsPage = lazy(() => import('./pages/Events'))
@@ -76,9 +75,8 @@ function App() {
               <Route path="/agents/:id/rules/:rid/edit" element={<AgentRuleFormPage />} />
               <Route path="/agents/:id/logs" element={<AgentLogsPage />} />
 
-              {/* Files */}
+              {/* Files (detail is a drawer on the list, WR-4) */}
               <Route path="/files" element={<FilesPage />} />
-              <Route path="/files/:id" element={<FileDetailPage />} />
 
               {/* File types */}
               <Route path="/file-types" element={<FileTypesPage />} />

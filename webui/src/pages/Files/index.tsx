@@ -1,26 +1,20 @@
 import { useRef, useState } from 'react'
-import {
-  App,
-  Button,
-  DatePicker,
-  Input,
-  Modal,
-  Radio,
-  Select,
-  Space,
-  Tag,
-  Typography,
-} from 'antd'
-import { DownloadOutlined, SearchOutlined, TagsOutlined, PlusOutlined } from '@ant-design/icons'
+import { App, Button, DatePicker, Input, Radio, Select, Space, Tag, Typography } from 'antd'
+import { SearchOutlined, TagsOutlined, PlusOutlined } from '@ant-design/icons'
 import { ProTable } from '@ant-design/pro-components'
 import type { ProColumns, ActionType } from '@ant-design/pro-components'
-import { useNavigate } from 'react-router-dom'
 import useSWR from 'swr'
-import { listFiles, getFileDownloadUrl, batchTagFiles, FILE_STATUS_COLOR } from '../../services/files'
+import { listFiles, batchTagFiles } from '../../services/files'
 import type { FileEntry, BatchTagFilter, FileStatusFilter } from '../../services/files'
 import { listTagKeys, listTagValues } from '../../services/tags'
 import useAuthStore from '../../store/auth'
 import BatchDownload from '../../components/BatchDownload'
+import StatusBadge from '../../components/StatusBadge'
+import TimeText from '../../components/TimeText'
+import EmptyState from '../../components/EmptyState'
+import FormDrawer from '../../components/FormDrawer'
+import { useDangerConfirm } from '../../hooks/useDangerConfirm'
+import FileDetailDrawer from './FileDetailDrawer'
 import type { RangePickerProps } from 'antd/es/date-picker'
 
 const { Title, Text } = Typography
@@ -45,15 +39,20 @@ const STATUS_OPTIONS: { label: string; value: FileStatusFilter | '' }[] = [
 ]
 
 /**
- * File browser page (metadata 6c, screen 7b) — faceted filtering including tag
- * predicates, plus bulk tagging of the current tag/status selection.
+ * File browser page (WR-4 / metadata 6c screen 7b) — single-line filter bar with
+ * tag predicates, selection-driven batch download, file detail in a 480px drawer
+ * (3a), and super_admin bulk tagging in a drawer.
  */
 function FilesPage() {
-  const navigate = useNavigate()
   const actionRef = useRef<ActionType | undefined>(undefined)
+  // Server-side filters (status/tag) are cached by key so typing in the
+  // client-side filename filter / picking a date range doesn't refetch. The
+  // backend's GET /files only supports status/tag/agent/bucket/file_type (it 400s
+  // on unknown params), so filename/date are applied client-side over the loaded
+  // page. Server-side filename/date is a backlog follow-up.
+  const cacheRef = useRef<{ key: string; items: FileEntry[] } | null>(null)
   const user = useAuthStore((s) => s.user)
   const isSuperAdmin = user?.role === 'super_admin'
-  const { message } = App.useApp()
 
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
   const [filterStatus, setFilterStatus] = useState<FileStatusFilter | ''>('')
@@ -61,24 +60,10 @@ function FilesPage() {
   const [filterRange, setFilterRange] = useState<[string, string] | null>(null)
   const [filterTags, setFilterTags] = useState<string[]>([])
   const [batchOpen, setBatchOpen] = useState(false)
+  const [detailFileId, setDetailFileId] = useState<string | null>(null)
 
-  const handleDownloadSingle = async (file: FileEntry) => {
-    try {
-      const { url } = await getFileDownloadUrl(file.id)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = file.filename
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-    } catch {
-      message.error('获取下载链接失败')
-    }
-  }
-
-  // Only update state; the table re-requests via its `params` prop (which
-  // includes filterRange). A manual reload here would fire an extra request with
-  // the previous range read from the stale closure.
+  // Only update state; the table re-requests via its `params` prop. A manual
+  // reload would fire an extra request with the stale value from the closure.
   const handleRangeChange: RangePickerProps['onChange'] = (_, dateStrings) => {
     if (dateStrings[0] && dateStrings[1]) {
       setFilterRange([dateStrings[0], dateStrings[1]])
@@ -87,9 +72,6 @@ function FilesPage() {
     }
   }
 
-  // The table re-requests when the `params` prop (which includes filterTags)
-  // changes, so these only update state — a manual reload here would fire an
-  // extra request with the stale filter first.
   const addTagFilter = (kv: string) => {
     const key = kv.slice(0, kv.indexOf(':'))
     setFilterTags((prev) => {
@@ -109,7 +91,15 @@ function FilesPage() {
       dataIndex: 'filename',
       key: 'filename',
       ellipsis: true,
-      render: (_, file) => <a onClick={() => navigate(`/files/${file.id}`)}>{file.filename}</a>,
+      render: (_, file) => (
+        <Button
+          type="link"
+          style={{ padding: 0, height: 'auto' }}
+          onClick={() => setDetailFileId(file.id)}
+        >
+          {file.filename}
+        </Button>
+      ),
     },
     {
       title: '标签',
@@ -122,7 +112,7 @@ function FilesPage() {
         return (
           <Space size={[4, 4]} wrap>
             {keys.sort().map((k) => (
-              <Tag key={k} color="blue" style={{ margin: 0 }}>
+              <Tag key={k} style={{ margin: 0 }}>
                 {k}:{tags[k]}
               </Tag>
             ))}
@@ -143,26 +133,14 @@ function FilesPage() {
       dataIndex: 'status',
       key: 'status',
       width: 90,
-      render: (_, file) => (
-        <Tag color={FILE_STATUS_COLOR[file.status] ?? 'default'}>{file.status}</Tag>
-      ),
+      render: (_, file) => <StatusBadge status={file.status} domain="file" />,
     },
     {
       title: '上传时间',
       dataIndex: 'uploaded_at',
       key: 'uploaded_at',
-      width: 170,
-      render: (_, file) => new Date(file.uploaded_at).toLocaleString('zh-CN'),
-    },
-    {
-      title: '操作',
-      key: 'action',
-      width: 90,
-      render: (_, file) => (
-        <Button size="small" icon={<DownloadOutlined />} onClick={() => handleDownloadSingle(file)}>
-          下载
-        </Button>
-      ),
+      width: 150,
+      render: (_, file) => <TimeText value={file.uploaded_at} />,
     },
   ]
 
@@ -172,7 +150,7 @@ function FilesPage() {
         文件浏览器
       </Title>
 
-      {/* Filters */}
+      {/* Single-line filter bar (定则 3) */}
       <Space wrap style={{ marginBottom: 8 }}>
         <Input
           placeholder="文件名搜索"
@@ -191,8 +169,6 @@ function FilesPage() {
         />
         <RangePicker showTime={false} onChange={handleRangeChange} placeholder={['开始日期', '结束日期']} />
         <TagFacetPicker onAdd={addTagFilter} />
-        {/* rowKey is the string `id`; convert explicitly rather than casting. */}
-        <BatchDownload fileIds={selectedRowKeys.map(String)} />
         {isSuperAdmin && (
           <Button icon={<TagsOutlined />} onClick={() => setBatchOpen(true)}>
             批量打标
@@ -212,25 +188,65 @@ function FilesPage() {
         </Space>
       )}
 
+      {/* Selection toolbar (1d) — appears once rows are checked. */}
+      {selectedRowKeys.length > 0 && (
+        <Space style={{ marginBottom: 12 }}>
+          <Text type="secondary">已选 {selectedRowKeys.length} 项</Text>
+          <BatchDownload fileIds={selectedRowKeys.map(String)} />
+          <Button size="small" type="text" onClick={() => setSelectedRowKeys([])}>
+            清除选择
+          </Button>
+        </Space>
+      )}
+
       <ProTable<FileEntry>
         actionRef={actionRef}
         columns={columns}
         rowKey="id"
         search={false}
+        options={false}
         pagination={{ pageSize: 20 }}
         rowSelection={{ selectedRowKeys, onChange: (keys) => setSelectedRowKeys(keys) }}
+        locale={{ emptyText: <EmptyState description="没有匹配的文件" /> }}
         request={async () => {
           try {
-            const params: Record<string, unknown> = { limit: 100 }
-            if (filterStatus) params.status = filterStatus
-            if (filterFilename) params.filename = filterFilename
-            if (filterRange) {
-              params.since = filterRange[0]
-              params.until = filterRange[1]
+            // Only status/tag go to the server (the rest 400s). Cache the result
+            // keyed by those so client-side filename/date filtering is free.
+            // Sort the tag predicates so the key (and request) are order-stable —
+            // {A,B} and {B,A} are the same AND-filter and must hit the same cache.
+            const sortedTags = [...filterTags].sort()
+            const serverKey = JSON.stringify({ filterStatus, filterTags: sortedTags })
+            let items = cacheRef.current?.key === serverKey ? cacheRef.current.items : null
+            if (!items) {
+              const params: Record<string, unknown> = { limit: 100 }
+              if (filterStatus) params.status = filterStatus
+              if (sortedTags.length > 0) params.tag = sortedTags
+              const data = await listFiles(params as Parameters<typeof listFiles>[0])
+              items = data.items
+              cacheRef.current = { key: serverKey, items }
             }
-            if (filterTags.length > 0) params.tag = filterTags
-            const data = await listFiles(params as Parameters<typeof listFiles>[0])
-            return { data: data.items, success: true, total: data.total }
+            // Client-side filename substring + date-range (on uploaded_at date).
+            let rows = items
+            if (filterFilename) {
+              const q = filterFilename.toLowerCase()
+              rows = rows.filter((f) => f.filename.toLowerCase().includes(q))
+            }
+            if (filterRange) {
+              const [from, to] = filterRange
+              rows = rows.filter((f) => {
+                if (!f.uploaded_at) return false
+                // Compare by LOCAL calendar day (matching how TimeText renders the
+                // time) so files near midnight aren't filtered by a different UTC day.
+                const dt = new Date(f.uploaded_at)
+                if (Number.isNaN(dt.getTime())) return false // invalid date → exclude
+                const y = dt.getFullYear()
+                const m = String(dt.getMonth() + 1).padStart(2, '0')
+                const d = String(dt.getDate()).padStart(2, '0')
+                const local = `${y}-${m}-${d}`
+                return local >= from && local <= to
+              })
+            }
+            return { data: rows, success: true, total: rows.length }
           } catch {
             return { data: [], success: false, total: 0 }
           }
@@ -238,14 +254,17 @@ function FilesPage() {
         params={{ filterStatus, filterFilename, filterRange, filterTags }}
       />
 
+      <FileDetailDrawer fileId={detailFileId} onClose={() => setDetailFileId(null)} />
+
       {isSuperAdmin && (
-        <BatchTagModal
+        <BatchTagDrawer
           open={batchOpen}
           status={filterStatus}
           tags={filterTags}
           onClose={() => setBatchOpen(false)}
           onDone={() => {
             setBatchOpen(false)
+            cacheRef.current = null // tags changed → drop cached page
             actionRef.current?.reload()
           }}
         />
@@ -304,12 +323,12 @@ function TagFacetPicker({ onAdd }: { onAdd: (kv: string) => void }) {
 }
 
 /**
- * Bulk-tag modal. Applies a single set/clear operation to every file matching the
+ * Bulk-tag drawer. Applies a single set/clear operation to every file matching the
  * current status + tag predicate (the subset of filters the batch-tag API
  * supports — filename/date are intentionally not part of the selection). It shows
  * the matched-file count so the operator knows the blast radius before applying.
  */
-function BatchTagModal({
+function BatchTagDrawer({
   open,
   status,
   tags,
@@ -323,28 +342,30 @@ function BatchTagModal({
   onDone: () => void
 }) {
   const { message } = App.useApp()
+  const dangerConfirm = useDangerConfirm()
   const { data: keys = [] } = useSWR('tag-keys', listTagKeys)
   const [key, setKey] = useState<string | undefined>()
   const [mode, setMode] = useState<'set' | 'clear'>('set')
   const [value, setValue] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
+  // Order-stable tag predicates: sorting keeps the SWR key and request identical
+  // regardless of insertion order, and spreading the array (vs join) avoids key
+  // collisions when a tag value contains the separator.
+  const sortedTags = [...tags].sort()
+
   // Preview the blast radius: count files matching the same predicate.
-  const { data: preview } = useSWR(open ? ['batch-count', status, tags.join(',')] : null, () =>
-    listFiles({ status: status || undefined, tag: tags.length ? tags : undefined, limit: 1 }),
+  const { data: preview } = useSWR(open ? ['batch-count', status, ...sortedTags] : null, () =>
+    listFiles({ status: status || undefined, tag: sortedTags.length ? sortedTags : undefined, limit: 1 }),
   )
 
-  const submit = async () => {
-    if (submitting || !key) return
-    if (mode === 'set' && !value.trim()) {
-      message.error('请填写要设置的取值')
-      return
-    }
+  const apply = async () => {
+    if (!key) return
     setSubmitting(true)
     try {
       const filter: BatchTagFilter = {}
       if (status) filter.status = status
-      if (tags.length) filter.tags = tags
+      if (sortedTags.length) filter.tags = sortedTags
       await batchTagFiles(filter, { [key]: mode === 'set' ? value.trim() : null })
       message.success('已提交批量打标任务，将在后台执行')
       onDone()
@@ -356,14 +377,38 @@ function BatchTagModal({
     }
   }
 
+  const submit = () => {
+    if (submitting) return
+    if (!key) {
+      message.error('请选择标签键')
+      return
+    }
+    if (mode === 'set' && !value.trim()) {
+      message.error('请填写要设置的取值')
+      return
+    }
+    // No filter = 全量变更: require an explicit danger confirm before applying,
+    // since it retags every file via an async worker and can't be undone per-file.
+    if (!status && tags.length === 0) {
+      dangerConfirm({
+        title: '对全部文件应用标签？',
+        content: '未添加任何筛选，本次打标将作用于全部文件，由后台任务执行且无法逐一撤销。',
+        okText: '仍然应用',
+        onOk: apply,
+      })
+      return
+    }
+    void apply()
+  }
+
   return (
-    <Modal
+    <FormDrawer
       open={open}
       title="批量打标"
-      okText="应用"
-      okButtonProps={{ disabled: !key, loading: submitting }}
-      onOk={submit}
-      onCancel={onClose}
+      onClose={onClose}
+      onSubmit={submit}
+      loading={submitting}
+      submitText="应用"
     >
       <Text type="secondary">
         将对<Text strong>匹配当前状态与标签筛选</Text>的全部文件应用标签
@@ -404,7 +449,7 @@ function BatchTagModal({
           />
         )}
       </Space>
-    </Modal>
+    </FormDrawer>
   )
 }
 

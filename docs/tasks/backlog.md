@@ -97,3 +97,35 @@ WR 禁改后端，故从 WR-2 拆出。
 
 **优先级**：⚪ 低。D-025 已把 `file_types` 降级为**兜底粗分类**，变种维度走标签；兜底 glob 规则很少变、可迁移/种子管理，
 UI 现价值低。触发信号：出现「需在 UI 配/调兜底 glob 规则」的真实需求。
+
+---
+
+## 文件列表 filename / 日期范围 服务端过滤（后端 + 前端）
+
+**来源**：WR-4 落地（2026-07-17）发现——文件页一直提供「文件名搜索」+「日期范围」筛选控件，但 `GET /api/v1/files`
+的 `RejectUnknownQuery` 允许清单只有 `cursor/limit/agent_id/bucket_id/file_type_id/status/tag`（`files.go:132`），
+发 `filename`/`since`/`until` 会 **400**（预存 bug，非 WR-4 引入）。WR-4 已改为**不发这些参数、在已加载页（limit 100，
+status/tag 服务端预筛后）内客户端过滤**，止血且不 400。
+
+**内容**（需在大数据量下跨 100 条精确搜索时再做）：
+- CP：`files.go` List 允许清单加 `filename`/`since`/`until`；`ListFileEntriesParams`/`CountFileEntriesFilter` 加字段；
+  list+count SQL 加 `filename ILIKE` + `created_at`（或 `uploaded_at`）范围（参考 D-028 status 过滤同款做法）。
+- webui：`Files/index.tsx` request 改回把 filename/date 交服务端，去掉客户端缓存过滤。
+
+**优先级**：⚪ 低（当前列表 limit 100 + 客户端分页，客户端过滤与 UI 展示范围一致；无真实大数据集）。触发信号：单类目文件 > 100
+且需按名/日期精确检索。
+
+---
+
+## 抽取 + 加固共享 formatBytes（跨页去重）
+
+**来源**：WR-4 评审（2026-07-17）第七轮——`formatBytes` 在 ~6 个页面（Dashboard / Logs / Files/index /
+FileDetailDrawer / Agents/Detail / Agents/Logs）各自复制；单位表 `['B','KB','MB','GB','TB']` 只到 TB，
+理论上 ≥1PB 会输出 `X undefined`，且未防非有限/负输入。
+
+**现状判断**：`size`/`bytes_transferred` 均为后端非负有限 int64，边缘采集单文件 ≥1PB 不现实，故当前无实际影响。
+
+**内容**（若做 UI 一致性清理时）：抽 `src/utils/formatBytes.ts`（clamp 单位下标到最后一档 + 非有限/负值回退 `-`），
+6 处改为引用，去掉重复定义。
+
+**优先级**：⚪ 低（纯健壮性/去重，无真实触发场景）。
