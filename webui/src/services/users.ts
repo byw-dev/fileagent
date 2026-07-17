@@ -44,7 +44,19 @@ export async function updateUser(
 }
 
 /**
- * Delete a user (super_admin only).
+ * Enable or disable a user (super_admin only). Soft alternative to delete
+ * (5b「禁用而非删除」) — the caller cannot disable their own account.
+ */
+export async function setUserActive(id: string, isActive: boolean): Promise<ManagedUser> {
+  const response = await apiClient.put<ManagedUser>(`/api/v1/users/${id}/active`, {
+    is_active: isActive,
+  })
+  return response.data
+}
+
+/**
+ * Delete a user (super_admin only). Retained for completeness; the UI prefers
+ * {@link setUserActive} (禁用而非删除).
  */
 export async function deleteUser(id: string): Promise<void> {
   await apiClient.delete(`/api/v1/users/${id}`)

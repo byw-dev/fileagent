@@ -21,6 +21,7 @@ type UsersDB interface {
 	GetUserByID(ctx context.Context, id uuid.UUID) (*db.User, error)
 	CreateUser(ctx context.Context, arg db.CreateUserParams) (*db.User, error)
 	UpdateUser(ctx context.Context, iD uuid.UUID, username string, email sql.NullString, role db.UserRole) (*db.User, error)
+	UpdateUserActive(ctx context.Context, iD uuid.UUID, isActive bool) error
 	DeleteUser(ctx context.Context, id uuid.UUID) error
 	UpdateUserPassword(ctx context.Context, iD uuid.UUID, passwordHash string) error
 }
@@ -212,6 +213,59 @@ func (h *UsersHandler) Delete(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// setActiveRequest is the body expected by PUT /api/v1/users/:id/active. The
+// pointer makes `binding:"required"` reject a missing field while still allowing
+// the explicit value `false` (disable).
+type setActiveRequest struct {
+	IsActive *bool `json:"is_active" binding:"required"`
+}
+
+// SetActive handles PUT /api/v1/users/:id/active — soft-disable or re-enable a
+// user instead of hard-deleting them (5b「禁用而非删除」). super_admin only (route
+// group); a user cannot disable their own account.
+func (h *UsersHandler) SetActive(c *gin.Context) {
+	if h.db == nil {
+		middleware.NotImplemented(c)
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid user id", nil)
+		return
+	}
+
+	var req setActiveRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), nil)
+		return
+	}
+
+	if !*req.IsActive && callerIDFromClaims(c) == id {
+		middleware.RespondError(c, http.StatusBadRequest, "CANNOT_DISABLE_SELF", "cannot disable your own account", nil)
+		return
+	}
+
+	if err := h.db.UpdateUserActive(c.Request.Context(), id, *req.IsActive); err != nil {
+		h.logger.Error("set user active", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to update user", nil)
+		return
+	}
+
+	// UpdateUserActive is an :exec (no not-found signal); read back to detect a
+	// missing user and return the refreshed row.
+	user, err := h.db.GetUserByID(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "user not found", nil)
+			return
+		}
+		h.logger.Error("get user after set active", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to load user", nil)
+		return
+	}
+	c.JSON(http.StatusOK, toUserResponse(user))
 }
 
 // updatePasswordRequest is the body expected by PUT /api/v1/users/:id/password.

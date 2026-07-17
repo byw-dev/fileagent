@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { App, Button, Modal, Select, Space, Tag, Typography } from 'antd'
+import { App, Button, Select, Space, Tag, Typography } from 'antd'
 import { ProTable } from '@ant-design/pro-components'
 import type { ProColumns, ActionType } from '@ant-design/pro-components'
 import useSWR from 'swr'
@@ -12,6 +12,10 @@ import {
 } from '../../services/pending-tags'
 import type { PendingTagValue } from '../../services/pending-tags'
 import { listTagValues } from '../../services/tags'
+import FormDrawer from '../../components/FormDrawer'
+import TimeText from '../../components/TimeText'
+import EmptyState from '../../components/EmptyState'
+import { useDangerConfirm } from '../../hooks/useDangerConfirm'
 
 const { Title, Text } = Typography
 
@@ -29,7 +33,8 @@ const sourceLabels: Record<string, string> = {
 function PendingTagsPage() {
   const user = useAuthStore((s) => s.user)
   const isSuperAdmin = user?.role === 'super_admin'
-  const { modal, message } = App.useApp()
+  const { message } = App.useApp()
+  const dangerConfirm = useDangerConfirm()
   const actionRef = useRef<ActionType | undefined>(undefined)
   const [mergeRow, setMergeRow] = useState<PendingTagValue | null>(null)
 
@@ -46,10 +51,10 @@ function PendingTagsPage() {
   }
 
   const reject = (row: PendingTagValue) => {
-    modal.confirm({
+    dangerConfirm({
       title: `拒绝取值：${row.extracted_value}`,
-      content: '拒绝后该取值移出队列且不入词表，已打标文件保留原值。确认拒绝？',
-      okType: 'danger',
+      content: '拒绝后该取值移出队列且不入词表，已打标文件保留原值。',
+      okText: '拒绝',
       onOk: async () => {
         try {
           await rejectPendingTagValue(row.id)
@@ -84,8 +89,8 @@ function PendingTagsPage() {
       title: '首次出现',
       dataIndex: 'first_seen_at',
       key: 'first_seen_at',
-      width: 170,
-      render: (_, r) => new Date(r.first_seen_at).toLocaleString('zh-CN'),
+      width: 150,
+      render: (_, r) => <TimeText value={r.first_seen_at} />,
     },
     {
       title: '操作',
@@ -126,6 +131,7 @@ function PendingTagsPage() {
         search={false}
         pagination={false}
         options={false}
+        locale={{ emptyText: <EmptyState description="没有待确认的取值" /> }}
         request={async () => {
           try {
             const data = await listPendingTagValues()
@@ -137,7 +143,7 @@ function PendingTagsPage() {
       />
 
       {mergeRow && (
-        <MergeModal
+        <MergeDrawer
           key={mergeRow.id}
           row={mergeRow}
           onClose={() => setMergeRow(null)}
@@ -152,11 +158,11 @@ function PendingTagsPage() {
 }
 
 /**
- * Modal to merge a pending value into an existing canonical value of its key.
+ * Drawer to merge a pending value into an existing canonical value of its key.
  * The target must be a registered value (the API enforces this), so it is chosen
  * from a Select of the key's vocabulary, defaulting to the suggested value.
  */
-function MergeModal({
+function MergeDrawer({
   row,
   onClose,
   onDone,
@@ -173,7 +179,11 @@ function MergeModal({
   const [submitting, setSubmitting] = useState(false)
 
   const submit = async () => {
-    if (!into || submitting) return
+    if (submitting) return
+    if (!into) {
+      message.error('请选择目标取值')
+      return
+    }
     setSubmitting(true)
     try {
       await mergePendingTagValue(row.id, into)
@@ -193,13 +203,13 @@ function MergeModal({
     .map((v) => ({ label: v.value, value: v.value }))
 
   return (
-    <Modal
+    <FormDrawer
       open
       title={`并入取值：${row.extracted_value}`}
-      okText="并入"
-      okButtonProps={{ disabled: !into, loading: submitting }}
-      onOk={submit}
-      onCancel={onClose}
+      submitText="并入"
+      loading={submitting}
+      onSubmit={submit}
+      onClose={onClose}
     >
       <Text type="secondary">
         将键 <Text code>{row.key}</Text> 的「{row.extracted_value}」并入下列已登记取值；已打标文件将回溯改写。
@@ -214,7 +224,7 @@ function MergeModal({
         showSearch
         optionFilterProp="label"
       />
-    </Modal>
+    </FormDrawer>
   )
 }
 

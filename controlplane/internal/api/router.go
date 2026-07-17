@@ -109,6 +109,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 		users.GET("", superAdmin, usersH.List)
 		users.POST("", superAdmin, usersH.Create)
 		users.PUT("/:id", superAdmin, usersH.Update)
+		users.PUT("/:id/active", superAdmin, usersH.SetActive)
 		users.DELETE("/:id", superAdmin, usersH.Delete)
 		users.PUT("/:id/password", usersH.UpdatePassword)
 	}
