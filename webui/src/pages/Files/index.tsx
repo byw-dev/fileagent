@@ -238,6 +238,7 @@ function FilesPage() {
                 // Compare by LOCAL calendar day (matching how TimeText renders the
                 // time) so files near midnight aren't filtered by a different UTC day.
                 const dt = new Date(f.uploaded_at)
+                if (Number.isNaN(dt.getTime())) return false // invalid date → exclude
                 const y = dt.getFullYear()
                 const m = String(dt.getMonth() + 1).padStart(2, '0')
                 const d = String(dt.getDate()).padStart(2, '0')
