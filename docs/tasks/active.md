@@ -59,7 +59,7 @@
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
 > bucket policy 对本系统冗余（MinIO 默认私有，访问全走 STS/presigned IAM）。待有 staging workflow 再做。
 
-> 每项任务独立 PR + Copilot review，改完真跑 e2e 再算完成。
+> 每项任务独立 PR + code review（Copilot 已不可用，改由其他渠道 review），改完真跑 e2e 再算完成。
 
 ---
 

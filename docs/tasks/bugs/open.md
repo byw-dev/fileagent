@@ -7,7 +7,7 @@
 
 ## 总览
 
-**DP 系列（数据面写入链路，2026-09-08 审计发现）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -69,12 +69,12 @@
 
 | 字段 | 内容 |
 |------|------|
-| **根因** | `BuildSessionPolicy` 的 Action 列表为 `PutObject / GetObject / DeleteObject / ListBucket`，缺 `s3:AbortMultipartUpload` 与 `s3:ListMultipartUploadParts` |
-| **精确位置** | `controlplane/internal/storage/policy.go:51-55` |
-| **文档冲突** | `system-design.md` §6.3 的 policy 明确要求包含这两个 Action，且**不包含** `s3:DeleteObject` |
-| **后果** | >64MB 文件走 multipart：`verifyRemoteParts` 的 ListParts 会 403（续传路径不可用，与 IC-BUG-5 叠加）；失败后无法 Abort，孤儿分片无法清理。另外多授的 `DeleteObject` 让被入侵的 Agent 可删除已归档数据，与最小权限原则不符 |
-| **修复** | Action 改为 `PutObject / GetObject / ListBucket / AbortMultipartUpload / ListMultipartUploadParts`；移除 `DeleteObject`（若某处确需删除，单独签发或走 CP） |
-| **验收** | 上传一个 >64MB 文件成功；中断后重试能走续传；`mc ls --incomplete` 无残留 |
+| **根因** | 两个同源问题：① Action 列表为 `PutObject / GetObject / DeleteObject / ListBucket`，缺 `s3:AbortMultipartUpload` 与 `s3:ListMultipartUploadParts`；② **Action 层级与 Resource ARN 层级不匹配**——所有 Resource 都构造成对象级 ARN（`arn:aws:s3:::{bucket}/{prefix}/*`），却把桶级 action `s3:ListBucket` 塞进同一个 statement，该条授权从来就是空转的 |
+| **精确位置** | `controlplane/internal/storage/policy.go:30-39`（Resource 全为对象级 ARN）、`:51-55`（Action 列表） |
+| **文档冲突** | `system-design.md` §6.3 的 policy 明确要求包含 multipart 两个 Action，且**不包含** `s3:DeleteObject` |
+| **后果** | >64MB 文件走 multipart：`verifyRemoteParts` 的 ListParts 会 403（续传路径不可用，与 IC-BUG-5 叠加）；失败后无法 Abort，孤儿分片无法清理。IC-BUG-5 验收要用的 `mc ls --incomplete` 需要 `s3:ListBucketMultipartUploads`，同为桶级 action，当前既没列出、列出了也会因 ARN 层级不匹配而空转。另外多授的 `DeleteObject` 让被入侵的 Agent 可删除已归档数据，与最小权限原则不符 |
+| **修复** | 拆成两个 statement：**桶级** `s3:ListBucket` / `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`），需收窄时加 `s3:prefix` condition；**对象级** `s3:PutObject` / `s3:GetObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/{prefix}/*`。移除 `DeleteObject`（若某处确需删除，单独签发或走 CP） |
+| **验收** | 上传一个 >64MB 文件成功；中断后重试能走续传；`mc ls --incomplete` 可执行（不 403）且无残留；用签发的 STS 对桶做 `ListBucket` 能返回前缀内对象、前缀外须 403 |
 
 ## IC-BUG-5 — 断点续传状态从未落盘，重试永远从头重传 🟠 P1
 
@@ -175,7 +175,7 @@
 
 | 字段 | 内容 |
 |------|------|
-| **根因** | 统计端点对 `file_entries` 做无条件 `COUNT(*)` 与 `SUM(size_bytes)`；文件列表按 D-007 还要每次返回 `total` |
+| **根因** | 统计端点对 `file_entries` 做 `COUNT(*)` 与 `SUM(size_bytes)`——三条查询均带 `WHERE org_id = $1`，但第一版单组织下该条件不筛掉任何行，**实际等同全表扫描**（多租户落地后仍需索引/物化，不是加个 `org_id` 条件就修好了）；文件列表按 D-007 还要每次返回 `total` |
 | **精确位置** | `controlplane/internal/db/read_queries.go:514,517,522` |
 | **后果** | 百万行尚可，按 §6.7 推算的量级（高频小文件 50 台 ≈ 2600 万对象/年，3–5 年上亿）会成为主要的 DB 负载来源 |
 | **修复** | 见 D-030 地基阶段（IC-7）：增量维护的计数表，或 `pg_class.reltuples` 估算 + 明确标注为估算值。改动 `total` 契约需新开决策记录（D-007 关联） |

@@ -51,7 +51,8 @@
 
 | ID | 模块 | 内容 | 验收要点 | 状态 |
 |----|------|------|----------|------|
-| **IC-0** | docs | **编号统一 + track 切换标记**。① 本文与 `bugs/open.md`、`DECISIONS.md`、`consistency-and-ingest.md`、`system-design.md`、`active.md` 中的 `CI-x`→`IC-x`、`DP-x`→`IC-BUG-x`、`S0…S4`→描述性阶段名；② 本文补「命名约定」小节；③ `active.md` 与 `webui-redesign-impl.md` 标记 WR 暂停、IC 接替为主线 | 全仓库 `grep -E '\b(CI|DP)-[0-9]+'` 无命中；所有 markdown 链接可解析 | ⬜ |
+| **IC-0** | docs | **编号统一 + track 切换标记**。① 本文与 `bugs/open.md`、`DECISIONS.md`、`consistency-and-ingest.md`、`system-design.md`、`active.md` 中的 `CI-x`→`IC-x`、`DP-x`→`IC-BUG-x`、`S0…S4`→描述性阶段名；② 本文补「命名约定」小节；③ `active.md`、`TASK_LIST.md` 与 `webui-redesign-impl.md` 标记 WR 暂停、IC 接替为主线（`TASK_LIST.md` 导航表补 `consistency-ingest.md` 条目） | 全仓库 `grep -rEn '\b(CI\|DP)-[0-9]+\|\b(CI\|DP)\s*系列' --include='*.md'` 无命中
+（正则同时覆盖「前缀 + 空格 + 系列」这类无数字形态；不放宽成 `[- ]`，否则会误伤大量合法的 Continuous Integration 提及）；所有 markdown 链接可解析 | ✅ PR #91 |
 
 > 单独成一刀：纯文本替换、零代码风险，且后续每个 PR 的描述都会引用这些编号，越早统一越少返工。
 
@@ -114,7 +115,8 @@
 
 ## 执行纪律
 
-- 每个 CI-x **独立分支 off master + PR + Copilot review + 人工合并**（沿用 CC / MT 冲刺惯例）。
+- 每个 IC-x **独立分支 off master + PR + code review + 人工合并**（沿用 CC / MT 冲刺惯例；
+  Copilot 已不可用，review 改由其他渠道进行）。
 - **改完真跑 live-e2e 再算完成。** 本 track 的存在本身就是「空心功能通过 mock 单测」的后果——
   IC-BUG-1…IC-BUG-4 长期不可见，正因为单测把 STS 与 gRPC 全 mock 了。
 - 契约改动先记 `DECISIONS.md`：`proto` 只增字段不改编号；迁移只追加；cursor 分页不得改 offset。

@@ -29,7 +29,7 @@
 | 路径 | 入口 | 设计意图 | 实际 |
 |---|---|---|---|
 | ① Agent gRPC `UploadResult` → `indexer.HandleUploadResult` | `grpcserver/handler.go:247` | **主路径** | **死代码**（IC-BUG-1 + IC-BUG-2） |
-| ② MinIO webhook → `indexer.IndexUpload` / `IndexDeletion` | `api/handler/events.go:766` | 「只做对账兜底」（D-025 补充 §3） | **唯一活着的写入者** |
+| ② MinIO webhook → `indexer.IndexUpload` / `IndexDeletion` | `api/handler/events.go:770` | 「只做对账兜底」（D-025 补充 §3） | **唯一活着的写入者** |
 
 补充事实：
 
@@ -176,7 +176,9 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 
 - 幂等键完整保留在不分区的窄表上
 - `file_entries` 可按时间分区 → 列表/cursor 分页最优，老数据可归档冷存
-- **对账只扫 `object_keys`，完全不碰宽表**——三列表在 1e8 行约 10GB 量级
+- **对账只扫 `object_keys`，完全不碰宽表**——该窄表只有 5 列（`bucket_id / storage_path / file_entry_id / last_modified / observed_at`），
+  行宽远小于 `file_entries`；但 `storage_path` 是变长 TEXT，主键 btree 的体积高度依赖真实 key 长度，
+  **具体容量与「索引能否常驻内存」须随 §6-B 一并实测估算，不要直接引用某个拍脑袋的数字**
 - `object_keys` 在角色上等同于 minio-inventory 项目的 `minio_objects`
 
 **排序键**：`file_entries` 与 `object_keys` 均增加 `observed_at`；
@@ -259,7 +261,7 @@ CP 已持有一个 root 权限的 MinIO client（`cmd/server/main.go:206`），�
 | # | 问题 | 状态 |
 |---|---|---|
 | A | `storage_path` 的前缀约定：强制模板前缀 vs 按模板静态前缀动态生成 policy | 倾向后者（见 3.2），须在准入阶段（IC-8）前定死并写入 `contracts.md` |
-| B | `file_entries` 分区粒度（月 / 周）与归档策略 | 地基阶段（IC-6）前需按真实增速估算 |
+| B | `file_entries` 分区粒度（月 / 周）与归档策略；**同时估算 `object_keys` 主键索引体积**（按真实 `storage_path` 长度算，决定索引能否常驻内存） | 地基阶段（IC-6）前需按真实增速估算 |
 | C | 文件列表 `total` 的去 `COUNT(*)` 方案（增量计数表 vs `reltuples` 估算） | 改动 D-007 契约，需单独决策记录 |
 | D | ETL 是否允许就地覆盖同一 key（决定是否需要对象版本） | 待产品确认 |
 | E | SDK 侧 outbox 的最小实现形态（进程内重试 vs 本地持久化） | 准入阶段（IC-10）时定 |

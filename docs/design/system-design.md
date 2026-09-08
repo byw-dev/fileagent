@@ -172,6 +172,10 @@ v1.0  第一版共十章
 │  │  PostgreSQL  │ Redis │ NATS       │◄── 仅 Control Plane 读写 │
 │  │  主数据库    │ 缓存  │ 事件总线   │                          │
 │  └───────────────────────────────────┘                          │
+│                                                                 │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │        Prometheus + Grafana + Loki + Alertmanager         │  │
+│  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -179,7 +183,7 @@ v1.0  第一版共十章
 > **HTTP webhook** 直接投递给 Control Plane（`POST /internal/minio-event`，见 §6.5），
 > **不经过 NATS**。NATS 在本系统中只承担 Control Plane 内部的事件发布与规则引擎消费。
 > 本文早期版本的架构图与 §2.1 曾描述为「MinIO → NATS」，与 §6.5 的配置自相矛盾且从未实现——
-> 已按实际链路更正。目标形态是改用 `notify_nats` + JetStream，见 **D-031**（排期 D-030 的 S3）。
+> 已按实际链路更正。目标形态是改用 `notify_nats` + JetStream，见 **D-031**（排期在对账阶段 IC-11）。
 
 ---
 
@@ -1761,7 +1765,7 @@ MINIO_VOLUMES="https://minio{1...4}.internal:9000/data{1...4} \
 > [`consistency-and-ingest.md`](./consistency-and-ingest.md) §1.3。
 >
 > 📌 **目标形态（D-031）**：本节的 `notify_webhook` 将改为 `notify_nats` + JetStream，
-> 以获得「投递与处理解耦 / 可重放 / 全局单调序号（供排序键与链路自证）」三项能力，排期在 D-030 的 S3。
+> 以获得「投递与处理解耦 / 可重放 / 全局单调序号（供排序键与链路自证）」三项能力，排期在对账阶段（IC-11）。
 > 切换后 D-014 的共享密钥鉴权由 NATS creds/nkey/TLS 取代。
 
 ```bash

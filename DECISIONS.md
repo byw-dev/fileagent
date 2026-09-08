@@ -1426,8 +1426,8 @@ D-014 只讨论「webhook 端点如何鉴权」，把 webhook 视作既成事实
    更关键的是支持**链路自证**——比较 stream 的 `first_seq` 与 consumer 的 `ack_floor`，即可判断是否有消息
    因 retention 过期而从未被消费，进而定位「哪些分片的核实结论已不可信」。这是 webhook 架构下无法回答的问题。
 
-基础设施已就绪：dev 与 prod 的 NATS 均已启用 JetStream（`docker-compose.dev.yml:61`、
-`docker-compose.prod.yml:52` 的 `-js`），但 CP 代码一直只用 core NATS（`conn.Publish` / `conn.Subscribe`），
+基础设施已就绪：dev 与 prod 的 NATS 均已启用 JetStream（`docker-compose.dev.yml:62`、
+`docker-compose.prod.yml:53` 的 `-js`），但 CP 代码一直只用 core NATS（`conn.Publish` / `conn.Subscribe`），
 JetStream 处于闲置状态。
 
 ### 明确不解决的（避免误判收益）
