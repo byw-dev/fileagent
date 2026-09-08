@@ -149,27 +149,28 @@ v1.0  第一版共十章
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      私有化部署边界                              │
+│                      私有化部署边界                             │
 │                                                                 │
-│  ┌──────────────┐   HTTPS    ┌──────────────────────────────┐  │
-│  │   Web UI     │──────────►│       Control Plane (Go)      │  │
+│  ┌──────────────┐   HTTPS    ┌──────────────────────────────┐   │
+│  │   Web UI     │──────────►│       Control Plane (Go)      │   │
 │  │ React/AntD   │           │  - Agent 注册审批 & 连接管理   │  │
 │  └──────────────┘           │  - 任务调度 & 指令下发         │  │
 │                             │  - 文件索引 & 查询 API         │  │
 │  ┌──────────────┐   HTTPS   │  - 事件规则引擎                │  │
 │  │ Client SDK   │──────────►│  - STS 凭据管理 & 轮转         │  │
-│  │ Python/Java  │           └───────┬──────────┬─────────────┘  │
-│  └──────────────┘                   │          │                │
-│                            gRPC/TLS │          │ Admin API      │
-│  ┌──────────────┐                   │          │                │
-│  │  Edge Agent  │◄──────────────────┘   ┌──────▼──────┐        │
-│  │  (Go 单二进制)│                        │    MinIO    │        │
-│  │  Win/Linux   │  S3 API/TLS(直传)      │  对象存储   │        │
-│  └──────────────┘──────────────────────►│  MNMD集群   │        │
-│                                          └──────┬──────┘        │
-│  ┌───────────────────────────────────┐          │ 事件通知       │
-│  │  PostgreSQL  │ Redis │ NATS       │◄─────────┘               │
-│  │  主数据库    │ 缓存  │ 事件总线   │                           │
+│  │ Python/Java  │           └──┬────────┬──────────────▲────┘   │
+│  └──────────────┘              │        │              │        │
+│                       gRPC/TLS │        │ Admin API    │ 事件   │
+│  ┌──────────────┐              │        │              │ 通知   │
+│  │  Edge Agent  │◄─────────────┘   ┌────▼────────┐     │        │
+│  │  (Go 单二进制)│                  │    MinIO    │─────┘       │
+│  │  Win/Linux   │  S3 API/TLS(直传) │  对象存储   │             │
+│  └──────────────┘─────────────────►│  MNMD 集群  │              │
+│                                    └─────────────┘              │
+│                                                                 │
+│  ┌───────────────────────────────────┐                          │
+│  │  PostgreSQL  │ Redis │ NATS       │◄── 仅 Control Plane 读写 │
+│  │  主数据库    │ 缓存  │ 事件总线   │                          │
 │  └───────────────────────────────────┘                          │
 │                                                                 │
 │  ┌───────────────────────────────────────────────────────────┐  │
@@ -177,6 +178,12 @@ v1.0  第一版共十章
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+> **对象事件通路（现状 / 目标）**：MinIO 的 `ObjectCreated` / `ObjectRemoved` 事件经
+> **HTTP webhook** 直接投递给 Control Plane（`POST /internal/minio-event`，见 §6.5），
+> **不经过 NATS**。NATS 在本系统中只承担 Control Plane 内部的事件发布与规则引擎消费。
+> 本文早期版本的架构图与 §2.1 曾描述为「MinIO → NATS」，与 §6.5 的配置自相矛盾且从未实现——
+> 已按实际链路更正。目标形态是改用 `notify_nats` + JetStream，见 **D-031**（排期在对账阶段 IC-11）。
 
 ---
 
@@ -188,10 +195,10 @@ v1.0  第一版共十章
 |-------------------|------------------|-------------------------------------------------|
 | **Control Plane** | Go (Gin)         | 核心业务逻辑：Agent 管理、任务调度、文件索引、API、事件引擎              |
 | **Edge Agent**    | Go (单二进制)        | 文件采集、上传、本地任务队列、与 Control Plane 长连接              |
-| **MinIO**         | MinIO MNMD       | 对象存储：Bucket 管理、ACL、STS、事件通知                     |
+| **MinIO**         | MinIO MNMD       | 对象存储：Bucket 管理、ACL、STS、事件通知（→ CP webhook，D-031 后改投 JetStream） |
 | **PostgreSQL**    | v15+             | 持久化：采集器、用户、文件索引、上传日志、事件规则                       |
 | **Redis**         | v7+              | Token 缓存、限流、短期状态、任务锁                            |
-| **NATS**          | v2.x JetStream   | 事件总线：MinIO 事件消费、Webhook 分发、内部异步通信               |
+| **NATS**          | v2.x（已开 JetStream） | 事件总线：Control Plane 内部事件发布 + 规则引擎消费、Webhook 分发。**不接收 MinIO 事件**（现状为 HTTP webhook，见 §6.5；目标改 `notify_nats`+JetStream，见 D-031）。当前代码仅用 core NATS |
 | **Nginx/Caddy**   | Caddy v2         | TLS 终止、反向代理、自动证书（公网 Let's Encrypt / 内网 ACME CA） |
 | **Web UI**        | React + AntD Pro | 管理后台、文件浏览器、事件规则配置                               |
 | **Prometheus**    | + Alertmanager   | 指标采集与告警                                         |
@@ -958,6 +965,12 @@ Scheduled 模式执行流程：
 
 ## 4.5 文件上传流程
 
+> ⚠️ **实现状态（2026-09-08 审计，D-030）**：本节描述的**主路径尚未实现**。Agent 从不上报 `UploadResult`
+> （`agent/cmd/agent/main.go:142` 丢弃结果，IC-BUG-2），断点续传状态也从未落盘（`upload_tasks` 的三条 UPDATE
+> 均不含 `upload_id`/`completed_parts`，IC-BUG-5）。当前 `file_entries` 的唯一写入者是 §6.5 的 MinIO webhook。
+> 目标写入协议见 [`consistency-and-ingest.md`](./consistency-and-ingest.md) §3.3；缺陷见
+> [`bugs/open.md`](../tasks/bugs/open.md) IC-BUG-2 / IC-BUG-5。
+
 ```
 上传决策流程：
   file_size ≤ 64MB ?
@@ -1042,6 +1055,11 @@ CREATE INDEX idx_processed_files_rule ON processed_files (rule_id, local_path);
   若只驱逐 pending 则断网久了队列仍会无限增长。
 
 ## 4.7 凭据管理与轮转
+
+> ⚠️ **实现状态（D-030）**：STS 链路当前是断的（IC-BUG-1）——Control Plane 从不推送
+> `ServerMessage_Credentials`，而 Agent 的刷新 goroutine 因 `sts == nil` 短路从不发起 RPC，
+> 发起也会因缺 `rule_id` 被拒。后果是 Agent 永远拿不到上传凭据。见
+> [`bugs/open.md`](../tasks/bugs/open.md) IC-BUG-1。
 
 ```
 Auth Token（JWT）管理：
@@ -1354,6 +1372,12 @@ defer redis.Del(lockKey)
 
 ## 5.7 STS 凭据管理与轮转
 
+> ⚠️ **实现偏差（D-030）**：实现签发的资源前缀是 `agents/{agent_id}/*`，而实际 `storage_path` 完全由规则的
+> `dest_path_template` 决定，二者不匹配（IC-BUG-3）；Action 列表缺 §6.3 要求的 `s3:AbortMultipartUpload` /
+> `s3:ListMultipartUploadParts`，且多授了 `s3:DeleteObject`（IC-BUG-4）。
+> 目标形态：policy 按 `dest_path_template` 的静态前缀动态生成，同时作为 `write_grants` 的对账粒度，见
+> [`consistency-and-ingest.md`](./consistency-and-ingest.md) §3.2。
+
 ```go
 func (s *STSManager) IssueCredentials(agentID string,
     buckets []BucketAccess) (*CredentialsPayload, error) {
@@ -1381,6 +1405,12 @@ func (s *STSManager) IssueCredentials(agentID string,
 ```
 
 ## 5.8 文件索引与归类引擎
+
+> ⚠️ **实现状态（D-030）**：本节的 `HandleUploadResult` 是死代码（Agent 从不上报，IC-BUG-2），
+> 因此 `agent_id` / `rule_id` / `sha256` / `file_mtime` 恒为 NULL、`upload_logs` 恒空、
+> `events.file.uploaded` 从未发布。另外 `UpsertFileEntry` 无排序键，webhook 路径会把富字段覆盖为 NULL（IC-BUG-8）。
+> 目标模型（`observed_at` 排序键 + `source` + 宽表/窄表分家 + 三级对账）见
+> [`consistency-and-ingest.md`](./consistency-and-ingest.md) §3.4–§3.5。
 
 ```go
 func (e *FileIndexer) HandleUploadResult(result *UploadResult) error {
@@ -1696,6 +1726,10 @@ MINIO_VOLUMES="https://minio{1...4}.internal:9000/data{1...4} \
 
 ## 6.3 ACL 与 Policy 设计
 
+> ⚠️ **实现偏差（D-030）**：`storage/policy.go` 的 Action 为 `PutObject / GetObject / DeleteObject / ListBucket`
+> ——缺下方要求的两个 multipart Action，且多授 `DeleteObject`（IC-BUG-4）。资源前缀亦与本文 §6.2 的对象键约定
+> 不一致（IC-BUG-3）。
+
 | 账号类型            | 权限范围                   | 用途                 |
 |-----------------|------------------------|--------------------|
 | **admin-sa**    | 全部权限                   | Control Plane 管理账号 |
@@ -1723,6 +1757,16 @@ MINIO_VOLUMES="https://minio{1...4}.internal:9000/data{1...4} \
 （见第五章 5.7 节代码实现）
 
 ## 6.5 事件通知配置
+
+> ⚠️ **定位澄清（D-025 补充 §3 / D-030）**：minio-event **只应作为对账兜底**，不承担主索引职责。
+> 当前实现与此相反——它是唯一的写入路径。另有两处必须修的缺陷：`queue_dir` 位于易失的 `/tmp`
+> （MinIO 重启即丢未投递事件，IC-BUG-9）；CP 索引失败仍返回 200，MinIO 据此丢弃事件、永不重投（IC-BUG-6）。
+> 且通过 API 新建的 bucket 不会注册通知规则（IC-BUG-7）。见
+> [`consistency-and-ingest.md`](./consistency-and-ingest.md) §1.3。
+>
+> 📌 **目标形态（D-031）**：本节的 `notify_webhook` 将改为 `notify_nats` + JetStream，
+> 以获得「投递与处理解耦 / 可重放 / 全局单调序号（供排序键与链路自证）」三项能力，排期在对账阶段（IC-11）。
+> 切换后 D-014 的共享密钥鉴权由 NATS creds/nkey/TLS 取代。
 
 ```bash
 mc admin config set myminio notify_webhook:primary \
@@ -1752,6 +1796,11 @@ mc event add myminio/data-sensor primary \
 | **Lifecycle 规则**      | s3.PutBucketLifecycleConfiguration() | tmp-uploads 7天清理     |
 
 ## 6.7 存储容量规划参考
+
+> 📌 **补充（D-030）**：下表只按字节规划，未按**对象数**推演。按第一行（高频小文件、50 台采集器）换算
+> 约 **2600 万对象/年**，3–5 年到**上亿**——每个对象对应一行 `file_entries`。该量级下
+> 「周期性全量列举 MinIO 对账」不成立，索引表也需要分区。见
+> [`consistency-and-ingest.md`](./consistency-and-ingest.md) §1.1 / §3.4。
 
 | 场景         | 文件频率  | 单文件大小    | 单采集器/天 | 50台/年   |
 |------------|-------|----------|--------|---------|

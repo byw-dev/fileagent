@@ -11,17 +11,29 @@
 **权威追踪**：[`metadata-phase1.md`](metadata-phase1.md)（含收官 banner）。落地：`DECISIONS.md` D-025 各「落地记录」；
 架构回填：`system-design.md` §3.3.8/§5.8。**推后**：规则改动回溯（低价值）；Phase 2（数据集/血缘）按信号触发。
 
-## ▶️ 当前 track（2026-07-14 拍板）：恢复 Web UI 重做（WR-2…10）
+## ▶️ 当前 track（2026-09-08 拍板）：写入准入与索引一致性（IC-0…IC-14）
 
-Phase 1 收官后恢复 WR track（之前为 Phase 1 让位暂停，WR-1 地基已合并可复用）。**追踪**：
-[`webui-redesign-impl.md`](webui-redesign-impl.md)（含 2026-07-14 规格校准：规则表单保留整页 4 步、元数据 4 屏折入 WR-3/4/8）。
-**顺序**：WR-2 样板页 → WR-9 → WR-5/6/7 → WR-3/4/8 → WR-10。纯前端、无后端契约改动；每片独立 PR + review。
-**其余候选（未排期）**：proto→buf 复现性 follow-up ／ Phase 2（数据集/血缘，触发信号出现时）。
+对写入链路做全面审计后发现 **Agent 数据面从未端到端跑通过**：Agent 拿不到 STS 凭据（IC-BUG-1）、
+从不上报 `UploadResult`（IC-BUG-2）、STS policy 前缀与实际对象键不匹配（IC-BUG-3）且缺 multipart 权限（IC-BUG-4）。
+当前 `file_entries` 的唯一写入者是本应「只做对账兜底」的 minio-event webhook，与 `system-design.md` §4.5
+描述的主路径完全相反。同时确认**不存在任何 MinIO↔PostgreSQL 对账机制**。
 
-**⏸️ 前一 track「Web UI 重做实现（Half A）」已暂停**（2026-07-10 价值优先决策）：WR-1 地基已合并（PR #66/#67）
-并被本 track 复用（token / `StatusBadge` / 时间 util / 共享外壳）；WR-2…WR-10 暂停，追踪与恢复方法见
-[`webui-redesign-impl.md`](webui-redesign-impl.md)。理由：WR 是给已能用的页面换皮，不产出核心价值；
-给文件维护元数据/标签才是采集系统的核心，而这套还没建。
+- **追踪**：[`consistency-ingest.md`](consistency-ingest.md)（IC-0…IC-14，含命名约定与执行纪律）
+- **设计**：[`docs/design/consistency-and-ingest.md`](../design/consistency-and-ingest.md)
+- **决策**：[`DECISIONS.md`](../../DECISIONS.md) **D-030**（不换存储层；STS grant + 注册 outbox + 分片对账）、
+  **D-031**（MinIO 事件传输 webhook → NATS JetStream，排期对账阶段 IC-11）
+- **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-15（4 个 P0 / 5 个 P1 / 6 个 P2）
+
+**顺序**：IC-0 文档基线 → 止血 IC-1…IC-5 → 地基 IC-6/7 → 准入 IC-8…10 → 对账 IC-11…13 → 血缘 IC-14。
+
+> ⚠️ 两条硬约束：**IC-1 必须第一个做**（在它之前 Agent 一个文件都传不上去，任何 live 验收都无法执行）；
+> **IC-2 必须把 IC-BUG-8 一起带上**（修好上报而不修排序键会立刻造成数据损坏）。
+> **地基阶段越晚做越贵**——按 §6.7 换算约 2600 万对象/年，到千万行再拆表/加列/改分区，每步都要锁表或双写迁移。
+
+**⏸️ WR track（Web UI 重做 WR-2…10）暂停让位**（同 2026-07-10 那次的理由）：WR 是给已能用的页面换皮，
+而 IC 修的是「文件根本传不上去、索引可能永久缺失」。WR-1 地基已合并（PR #66/#67）不受影响；
+恢复方法见 [`webui-redesign-impl.md`](webui-redesign-impl.md)。
+**其余候选（未排期）**：proto→buf 复现性 follow-up。
 
 ---
 
@@ -37,7 +49,8 @@ Phase 1 收官后恢复 WR track（之前为 Phase 1 让位暂停，WR-1 地基�
 | MinIO internal/public endpoint 拆分 | #62 | D-024 |
 | 元数据模型 6c 拍板 + Web UI 重做设计 | #63 | D-025 |
 
-**已选定 track**：**元数据 6c Phase 1 实现**（见顶部），追踪 [`metadata-phase1.md`](metadata-phase1.md)。
+> 上述为历史记录。**当前 track 见本文顶部（IC）**；元数据 Phase 1 与 WR 的状态分别见
+> [`metadata-phase1.md`](metadata-phase1.md) 与 [`webui-redesign-impl.md`](webui-redesign-impl.md)。
 
 **其余候选（未排期）**：
 1. **Web UI 重做实现 WR-2…WR-10**（⏸️ 已暂停，恢复条件与方法见 [`webui-redesign-impl.md`](webui-redesign-impl.md)）。
@@ -46,7 +59,7 @@ Phase 1 收官后恢复 WR track（之前为 Phase 1 让位暂停，WR-1 地基�
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
 > bucket policy 对本系统冗余（MinIO 默认私有，访问全走 STS/presigned IAM）。待有 staging workflow 再做。
 
-> 每项任务独立 PR + Copilot review，改完真跑 e2e 再算完成。
+> 每项任务独立 PR + code review（Copilot 已不可用，改由其他渠道 review），改完真跑 e2e 再算完成。
 
 ---
 
@@ -81,7 +94,8 @@ Phase 1 收官后恢复 WR track（之前为 Phase 1 让位暂停，WR-1 地基�
 
 ## 关联入口
 
-- 当前 track 追踪：[`metadata-phase1.md`](metadata-phase1.md)
+- 当前 track 追踪：[`consistency-ingest.md`](consistency-ingest.md)
+- 前一 track（已收官）：[`metadata-phase1.md`](metadata-phase1.md)
 - 前一冲刺（已收官）：[`core-completeness.md`](core-completeness.md)
 - Phase 3 主线（含已完成 T3-x）：[`phases/phase-3.md`](phases/phase-3.md)
 - 采集规则重构规格：[`phases/phase-3-rft.md`](phases/phase-3-rft.md)

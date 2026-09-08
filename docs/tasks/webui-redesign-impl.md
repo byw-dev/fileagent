@@ -1,5 +1,10 @@
 # webui-redesign-impl.md — Web UI 重做实现（Half A）
 
+> **⏸️ 状态（2026-09-08）：再次暂停，让位给 IC track**（写入准入与索引一致性，见
+> [`consistency-ingest.md`](consistency-ingest.md)）。理由同 2026-07-10：WR 是给已能用的页面换皮，
+> 而 IC 修的是「Agent 数据面从未端到端跑通过」。恢复条件：IC 止血阶段（IC-1…IC-5）收官后重新评估。
+> 以下为暂停前的状态记录。
+>
 > **▶️ 状态（2026-07-14）：恢复 WR track。** 元数据 6c Phase 1（MT-1…6，PR #69–#79）已收官，恢复本 track。
 > WR-1 地基已合并（PR #66/#67），其产出（token / `StatusBadge` / 时间 util / `FormDrawer` 等共享外壳）已被元数据
 > track 复用。恢复前做了一次**规格校准**（本次更新）：Phase 1 的 4 个元数据屏（7a–7d）改动/新增了 WR-3/4/8

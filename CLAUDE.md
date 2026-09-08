@@ -39,6 +39,7 @@ fileagent/                        # Monorepo 根目录
 ├── docs/
 │   ├── design/
 │   │   ├── system-design.md      # 系统设计文档（架构背景；细节可能滞后于代码）
+│   │   ├── consistency-and-ingest.md  # 写入准入与索引一致性设计（D-030）
 │   │   └── fileagent_design_complete.docx
 │   ├── reports/                  # 审计报告（已归档）
 │   └── tasks/                    # 任务管理（详见 TASK_LIST.md 导航）
@@ -333,16 +334,20 @@ docker compose -f deploy/docker-compose.test.yml down -v
 **上一 track 已收官（2026-07-14）**：**元数据 6c Phase 1**（受控标签，MT-1…MT-6，PR #69–#79）——全链路完成
 （迁移 5 表 + `retag_jobs` → indexer 打标 → 词表/待确认/单文件·批量打标 API → 回溯 worker → 四屏 UI 7a–7d）。
 追踪 `docs/tasks/metadata-phase1.md`，落地 `DECISIONS.md` D-025 各「落地记录」，架构回填 `system-design.md` §3.3.8/§5.8。
-**当前 track（2026-07-14 拍板）**：恢复 **Web UI 重做（WR-2…10）**——纯前端统一既有页面视觉/交互，WR-1 地基已合并可复用。
-追踪 `docs/tasks/webui-redesign-impl.md`（含 2026-07-14 规格校准：规则表单保留整页 4 步、Phase-1 元数据 4 屏折入 WR-3/4/8）。
-顺序 WR-2 样板页 → WR-9 → WR-5/6/7 → WR-3/4/8 → WR-10。未排期：proto→buf ／ Phase 2（按信号触发）。
+**当前 track（2026-09-08 拍板）**：**写入准入与索引一致性（IC-0…IC-14）**——2026-09-08 审计发现
+**Agent 数据面从未端到端跑通过**（拿不到 STS 凭据 / 从不上报 `UploadResult` / policy 前缀不匹配 / 缺 multipart 权限），
+且不存在任何 MinIO↔PostgreSQL 对账机制。决策 **D-030**（不换存储层；STS grant + 注册 outbox + 分片对账）、
+**D-031**（事件传输 webhook → NATS JetStream）。设计 `docs/design/consistency-and-ingest.md`，
+追踪 `docs/tasks/consistency-ingest.md`，缺陷 `docs/tasks/bugs/open.md`（IC-BUG-1…IC-BUG-15）。
+顺序：IC-0 文档基线 → 止血 IC-1…5 → 地基 IC-6/7 → 准入 IC-8…10 → 对账 IC-11…13 → 血缘 IC-14。
+**WR track（Web UI 重做 WR-2…10）暂停让位**，追踪 `docs/tasks/webui-redesign-impl.md`。未排期：proto→buf。
 
 **已按产品决策推后**（2026-07-04）：**T3-3（Python SDK）/ T4-4（Java SDK）**——暂无消费方；
 契约单一权威/OpenAPI 校验（G-8/G-9）、结构性文档重构（design 去重指针化、CLAUDE.md 减肥）、
 Prometheus 指标（T4-1）、Agent `disks`/`upload_bps` 遥测、存储物理用量。止血冲刺回顾见
 `docs/reports/design-gap-analysis/07-summary.md` §五。
 
-当前任务与状态以 `docs/tasks/active.md` + `docs/tasks/metadata-phase1.md` 为准；
+当前任务与状态以 `docs/tasks/active.md` + `docs/tasks/consistency-ingest.md` 为准；
 `TASK_LIST.md` 提供总索引。
 
 > **文档权威优先级**（层级从高到低）：
