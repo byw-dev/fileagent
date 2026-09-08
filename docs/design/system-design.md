@@ -1375,8 +1375,9 @@ defer redis.Del(lockKey)
 > ⚠️ **实现偏差（D-030）**：实现签发的资源前缀是 `agents/{agent_id}/*`，而实际 `storage_path` 完全由规则的
 > `dest_path_template` 决定，二者不匹配（IC-BUG-3）；Action 列表缺 §6.3 要求的 `s3:AbortMultipartUpload` /
 > `s3:ListMultipartUploadParts`，且多授了 `s3:DeleteObject`（IC-BUG-4）。
-> 目标形态：policy 按 `dest_path_template` 的静态前缀动态生成，同时作为 `write_grants` 的对账粒度，见
-> [`consistency-and-ingest.md`](./consistency-and-ingest.md) §3.2。
+> 目标形态（D-030 第八条）：policy 资源改为**整桶** `arn:aws:s3:::{bucket}/*`，`dest_path_template`
+> 不受任何约束——授权宽度是管理权限问题，清点成本由分片+封存对账解决，不靠约束用户路径。见
+> [`consistency-and-ingest.md`](./consistency-and-ingest.md) §3.2 / §3.5。
 
 ```go
 func (s *STSManager) IssueCredentials(agentID string,

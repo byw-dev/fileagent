@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16 为 2026-09-09 追加）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -31,6 +31,7 @@
 | IC-BUG-13 | `content_type` 两条索引路径都不赋值，且会被 upsert 清空 | 🟡 P2 | controlplane |
 | IC-BUG-14 | Dashboard `COUNT(*)` / `SUM` 全表扫描（规模隐患） | 🟡 P2 | controlplane |
 | IC-BUG-15 | 预签名下载 URL TTL 硬编码 15 分钟，大文件不够用 | 🟡 P2 | controlplane |
+| IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效 | 🟠 P1 | agent + controlplane |
 
 ---
 
@@ -190,6 +191,18 @@
 | **后果** | 违反「禁止 hardcode 配置项」；ETL 拉取 GB 级文件时 15 分钟不足，下载中途 403 |
 | **修复** | 提为配置项（默认保持 15min），并在响应的 `expires_in` 中如实返回 |
 | **验收** | 改配置后 `expires_in` 随之变化 |
+
+## IC-BUG-16 — 模板前导 `/` 使 path_var 打标对多数规则静默失效 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | Agent 侧 `buildStoragePath` 最后一行 `strings.TrimPrefix(storagePath, "/")` 剥掉了前导斜杠，而 CP 侧 `applyPathVarTags` 用**未经归一化的原始模板**去反解 `storage_path`。模板以 `/` 开头时，字面量 `/` 无法与已剥离的路径匹配 |
+| **精确位置** | `agent/cmd/agent/main.go:545`（TrimPrefix）；`controlplane/internal/indexer/indexer.go:409-417`（`trollsift.New(destTemplate)` + `parser.Parse(storagePath)`） |
+| **实测** | `tmpl="/{year}/{filename}" path="2026/x.csv"` → `does not match pattern`；去掉模板前导 `/` 或给路径加回 `/` 均可匹配 |
+| **后果** | **凡是模板以 `/` 开头的规则，MT-3 的 path_var 打标从未生效过**——`applyPathVarTags` 只 `logger.Warn("storage path does not match template")` 后 return，索引照常成功，缺陷完全静默。现有 4 个模板夹具里 3 个以 `/` 开头 |
+| **同源** | 与 IC-BUG-3 是同一类病：同一个模板在 agent 与 CP 两端各自解释，没有任何机制保证一致 |
+| **修复** | 抽一个模板归一化函数（去前导 `/`，其余规则集中），**agent 拼路径与 CP 反解共用同一个**；放在 `pkg/trollsift` 或其相邻位置，使两端不可能再分叉 |
+| **验收** | 建一条 `path_tag_map` 非空、模板以 `/` 开头的规则，上传文件后 `file_tags` 中出现 `source='path_var'` 的行；单测覆盖「模板带/不带前导 `/`」两种写法均能反解 |
 
 ---
 

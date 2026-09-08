@@ -68,14 +68,14 @@ grep -rEn '\b(CI|DP)-[0-9]+|\b(CI|DP)\s*系列' --include='*.md' .
 
 | ID | 模块 | 内容 | 验收要点 | 状态 |
 |----|------|------|----------|------|
-| **IC-1** | CP + agent | **STS 链路接通**（IC-BUG-1 + IC-BUG-3 + IC-BUG-4）。① CP 在 `Connect` 建流后推送一次 `ServerMessage_Credentials`（与 `SyncRulesOnConnect` 同时机）；② 对齐 `RefreshCredentialsRequest` 契约——允许省略 `rule_id`，按该 Agent 已下发规则涉及的 bucket 集合签发；③ **policy 资源改为按规则 `dest_path_template` 的静态前缀动态生成**（修 IC-BUG-3，同时天然收窄 IC-8 的 grant 粒度）；④ **policy 拆两个 statement**（修 IC-BUG-4，对齐 §6.3）：桶级 `s3:ListBucket` / `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`，收窄用 `s3:prefix` condition）；对象级 `s3:PutObject` / `s3:GetObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/{prefix}/*`；移除 `DeleteObject`。**注意**：当前 `ListBucket` 配对象级 ARN，是一条从未生效的空转授权，只补 Action 不改 ARN 层级修不掉；⑤ Agent 刷新 goroutine 去掉 `sts == nil` 短路 | **live-e2e**：dev 环境起 CP + agent，落一个文件 → MinIO 出现对象 → `file_entries` 有行。用签发的 STS 直接 `PutObject` 到前缀外须 403；`ListBucket` 能列出前缀内对象、前缀外须 403；`mc ls --incomplete` 可执行（不 403）——**IC-3 的验收依赖这一条**。**不接受仅单测通过** | ⬜ |
+| **IC-1** | CP + agent | **STS 链路接通**（IC-BUG-1 + IC-BUG-3 + IC-BUG-4 + IC-BUG-16）。① CP 在 `Connect` 建流后推送一次 `ServerMessage_Credentials`（与 `SyncRulesOnConnect` 同时机）；② 对齐 `RefreshCredentialsRequest` 契约——允许省略 `rule_id`，按该 Agent 已下发规则涉及的 bucket 集合签发；③ **policy 资源改为整桶** `arn:aws:s3:::{bucket}/*`（修 IC-BUG-3；D-030 第八条：授权宽度是管理问题、清点成本由分片对账解决，**不约束 `dest_path_template`**）；④ **policy 拆两个 statement**（修 IC-BUG-4，对齐 §6.3）：桶级 `s3:ListBucket` / `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`）；对象级 `s3:PutObject` / `s3:GetObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/*`；移除 `DeleteObject`。**注意**：当前 `ListBucket` 配对象级 ARN，是一条从未生效的空转授权，只补 Action 不改 ARN 层级修不掉；⑤ Agent 刷新 goroutine 去掉 `sts == nil` 短路；⑥ **模板归一化**（修 IC-BUG-16）：收敛到一个函数，两端共用 | **live-e2e**：dev 环境起 CP + agent，落一个文件 → MinIO 出现对象 → `file_entries` 有行；`mc ls --incomplete` 可执行（不 403）——**IC-3 的验收依赖这一条**；模板以 `/` 开头的规则，`file_tags` 里能查到 path_var 来源的标签（IC-BUG-16 回归）。**不接受仅单测通过** | ⬜ |
 | **IC-2** | proto + CP + agent + 迁移 | **上报 + ack outbox + 排序键**（IC-BUG-2 + IC-BUG-8 + IC-BUG-13，含 IC-BUG-12 的上报部分）。① `proto` 给 `UploadResult` 加 `task_id`（只增字段）；② CP 处理完后回发 `Acknowledgement`（消息已存在，只是无人发送）；③ `UploadFunc` 改为返回 `(*uploader.UploadResult, error)`，队列增 `reported` 状态，**收到 ack 才置 completed**；④ **迁移：`file_entries` 加 `observed_at` + `source`**（`agent`/`api`/`minio_event`/`audit`），upsert 加 `WHERE EXCLUDED.observed_at >= 现有值` + 富字段 `COALESCE`；⑤ 重试耗尽时以 `success=false` 上报 | **live**：上传后 `agent_id`/`rule_id`/`sha256` 非空、`upload_logs` 有行、NATS 收到 `events.file.uploaded`；停 CP 再恢复，任务重发且不产生重复行；单测覆盖「webhook 更早/更晚 `observed_at` 均不清空富字段」 | ⬜ |
 | **IC-3** | agent + deploy | **续传落盘 + 分片清理**（IC-BUG-5）。① 新增 `Queue.SaveMultipartProgress(id, uploadID, partsJSON)`，每片完成即落盘；② 任务进入终态（completed / 放弃）时调 `AbortMultipartUpload`；③ 数据桶加 `AbortIncompleteMultipartUpload` 的 ILM 规则兜底。**依赖 IC-1 已签发桶级 `s3:ListBucketMultipartUploads`**，否则本条验收会 403 卡住 | >64MB 文件传输中途 kill agent，重启后从断点续传（日志可见跳过分片数）；放弃的任务在 `mc ls --incomplete` 无残留 | ⬜ |
 | **IC-4** | CP + deploy | **webhook 可靠性止血**（IC-BUG-6 + IC-BUG-7 + IC-BUG-9）。① 索引失败返回 5xx 让 MinIO 重投、解析失败返回 400；② `MakeBucket` 后调 `SetBucketNotification`，并在启动时对 `buckets` 表逐个 ensure（幂等补注册）；③ `queue_dir` 迁至持久卷 | 断开 PG 触发 ObjectCreated → 端点 5xx → 恢复 PG 后 MinIO 重投、`file_entries` 补齐；通过 API 新建 bucket 后直接 `mc cp` 一个对象，索引出现该行 | ⬜ |
 | **IC-5** | agent | **采集正确性**（IC-BUG-10 + IC-BUG-11 + IC-BUG-12 剩余）。① `IsProcessed` 改为比较 `(rule_id, local_path, file_mtime, file_size)`，并修正与实现不符的注释；② `submitFile` 补齐 `FileOffset` / `AppendMode` 赋值，tail 偏移随任务落盘；③ 按文件大小推导 per-upload timeout（可配置下限） | 改文件内容后能被重新采集；`append_mode=tail` 规则第二次只传增量且重启后偏移不丢；不可达 MinIO 下 worker 会超时释放而非永久占用 | ⬜ |
 
 > **止血阶段顺序**：IC-1 → IC-2 →（IC-3 / IC-4 / IC-5 可并行）。
-> **止血阶段收尾产出**：`docs/tasks/bugs/closed.md` 归档 IC-BUG-1…IC-BUG-13；`system-design.md` §4.5/§4.7/§5.7/§5.8/§6.3/§6.5
+> **止血阶段收尾产出**：`docs/tasks/bugs/closed.md` 归档 IC-BUG-1…IC-BUG-13 与 IC-BUG-16；`system-design.md` §4.5/§4.7/§5.7/§5.8/§6.3/§6.5
 > 的「实现状态 / 实现偏差」告警块随之删除或改写。
 
 ### 地基 — 表结构（有时间窗口，宜早不宜迟）（IC-6…IC-7）
@@ -116,7 +116,7 @@ grep -rEn '\b(CI|DP)-[0-9]+|\b(CI|DP)\s*系列' --include='*.md' .
 
 | # | 问题 | 阻塞 | 倾向 |
 |---|------|------|------|
-| A | `storage_path` 前缀约定：强制模板前缀 vs 按模板静态前缀动态生成 policy | **IC-1** | 后者（同时收窄 grant 粒度）；结论须写入 `contracts.md` |
+| ~~A~~ | ~~`storage_path` 前缀约定~~ | ~~IC-1~~ | ✅ **已定（2026-09-09）：不约束**。policy 写整桶，模板完全自由；清点成本由 L2 分片+封存解决。见 `DECISIONS.md` D-030 第八条 |
 | B | `file_entries` 分区粒度（月 / 周）与归档策略；同时估算 `object_keys` 主键索引体积（按真实 `storage_path` 长度算，决定索引能否常驻内存） | IC-6 | 按真实增速估算后定 |
 | C | 文件列表 `total` 去 `COUNT(*)` 的方案 | IC-7 | 需新决策记录（改动 D-007 契约） |
 | D | ETL 是否允许就地覆盖同一 key（决定是否需要对象版本） | IC-9 | 待产品确认 |

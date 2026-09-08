@@ -1320,10 +1320,11 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 对账成本 = O(未结算的授权) + O(总量 / 轮转预算)     ← 两项都有界且可配
 ```
 
-**三、STS 授权即写入意向声明。** 新增 `write_grants` 记录每次 STS 签发的 (principal, bucket, prefix, TTL)。
+**三、STS 授权即写入意向声明。** 新增 `write_grants` 记录每次 STS 签发的 (principal, bucket, TTL)。
 写入方 outbox 清空后调 `POST /api/v1/grants/{id}/settle {count:N}`，CP 比对注册数即结算，
-**稳态下不发一次 `ListObjects`**；仅「数量不符」或「到期未结算」才触发列举。
-STS 的 1h TTL 天然把最坏情况的对账工作单元切成「一小时的写入量」。
+**稳态下不发一次 `ListObjects`**。数量不符或到期未结算时**同样不列举**——改为从 PG 查出该
+时间窗口内有写入的分片、置为 `active`，交给 L2 的分片预算核实。grant 记录的是**写入意向的
+时间窗口**（谁、哪个桶、什么时段），空间切分由分片承担。
 
 **四、统一写入协议，Agent 与 SDK/ETL 共用**：申请 STS + grant_id → 直传 MinIO（内容不过 CP）→
 `POST /api/v1/files/register`（批量幂等，携带 tags / run_id）→ 失败留 outbox 重试 → 结算。
@@ -1337,12 +1338,26 @@ STS 的 1h TTL 天然把最坏情况的对账工作单元切成「一小时的�
 upsert 加 `WHERE EXCLUDED.observed_at >= 现有值` + 富字段 `COALESCE`，
 使两条写入路径可交换（修 IC-BUG-8 / IC-BUG-13）。
 
-**七、对账分三级**：L1 grant 结算（稳态零列举）→ L2 分片轮转（长尾兜底，采用外部项目
-minio-inventory 已在生产验证的分片审计模型）→ L3 幽灵清理。L2 的五条实施约束见设计文档 §3.5，
+**七、对账分三级**：L1 grant 结算（全程零列举）→ L2 分片轮转（长尾兜底，采用外部项目
+minio-inventory 已在生产验证的分片审计模型）→ L3 幽灵清理。L2 的八条实施约束见设计文档 §3.5，
 其中最关键的一条：**判「分片被写过」只能用对象自身的 mtime，绝不能用 `updated_at`**
 （扫描自身的 upsert 会推进后者，导致封存机制完全失效）。
 
-**八、血缘提前实施 `metadata-model.md` P2.3 的 run 模型**（触发信号「ETL 开始建设」已到达），
+**八、授权宽度与清点成本分开处理（2026-09-09 追加）。** STS session policy **写整桶**
+（`arn:aws:s3:::{bucket}/*`），不按前缀收窄；`dest_path_template` **不受任何约束**。理由：
+
+- **授权宽度是管理权限问题**——单组织私有化部署、Agent 需审批接入，已审批 Agent 拿到所属桶
+  写权限可接受。
+- **清点成本是技术缺陷**——不能靠约束用户解决，必须由机制解决（即第七条的分片+封存）。
+
+副作用是消掉一整类故障：IC-BUG-3（policy 前缀 ≠ 实际对象键）不再可能发生；前缀含日期跨零点
+403、Agent 改名后持续 403（`agentCtx.AgentName` 只在审批时取一次、运行中永不更新）、多规则
+Agent 的 session policy 体积上限，全部不存在。IC-1 的实现量因此降低一档。
+
+曾考虑的三种模板约束（强制 `agents/{agent_id}/` 前缀 / 首段不得为逐文件变量 / 必须含时间分区）
+**全部否决**，其中第三种被 minio-inventory 的生产实测直接推翻，见下方备选方案。
+
+**九、血缘提前实施 `metadata-model.md` P2.3 的 run 模型**（触发信号「ETL 开始建设」已到达），
 挂载点为 `batch-download-urls`（记 `run_inputs`）与 `files/register`（挂输出），ETL 零额外申报。
 
 ### 备选方案（被否决）
@@ -1360,6 +1375,18 @@ minio-inventory 已在生产验证的分片审计模型）→ L3 幽灵清理。
 - **`file_entries` 直接按时间分区、不拆窄表**：唯一约束被迫包含分区键，
   `(bucket_id, storage_path)` 幂等性失效，同 key 不同时间会插入两行。
 - **允许写入方绕过 CP 直连 MinIO**（产品已确认不需要）：准入闸门失效，对账退回 O(总量)。
+- **约束 `dest_path_template` 以收窄 grant 前缀**（三个变体均否决，2026-09-09）：
+  - *强制 `agents/{agent_id}/` 前缀*：把 producer 身份塞进数据布局。从数据管理角度，
+    对象命名空间该按数据语义组织，不该按"谁上传的"组织；且会改写对象键，牵动
+    `file_entries.storage_path`、MT-3 的 path_var 反解（`indexer.go:405` 拿模板反解 storage_path，
+    前缀必须同步进模板）、webui 模板预览、以及已落盘对象的重铺。
+  - *要求首段不得为逐文件变量*：仅为「让 grant 前缀非空」服务，而前缀已不承担对账职责。
+  - *要求模板含时间字段以便按时间片扫描*：**被生产实测推翻**。minio-inventory 的 karadar 桶
+    260 个分片中 **258 个**首次写入比目录名日期晚 7 天以上、246 个晚 30 天以上、最长晚 232 天，
+    且为持续行为而非一次性迁移。任何「路径含日期 → 只扫当天分区」的调度都会把这 246 个
+    **正在被写入**的分片判为陈旧、永不扫描。根本理由：命名约定能说明新数据落在哪，
+    **不能说明历史分区没被改过**，因此不能充当正确性机制。这也正是「上传一组历史归档数据」
+    这类场景的真实形态。见 `~/workspace/minio-inventory` `docs/01-审计可扩展性设计.md` §2.3。
 
 ### 分期实施
 
@@ -1367,13 +1394,14 @@ minio-inventory 已在生产验证的分片审计模型）→ L3 幽灵清理。
 |---|---|---|---|
 | 止血 | IC-1…IC-5 | 修 IC-BUG-1…IC-BUG-7、IC-BUG-9…IC-BUG-12 | 独立可发；完成后数据面首次端到端可用 |
 | 地基 | IC-6…IC-7 | `observed_at`/`source`/`grant_id`/`run_id` 列、`object_keys` 拆分、分区、排序键 upsert | **必须趁数据量小完成** |
-| 准入 | IC-8…IC-10 | `write_grants` + `register` + `settle` + policy 前缀动态生成 | 依赖地基阶段的列 |
+| 准入 | IC-8…IC-10 | `write_grants` + `register` + `settle` | 依赖地基阶段的列；policy 保持整桶 |
 | 对账 | IC-11…IC-13 | 事件传输改 JetStream（D-031）→ L1 → L2 → L3 | 依赖地基（窄表的 mtime 是 L2 唯一可用信号列） |
 | 血缘 | IC-14 | run 模型（P2.3） | 随 ETL 建设 |
 
 ### 待定（不阻塞止血阶段）
 
-`storage_path` 前缀约定的最终形态（A）、分区粒度与归档策略（B）、
+~~`storage_path` 前缀约定的最终形态（A）~~（**2026-09-09 已定：不约束**，见上方第八条）、
+分区粒度与归档策略（B）、
 文件列表 `total` 去 `COUNT(*)` 的方案（C，改动 D-007 契约需单独决策）、
 ETL 是否允许就地覆盖同一 key（D）、SDK outbox 最小形态（E）。详见设计文档 §6。
 
@@ -1382,7 +1410,7 @@ ETL 是否允许就地覆盖同一 key（D）、SDK outbox 最小形态（E）�
 - 前序：**D-014**（minio-event 鉴权）、**D-017**（webhook 索引路径复活）、
   **D-025** 补充 §3（衍生数据入口：ETL 禁止直连 MinIO）、**D-007**（cursor 分页与 `total`）
 - 设计：`docs/design/consistency-and-ingest.md`、`docs/design/metadata-model.md` P2.2/P2.3
-- 缺陷：`docs/tasks/bugs/open.md` IC-BUG-1…IC-BUG-15
+- 缺陷：`docs/tasks/bugs/open.md` IC-BUG-1…IC-BUG-16
 
 ---
 
@@ -1450,6 +1478,12 @@ JetStream 处于闲置状态。
 - 真正的增量价值（重放、序号作排序键、链路自证）须待地基阶段（`observed_at` / `object_keys`，IC-6）与
   对账阶段（IC-12/IC-13）落地后才兑现；
 - 现在切换会使止血阶段复杂化，而止血阶段的唯一目标是**先让数据面端到端跑通**。
+
+> ⚠️ **但它是 L2 的硬前置，不是可选优化（2026-09-09 追加）。** L2 的分片状态需要二维信息回答
+> 「这个分片是否已知完整」——*扫描核实到 T 时刻，且事件已消费到序号 X*（`shard_state.last_event_seq`）。
+> 只有扫描时间不够：扫描期间与之后的变更由事件覆盖，必须知道事件消费位置才能推断覆盖范围。
+> **HTTP webhook 没有单调序号，拿不到 X。** 因此 IC-11 必须先于 IC-12/IC-13 完成，
+> 这条依赖不能因排期压力而跳过。
 
 > **与 D-030 已否决项的界线**：D-030 否决的是「把 minio-event 做成可靠通道**作为唯一方案**」——
 > 因为事件路径无法携带 tags 与血缘，且无法解决贫血写入与富字段覆盖。
