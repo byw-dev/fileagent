@@ -2,7 +2,7 @@
 
 > **状态**：设计（2026-09-08 拍板方向，尚未实施）
 > **决策记录**：[`DECISIONS.md`](../../DECISIONS.md) **D-030** / **D-031**（事件传输改 JetStream）
-> **缺陷清单**：[`docs/tasks/bugs/open.md`](../tasks/bugs/open.md) IC-BUG-1…IC-BUG-15
+> **缺陷清单**：[`docs/tasks/bugs/open.md`](../tasks/bugs/open.md) IC-BUG-1…IC-BUG-17
 > **关联**：`system-design.md` §4.5（上传流程）/ §4.7（凭据轮转）/ §5.7（STS）/ §5.8（索引）/ §6.3（Policy）/ §6.5（事件通知）；
 > [`metadata-model.md`](./metadata-model.md) P2.2（衍生数据入口）/ P2.3（run 血缘）；D-014、D-017、D-025
 >
@@ -98,15 +98,15 @@ MinIO 事件 = 低延迟提示，不是事实来源
 **产品已确认可接受的运维约束**：数据桶不下发长期 access key，所有写入必须先向 CP 申请 STS。
 于是「绕过索引写入」从默认行为变成需要 root 凭据的显式运维动作。
 
-CP 本来就在签发按 bucket + 前缀收窄的 STS（`storage/policy.go:29`），
-即 **CP 在对象被写之前就知道有人要往哪个前缀写**——这个信息目前被丢弃了。记下来即可：
+CP 本来就在签发 STS，即 **CP 在对象被写之前就知道有人要往哪个桶写、写多久**——
+这个信息目前被丢弃了。记下来即可：
 
 ```sql
 write_grants(
     id, org_id,
     principal_type,        -- agent | api
     principal_id,
-    bucket_id, prefix,
+    bucket_id,
     issued_at, expires_at,
     state,                 -- active | settled | unsettled
     declared_count,        -- 写入方结算时申报的对象数（可空）
@@ -117,15 +117,79 @@ write_grants(
 
 **结算语义让稳态下零列举**：写入方 outbox 清空时调 `POST /api/v1/grants/{id}/settle {count: N}`，
 CP 比对 `registered_count == N` → 标记 `settled`，**不发一次 ListObjects**。
-只有「数量不符」或「到期未结算」才把该 grant 的 prefix 送进对账队列。
 
-STS 的 1 小时 TTL 天然把最坏情况的对账工作单元切成「一小时的写入量」，与总量无关。
+**未结算时也不列举。** grant 数量不符或到期未结算，只说明「这个窗口里可能有对象没注册上来」。
+此时从 PG 自身查出该窗口有写入的分片，置为 `active` 交给 L2 的分片预算去核实：
 
-> ⚠️ **前提是前缀必须足够窄。** 当前实现签发的是 `agents/{agent_id}/*`（`grpcserver/handler.go:153`），
-> 那是该 Agent 的**全部历史数据**，列举它就是 O(该 Agent 总量)，量纲会退回去。
-> 且该前缀与实际 `storage_path` 根本不匹配（IC-BUG-3）。
-> **结论**：policy 资源改为按规则 `dest_path_template` 的**静态前缀部分**动态生成，
-> 既修好 IC-BUG-3，又天然收窄 grant 范围。此前缀约定须写入 `contracts.md`。
+```sql
+SELECT DISTINCT <分片前缀> FROM object_keys
+WHERE bucket_id = $1 AND last_modified >= $2 AND last_modified < $3
+```
+
+`<分片前缀>` 必须与 §3.5 的分片定义**用同一个函数**（叶子目录，按桶可配层数覆盖），
+否则 L1 置 `active` 的前缀会落不到 `shard_state` 的任何一行上。
+零列举，走 `(bucket_id, last_modified)` 索引，与 §3.5 的解封检测是同一个查询形状。
+**L1 只负责低延迟发现分歧，实际核实一律走 L2 的预算**——避免「O(1) 的信号触发 O(总量) 的响应」。
+
+时间窗口 `$2/$3` 取 grant 的 `[issued_at, expires_at]` **并向两端各留一个时钟偏移余量**——
+grant 时间来自 CP 时钟，而 `last_modified` 来自 MinIO 时钟或事件时刻，两者不同源。
+
+> **这条升级路径有一个已知缺口，必须写明而不是掩盖**：若该 grant 写入的对象**一条都没进
+> `object_keys`**，上面的查询返回空集，L1 检出了分歧却产出零工作量。实践中这个缺口比看上去窄——
+> minio-event 通道通常已把对象以贫血行写入 `object_keys`，所以窗口内一般查得到前缀；
+> 只有「register 与 event 双双丢失」才落空。此时由 §3.5 第 8 条的**兜底通道**（真实 delimiter
+> 列举）覆盖，这是已接受的残余风险，与「MinIO 静默不发事件」同级。
+>
+> **未结算的 grant 必须告警，不能只静默置 `active`。** L2 补得回对象的**存在性**，
+> 补不回 register 本该携带的 `tags` / `run_id` / `sha256`——那些随注册请求一起永久丢失了。
+
+#### 授权宽度与扫描成本是两件事
+
+**policy 资源写整桶**（`arn:aws:s3:::{bucket}/*`），不按前缀收窄。这是一次明确的产品取舍：
+
+- **授权宽度是管理权限问题**。单组织私有化部署、Agent 需审批才能接入，一个已审批 Agent
+  拿到所属桶的**写**权限是可接受的。
+- **清点成本是技术缺陷**。它不能靠约束用户来解决，必须由机制解决——即 §3.5 的分片 + 封存。
+
+> ⚠️ **放开的只有「写」，不含「读」与「列举」。** 产品批准的是写整桶，不能借机顺带放开其余。
+> Agent 全仓库从不调用 `GetObject` / `StatObject` / `ListObjects`（已 grep 确认，只用 `PutObject`
+> 与 multipart），因此 `s3:GetObject` 与 `s3:ListBucket` 在整桶形态下是**纯超授**——
+> 若保留，任一已审批 Agent 可枚举并下载整个数据湖。按最小权限一并砍掉，与砍 `DeleteObject`
+> 是同一条论证。最终 Action 集合见 IC-BUG-4。
+>
+> `policy.go:41-43` 在 `buckets` 为空时兜底成 `arn:aws:s3:::*`（**全部桶**）。当前调用方恒传
+> 一个桶所以不可达，但 IC-1 重构时应删掉——别在「整桶」决策之上留一个「整集群」后门。
+
+这条取舍消掉了一整类故障，且大幅简化 IC-1：
+
+**最直接的一条**：按字面的「模板**静态**前缀」计算，webui 新建规则的默认模板
+`/{agent_name}/{time:yyyy/MM/dd}/{filename}`（`webui/src/pages/Agents/RuleForm.tsx:104`）的静态前缀
+是**空串**——收窄当场退化成整桶。也就是说「按静态前缀收窄」对经 UI 创建的规则根本不产生收窄效果，
+只是把整桶写成了一个更复杂的表达式。
+
+若改用「签发时求值」的变体（把 `{agent_name}` / `{time:…}` 代入后再取前缀），前缀确实变窄了，
+但会引入下面这些故障——整桶 policy 一并消掉：
+
+| 「签发时求值」变体会带来的问题 | 整桶 policy |
+|---|---|
+| IC-BUG-3（policy 前缀 ≠ 实际对象键） | 不存在——整桶必然覆盖模板产出的任何键 |
+| 前缀含日期时跨零点 403（STS TTL 1h，刷新只在剩余 <10min 触发） | 不存在 |
+| Agent 改名后持续 403（`agentCtx.AgentName` 只在审批时取一次，永不更新） | 不存在 |
+| 多规则 Agent 的 session policy 体积上限（未实测，属推测） | 不存在 |
+
+> **`dest_path_template` 不受任何约束**——不强制前缀、不要求首段可解析、不要求含时间字段。
+> 对象键就是模板渲染的结果，CP 不往里面注入任何东西。
+>
+> 曾考虑过三种约束（强制 `agents/{agent_id}/` 前缀 / 首段不得为逐文件变量 / 必须含时间分区），
+> **全部否决**。前两者只为「让 grant 前缀非空」服务，而前缀已不承担对账职责；第三者被
+> minio-inventory 的生产实测直接推翻：karadar 桶 260 个分片里 **258 个**的首次写入比目录名上的
+> 日期晚 7 天以上、246 个晚 30 天以上、最长晚 232 天，且是持续行为。任何「路径含日期 →
+> 只扫当天分区」的调度都会把这 246 个正在被写入的分片判为陈旧、永不扫描。
+> **根本理由**：命名约定能说明新数据落在哪，**不能说明历史分区没被改过**，因此不能充当正确性机制。
+> 见 `~/workspace/minio-inventory` `docs/01-审计可扩展性设计.md` §2.3。
+
+> STS 仍然重要，但它提供的是**写入意向的时间窗口**（谁、哪个桶、什么时段），不是空间范围。
+> 对账的空间切分由分片承担。
 
 ### 3.3 统一写入协议（Agent / SDK / ETL 共用）
 
@@ -192,14 +256,23 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 
 | 级别 | 触发 | 覆盖场景 | 成本 |
 |---|---|---|---|
-| **L1 grant 结算** | grant 过期或数量不符 | 正常写入丢注册 | O(写入速率)，稳态零列举 |
+| **L1 grant 结算** | grant 过期或数量不符 | 正常写入丢注册 | O(写入速率)，**全程零列举**（异常时置分片 active，不自己扫） |
 | **L2 分片轮转** | 后台预算驱动 | grant 丢失 / 绕过写入 / MinIO 静默不发事件 | O(总量 / 预算) |
-| **L3 幽灵清理** | 随 L1/L2 列举顺带 | PG 有行、MinIO 无对象 | 附带 |
+| **L3 幽灵清理** | 随 L2 分片扫描顺带（L1 已不列举） | PG 有行、MinIO 无对象 | 附带 |
 
 L2 直接采用外部项目 minio-inventory 已在生产验证过的分片审计模型
-（`shard_state(bucket_id, prefix, state, last_verified_at, object_count)`，
+（`shard_state(bucket_id, prefix, state, last_verified_at, last_event_seq, sealed_at, object_count)`，
 state ∈ `active | verified | sealed`；分片取 key 的叶子目录；
-主通道从 PG 自身推导前缀，兜底通道才真去 `ListObjects`）。**必须原样避开它踩过的坑**：
+主通道从 PG 自身推导前缀，兜底通道才真去 `ListObjects`）。
+
+该模型 2026-09-08 上线、2026-09-09 完成首轮核实，实测 radar 桶每轮扫描量从 171 万对象降到
+7.2 万（封存率 95.8%），一轮从 5h31m 降到约 14 分钟。**成本量纲**：
+
+```
+O(未结算的授权) + O(总量 / 轮转预算)      ← 两项都有界且可配，不再是 O(总量)/周期
+```
+
+**必须原样避开它踩过的坑**：
 
 1. **判「分片被写过」只能用对象自身的 mtime**（`object_keys.last_modified`），
    **绝不能用 `updated_at` / `observed_at`**——扫描自身的 upsert 会推进后者，
@@ -210,6 +283,18 @@ state ∈ `active | verified | sealed`；分片取 key 的叶子目录；
    幽灵清理必须按 key 范围收窄 + 时间围栏，否则一次分片扫描会删掉整个桶。
 4. **封存静默期按桶从运行数据反推**，不写死全局值（不同桶的安全值可相差 10 倍）。
 5. **轮转配置的是列举预算，周期是结果**——固定周期会在列举性能退化时让占用率不受控上升。
+6. **批大小按对象数限，不按分片数限**。分片大小可跨三个数量级，按分片数限会让单批达数十万对象、
+   持锁数十分钟，而按批加锁的全部意义就是批间释放。
+7. **`verified` 分片需要重查下限**（默认 1h）。只按「陈旧程度」排序而无下限时，小桶的全部分片
+   一批装得下、扫完立刻又全部合格，实测出现过每 9 秒重新完整列举一遍。**从未核实过的分片不受此限**，
+   否则首轮追平会被拖慢。
+8. **双通道发现有明确盲区**：主通道从 PG 推导前缀，发现不了「全部对象都不在 PG 里」的分片——
+   这正是兜底通道（真实 delimiter 列举）存在的唯一理由，其周期须与 L3 轮转对齐。
+
+**`last_event_seq` 是 D-031 的硬依赖。** 「这个分片是否已知完整」需要二维状态回答——
+*扫描核实到 T 时刻，且事件已消费到序号 X*。只有扫描时间不够：扫描期间与之后的变更由事件覆盖，
+必须知道事件消费位置才能推断覆盖范围。**HTTP webhook 没有单调序号，拿不到 X**，
+因此 D-031（webhook → NATS JetStream）不是优化项而是 L2 的前置条件，须在 IC-11 先落地。
 
 CP 已持有一个 root 权限的 MinIO client（`cmd/server/main.go:206`），可直接复用作列举通道。
 
@@ -231,9 +316,9 @@ CP 已持有一个 root 权限的 MinIO client（`cmd/server/main.go:206`），�
 
 | 阶段 | 内容 | 依赖 / 说明 |
 |---|---|---|
-| **止血**（IC-1…IC-5） | 修 IC-BUG-1…IC-BUG-7、IC-BUG-9…IC-BUG-12：接通 STS 链路、Agent 上报 `UploadResult` + `Acknowledgement`、队列增 `reported` 状态、续传状态落盘 + Abort + ILM、新建 bucket 注册通知、webhook 失败返回 5xx + `queue_dir` 持久化、判重比较 mtime/size | 独立可发；**此前数据面从未端到端跑通** |
+| **止血**（IC-1…IC-5） | 修 IC-BUG-1…IC-BUG-7、IC-BUG-9…IC-BUG-12、IC-BUG-16…IC-BUG-17：接通 STS 链路、Agent 上报 `UploadResult` + `Acknowledgement`、队列增 `reported` 状态、续传状态落盘 + Abort + ILM、新建 bucket 注册通知、webhook 失败返回 5xx + `queue_dir` 持久化、判重比较 mtime/size | 独立可发；**此前数据面从未端到端跑通** |
 | **地基**（IC-6…IC-7） | `observed_at` / `source` / `grant_id` / `run_id` 列、`object_keys` 拆分、分区、排序键 upsert（修 IC-BUG-8 / IC-BUG-13） | ⚠️ **必须趁数据量小完成**——到千万行再拆表、加列、改分区，每步都要锁表或双写迁移 |
-| **准入**（IC-8…IC-10） | `write_grants` + `POST /files/register` + `POST /grants/{id}/settle` + SDK 写入协议；policy 前缀按 `dest_path_template` 动态生成 | 依赖地基阶段的列 |
+| **准入**（IC-8…IC-10） | `write_grants` + `POST /files/register` + `POST /grants/{id}/settle` + SDK 写入协议 | 依赖地基阶段的列；policy 保持整桶，grant 记录的是**时间窗口**而非空间范围（§3.2） |
 | **对账**（IC-11…IC-13） | 事件传输改 JetStream（**D-031**，前置）→ L1 → L2 → L3 | 依赖地基（`object_keys.last_modified` 是 L2 唯一可用的信号列）；JetStream 提供重放与全局单调序号，是 L2「链路自证」的前提 |
 | **血缘**（IC-14） | run 模型（P2.3） | 随 ETL 建设 |
 
@@ -260,7 +345,7 @@ CP 已持有一个 root 权限的 MinIO client（`cmd/server/main.go:206`），�
 
 | # | 问题 | 状态 |
 |---|---|---|
-| A | `storage_path` 的前缀约定：强制模板前缀 vs 按模板静态前缀动态生成 policy | 倾向后者（见 3.2），须在准入阶段（IC-8）前定死并写入 `contracts.md` |
+| A | ~~`storage_path` 的前缀约定~~ | ✅ **已定（2026-09-09）：不约束**。policy 写整桶，`dest_path_template` 完全自由。授权宽度（管理问题）与清点成本（技术缺陷）分开处理，后者由 §3.5 的分片+封存解决。三种候选约束的否决理由见 §3.2 |
 | B | `file_entries` 分区粒度（月 / 周）与归档策略；**同时估算 `object_keys` 主键索引体积**（按真实 `storage_path` 长度算，决定索引能否常驻内存） | 地基阶段（IC-6）前需按真实增速估算 |
 | C | 文件列表 `total` 的去 `COUNT(*)` 方案（增量计数表 vs `reltuples` 估算） | 改动 D-007 契约，需单独决策记录 |
 | D | ETL 是否允许就地覆盖同一 key（决定是否需要对象版本） | 待产品确认 |
