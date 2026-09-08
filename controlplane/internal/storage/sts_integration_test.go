@@ -65,7 +65,7 @@ func TestIssueCredentials_Integration(t *testing.T) {
 	mgr := NewSTSManager(itMinIOEndpoint, itMinIOUser, itMinIOPassword, itRoleARN, false, logger)
 
 	cred, err := mgr.IssueCredentials(ctx, "agent-integration-1", []BucketAccess{
-		{BucketName: bucket, PathPrefix: "uploads/"},
+		{BucketName: bucket},
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "not supported") ||
@@ -91,7 +91,7 @@ func TestIssueCredentials_Integration(t *testing.T) {
 	pubMgr := NewSTSManager(itMinIOEndpoint, itMinIOUser, itMinIOPassword, itRoleARN, false, logger).
 		WithPublicEndpoint("minio.public.example:443", true)
 	pubCred, err := pubMgr.IssueCredentials(ctx, "agent-integration-public", []BucketAccess{
-		{BucketName: bucket, PathPrefix: "uploads/"},
+		{BucketName: bucket},
 	})
 	require.NoError(t, err, "IssueCredentials with public endpoint override")
 	assert.Equal(t, "minio.public.example:443", pubCred.GetEndpoint())
@@ -134,7 +134,7 @@ func TestIssueCredentials_ScopingDeniesOtherBuckets(t *testing.T) {
 	mgr := NewSTSManager(itMinIOEndpoint, itMinIOUser, itMinIOPassword, itRoleARN, false, logger)
 
 	cred, err := mgr.IssueCredentials(ctx, "agent-integration-2", []BucketAccess{
-		{BucketName: allowedBucket, PathPrefix: ""},
+		{BucketName: allowedBucket},
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "not supported") ||

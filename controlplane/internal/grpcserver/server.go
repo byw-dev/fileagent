@@ -58,6 +58,10 @@ type STSManagerClient interface {
 type CredentialDB interface {
 	GetCollectionRuleByID(ctx context.Context, id uuid.UUID) (*db.CollectionRule, error)
 	GetBucketByID(ctx context.Context, id uuid.UUID) (*db.Bucket, error)
+	// ListCollectionRulesByAgent backs credential issuance when the agent does
+	// not name a specific rule: the session covers every bucket the agent's
+	// active rules target.
+	ListCollectionRulesByAgent(ctx context.Context, agentID uuid.UUID) ([]*db.CollectionRule, error)
 }
 
 // AgentStateDB is the minimal DB interface used by Connect/Disconnect and

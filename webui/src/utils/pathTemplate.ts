@@ -10,6 +10,18 @@ export const SYSTEM_TEMPLATE_VARIABLES: ReadonlyArray<{ key: string; desc: strin
 ]
 
 /**
+ * Strip the leading "/" from a path template.
+ *
+ * Mirror of `pkg/trollsift.NormalizeTemplate` (Go side is authoritative). An
+ * object key never starts with "/", so any preview or comparison must apply the
+ * same normalisation the Agent applies when composing the key.
+ * See docs/design/contracts.md V-3.
+ */
+export function normalizeTemplate(template: string): string {
+  return template.startsWith('/') ? template.slice(1) : template
+}
+
+/**
  * Format a LDML pattern string using the given UTC date via a single-pass substitution.
  *
  * Supported symbols (longest match wins): yyyy, yy, MM, dd, HH, mm, ss.
@@ -41,12 +53,19 @@ function formatLDML(ldml: string, now: Date): string {
  *  3. Fields present in `dynamicFields` — shown as `«fieldname»` (runtime placeholder).
  *  4. All other variables — left unchanged (valid syntax, resolved at runtime).
  *
+ * A leading "/" is stripped first, matching how the Agent builds the object key.
+ *
  * @param template - Path template string, e.g. `/{agent_name}/{time:yyyy/MM/dd}/{filename}`.
  * @param dynamicFields - Field names extracted from path_pattern (shown as «name» placeholders).
- * @returns Preview string with example substitutions applied.
+ * @returns Preview string with example substitutions applied, without a leading "/".
  */
 export function renderPathPreview(template: string, dynamicFields?: string[]): string {
   if (!template) return template
+
+  // Mirror of pkg/trollsift.NormalizeTemplate: an object key never starts with
+  // "/", so a preview that shows one does not match what actually lands in
+  // MinIO. See docs/design/contracts.md V-3.
+  template = normalizeTemplate(template)
 
   const now = new Date()
 

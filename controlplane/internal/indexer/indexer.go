@@ -406,13 +406,17 @@ func (ix *Indexer) applyPathVarTags(ctx context.Context, orgID, fileEntryID uuid
 	if len(pathTagMap) == 0 || destTemplate == "" {
 		return
 	}
-	parser, err := trollsift.New(destTemplate)
+	// Normalise before parsing: the agent strips the leading "/" when composing
+	// the object key, so reverse-parsing the raw template never matched for any
+	// template written as "/{...}" — which is what the Web UI creates by default
+	// (IC-BUG-16). See docs/design/contracts.md V-3.
+	parser, err := trollsift.New(trollsift.NormalizeTemplate(destTemplate))
 	if err != nil {
 		ix.logger.Warn("indexer: parse dest_path_template",
 			zap.String("template", destTemplate), zap.Error(err))
 		return
 	}
-	vals, err := parser.Parse(storagePath)
+	vals, err := parser.Parse(trollsift.NormalizeObjectKey(storagePath))
 	if err != nil {
 		// The stored object may not match the template (e.g. legacy/hand-placed);
 		// skip path-var extraction rather than failing the index.

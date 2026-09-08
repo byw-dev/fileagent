@@ -54,10 +54,12 @@ func (m *mockSTSMgr) IssueCredentials(_ context.Context, _ string, _ []storage.B
 // ── Mock CredentialDB ─────────────────────────────────────────────────────────
 
 type mockCredDB struct {
-	rule    *db.CollectionRule
-	ruleErr error
-	bucket  *db.Bucket
-	buckErr error
+	rule     *db.CollectionRule
+	ruleErr  error
+	bucket   *db.Bucket
+	buckErr  error
+	rules    []*db.CollectionRule
+	rulesErr error
 }
 
 func (m *mockCredDB) GetCollectionRuleByID(_ context.Context, _ uuid.UUID) (*db.CollectionRule, error) {
@@ -66,6 +68,10 @@ func (m *mockCredDB) GetCollectionRuleByID(_ context.Context, _ uuid.UUID) (*db.
 
 func (m *mockCredDB) GetBucketByID(_ context.Context, _ uuid.UUID) (*db.Bucket, error) {
 	return m.bucket, m.buckErr
+}
+
+func (m *mockCredDB) ListCollectionRulesByAgent(_ context.Context, _ uuid.UUID) ([]*db.CollectionRule, error) {
+	return m.rules, m.rulesErr
 }
 
 // ── RefreshCredentials ────────────────────────────────────────────────────────

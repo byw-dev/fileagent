@@ -754,6 +754,25 @@ func TestHandleUploadResult_ExtractsPathVarTag(t *testing.T) {
 	assert.Equal(t, "path_var", store.insertedTags[0].Source)
 }
 
+// Regression for IC-BUG-16: templates written with a leading "/" — which is
+// what the Web UI creates by default — never matched the object key the agent
+// writes, so path-variable tagging silently did nothing for those rules.
+func TestHandleUploadResult_PathVar_LeadingSlashTemplate(t *testing.T) {
+	bucket := newBucket()
+	fe := newFileEntry(bucket.ID, "data/tokyo/p.csv")
+	store := pathVarStore(bucket, fe,
+		`{"path_tag_map":{"site":"{site}"}}`, "/data/{site}/{filename}")
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+
+	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID,
+		newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	require.NoError(t, err)
+
+	require.Len(t, store.insertedTags, 1, "leading-slash template must still extract path vars")
+	assert.Equal(t, "site", store.insertedTags[0].Key)
+	assert.Equal(t, "tokyo", store.insertedTags[0].Value)
+}
+
 func TestHandleUploadResult_PathVar_TemplateMismatch_NoTag(t *testing.T) {
 	bucket := newBucket()
 	fe := newFileEntry(bucket.ID, "totally/different/path.csv")

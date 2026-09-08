@@ -243,7 +243,8 @@ describe('utils/pathTemplate – coverage for renderPathPreview', () => {
     const { renderPathPreview } = await import('../utils/pathTemplate')
     const result = renderPathPreview('/{time:yyyy}/{time:MM}/{time:dd}')
     expect(result).not.toContain('{time:')
-    expect(result).toMatch(/\/\d{4}\/\d{2}\/\d{2}/)
+    // No leading "/": the preview mirrors the object key, which never has one.
+    expect(result).toMatch(/^\d{4}\/\d{2}\/\d{2}$/)
   })
 
   it('validatePathTemplate returns null for valid template', async () => {

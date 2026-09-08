@@ -121,6 +121,37 @@ func (m *TokenManager) IsTokenValid(renewThreshold float64) bool {
 	return float64(remaining)/float64(ttl) > renewThreshold
 }
 
+// Identity returns the agent id and name carried by the cached JWT.
+//
+// The Control Plane mints agent tokens with the agent UUID as "sub" and the
+// agent's display name as "username" (see controlplane agent.Manager), so an
+// agent that starts from a cached token can recover its own identity without
+// re-registering. Before this existed, that startup path left both fields empty
+// and every dest_path_template referencing {agent_name} or {agent_id} silently
+// fell back to the bare file name (IC-BUG-17).
+//
+// The claims are read without signature verification: the token was minted by
+// the Control Plane and stored locally, and a forged local token would only let
+// the agent mislabel its own uploads, which the Control Plane rejects anyway
+// because it derives the agent id from the verified token on its side.
+func (m *TokenManager) Identity() (agentID, agentName string, err error) {
+	m.mu.RLock()
+	tok := m.token
+	m.mu.RUnlock()
+
+	if tok == "" {
+		return "", "", errors.New("no cached token")
+	}
+	claims, err := parseJWTClaims(tok)
+	if err != nil {
+		return "", "", err
+	}
+	if claims.Sub == "" {
+		return "", "", errors.New("JWT missing sub claim")
+	}
+	return claims.Sub, claims.Username, nil
+}
+
 // ── STS Credentials ───────────────────────────────────────────────────────────
 
 // STSCredentials holds a set of temporary MinIO / S3 credentials.
@@ -237,28 +268,40 @@ func decrypt(encoded string, key []byte) (string, error) {
 
 // jwtClaims is a minimal subset of standard JWT claims used for validity checks.
 type jwtClaims struct {
-	Exp int64 `json:"exp"`
-	Iat int64 `json:"iat"`
+	Exp      int64  `json:"exp"`
+	Iat      int64  `json:"iat"`
+	Sub      string `json:"sub"`
+	Username string `json:"username"`
 }
 
 // parseJWTTimes base64-decodes the JWT payload section and extracts the
 // "exp" and "iat" fields without performing any signature verification.
 // hasIat is false when the "iat" claim is absent (zero value after unmarshal).
 func parseJWTTimes(token string) (exp, iat time.Time, hasIat bool, err error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return time.Time{}, time.Time{}, false, errors.New("invalid JWT format")
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	claims, err := parseJWTClaims(token)
 	if err != nil {
-		return time.Time{}, time.Time{}, false, fmt.Errorf("decode JWT payload: %w", err)
-	}
-	var claims jwtClaims
-	if err = json.Unmarshal(payload, &claims); err != nil {
-		return time.Time{}, time.Time{}, false, fmt.Errorf("unmarshal JWT claims: %w", err)
+		return time.Time{}, time.Time{}, false, err
 	}
 	if claims.Exp == 0 {
 		return time.Time{}, time.Time{}, false, errors.New("JWT missing exp claim")
 	}
 	return time.Unix(claims.Exp, 0), time.Unix(claims.Iat, 0), claims.Iat != 0, nil
+}
+
+// parseJWTClaims base64-decodes the JWT payload section without performing any
+// signature verification.
+func parseJWTClaims(token string) (jwtClaims, error) {
+	var claims jwtClaims
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return claims, errors.New("invalid JWT format")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return claims, fmt.Errorf("decode JWT payload: %w", err)
+	}
+	if err = json.Unmarshal(payload, &claims); err != nil {
+		return claims, fmt.Errorf("unmarshal JWT claims: %w", err)
+	}
+	return claims, nil
 }

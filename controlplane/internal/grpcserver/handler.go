@@ -3,7 +3,6 @@ package grpcserver
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"path"
 	"time"
 
@@ -88,6 +87,9 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		}
 	}
 
+	// Push an initial STS session so the agent can upload immediately (IC-BUG-1).
+	s.pushCredentials(ctx, agentID)
+
 	// Start send goroutine.
 	sendErr := make(chan error, 1)
 	go func() {
@@ -121,8 +123,14 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	}
 }
 
-// RefreshCredentials allows an Agent to request new STS credentials for a
-// specific collection rule.
+// RefreshCredentials allows an Agent to request new STS credentials.
+//
+// rule_id is optional. When omitted the session covers every bucket targeted by
+// the agent's active collection rules, which is what the agent actually needs:
+// it uploads for all of its rules from a single credential and has no reason to
+// track which rule a queued task came from. Requiring rule_id was IC-BUG-1 —
+// the agent never sent one, so the parse failed and no credential was ever
+// issued.
 func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCredentialsRequest) (*agentv1.RefreshCredentialsResponse, error) {
 	if s.stsMgr == nil || s.credDB == nil {
 		s.logger.Debug("RefreshCredentials called (stsMgr/credDB not wired)",
@@ -131,27 +139,21 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 	}
 
 	agentID := req.GetAgentId()
-	ruleID := req.GetRuleId()
-
-	// Look up collection rule to find the target bucket.
-	parsedRuleID, err := uuid.Parse(ruleID)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid rule_id: %v", err)
+	if agentID == "" {
+		// Fall back to the verified identity on the stream/RPC context rather
+		// than trusting the request body.
+		agentID = extractAgentID(ctx)
+	}
+	if agentID == "" {
+		return nil, status.Error(codes.InvalidArgument, "missing agent_id")
 	}
 
-	rule, err := s.credDB.GetCollectionRuleByID(ctx, parsedRuleID)
+	buckets, err := s.bucketsForAgent(ctx, agentID, req.GetRuleId())
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "collection rule not found: %v", err)
+		return nil, err
 	}
 
-	bucket, err := s.credDB.GetBucketByID(ctx, rule.BucketID)
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "bucket not found: %v", err)
-	}
-
-	creds, err := s.stsMgr.IssueCredentials(ctx, agentID, []storage.BucketAccess{
-		{BucketName: bucket.Name, PathPrefix: fmt.Sprintf("agents/%s/", agentID)},
-	})
+	creds, err := s.stsMgr.IssueCredentials(ctx, agentID, buckets)
 	if err != nil {
 		s.logger.Error("refresh_credentials: issue STS failed",
 			zap.String("agent_id", agentID),
@@ -162,9 +164,104 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 
 	s.logger.Info("credentials refreshed",
 		zap.String("agent_id", agentID),
-		zap.String("bucket", bucket.Name),
+		zap.Int("buckets", len(buckets)),
 	)
 	return &agentv1.RefreshCredentialsResponse{Credentials: creds}, nil
+}
+
+// bucketsForAgent resolves the bucket set an STS session should cover.
+//
+// A non-empty ruleID narrows the session to that rule's bucket; otherwise every
+// active rule of the agent contributes its bucket. The result is deduplicated
+// by BuildSessionPolicy.
+func (s *Server) bucketsForAgent(ctx context.Context, agentID, ruleID string) ([]storage.BucketAccess, error) {
+	if ruleID != "" {
+		parsedRuleID, err := uuid.Parse(ruleID)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid rule_id: %v", err)
+		}
+		rule, err := s.credDB.GetCollectionRuleByID(ctx, parsedRuleID)
+		if err != nil {
+			return nil, status.Errorf(codes.NotFound, "collection rule not found: %v", err)
+		}
+		bucket, err := s.credDB.GetBucketByID(ctx, rule.BucketID)
+		if err != nil {
+			return nil, status.Errorf(codes.NotFound, "bucket not found: %v", err)
+		}
+		return []storage.BucketAccess{{BucketName: bucket.Name}}, nil
+	}
+
+	parsedAgentID, err := uuid.Parse(agentID)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid agent_id: %v", err)
+	}
+	rules, err := s.credDB.ListCollectionRulesByAgent(ctx, parsedAgentID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list collection rules: %v", err)
+	}
+
+	seen := make(map[uuid.UUID]struct{}, len(rules))
+	var buckets []storage.BucketAccess
+	for _, rule := range rules {
+		if rule.Status != db.RuleStatusActive {
+			continue
+		}
+		if _, dup := seen[rule.BucketID]; dup {
+			continue
+		}
+		seen[rule.BucketID] = struct{}{}
+		bucket, bErr := s.credDB.GetBucketByID(ctx, rule.BucketID)
+		if bErr != nil {
+			s.logger.Warn("credentials: lookup bucket failed, skipping",
+				zap.String("rule_id", rule.ID.String()),
+				zap.Error(bErr))
+			continue
+		}
+		buckets = append(buckets, storage.BucketAccess{BucketName: bucket.Name})
+	}
+	if len(buckets) == 0 {
+		return nil, status.Error(codes.FailedPrecondition,
+			"agent has no active collection rule with a resolvable bucket")
+	}
+	return buckets, nil
+}
+
+// pushCredentials issues an STS session for the agent and delivers it over the
+// open stream.
+//
+// The Control Plane never used to send ServerMessage_Credentials at all, so an
+// agent that had just connected sat there with no credentials and failed every
+// upload (IC-BUG-1). Pushing once at stream setup — alongside the rule sync —
+// means the agent is ready to upload as soon as it has rules to act on.
+func (s *Server) pushCredentials(ctx context.Context, agentID string) {
+	if s.stsMgr == nil || s.credDB == nil {
+		return
+	}
+	buckets, err := s.bucketsForAgent(ctx, agentID, "")
+	if err != nil {
+		// No active rule yet is the normal state for a freshly approved agent;
+		// it will get credentials from the refresh RPC once rules arrive.
+		s.logger.Info("connect: no credentials pushed",
+			zap.String("agent_id", agentID),
+			zap.Error(err))
+		return
+	}
+	creds, err := s.stsMgr.IssueCredentials(ctx, agentID, buckets)
+	if err != nil {
+		s.logger.Error("connect: issue STS failed",
+			zap.String("agent_id", agentID), zap.Error(err))
+		return
+	}
+	if !s.registry.Send(agentID, &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Credentials{Credentials: creds},
+	}) {
+		s.logger.Warn("connect: deliver credentials failed",
+			zap.String("agent_id", agentID))
+		return
+	}
+	s.logger.Info("connect: credentials pushed",
+		zap.String("agent_id", agentID),
+		zap.Int("buckets", len(buckets)))
 }
 
 // handleAgentMessage processes a single incoming message from an agent.

@@ -18,6 +18,13 @@ describe('SYSTEM_TEMPLATE_VARIABLES', () => {
 })
 
 describe('renderPathPreview', () => {
+  // IC-BUG-16: the object key never starts with "/", so a preview that shows
+  // one misrepresents what actually lands in MinIO.
+  it('strips the leading slash so the preview matches the real object key', () => {
+    expect(renderPathPreview('/{agent_name}/{filename}')).toBe('my-agent/data.csv')
+    expect(renderPathPreview('{agent_name}/{filename}')).toBe('my-agent/data.csv')
+  })
+
   // R-1: LDML time field + system variables
   it('R-1: replaces LDML time field and system variables', () => {
     const preview = renderPathPreview('/{agent_name}/{time:yyyy/MM/dd}/{filename}')
@@ -37,10 +44,11 @@ describe('renderPathPreview', () => {
     expect(preview).toContain('data.csv')
   })
 
-  // R-3: static path unchanged
+  // R-3: static path unchanged apart from the leading-slash normalisation
   it('R-3: returns static path unchanged when no variables are used', () => {
-    const preview = renderPathPreview('/static/path')
-    expect(preview).toBe('/static/path')
+    expect(renderPathPreview('static/path')).toBe('static/path')
+    // The leading "/" is dropped: it is not part of the object key.
+    expect(renderPathPreview('/static/path')).toBe('static/path')
   })
 
   // R-4: empty string
@@ -63,7 +71,7 @@ describe('renderPathPreview', () => {
 
   it('strips |tz= suffix and still renders LDML', () => {
     const preview = renderPathPreview('/{time:yyyy/MM|tz=Asia/Shanghai}')
-    expect(preview).toMatch(/\/\d{4}\/\d{2}/)
+    expect(preview).toMatch(/^\d{4}\/\d{2}$/)
   })
 })
 
