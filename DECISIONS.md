@@ -1283,3 +1283,185 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 - 测试：`SetActive_Disable`（is_active=false 透传 + 回读 body）/`_MissingField`（400）/`_CannotDisableSelf`（自禁 400、DB 未被调）。
 - 前端：`setUserActive(id, isActive)`；`Settings/Users` 操作列 删除 → 禁用/启用（`useDangerConfirm`，自禁按钮禁用）。
 - 实机：自我禁用→400、缺字段→400。
+
+---
+
+## D-030：文件索引一致性与写入准入模型（STS grant + 注册 outbox + 分片对账）
+
+**决策日期**：2026-09-08
+**影响范围**：controlplane（`internal/indexer`、`internal/storage`、`internal/grpcserver`、`internal/api/handler`、
+`internal/worker`、`migrations`）、agent（`internal/queue`、`internal/executor`、`internal/uploader`、`cmd/agent`）、
+`proto/v1/agent.proto`（只增字段）、SDK（写入协议）、deploy（MinIO 通知与 ILM 配置）、
+文档（`system-design.md` §4.5/§4.7/§5.7/§5.8/§6.3/§6.5、`contracts.md`）
+**权威设计**：[`docs/design/consistency-and-ingest.md`](docs/design/consistency-and-ingest.md)
+**缺陷清单**：[`docs/tasks/bugs/open.md`](docs/tasks/bugs/open.md) IC-BUG-1…IC-BUG-15
+**来源**：产品提出两条此前不成立的前提——(1) 必须允许 Agent 之外的进程（ETL）写入 bucket 并记录 tags 与血缘；
+(2) 对象数量级为千万/年、3–5 年上亿。据此对写入链路做全面审计，发现**设计与实现存在系统性反转**。
+
+### 背景：审计发现（2026-09-08）
+
+`system-design.md` §4.5 描述的主路径（Agent 上传 → 上报 `UploadResult` → CP 索引）**在实现中完全不存在**，
+而 D-025 补充 §3 与 `metadata-model.md` P2.2 明确定位为「只做对账兜底」的 minio-event webhook，
+**成了 `file_entries` 的唯一写入者**。根因是四条独立断链（IC-BUG-1…IC-BUG-4），合起来意味着
+**Agent 数据面从未端到端跑通过**——单元测试全部 mock 掉 STS 与 gRPC，故长期不可见。
+
+同时确认：全 controlplane 无一处 `ListObjects` / `StatObject`，**不存在任何 MinIO↔PostgreSQL 对账机制**；
+事件丢失有三条相互独立的通道（`queue_dir` 在 `/tmp`、`queue_limit` 溢出、索引失败仍返回 200），
+且丢失即终态。
+
+### 决策
+
+**一、不更换存储层。** 四项需求中只有一项与存储实现有关，且对象存储在该项上无差别。
+详细评估见设计文档 §2（lakeFS / Iceberg-Delta / S3 Object Tagging / 换 PG 均被否决）。
+
+**二、事实来源改为「写入方的持久化意图 + CP 的授权记录」**，MinIO 事件降级为低延迟提示：
+
+```
+对账成本 = O(未结算的授权) + O(总量 / 轮转预算)     ← 两项都有界且可配
+```
+
+**三、STS 授权即写入意向声明。** 新增 `write_grants` 记录每次 STS 签发的 (principal, bucket, prefix, TTL)。
+写入方 outbox 清空后调 `POST /api/v1/grants/{id}/settle {count:N}`，CP 比对注册数即结算，
+**稳态下不发一次 `ListObjects`**；仅「数量不符」或「到期未结算」才触发列举。
+STS 的 1h TTL 天然把最坏情况的对账工作单元切成「一小时的写入量」。
+
+**四、统一写入协议，Agent 与 SDK/ETL 共用**：申请 STS + grant_id → 直传 MinIO（内容不过 CP）→
+`POST /api/v1/files/register`（批量幂等，携带 tags / run_id）→ 失败留 outbox 重试 → 结算。
+这是 `metadata-model.md` P2.2 的完整化，并把同一协议**回收适用于 Agent**。
+
+**五、宽表/窄表分家**（PostgreSQL 分区表要求唯一约束包含分区键，否则 `(bucket_id, storage_path)`
+幂等性会失效）：新增不分区的窄表 `object_keys` 承载幂等键与对账；`file_entries` 按 `uploaded_at`
+月 RANGE 分区承载业务查询。对账只扫窄表，不碰宽表。
+
+**六、`file_entries` / `object_keys` 增加 `observed_at` 排序键与 `source` 来源列**，
+upsert 加 `WHERE EXCLUDED.observed_at >= 现有值` + 富字段 `COALESCE`，
+使两条写入路径可交换（修 IC-BUG-8 / IC-BUG-13）。
+
+**七、对账分三级**：L1 grant 结算（稳态零列举）→ L2 分片轮转（长尾兜底，采用外部项目
+minio-inventory 已在生产验证的分片审计模型）→ L3 幽灵清理。L2 的五条实施约束见设计文档 §3.5，
+其中最关键的一条：**判「分片被写过」只能用对象自身的 mtime，绝不能用 `updated_at`**
+（扫描自身的 upsert 会推进后者，导致封存机制完全失效）。
+
+**八、血缘提前实施 `metadata-model.md` P2.3 的 run 模型**（触发信号「ETL 开始建设」已到达），
+挂载点为 `batch-download-urls`（记 `run_inputs`）与 `files/register`（挂输出），ETL 零额外申报。
+
+### 备选方案（被否决）
+
+- **更换存储层为 lakeFS / Iceberg / Delta**：见设计文档 §2 逐项理由。核心是这些需求属于**准入协议**
+  与 **catalog** 两层，不属于存储层；血缘是图，任何对象存储都无法表达。
+- **用 S3 Object Tagging 让对象自描述、PG 退化为可重建缓存**：`ListObjectsV2` 不返回 tag，
+  读取需每对象一次 `GetObjectTagging`，把对账从 O(N) 次列举变成 O(N) 次请求，比现状更差。
+  保留为「灾难重建的冗余副本」这一有限用途。
+- **把 minio-event 做成可靠通道（JetStream + 持久 queue_dir + 失败重投）作为唯一方案**：
+  能修补丢失，但仍无法解决贫血写入、覆盖富字段、以及「MinIO 静默不发事件」的残余风险；
+  且事件路径无法携带 tags 与血缘。降级为**兜底**而非主路径。
+- **周期性全量列举 MinIO 对账**：成本 O(总量)/周期，在目标量级（3–5 年上亿）上不成立，
+  换硬件只改常数不改量纲。
+- **`file_entries` 直接按时间分区、不拆窄表**：唯一约束被迫包含分区键，
+  `(bucket_id, storage_path)` 幂等性失效，同 key 不同时间会插入两行。
+- **允许写入方绕过 CP 直连 MinIO**（产品已确认不需要）：准入闸门失效，对账退回 O(总量)。
+
+### 分期实施
+
+| 阶段 | 任务 | 内容 | 说明 |
+|---|---|---|---|
+| 止血 | IC-1…IC-5 | 修 IC-BUG-1…IC-BUG-7、IC-BUG-9…IC-BUG-12 | 独立可发；完成后数据面首次端到端可用 |
+| 地基 | IC-6…IC-7 | `observed_at`/`source`/`grant_id`/`run_id` 列、`object_keys` 拆分、分区、排序键 upsert | **必须趁数据量小完成** |
+| 准入 | IC-8…IC-10 | `write_grants` + `register` + `settle` + policy 前缀动态生成 | 依赖地基阶段的列 |
+| 对账 | IC-11…IC-13 | 事件传输改 JetStream（D-031）→ L1 → L2 → L3 | 依赖地基（窄表的 mtime 是 L2 唯一可用信号列） |
+| 血缘 | IC-14 | run 模型（P2.3） | 随 ETL 建设 |
+
+### 待定（不阻塞止血阶段）
+
+`storage_path` 前缀约定的最终形态（A）、分区粒度与归档策略（B）、
+文件列表 `total` 去 `COUNT(*)` 的方案（C，改动 D-007 契约需单独决策）、
+ETL 是否允许就地覆盖同一 key（D）、SDK outbox 最小形态（E）。详见设计文档 §6。
+
+### 关联
+
+- 前序：**D-014**（minio-event 鉴权）、**D-017**（webhook 索引路径复活）、
+  **D-025** 补充 §3（衍生数据入口：ETL 禁止直连 MinIO）、**D-007**（cursor 分页与 `total`）
+- 设计：`docs/design/consistency-and-ingest.md`、`docs/design/metadata-model.md` P2.2/P2.3
+- 缺陷：`docs/tasks/bugs/open.md` IC-BUG-1…IC-BUG-15
+
+---
+
+## D-031：MinIO 事件传输由 webhook 改为 NATS JetStream（排期对账阶段 IC-11）
+
+**决策日期**：2026-09-08
+**影响范围**：deploy（`init-minio.sh`、compose）、controlplane（`internal/event`、`internal/api/handler/events.go`、
+`internal/api/router.go`、`config`）、文档（`system-design.md` §1.4/§2.1/§6.5、`docs/ops/`）
+**关联**：**D-030**（一致性与写入准入总设计，本条是其对账阶段的前置）、**D-014**（webhook 共享密钥鉴权，将被取代）、
+**D-017**（webhook 索引路径复活）
+**权威设计**：[`docs/design/consistency-and-ingest.md`](docs/design/consistency-and-ingest.md) §3.5
+
+### 背景：当初并没有做过这个选型
+
+审计发现，**`system-design.md` 从初始导入（`c2341f0`，2026-04-27）起就自相矛盾**：
+
+| 位置 | 说法 |
+|---|---|
+| §1.4 整体架构图 | `MinIO ──事件通知──► [PostgreSQL │ Redis │ NATS 事件总线]` |
+| §2.1 组件职责 | NATS 职责 = 「**MinIO 事件消费**、Webhook 分发、内部异步通信」 |
+| §6.5 事件通知配置 | 给出的却是 `notify_webhook` + `POST /internal/minio-event` 的可执行配置 |
+
+实现照抄了 §6.5——因为它是三处里唯一一段**可直接执行的配置片段**（`init-minio.sh` 于 PR #4 落地、
+`events.go` 骨架于 PR #6 落地）。架构图与 §2.1 描述的 MinIO→NATS 通路**从未被实现**。
+D-014 只讨论「webhook 端点如何鉴权」，把 webhook 视作既成事实，未回头质疑传输选型。
+
+**结论：不存在「当初为什么选 webhook」这个决策，只有「照抄了文档中更具体的那一半」。** 本条补上缺失的选型。
+
+### 决策
+
+**MinIO → Control Plane 的对象事件通道改用 `notify_nats` + JetStream（`jetstream=on`），排期在 D-030 的对账阶段（IC-11）。**
+
+选它而非 webhook 的理由，三条都直接服务于 D-030 的对账模型：
+
+1. **解耦「投递成功」与「处理成功」**。MinIO 拿到 JetStream 的 PubAck 即完成投递；CP 宕机时消息留在 stream 中，
+   重启后由 durable consumer 从原位置续读。**这从根上消除 IC-BUG-6**——不再依赖「CP 返回什么 HTTP 状态码」
+   这一极易写错的约定（现状正是无条件返回 200 导致 MinIO 丢弃事件），改为「处理成功才 ack，否则按
+   `ack_wait` 重投」。
+2. **可重放**。retention 期内可从任意序号重放，对重建索引与对账极有价值；webhook 无此能力。
+3. **stream sequence 是全局单调序号**。可直接用作 D-030 §3.4 的 `observed_at` 排序键来源；
+   更关键的是支持**链路自证**——比较 stream 的 `first_seq` 与 consumer 的 `ack_floor`，即可判断是否有消息
+   因 retention 过期而从未被消费，进而定位「哪些分片的核实结论已不可信」。这是 webhook 架构下无法回答的问题。
+
+基础设施已就绪：dev 与 prod 的 NATS 均已启用 JetStream（`docker-compose.dev.yml:61`、
+`docker-compose.prod.yml:52` 的 `-js`），但 CP 代码一直只用 core NATS（`conn.Publish` / `conn.Subscribe`），
+JetStream 处于闲置状态。
+
+### 明确不解决的（避免误判收益）
+
+- **不消除「MinIO 静默不发事件」的残余风险**——那是 MinIO 内部行为，与传输层无关。
+  **D-030 的 L2 分片轮转仍然必需，一项都不能省。**
+- **`queue_dir` 的问题原样存在**。`notify_nats` 同样有 `queue_dir` / `queue_limit`，IC-BUG-9 必须照修。
+- **retention 配置过短 = 静默丢消息**，这恰恰是上面第 3 条「链路自证」存在的理由，不是可选项。
+
+### 代价
+
+- 新增运维面：stream 定义、retention 策略、durable consumer 配置、磁盘容量规划。
+- 鉴权载体更换：D-014 的共享密钥 → NATS creds / nkey / TLS。**fail-closed 原则继续适用**，
+  但 D-014 的具体结论在切换完成后作废。
+- CP 侧需引入 JetStream context 与 durable consumer，替换现有的 core NATS 订阅。
+
+### 排期与理由：排在对账阶段，不在止血阶段
+
+- 单独更换传输，增量收益仅为「CP 宕机不丢事件」，而修完 IC-BUG-6 + IC-BUG-9 已能取得其中大部分；
+- 真正的增量价值（重放、序号作排序键、链路自证）须待地基阶段（`observed_at` / `object_keys`，IC-6）与
+  对账阶段（IC-12/IC-13）落地后才兑现；
+- 现在切换会使止血阶段复杂化，而止血阶段的唯一目标是**先让数据面端到端跑通**。
+
+> **与 D-030 已否决项的界线**：D-030 否决的是「把 minio-event 做成可靠通道**作为唯一方案**」——
+> 因为事件路径无法携带 tags 与血缘，且无法解决贫血写入与富字段覆盖。
+> 本条决定的是「**作为兜底通道时，它应当用什么传输实现**」。两者不冲突：
+> 事件通道降级为兜底之后**更需要"可重放"**，这反而加强了改用 JetStream 的理由。
+
+### 备选方案（被否决）
+
+- **维持 webhook，仅修 IC-BUG-6 + IC-BUG-9**：能止血，但拿不到重放与全局序号，
+  D-030 的链路自证（判断分片核实结论是否可信）将无法实现。
+- **改用 core NATS（`jetstream=off`）**：**比 webhook 更差**——fire-and-forget，MinIO 发出即忘，
+  无 PubAck、无持久化，无订阅者时消息直接消失。
+- **立即切换（放进止血阶段）**：见上「排期与理由」。
+- **双通道并行（webhook + JetStream 同时开）**：两条路径写同一张表，在 `observed_at` 排序键
+  （地基阶段 IC-6）落地前会互相覆盖；且加倍了鉴权与运维面。切换应是一次性替换。
