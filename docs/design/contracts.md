@@ -147,9 +147,30 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 - webui 预览渲染镜像：`webui/src/utils/pathTemplate.ts`（`formatLDML`）
 - 决策背景：`DECISIONS.md` **D-010**（引入 `pkg/trollsift` 统一路径模板）
 
+### 前导 `/` 的归一化（三端共享约定）
+
+**对象键 = 模板渲染结果去掉前导 `/`。** 权威实现是 agent 的 `buildStoragePath`
+（`agent/cmd/agent/main.go:545` 的 `strings.TrimPrefix(storagePath, "/")`）。
+
+这条约定有**三个解释者**，且当前只有一个做对：
+
+| 端 | 位置 | 现状 |
+|---|---|---|
+| agent（拼对象键） | `agent/cmd/agent/main.go:545` | ✅ 剥前导 `/` |
+| CP（反解 path_var 打标） | `controlplane/internal/indexer/indexer.go:409` | ❌ 用未归一化的原始模板 `Parse`，模板带 `/` 时必然失配 |
+| webui（模板预览） | `webui/src/utils/pathTemplate.ts:48` | ❌ 不剥，预览显示 `/my-agent/…`，实际键是 `my-agent/…` |
+
+而 webui 新建规则的默认模板就带前导 `/`（`webui/src/pages/Agents/RuleForm.tsx:104` = `/{agent_name}/{time:yyyy/MM/dd}/{filename}`），
+**经 UI 创建的规则全部命中**。见 `docs/tasks/bugs/open.md` **IC-BUG-16**，随 IC-1 修复：
+归一化收敛为单一函数、三端共用，方向是**CP 与 webui 剥模板**（不是让 agent 停止剥路径——那会改写所有既有对象键）。
+
 > ⚠️ **漂移风险点**：系统变量清单与时间符号表当前在
 > `pkg/trollsift`（Go，权威）与 `webui/src/utils/pathTemplate.ts`（TS，镜像）**两处手工维护**。
 > 修改任一处务必同步另一处；`pkg/trollsift` 为准。（这正是 G-8 契约单一权威想根治的场景，暂以本注记兜底。）
+> 加上前导 `/` 的归一化，这条模板契约实际有**三个**手工维护点。
+
+> **`dest_path_template` 不受任何形状约束**——不强制前缀、不要求首段可解析、不要求含时间字段。
+> 见 `DECISIONS.md` **D-030 第八条**。
 
 ---
 
@@ -200,6 +221,10 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 ---
 
 ## 规划中（未实现，不作为现行契约）
+
+> ⚠️ **本节已部分过期**：6c Phase 1（MT-1…MT-6）已于 2026-07-14 收官（PR #69–#79），
+> 下面这条不再是「规划中」。正式条目待回填——IC-BUG-16 恰恰是一条 V-3 契约违规，
+> 若当初收官时回填了带 `file:line` 的正式条目，本索引本可拦下它。
 
 - **元数据 / 标签（6c Phase 1，D-025）**：将新增若干跨模块契约——待确认取值队列（`pending_tag_values.status`
   当前设计仅 `pending` 一个活跃态，核准/合并/拒绝即出队，非多态状态机）、文件筛选可重复

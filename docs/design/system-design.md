@@ -1725,11 +1725,23 @@ MINIO_VOLUMES="https://minio{1...4}.internal:9000/data{1...4} \
 {yyyy} {yy} {mm} {dd} {HH} {agent} {filename} {stem} {ext}
 ```
 
+> ⚠️ **本节与实现不符（既存漂移，随 IC-1 修正）**：
+> 1. 「推荐格式」只是**建议**，不是约束——D-030 第八条已定 `dest_path_template` 不受任何约束。
+> 2. 变量清单与权威定义不一致：实际支持的系统变量是 `{agent_name}` / `{agent_id}` / `{filename}` / `{ext}`
+>    （`pkg/trollsift/context.go`，索引见 [`contracts.md`](./contracts.md) V-3），本节的 `{agent}` / `{stem}` 不存在。
+> 3. **前导 `/` 是陷阱**：agent 在拼对象键时会剥掉它（`buildStoragePath`），
+>    而 CP 反解与 webui 预览都不剥——即 IC-BUG-16。归一化规则见 `contracts.md` V-3。
+
 ## 6.3 ACL 与 Policy 设计
 
 > ⚠️ **实现偏差（D-030）**：`storage/policy.go` 的 Action 为 `PutObject / GetObject / DeleteObject / ListBucket`
 > ——缺下方要求的两个 multipart Action，且多授 `DeleteObject`（IC-BUG-4）。资源前缀亦与本文 §6.2 的对象键约定
-> 不一致（IC-BUG-3）。
+> 不一致（IC-BUG-3）。另外 `ListBucket` 是**桶级** action 却配了对象级 ARN，是一条从未生效的空转授权。
+>
+> 📌 **目标形态（D-030 第八条，2026-09-09）**：下方示例已按新决策改写——**拆两个 statement**
+> （桶级 / 对象级 ARN 层级必须匹配），**资源为整桶**（不按前缀收窄；授权宽度是管理权限问题，
+> 清点成本由分片对账解决），**只授「写」**（agent 从不调 `GetObject` / `ListObjects`，
+> 二者属超授，一并砍掉）。见 [`consistency-and-ingest.md`](./consistency-and-ingest.md) §3.2。
 
 | 账号类型            | 权限范围                   | 用途                 |
 |-----------------|------------------------|--------------------|
@@ -1737,21 +1749,31 @@ MINIO_VOLUMES="https://minio{1...4}.internal:9000/data{1...4} \
 | **agent-role**  | STS AssumeRole 角色      | Agent 临时扮演         |
 | **readonly-sa** | 所有 Bucket s3:GetObject | 预签名下载 URL          |
 
-**STS Session Policy（动态生成）：**
+**STS Session Policy（按 Agent 已下发规则涉及的 bucket 集合生成）：**
 
 ```json
 {
   "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": [
-      "s3:PutObject", "s3:GetObject",
-      "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
-    ],
-    "Resource": ["arn:aws:s3:::data-sensor/var/2025/*"]
-  }]
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucketMultipartUploads"],
+      "Resource": ["arn:aws:s3:::data-sensor"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
+      ],
+      "Resource": ["arn:aws:s3:::data-sensor/*"]
+    }
+  ]
 }
 ```
+
+> 桶级 action（`ListBucketMultipartUploads`）的 Resource **不带 `/*`**，对象级 action 的**带**——
+> 层级不匹配的授权不会报错，只是静默失效。
 
 ## 6.4 STS AssumeRole 凭据下发机制
 

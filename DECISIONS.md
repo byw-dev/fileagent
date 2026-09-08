@@ -1294,7 +1294,7 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 `proto/v1/agent.proto`（只增字段）、SDK（写入协议）、deploy（MinIO 通知与 ILM 配置）、
 文档（`system-design.md` §4.5/§4.7/§5.7/§5.8/§6.3/§6.5、`contracts.md`）
 **权威设计**：[`docs/design/consistency-and-ingest.md`](docs/design/consistency-and-ingest.md)
-**缺陷清单**：[`docs/tasks/bugs/open.md`](docs/tasks/bugs/open.md) IC-BUG-1…IC-BUG-15
+**缺陷清单**：[`docs/tasks/bugs/open.md`](docs/tasks/bugs/open.md) IC-BUG-1…IC-BUG-17
 **来源**：产品提出两条此前不成立的前提——(1) 必须允许 Agent 之外的进程（ETL）写入 bucket 并记录 tags 与血缘；
 (2) 对象数量级为千万/年、3–5 年上亿。据此对写入链路做全面审计，发现**设计与实现存在系统性反转**。
 
@@ -1392,7 +1392,7 @@ Agent 的 session policy 体积上限，全部不存在。IC-1 的实现量因�
 
 | 阶段 | 任务 | 内容 | 说明 |
 |---|---|---|---|
-| 止血 | IC-1…IC-5 | 修 IC-BUG-1…IC-BUG-7、IC-BUG-9…IC-BUG-12 | 独立可发；完成后数据面首次端到端可用 |
+| 止血 | IC-1…IC-5 | 修 IC-BUG-1…IC-BUG-7、IC-BUG-9…IC-BUG-12、IC-BUG-16…IC-BUG-17 | 独立可发；完成后数据面首次端到端可用 |
 | 地基 | IC-6…IC-7 | `observed_at`/`source`/`grant_id`/`run_id` 列、`object_keys` 拆分、分区、排序键 upsert | **必须趁数据量小完成** |
 | 准入 | IC-8…IC-10 | `write_grants` + `register` + `settle` | 依赖地基阶段的列；policy 保持整桶 |
 | 对账 | IC-11…IC-13 | 事件传输改 JetStream（D-031）→ L1 → L2 → L3 | 依赖地基（窄表的 mtime 是 L2 唯一可用信号列） |
@@ -1410,7 +1410,7 @@ ETL 是否允许就地覆盖同一 key（D）、SDK outbox 最小形态（E）�
 - 前序：**D-014**（minio-event 鉴权）、**D-017**（webhook 索引路径复活）、
   **D-025** 补充 §3（衍生数据入口：ETL 禁止直连 MinIO）、**D-007**（cursor 分页与 `total`）
 - 设计：`docs/design/consistency-and-ingest.md`、`docs/design/metadata-model.md` P2.2/P2.3
-- 缺陷：`docs/tasks/bugs/open.md` IC-BUG-1…IC-BUG-16
+- 缺陷：`docs/tasks/bugs/open.md` IC-BUG-1…IC-BUG-17
 
 ---
 
@@ -1479,11 +1479,13 @@ JetStream 处于闲置状态。
   对账阶段（IC-12/IC-13）落地后才兑现；
 - 现在切换会使止血阶段复杂化，而止血阶段的唯一目标是**先让数据面端到端跑通**。
 
-> ⚠️ **但它是 L2 的硬前置，不是可选优化（2026-09-09 追加）。** L2 的分片状态需要二维信息回答
-> 「这个分片是否已知完整」——*扫描核实到 T 时刻，且事件已消费到序号 X*（`shard_state.last_event_seq`）。
-> 只有扫描时间不够：扫描期间与之后的变更由事件覆盖，必须知道事件消费位置才能推断覆盖范围。
-> **HTTP webhook 没有单调序号，拿不到 X。** 因此 IC-11 必须先于 IC-12/IC-13 完成，
-> 这条依赖不能因排期压力而跳过。
+> **补充：这个顺序不只是排期偏好，也是 L2 结论可信度的前提（2026-09-09 追加）。**
+> 没有 JetStream，L2 仍然能工作——minio-inventory 的 L2 就在纯事件 + 扫描的形态下跑在生产上——
+> 但它的 `verified` / `sealed` 结论**无法自证**：事件若因 retention 过期而从未被消费，
+> 无从判定哪些分片的核实结论已经作废。`shard_state.last_event_seq` 正是为收窄这个失效范围而存在
+> （用途仅此一项，见 minio-inventory `docs/01-审计可扩展性设计.md` §6.D），
+> 而 HTTP webhook 没有全局单调序号，拿不到它。分期表原本就把 IC-11 排在 IC-12/IC-13 之前，
+> 这里补的是该顺序的理由。
 
 > **与 D-030 已否决项的界线**：D-030 否决的是「把 minio-event 做成可靠通道**作为唯一方案**」——
 > 因为事件路径无法携带 tags 与血缘，且无法解决贫血写入与富字段覆盖。

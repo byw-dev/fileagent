@@ -4,7 +4,7 @@
 > 从「靠事件运气」改造为「有界成本可验证」。
 > **权威设计**：[`docs/design/consistency-and-ingest.md`](../design/consistency-and-ingest.md)
 > **决策**：`DECISIONS.md` **D-030**（总设计）、**D-031**（事件传输改 JetStream）
-> **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-15
+> **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-17
 > **来由**（2026-09-08）：产品提出两条此前不成立的前提——必须允许 ETL 等非 Agent 进程写入并记录
 > tags 与血缘；对象量级为千万/年、3–5 年上亿。据此审计发现 **Agent 数据面从未端到端跑通过**。
 
@@ -68,14 +68,14 @@ grep -rEn '\b(CI|DP)-[0-9]+|\b(CI|DP)\s*系列' --include='*.md' .
 
 | ID | 模块 | 内容 | 验收要点 | 状态 |
 |----|------|------|----------|------|
-| **IC-1** | CP + agent | **STS 链路接通**（IC-BUG-1 + IC-BUG-3 + IC-BUG-4 + IC-BUG-16）。① CP 在 `Connect` 建流后推送一次 `ServerMessage_Credentials`（与 `SyncRulesOnConnect` 同时机）；② 对齐 `RefreshCredentialsRequest` 契约——允许省略 `rule_id`，按该 Agent 已下发规则涉及的 bucket 集合签发；③ **policy 资源改为整桶** `arn:aws:s3:::{bucket}/*`（修 IC-BUG-3；D-030 第八条：授权宽度是管理问题、清点成本由分片对账解决，**不约束 `dest_path_template`**）；④ **policy 拆两个 statement**（修 IC-BUG-4，对齐 §6.3）：桶级 `s3:ListBucket` / `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`）；对象级 `s3:PutObject` / `s3:GetObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/*`；移除 `DeleteObject`。**注意**：当前 `ListBucket` 配对象级 ARN，是一条从未生效的空转授权，只补 Action 不改 ARN 层级修不掉；⑤ Agent 刷新 goroutine 去掉 `sts == nil` 短路；⑥ **模板归一化**（修 IC-BUG-16）：收敛到一个函数，两端共用 | **live-e2e**：dev 环境起 CP + agent，落一个文件 → MinIO 出现对象 → `file_entries` 有行；`mc ls --incomplete` 可执行（不 403）——**IC-3 的验收依赖这一条**；模板以 `/` 开头的规则，`file_tags` 里能查到 path_var 来源的标签（IC-BUG-16 回归）。**不接受仅单测通过** | ⬜ |
+| **IC-1** | CP + agent | **STS 链路接通 + 身份/模板归一化**（IC-BUG-1 + IC-BUG-3 + IC-BUG-4 + IC-BUG-16 + IC-BUG-17）。① CP 在 `Connect` 建流后推送一次 `ServerMessage_Credentials`（与 `SyncRulesOnConnect` 同时机）；② 对齐 `RefreshCredentialsRequest` 契约——允许省略 `rule_id`，按该 Agent 已下发规则涉及的 bucket 集合签发；③ **policy 资源改为整桶** `arn:aws:s3:::{bucket}/*`（修 IC-BUG-3；D-030 第八条：授权宽度是管理问题、清点成本由分片对账解决，**不约束 `dest_path_template`**）；④ **policy 拆两个 statement**（修 IC-BUG-4，对齐 §6.3）：桶级 `s3:ListBucket` / `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`）；对象级 `s3:PutObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/*`；**移除 `DeleteObject` / `GetObject` / `ListBucket`**（产品批的是「写整桶」，agent 从不调 Get/List，读与列举属超授）；删掉 `policy.go:41-43` 的 `arn:aws:s3:::*` 空桶兜底。**注意**：当前 `ListBucket` 配对象级 ARN，是一条从未生效的空转授权，只补 Action 不改 ARN 层级修不掉；⑤ Agent 刷新 goroutine 去掉 `sts == nil` 短路；⑥ **模板归一化**（修 IC-BUG-16）：收敛到一个函数，**agent 拼路径 / CP 反解 / webui 预览三端共用**。**方向必须是「CP 与 webui 侧剥模板的前导 `/`」，不是「agent 停止剥路径」**——后者会改写所有对象键、需全量重铺；⑦ **缓存 token 分支补齐 `AgentID`/`AgentName`**（修 IC-BUG-17，从 JWT claims 还原），并给 `buildStoragePath` 的 Compose 失败路径加 `logger.Warn` | **live-e2e**：dev 环境起 CP + agent，落一个文件 → MinIO 出现对象 → `file_entries` 有行；`mc ls --incomplete` 可执行（不 403）——**IC-3 的验收依赖这一条**；模板以 `/` 开头的规则，`file_tags` 里能查到 path_var 来源的标签（IC-BUG-16 回归）；**Agent 重启后**再落一个文件，对象键仍符合模板而非裸 basename（IC-BUG-17 回归）；用签发的 STS 做 `GetObject` / `ListObjects` 须 403。**不接受仅单测通过** | ⬜ |
 | **IC-2** | proto + CP + agent + 迁移 | **上报 + ack outbox + 排序键**（IC-BUG-2 + IC-BUG-8 + IC-BUG-13，含 IC-BUG-12 的上报部分）。① `proto` 给 `UploadResult` 加 `task_id`（只增字段）；② CP 处理完后回发 `Acknowledgement`（消息已存在，只是无人发送）；③ `UploadFunc` 改为返回 `(*uploader.UploadResult, error)`，队列增 `reported` 状态，**收到 ack 才置 completed**；④ **迁移：`file_entries` 加 `observed_at` + `source`**（`agent`/`api`/`minio_event`/`audit`），upsert 加 `WHERE EXCLUDED.observed_at >= 现有值` + 富字段 `COALESCE`；⑤ 重试耗尽时以 `success=false` 上报 | **live**：上传后 `agent_id`/`rule_id`/`sha256` 非空、`upload_logs` 有行、NATS 收到 `events.file.uploaded`；停 CP 再恢复，任务重发且不产生重复行；单测覆盖「webhook 更早/更晚 `observed_at` 均不清空富字段」 | ⬜ |
 | **IC-3** | agent + deploy | **续传落盘 + 分片清理**（IC-BUG-5）。① 新增 `Queue.SaveMultipartProgress(id, uploadID, partsJSON)`，每片完成即落盘；② 任务进入终态（completed / 放弃）时调 `AbortMultipartUpload`；③ 数据桶加 `AbortIncompleteMultipartUpload` 的 ILM 规则兜底。**依赖 IC-1 已签发桶级 `s3:ListBucketMultipartUploads`**，否则本条验收会 403 卡住 | >64MB 文件传输中途 kill agent，重启后从断点续传（日志可见跳过分片数）；放弃的任务在 `mc ls --incomplete` 无残留 | ⬜ |
 | **IC-4** | CP + deploy | **webhook 可靠性止血**（IC-BUG-6 + IC-BUG-7 + IC-BUG-9）。① 索引失败返回 5xx 让 MinIO 重投、解析失败返回 400；② `MakeBucket` 后调 `SetBucketNotification`，并在启动时对 `buckets` 表逐个 ensure（幂等补注册）；③ `queue_dir` 迁至持久卷 | 断开 PG 触发 ObjectCreated → 端点 5xx → 恢复 PG 后 MinIO 重投、`file_entries` 补齐；通过 API 新建 bucket 后直接 `mc cp` 一个对象，索引出现该行 | ⬜ |
 | **IC-5** | agent | **采集正确性**（IC-BUG-10 + IC-BUG-11 + IC-BUG-12 剩余）。① `IsProcessed` 改为比较 `(rule_id, local_path, file_mtime, file_size)`，并修正与实现不符的注释；② `submitFile` 补齐 `FileOffset` / `AppendMode` 赋值，tail 偏移随任务落盘；③ 按文件大小推导 per-upload timeout（可配置下限） | 改文件内容后能被重新采集；`append_mode=tail` 规则第二次只传增量且重启后偏移不丢；不可达 MinIO 下 worker 会超时释放而非永久占用 | ⬜ |
 
 > **止血阶段顺序**：IC-1 → IC-2 →（IC-3 / IC-4 / IC-5 可并行）。
-> **止血阶段收尾产出**：`docs/tasks/bugs/closed.md` 归档 IC-BUG-1…IC-BUG-13 与 IC-BUG-16；`system-design.md` §4.5/§4.7/§5.7/§5.8/§6.3/§6.5
+> **止血阶段收尾产出**：`docs/tasks/bugs/closed.md` 归档 IC-BUG-1…IC-BUG-13、IC-BUG-16 与 IC-BUG-17；`system-design.md` §4.5/§4.7/§5.7/§5.8/§6.3/§6.5
 > 的「实现状态 / 实现偏差」告警块随之删除或改写。
 
 ### 地基 — 表结构（有时间窗口，宜早不宜迟）（IC-6…IC-7）
@@ -89,7 +89,7 @@ grep -rEn '\b(CI|DP)-[0-9]+|\b(CI|DP)\s*系列' --include='*.md' .
 
 | ID | 模块 | 内容 | 验收要点 | 状态 |
 |----|------|------|----------|------|
-| **IC-8** | 迁移 + CP | **`write_grants` 表 + 签发登记**。每次签发 STS 时写入 `(principal, bucket_id, prefix, issued_at, expires_at, state)`；prefix 取 IC-1 已实现的动态前缀 | 每次凭据下发都有对应 grant 行；过期 grant 可被查询出来 | ⬜ |
+| **IC-8** | 迁移 + CP | **`write_grants` 表 + 签发登记**。每次签发 STS 时写入 `(principal_type, principal_id, bucket_id, issued_at, expires_at, state)`。**无 `prefix` 列**——D-030 第八条已定 policy 写整桶，grant 记录的是写入意向的**时间窗口**，空间切分由分片承担 | 每次凭据下发都有对应 grant 行；过期 grant 可被查询出来 | ⬜ |
 | **IC-9** | CP | **注册与结算端点**。① `POST /api/v1/files/register`（批量、幂等，携带 `storage_path/size/sha256/etag/file_mtime/tags/run_id/grant_id`，`source=api`，未登记 tag 值入 `pending_tag_values`）；② `POST /api/v1/grants/{id}/settle {count:N}`，比对 `registered_count == N` 即标记 settled | 重复注册不产生重复行且不倒退 `observed_at`；结算后 grant 状态正确；数量不符时进入待对账队列 | ⬜ |
 | **IC-10** | agent + SDK | **写入方接入协议**。① Agent 上报携带 `grant_id`，outbox 清空后调结算；② SDK 写入侧（Python 优先）提供 STS 申请 → 直传 → 注册 → 结算的封装与本地 outbox。**前置拍板：待定 E（SDK outbox 最小形态）** | Agent 正常运行时 grant 全部 settled；SDK 端到端跑通一次「拉取 → 加工 → 回写注册」 | ⬜ |
 
@@ -98,8 +98,8 @@ grep -rEn '\b(CI|DP)-[0-9]+|\b(CI|DP)\s*系列' --include='*.md' .
 | ID | 模块 | 内容 | 验收要点 | 状态 |
 |----|------|------|----------|------|
 | **IC-11** | deploy + CP | **事件传输 webhook → NATS JetStream**（**D-031**，对账阶段前置）。① MinIO 改配 `notify_nats` + `jetstream=on`；② CP 改用 JetStream durable consumer，**处理成功才 ack**；③ 鉴权载体由共享密钥换为 NATS creds/nkey/TLS（D-014 作废）；④ 用 stream sequence 填 `observed_at` | 停 CP 期间写入的对象，CP 重启后从 stream 续读并补齐索引；能按序号重放一段历史 | ⬜ |
-| **IC-12** | CP worker | **L1 grant 结算对账**。到期未结算 / 数量不符的 grant → 列举其 prefix → 与 `object_keys` 比对 → 补齐缺失、告警异常 | 人为丢弃一次注册后，grant 到期时被检出并补齐；稳态下**不发一次 `ListObjects`** | ⬜ |
-| **IC-13** | 迁移 + CP worker | **L2 分片轮转 + L3 幽灵清理**。`shard_state` + `bucket_audit_policy`；分片取 key 叶子目录；主通道从 `object_keys` 推导前缀、兜底通道真实列举；按预算调度。**严格遵守设计 §3.5 的五条约束**，尤其：判「分片被写过」只能用 `object_keys.last_modified`，**绝不能用 `observed_at` / `updated_at`** | 在目标分片与相邻分片各注入一条幽灵：目标分片的被清理、**相邻分片的存活**、真实对象一行未动；长期无写入的分片能成功封存；封存分片被写后能解封 | ⬜ |
+| **IC-12** | CP worker | **L1 grant 结算对账**。到期未结算 / 数量不符的 grant → **不列举**，改为按该 grant 的时间窗口查 `object_keys.last_modified` 得出受影响分片 → 置 `active` 交 L2 预算核实 → **同时告警**（富字段 tags/run_id/sha256 已永久丢失，L2 只能补回存在性，无法恢复，必须让人知道）| 人为丢弃一次注册后，grant 到期时被检出、相关分片转 `active`、告警产生；**L1 全程不发一次 `ListObjects`**（不只是稳态） | ⬜ |
+| **IC-13** | 迁移 + CP worker | **L2 分片轮转 + L3 幽灵清理**。`shard_state` + `bucket_audit_policy`；分片取 key 叶子目录；主通道从 `object_keys` 推导前缀、兜底通道真实列举；按预算调度。`shard_state` 含 `last_event_seq`（供链路自证收窄失效范围）。**严格遵守设计 §3.5 的八条约束**，尤其：判「分片被写过」只能用 `object_keys.last_modified`，**绝不能用 `observed_at` / `updated_at`**；批预算按对象数而非分片数；`verified` 分片有重查下限但首轮核实不受限 | 在目标分片与相邻分片各注入一条幽灵：目标分片的被清理、**相邻分片的存活**、真实对象一行未动；长期无写入的分片能成功封存；封存分片被写后能解封 | ⬜ |
 
 ### 血缘（IC-14）
 

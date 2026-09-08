@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16 为 2026-09-09 追加）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16/17 为 2026-09-09 追加）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -32,6 +32,7 @@
 | IC-BUG-14 | Dashboard `COUNT(*)` / `SUM` 全表扫描（规模隐患） | 🟡 P2 | controlplane |
 | IC-BUG-15 | 预签名下载 URL TTL 硬编码 15 分钟，大文件不够用 | 🟡 P2 | controlplane |
 | IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效 | 🟠 P1 | agent + controlplane |
+| IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 | 🔴 P0 | agent |
 
 ---
 
@@ -62,9 +63,9 @@
 | **根因** | CP 签发的 policy 资源固定为 `arn:aws:s3:::{bucket}/agents/{agent_id}/*`，而实际 `storage_path` **完全由规则的 `dest_path_template` 决定**，没有任何机制保证它落在该前缀下（测试夹具里就是 `/{year}/{filename}`、`out/{filename}`） |
 | **精确位置** | `controlplane/internal/grpcserver/handler.go:153`；`agent/cmd/agent/main.go:509`（`buildStoragePath`，纯模板展开） |
 | **文档冲突** | `system-design.md` §6.2 约定对象键为 `/{prefix}/{yyyy}/{mm}/{dd}/{filename}`，§6.3 的 policy 示例是 `data-sensor/var/2025/*`——**代码自造了一个文档里不存在的 `agents/{id}/` 前缀** |
-| **后果** | 即使修好 IC-BUG-1，上传仍会 403。且该前缀直接决定 D-030 中 grant 的对账粒度，必须先定死 |
-| **修复** | 二选一并在 D-030 记录：(a) 强制 `dest_path_template` 前缀，由 CP 在规则保存时校验/补齐；(b) policy 按规则的 `dest_path_template` 的**静态前缀部分**动态生成（推荐——同时天然收窄 grant 范围）。无论哪种，`storage_path` 的前缀约定必须写入 `contracts.md` |
-| **验收** | 用签发的 STS 凭据直接 `PutObject` 到规则实际生成的 `storage_path`，返回 200；写到前缀之外返回 403 |
+| **后果** | 即使修好 IC-BUG-1，上传仍会 403 |
+| **修复** | **已定（D-030 第八条，2026-09-09）**：policy 资源改为整桶 `arn:aws:s3:::{bucket}/*`，`dest_path_template` 不受任何约束。此前考虑的两个方案（强制模板前缀 / 按静态前缀动态生成）均已否决，理由见 D-030 备选方案 |
+| **验收** | 用签发的 STS 凭据直接 `PutObject` 到规则实际生成的 `storage_path`，返回 200（任意模板形状均成立，包括以 `/` 开头与首段为 `{filename}` 的） |
 
 ## IC-BUG-4 — STS session policy 缺 multipart 权限、多授 DeleteObject 🔴 P0
 
@@ -74,8 +75,8 @@
 | **精确位置** | `controlplane/internal/storage/policy.go:30-39`（Resource 全为对象级 ARN）、`:51-55`（Action 列表） |
 | **文档冲突** | `system-design.md` §6.3 的 policy 明确要求包含 multipart 两个 Action，且**不包含** `s3:DeleteObject` |
 | **后果** | >64MB 文件走 multipart：`verifyRemoteParts` 的 ListParts 会 403（续传路径不可用，与 IC-BUG-5 叠加）；失败后无法 Abort，孤儿分片无法清理。IC-BUG-5 验收要用的 `mc ls --incomplete` 需要 `s3:ListBucketMultipartUploads`，同为桶级 action，当前既没列出、列出了也会因 ARN 层级不匹配而空转。另外多授的 `DeleteObject` 让被入侵的 Agent 可删除已归档数据，与最小权限原则不符 |
-| **修复** | 拆成两个 statement：**桶级** `s3:ListBucket` / `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`），需收窄时加 `s3:prefix` condition；**对象级** `s3:PutObject` / `s3:GetObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/{prefix}/*`。移除 `DeleteObject`（若某处确需删除，单独签发或走 CP） |
-| **验收** | 上传一个 >64MB 文件成功；中断后重试能走续传；`mc ls --incomplete` 可执行（不 403）且无残留；用签发的 STS 对桶做 `ListBucket` 能返回前缀内对象、前缀外须 403 |
+| **修复** | 拆成两个 statement（前缀部分随 D-030 第八条改为整桶）：**桶级** `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`）；**对象级** `s3:PutObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/*`。**移除 `DeleteObject`、`GetObject`、`ListBucket`**——agent 全仓库从不调用 `GetObject` / `StatObject` / `ListObjects`（已 grep 确认），产品批准的是「写整桶」，读与列举不在其内，按最小权限一并砍掉 |
+| **验收** | 上传一个 >64MB 文件成功；中断后重试能走续传；`mc ls --incomplete` 可执行（不 403）且无残留；用签发的 STS 做 `GetObject` 与 `ListObjects` 均须 403（确认未超授） |
 
 ## IC-BUG-5 — 断点续传状态从未落盘，重试永远从头重传 🟠 P1
 
@@ -199,10 +200,22 @@
 | **根因** | Agent 侧 `buildStoragePath` 最后一行 `strings.TrimPrefix(storagePath, "/")` 剥掉了前导斜杠，而 CP 侧 `applyPathVarTags` 用**未经归一化的原始模板**去反解 `storage_path`。模板以 `/` 开头时，字面量 `/` 无法与已剥离的路径匹配 |
 | **精确位置** | `agent/cmd/agent/main.go:545`（TrimPrefix）；`controlplane/internal/indexer/indexer.go:409-417`（`trollsift.New(destTemplate)` + `parser.Parse(storagePath)`） |
 | **实测** | `tmpl="/{year}/{filename}" path="2026/x.csv"` → `does not match pattern`；去掉模板前导 `/` 或给路径加回 `/` 均可匹配 |
-| **后果** | **凡是模板以 `/` 开头的规则，MT-3 的 path_var 打标从未生效过**——`applyPathVarTags` 只 `logger.Warn("storage path does not match template")` 后 return，索引照常成功，缺陷完全静默。现有 4 个模板夹具里 3 个以 `/` 开头 |
+| **后果** | **凡是模板以 `/` 开头的规则，MT-3 的 path_var 打标从未生效过**——`applyPathVarTags` 只 `logger.Warn("storage path does not match template")` 后 return，索引照常成功，缺陷完全静默。两条可验证的事实说明影响面：① **webui 新建规则的默认模板就带前导 `/`**（`webui/src/pages/Agents/RuleForm.tsx:104` = `/{agent_name}/{time:yyyy/MM/dd}/{filename}`），经 UI 创建的规则**全部命中**；② CP 侧 path_var 的 7 个单测夹具（`indexer_test.go`）**无一带前导 `/`**——这正是缺陷从未被测出的原因 |
 | **同源** | 与 IC-BUG-3 是同一类病：同一个模板在 agent 与 CP 两端各自解释，没有任何机制保证一致 |
-| **修复** | 抽一个模板归一化函数（去前导 `/`，其余规则集中），**agent 拼路径与 CP 反解共用同一个**；放在 `pkg/trollsift` 或其相邻位置，使两端不可能再分叉 |
-| **验收** | 建一条 `path_tag_map` 非空、模板以 `/` 开头的规则，上传文件后 `file_tags` 中出现 `source='path_var'` 的行；单测覆盖「模板带/不带前导 `/`」两种写法均能反解 |
+| **修复** | 抽一个模板归一化函数（去前导 `/`，其余规则集中），**agent 拼路径 / CP 反解 / webui 预览三端共用**；放在 `pkg/trollsift` 或其相邻位置，使各端不可能再分叉。**方向必须是「CP 与 webui 剥模板的前导 `/`」，不是「agent 停止剥路径」**——后者会改写所有对象键、需全量重铺。约定写入 [`contracts.md`](../../design/contracts.md) V-3 |
+| **验收** | 建一条 `path_tag_map` 非空、模板以 `/` 开头的规则，上传文件后 `file_tags` 中出现 `source='path_var'` 的行；单测覆盖「模板带/不带前导 `/`」两种写法均能反解；webui 预览与实际对象键一致（都不带前导 `/`） |
+
+## IC-BUG-17 — 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 🔴 P0
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `Lifecycle.Start` 的「已有有效 token」分支直接 `return nil`，**从不给 `l.AgentID` / `l.AgentName` 赋值**——赋值只发生在注册分支。于是 `main.go:271-272` 把两个空串写进 `agentCtx` |
+| **精确位置** | `agent/internal/grpcclient/registration.go:122-126`（提前 return）vs `:135-136` / `:145`（唯一赋值处）；消费方 `agent/cmd/agent/main.go:271-272`、`:288`（`SetAgentID`）、`:299`（`Heartbeat.AgentId`） |
+| **实测** | `InjectContext` 对空值跳过注入（`pkg/trollsift/context.go:14,19`），于是 `{agent_name}` 缺失 → `Compose(fields, false)` 返回 `missing field "agent_name"` → `buildStoragePath` 走 `main.go:536-541` 的兜底 `return filepath.Base(localPath)` |
+| **后果** | **Agent 每次正常重启后，所有文件平铺到桶根、对象键退化为裸 basename，`dest_path_template` 被完全忽略，且全程静默**（Compose 失败不打日志）。跨 Agent 还会互相撞 key。webui 新建规则的默认模板 `/{agent_name}/{time:yyyy/MM/dd}/{filename}`（`webui/src/pages/Agents/RuleForm.tsx:104`）必然命中。gRPC 流本身不受影响——CP 从 JWT claims 取 agent_id（`grpcserver/handler.go:52`），所以故障不会以连接失败的形式暴露 |
+| **与 D-030 的关系** | 整桶 policy 让这类「对象键完全跑偏」的写入**不再被 403 挡住**，缺陷会从「上传失败」退化成「静默写错位置」。因此必须与 IC-1 同刀修 |
+| **修复** | 缓存 token 分支补齐身份：从 JWT claims 还原 `agent_id` / `agent_name`（token 里已有，CP 侧就是这么取的），或把两者与 token 一起持久化。另外给 `buildStoragePath` 的 Compose 失败路径加 `logger.Warn`——它现在完全静默 |
+| **验收** | Agent 首次注册后**重启**，落一个文件：对象键仍符合 `dest_path_template`（不是裸 basename）；心跳的 `agent_id` 非空；日志中无 `missing field` |
 
 ---
 

@@ -2,7 +2,7 @@
 
 > **状态**：设计（2026-09-08 拍板方向，尚未实施）
 > **决策记录**：[`DECISIONS.md`](../../DECISIONS.md) **D-030** / **D-031**（事件传输改 JetStream）
-> **缺陷清单**：[`docs/tasks/bugs/open.md`](../tasks/bugs/open.md) IC-BUG-1…IC-BUG-16
+> **缺陷清单**：[`docs/tasks/bugs/open.md`](../tasks/bugs/open.md) IC-BUG-1…IC-BUG-17
 > **关联**：`system-design.md` §4.5（上传流程）/ §4.7（凭据轮转）/ §5.7（STS）/ §5.8（索引）/ §6.3（Policy）/ §6.5（事件通知）；
 > [`metadata-model.md`](./metadata-model.md) P2.2（衍生数据入口）/ P2.3（run 血缘）；D-014、D-017、D-025
 >
@@ -122,29 +122,60 @@ CP 比对 `registered_count == N` → 标记 `settled`，**不发一次 ListObje
 此时从 PG 自身查出该窗口有写入的分片，置为 `active` 交给 L2 的分片预算去核实：
 
 ```sql
-SELECT DISTINCT <按配置层数截取的前缀> FROM object_keys
+SELECT DISTINCT <分片前缀> FROM object_keys
 WHERE bucket_id = $1 AND last_modified >= $2 AND last_modified < $3
 ```
 
+`<分片前缀>` 必须与 §3.5 的分片定义**用同一个函数**（叶子目录，按桶可配层数覆盖），
+否则 L1 置 `active` 的前缀会落不到 `shard_state` 的任何一行上。
 零列举，走 `(bucket_id, last_modified)` 索引，与 §3.5 的解封检测是同一个查询形状。
 **L1 只负责低延迟发现分歧，实际核实一律走 L2 的预算**——避免「O(1) 的信号触发 O(总量) 的响应」。
+
+时间窗口 `$2/$3` 取 grant 的 `[issued_at, expires_at]` **并向两端各留一个时钟偏移余量**——
+grant 时间来自 CP 时钟，而 `last_modified` 来自 MinIO 时钟或事件时刻，两者不同源。
+
+> **这条升级路径有一个已知缺口，必须写明而不是掩盖**：若该 grant 写入的对象**一条都没进
+> `object_keys`**，上面的查询返回空集，L1 检出了分歧却产出零工作量。实践中这个缺口比看上去窄——
+> minio-event 通道通常已把对象以贫血行写入 `object_keys`，所以窗口内一般查得到前缀；
+> 只有「register 与 event 双双丢失」才落空。此时由 §3.5 第 8 条的**兜底通道**（真实 delimiter
+> 列举）覆盖，这是已接受的残余风险，与「MinIO 静默不发事件」同级。
+>
+> **未结算的 grant 必须告警，不能只静默置 `active`。** L2 补得回对象的**存在性**，
+> 补不回 register 本该携带的 `tags` / `run_id` / `sha256`——那些随注册请求一起永久丢失了。
 
 #### 授权宽度与扫描成本是两件事
 
 **policy 资源写整桶**（`arn:aws:s3:::{bucket}/*`），不按前缀收窄。这是一次明确的产品取舍：
 
 - **授权宽度是管理权限问题**。单组织私有化部署、Agent 需审批才能接入，一个已审批 Agent
-  拿到所属桶的写权限是可接受的。
+  拿到所属桶的**写**权限是可接受的。
 - **清点成本是技术缺陷**。它不能靠约束用户来解决，必须由机制解决——即 §3.5 的分片 + 封存。
+
+> ⚠️ **放开的只有「写」，不含「读」与「列举」。** 产品批准的是写整桶，不能借机顺带放开其余。
+> Agent 全仓库从不调用 `GetObject` / `StatObject` / `ListObjects`（已 grep 确认，只用 `PutObject`
+> 与 multipart），因此 `s3:GetObject` 与 `s3:ListBucket` 在整桶形态下是**纯超授**——
+> 若保留，任一已审批 Agent 可枚举并下载整个数据湖。按最小权限一并砍掉，与砍 `DeleteObject`
+> 是同一条论证。最终 Action 集合见 IC-BUG-4。
+>
+> `policy.go:41-43` 在 `buckets` 为空时兜底成 `arn:aws:s3:::*`（**全部桶**）。当前调用方恒传
+> 一个桶所以不可达，但 IC-1 重构时应删掉——别在「整桶」决策之上留一个「整集群」后门。
 
 这条取舍消掉了一整类故障，且大幅简化 IC-1：
 
-| 收窄前缀会带来的问题 | 整桶 policy |
+**最直接的一条**：按字面的「模板**静态**前缀」计算，webui 新建规则的默认模板
+`/{agent_name}/{time:yyyy/MM/dd}/{filename}`（`webui/src/pages/Agents/RuleForm.tsx:104`）的静态前缀
+是**空串**——收窄当场退化成整桶。也就是说「按静态前缀收窄」对经 UI 创建的规则根本不产生收窄效果，
+只是把整桶写成了一个更复杂的表达式。
+
+若改用「签发时求值」的变体（把 `{agent_name}` / `{time:…}` 代入后再取前缀），前缀确实变窄了，
+但会引入下面这些故障——整桶 policy 一并消掉：
+
+| 「签发时求值」变体会带来的问题 | 整桶 policy |
 |---|---|
 | IC-BUG-3（policy 前缀 ≠ 实际对象键） | 不存在——整桶必然覆盖模板产出的任何键 |
 | 前缀含日期时跨零点 403（STS TTL 1h，刷新只在剩余 <10min 触发） | 不存在 |
 | Agent 改名后持续 403（`agentCtx.AgentName` 只在审批时取一次，永不更新） | 不存在 |
-| 多规则 Agent 的 session policy 体积上限 | 不存在 |
+| 多规则 Agent 的 session policy 体积上限（未实测，属推测） | 不存在 |
 
 > **`dest_path_template` 不受任何约束**——不强制前缀、不要求首段可解析、不要求含时间字段。
 > 对象键就是模板渲染的结果，CP 不往里面注入任何东西。
@@ -227,7 +258,7 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 |---|---|---|---|
 | **L1 grant 结算** | grant 过期或数量不符 | 正常写入丢注册 | O(写入速率)，**全程零列举**（异常时置分片 active，不自己扫） |
 | **L2 分片轮转** | 后台预算驱动 | grant 丢失 / 绕过写入 / MinIO 静默不发事件 | O(总量 / 预算) |
-| **L3 幽灵清理** | 随 L1/L2 列举顺带 | PG 有行、MinIO 无对象 | 附带 |
+| **L3 幽灵清理** | 随 L2 分片扫描顺带（L1 已不列举） | PG 有行、MinIO 无对象 | 附带 |
 
 L2 直接采用外部项目 minio-inventory 已在生产验证过的分片审计模型
 （`shard_state(bucket_id, prefix, state, last_verified_at, last_event_seq, sealed_at, object_count)`，
@@ -238,7 +269,7 @@ state ∈ `active | verified | sealed`；分片取 key 的叶子目录；
 7.2 万（封存率 95.8%），一轮从 5h31m 降到约 14 分钟。**成本量纲**：
 
 ```
-O(写入速率) + O(总量 / 轮转预算)      ← 两项都有界且可配，不再是 O(总量)/周期
+O(未结算的授权) + O(总量 / 轮转预算)      ← 两项都有界且可配，不再是 O(总量)/周期
 ```
 
 **必须原样避开它踩过的坑**：
@@ -285,7 +316,7 @@ CP 已持有一个 root 权限的 MinIO client（`cmd/server/main.go:206`），�
 
 | 阶段 | 内容 | 依赖 / 说明 |
 |---|---|---|
-| **止血**（IC-1…IC-5） | 修 IC-BUG-1…IC-BUG-7、IC-BUG-9…IC-BUG-12：接通 STS 链路、Agent 上报 `UploadResult` + `Acknowledgement`、队列增 `reported` 状态、续传状态落盘 + Abort + ILM、新建 bucket 注册通知、webhook 失败返回 5xx + `queue_dir` 持久化、判重比较 mtime/size | 独立可发；**此前数据面从未端到端跑通** |
+| **止血**（IC-1…IC-5） | 修 IC-BUG-1…IC-BUG-7、IC-BUG-9…IC-BUG-12、IC-BUG-16…IC-BUG-17：接通 STS 链路、Agent 上报 `UploadResult` + `Acknowledgement`、队列增 `reported` 状态、续传状态落盘 + Abort + ILM、新建 bucket 注册通知、webhook 失败返回 5xx + `queue_dir` 持久化、判重比较 mtime/size | 独立可发；**此前数据面从未端到端跑通** |
 | **地基**（IC-6…IC-7） | `observed_at` / `source` / `grant_id` / `run_id` 列、`object_keys` 拆分、分区、排序键 upsert（修 IC-BUG-8 / IC-BUG-13） | ⚠️ **必须趁数据量小完成**——到千万行再拆表、加列、改分区，每步都要锁表或双写迁移 |
 | **准入**（IC-8…IC-10） | `write_grants` + `POST /files/register` + `POST /grants/{id}/settle` + SDK 写入协议 | 依赖地基阶段的列；policy 保持整桶，grant 记录的是**时间窗口**而非空间范围（§3.2） |
 | **对账**（IC-11…IC-13） | 事件传输改 JetStream（**D-031**，前置）→ L1 → L2 → L3 | 依赖地基（`object_keys.last_modified` 是 L2 唯一可用的信号列）；JetStream 提供重放与全局单调序号，是 L2「链路自证」的前提 |
