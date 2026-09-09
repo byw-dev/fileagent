@@ -252,15 +252,24 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 
 `source` 取值：`agent | api | minio_event | audit`。
 
-**`observed_at` 的取值来源（2026-09-10 补，随 D-031 全量扫描）**——排序键要在 4 个 source 之间可比，
-因此**必须是同一量纲的时间**，不能按 source 各取各的：
+**排序与因果：三个字段各司其职（2026-09-10 定案，实测见下）**——此前的错误是让一个字段兼两职。
 
-| source | 取自 |
-|---|---|
-| `minio_event` | 事件载荷的 **`eventTime`**（`Records[].eventTime`，实测两种传输都有，**与传输无关**）|
-| `agent` | `UploadResult.uploaded_at`（缺失时回落到 CP 收到的时刻）|
-| `api` | `files/register` 的受理时刻 |
-| `audit` | 该轮对账的扫描时刻 |
+| 用途 | 字段 | 来源 | 说明 |
+|---|---|---|---|
+| **防覆盖闸门**（`WHERE EXCLUDED.observed_at >= 现有值`）| `observed_at TIMESTAMPTZ NOT NULL` | **CP 受理时刻**，四个 source 统一 | 单一时钟、**客户端碰不到**。绝不采信 `UploadResult.uploaded_at`——它由 agent 提供，一台时钟跑飞或被入侵的 agent 报 `2099-01-01` 就能把该行永久冻结，此后 webhook / `register` / **甚至 IC-13 对账**的写入全被静默丢弃 |
+| **同 key 的删除/创建因果** | `event_seq TEXT`（可空，仅 `minio_event`）| 事件的 **`sequencer`** | S3 专为此定义。**补零后按字典序比较**，且**只在同一 key 内有效**（S3 规范如此，不可跨 key 比较）|
+| **业务事实「文件何时上传」** | `uploaded_at`（列已存在）| agent 上报值 | **只作数据，不作排序键** |
+
+> **为什么 CP 受理时刻是安全的（2026-09-10 dev 实测）**：曾担心「事件乱序到达会把 delete 判成早于
+> create」，从而必须改用事件自身的时间。实测证伪——
+> ① **基线**（`queue_dir` 空、走 `sendSync`）：同一 key 反复 create/delete 12 次，到达顺序与
+> `eventTime`、`sequencer` 三者完全一致，无重复值；
+> ② **重试路径**（配 `queue_dir`，对前 3 次投递返回 500）：MinIO 的队列是**队头阻塞的单队列**——
+> 失败事件重试期间（间隔约 3s）后续事件全部排队，成功后按原序一次性放行。**重试不产生乱序。**
+>
+> ⚠️ **但不要把正确性押在「传输保序」上**。IC-11 换 JetStream 后，保序取决于 consumer 配置
+> （`MaxAckPending=1` 或 ordered consumer），配错即静默失序。`event_seq` 的存在就是为了让这条
+> 不变式**自证**而非依赖配置——这正是本 track 反复吃亏的地方。
 
 > ⚠️ **不要用 JetStream 的 stream sequence 充当 `observed_at`**。D-031 上文曾写「可直接用作 `observed_at`
 > 来源」，**该说法已在 D-031 就地更正**：sequence 是 `uint64` 与本列的 `TIMESTAMPTZ` 类型不符，

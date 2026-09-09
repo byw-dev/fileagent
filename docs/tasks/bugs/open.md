@@ -192,6 +192,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/api/handler/events.go:803-812`、`:818`、`:779-784` |
 | **后果** | MinIO 看到 200 即从 `queue_dir` 删除该事件、永不重投。一次瞬时 DB 抖动 = 永久丢失文件记录，且无任何机制能发现（当前无对账） |
 | **修复** | 索引失败返回 5xx 让 MinIO 重投；解析失败返回 400（真正的坏载荷不该无限重投）。注意保持幂等——重投会重复索引，由 `UNIQUE (bucket_id, storage_path)` upsert 兜住 |
+| **⚠️ 5xx 会阻塞整条事件流（2026-09-10 dev 实测）** | MinIO 的 `queue_dir` 是**队头阻塞的单队列**：对前 3 次投递返回 500，实测后续的 delete 与 create **全部排队等待**（约 3s 一次重试），直到那条失败事件成功才按原序一次性放行。**含义**：一个持久失败的事件（如 bucket 行缺失导致 `IndexUpload` 恒错）会让该 target 的**索引 feed 无限期停摆**，止血变断流。**因此 IC-4 ① 必须带毒丸处理**：同一事件重试超过上限 → 落死信（日志/表）→ 返 200 放行队列，而不是无限 5xx。**副作用**（有序性）见 IC-BUG-8 卡片的 `observed_at` 定案 |
 | **验收** | 断开 PG 后触发一次 ObjectCreated，端点返回 5xx；恢复 PG 后 MinIO 重投，`file_entries` 出现该行 |
 
 > 📌 本条是**止血修法**。结构性修法是 **D-031**——改用 `notify_nats` + JetStream 后，

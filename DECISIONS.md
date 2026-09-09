@@ -1506,9 +1506,10 @@ JetStream 处于闲置状态。
    而 stream sequence 只对 `minio_event` 这一路单调。拿它当 `observed_at`，另外三路就没法与之比较——
    排序键会退化成「只在同一 source 内有效」，而 IC-BUG-8 要防的恰恰是**跨 source**的覆盖。
 
-**正解**：JetStream 消息同时带 sequence 与 timestamp，两者各司其职——
-- `observed_at` ← 事件自身的 **`eventTime`**（实测载荷里就有：`"eventTime":"2026-09-09T22:09:51.412Z"`），
-  **与传输无关**，因此 **IC-2a ⑤ 现在就该用它**，IC-11 落地时不必改；
+**正解（2026-09-10 dev 实测后定案，前置拍板 F 结案）**：`observed_at` 一律取 **CP 受理时刻**（四源统一、客户端碰不到），同 key 的删除/创建因果另用事件的 `sequencer`（存 `event_seq`）。曾担心「全用 CP 时刻会让乱序事件把 delete 判成早于 create」——**实测证伪**：基线与重试路径都严格保序，MinIO 的 `queue_dir` 是队头阻塞单队列。三字段分工与实测数据见 `consistency-and-ingest.md` §3.4。**但 IC-11 的 JetStream consumer 保序取决于配置（`MaxAckPending=1` / ordered consumer），配错即静默失序，因此不得依赖传输保序——`event_seq` 就是为了让它自证。**
+
+此外，JetStream 消息同时带 sequence 与 timestamp，两者各司其职——
+- 事件自身的 `eventTime` 与 `sequencer` 都在载荷里、**与传输无关**，IC-11 落地时不必改（前者可留作参考列，后者即 `event_seq`）；
 - stream sequence ← 只喂 `shard_state.last_event_seq`（链路自证，用途仅此一项，见 §3.5）。
 
 即两个字段、两个来源，不是一个。
