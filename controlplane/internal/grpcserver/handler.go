@@ -200,6 +200,46 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 	return &agentv1.RefreshCredentialsResponse{Credentials: creds}, nil
 }
 
+// ruleBelongsToAgent reports whether ruleID names a rule owned by agentID.
+//
+// The rule id arrives in the message body, so without this check any connected
+// agent could deliver a fabricated dry-run preview against another agent's rule
+// and the operator would see it as genuine. Same shape as the rule-ownership
+// check on credential issuance (IC-BUG-24).
+//
+// It fails closed on any lookup problem, and fails open only when no credential
+// DB is wired, matching how the other gates treat an unconfigured server.
+func (s *Server) ruleBelongsToAgent(ctx context.Context, agentID, ruleID string) bool {
+	if s.credDB == nil {
+		return true
+	}
+	parsedAgentID, err := uuid.Parse(agentID)
+	if err != nil {
+		return false
+	}
+	parsedRuleID, err := uuid.Parse(ruleID)
+	if err != nil {
+		s.logger.Warn("rule ownership: invalid rule_id",
+			zap.String("agent_id", agentID), zap.String("rule_id", ruleID))
+		return false
+	}
+	rule, err := s.credDB.GetCollectionRuleByID(ctx, parsedRuleID)
+	if err != nil {
+		s.logger.Warn("rule ownership: lookup failed",
+			zap.String("agent_id", agentID), zap.String("rule_id", ruleID), zap.Error(err))
+		return false
+	}
+	if rule.AgentID != parsedAgentID {
+		s.logger.Warn("rule ownership: rule belongs to a different agent, message discarded",
+			zap.String("agent_id", agentID),
+			zap.String("rule_id", ruleID),
+			zap.String("owner_agent_id", rule.AgentID.String()),
+		)
+		return false
+	}
+	return true
+}
+
 // assertAgentUsable rejects agents that must no longer act, consulting the
 // persisted status rather than the token.
 //
@@ -353,7 +393,7 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, msg *ag
 	case *agentv1.AgentMessage_DirectoryListing:
 		s.handleDirectoryListing(agentID, p.DirectoryListing)
 	case *agentv1.AgentMessage_DryRunResult:
-		s.handleDryRunResult(p.DryRunResult)
+		s.handleDryRunResult(ctx, agentID, p.DryRunResult)
 	default:
 		s.logger.Debug("agent message received",
 			zap.String("agent_id", agentID),
@@ -542,10 +582,13 @@ func (s *Server) handleDirectoryListing(agentID string, listing *agentv1.Directo
 
 // handleDryRunResult delivers a dry-run result from the agent to the waiting
 // REST handler via the dryRunStore.
-func (s *Server) handleDryRunResult(result *agentv1.DryRunResult) {
+func (s *Server) handleDryRunResult(ctx context.Context, agentID string, result *agentv1.DryRunResult) {
 	if s.dryRunStore == nil {
 		s.logger.Debug("dry_run result received but no dryRunStore wired",
 			zap.String("rule_id", result.GetRuleId()))
+		return
+	}
+	if !s.ruleBelongsToAgent(ctx, agentID, result.GetRuleId()) {
 		return
 	}
 	s.dryRunStore.Deliver(result.GetRuleId(), result)

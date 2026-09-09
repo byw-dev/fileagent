@@ -515,3 +515,58 @@ func TestRefreshCredentials_AgentLookupFails_ReturnsPermissionDenied(t *testing.
 	assert.Equal(t, codes.PermissionDenied, status.Code(err))
 	assert.Zero(t, stsMgr.calls)
 }
+
+// ── dry-run results must belong to the reporting agent ───────────────────────
+
+// The rule id travels in the message body, so without an ownership check any
+// connected agent could deliver a fabricated preview against someone else's
+// rule and the operator would see it as genuine (IC-BUG-24).
+func TestHandleDryRunResult_ForeignRule_IsDiscarded(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	store := &mockDryRunStore{}
+	credDB := &mockCredDB{
+		rule: &db.CollectionRule{ID: uuid.New(), AgentID: uuid.New()}, // owned by someone else
+	}
+	srv.WithExtraDeps(nil, nil, nil, credDB)
+	srv.WithDryRunStore(store)
+
+	srv.handleDryRunResult(context.Background(), testAgentID,
+		&agentv1.DryRunResult{RuleId: uuid.NewString()})
+
+	assert.Zero(t, store.delivered, "a foreign rule's result must not reach the store")
+}
+
+func TestHandleDryRunResult_OwnRule_IsDelivered(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	store := &mockDryRunStore{}
+	credDB := &mockCredDB{
+		rule: &db.CollectionRule{ID: uuid.New(), AgentID: uuid.MustParse(testAgentID)},
+	}
+	srv.WithExtraDeps(nil, nil, nil, credDB)
+	srv.WithDryRunStore(store)
+
+	srv.handleDryRunResult(context.Background(), testAgentID,
+		&agentv1.DryRunResult{RuleId: uuid.NewString()})
+
+	assert.Equal(t, 1, store.delivered)
+}
+
+// A lookup failure must not be treated as ownership.
+func TestHandleDryRunResult_LookupFails_IsDiscarded(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	store := &mockDryRunStore{}
+	srv.WithExtraDeps(nil, nil, nil, &mockCredDB{ruleErr: assert.AnError})
+	srv.WithDryRunStore(store)
+
+	srv.handleDryRunResult(context.Background(), testAgentID,
+		&agentv1.DryRunResult{RuleId: uuid.NewString()})
+
+	assert.Zero(t, store.delivered)
+}
+
+type mockDryRunStore struct{ delivered int }
+
+func (m *mockDryRunStore) Deliver(_ string, _ *agentv1.DryRunResult) { m.delivered++ }

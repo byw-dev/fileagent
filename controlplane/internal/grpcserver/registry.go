@@ -60,6 +60,29 @@ func (r *AgentRegistry) Unregister(agentID string) {
 	r.mu.Unlock()
 }
 
+// Disconnect tears down the agent's stream by cancelling the context Connect
+// derived it from. It reports whether a connection was actually cancelled.
+//
+// Revocation used to be purely cooperative: the Control Plane sent a Revoke
+// command and relied on the agent deleting its own token. A compromised agent
+// simply ignores it, and nothing else stopped it — it kept heartbeating (so the
+// UI showed it online with no way to kick it), kept reporting uploads and kept
+// answering directory listings. See IC-BUG-25.
+//
+// The connection removes itself from the registry via Connect's deferred
+// Unregister, so this only cancels; it must not close SendCh itself, or that
+// deferred Unregister would close an already-closed channel.
+func (r *AgentRegistry) Disconnect(agentID string) bool {
+	r.mu.RLock()
+	conn, ok := r.conns[agentID]
+	r.mu.RUnlock()
+	if !ok || conn.CancelFunc == nil {
+		return false
+	}
+	conn.CancelFunc()
+	return true
+}
+
 // Get returns the AgentConn for the given agent ID, or nil if not connected.
 func (r *AgentRegistry) Get(agentID string) *AgentConn {
 	r.mu.RLock()
