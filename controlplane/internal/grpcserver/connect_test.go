@@ -73,14 +73,15 @@ func newFullServer(t *testing.T) (agentv1.AgentServiceClient, string) {
 // RefreshCredentials is gated would keep the whole attack chain intact: connect
 // once, receive credentials, done.
 //
-// The registry assertion is deliberate — it pins the gate *before*
-// registry.Register. Asserting only the status code would still pass if the gate
-// were moved after registration, which would leak an online marker and a
-// credentials push for an agent that must not act.
+// The extra assertions are deliberate. A status-code-only test would still pass
+// if the gate were moved further down Connect, where the agent would already
+// have been registered, marked online and handed credentials before being
+// refused. IsOnline alone is not enough either — the deferred Unregister resets
+// it — so the online write is what actually pins the gate's position.
 func TestServer_Connect_RevokedAgent_IsRejectedBeforeRegistration(t *testing.T) {
 	agentID := "22222222-2222-2222-2222-222222222222"
-	client, bearer, registry := newFullServerForAgent(t, agentID,
-		&mockStateDB{agentStatus: db.AgentStatusRevoked})
+	stateDB := &mockStateDB{agentStatus: db.AgentStatusRevoked}
+	client, bearer, registry := newFullServerForAgent(t, agentID, stateDB)
 
 	// Bounded: if the gate is ever removed the server accepts the stream and
 	// Recv would block forever, turning a regression into a hung suite instead
@@ -96,6 +97,8 @@ func TestServer_Connect_RevokedAgent_IsRejectedBeforeRegistration(t *testing.T) 
 		"a stream that merely times out means the gate is gone")
 	assert.False(t, registry.IsOnline(agentID),
 		"a rejected agent must never enter the registry")
+	assert.Zero(t, stateDB.markOnlineUsableCalls,
+		"the gate must run before the online transition, not after it")
 }
 
 func TestServer_Connect_ApprovedAgent_IsAccepted(t *testing.T) {

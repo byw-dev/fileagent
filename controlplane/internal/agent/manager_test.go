@@ -395,7 +395,7 @@ func TestPollApproval_MatchingFingerprint_IssuesToken(t *testing.T) {
 
 // The fingerprint column is NOT NULL UNIQUE but the empty string satisfies that,
 // so an unauthenticated caller could otherwise create and then poll the one row
-// with fingerprint ”. Both ends are guarded: Register refuses to create it and
+// with fingerprint "". Both ends are guarded: Register refuses to create it and
 // PollApproval refuses to serve it.
 func TestRegister_EmptyFingerprint_Rejected(t *testing.T) {
 	m, _, _ := newTestManager(t)

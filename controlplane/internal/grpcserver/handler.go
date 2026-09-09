@@ -83,8 +83,17 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 			// a revocation landing between the two would otherwise be undone by
 			// an unconditional write, and the agent would then pass the gate on
 			// every subsequent call. Terminal states must never be revived.
-			if _, dbErr := s.stateDB.MarkAgentOnlineIfUsable(ctx, id); dbErr != nil {
+			rows, dbErr := s.stateDB.MarkAgentOnlineIfUsable(ctx, id)
+			switch {
+			case dbErr != nil:
 				s.logger.Warn("connect: update status to online failed", zap.Error(dbErr))
+			case rows == 0:
+				// The status left the usable set between the liveness check and
+				// this write — i.e. the agent was revoked mid-connect. The
+				// constraint did its job; log it, because this is the only place
+				// that race is ever visible.
+				s.logger.Warn("connect: agent left the usable state during connect setup",
+					zap.String("agent_id", agentID))
 			}
 		}
 	}
