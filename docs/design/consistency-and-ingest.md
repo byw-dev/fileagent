@@ -252,6 +252,23 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 
 `source` 取值：`agent | api | minio_event | audit`。
 
+**`observed_at` 的取值来源（2026-09-10 补，随 D-031 全量扫描）**——排序键要在 4 个 source 之间可比，
+因此**必须是同一量纲的时间**，不能按 source 各取各的：
+
+| source | 取自 |
+|---|---|
+| `minio_event` | 事件载荷的 **`eventTime`**（`Records[].eventTime`，实测两种传输都有，**与传输无关**）|
+| `agent` | `UploadResult.uploaded_at`（缺失时回落到 CP 收到的时刻）|
+| `api` | `files/register` 的受理时刻 |
+| `audit` | 该轮对账的扫描时刻 |
+
+> ⚠️ **不要用 JetStream 的 stream sequence 充当 `observed_at`**。D-031 上文曾写「可直接用作 `observed_at`
+> 来源」，**该说法已在 D-031 就地更正**：sequence 是 `uint64` 与本列的 `TIMESTAMPTZ` 类型不符，
+> 且它只对 `minio_event` 一路单调、与另外三路不可比——而排序键要防的恰恰是**跨 source** 的覆盖。
+> sequence 的正确用途只有一个：喂 `shard_state.last_event_seq` 做链路自证（见 §3.5）。
+>
+> 推论：**IC-2a ⑤ 现在就用 `eventTime`，IC-11 落地时这一列不必改**。
+
 ### 3.5 对账三级
 
 | 级别 | 触发 | 覆盖场景 | 成本 |

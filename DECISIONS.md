@@ -1476,6 +1476,43 @@ JetStream 处于闲置状态。
   否则 IC-11 落地时会把它打回原形。
 - **retention 配置过短 = 静默丢消息**，这恰恰是上面第 3 条「链路自证」存在的理由，不是可选项。
 
+### 全量扫描结论（2026-09-10）
+
+上面这份清单此前是「撞见一条补一条」——IC-BUG-19 与 IC-BUG-7 都是在别的工作里撞上才发现漏了。
+既然清单的价值就在于完整，这次拿 **IC-BUG-1…IC-BUG-34 逐条**问同一个问题：
+**IC-11 实际改变的六件事碰得到它吗？**（六件事 = 投递语义 PubAck + 显式 ack/重投、跨 CP 宕机的持久化、
+可重放、全局单调序号、鉴权载体、`/internal/minio-event` 端点消失）
+
+**结论：34 条里只有 6 条与事件通道有关。**
+
+| 缺陷 | IC-11 的影响 | 结论 |
+|---|---|---|
+| **IC-BUG-6**（索引失败仍返 200） | ✅ **解决** | 「是否重投」由 ack 语义决定，不再依赖 CP 返回什么 HTTP 状态码 |
+| **IC-BUG-7**（新建 bucket 不注册通知） | ❌ 不解决 | 换传输只改 ARN，不改变「要不要配通知」。**IC-4 ② 的 ARN 须做成可配置** |
+| **IC-BUG-9**（`queue_dir` 在 `/tmp`） | ❌ 不解决 | `notify_nats` 同样有 `queue_dir` / `queue_limit` |
+| **IC-BUG-19**（对象键 URL 编码） | ❌ 不解决 | 双向实测：两种传输载荷字节级同构，编码在 MinIO 构造事件时发生 |
+| **IC-BUG-8**（upsert 无排序键） | ◐ **改善但不解决** | SQL 侧的 `WHERE` + `COALESCE` 该写还得写；IC-11 只是让排序键的**来源**更可靠。**见下方「排序键来源」的更正** |
+| **IC-BUG-13**（`content_type` 不赋值） | ◐ 相关但不解决 | 载荷里**本来就有** `contentType`（实测确认，两种传输都有），是 CP 侧 `IndexUpload` 没读它。与传输无关 |
+| 其余 **28 条** | 无关 | agent 侧（采集/队列/上传/凭据）、STS policy、gRPC 流与 registry、DB 查询与统计——事件通道碰不到 |
+
+### 更正：stream sequence 不能「直接用作 `observed_at`」
+
+本决策上文第 3 条写的是「stream sequence … 可直接用作 D-030 §3.4 的 `observed_at` 排序键来源」。
+**这句话把两个用途混在了一起，落地时会撞墙**：
+
+1. **类型对不上**：`observed_at` 是 `TIMESTAMPTZ NOT NULL`（`consistency-and-ingest.md:231`），
+   而 JetStream 的 stream sequence 是 `uint64`。
+2. **更根本的是不可比**：`observed_at` 要在 **4 个 source 之间**排序（`agent | api | minio_event | audit`），
+   而 stream sequence 只对 `minio_event` 这一路单调。拿它当 `observed_at`，另外三路就没法与之比较——
+   排序键会退化成「只在同一 source 内有效」，而 IC-BUG-8 要防的恰恰是**跨 source**的覆盖。
+
+**正解**：JetStream 消息同时带 sequence 与 timestamp，两者各司其职——
+- `observed_at` ← 事件自身的 **`eventTime`**（实测载荷里就有：`"eventTime":"2026-09-09T22:09:51.412Z"`），
+  **与传输无关**，因此 **IC-2a ⑤ 现在就该用它**，IC-11 落地时不必改；
+- stream sequence ← 只喂 `shard_state.last_event_seq`（链路自证，用途仅此一项，见 §3.5）。
+
+即两个字段、两个来源，不是一个。
+
 ### 代价
 
 - 新增运维面：stream 定义、retention 策略、durable consumer 配置、磁盘容量规划。

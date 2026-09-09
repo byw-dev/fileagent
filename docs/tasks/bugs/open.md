@@ -213,6 +213,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/indexer/queries.go:48-60`（DO UPDATE 子句）；`controlplane/internal/indexer/indexer.go:538-548`（IndexUpload 只填 5 个字段） |
 | **后果** | 今天不可见（因 IC-BUG-2，agent 路径是死的）。**一旦修好 IC-BUG-2 就会立刻变成数据损坏**：同一对象的 webhook 事件晚于 agent 上报到达时，会把 agent 写入的 `agent_id` / `rule_id` / `sha256` / `file_mtime` 全部清成 NULL |
 | **修复** | 按 D-030：`file_entries` 增加 `observed_at`（排序键）与 `source`；`DO UPDATE` 加 `WHERE EXCLUDED.observed_at >= file_entries.observed_at`，富字段一律 `COALESCE(EXCLUDED.x, file_entries.x)`。软删除同样加时间围栏 |
+| **`observed_at` 取值来源（2026-09-10 定）** | `minio_event` ← 载荷的 **`eventTime`**（`Records[].eventTime`，实测 webhook 与 NATS 都有，**与传输无关**）；`agent` ← `UploadResult.uploaded_at`（缺失回落到 CP 收到时刻）。**四个 source 必须同量纲**，否则跨 source 不可比、排序键失效——而跨 source 覆盖正是本条要防的。**不要等 IC-11 用 JetStream stream sequence**：它是 `uint64`（本列是 `TIMESTAMPTZ`），且只对 `minio_event` 一路单调；sequence 的正确用途只有 `shard_state.last_event_seq`。用 `eventTime` 则 IC-11 落地时这一列不必改 |
+| **IC-11 只改善不解决** | D-031 全量扫描结论：换 JetStream 让排序键的**来源**更可靠，但 SQL 侧的 `WHERE` + `COALESCE` 该写还得写 |
 | **验收** | 单测：先以 `source=agent` 写入完整行，再以 `source=minio_event` 用更早/更晚的 `observed_at` 各写一次，富字段均不被清空 |
 
 ## IC-BUG-9 — webhook `queue_dir` 位于 `/tmp` 🟠 P1
@@ -265,6 +267,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/indexer/indexer.go`（全文无 `ContentType`）；`controlplane/internal/indexer/queries.go:56` |
 | **后果** | 该列恒为 NULL；将来任何补齐它的路径都会被另一条路径清空（与 IC-BUG-8 同源） |
 | **修复** | 随 IC-BUG-8 的 `COALESCE` 一并修；MinIO 事件载荷含 `contentType` 时填入，agent 侧由 `UploadResult` 带上（需 proto 增字段，只增不改编号） |
+| **载荷里本来就有（2026-09-10 实测）** | webhook 与 NATS 载荷均含 `"contentType":"text/plain"`，是 CP 侧 `IndexUpload` 没读它——**填值半边的 webhook 那一路今天就能做，无需任何前置**。与传输无关，IC-11 不改变这一点 |
 | **⚠️ 拆分（2026-09-10）——归档时不得整条关闭** | **防清空半边**（`DO UPDATE` 的 `COALESCE`）随 **IC-2a ⑤** 免费带上——它就是 IC-BUG-8 的同一条 SQL；**填值半边**（agent 侧经 `UploadResult` 带 `content_type`、webhook 侧从事件载荷取）**仍开着**，需 proto 增字段，可推到准入阶段之后。**两半都完成前本卡片保持 open** |
 | **验收** | 上传一个 `.csv`，`file_entries.content_type` 为 `text/csv`（填值半边），随后到达的 webhook 事件不会清空它（防清空半边） |
 
