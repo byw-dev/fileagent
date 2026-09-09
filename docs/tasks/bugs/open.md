@@ -296,7 +296,7 @@
 | **根因** | `handleAgentMessage` 里 `DryRunResult` 是**唯一不传 agentID** 的分支，按 body 里的 `rule_id` 投递进共享的 `dryRunStore` |
 | **精确位置** | `controlplane/internal/grpcserver/handler.go` `handleAgentMessage` 的 `AgentMessage_DryRunResult` 分支 |
 | **后果** | 任一已连接 agent 可对**别人的 `rule_id`** 投递伪造的试运行结果，管理员在 UI 上看到的预览是伪造的。只读、影响面小，但与 IC-BUG-22/23 是同一个模式：**凡是客户端指定资源 ID 的接口，都要问一句「这个资源是它的吗」** |
-| **修复** | 投递前校验该 rule 归属于流上的 agentID（`handleDryRunResult` 增加 agentID 参数）。归 IC-2 一并做 |
+| **修复** | ✅ **已修（IC-SEC-1，PR #94）**：新增 `Server.ruleBelongsToAgent`，投递前校验 rule 归属于流上的 agentID；查库失败与非法 rule_id 一律 fail-closed |
 | **验收** | agent A 对 agent B 的 rule_id 投递 DryRunResult 被丢弃并告警 |
 
 ## IC-BUG-25 — 吊销切不断已建立的流 🟠 P1
@@ -307,7 +307,7 @@
 | **精确位置** | `controlplane/internal/grpcserver/registry.go`（`CancelFunc` 无调用点）；`controlplane/internal/grpcserver/handler.go` `handleAgentMessage`；`controlplane/internal/agent/manager.go` `RevokeAgent` |
 | **后果** | 被入侵的 agent 已连接 → 管理员吊销 → 它忽略 `Revoke` 命令、不断开。于是：①继续心跳刷新 `agent:online:<id>` 与 `last_seen_at`，**UI 上这个已吊销的 agent 一直显示在线，管理员没有任何手段把它踢下线**；②继续上报 `UploadResult`（IC-2 之后就是攻击者可控地直接写 `file_entries`/`upload_logs`）；③继续响应 `ListDirectory` |
 | **残留窗口（已接受）** | 手里已签发的 STS 会话在 ≤1h 内仍是整桶写。STS 会话本质上不可撤销（除非轮转 MinIO 父用户或加 deny policy），这一条**接受**，但必须在运维文档里写明「吊销不是即时的，最长一个 STS TTL」 |
-| **修复** | `RevokeAgent` 发完命令后主动切流：registry 加 `Disconnect(agentID)` 调用该 conn 的 `CancelFunc`。顺带修掉「已吊销却显示在线」。归 IC-2 |
+| **修复** | ✅ **已修（IC-SEC-1，PR #94）**：registry 加 `Disconnect`，取消 Connect 派生流的 context；Revoke 发完协作式命令后无条件切流。`Disconnect` 只 cancel、**不** `close(SendCh)`——所有权在 Connect 的 defer `Unregister` 上，重复关闭会 panic（变异测试实证）|
 | **验收** | 吊销一个不配合的 agent（不处理 `Revoke` 命令的构造版本）后，流在秒级断开、UI 立即显示离线、后续 `UploadResult` 不再入库 |
 
 ---
