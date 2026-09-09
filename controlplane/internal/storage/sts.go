@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
@@ -55,8 +56,25 @@ func (m *STSManager) WithPublicEndpoint(endpoint string, useSSL bool) *STSManage
 	return m
 }
 
+// stsRequestTimeout bounds a single AssumeRole call.
+//
+// The call is made on the Connect path, so an unreachable MinIO that blackholes
+// packets (rather than refusing them) would otherwise block stream setup
+// indefinitely and starve the agent's heartbeat until Redis marked it offline.
+// minio-go's AssumeRole flow takes no context, so the bound has to come from the
+// HTTP client.
+const stsRequestTimeout = 10 * time.Second
+
 // IssueCredentials obtains temporary STS credentials for an agent.
+//
+// ctx is honoured for cancellation before the call; the AssumeRole request
+// itself is bounded by stsRequestTimeout because the upstream library offers no
+// context-aware entry point.
 func (m *STSManager) IssueCredentials(ctx context.Context, agentID string, buckets []BucketAccess) (*agentv1.CredentialsPayload, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("sts: %w", err)
+	}
+
 	policyJSON, err := BuildSessionPolicy(buckets)
 	if err != nil {
 		return nil, err
@@ -68,17 +86,21 @@ func (m *STSManager) IssueCredentials(ctx context.Context, agentID string, bucke
 	}
 	stsEndpoint := scheme + "://" + m.endpoint
 
-	li, err := credentials.NewSTSAssumeRole(stsEndpoint, credentials.STSAssumeRoleOptions{
-		AccessKey:       m.accessKey,
-		SecretKey:       m.secretKey,
-		RoleARN:         m.roleARN,
-		RoleSessionName: "agent-" + agentID,
-		Policy:          policyJSON,
-		DurationSeconds: 3600,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("sts: create assume role credential: %w", err)
+	if m.accessKey == "" || m.secretKey == "" {
+		return nil, fmt.Errorf("sts: access key and secret key are required")
 	}
+	li := credentials.New(&credentials.STSAssumeRole{
+		STSEndpoint: stsEndpoint,
+		Options: credentials.STSAssumeRoleOptions{
+			AccessKey:       m.accessKey,
+			SecretKey:       m.secretKey,
+			RoleARN:         m.roleARN,
+			RoleSessionName: "agent-" + agentID,
+			Policy:          policyJSON,
+			DurationSeconds: 3600,
+		},
+		Client: &http.Client{Timeout: stsRequestTimeout},
+	})
 
 	val, err := li.Get()
 	if err != nil {

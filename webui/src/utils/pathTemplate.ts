@@ -12,13 +12,14 @@ export const SYSTEM_TEMPLATE_VARIABLES: ReadonlyArray<{ key: string; desc: strin
 /**
  * Strip the leading "/" from a path template.
  *
- * Mirror of `pkg/trollsift.NormalizeTemplate` (Go side is authoritative). An
+ * Mirror of `pkg/trollsift.NormalizeTemplate` (Go side is authoritative). All
+ * leading separators are removed, not just one. An
  * object key never starts with "/", so any preview or comparison must apply the
  * same normalisation the Agent applies when composing the key.
  * See docs/design/contracts.md V-3.
  */
 export function normalizeTemplate(template: string): string {
-  return template.startsWith('/') ? template.slice(1) : template
+  return template.replace(/^\/+/, '')
 }
 
 /**
@@ -109,7 +110,9 @@ export function renderPathPreview(template: string, dynamicFields?: string[]): s
  */
 export function validatePathTemplate(template: string): string | null {
   if (!template) return '路径模板不能为空'
-  if (!template.startsWith('/')) return '路径模板必须以 / 开头'
+  // A leading "/" is accepted but not required: it is stripped before the key is
+  // built (see normalizeTemplate), so demanding it forced users to type a
+  // character that never reaches the object key.
   if (template.includes('//')) return '路径模板不能包含连续的 //'
 
   // Check balanced braces (no nesting, all opened braces must be closed)

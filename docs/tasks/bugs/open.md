@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…19 为 2026-09-09 追加，其中 18/19 是 IC-1 的 live-e2e 中暴露的）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20/21 来自 IC-1 的 code review）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -35,6 +35,8 @@
 | IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 | 🔴 P0 | agent |
 | IC-BUG-18 | Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 | 🔴 P0 | agent |
 | IC-BUG-19 | minio-event 索引 URL 编码后的对象键（`%2F`），与真实键不符 | 🟠 P1 | controlplane |
+| IC-BUG-20 | bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 | 🟠 P1 | controlplane + agent |
+| IC-BUG-21 | 模板解析失败时猜一个对象键写进去，污染对账分片 | 🟡 P2 | agent |
 
 ---
 
@@ -240,6 +242,26 @@
 | **后果** | 凡是带层级的对象键（正常情况）索引值都与真实键不符。①预签名下载用 `storage_path` 作 key，必然 404；②path_var 反解拿不到分隔符，打标失效；③IC-6 之后 `object_keys` 的幂等键与对账会把这些行全判成幽灵。**当前 `file_entries` 的唯一写入者就是这条路径**，所以影响是全量的 |
 | **修复** | 在 `MinioEventHandler.Handle` 解析后对 key 做一次 `url.QueryUnescape`（S3 事件用的是 `+`-as-space 的 query 编码，不是 path 编码），失败时退回原值并告警；补带层级键与含空格/中文键的单测 |
 | **验收** | `mc cp` 一个 `a/b/中 文.csv`，`file_entries.storage_path` 等于 `a/b/中 文.csv`；预签名下载可直接取回该对象 |
+
+## IC-BUG-20 — bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 凭据只在 `Connect` 建流时按当时的 active 规则推一次（`pushCredentials`）。`DispatchRule` 推送新规则时**不带凭据**；agent 侧刷新只看过期时间（`agent/cmd/agent/main.go`：tick 1min，剩余 >10min 即 `continue`）；上传失败路径**没有任何 AccessDenied 触发刷新**的逻辑 |
+| **精确位置** | `controlplane/internal/grpcserver/handler.go`（`pushCredentials` 仅 Connect 调用）；`controlplane/internal/agent/dispatch.go`（`DispatchRule` 不推凭据）；`agent/cmd/agent/main.go` 刷新 goroutine；`agent/internal/uploader/`（无 403 分支） |
+| **后果** | agent 已连接、持有覆盖 bucket A 的 1h 会话 → 管理员新建一条指向 **bucket B** 的规则 → 规则立即下发、agent 立即开始 PutObject 到 B → **403**，直到会话剩余 10 分钟才刷新，**最坏约 50 分钟**。期间重试耗尽的任务直接失败，不会自愈。IC-1 任务卡 ② 写的是「按该 Agent **已下发规则**涉及的 bucket 集合签发」——该集合是动态的，当前实现只在建流时快照了一次 |
+| **修复** | 两条都做：① CP 在规则下发/启用导致 bucket 集合变化时重推凭据（`DispatchRule` 成功后调 `pushCredentials`）；② agent 侧上传遇 `AccessDenied` 时作废当前凭据、立即刷新一次并重试**一次**——第二次仍 403 则以独特错误落终态，不做无限重试（否则会把 policy 前缀错配那类缺陷变成静默循环）。②同时是设计文档 §3.2 要求的通用兜底 |
+| **验收** | agent 运行中新建一条指向新 bucket 的规则，首个文件即上传成功（不出现 403）；断开 policy 授权后上传失败两次即落终态并告警 |
+
+## IC-BUG-21 — 模板解析失败时猜一个对象键写进去，污染对账分片 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `buildStoragePath` 在模板无效 / `Compose` 失败 / 结果为空时一律 `return filepath.Base(localPath)`，即把文件平铺到桶根。IC-1 给这三条路径加了 `logger.Warn`，但**行为本身没变** |
+| **精确位置** | `agent/cmd/agent/main.go` `buildStoragePath` 的三条兜底 return |
+| **后果** | ①写入一个**错误的**对象键比让任务失败更糟：IC-6 之后 `object_keys` 按前缀分片对账，桶根平铺的对象会污染分片树，且这些对象的 path_var 永远反解不出来；②Warn 是 per-file 的——规则模板配错时一次投 5000 个文件就是 5000 条 Warn + 5000 个根目录对象，运维会把它当噪音关掉，等于退回静默 |
+| **修复** | 兜底改为**任务失败**（可重试 / 可告警）而不是猜键；Warn 按 `rule_id` 去重（首次记录）或采样。建议随 IC-2 一起做——IC-2 正好要改上报与终态语义 |
+| **验收** | 模板解析不出来时任务进入失败态并可在 UI 看到原因；同一规则连续 N 个文件失败只产生一条 Warn |
 
 ---
 

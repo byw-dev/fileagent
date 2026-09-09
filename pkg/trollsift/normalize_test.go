@@ -69,3 +69,29 @@ func TestRawTemplateDoesNotMatchStrippedKey(t *testing.T) {
 			"trollsift changed and NormalizeTemplate may no longer be needed")
 	}
 }
+
+// Rule creation over REST applies no template constraints, so a template with
+// repeated leading separators is reachable; agent and Control Plane must still
+// agree on the resulting key.
+func TestNormalizeStripsRepeatedSeparators(t *testing.T) {
+	if got := NormalizeTemplate("//data/{site}/{filename}"); got != "data/{site}/{filename}" {
+		t.Errorf("NormalizeTemplate: got %q", got)
+	}
+	if got := NormalizeObjectKey("///a/b.csv"); got != "a/b.csv" {
+		t.Errorf("NormalizeObjectKey: got %q", got)
+	}
+
+	composer, err := New(NormalizeTemplate("//data/{site}/{filename}"))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	key, err := composer.Compose(map[string]Value{
+		"site": S("tokyo"), "filename": S("x.csv"),
+	}, false)
+	if err != nil {
+		t.Fatalf("Compose: %v", err)
+	}
+	if _, err := composer.Parse(NormalizeObjectKey(key)); err != nil {
+		t.Fatalf("round trip failed for a template with repeated slashes: %v", err)
+	}
+}

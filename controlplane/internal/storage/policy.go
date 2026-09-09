@@ -35,6 +35,11 @@ type policyStatement struct {
 // bucketActions are bucket-level S3 actions. Their resource ARN must be the
 // bucket itself, without a "/*" object suffix — an object-level ARN silently
 // makes the grant a no-op rather than raising an error (that was IC-BUG-4).
+//
+// The agent itself does not call ListBucketMultipartUploads (its uploader only
+// lists the parts of an upload it already owns). It is granted for the operator
+// check "mc ls --incomplete", which IC-3's acceptance depends on — so do not
+// remove it on the reasoning that the agent has no use for it.
 var bucketActions = []string{
 	"s3:ListBucketMultipartUploads",
 }

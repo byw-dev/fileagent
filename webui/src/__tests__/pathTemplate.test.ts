@@ -23,6 +23,8 @@ describe('renderPathPreview', () => {
   it('strips the leading slash so the preview matches the real object key', () => {
     expect(renderPathPreview('/{agent_name}/{filename}')).toBe('my-agent/data.csv')
     expect(renderPathPreview('{agent_name}/{filename}')).toBe('my-agent/data.csv')
+    // Repeated separators too: the Go side uses TrimLeft, this must match.
+    expect(renderPathPreview('//{agent_name}/{filename}')).toBe('my-agent/data.csv')
   })
 
   // R-1: LDML time field + system variables
@@ -81,9 +83,12 @@ describe('validatePathTemplate', () => {
     expect(validatePathTemplate('')).toBeTruthy()
   })
 
-  // V-2: not starting with /
-  it('V-2: rejects templates not starting with /', () => {
-    expect(validatePathTemplate('year/month')).toBeTruthy()
+  // V-2: a leading "/" is optional — it is stripped before the object key is
+  // built, so requiring it only forced users to type a character that never
+  // reaches MinIO.
+  it('V-2: accepts templates with or without a leading /', () => {
+    expect(validatePathTemplate('{year}/{filename}')).toBeNull()
+    expect(validatePathTemplate('/{year}/{filename}')).toBeNull()
   })
 
   // V-3: double slashes

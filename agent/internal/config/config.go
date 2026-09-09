@@ -135,7 +135,10 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Server.TLSCACert = v
 	}
 	if v := os.Getenv("AGENT_SERVER_TLS_INSECURE"); v != "" {
-		cfg.Server.TLSInsecure = v == "true" || v == "1"
+		// Parse leniently but fail safe: anything unparseable leaves TLS on.
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.Server.TLSInsecure = b
+		}
 	}
 
 	// [agent]

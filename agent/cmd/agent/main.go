@@ -656,7 +656,11 @@ func handleDryRun(rule scheduler.CollectionRule, client *grpcclient.Client, agen
 		fields["filename"] = trollsift.S(filepath.Base(path))
 		fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(path), "."))
 
-		destParser, dErr := trollsift.New(rule.DestPathTemplate)
+		// Normalise exactly as buildStoragePath does: the dry-run preview sits
+		// next to the Web UI's own preview in the same form, so showing a
+		// different key than the upload would actually produce is worse than
+		// showing nothing.
+		destParser, dErr := trollsift.New(trollsift.NormalizeTemplate(rule.DestPathTemplate))
 		if dErr != nil {
 			fileResult.ComposeError = dErr.Error()
 		} else {
@@ -664,7 +668,7 @@ func handleDryRun(rule scheduler.CollectionRule, client *grpcclient.Client, agen
 			if cErr != nil {
 				fileResult.ComposeError = cErr.Error()
 			} else {
-				fileResult.UploadPath = uploadPath
+				fileResult.UploadPath = trollsift.NormalizeObjectKey(uploadPath)
 			}
 		}
 

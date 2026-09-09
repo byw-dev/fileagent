@@ -8,6 +8,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -45,10 +46,28 @@ func (m *mockIndexer) HandleUploadResult(_ context.Context, _ uuid.UUID, _ uuid.
 type mockSTSMgr struct {
 	creds *agentv1.CredentialsPayload
 	err   error
+	// gotAgentID / gotBuckets record the last call so tests can assert on the
+	// scope actually requested, not merely that a call happened.
+	gotAgentID string
+	gotBuckets []storage.BucketAccess
+	calls      int
 }
 
-func (m *mockSTSMgr) IssueCredentials(_ context.Context, _ string, _ []storage.BucketAccess) (*agentv1.CredentialsPayload, error) {
+func (m *mockSTSMgr) IssueCredentials(_ context.Context, agentID string, buckets []storage.BucketAccess) (*agentv1.CredentialsPayload, error) {
+	m.calls++
+	m.gotAgentID = agentID
+	m.gotBuckets = buckets
 	return m.creds, m.err
+}
+
+// testAgentID is the authenticated agent used by the credential tests.
+var testAgentID = uuid.NewString()
+
+// agentCtx returns a context carrying verified JWT claims for agentID, matching
+// what the gRPC interceptor installs on a real call.
+func agentCtx(agentID string) context.Context {
+	return context.WithValue(context.Background(), claimsContextKey,
+		&auth.Claims{RegisteredClaims: jwt.RegisteredClaims{Subject: agentID}})
 }
 
 // ── Mock CredentialDB ─────────────────────────────────────────────────────────
@@ -80,8 +99,8 @@ func TestRefreshCredentials_NoSTSMgr_ReturnsUnimplemented(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	srv := New(logger)
 
-	_, err := srv.RefreshCredentials(context.Background(), &agentv1.RefreshCredentialsRequest{
-		AgentId: "agent-1",
+	_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{
+		AgentId: testAgentID,
 		RuleId:  uuid.New().String(),
 	})
 	require.Error(t, err)
@@ -93,8 +112,8 @@ func TestRefreshCredentials_InvalidRuleID_ReturnsInvalidArgument(t *testing.T) {
 	srv := New(logger)
 	srv.WithExtraDeps(nil, nil, &mockSTSMgr{}, &mockCredDB{})
 
-	_, err := srv.RefreshCredentials(context.Background(), &agentv1.RefreshCredentialsRequest{
-		AgentId: "agent-1",
+	_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{
+		AgentId: testAgentID,
 		RuleId:  "not-a-uuid",
 	})
 	require.Error(t, err)
@@ -107,8 +126,8 @@ func TestRefreshCredentials_RuleNotFound_ReturnsNotFound(t *testing.T) {
 	credDB := &mockCredDB{ruleErr: assert.AnError}
 	srv.WithExtraDeps(nil, nil, &mockSTSMgr{}, credDB)
 
-	_, err := srv.RefreshCredentials(context.Background(), &agentv1.RefreshCredentialsRequest{
-		AgentId: "agent-1",
+	_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{
+		AgentId: testAgentID,
 		RuleId:  uuid.New().String(),
 	})
 	require.Error(t, err)
@@ -120,13 +139,13 @@ func TestRefreshCredentials_BucketNotFound_ReturnsNotFound(t *testing.T) {
 	srv := New(logger)
 	bucketID := uuid.New()
 	credDB := &mockCredDB{
-		rule:    &db.CollectionRule{ID: uuid.New(), BucketID: bucketID},
+		rule:    &db.CollectionRule{ID: uuid.New(), AgentID: uuid.MustParse(testAgentID), BucketID: bucketID},
 		buckErr: assert.AnError,
 	}
 	srv.WithExtraDeps(nil, nil, &mockSTSMgr{}, credDB)
 
-	_, err := srv.RefreshCredentials(context.Background(), &agentv1.RefreshCredentialsRequest{
-		AgentId: "agent-1",
+	_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{
+		AgentId: testAgentID,
 		RuleId:  uuid.New().String(),
 	})
 	require.Error(t, err)
@@ -138,14 +157,14 @@ func TestRefreshCredentials_STSError_ReturnsInternal(t *testing.T) {
 	srv := New(logger)
 	bucketID := uuid.New()
 	credDB := &mockCredDB{
-		rule:   &db.CollectionRule{ID: uuid.New(), BucketID: bucketID},
+		rule:   &db.CollectionRule{ID: uuid.New(), AgentID: uuid.MustParse(testAgentID), BucketID: bucketID},
 		bucket: &db.Bucket{ID: bucketID, Name: "data-sensor"},
 	}
 	stsMgr := &mockSTSMgr{err: assert.AnError}
 	srv.WithExtraDeps(nil, nil, stsMgr, credDB)
 
-	_, err := srv.RefreshCredentials(context.Background(), &agentv1.RefreshCredentialsRequest{
-		AgentId: "agent-1",
+	_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{
+		AgentId: testAgentID,
 		RuleId:  uuid.New().String(),
 	})
 	require.Error(t, err)
@@ -158,14 +177,14 @@ func TestRefreshCredentials_Success(t *testing.T) {
 	bucketID := uuid.New()
 	creds := &agentv1.CredentialsPayload{AccessKey: "AKID", SecretKey: "SECRET"}
 	credDB := &mockCredDB{
-		rule:   &db.CollectionRule{ID: uuid.New(), BucketID: bucketID},
+		rule:   &db.CollectionRule{ID: uuid.New(), AgentID: uuid.MustParse(testAgentID), BucketID: bucketID},
 		bucket: &db.Bucket{ID: bucketID, Name: "data-sensor"},
 	}
 	stsMgr := &mockSTSMgr{creds: creds}
 	srv.WithExtraDeps(nil, nil, stsMgr, credDB)
 
-	resp, err := srv.RefreshCredentials(context.Background(), &agentv1.RefreshCredentialsRequest{
-		AgentId: "agent-1",
+	resp, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{
+		AgentId: testAgentID,
 		RuleId:  uuid.New().String(),
 	})
 	require.NoError(t, err)
@@ -262,4 +281,175 @@ func TestWithExtraDeps_SetsAllFields(t *testing.T) {
 	assert.NotNil(t, srv.indexer)
 	assert.NotNil(t, srv.stsMgr)
 	assert.NotNil(t, srv.credDB)
+}
+
+// ── RefreshCredentials: identity is taken from the token, never the body ──────
+
+// An approved agent must not be able to mint credentials for a different agent
+// by naming it in the request body. Under the bucket-wide policy of D-030 §8
+// that would mean full write access to another agent's buckets.
+func TestRefreshCredentials_ForeignAgentID_ReturnsPermissionDenied(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	stsMgr := &mockSTSMgr{creds: &agentv1.CredentialsPayload{AccessKey: "AKID"}}
+	srv.WithExtraDeps(nil, nil, stsMgr, &mockCredDB{})
+
+	_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{
+		AgentId: uuid.NewString(), // some other agent
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
+	assert.Zero(t, stsMgr.calls, "no credential may be issued for a foreign agent_id")
+}
+
+// Naming another agent's rule must be refused too: fixing only agent_id would
+// leave this second path open.
+func TestRefreshCredentials_ForeignRuleID_ReturnsPermissionDenied(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	bucketID := uuid.New()
+	stsMgr := &mockSTSMgr{creds: &agentv1.CredentialsPayload{AccessKey: "AKID"}}
+	credDB := &mockCredDB{
+		rule:   &db.CollectionRule{ID: uuid.New(), AgentID: uuid.New(), BucketID: bucketID},
+		bucket: &db.Bucket{ID: bucketID, Name: "someone-elses-bucket"},
+	}
+	srv.WithExtraDeps(nil, nil, stsMgr, credDB)
+
+	_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{
+		RuleId: uuid.NewString(),
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
+	assert.Zero(t, stsMgr.calls)
+}
+
+func TestRefreshCredentials_NoClaims_ReturnsUnauthenticated(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	srv.WithExtraDeps(nil, nil, &mockSTSMgr{}, &mockCredDB{})
+
+	_, err := srv.RefreshCredentials(context.Background(), &agentv1.RefreshCredentialsRequest{
+		AgentId: testAgentID,
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
+// ── RefreshCredentials: rule_id omitted (the shape the agent actually uses) ───
+
+func TestRefreshCredentials_NoRuleID_CoversAllActiveRuleBuckets(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	bucketA, bucketB := uuid.New(), uuid.New()
+	agentUUID := uuid.MustParse(testAgentID)
+	credDB := &multiBucketCredDB{
+		rules: []*db.CollectionRule{
+			{ID: uuid.New(), AgentID: agentUUID, BucketID: bucketA, Status: db.RuleStatusActive},
+			{ID: uuid.New(), AgentID: agentUUID, BucketID: bucketB, Status: db.RuleStatusActive},
+			// duplicate bucket: two rules may target the same one
+			{ID: uuid.New(), AgentID: agentUUID, BucketID: bucketA, Status: db.RuleStatusActive},
+			// inactive rules contribute nothing
+			{ID: uuid.New(), AgentID: agentUUID, BucketID: uuid.New(), Status: db.RuleStatusInactive},
+		},
+		buckets: map[uuid.UUID]*db.Bucket{
+			bucketA: {ID: bucketA, Name: "bucket-a"},
+			bucketB: {ID: bucketB, Name: "bucket-b"},
+		},
+	}
+	stsMgr := &mockSTSMgr{creds: &agentv1.CredentialsPayload{AccessKey: "AKID"}}
+	srv.WithExtraDeps(nil, nil, stsMgr, credDB)
+
+	resp, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, "AKID", resp.Credentials.AccessKey)
+
+	assert.Equal(t, testAgentID, stsMgr.gotAgentID)
+	names := make([]string, 0, len(stsMgr.gotBuckets))
+	for _, b := range stsMgr.gotBuckets {
+		names = append(names, b.BucketName)
+	}
+	assert.ElementsMatch(t, []string{"bucket-a", "bucket-b"}, names,
+		"duplicates collapse and paused rules are excluded")
+}
+
+func TestRefreshCredentials_NoActiveRules_ReturnsFailedPrecondition(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	credDB := &multiBucketCredDB{}
+	stsMgr := &mockSTSMgr{}
+	srv.WithExtraDeps(nil, nil, stsMgr, credDB)
+
+	_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Zero(t, stsMgr.calls)
+}
+
+// multiBucketCredDB resolves each rule's bucket independently, which the single
+// -bucket mockCredDB cannot express.
+type multiBucketCredDB struct {
+	rules   []*db.CollectionRule
+	buckets map[uuid.UUID]*db.Bucket
+}
+
+func (m *multiBucketCredDB) GetCollectionRuleByID(context.Context, uuid.UUID) (*db.CollectionRule, error) {
+	return nil, assert.AnError
+}
+
+func (m *multiBucketCredDB) GetBucketByID(_ context.Context, id uuid.UUID) (*db.Bucket, error) {
+	if b, ok := m.buckets[id]; ok {
+		return b, nil
+	}
+	return nil, assert.AnError
+}
+
+func (m *multiBucketCredDB) ListCollectionRulesByAgent(context.Context, uuid.UUID) ([]*db.CollectionRule, error) {
+	return m.rules, nil
+}
+
+// ── pushCredentials ──────────────────────────────────────────────────────────
+
+func TestPushCredentials_DeliversOverStream(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	registry := NewAgentRegistry()
+	srv.WithDeps(registry, nil, nil, nil, nil)
+
+	bucketID := uuid.New()
+	credDB := &multiBucketCredDB{
+		rules: []*db.CollectionRule{
+			{ID: uuid.New(), AgentID: uuid.MustParse(testAgentID), BucketID: bucketID, Status: db.RuleStatusActive},
+		},
+		buckets: map[uuid.UUID]*db.Bucket{bucketID: {ID: bucketID, Name: "data-sensor"}},
+	}
+	stsMgr := &mockSTSMgr{creds: &agentv1.CredentialsPayload{AccessKey: "AKID"}}
+	srv.WithExtraDeps(nil, nil, stsMgr, credDB)
+
+	conn := registry.Register(testAgentID, nil, func() {})
+	srv.pushCredentials(context.Background(), testAgentID)
+
+	select {
+	case msg := <-conn.SendCh:
+		payload, ok := msg.Payload.(*agentv1.ServerMessage_Credentials)
+		require.True(t, ok, "expected a Credentials payload, got %T", msg.Payload)
+		assert.Equal(t, "AKID", payload.Credentials.AccessKey)
+	default:
+		t.Fatal("no credentials delivered to the agent stream")
+	}
+}
+
+// A freshly approved agent has no rules yet; that is normal and must not be
+// treated as an error, the refresh RPC supplies credentials once rules arrive.
+func TestPushCredentials_NoRules_IsQuietNoOp(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	registry := NewAgentRegistry()
+	srv.WithDeps(registry, nil, nil, nil, nil)
+	stsMgr := &mockSTSMgr{}
+	srv.WithExtraDeps(nil, nil, stsMgr, &multiBucketCredDB{})
+
+	conn := registry.Register(testAgentID, nil, func() {})
+	assert.NotPanics(t, func() { srv.pushCredentials(context.Background(), testAgentID) })
+	assert.Zero(t, stsMgr.calls)
+	assert.Empty(t, conn.SendCh)
 }

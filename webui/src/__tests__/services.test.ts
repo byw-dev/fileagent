@@ -257,9 +257,12 @@ describe('utils/pathTemplate – coverage for renderPathPreview', () => {
     expect(validatePathTemplate('')).toBeTruthy()
   })
 
-  it('validatePathTemplate rejects template not starting with /', async () => {
+  it('validatePathTemplate accepts a template with or without a leading /', async () => {
     const { validatePathTemplate } = await import('../utils/pathTemplate')
-    expect(validatePathTemplate('year/month')).toBeTruthy()
+    // The leading "/" is stripped before the object key is built, so it is
+    // optional rather than required.
+    expect(validatePathTemplate('year/month')).toBeNull()
+    expect(validatePathTemplate('/year/month')).toBeNull()
   })
 
   it('validatePathTemplate accepts custom variables (no whitelist)', async () => {

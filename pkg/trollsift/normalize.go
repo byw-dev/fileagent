@@ -17,15 +17,21 @@ import "strings"
 // path — is deliberate: the reverse direction would change every object key
 // ever written and require re-laying out existing data.
 //
+// All leading separators are removed, not just one: the agent strips the
+// template's leading "/" and then strips the composed path's as well, so a
+// template written "//data/{x}" would otherwise leave the two sides disagreeing
+// again. Rule creation over REST applies no template constraints (D-030 §8), so
+// that shape is reachable.
+//
 // Callers should normalise the template once, then use the result for both
 // Compose and Parse. See docs/design/contracts.md V-3.
 func NormalizeTemplate(template string) string {
-	return strings.TrimPrefix(template, "/")
+	return strings.TrimLeft(template, "/")
 }
 
 // NormalizeObjectKey applies the same canonical form to a composed path, so a
 // key and the template it came from can be compared without either side
 // carrying a stray leading separator.
 func NormalizeObjectKey(key string) string {
-	return strings.TrimPrefix(key, "/")
+	return strings.TrimLeft(key, "/")
 }

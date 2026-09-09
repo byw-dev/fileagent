@@ -138,14 +138,21 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 		return nil, status.Error(codes.Unimplemented, "RefreshCredentials not yet implemented")
 	}
 
-	agentID := req.GetAgentId()
+	// The identity always comes from the verified JWT claims, never from the
+	// request body. request.agent_id is a caller-supplied string; honouring it
+	// would let any approved agent mint credentials for another agent's buckets,
+	// which under the bucket-wide policy of D-030 §8 means full write access to
+	// someone else's data.
+	agentID := extractAgentID(ctx)
 	if agentID == "" {
-		// Fall back to the verified identity on the stream/RPC context rather
-		// than trusting the request body.
-		agentID = extractAgentID(ctx)
+		return nil, status.Error(codes.Unauthenticated, "missing agent identity in token")
 	}
-	if agentID == "" {
-		return nil, status.Error(codes.InvalidArgument, "missing agent_id")
+	if claimed := req.GetAgentId(); claimed != "" && claimed != agentID {
+		s.logger.Warn("refresh_credentials: agent_id does not match token subject",
+			zap.String("token_agent_id", agentID),
+			zap.String("claimed_agent_id", claimed),
+		)
+		return nil, status.Error(codes.PermissionDenied, "agent_id does not match authenticated identity")
 	}
 
 	buckets, err := s.bucketsForAgent(ctx, agentID, req.GetRuleId())
@@ -171,29 +178,41 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 
 // bucketsForAgent resolves the bucket set an STS session should cover.
 //
-// A non-empty ruleID narrows the session to that rule's bucket; otherwise every
-// active rule of the agent contributes its bucket. The result is deduplicated
-// by BuildSessionPolicy.
+// agentID must already be the authenticated identity, never a value taken from
+// the request body. A non-empty ruleID narrows the session to that rule's
+// bucket, but only if the rule belongs to this agent; otherwise every active
+// rule of the agent contributes its bucket. The result is deduplicated by
+// BuildSessionPolicy.
 func (s *Server) bucketsForAgent(ctx context.Context, agentID, ruleID string) ([]storage.BucketAccess, error) {
-	if ruleID != "" {
-		parsedRuleID, err := uuid.Parse(ruleID)
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "invalid rule_id: %v", err)
-		}
-		rule, err := s.credDB.GetCollectionRuleByID(ctx, parsedRuleID)
-		if err != nil {
-			return nil, status.Errorf(codes.NotFound, "collection rule not found: %v", err)
-		}
-		bucket, err := s.credDB.GetBucketByID(ctx, rule.BucketID)
-		if err != nil {
-			return nil, status.Errorf(codes.NotFound, "bucket not found: %v", err)
-		}
-		return []storage.BucketAccess{{BucketName: bucket.Name}}, nil
-	}
-
 	parsedAgentID, err := uuid.Parse(agentID)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid agent_id: %v", err)
+	}
+
+	if ruleID != "" {
+		parsedRuleID, pErr := uuid.Parse(ruleID)
+		if pErr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid rule_id: %v", pErr)
+		}
+		rule, rErr := s.credDB.GetCollectionRuleByID(ctx, parsedRuleID)
+		if rErr != nil {
+			return nil, status.Errorf(codes.NotFound, "collection rule not found: %v", rErr)
+		}
+		// Ownership check: a rule id is caller-supplied, so without this an
+		// agent could name any other agent's rule and receive credentials for
+		// that rule's bucket.
+		if rule.AgentID != parsedAgentID {
+			s.logger.Warn("credentials: rule does not belong to the requesting agent",
+				zap.String("agent_id", agentID),
+				zap.String("rule_id", ruleID),
+			)
+			return nil, status.Error(codes.PermissionDenied, "collection rule does not belong to this agent")
+		}
+		bucket, bErr := s.credDB.GetBucketByID(ctx, rule.BucketID)
+		if bErr != nil {
+			return nil, status.Errorf(codes.NotFound, "bucket not found: %v", bErr)
+		}
+		return []storage.BucketAccess{{BucketName: bucket.Name}}, nil
 	}
 	rules, err := s.credDB.ListCollectionRulesByAgent(ctx, parsedAgentID)
 	if err != nil {
