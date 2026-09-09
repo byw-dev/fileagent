@@ -170,3 +170,6 @@ bootstrap_admin_credentials.txt.*
 
 # Claude Design handoff bundles (local design reference; decisions land in docs/design/)
 *-handoff.zip
+
+# 设计稿 / 导出的 HTML：保持本地未跟踪（见 docs/design/mockups/README.md）
+docs/design/mockups/
