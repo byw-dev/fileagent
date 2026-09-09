@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…24 来自 IC-1 的 code review，其中 22/23 已随 IC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，其中 22/23 已随 IC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -40,6 +40,7 @@
 | IC-BUG-22 | `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token | 🔴 P0 | controlplane |
 | IC-BUG-23 | 吊销不生效：被吊销 agent 的 token 仍可用，且重连会把状态刷回 online | 🔴 P0 | controlplane |
 | IC-BUG-24 | `handleDryRunResult` 无归属校验，可对他人 rule 投递伪造试运行结果 | 🟡 P2 | controlplane |
+| IC-BUG-25 | 吊销切不断已建立的流：被吊销 agent 仍可心跳/上报，UI 显示在线且踢不掉 | 🟠 P1 | controlplane |
 
 ---
 
@@ -285,7 +286,7 @@
 | **精确位置** | `controlplane/internal/agent/manager.go` `RevokeAgent`；`controlplane/internal/grpcserver/handler.go` `Connect` / `RefreshCredentials`；`controlplane/internal/db/queries/agents.sql:60-70`（那条被绕过的约束） |
 | **实测** | 把已连接 agent 在库里置为 `revoked` 后调 `RefreshCredentials{}`，**照常返回 STS 凭据**；重连后状态被刷回 `online`，UI 上看不出曾被吊销 |
 | **后果** | `AGENT_TOKEN_TTL` 默认 **720h = 30 天**，吊销一个**被入侵的** agent 完全依赖它自愿执行 `handleRevokeCommand` 删本地 token——而被入侵的 agent 正是不会照做的那个。D-030 第八条「授权宽度是管理权限问题」所依赖的管理手段本身失效 |
-| **修复** | ✅ **已随 IC-1 修**：新增 `Server.assertAgentUsable`，`Connect` 与 `RefreshCredentials` 入口查一次 `agents.status`，仅 `approved/online/offline` 放行；查不到 agent 行一律拒绝（fail-closed）。有了这道闸门，`Connect` 里的无条件 online 写入不再能复活终态。**未做**按 jti 吊销 JWT——CP 只存 token 的 sha256、无法还原 jti，真要做需引入「按 agent 维度的令牌版本号」，成本远高于状态闸门 |
+| **修复** | ✅ **已随 IC-1 修**：新增 `Server.assertAgentUsable`，`Connect` 与 `RefreshCredentials` 入口查一次 `agents.status`，仅 `approved/online/offline` 放行；查不到 agent 行一律拒绝（fail-closed）。并把 `Connect` 的 online 写入换成条件 SQL `MarkAgentOnlineIfUsable`（`WHERE status IN ('approved','offline','online')`）——**不变式钉在 SQL 里而不是靠「同一函数里更早的一行」**，否则吊销恰好落在闸门与写入之间就会被这条无条件 UPDATE 撤销、此后闸门永久放行。**未做**按 jti 吊销 JWT——CP 只存 token 的 sha256、无法还原 jti，真要做需引入「按 agent 维度的令牌版本号」，成本远高于状态闸门 |
 | **验收** | ✅ 单测覆盖（revoked 拒绝 + 三种可用状态放行 + 查库失败拒绝）；变异测试确认去掉闸门后用例失败 |
 
 ## IC-BUG-24 — `handleDryRunResult` 无归属校验 🟡 P2
@@ -297,6 +298,17 @@
 | **后果** | 任一已连接 agent 可对**别人的 `rule_id`** 投递伪造的试运行结果，管理员在 UI 上看到的预览是伪造的。只读、影响面小，但与 IC-BUG-22/23 是同一个模式：**凡是客户端指定资源 ID 的接口，都要问一句「这个资源是它的吗」** |
 | **修复** | 投递前校验该 rule 归属于流上的 agentID（`handleDryRunResult` 增加 agentID 参数）。归 IC-2 一并做 |
 | **验收** | agent A 对 agent B 的 rule_id 投递 DryRunResult 被丢弃并告警 |
+
+## IC-BUG-25 — 吊销切不断已建立的流 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `assertAgentUsable` 只在**建流时**跑一次（IC-1 加的闸门）。已建立的流不受任何约束：`AgentConn.CancelFunc` **全仓库无人调用**（唯一的 `Unregister` 是 `Connect` 自己的 defer），REST 的 `Revoke` 只发一条**协作式**命令；`handleAgentMessage` 的四个分支都没有闸门 |
+| **精确位置** | `controlplane/internal/grpcserver/registry.go`（`CancelFunc` 无调用点）；`controlplane/internal/grpcserver/handler.go` `handleAgentMessage`；`controlplane/internal/agent/manager.go` `RevokeAgent` |
+| **后果** | 被入侵的 agent 已连接 → 管理员吊销 → 它忽略 `Revoke` 命令、不断开。于是：①继续心跳刷新 `agent:online:<id>` 与 `last_seen_at`，**UI 上这个已吊销的 agent 一直显示在线，管理员没有任何手段把它踢下线**；②继续上报 `UploadResult`（IC-2 之后就是攻击者可控地直接写 `file_entries`/`upload_logs`）；③继续响应 `ListDirectory` |
+| **残留窗口（已接受）** | 手里已签发的 STS 会话在 ≤1h 内仍是整桶写。STS 会话本质上不可撤销（除非轮转 MinIO 父用户或加 deny policy），这一条**接受**，但必须在运维文档里写明「吊销不是即时的，最长一个 STS TTL」 |
+| **修复** | `RevokeAgent` 发完命令后主动切流：registry 加 `Disconnect(agentID)` 调用该 conn 的 `CancelFunc`。顺带修掉「已吊销却显示在线」。归 IC-2 |
+| **验收** | 吊销一个不配合的 agent（不处理 `Revoke` 命令的构造版本）后，流在秒级断开、UI 立即显示离线、后续 `UploadResult` 不再入库 |
 
 ---
 

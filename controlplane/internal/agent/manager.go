@@ -80,6 +80,13 @@ func NewManager(
 
 // Register handles agent self-registration.
 func (m *Manager) Register(ctx context.Context, req *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
+	// The fingerprint column is NOT NULL UNIQUE, which does not exclude the
+	// empty string — and this RPC needs no authentication, so without this check
+	// anyone could claim the single row with fingerprint '' and then poll it.
+	if req.GetFingerprint() == "" {
+		return nil, status.Error(codes.InvalidArgument, "fingerprint is required")
+	}
+
 	existing, err := m.db.GetAgentByFingerprint(ctx, req.GetFingerprint())
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("register: lookup fingerprint: %w", err)

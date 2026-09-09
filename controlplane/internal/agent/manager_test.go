@@ -392,3 +392,38 @@ func TestPollApproval_MatchingFingerprint_IssuesToken(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEmpty(t, resp.AuthToken)
 }
+
+// The fingerprint column is NOT NULL UNIQUE but the empty string satisfies that,
+// so an unauthenticated caller could otherwise create and then poll the one row
+// with fingerprint ”. Both ends are guarded: Register refuses to create it and
+// PollApproval refuses to serve it.
+func TestRegister_EmptyFingerprint_Rejected(t *testing.T) {
+	m, _, _ := newTestManager(t)
+
+	_, err := m.Register(context.Background(), &agentv1.RegisterRequest{
+		Fingerprint: "",
+		Hostname:    "attacker",
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestPollApproval_BothFingerprintsEmpty_StillRejected(t *testing.T) {
+	m, agentDB, _ := newTestManager(t)
+
+	agentID := uuid.New()
+	agentDB.agents[agentID.String()] = &db.Agent{
+		ID:          agentID,
+		Name:        "legacy-row",
+		OrgID:       defaultOrgID,
+		Status:      db.AgentStatusApproved,
+		Fingerprint: "", // a row that predates the Register guard
+	}
+
+	_, err := m.PollApproval(context.Background(), &agentv1.PollApprovalRequest{
+		AgentId:     agentID.String(),
+		Fingerprint: "",
+	})
+	require.Error(t, err, "an empty fingerprint must never authenticate, even against an empty stored one")
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
+}

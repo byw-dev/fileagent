@@ -79,12 +79,11 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	}
 	if s.stateDB != nil {
 		if id, err := uuid.Parse(agentID); err == nil {
-			// Safe to write unconditionally only because assertAgentUsable has
-			// already rejected terminal states above. Before that gate existed
-			// this line resurrected a revoked agent to online the moment it
-			// reconnected — the very thing MarkAgentOnlineIfOffline's SQL
-			// comment says must never happen.
-			if _, dbErr := s.stateDB.UpdateAgentStatus(ctx, id, db.AgentStatusOnline); dbErr != nil {
+			// Constrained in SQL rather than relying on the liveness check above:
+			// a revocation landing between the two would otherwise be undone by
+			// an unconditional write, and the agent would then pass the gate on
+			// every subsequent call. Terminal states must never be revived.
+			if _, dbErr := s.stateDB.MarkAgentOnlineIfUsable(ctx, id); dbErr != nil {
 				s.logger.Warn("connect: update status to online failed", zap.Error(dbErr))
 			}
 		}

@@ -73,6 +73,10 @@ type AgentStateDB interface {
 	GetAgentByID(ctx context.Context, id uuid.UUID) (*db.Agent, error)
 	UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error
 	UpdateAgentStatus(ctx context.Context, id uuid.UUID, status db.AgentStatus) (*db.Agent, error)
+	// MarkAgentOnlineIfUsable transitions to online only from a status an agent
+	// may legitimately connect from, so a revocation landing between the
+	// liveness check and this write cannot be undone by it.
+	MarkAgentOnlineIfUsable(ctx context.Context, id uuid.UUID) (int64, error)
 	// MarkAgentOnlineIfOffline restores status to online (rows==1) when a
 	// heartbeat proves the agent is alive but the DB says otherwise — e.g. after
 	// the offline sweeper's reconnect-race false positive.

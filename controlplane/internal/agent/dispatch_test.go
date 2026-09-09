@@ -62,8 +62,8 @@ func (m *mockDispatchCache) Del(_ context.Context, keys ...string) error {
 }
 
 type mockRegistry struct {
-	online  map[string]bool
-	sent    []*agentv1.ServerMessage
+	online map[string]bool
+	sent   []*agentv1.ServerMessage
 }
 
 func newMockRegistry() *mockRegistry {
@@ -152,53 +152,53 @@ func TestSyncRulesOnConnect(t *testing.T) {
 }
 
 func TestDispatchRule_LockAlreadyHeld(t *testing.T) {
-d, _, cache, reg := newTestDispatcher(t)
-agentID := uuid.New()
-reg.online[agentID.String()] = true
-rule := &db.CollectionRule{
-ID:      uuid.New(),
-AgentID: agentID,
-Status:  db.RuleStatusActive,
-}
+	d, _, cache, reg := newTestDispatcher(t)
+	agentID := uuid.New()
+	reg.online[agentID.String()] = true
+	rule := &db.CollectionRule{
+		ID:      uuid.New(),
+		AgentID: agentID,
+		Status:  db.RuleStatusActive,
+	}
 
-// First dispatch acquires the lock
-require.NoError(t, d.DispatchRule(context.Background(), rule))
-assert.Len(t, reg.sent, 1)
+	// First dispatch acquires the lock
+	require.NoError(t, d.DispatchRule(context.Background(), rule))
+	assert.Len(t, reg.sent, 1)
 
-// Manually re-add the lock key so the second call finds it held
-cache.keys["lock:rule_dispatch:"+rule.ID.String()] = true
-require.NoError(t, d.DispatchRule(context.Background(), rule))
-// Still only 1 message sent (second call was skipped)
-assert.Len(t, reg.sent, 1)
+	// Manually re-add the lock key so the second call finds it held
+	cache.keys["lock:rule_dispatch:"+rule.ID.String()] = true
+	require.NoError(t, d.DispatchRule(context.Background(), rule))
+	// Still only 1 message sent (second call was skipped)
+	assert.Len(t, reg.sent, 1)
 }
 
 func TestDispatchRuleCancel_AgentOffline(t *testing.T) {
-d, _, _, reg := newTestDispatcher(t)
-reg.online["agent-1"] = false
-err := d.DispatchRuleCancel(context.Background(), uuid.New().String(), "agent-1")
-require.NoError(t, err)
-assert.Empty(t, reg.sent)
+	d, _, _, reg := newTestDispatcher(t)
+	reg.online["agent-1"] = false
+	err := d.DispatchRuleCancel(context.Background(), uuid.New().String(), "agent-1")
+	require.NoError(t, err)
+	assert.Empty(t, reg.sent)
 }
 
 func TestSyncRulesOnConnect_InvalidAgentID(t *testing.T) {
-d, _, _, _ := newTestDispatcher(t)
-err := d.SyncRulesOnConnect(context.Background(), "not-a-uuid")
-require.Error(t, err)
-assert.Contains(t, err.Error(), "invalid agent_id")
+	d, _, _, _ := newTestDispatcher(t)
+	err := d.SyncRulesOnConnect(context.Background(), "not-a-uuid")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid agent_id")
 }
 
 type errDispatchDB struct{ err error }
 
 func (e *errDispatchDB) ListCollectionRulesByAgent(_ context.Context, _ uuid.UUID) ([]*db.CollectionRule, error) {
-return nil, e.err
+	return nil, e.err
 }
 
 func TestSyncRulesOnConnect_DBError(t *testing.T) {
-logger, _ := zap.NewDevelopment()
-d := NewDispatcher(&errDispatchDB{err: assert.AnError}, newMockBucketQuerier(), newMockDispatchCache(), newMockRegistry(), logger)
-err := d.SyncRulesOnConnect(context.Background(), uuid.New().String())
-require.Error(t, err)
-assert.Contains(t, err.Error(), "list rules")
+	logger, _ := zap.NewDevelopment()
+	d := NewDispatcher(&errDispatchDB{err: assert.AnError}, newMockBucketQuerier(), newMockDispatchCache(), newMockRegistry(), logger)
+	err := d.SyncRulesOnConnect(context.Background(), uuid.New().String())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "list rules")
 }
 
 type errBucketQuerier struct{ err error }
