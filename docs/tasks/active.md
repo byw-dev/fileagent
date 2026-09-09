@@ -22,7 +22,7 @@
 - **设计**：[`docs/design/consistency-and-ingest.md`](../design/consistency-and-ingest.md)
 - **决策**：[`DECISIONS.md`](../../DECISIONS.md) **D-030**（不换存储层；STS grant + 注册 outbox + 分片对账）、
   **D-031**（MinIO 事件传输 webhook → NATS JetStream，排期对账阶段 IC-11）
-- **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-32（8 个 P0 / 14 个 P1 / 10 个 P2；30…32 来自 2026-09-10 的 M-2 类扫描）
+- **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-34（8 个 P0 / 16 个 P1 / 10 个 P2；30…32 来自 2026-09-10 的 M-2 类扫描，33/34 来自同日评审）。**分诊结论见 [`consistency-ingest.md`](consistency-ingest.md) 「分诊结论」一节**——未关闭 24 条中 16 条挡着数据面可用、6 条可推、2 条拆半
 
 **顺序**：IC-0 文档基线 → 止血 IC-1 → **IC-2a** →（IC-2b / IC-3 / IC-4 / IC-5 / IC-SEC-2 可并行）
 → 地基 IC-6/7 → 准入 IC-8…10 → 对账 IC-11…13 → 血缘 IC-14。
