@@ -81,3 +81,30 @@ func TestStore_ConcurrentDelivers(t *testing.T) {
 		}
 	}
 }
+
+// The recipient check is the invariant this package exists to protect, so it
+// needs a test here and not only in the grpcserver package that calls it.
+func TestStore_Deliver_WrongAgent_IsRefused(t *testing.T) {
+	s := dryrun.New()
+	ch := s.Register("req-1", "agent-a")
+
+	if s.Deliver("req-1", "agent-b", &agentv1.DryRunResult{RuleId: "req-1"}) {
+		t.Fatal("Deliver accepted a result from an agent the request was not sent to")
+	}
+	select {
+	case <-ch:
+		t.Fatal("the waiting caller received a result from the wrong agent")
+	default:
+	}
+
+	// The entry survives the refusal: the rightful agent can still deliver.
+	if !s.Deliver("req-1", "agent-a", &agentv1.DryRunResult{RuleId: "req-1"}) {
+		t.Fatal("a refused delivery must not consume the pending entry")
+	}
+}
+
+func TestStore_Deliver_UnknownRequest_ReturnsFalse(t *testing.T) {
+	if dryrun.New().Deliver("nope", "agent-a", &agentv1.DryRunResult{}) {
+		t.Fatal("Deliver reported success for an unregistered request id")
+	}
+}

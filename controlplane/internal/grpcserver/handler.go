@@ -163,7 +163,17 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		select {
 		case <-ctx.Done():
 			// Cancelled from outside — the agent was revoked (IC-BUG-25).
-			<-sendErr
+			//
+			// Deliberately does not wait for the send goroutine. That goroutine
+			// only checks ctx while idle; if it is parked inside stream.Send it
+			// stays there until the client reads, which a revoked agent has no
+			// reason to do. Waiting here would hang this handler exactly as the
+			// blocking Recv used to, leaking the goroutine and the registry
+			// entry and leaving IsOnline true forever.
+			//
+			// Returning is what actually ends the RPC: the parked Send then
+			// fails, and the goroutine's write to the buffered sendErr channel
+			// completes without a reader.
 			s.logger.Info("connect: stream terminated by control plane",
 				zap.String("agent_id", agentID))
 			return status.Error(codes.PermissionDenied, "agent connection terminated")

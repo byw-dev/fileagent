@@ -3,6 +3,7 @@ package grpcserver
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -241,4 +242,47 @@ func TestServer_Connect_Disconnect_EndsStreamAndUnregisters(t *testing.T) {
 	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
 		3*time.Second, 20*time.Millisecond,
 		"registry entry leaked: the handler goroutine is still alive")
+}
+
+// A revoked agent has no reason to keep reading the stream, and once it stops
+// the send goroutine parks inside stream.Send — where cancelling the context
+// cannot reach it. An earlier version waited for that goroutine before
+// returning, which reproduced the very leak IC-BUG-25 is about: the handler
+// never returned, the registry entry stayed, IsOnline stayed true.
+//
+// The agent here deliberately never calls Recv.
+func TestServer_Connect_Disconnect_WhileSendBlocked(t *testing.T) {
+	agentID := "55555555-5555-5555-5555-555555555555"
+	client, bearer, registry := newFullServerForAgent(t, agentID,
+		&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", bearer))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		3*time.Second, 10*time.Millisecond)
+
+	// Fill the flow-control window so the send goroutine is parked in Send.
+	// SendCh refusing a message is the signal that it has stopped draining.
+	big := strings.Repeat("x", 1<<20)
+	for i := 0; i < 200; i++ {
+		if !registry.Send(agentID, &agentv1.ServerMessage{
+			Payload: &agentv1.ServerMessage_PushRule{
+				PushRule: &agentv1.PushRuleCommand{
+					Rule: &agentv1.CollectionRule{RuleId: "r", BasePath: big},
+				},
+			},
+		}) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	require.True(t, registry.Disconnect(agentID))
+
+	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		8*time.Second, 50*time.Millisecond,
+		"handler did not return while the send path was blocked — registry and goroutine leaked")
 }
