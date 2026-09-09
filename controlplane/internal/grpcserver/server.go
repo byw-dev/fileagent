@@ -67,6 +67,10 @@ type CredentialDB interface {
 // AgentStateDB is the minimal DB interface used by Connect/Disconnect and
 // handleHeartbeat to persist agent lifecycle state.
 type AgentStateDB interface {
+	// GetAgentByID backs the liveness gate on Connect and RefreshCredentials:
+	// a JWT stays valid for its whole TTL, so revocation only takes effect if
+	// the persisted status is consulted at use time.
+	GetAgentByID(ctx context.Context, id uuid.UUID) (*db.Agent, error)
 	UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error
 	UpdateAgentStatus(ctx context.Context, id uuid.UUID, status db.AgentStatus) (*db.Agent, error)
 	// MarkAgentOnlineIfOffline restores status to online (rows==1) when a

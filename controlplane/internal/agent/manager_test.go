@@ -16,6 +16,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ── Mock implementations ────────────────────────────────────────────────────
@@ -157,14 +159,16 @@ func TestPollApproval_PendingStatus(t *testing.T) {
 
 	agentID := uuid.New()
 	agentDB.agents[agentID.String()] = &db.Agent{
-		ID:     agentID,
-		Status: db.AgentStatusPending,
+		ID:          agentID,
+		Status:      db.AgentStatusPending,
+		Fingerprint: "fp-1",
 	}
 
 	m := NewManager(agentDB, &mockCache{}, nil, nil, logger, 24*time.Hour)
 
 	resp, err := m.PollApproval(context.Background(), &agentv1.PollApprovalRequest{
-		AgentId: agentID.String(),
+		AgentId:     agentID.String(),
+		Fingerprint: "fp-1",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "pending", resp.Status)
@@ -176,14 +180,16 @@ func TestPollApproval_ApprovedReturnsToken(t *testing.T) {
 
 	agentID := uuid.New()
 	agentDB.agents[agentID.String()] = &db.Agent{
-		ID:     agentID,
-		OrgID:  defaultOrgID,
-		Name:   "approved-agent",
-		Status: db.AgentStatusApproved,
+		ID:          agentID,
+		OrgID:       defaultOrgID,
+		Name:        "approved-agent",
+		Status:      db.AgentStatusApproved,
+		Fingerprint: "fp-1",
 	}
 
 	resp, err := m.PollApproval(context.Background(), &agentv1.PollApprovalRequest{
-		AgentId: agentID.String(),
+		AgentId:     agentID.String(),
+		Fingerprint: "fp-1",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "approved", resp.Status)
@@ -212,15 +218,17 @@ func TestPollApproval_TokenUsesAgentTokenTTL(t *testing.T) {
 
 	agentID := uuid.New()
 	agentDB.agents[agentID.String()] = &db.Agent{
-		ID:     agentID,
-		OrgID:  defaultOrgID,
-		Name:   "approved-agent",
-		Status: db.AgentStatusApproved,
+		ID:          agentID,
+		OrgID:       defaultOrgID,
+		Name:        "approved-agent",
+		Status:      db.AgentStatusApproved,
+		Fingerprint: "fp-1",
 	}
 
 	before := time.Now()
 	resp, err := m.PollApproval(context.Background(), &agentv1.PollApprovalRequest{
-		AgentId: agentID.String(),
+		AgentId:     agentID.String(),
+		Fingerprint: "fp-1",
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, resp.AuthToken)
@@ -333,4 +341,54 @@ func TestPublishEvent_NilNATS(t *testing.T) {
 	assert.NotPanics(t, func() {
 		m.publishEvent("events.agent.test", map[string]string{"key": "value"})
 	})
+}
+
+// ── PollApproval: fingerprint is the only proof of identity ──────────────────
+
+// PollApproval is exempt from JWT auth, so the fingerprint is all that ties the
+// caller to the registered machine. An agent id is not a secret — it shows up in
+// object keys, logs and API responses — so without this check anyone holding one
+// could collect that agent's 30-day token, and since D-030 §8 that token buys
+// bucket-wide write credentials.
+func TestPollApproval_WrongFingerprint_IssuesNoToken(t *testing.T) {
+	m, agentDB, _ := newTestManager(t)
+
+	agentID := uuid.New()
+	agentDB.agents[agentID.String()] = &db.Agent{
+		ID:          agentID,
+		Name:        "test-agent",
+		OrgID:       defaultOrgID,
+		Status:      db.AgentStatusApproved,
+		Fingerprint: "the-real-machine",
+	}
+
+	for _, fp := range []string{"totally-wrong-fingerprint", ""} {
+		resp, err := m.PollApproval(context.Background(), &agentv1.PollApprovalRequest{
+			AgentId:     agentID.String(),
+			Fingerprint: fp,
+		})
+		require.Error(t, err, "fingerprint %q must be rejected", fp)
+		assert.Equal(t, codes.PermissionDenied, status.Code(err))
+		assert.Nil(t, resp)
+	}
+}
+
+func TestPollApproval_MatchingFingerprint_IssuesToken(t *testing.T) {
+	m, agentDB, _ := newTestManager(t)
+
+	agentID := uuid.New()
+	agentDB.agents[agentID.String()] = &db.Agent{
+		ID:          agentID,
+		Name:        "test-agent",
+		OrgID:       defaultOrgID,
+		Status:      db.AgentStatusApproved,
+		Fingerprint: "the-real-machine",
+	}
+
+	resp, err := m.PollApproval(context.Background(), &agentv1.PollApprovalRequest{
+		AgentId:     agentID.String(),
+		Fingerprint: "the-real-machine",
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, resp.AuthToken)
 }

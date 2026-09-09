@@ -53,6 +53,13 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		return status.Error(codes.Unauthenticated, "missing agent identity in token")
 	}
 
+	// A revoked agent keeps a syntactically valid JWT until it expires (default
+	// 30 days), and revocation never invalidated it. Checking the persisted
+	// status here is what actually makes RevokeAgent take effect.
+	if err := s.assertAgentUsable(stream.Context(), agentID); err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithCancel(stream.Context())
 	conn := s.registry.Register(agentID, stream, cancel)
 	defer func() {
@@ -72,6 +79,11 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	}
 	if s.stateDB != nil {
 		if id, err := uuid.Parse(agentID); err == nil {
+			// Safe to write unconditionally only because assertAgentUsable has
+			// already rejected terminal states above. Before that gate existed
+			// this line resurrected a revoked agent to online the moment it
+			// reconnected — the very thing MarkAgentOnlineIfOffline's SQL
+			// comment says must never happen.
 			if _, dbErr := s.stateDB.UpdateAgentStatus(ctx, id, db.AgentStatusOnline); dbErr != nil {
 				s.logger.Warn("connect: update status to online failed", zap.Error(dbErr))
 			}
@@ -155,6 +167,10 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 		return nil, status.Error(codes.PermissionDenied, "agent_id does not match authenticated identity")
 	}
 
+	if err := s.assertAgentUsable(ctx, agentID); err != nil {
+		return nil, err
+	}
+
 	buckets, err := s.bucketsForAgent(ctx, agentID, req.GetRuleId())
 	if err != nil {
 		return nil, err
@@ -174,6 +190,42 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 		zap.Int("buckets", len(buckets)),
 	)
 	return &agentv1.RefreshCredentialsResponse{Credentials: creds}, nil
+}
+
+// assertAgentUsable rejects agents that must no longer act, consulting the
+// persisted status rather than the token.
+//
+// Agent JWTs are long-lived (AGENT_TOKEN_TTL defaults to 30 days) and
+// RevokeAgent never invalidated them, so without this gate revoking a
+// compromised agent depended on that agent voluntarily deleting its own token —
+// which is precisely what a compromised agent will not do. Since D-030 §8 an
+// agent token buys bucket-wide write access, so revocation has to actually bite.
+//
+// It fails open when no state DB is wired (unit-test servers), and treats a
+// lookup failure as fatal: an agent row that cannot be read must not be trusted.
+func (s *Server) assertAgentUsable(ctx context.Context, agentID string) error {
+	if s.stateDB == nil {
+		return nil
+	}
+	id, err := uuid.Parse(agentID)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid agent_id: %v", err)
+	}
+	agent, err := s.stateDB.GetAgentByID(ctx, id)
+	if err != nil {
+		s.logger.Warn("agent liveness check failed", zap.String("agent_id", agentID), zap.Error(err))
+		return status.Error(codes.PermissionDenied, "agent is not in a usable state")
+	}
+	switch agent.Status {
+	case db.AgentStatusApproved, db.AgentStatusOnline, db.AgentStatusOffline:
+		return nil
+	default:
+		s.logger.Warn("rejected agent in non-usable state",
+			zap.String("agent_id", agentID),
+			zap.String("status", string(agent.Status)),
+		)
+		return status.Errorf(codes.PermissionDenied, "agent status is %s", agent.Status)
+	}
 }
 
 // bucketsForAgent resolves the bucket set an STS session should cover.

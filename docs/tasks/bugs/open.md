@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20/21 来自 IC-1 的 code review）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…24 来自 IC-1 的 code review，其中 22/23 已随 IC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -37,6 +37,9 @@
 | IC-BUG-19 | minio-event 索引 URL 编码后的对象键（`%2F`），与真实键不符 | 🟠 P1 | controlplane |
 | IC-BUG-20 | bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 | 🟠 P1 | controlplane + agent |
 | IC-BUG-21 | 模板解析失败时猜一个对象键写进去，污染对账分片 | 🟡 P2 | agent |
+| IC-BUG-22 | `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token | 🔴 P0 | controlplane |
+| IC-BUG-23 | 吊销不生效：被吊销 agent 的 token 仍可用，且重连会把状态刷回 online | 🔴 P0 | controlplane |
+| IC-BUG-24 | `handleDryRunResult` 无归属校验，可对他人 rule 投递伪造试运行结果 | 🟡 P2 | controlplane |
 
 ---
 
@@ -262,6 +265,38 @@
 | **后果** | ①写入一个**错误的**对象键比让任务失败更糟：IC-6 之后 `object_keys` 按前缀分片对账，桶根平铺的对象会污染分片树，且这些对象的 path_var 永远反解不出来；②Warn 是 per-file 的——规则模板配错时一次投 5000 个文件就是 5000 条 Warn + 5000 个根目录对象，运维会把它当噪音关掉，等于退回静默 |
 | **修复** | 兜底改为**任务失败**（可重试 / 可告警）而不是猜键；Warn 按 `rule_id` 去重（首次记录）或采样。建议随 IC-2 一起做——IC-2 正好要改上报与终态语义 |
 | **验收** | 模板解析不出来时任务进入失败态并可在 UI 看到原因；同一规则连续 N 个文件失败只产生一条 Warn |
+
+## IC-BUG-22 — `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token 🔴 P0
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `PollApprovalRequest` 有 `fingerprint` 字段（`proto/v1/agent.proto:204`），但 `Manager.PollApproval` **从头到尾没读过它**——只 parse agent_id、查库、若 `status == approved` 就签发新 token。而 `PollApproval` 在 `jwtExemptMethods` 里（`interceptor.go:32`），**不需要任何认证** |
+| **精确位置** | `controlplane/internal/agent/manager.go` `PollApproval`；`controlplane/internal/grpcserver/interceptor.go:31-36` |
+| **实测** | dev 环境 grpcurl 用 `"fingerprint":"totally-wrong-fingerprint"` 直接换到 `authToken`，再用它调 `RefreshCredentials` 拿到 `data-sensor` 整桶写的 STS 会话。**攻击者除一个 agent UUID 外什么都不需要** |
+| **后果** | agent UUID 不是秘密——它出现在对象键、日志、NATS 事件、webui 响应里；`Register`（同样免认证）对已存在 fingerprint 还会回吐 agent_id。触发条件是 agent 状态恰为 `approved`（已审批、尚未首次连接），这是每个新 agent 的必经状态，窗口长度由现场决定。**IC-1 之前拿到 agent JWT 基本没用（STS 链路不通），之后它直接等于数据湖整桶写** |
+| **修复** | ✅ **已随 IC-1 修**：`PollApproval` 比对 `agent.Fingerprint`，空或不匹配返回 `PermissionDenied`。校验放在状态检查**之前**，避免向未认证调用方泄露 agent 状态 |
+| **验收** | ✅ 单测覆盖（错误指纹 / 空指纹均拒绝，正确指纹签发）；变异测试确认去掉校验后用例失败 |
+
+## IC-BUG-23 — 吊销不生效：token 仍可用，且重连会把状态刷回 online 🔴 P0
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 三处叠加：① `RevokeAgent` 只置 DB 状态 + 删 Redis 键 + 发事件，**从不调 `jwtSvc.RevokeToken`**；② `Connect` / `RefreshCredentials` / `pushCredentials` **都不查 agent 的 DB 状态**，拦截器只验签 + 黑名单；③ `Connect` 用**无条件**的 `UpdateAgentStatus(online)`，而 `MarkAgentOnlineIfOffline` 的 SQL 注释明写「must never resurrect terminal states such as 'revoked'」——`Connect` 恰恰在做这件事 |
+| **精确位置** | `controlplane/internal/agent/manager.go` `RevokeAgent`；`controlplane/internal/grpcserver/handler.go` `Connect` / `RefreshCredentials`；`controlplane/internal/db/queries/agents.sql:60-70`（那条被绕过的约束） |
+| **实测** | 把已连接 agent 在库里置为 `revoked` 后调 `RefreshCredentials{}`，**照常返回 STS 凭据**；重连后状态被刷回 `online`，UI 上看不出曾被吊销 |
+| **后果** | `AGENT_TOKEN_TTL` 默认 **720h = 30 天**，吊销一个**被入侵的** agent 完全依赖它自愿执行 `handleRevokeCommand` 删本地 token——而被入侵的 agent 正是不会照做的那个。D-030 第八条「授权宽度是管理权限问题」所依赖的管理手段本身失效 |
+| **修复** | ✅ **已随 IC-1 修**：新增 `Server.assertAgentUsable`，`Connect` 与 `RefreshCredentials` 入口查一次 `agents.status`，仅 `approved/online/offline` 放行；查不到 agent 行一律拒绝（fail-closed）。有了这道闸门，`Connect` 里的无条件 online 写入不再能复活终态。**未做**按 jti 吊销 JWT——CP 只存 token 的 sha256、无法还原 jti，真要做需引入「按 agent 维度的令牌版本号」，成本远高于状态闸门 |
+| **验收** | ✅ 单测覆盖（revoked 拒绝 + 三种可用状态放行 + 查库失败拒绝）；变异测试确认去掉闸门后用例失败 |
+
+## IC-BUG-24 — `handleDryRunResult` 无归属校验 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `handleAgentMessage` 里 `DryRunResult` 是**唯一不传 agentID** 的分支，按 body 里的 `rule_id` 投递进共享的 `dryRunStore` |
+| **精确位置** | `controlplane/internal/grpcserver/handler.go` `handleAgentMessage` 的 `AgentMessage_DryRunResult` 分支 |
+| **后果** | 任一已连接 agent 可对**别人的 `rule_id`** 投递伪造的试运行结果，管理员在 UI 上看到的预览是伪造的。只读、影响面小，但与 IC-BUG-22/23 是同一个模式：**凡是客户端指定资源 ID 的接口，都要问一句「这个资源是它的吗」** |
+| **修复** | 投递前校验该 rule 归属于流上的 agentID（`handleDryRunResult` 增加 agentID 参数）。归 IC-2 一并做 |
+| **验收** | agent A 对 agent B 的 rule_id 投递 DryRunResult 被丢弃并告警 |
 
 ---
 

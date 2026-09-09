@@ -340,7 +340,7 @@ func TestRefreshCredentials_NoClaims_ReturnsUnauthenticated(t *testing.T) {
 func TestRefreshCredentials_NoRuleID_CoversAllActiveRuleBuckets(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	srv := New(logger)
-	bucketA, bucketB := uuid.New(), uuid.New()
+	bucketA, bucketB, bucketC := uuid.New(), uuid.New(), uuid.New()
 	agentUUID := uuid.MustParse(testAgentID)
 	credDB := &multiBucketCredDB{
 		rules: []*db.CollectionRule{
@@ -348,12 +348,15 @@ func TestRefreshCredentials_NoRuleID_CoversAllActiveRuleBuckets(t *testing.T) {
 			{ID: uuid.New(), AgentID: agentUUID, BucketID: bucketB, Status: db.RuleStatusActive},
 			// duplicate bucket: two rules may target the same one
 			{ID: uuid.New(), AgentID: agentUUID, BucketID: bucketA, Status: db.RuleStatusActive},
-			// inactive rules contribute nothing
-			{ID: uuid.New(), AgentID: agentUUID, BucketID: uuid.New(), Status: db.RuleStatusInactive},
+			// Inactive rules contribute nothing. Its bucket must be resolvable,
+			// otherwise the assertion below would pass even without the status
+			// filter — the row would be dropped by the bucket lookup instead.
+			{ID: uuid.New(), AgentID: agentUUID, BucketID: bucketC, Status: db.RuleStatusInactive},
 		},
 		buckets: map[uuid.UUID]*db.Bucket{
 			bucketA: {ID: bucketA, Name: "bucket-a"},
 			bucketB: {ID: bucketB, Name: "bucket-b"},
+			bucketC: {ID: bucketC, Name: "bucket-c"},
 		},
 	}
 	stsMgr := &mockSTSMgr{creds: &agentv1.CredentialsPayload{AccessKey: "AKID"}}
@@ -369,7 +372,8 @@ func TestRefreshCredentials_NoRuleID_CoversAllActiveRuleBuckets(t *testing.T) {
 		names = append(names, b.BucketName)
 	}
 	assert.ElementsMatch(t, []string{"bucket-a", "bucket-b"}, names,
-		"duplicates collapse and paused rules are excluded")
+		"duplicates collapse and inactive rules are excluded")
+	assert.NotContains(t, names, "bucket-c", "an inactive rule must not widen the session")
 }
 
 func TestRefreshCredentials_NoActiveRules_ReturnsFailedPrecondition(t *testing.T) {
@@ -452,4 +456,62 @@ func TestPushCredentials_NoRules_IsQuietNoOp(t *testing.T) {
 	assert.NotPanics(t, func() { srv.pushCredentials(context.Background(), testAgentID) })
 	assert.Zero(t, stsMgr.calls)
 	assert.Empty(t, conn.SendCh)
+}
+
+// ── liveness gate: a revoked agent's token must stop working ─────────────────
+
+// Agent JWTs live for 30 days by default and RevokeAgent never invalidated
+// them, so revocation only bites if the persisted status is consulted at use
+// time. Without this the "management" control that D-030 §8 leans on is inert.
+func TestRefreshCredentials_RevokedAgent_ReturnsPermissionDenied(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	stsMgr := &mockSTSMgr{creds: &agentv1.CredentialsPayload{AccessKey: "AKID"}}
+	bucketID := uuid.New()
+	credDB := &multiBucketCredDB{
+		rules: []*db.CollectionRule{
+			{ID: uuid.New(), AgentID: uuid.MustParse(testAgentID), BucketID: bucketID, Status: db.RuleStatusActive},
+		},
+		buckets: map[uuid.UUID]*db.Bucket{bucketID: {ID: bucketID, Name: "data-sensor"}},
+	}
+	srv.WithExtraDeps(nil, nil, stsMgr, credDB)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusRevoked})
+
+	_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{})
+	require.Error(t, err)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
+	assert.Zero(t, stsMgr.calls, "a revoked agent must not receive credentials")
+}
+
+func TestRefreshCredentials_ApprovedAgent_PassesLivenessGate(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	bucketID := uuid.New()
+	for _, st := range []db.AgentStatus{db.AgentStatusApproved, db.AgentStatusOnline, db.AgentStatusOffline} {
+		stsMgr := &mockSTSMgr{creds: &agentv1.CredentialsPayload{AccessKey: "AKID"}}
+		credDB := &multiBucketCredDB{
+			rules: []*db.CollectionRule{
+				{ID: uuid.New(), AgentID: uuid.MustParse(testAgentID), BucketID: bucketID, Status: db.RuleStatusActive},
+			},
+			buckets: map[uuid.UUID]*db.Bucket{bucketID: {ID: bucketID, Name: "data-sensor"}},
+		}
+		srv.WithExtraDeps(nil, nil, stsMgr, credDB)
+		srv.WithStateDB(&mockStateDB{agentStatus: st})
+		_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{})
+		require.NoError(t, err, "status %s must be allowed", st)
+	}
+}
+
+// An agent row that cannot be read must not be trusted.
+func TestRefreshCredentials_AgentLookupFails_ReturnsPermissionDenied(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	stsMgr := &mockSTSMgr{}
+	srv.WithExtraDeps(nil, nil, stsMgr, &multiBucketCredDB{})
+	srv.WithStateDB(&mockStateDB{agentErr: assert.AnError})
+
+	_, err := srv.RefreshCredentials(agentCtx(testAgentID), &agentv1.RefreshCredentialsRequest{})
+	require.Error(t, err)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
+	assert.Zero(t, stsMgr.calls)
 }

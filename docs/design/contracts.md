@@ -170,6 +170,10 @@ webui 新建规则的默认模板就带前导 `/`（`webui/src/pages/Agents/Rule
 
 修复方向是**让 CP 与 webui 剥模板**，不是让 agent 停止剥路径：后者会改写所有既有对象键、需全量重铺。
 
+> **前后端严格度不同是有意的**：webui 的 `validatePathTemplate` 仍拒绝任何 `//`（包括前导），
+> 而 Go 侧的 `TrimLeft` 会容忍前导 `//`。二者不矛盾——UI 是给人的即时提示，Go 侧是给
+> REST/SDK 建规则兜底（那条路径无任何模板校验）。中间位置的 `a//b` 两侧都救不了，也不打算救。
+
 > ⚠️ **漂移风险点**：系统变量清单与时间符号表当前在
 > `pkg/trollsift`（Go，权威）与 `webui/src/utils/pathTemplate.ts`（TS，镜像）**两处手工维护**。
 > 修改任一处务必同步另一处；`pkg/trollsift` 为准。（这正是 G-8 契约单一权威想根治的场景，暂以本注记兜底。）
