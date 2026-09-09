@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -16,8 +16,10 @@
 
 ### 缺陷模式（2026-09-10 归纳）
 
-32 条**不是 32 个独立缺陷**。按成因归类后只有三类。M-1 与 M-2 的类扫描均已完成（结论见下方两小节），
-M-3 待扫。**逐条等评审撞见是最贵的发现方式**——两次扫描各自挖出了评审没撞见的实例，
+34 条里**有 30 条归得进三类成因**（M-1/M-2/M-3）。M-1 与 M-2 的类扫描均已完成（结论见下方两小节），
+M-3 待扫。**剩下 4 条不属于任何一类**——IC-BUG-33/34 是「持久化状态缺少终态处理」，IC-BUG-5/11 是
+「参数收了不用」，两者实例都太少，暂不立类，但下次归纳时应重新审视。
+**逐条等评审撞见是最贵的发现方式**——两次扫描各自挖出了评审没撞见的实例，
 且都直接改变了下一刀的边界，这正是「先扫完再发刀」的收益：
 
 | # | 模式 | 已知实例 | 未扫描的面 |
@@ -81,7 +83,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
    ⚠️ **归因要点**：这一支**不是 IC-BUG-30 造成的**——它的根在「队列与规则生命周期解耦」这个
    结构事实上（`stopRule` 不碰 `upload_tasks`、`DequeuePending` 无 rule 过滤），因此**即使
    IC-2b 修好 IC-BUG-30，这一支依然存在**。IC-BUG-30 的贡献是把它从「一次排空」放大成
-   「持续产生、直到进程重启」。五条路径与定案见 IC-BUG-29 卡片。
+   「持续产生、直到进程重启」。**六条**路径与定案见 IC-BUG-29 卡片。
 2. **IC-BUG-31 决定 ack 的可靠性模型。** IC-2a 新增的 `Acknowledgement` 走的是同一个
    best-effort `registry.Send`——丢一个 ack 就有一个任务永久停在 `reported`、outbox 永不清空。
    **修法不是把 `Send` 改成可靠投递**，那恰恰是 M-2 的错误方向；而是让 agent 侧带**重报超时**：
@@ -222,8 +224,10 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | 字段 | 内容 |
 |------|------|
 | **根因** | `queue_dir=/tmp/minio-webhook-queue` 在容器内是易失路径 |
-| **精确位置** | `deploy/scripts/init-minio.sh:125`；`docs/design/system-design.md:1731`（同样的示例配置） |
+| **精确位置** | `deploy/scripts/init-minio.sh:125`；`docs/design/system-design.md:1799`（同样的示例配置） |
 | **后果** | MinIO 容器重启/重建 → 未投递事件全部丢失，无任何补偿。叠加 IC-BUG-6 后，事件丢失有两条独立通道 |
+| **⚠️ 实测：脚本值与生效值不符（2026-09-10）** | dev 环境 `mc admin config get myminio notify_webhook:primary` 显示 `queue_dir=`（**空**），与 `init-minio.sh:125` 写的 `/tmp/minio-webhook-queue` 不符。`queue_dir` 为空时 MinIO 走 `sendSync`——**投递失败直接丢弃，连队列都没有**（容器日志可见 `Error: not connected to target server/service`）。因此 IC-4 ③ 的验收必须查**生效值**（`mc admin config get`）而非脚本文本 |
+| **IC-11 不解决** | `notify_nats` 同样有 `queue_dir` / `queue_limit`（实测确认）。分诊表初版曾写「IC-11 会连 `queue_dir` 一起删掉、别修」，**已于 2026-09-10 改判**，见 D-031「全量扫描结论」|
 | **修复** | 改为持久卷路径；同步更新 §6.5 的示例配置 |
 | **验收** | 停 CP → 写入若干对象 → 重启 MinIO 容器 → 启 CP，事件仍被投递、`file_entries` 补齐 |
 
@@ -335,7 +339,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **实测** | live-e2e 中 agent 上传 `Miru/tokyo/tokyo_001.csv`，`file_entries.storage_path` 落为 `Miru%2Ftokyo%2Ftokyo_001.csv`；直接 `mc cp` 到 `nested/dir/probe.txt` 同样落为 `nested%2Fdir%2Fprobe.txt` |
 | **后果** | 凡是带层级的对象键（正常情况）索引值都与真实键不符。①预签名下载用 `storage_path` 作 key，必然 404；②path_var 反解拿不到分隔符，打标失效；③IC-6 之后 `object_keys` 的幂等键与对账会把这些行全判成幽灵。**当前 `file_entries` 的唯一写入者就是这条路径**，所以影响是全量的 |
 | **修复** | 在 `MinioEventHandler.Handle` 解析后对 key 做一次 `url.QueryUnescape`（S3 事件用的是 `+`-as-space 的 query 编码，不是 path 编码），失败时退回原值并告警；补带层级键与含空格/中文键的单测 |
-| **归属（2026-09-10 两次改期：IC-4 → IC-2a ⑥ → 独立的 IC-2c）** | **必须早于 IC-BUG-2 的那一刀**，因为二者会**互相制造重复行**。拆成独立一刀的理由是**顺序约束不等于打包约束**——它只需在上报开启之前到位，且能独立 live 验证（`mc cp` 一个带层级的键即可，不依赖 agent）。证据：`migrations/000001_init_schema.up.sql:165` 的 `UNIQUE (bucket_id, storage_path)`、`controlplane/internal/indexer/queries.go:48` 的 `ON CONFLICT (bucket_id, storage_path)`。IC-2 之后 agent 上报写 `a/b/c.csv`、webhook 仍写 `a%2Fb%2Fc.csv`——**两个不同的 `storage_path`，进不了同一个 conflict target**，于是同一个对象变成两行，IC-2 ④ 新加的 `observed_at` 排序键**永远不会被触发**。两个写入方在 IC-11（D-031 换传输）之前一直并存 |
+| **归属（2026-09-10 两次改期：IC-4 → IC-2a ⑥ → 独立的 IC-2c）** | **必须早于 IC-BUG-2 的那一刀**，因为二者会**互相制造重复行**。拆成独立一刀的理由是**顺序约束不等于打包约束**——它只需在上报开启之前到位，且能独立 live 验证（`mc cp` 一个带层级的键即可，不依赖 agent）。证据：`migrations/000001_init_schema.up.sql:165` 的 `UNIQUE (bucket_id, storage_path)`、`controlplane/internal/indexer/queries.go:48` 的 `ON CONFLICT (bucket_id, storage_path)`。IC-2 之后 agent 上报写 `a/b/c.csv`、webhook 仍写 `a%2Fb%2Fc.csv`——**两个不同的 `storage_path`，进不了同一个 conflict target**，于是同一个对象变成两行，IC-2a ⑤ 新加的 `observed_at` 排序键**永远不会被触发**。两个写入方在 IC-11（D-031 换传输）之前一直并存 |
 | **下游传染** | 更严重的是往下游走：IC-6 的 `object_keys` 窄表用**同一个键形状**，重复会被带进对账的输入——L2 分片扫描会把其中一行判成幽灵、另一行判成真的。**等 IC-6 之后再修就要连带清洗历史行** |
 | **⚠️ IC-11（NATS）不解决它——2026-09-10 双向实测** | 曾被问「D-031 换成 NATS JetStream 后是不是就没这问题了」。**不是。** dev 环境对同一个键（`ic19/nested dir/中 文.csv`）同时挂 `notify_nats` 与 `notify_webhook` 两个 target 各抓一次载荷，**两者字节级同构**：<br>顶层字段均为 `['EventName','Key','Records']`；<br>`Records[].s3.object.key`（**CP 实际读的那个**）两边都是 `ic19%2Fnested+dir%2F%E4%B8%AD+%E6%96%87.csv`。<br>编码发生在 MinIO **构造事件对象**时，不在传输层——`%2F` 位于 JSON 字符串字段**内部**，HTTP 与 NATS 都不会改写 JSON 字符串的内容。**因此本条与 IC-11 完全正交，不能等 IC-11 一起解决** |
 | **⚠️ 别用顶层 `Key` 字段绕过** | 同次实测发现 MinIO 的事件信封有个**未编码**的顶层 `"Key":"data-sensor/ic19/nested dir/中 文.csv"`，**webhook 与 NATS 都有**（不是 NATS 独有——CP 当前的 `minioEventRecord` 只解析 `Records[]`，所以从没注意到它）。**仍然不要用它**：它是 `bucket/key` 拼接、且属 MinIO 私有信封字段，不在 S3 事件通知规范内。正解是对 `s3.object.key` 做 `QueryUnescape` |
@@ -455,7 +459,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **可利用性** | **当前为零**——agent 从不上报 `UploadResult`（IC-BUG-2），这条路径是死代码。**IC-2a 把它变成索引主路径的那一刻起就成立**，与 IC-1 让 IC-BUG-22/23 变得可利用是同一个机制 |
 | **修复** | 在 `HandleUploadResult` 里校验归属（`agentID` 已经是流上的可信身份，函数签名里就有）。**分支是三个，不是两个**——见下行 |
 | **⚠️ 三分支** | 只写 `rule.AgentID == agentID` 不够。实际要处理 ①**规则不存在** ②**规则属于别的 agent** ③**合法**，且**不能让 `loadRuleMetadata` 查不到就默默走空 metadata**——那等于把 ① 静默当成「无规则来源」，正是这条缺陷的静默版本 |
-| **① 的来源：队列与规则生命周期解耦（结构性，非缺陷）** | 三个已确认的事实：`stopRule` 只做 `sched.RemoveRule` + cancel ruleCtx（`agent/cmd/agent/main.go:159-167`），**从不触碰 `upload_tasks`**；`DequeuePending` 只按 `WHERE status = ?` 取（`queue.go:293`），**无 rule 过滤**；全仓库无「按 rule 删任务」语句（唯一的 `DELETE FROM upload_tasks` 是容量淘汰 `queue.go:277`）。**任务一旦入队，规则怎么变都不影响它被上传和上报**。于是有五条路径：<br>1. **队列滞留**——任务已入队、`CancelRule` 正常送达并停掉 watcher/cron，但队列照常排空。窗口 = 排空时间；叠加重试（`maxRetries=10`，退避 1/5/15/60min 封顶）可达数小时，大文件再叠加 IC-BUG-5 更久<br>2. **离线积压**——离线期间持续写本地队列（设计行为），期间规则被删，重连补传整批。窗口 = 断线时长<br>3. **IC-BUG-30**——断连期间删规则，重连后 agent 不知道规则没了，**持续产生新任务**。无界，直到进程重启<br>4. **重启残留**——SQLite 队列跨重启存活，规则却只从 `SyncRulesOnConnect` 来<br>5. **恶意/有缺陷的 agent** 伪造 rule_id（本卡片要防的那条）<br>6. **IC-BUG-26 自己制造的那条（评审补，最难堪的一条）**——`DeleteCollectionRule` 只按 `id` 删（`db/queries/rules.sql:58`），而 `DeleteRule` handler 把 cancel 发给 **URL 里的 agent**（`api/handler/agents.go:1041`，`agentID := c.Param("id")`）。于是 `DELETE /api/v1/agents/<A>/rules/<属于 B 的 rule>` 会删掉 B 的规则、把 cancel 发给 A——**B 全程在线、连接正常、没有任何断连窗口**，却永远收不到 cancel。这是**唯一一条在全在线稳态下无界产生**的路径<br>**只有第 3 条能被 IC-2b 消掉；第 6 条 IC-SEC-2 的 IC-BUG-26 只能消掉一半**（另一半是收件人错了，需要 `DeleteRule` 先从 DB 读回真实 `agent_id` 再发 cancel）。**1/2/4 是持久化队列 + 可变规则集的必然结果**——换句话说，**「规则不存在」是稳态下的正常情形，不是异常**：管理员每删一次规则，只要名下还有在途任务就会产生一批 |
+| **① 的来源：队列与规则生命周期解耦（结构性，非缺陷）** | 三个已确认的事实：`stopRule` 只做 `sched.RemoveRule` + cancel ruleCtx（`agent/cmd/agent/main.go:159-167`），**从不触碰 `upload_tasks`**；`DequeuePending` 只按 `WHERE status = ?` 取（`queue.go:293`），**无 rule 过滤**；全仓库无「按 rule 删任务」语句（唯一的 `DELETE FROM upload_tasks` 是容量淘汰 `queue.go:277`）。**任务一旦入队，规则怎么变都不影响它被上传和上报**。于是有五条路径：<br>1. **队列滞留**——任务已入队、`CancelRule` 正常送达并停掉 watcher/cron，但队列照常排空。窗口 = 排空时间；叠加重试（`maxRetries=10`，退避 1/5/15/60min 封顶）可达数小时，大文件再叠加 IC-BUG-5 更久<br>2. **离线积压**——离线期间持续写本地队列（设计行为），期间规则被删，重连补传整批。窗口 = 断线时长<br>3. **IC-BUG-30**——断连期间删规则，重连后 agent 不知道规则没了，**持续产生新任务**。无界，直到进程重启<br>4. **重启残留**——SQLite 队列跨重启存活，规则却只从 `SyncRulesOnConnect` 来<br>5. **恶意/有缺陷的 agent** 伪造 rule_id（本卡片要防的那条）<br>6. **IC-BUG-26 自己制造的那条（评审补，最难堪的一条）**——`DeleteCollectionRule` 只按 `id` 删（`db/queries/rules.sql:58`），而 `DeleteRule` handler 把 cancel 发给 **URL 里的 agent**（`api/handler/agents.go:1026` 取 `agentID := c.Param("id")`，`:1041` 用它发 cancel）。于是 `DELETE /api/v1/agents/<A>/rules/<属于 B 的 rule>` 会删掉 B 的规则、把 cancel 发给 A——**B 全程在线、连接正常、没有任何断连窗口**，却永远收不到 cancel。这是**唯一一条在全在线稳态下无界产生**的路径<br>**只有第 3 条能被 IC-2b 消掉；第 6 条 IC-SEC-2 的 IC-BUG-26 只能消掉一半**（另一半是收件人错了，需要 `DeleteRule` 先从 DB 读回真实 `agent_id` 再发 cancel）。**1/2/4 是持久化队列 + 可变规则集的必然结果**——换句话说，**「规则不存在」是稳态下的正常情形，不是异常**：管理员每删一次规则，只要名下还有在途任务就会产生一批 |
 | **✅ 定案（2026-09-10）：宽松——清空 `rule_id`，文件照常入索引** | **严格（整条拒绝）会让「删除一条规则」变成「静默丢弃若干已在 MinIO 里的文件的索引行」**。对象已经写进去了，拒绝入索引只是制造一批要等 IC-13 对账才发现的幽灵，而 L2 那时只能补回存在性、补不回 tags/sha256。一个日常管理动作不该有这种后果 |
 | **⚠️ 告警分级** | ① 与 ② 的告警等级**必须分开**：① 是路径 1/2/4 的正常产物，per-file 告警就是 IC-BUG-21 里「5000 条 Warn 被运维关掉」的翻版，应按 `rule_id` 去重或降为 Info；**② 永远不合法，是唯一值得响的那一支** |
 | **⚠️ 宽松的代价，须可见** | 走 ① 分支的文件拿不到 `loadRuleMetadata` 的规则声明——**永久丢失的是「规则声明的 `file_type` 覆盖」+ `static_tags` + `path_var` 标签**，规则已删，retag worker 也没有可回溯的声明。**注意不是「无类型」**：`indexer.go:333` 仍会走 glob `classifier.Classify` 兜底，文件类型按后缀正常判定（评审证伪，初版措辞过重）。这是接受的代价，但要让它可查（在 `source` 之外记一个「元数据缺失」标记），而不是当正常行写完了事 |
@@ -506,9 +510,9 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **可利用性 / 触发条件** | **当前为零**——agent 从不上报（IC-BUG-2），这条路径是死代码。**IC-2a ⑥ 让「重试耗尽以 `success=false` 上报」成为常规行为的那一刻起就成立**，与 IC-BUG-29 同一个机制 |
 | **后果** | MinIO 里没有对象，`file_entries` 里却有行。这是 IC-6 `object_keys` 与 IC-13 L2 分片对账的**反向幽灵**（DB 有、对象无）——L3 幽灵清理找的是「DB 有而对象无」，这些行会被当成真幽灵反复核实、浪费对账预算；若清理逻辑真删了它们，又会把「上传失败」这个运维信号一并抹掉 |
 | **✅ 定案（2026-09-10）：`success=false` 时不写 `file_entries`，只写 `upload_logs`** | 归 **IC-2a ⑥**。定案理由**不是「更简洁」，而是另一个选项有损坏真实数据的分支**——见下行 |
-| **为什么不选「照写 + 对账排除 `status='failed'`」** | ① upsert 的 `DO UPDATE` **无条件覆盖 `status`**（IC-BUG-8 的同一条 SQL）。于是「某路径已成功上传（行是 `completed`、MinIO 里对象好好的）→ 后来同路径重传失败」会把**那行活着的对象标成 `failed`**——这比反向幽灵更糟，是把真实存在的对象标成失败；② 那个过滤条件要被记住的地方不止两处：IC-6 `object_keys` 回填、IC-13 L2 分片扫描、L3 幽灵清理，**以及 IC-7 的 Dashboard 统计**（`COUNT(*)`/`SUM(size_bytes)` 会把失败上传算进「总文件数」与「总存储量」）。把不变式换成一个必须被记住的隐性契约，代价太高 |
-| **实现细节** | `CreateUploadLog` 现传 `FileEntryID: {fileEntry.ID, Valid: true}`（`indexer.go:233`），跳过 upsert 后没有该 ID——置 `Valid: false` 即可，`upload_logs.file_entry_id` 可空（`REFERENCES file_entries(id)`，无 NOT NULL）|
-| **连带改动** | 摘掉 Files 页的「失败」筛选项（`webui/src/pages/Files/index.tsx:38`）——它将永远返回空；`file_status` 枚举里的 `failed` 成为死值（**不删枚举**，迁移只追加）。失败信号统一走已有的 Logs 页 / `upload_logs`，那张表才有 `error_message` / `retry_count` / `started_at` / `finished_at`，本就是为此建的 |
+| **为什么不选「照写 + 对账排除 `status='failed'`」** | ① upsert 的 `DO UPDATE` **无条件覆盖 `status`**（IC-BUG-8 的同一条 SQL）。于是「某路径已成功上传（行是 `completed`、MinIO 里对象好好的）→ 后来同路径重传失败」会把**那行活着的对象标成 `failed`**——这比反向幽灵更糟，是把真实存在的对象标成失败。**且不止 `status`**：失败上报里 `sha256` / `etag` / `content_type` 都是空串，经 `Valid: x != ""`（`indexer.go:203-206`）落成 NULL，会把这行活对象的校验和一并抹掉（评审复核时补强）；② 那个过滤条件要被记住的地方不止两处：IC-6 `object_keys` 回填、IC-13 L2 分片扫描、L3 幽灵清理，**以及 IC-7 的 Dashboard 统计**（`COUNT(*)`/`SUM(size_bytes)` 会把失败上传算进「总文件数」与「总存储量」）。把不变式换成一个必须被记住的隐性契约，代价太高 |
+| **实现细节** | `CreateUploadLog` 现传 `FileEntryID: {fileEntry.ID, Valid: true}`（`indexer.go:234`），跳过 upsert 后没有该 ID——置 `Valid: false` 即可，`upload_logs.file_entry_id` 可空（`REFERENCES file_entries(id)`，无 NOT NULL）|
+| **连带改动** | 摘掉 Files 页的「失败」筛选项（`webui/src/pages/Files/index.tsx:37`）——它将永远返回空；`file_status` 枚举里的 `failed` 成为死值（**不删枚举**，迁移只追加）。失败信号统一走已有的 Logs 页 / `upload_logs`，那张表才有 `error_message` / `retry_count` / `started_at` / `finished_at`，本就是为此建的 |
 | **保住的不变式** | **`file_entries` 一行 = MinIO 里一个对象**。IC-6 的 `object_keys` 回填与 IC-13 的 L2/L3 全都白捡这个前提，不必记任何过滤条件 |
 | **验收** | 制造一个不可达的 MinIO，任务重试耗尽后：`upload_logs` 有失败行；`file_entries` 或无该行、或该行被对账显式排除（按选定方案二选一断言） |
 

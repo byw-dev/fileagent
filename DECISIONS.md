@@ -1467,7 +1467,7 @@ JetStream 处于闲置状态。
   `notify_nats` 与 `notify_webhook` 各抓一次载荷，**两者字节级同构**：顶层字段均为
   `['EventName','Key','Records']`，而 CP 实际读取的 `Records[].s3.object.key` 两边都是
   `ic19%2Fnested+dir%2F%E4%B8%AD+%E6%96%87.csv`。编码发生在 MinIO **构造事件对象**时而非传输层
-  （`%2F` 位于 JSON 字符串**内部**，两种传输都不改写它）。**IC-BUG-19 与本条正交，已排在 IC-2a ⑥，
+  （`%2F` 位于 JSON 字符串**内部**，两种传输都不改写它）。**IC-BUG-19 与本条正交，已拆为独立的 IC-2c（排在 IC-2a 之前），
   不得等 IC-11。** 附带提醒：事件信封有个未编码的顶层 `Key` 字段（**webhook 与 NATS 都有**，CP 当前
   只解析 `Records[]` 所以从没注意到），但它是 `bucket/key` 拼接的 MinIO 私有字段、不在 S3 事件规范内，
   **不要用它绕过 unescape**。
@@ -1491,7 +1491,7 @@ JetStream 处于闲置状态。
 | **IC-BUG-7**（新建 bucket 不注册通知） | ❌ 不解决 | 换传输只改 ARN，不改变「要不要配通知」。**IC-4 ② 的 ARN 须做成可配置** |
 | **IC-BUG-9**（`queue_dir` 在 `/tmp`） | ❌ 不解决 | `notify_nats` 同样有 `queue_dir` / `queue_limit` |
 | **IC-BUG-19**（对象键 URL 编码） | ❌ 不解决 | 双向实测：两种传输载荷字节级同构，编码在 MinIO 构造事件时发生 |
-| **IC-BUG-8**（upsert 无排序键） | ◐ **改善但不解决** | SQL 侧的 `WHERE` + `COALESCE` 该写还得写；IC-11 只是让排序键的**来源**更可靠。**见下方「排序键来源」的更正** |
+| **IC-BUG-8**（upsert 无排序键） | ❌ 不解决，**且加重** | 初版写「改善但不解决——让排序键来源更可靠」，与下方「更正」自相矛盾（更正的结论是排序键来源取 `eventTime`，**与传输无关**）。正确表述：IC-11 的至少一次投递与可重放会**增加**重复 upsert，排序键因此**更必要**，而 SQL 侧的 `WHERE` + `COALESCE` 一行都不能省 |
 | **IC-BUG-13**（`content_type` 不赋值） | ◐ 相关但不解决 | 载荷里**本来就有** `contentType`（实测确认，两种传输都有），是 CP 侧 `IndexUpload` 没读它。与传输无关 |
 | 其余 **28 条** | 无关 | agent 侧（采集/队列/上传/凭据）、STS policy、gRPC 流与 registry、DB 查询与统计——事件通道碰不到 |
 
