@@ -80,7 +80,9 @@ type DirListingStore interface {
 
 // DryRunStore manages pending dry-run result channels.
 type DryRunStore interface {
-	Register(reqID string) <-chan *agentv1.DryRunResult
+	// Register records which agent reqID was issued to, so the gRPC side can
+	// refuse a result arriving from any other agent.
+	Register(reqID, agentID string) <-chan *agentv1.DryRunResult
 	Cancel(reqID string)
 }
 
@@ -596,7 +598,7 @@ func (h *AgentsHandler) TestRule(c *gin.Context) {
 
 	// Use a temporary rule_id so the gRPC round-trip can be correlated.
 	ruleID := uuid.New().String()
-	resultCh := h.dryRunStore.Register(ruleID)
+	resultCh := h.dryRunStore.Register(ruleID, agentID)
 	defer h.dryRunStore.Cancel(ruleID)
 
 	msg := &agentv1.ServerMessage{

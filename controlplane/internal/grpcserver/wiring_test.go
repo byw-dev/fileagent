@@ -7,6 +7,7 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/dryrun"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -516,57 +517,88 @@ func TestRefreshCredentials_AgentLookupFails_ReturnsPermissionDenied(t *testing.
 	assert.Zero(t, stsMgr.calls)
 }
 
-// ── dry-run results must belong to the reporting agent ───────────────────────
+// ── dry-run results must be addressed to the reporting agent ─────────────────
 
-// The rule id travels in the message body, so without an ownership check any
-// connected agent could deliver a fabricated preview against someone else's
-// rule and the operator would see it as genuine (IC-BUG-24).
-func TestHandleDryRunResult_ForeignRule_IsDiscarded(t *testing.T) {
+// The id on a DryRunResult is a correlation id the Control Plane minted for one
+// specific agent, so the store is the only thing that knows who it was sent to.
+// An earlier attempt looked it up as a collection rule, which rejected every
+// legitimate result because that id is never persisted (IC-BUG-24).
+func TestHandleDryRunResult_AddressedToAnotherAgent_IsDiscarded(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	srv := New(logger)
-	store := &mockDryRunStore{}
-	credDB := &mockCredDB{
-		rule: &db.CollectionRule{ID: uuid.New(), AgentID: uuid.New()}, // owned by someone else
+	store := dryrun.New()
+	srv.WithDryRunStore(store)
+
+	reqID := uuid.NewString()
+	ch := store.Register(reqID, uuid.NewString()) // issued to a different agent
+
+	srv.handleDryRunResult(context.Background(), testAgentID,
+		&agentv1.DryRunResult{RuleId: reqID})
+
+	select {
+	case <-ch:
+		t.Fatal("a result from the wrong agent must not reach the waiting caller")
+	default:
 	}
-	srv.WithExtraDeps(nil, nil, nil, credDB)
-	srv.WithDryRunStore(store)
-
-	srv.handleDryRunResult(context.Background(), testAgentID,
-		&agentv1.DryRunResult{RuleId: uuid.NewString()})
-
-	assert.Zero(t, store.delivered, "a foreign rule's result must not reach the store")
 }
 
-func TestHandleDryRunResult_OwnRule_IsDelivered(t *testing.T) {
+// The correlation id is not a collection rule and is never in the database, so
+// a legitimate result must go through without any rule lookup.
+func TestHandleDryRunResult_AddressedToThisAgent_IsDelivered(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	srv := New(logger)
-	store := &mockDryRunStore{}
-	credDB := &mockCredDB{
-		rule: &db.CollectionRule{ID: uuid.New(), AgentID: uuid.MustParse(testAgentID)},
+	store := dryrun.New()
+	srv.WithDryRunStore(store)
+
+	reqID := uuid.NewString()
+	ch := store.Register(reqID, testAgentID)
+
+	srv.handleDryRunResult(context.Background(), testAgentID,
+		&agentv1.DryRunResult{RuleId: reqID})
+
+	select {
+	case got := <-ch:
+		require.NotNil(t, got)
+		assert.Equal(t, reqID, got.GetRuleId())
+	default:
+		t.Fatal("a legitimate dry-run result was dropped — this is what breaks 试运行")
 	}
-	srv.WithExtraDeps(nil, nil, nil, credDB)
-	srv.WithDryRunStore(store)
-
-	srv.handleDryRunResult(context.Background(), testAgentID,
-		&agentv1.DryRunResult{RuleId: uuid.NewString()})
-
-	assert.Equal(t, 1, store.delivered)
 }
 
-// A lookup failure must not be treated as ownership.
-func TestHandleDryRunResult_LookupFails_IsDiscarded(t *testing.T) {
+// An unknown id (the caller already timed out and cancelled) is simply dropped.
+func TestHandleDryRunResult_UnknownRequestID_IsDiscarded(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	srv := New(logger)
-	store := &mockDryRunStore{}
-	srv.WithExtraDeps(nil, nil, nil, &mockCredDB{ruleErr: assert.AnError})
-	srv.WithDryRunStore(store)
+	srv.WithDryRunStore(dryrun.New())
 
-	srv.handleDryRunResult(context.Background(), testAgentID,
-		&agentv1.DryRunResult{RuleId: uuid.NewString()})
-
-	assert.Zero(t, store.delivered)
+	assert.NotPanics(t, func() {
+		srv.handleDryRunResult(context.Background(), testAgentID,
+			&agentv1.DryRunResult{RuleId: uuid.NewString()})
+	})
 }
 
-type mockDryRunStore struct{ delivered int }
+// The gate is only worth anything if it receives the *stream's* agent id.
+// Passing "" (or the body's own value) would silently discard every result, and
+// no test above would notice — all of them call handleDryRunResult directly.
+func TestHandleAgentMessage_DryRunResult_UsesStreamIdentity(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	store := dryrun.New()
+	srv.WithDryRunStore(store)
 
-func (m *mockDryRunStore) Deliver(_ string, _ *agentv1.DryRunResult) { m.delivered++ }
+	reqID := uuid.NewString()
+	ch := store.Register(reqID, testAgentID)
+
+	srv.handleAgentMessage(context.Background(), testAgentID, &agentv1.AgentMessage{
+		Payload: &agentv1.AgentMessage_DryRunResult{
+			DryRunResult: &agentv1.DryRunResult{RuleId: reqID},
+		},
+	})
+
+	select {
+	case got := <-ch:
+		require.NotNil(t, got)
+	default:
+		t.Fatal("handleAgentMessage did not pass the stream's agent id to the gate")
+	}
+}

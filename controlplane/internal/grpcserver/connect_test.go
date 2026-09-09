@@ -203,3 +203,42 @@ func TestServer_Connect_WithRegistry_Unauthenticated_NoToken(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, codes.Unauthenticated, status.Code(err))
 }
+
+// Revocation has to actually end the RPC, not merely cancel a context nobody
+// observes. The first attempt at IC-BUG-25 cancelled a context derived from
+// stream.Context(), which the blocking Recv never looks at: the handler kept
+// running, its registry entry stayed, and the agent went on sending.
+//
+// The assertion is therefore about the stream ending and the registry emptying,
+// not about Disconnect returning true.
+func TestServer_Connect_Disconnect_EndsStreamAndUnregisters(t *testing.T) {
+	agentID := "44444444-4444-4444-4444-444444444444"
+	client, bearer, registry := newFullServerForAgent(t, agentID,
+		&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", bearer))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		2*time.Second, 20*time.Millisecond)
+
+	require.True(t, registry.Disconnect(agentID))
+
+	// The client's Recv must return rather than block forever.
+	recvErr := make(chan error, 1)
+	go func() { _, e := stream.Recv(); recvErr <- e }()
+	select {
+	case e := <-recvErr:
+		require.Error(t, e)
+		assert.Equal(t, codes.PermissionDenied, status.Code(e))
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream still open 5s after Disconnect — the handler never returned")
+	}
+
+	// The handler's deferred Unregister only runs once it returns.
+	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		3*time.Second, 20*time.Millisecond,
+		"registry entry leaked: the handler goroutine is still alive")
+}

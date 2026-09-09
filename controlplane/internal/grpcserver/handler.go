@@ -132,14 +132,49 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	}()
 
 	// Receive loop.
-	for {
-		msg, err := stream.Recv()
-		if err != nil {
-			cancel()
-			<-sendErr
-			return err
+	//
+	// Recv runs in its own goroutine so the loop can also wake on ctx.Done().
+	// Reading Recv directly would block until the agent sends something or the
+	// transport breaks, which means cancelling ctx — the only thing Disconnect
+	// can do — would not end this handler: it would keep its registry entry and
+	// its goroutines forever while an uncooperative agent held the stream open.
+	// Only returning from this function actually terminates the RPC; the pending
+	// Recv then fails and its goroutine exits.
+	type recvResult struct {
+		msg *agentv1.AgentMessage
+		err error
+	}
+	recvCh := make(chan recvResult)
+	go func() {
+		for {
+			msg, err := stream.Recv()
+			select {
+			case recvCh <- recvResult{msg: msg, err: err}:
+				if err != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
 		}
-		s.handleAgentMessage(ctx, agentID, msg)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Cancelled from outside — the agent was revoked (IC-BUG-25).
+			<-sendErr
+			s.logger.Info("connect: stream terminated by control plane",
+				zap.String("agent_id", agentID))
+			return status.Error(codes.PermissionDenied, "agent connection terminated")
+		case r := <-recvCh:
+			if r.err != nil {
+				cancel()
+				<-sendErr
+				return r.err
+			}
+			s.handleAgentMessage(ctx, agentID, r.msg)
+		}
 	}
 }
 
@@ -198,46 +233,6 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 		zap.Int("buckets", len(buckets)),
 	)
 	return &agentv1.RefreshCredentialsResponse{Credentials: creds}, nil
-}
-
-// ruleBelongsToAgent reports whether ruleID names a rule owned by agentID.
-//
-// The rule id arrives in the message body, so without this check any connected
-// agent could deliver a fabricated dry-run preview against another agent's rule
-// and the operator would see it as genuine. Same shape as the rule-ownership
-// check on credential issuance (IC-BUG-24).
-//
-// It fails closed on any lookup problem, and fails open only when no credential
-// DB is wired, matching how the other gates treat an unconfigured server.
-func (s *Server) ruleBelongsToAgent(ctx context.Context, agentID, ruleID string) bool {
-	if s.credDB == nil {
-		return true
-	}
-	parsedAgentID, err := uuid.Parse(agentID)
-	if err != nil {
-		return false
-	}
-	parsedRuleID, err := uuid.Parse(ruleID)
-	if err != nil {
-		s.logger.Warn("rule ownership: invalid rule_id",
-			zap.String("agent_id", agentID), zap.String("rule_id", ruleID))
-		return false
-	}
-	rule, err := s.credDB.GetCollectionRuleByID(ctx, parsedRuleID)
-	if err != nil {
-		s.logger.Warn("rule ownership: lookup failed",
-			zap.String("agent_id", agentID), zap.String("rule_id", ruleID), zap.Error(err))
-		return false
-	}
-	if rule.AgentID != parsedAgentID {
-		s.logger.Warn("rule ownership: rule belongs to a different agent, message discarded",
-			zap.String("agent_id", agentID),
-			zap.String("rule_id", ruleID),
-			zap.String("owner_agent_id", rule.AgentID.String()),
-		)
-		return false
-	}
-	return true
 }
 
 // assertAgentUsable rejects agents that must no longer act, consulting the
@@ -588,12 +583,20 @@ func (s *Server) handleDryRunResult(ctx context.Context, agentID string, result 
 			zap.String("rule_id", result.GetRuleId()))
 		return
 	}
-	if !s.ruleBelongsToAgent(ctx, agentID, result.GetRuleId()) {
+	// The id here is a correlation id the Control Plane minted for one specific
+	// agent, not a collection rule — so the question is "was this request
+	// addressed to you", which only the store can answer. Looking the id up as a
+	// rule would reject every legitimate result, since it is never persisted.
+	if !s.dryRunStore.Deliver(result.GetRuleId(), agentID, result) {
+		s.logger.Warn("dry_run result discarded: not addressed to this agent, or already timed out",
+			zap.String("agent_id", agentID),
+			zap.String("request_id", result.GetRuleId()),
+		)
 		return
 	}
-	s.dryRunStore.Deliver(result.GetRuleId(), result)
 	s.logger.Debug("dry_run result delivered",
-		zap.String("rule_id", result.GetRuleId()),
+		zap.String("agent_id", agentID),
+		zap.String("request_id", result.GetRuleId()),
 		zap.Int("files", len(result.GetFiles())),
 	)
 }

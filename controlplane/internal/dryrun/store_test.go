@@ -12,10 +12,10 @@ import (
 
 func TestStore_RegisterAndDeliver(t *testing.T) {
 	s := dryrun.New()
-	ch := s.Register("req-1")
+	ch := s.Register("req-1", "agent-1")
 
 	result := &agentv1.DryRunResult{RuleId: "req-1", Error: ""}
-	s.Deliver("req-1", result)
+	s.Deliver("req-1", "agent-1", result)
 
 	select {
 	case got := <-ch:
@@ -27,25 +27,25 @@ func TestStore_RegisterAndDeliver(t *testing.T) {
 
 func TestStore_Cancel_NoLeak(t *testing.T) {
 	s := dryrun.New()
-	_ = s.Register("req-2")
+	_ = s.Register("req-2", "agent-1")
 	s.Cancel("req-2")
 	// Deliver after cancel should not panic or block.
-	s.Deliver("req-2", &agentv1.DryRunResult{RuleId: "req-2"})
+	s.Deliver("req-2", "agent-1", &agentv1.DryRunResult{RuleId: "req-2"})
 }
 
 func TestStore_Deliver_UnknownID_IsNoop(t *testing.T) {
 	s := dryrun.New()
 	// Should not panic.
-	s.Deliver("nonexistent", &agentv1.DryRunResult{RuleId: "nonexistent"})
+	s.Deliver("nonexistent", "agent-1", &agentv1.DryRunResult{RuleId: "nonexistent"})
 }
 
 func TestStore_Deliver_CallerTimedOut_IsNoop(t *testing.T) {
 	s := dryrun.New()
-	ch := s.Register("req-3")
+	ch := s.Register("req-3", "agent-1")
 	s.Cancel("req-3")
 
 	// Deliver after cancel: no panic, nothing readable.
-	s.Deliver("req-3", &agentv1.DryRunResult{RuleId: "req-3"})
+	s.Deliver("req-3", "agent-1", &agentv1.DryRunResult{RuleId: "req-3"})
 
 	select {
 	case <-ch:
@@ -56,13 +56,13 @@ func TestStore_Deliver_CallerTimedOut_IsNoop(t *testing.T) {
 
 func TestStore_ConcurrentDelivers(t *testing.T) {
 	s := dryrun.New()
-	ch := s.Register("req-4")
+	ch := s.Register("req-4", "agent-1")
 
 	result := &agentv1.DryRunResult{RuleId: "req-4"}
 	done := make(chan struct{}, 2)
 	for range 2 {
 		go func() {
-			s.Deliver("req-4", result)
+			s.Deliver("req-4", "agent-1", result)
 			done <- struct{}{}
 		}()
 	}
