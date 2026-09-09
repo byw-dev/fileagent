@@ -4,7 +4,7 @@
 > 从「靠事件运气」改造为「有界成本可验证」。
 > **权威设计**：[`docs/design/consistency-and-ingest.md`](../design/consistency-and-ingest.md)
 > **决策**：`DECISIONS.md` **D-030**（总设计）、**D-031**（事件传输改 JetStream）
-> **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-29
+> **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-32
 > **来由**（2026-09-08）：产品提出两条此前不成立的前提——必须允许 ETL 等非 Agent 进程写入并记录
 > tags 与血缘；对象量级为千万/年、3–5 年上亿。据此审计发现 **Agent 数据面从未端到端跑通过**。
 
@@ -14,9 +14,15 @@
 
 1. **IC-1 是一切 live 验收的前提。** 在 STS 链路接通之前，Agent 拿不到凭据、一个文件都传不上去，
    任何「改完真跑 e2e」的纪律都无法执行。因此 IC-1 必须第一个做，且**只有 live 验证算通过**。
-2. **IC-2 必须把 IC-BUG-8 一起带上。** IC-BUG-8（upsert 无排序键）今天不可见——因为 Agent 上报路径是死的。
-   **一旦 IC-2 修好上报、IC-BUG-8 就立刻变成数据损坏**：webhook 事件晚到会把 Agent 写入的
-   `agent_id` / `rule_id` / `sha256` / `file_mtime` 全部覆盖为 NULL。二者不可拆成两个 PR。
+2. **IC-2a 是一把不可再拆的原子刀。** 原 IC-2 有 ⑪ 个子项，2026-09-10 拆成 IC-2a / IC-2b / IC-SEC-2
+   （理由见下方任务表）。留在 IC-2a 里的四条缺陷共享同一个时刻——**「上报成为索引主路径」的那一刻**：
+   - **IC-BUG-8**（upsert 无排序键）：不修则 webhook 晚到会把 Agent 写的富字段覆盖为 NULL；
+   - **IC-BUG-19**（webhook 索引 URL 编码键）：不修则两个写入方的 `storage_path` 进不了同一个
+     conflict target，**同一对象变两行**，IC-BUG-8 新加的排序键永不触发；
+   - **IC-BUG-29**（`UploadResult.rule_id` 无归属校验）：不修则该刀把死代码变成可利用；
+   - **IC-BUG-31 的 ack 半边**：ack 走 best-effort `Send`，丢一个就有一个任务永久卡在 `reported`。
+
+   四者都不是「顺手带上」，而是**不带上就会引入新缺陷**。不可拆成多个 PR。
 3. **地基阶段（IC-6/IC-7）有时间窗口。** 按 `system-design.md` §6.7 换算约 2600 万对象/年，
    到千万行再拆表 / 加列 / 改分区，每一步都要锁表或双写迁移。止血阶段做完应尽快推进地基，
    不要让它排在准入 / 对账之后。
@@ -31,7 +37,8 @@
 | 类别 | 编号 | 说明 |
 |---|---|---|
 | 任务 | **`IC-0` … `IC-14`** | Ingest & Consistency，对应 `consistency-and-ingest.md`。按依赖顺序编号 |
-| 缺陷 | **`IC-BUG-1` … `IC-BUG-15`** | 见 [`bugs/open.md`](bugs/open.md)，沿用 `T3-5-BUG-x` 的既有形状 |
+| 缺陷 | **`IC-BUG-1` … `IC-BUG-32`** | 见 [`bugs/open.md`](bugs/open.md)，沿用 `T3-5-BUG-x` 的既有形状 |
+| 拆刀 | **`IC-2a` / `IC-2b`**、**`IC-SEC-n`** | 一刀过大时就地加后缀，**不消耗新序号**——`IC-15` 留给真正的新任务，否则「按依赖顺序编号」的性质会被破坏 |
 | 阶段 | **不编号** | 仅作描述性小标题（止血 / 地基 / 准入 / 对账 / 血缘） |
 
 三条纪律：
@@ -68,18 +75,36 @@ grep -rEn '\b(CI|DP)-[0-9]+|\b(CI|DP)\s*系列' --include='*.md' .
 
 | ID | 模块 | 内容 | 验收要点 | 状态 |
 |----|------|------|----------|------|
-| **IC-1** | CP + agent | **STS 链路接通 + 身份/模板归一化**（IC-BUG-1 + IC-BUG-3 + IC-BUG-4 + IC-BUG-16 + IC-BUG-17）。① CP 在 `Connect` 建流后推送一次 `ServerMessage_Credentials`（与 `SyncRulesOnConnect` 同时机）；② 对齐 `RefreshCredentialsRequest` 契约——允许省略 `rule_id`，按该 Agent 已下发规则涉及的 bucket 集合签发；③ **policy 资源改为整桶** `arn:aws:s3:::{bucket}/*`（修 IC-BUG-3；D-030 第八条：授权宽度是管理问题、清点成本由分片对账解决，**不约束 `dest_path_template`**）；④ **policy 拆两个 statement**（修 IC-BUG-4，对齐 §6.3）：桶级 `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`）；对象级 `s3:PutObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/*`；**移除 `DeleteObject` / `GetObject` / `ListBucket`**（产品批的是「写整桶」，agent 从不调 Get/List，读与列举属超授）；删掉 `policy.go:41-43` 的 `arn:aws:s3:::*` 空桶兜底。**注意**：当前 `ListBucket` 配对象级 ARN，是一条从未生效的空转授权，只补 Action 不改 ARN 层级修不掉；⑤ Agent 刷新 goroutine 去掉 `sts == nil` 短路；⑥ **模板归一化**（修 IC-BUG-16）：收敛到一个函数，**agent 拼路径 / CP 反解 / webui 预览三端共用**。**方向必须是「CP 与 webui 侧剥模板的前导 `/`」，不是「agent 停止剥路径」**——后者会改写所有对象键、需全量重铺；⑦ **缓存 token 分支补齐 `AgentID`/`AgentName`**（修 IC-BUG-17，从 JWT claims 还原），并给 `buildStoragePath` 的 Compose 失败路径加 `logger.Warn`；⑧ **`server.tls_insecure` 开关**（修 IC-BUG-18，**零值即安全**：不设置就是 TLS；不加这条则本地 agent 根本连不上明文 CP，live-e2e 无法执行）；⑨ **`PollApproval` 校验 fingerprint**（修 IC-BUG-22——该 RPC 免认证，指纹是唯一身份凭证）；⑩ **`Connect`/`RefreshCredentials` 查 agent 状态闸门**（修 IC-BUG-23——吊销此前完全不生效） | **live-e2e**：dev 环境起 CP + agent，落一个文件 → MinIO 出现对象 → `file_entries` 有行；`mc ls --incomplete` 可执行（不 403）——**IC-3 的验收依赖这一条**；模板以 `/` 开头的规则对象键正确（IC-BUG-16 的 agent 侧；**CP 侧打标须待 IC-2**——`applyPathVarTags` 只在 `HandleUploadResult` 里调用，webhook 路径不打标，而 agent 尚不上报 `UploadResult`）；**Agent 重启后**再落一个文件，对象键仍符合模板而非裸 basename（IC-BUG-17 回归）；用签发的 STS 做 `GetObject` / `ListObjects` 须 403。**不接受仅单测通过** | ✅ PR #93（live-e2e 通过；path_var 打标回归改期至 IC-2，见验收注） |
-| **IC-2** | proto + CP + agent + 迁移 | **上报 + ack outbox + 排序键**（IC-BUG-2 + IC-BUG-8 + IC-BUG-13，含 IC-BUG-12 的上报部分）。① `proto` 给 `UploadResult` 加 `task_id`（只增字段）；② CP 处理完后回发 `Acknowledgement`（消息已存在，只是无人发送）；③ `UploadFunc` 改为返回 `(*uploader.UploadResult, error)`，队列增 `reported` 状态，**收到 ack 才置 completed**；④ **迁移：`file_entries` 加 `observed_at` + `source`**（`agent`/`api`/`minio_event`/`audit`），upsert 加 `WHERE EXCLUDED.observed_at >= 现有值` + 富字段 `COALESCE`；⑤ 重试耗尽时以 `success=false` 上报；⑥ **凭据随 bucket 集合变化补发**（修 IC-BUG-20）：**CP 侧** `DispatchRule` 成功后若该 Agent 的 bucket 集合变了就重推一次 `Credentials`；**agent 侧**上传遇 `AccessDenied` 时作废凭据、刷新并重试一次，二次仍 403 则落终态告警；⑦ **模板解析失败改为任务失败而非猜键**（修 IC-BUG-21）；⑧ **`DeleteCollectionRule` 加归属约束**（修 IC-BUG-26）；⑨ **`handleDirectoryListing` 校验收件人**（修 IC-BUG-27，照抄 IC-SEC-1 给 `dryrun.Store` 的形状）；⑩ **`registry.Unregister` 按 conn 身份删除**（修 IC-BUG-28）；⑪ **`UploadResult.rule_id` 校验归属**（修 IC-BUG-29——**必须与 ③ 同刀**：③ 让上报成为索引主路径的那一刻，这条就从死代码变成可利用） | **live**：上传后 `agent_id`/`rule_id`/`sha256` 非空、`upload_logs` 有行、NATS 收到 `events.file.uploaded`；停 CP 再恢复，任务重发且不产生重复行；单测覆盖「webhook 更早/更晚 `observed_at` 均不清空富字段」 | ⬜ |
+| **IC-1** | CP + agent | **STS 链路接通 + 身份/模板归一化**（IC-BUG-1 + IC-BUG-3 + IC-BUG-4 + IC-BUG-16 + IC-BUG-17）。① CP 在 `Connect` 建流后推送一次 `ServerMessage_Credentials`（与 `SyncRulesOnConnect` 同时机）；② 对齐 `RefreshCredentialsRequest` 契约——允许省略 `rule_id`，按该 Agent 已下发规则涉及的 bucket 集合签发；③ **policy 资源改为整桶** `arn:aws:s3:::{bucket}/*`（修 IC-BUG-3；D-030 第八条：授权宽度是管理问题、清点成本由分片对账解决，**不约束 `dest_path_template`**）；④ **policy 拆两个 statement**（修 IC-BUG-4，对齐 §6.3）：桶级 `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`）；对象级 `s3:PutObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/*`；**移除 `DeleteObject` / `GetObject` / `ListBucket`**（产品批的是「写整桶」，agent 从不调 Get/List，读与列举属超授）；删掉 `policy.go:41-43` 的 `arn:aws:s3:::*` 空桶兜底。**注意**：当前 `ListBucket` 配对象级 ARN，是一条从未生效的空转授权，只补 Action 不改 ARN 层级修不掉；⑤ Agent 刷新 goroutine 去掉 `sts == nil` 短路；⑥ **模板归一化**（修 IC-BUG-16）：收敛到一个函数，**agent 拼路径 / CP 反解 / webui 预览三端共用**。**方向必须是「CP 与 webui 侧剥模板的前导 `/`」，不是「agent 停止剥路径」**——后者会改写所有对象键、需全量重铺；⑦ **缓存 token 分支补齐 `AgentID`/`AgentName`**（修 IC-BUG-17，从 JWT claims 还原），并给 `buildStoragePath` 的 Compose 失败路径加 `logger.Warn`；⑧ **`server.tls_insecure` 开关**（修 IC-BUG-18，**零值即安全**：不设置就是 TLS；不加这条则本地 agent 根本连不上明文 CP，live-e2e 无法执行）；⑨ **`PollApproval` 校验 fingerprint**（修 IC-BUG-22——该 RPC 免认证，指纹是唯一身份凭证）；⑩ **`Connect`/`RefreshCredentials` 查 agent 状态闸门**（修 IC-BUG-23——吊销此前完全不生效） | **live-e2e**：dev 环境起 CP + agent，落一个文件 → MinIO 出现对象 → `file_entries` 有行；`mc ls --incomplete` 可执行（不 403）——**IC-3 的验收依赖这一条**；模板以 `/` 开头的规则对象键正确（IC-BUG-16 的 agent 侧；**CP 侧打标须待 IC-2**——`applyPathVarTags` 只在 `HandleUploadResult` 里调用，webhook 路径不打标，而 agent 尚不上报 `UploadResult`）；**Agent 重启后**再落一个文件，对象键仍符合模板而非裸 basename（IC-BUG-17 回归）；用签发的 STS 做 `GetObject` / `ListObjects` 须 403。**不接受仅单测通过** | ✅ PR #93（live-e2e 通过；path_var 打标回归改期至 IC-2a，见验收注） |
+| **IC-2a** | proto + CP + agent + 迁移 | **上报主路径（原子刀，不可再拆）**（IC-BUG-2 + IC-BUG-8 + IC-BUG-19 + IC-BUG-29，含 IC-BUG-12 的上报半边、IC-BUG-13 的防清空半边、IC-BUG-31 的 ack 半边）。① `proto` 给 `UploadResult` 加 `task_id`（只增字段）；② CP 处理完后回发 `Acknowledgement`（消息已存在，只是无人发送）；③ `UploadFunc` 改为返回 `(*uploader.UploadResult, error)`，队列增 `reported` 状态，**收到 ack 才置 completed**；④ **`reported` 重报超时**（M-2 扫描新增，IC-BUG-31 的 ack 半边）：ack 走的是 best-effort 的 `registry.Send`（队满即丢），丢一个就有一个任务永久卡在 `reported`、outbox 永不清空——**修法是超时回退重发，不是让 `Send` 变可靠**（后者正是 M-2 的错误方向）；幂等由 ① 的 `task_id` + `(bucket_id, storage_path)` + ⑤ 的 `observed_at` 三者保证；⑤ **迁移：`file_entries` 加 `observed_at` + `source`**（`agent`/`api`/`minio_event`/`audit`），upsert 加 `WHERE EXCLUDED.observed_at >= 现有值` + 富字段 `COALESCE`（修 IC-BUG-8，顺带 IC-BUG-13 的防清空半边）；⑥ **webhook 对象键 `url.QueryUnescape`**（修 IC-BUG-19，**2026-09-10 从 IC-4 提前，必须与 ③ 同刀**：不修则 agent 写 `a/b/c.csv`、webhook 写 `a%2Fb%2Fc.csv`，两个 `storage_path` 进不了同一个 conflict target，⑤ 的排序键**永不触发**，同一对象变两行，并沿 `object_keys` 传染进 IC-13 的对账输入）；⑦ 重试耗尽时以 `success=false` 上报（IC-BUG-12 的上报半边）；⑧ **`UploadResult.rule_id` 归属校验，三分支**（修 IC-BUG-29——**必须与 ③ 同刀**：③ 让上报成为索引主路径的那一刻，它就从死代码变成可利用）。**因 IC-BUG-30，分支是三个而非两个**：规则不存在（断连期间被删）/ 规则属于别的 agent / 合法；前两种的行为须在本刀显式定义，不能让 `loadRuleMetadata` 查不到就默默走空 metadata | **live**：上传后 `agent_id`/`rule_id`/`sha256` 非空、`upload_logs` 有行、NATS 收到 `events.file.uploaded`；**同一对象经 agent 上报与 webhook 各写一次后 `file_entries` 只有一行**（IC-BUG-19 回归）；停 CP 再恢复，任务重发且不产生重复行；**人为丢弃一个 ack 后任务仍能自愈**（④ 的回归）；**补 IC-1 欠下的 path_var 打标回归**——模板带前导 `/` 的规则上传后 `file_tags` 出现 `source='path_var'` 行。单测覆盖「webhook 更早/更晚 `observed_at` 均不清空富字段」+「上报携带不存在的 / 他人的 `rule_id`」 | ⬜ |
+| **IC-2b** | CP + agent | **下发链路鲁棒性**（IC-BUG-20 + IC-BUG-21 + IC-BUG-30 + IC-BUG-31 的结构半边）。① **凭据随 bucket 集合变化补发**（修 IC-BUG-20）：**CP 侧** `DispatchRule` 成功后若该 Agent 的 bucket 集合变了就重推一次 `Credentials`；**agent 侧**上传遇 `AccessDenied` 时作废凭据、刷新并重试一次，二次仍 403 则落终态告警；② **模板解析失败改为任务失败而非猜键**（修 IC-BUG-21）；③ **规则同步补全集语义**（修 IC-BUG-30，M-2 扫描新增）：`SyncRulesOnConnect` 连 inactive 一起推（agent 的 `applyRule` 对 `Enabled == false` 已会 `stopRule`，复用既有分支），**并另下发一条「本次同步的 `rule_id` 全集」让 agent 停掉集合外的规则**——删除的行已不在 `ListCollectionRulesByAgent` 里，只推 inactive 修不掉删除那半；④ **`Connect` 里把发送 goroutine 提到 `SyncRulesOnConnect` / `pushCredentials` 之前启动**（IC-BUG-31 的结构半边：当前两处都在无消费者时入队，≥32 条 active 规则即静默丢弃），并让 `DispatchRule` 不再吞掉 `Send` 失败 | agent 与 CP 断连期间删除/停用规则，恢复连接后**不重启 agent** 也不再产生上传；运行中新建指向新 bucket 的规则，首个文件即成功（不出现 403）；配 40 条 active 规则重连后 40 条全部生效且凭据到达 | ⬜ |
 | **IC-3** | agent + deploy | **续传落盘 + 分片清理**（IC-BUG-5）。① 新增 `Queue.SaveMultipartProgress(id, uploadID, partsJSON)`，每片完成即落盘；② 任务进入终态（completed / 放弃）时调 `AbortMultipartUpload`；③ 数据桶加 `AbortIncompleteMultipartUpload` 的 ILM 规则兜底。**依赖 IC-1 已签发桶级 `s3:ListBucketMultipartUploads`**，否则本条验收会 403 卡住 | >64MB 文件传输中途 kill agent，重启后从断点续传（日志可见跳过分片数）；放弃的任务在 `mc ls --incomplete` 无残留 | ⬜ |
-| **IC-4** | CP + deploy | **webhook 可靠性止血**（IC-BUG-6 + IC-BUG-7 + IC-BUG-9 + IC-BUG-19）。① 索引失败返回 5xx 让 MinIO 重投、解析失败返回 400；② `MakeBucket` 后调 `SetBucketNotification`，并在启动时对 `buckets` 表逐个 ensure（幂等补注册）；③ `queue_dir` 迁至持久卷；④ **对事件里的 `object.key` 做 `url.QueryUnescape`**（修 IC-BUG-19——S3 事件的 key 是 URL 编码的，当前直接落库，凡带层级的键索引值都与真实键不符） | 断开 PG 触发 ObjectCreated → 端点 5xx → 恢复 PG 后 MinIO 重投、`file_entries` 补齐；通过 API 新建 bucket 后直接 `mc cp` 一个对象，索引出现该行 | ⬜ |
-| **IC-5** | agent | **采集正确性**（IC-BUG-10 + IC-BUG-11 + IC-BUG-12 剩余）。① `IsProcessed` 改为比较 `(rule_id, local_path, file_mtime, file_size)`，并修正与实现不符的注释；② `submitFile` 补齐 `FileOffset` / `AppendMode` 赋值，tail 偏移随任务落盘；③ 按文件大小推导 per-upload timeout（可配置下限） | 改文件内容后能被重新采集；`append_mode=tail` 规则第二次只传增量且重启后偏移不丢；不可达 MinIO 下 worker 会超时释放而非永久占用 | ⬜ |
+| **IC-4** | CP + deploy | **webhook 可靠性止血**（IC-BUG-6 + IC-BUG-7 + IC-BUG-9；**IC-BUG-19 已于 2026-09-10 提前至 IC-2a**）。① 索引失败返回 5xx 让 MinIO 重投、解析失败返回 400；② `MakeBucket` 后调 `SetBucketNotification`，并在启动时对 `buckets` 表逐个 ensure（幂等补注册）；③ `queue_dir` 迁至持久卷 | 断开 PG 触发 ObjectCreated → 端点 5xx → 恢复 PG 后 MinIO 重投、`file_entries` 补齐；通过 API 新建 bucket 后直接 `mc cp` 一个对象，索引出现该行 | ⬜ |
+| **IC-5** | agent | **采集正确性**（IC-BUG-10 + IC-BUG-11 + IC-BUG-12 的超时半边）。① `IsProcessed` 改为比较 `(rule_id, local_path, file_mtime, file_size)`，并修正与实现不符的注释；② `submitFile` 补齐 `FileOffset` / `AppendMode` 赋值，tail 偏移随任务落盘；③ 按文件大小推导 per-upload timeout（可配置下限） | 改文件内容后能被重新采集；`append_mode=tail` 规则第二次只传增量且重启后偏移不丢；不可达 MinIO 下 worker 会超时释放而非永久占用 | ⬜ |
 
-> **止血阶段顺序**：IC-1 → IC-2 →（IC-3 / IC-4 / IC-5 可并行）。
+> **止血阶段顺序**：IC-1 → **IC-2a** →（IC-2b / IC-3 / IC-4 / IC-5 / IC-SEC-2 可并行）。
 >
-> **IC-SEC-1（插入刀，PR #94）**：IC-BUG-24 + IC-BUG-25。二者是 IC-1 的 code review 顺带挖出的安全缺陷，
-> 原挂在 IC-2 的 ⑧⑨ 上，但与上报链路无关，拆出单独一刀，避免两个不相干的安全改动混进同一次 review。
-> **止血阶段收尾产出**：`docs/tasks/bugs/closed.md` 归档 IC-BUG-1…IC-BUG-13、IC-BUG-16…IC-BUG-29（24/25 已随 IC-SEC-1 关闭）；`system-design.md` §4.5/§4.7/§5.7/§5.8/§6.3/§6.5
-> 的「实现状态 / 实现偏差」告警块随之删除或改写。
+> **IC-SEC-1（插入刀，PR #94，已合并）**：IC-BUG-24 + IC-BUG-25。二者是 IC-1 的 code review 顺带挖出的
+> 安全缺陷，原挂在 IC-2 的 ⑧⑨ 上，但与上报链路无关，拆出单独一刀，避免两个不相干的安全改动混进同一次 review。
+>
+> **IC-SEC-2（插入刀）**：IC-BUG-26（`DeleteCollectionRule` 归属约束）+ IC-BUG-27（`handleDirectoryListing`
+> 校验收件人，照抄 IC-SEC-1 给 `dryrun.Store` 的形状）+ IC-BUG-28（`registry.Unregister` 按 conn 身份删除）
+> + IC-BUG-32（`Revoke` 的 `Send`/`Disconnect` 竞态）。四条都不挡数据面可用，沿 IC-SEC-1 的先例单独成刀。
+> **⚠️ IC-BUG-28 必须对着当前 master 的 `Disconnect` 行为验**——IC-BUG-25 已随 IC-SEC-1 合并，
+> `Disconnect` **只 cancel、不 `close(SendCh)`**，`SendCh` 的所有权在 `Connect` 的 `defer Unregister` 上；
+> 改 `Unregister` 时若顺手在 `Disconnect` 里也 close 就是重复关闭 panic（IC-SEC-1 变异测试实证过）。
+>
+> **IC-2 的拆分（2026-09-10）**：原 IC-2 有 ⑪ 个子项，拆为 **IC-2a**（上报主路径，原子）/ **IC-2b**
+> （下发链路鲁棒性）/ **IC-SEC-2**（归属与并发）。拆分依据是「是否共享『上报成为索引主路径』这一时刻」，
+> 不是按模块或按严重度。M-2 类扫描（见 `bugs/open.md`）在拆分**之前**完成，因此 IC-BUG-30/31 对 IC-2a
+> 边界的两处影响（⑧ 的三分支、④ 的重报超时）已经并进来了——**先扫完再定边界，避免回头拆已关掉的刀**。
+>
+> **止血阶段收尾产出**：`docs/tasks/bugs/closed.md` 归档 IC-BUG-1…IC-BUG-11、IC-BUG-14…IC-BUG-32
+> 中已完成者；`system-design.md` §4.5/§4.7/§5.7/§5.8/§6.3/§6.5 的「实现状态 / 实现偏差」告警块随之删除或改写。
+>
+> **⚠️ 归档纪律：IC-BUG-12 与 IC-BUG-13 是拆半的，不得按 ID 批量关闭。**
+> 12 的上报半边随 IC-2a ⑦、超时半边留在 IC-5 ③；13 的防清空半边随 IC-2a ⑤、填值半边仍开着。
+> **两半都完成前卡片保持 open**——这个 track 上已经出现过一次「标记先于验收」，卡片里写明拆法就是为了防它复发。
 
 ### 地基 — 表结构（有时间窗口，宜早不宜迟）（IC-6…IC-7）
 

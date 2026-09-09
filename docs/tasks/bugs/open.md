@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -16,13 +16,14 @@
 
 ### 缺陷模式（2026-09-10 归纳）
 
-28 条**不是 28 个独立缺陷**。按成因归类后只有三类，每类都还有未被发现的实例——
-逐条等评审撞见是最贵的发现方式，建议按类做扫描：
+32 条**不是 32 个独立缺陷**。按成因归类后只有三类。M-1 与 M-2 的类扫描均已完成（结论见下方两小节），
+M-3 待扫。**逐条等评审撞见是最贵的发现方式**——两次扫描各自挖出了评审没撞见的实例，
+且都直接改变了下一刀的边界，这正是「先扫完再发刀」的收益：
 
 | # | 模式 | 已知实例 | 未扫描的面 |
 |---|---|---|---|
 | **M-1** | **客户端指定资源 ID，无人校验归属**——「这个资源是它的吗」这个问题反复没被问 | IC-BUG-24（dry-run，已修）、IC-BUG-26（`DeleteCollectionRule`）、IC-BUG-27（目录列举）、IC-BUG-29（`UploadResult.rule_id`）；IC-1 修掉的 `rule_id` 越权同源 | ✅ **2026-09-10 已完成类扫描**，见下方「M-1 扫描结论」。REST 与 gRPC 两侧均已过一遍，无其余实例 |
-| **M-2** | **协作式机制被当成强制手段**——发个命令就认为对方会照做 | IC-BUG-25（吊销靠 agent 自觉删 token）；IC-SEC-1 评审中的 MF-2 / MF-4（以为 cancel 能中断 `Recv`、以为等 `sendErr` 会返回） | 所有「CP 下发命令后就认为状态已改变」的路径：`CancelRule`、`Revoke`、`PushRule` |
+| **M-2** | **协作式机制被当成强制手段**——发个命令就认为对方会照做 | IC-BUG-25（吊销靠 agent 自觉删 token）、**IC-BUG-30**（cancel 无补偿通道）、**IC-BUG-31**（`SendCh` 满即静默丢弃）、**IC-BUG-32**（Revoke 的 Send/Disconnect 竞态）；IC-SEC-1 评审中的 MF-2 / MF-4（以为 cancel 能中断 `Recv`、以为等 `sendErr` 会返回） | ✅ **2026-09-10 已完成类扫描**，见下方「M-2 扫描结论」。`registry.Send` 的 8 个调用点已逐个过完 |
 | **M-3** | **鉴权检查不在使用点**——签发时验过，使用时不验 | IC-BUG-22（`PollApproval` 不验指纹）、IC-BUG-23（吊销后 token 仍可用） | 长生命周期凭据的每个消费点；STS 会话本身仍是 ≤1h 不可撤销（已接受） |
 
 > **「新缺陷」与「老缺陷」不是有用的分类。** IC-BUG-22/23 在代码里存在数月，但 IC-1 之前
@@ -53,6 +54,36 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 第一版单组织 + 管理员鉴权下不可利用（`org_id` 本就是预留字段，见 `DECISIONS.md` 多租户条），
 但多租户落地时会全线失效。**这是一条架构待办，不是缺陷**——建议在多租户开工前做一次统一收窄，
 而不是逐条登记成 bug。
+
+#### M-2 扫描结论（2026-09-10）
+
+方法：以 `registry.Send` 的 8 个调用点为入口（`grep -rn "registry.Send" controlplane/`），对每条
+「CP 下发命令」问两个问题——**命令丢了有没有补偿通道**、**命令到了对方会不会照做**；
+再逐个回溯 agent 侧是否真有对应的状态变更。
+
+**结论：M-2 有 3 个新实例，其中 2 个直接改变 IC-2a 的边界。**
+
+| 检查面 | 结果 |
+|---|---|
+| `PushRule`（`DispatchRule`，规则新建/启用） | ✅ **有补偿**——离线时跳过，重连由 `SyncRulesOnConnect` 补推 |
+| `CancelRule`（`DispatchRuleCancel`，停用/删除） | ❌ **无补偿通道（IC-BUG-30）**——离线即放弃，而 `SyncRulesOnConnect` 只推 active 规则，从不推 cancel |
+| `SyncRulesOnConnect` / `pushCredentials` 的投递容量 | ❌ **静默丢弃（IC-BUG-31）**——`SendCh` cap 32，且这两处都在发送 goroutine 启动**之前**入队 |
+| `Revoke` 的 `Send` → `Disconnect` | ❌ **竞态（IC-BUG-32）**——原埋在 IC-BUG-25 的「备注（本刀未处理）」里，本次升格为独立卡片 |
+| `ListDirectory` / `TestRule`（dry-run `PushRule`） | ✅ 请求-响应型：30s 超时 + store 记收件人，`Send` 失败立即 409——不存在「以为送到了」 |
+| `Ping` | ✅ 不含状态假设 |
+| agent 侧 `rules` 表 | ⚠️ **不是 M-2，但该记**：`UpsertRule` 是唯一方法，无 `ListRules`/`DeleteRule`，全仓库无人读——**一张只写不读的死表**。它同时决定了 IC-BUG-30 的爆炸半径止于 agent 进程重启（规则只从 `SyncRulesOnConnect` 来） |
+
+**两条改变 IC-2a 边界的结论**——这正是「先扫完再发刀」的收益，与 M-1 挖出 IC-BUG-29 同理：
+
+1. **IC-BUG-30 决定 IC-BUG-29 修复的分支语义。** agent 会为一条**已删除**的规则继续上报，
+   于是 `HandleUploadResult` 面对的不是「属于我 / 属于别人」两种情况，而是三种：**规则不存在 /
+   规则属于别的 agent / 规则合法**。IC-2a 的 ⑪ 必须显式定义前两种的行为，否则
+   `loadRuleMetadata` 查不到就走空 metadata，静默把上报记成「无规则来源」。
+2. **IC-BUG-31 决定 ack 的可靠性模型。** IC-2a 新增的 `Acknowledgement` 走的是同一个
+   best-effort `registry.Send`——丢一个 ack 就有一个任务永久停在 `reported`、outbox 永不清空。
+   **修法不是把 `Send` 改成可靠投递**，那恰恰是 M-2 的错误方向；而是让 agent 侧带**重报超时**：
+   `reported` 超时回退重发，幂等由 `task_id` + `(bucket_id, storage_path)` + `observed_at` 保证。
+   **这一条当前不在 IC-2 的 ③ 里，必须补进 IC-2a。**
 
 ---
 
@@ -87,6 +118,9 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-27 | `handleDirectoryListing` 拿到 agentID 却只用于打日志，不校验归属 | 🟡 P2 | controlplane |
 | IC-BUG-28 | `registry.Register` 覆盖 map，重连时陈旧流的 defer 会关掉新连接的 SendCh | 🟠 P1 | controlplane |
 | IC-BUG-29 | `UploadResult.rule_id` 无归属校验，agent 可把上传记到别人的规则上并借其元数据打标 | 🟠 P1 | controlplane |
+| IC-BUG-30 | 规则 cancel 无补偿通道：断连期间删除的规则，agent 重连后继续采集上传 | 🟠 P1 | controlplane + agent |
+| IC-BUG-31 | `registry.Send` 队列满即静默丢弃，且 Connect 在消费者启动前入队 | 🟠 P1 | controlplane |
+| IC-BUG-32 | `Revoke` 的 `Send` 与 `Disconnect` 竞态，协作式命令约半数丢失 | 🟡 P2 | controlplane |
 
 ---
 
@@ -215,7 +249,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **文档冲突** | `system-design.md` §4.6「超过重试上限的任务标记为 failed，**上报 Control Plane**」——未实现 |
 | **后果** | 卡死的连接会永久占用一个 worker（默认只有 3 个）；管理员在 Web UI 上看不到任何失败信号 |
 | **修复** | 按文件大小推导 per-upload timeout（可配置下限）；重试耗尽时通过 `UploadResult{success=false, error_message}` 上报（依赖 IC-BUG-2） |
-| **验收** | 制造一个不可达的 MinIO，任务重试耗尽后 Web UI 的上传日志出现 failed 记录 |
+| **⚠️ 拆分（2026-09-10）——归档时不得整条关闭** | **上报半边**（重试耗尽以 `UploadResult{success=false}` 上报）随 **IC-2a ⑤** 关闭，它依赖 IC-BUG-2 的上报通道；**超时半边**（per-upload timeout）留在 **IC-5 ③**，与上报链路无关，属资源保护。**两半都完成前本卡片保持 open** |
+| **验收** | 制造一个不可达的 MinIO，任务重试耗尽后 Web UI 的上传日志出现 failed 记录（上报半边）；worker 在超时后释放而非永久占用（超时半边） |
 
 ## IC-BUG-13 — `content_type` 两条索引路径都不赋值，且会被清空 🟡 P2
 
@@ -225,7 +260,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/indexer/indexer.go`（全文无 `ContentType`）；`controlplane/internal/indexer/queries.go:56` |
 | **后果** | 该列恒为 NULL；将来任何补齐它的路径都会被另一条路径清空（与 IC-BUG-8 同源） |
 | **修复** | 随 IC-BUG-8 的 `COALESCE` 一并修；MinIO 事件载荷含 `contentType` 时填入，agent 侧由 `UploadResult` 带上（需 proto 增字段，只增不改编号） |
-| **验收** | 上传一个 `.csv`，`file_entries.content_type` 为 `text/csv`，随后到达的 webhook 事件不会清空它 |
+| **⚠️ 拆分（2026-09-10）——归档时不得整条关闭** | **防清空半边**（`DO UPDATE` 的 `COALESCE`）随 **IC-2a ④** 免费带上——它就是 IC-BUG-8 的同一条 SQL；**填值半边**（agent 侧经 `UploadResult` 带 `content_type`、webhook 侧从事件载荷取）**仍开着**，需 proto 增字段，可推到准入阶段之后。**两半都完成前本卡片保持 open** |
+| **验收** | 上传一个 `.csv`，`file_entries.content_type` 为 `text/csv`（填值半边），随后到达的 webhook 事件不会清空它（防清空半边） |
 
 ## IC-BUG-14 — Dashboard `COUNT(*)` / `SUM` 全表扫描 🟡 P2
 
@@ -291,7 +327,10 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **实测** | live-e2e 中 agent 上传 `Miru/tokyo/tokyo_001.csv`，`file_entries.storage_path` 落为 `Miru%2Ftokyo%2Ftokyo_001.csv`；直接 `mc cp` 到 `nested/dir/probe.txt` 同样落为 `nested%2Fdir%2Fprobe.txt` |
 | **后果** | 凡是带层级的对象键（正常情况）索引值都与真实键不符。①预签名下载用 `storage_path` 作 key，必然 404；②path_var 反解拿不到分隔符，打标失效；③IC-6 之后 `object_keys` 的幂等键与对账会把这些行全判成幽灵。**当前 `file_entries` 的唯一写入者就是这条路径**，所以影响是全量的 |
 | **修复** | 在 `MinioEventHandler.Handle` 解析后对 key 做一次 `url.QueryUnescape`（S3 事件用的是 `+`-as-space 的 query 编码，不是 path 编码），失败时退回原值并告警；补带层级键与含空格/中文键的单测 |
-| **验收** | `mc cp` 一个 `a/b/中 文.csv`，`file_entries.storage_path` 等于 `a/b/中 文.csv`；预签名下载可直接取回该对象 |
+| **归属（2026-09-10 改期：IC-4 → IC-2a）** | **必须与 IC-BUG-2 同刀**，因为二者会**互相制造重复行**。证据：`migrations/000001_init_schema.up.sql:165` 的 `UNIQUE (bucket_id, storage_path)`、`controlplane/internal/indexer/queries.go:48` 的 `ON CONFLICT (bucket_id, storage_path)`。IC-2 之后 agent 上报写 `a/b/c.csv`、webhook 仍写 `a%2Fb%2Fc.csv`——**两个不同的 `storage_path`，进不了同一个 conflict target**，于是同一个对象变成两行，IC-2 ④ 新加的 `observed_at` 排序键**永远不会被触发**。两个写入方在 IC-11（D-031 换传输）之前一直并存 |
+| **下游传染** | 更严重的是往下游走：IC-6 的 `object_keys` 窄表用**同一个键形状**，重复会被带进对账的输入——L2 分片扫描会把其中一行判成幽灵、另一行判成真的。**等 IC-6 之后再修就要连带清洗历史行** |
+| **⚠️ 归属理由不得省略** | 本条当初被推到 IC-4，正是因为卡片上看不出上面这层交互。**「一行 `url.QueryUnescape` 的事」是它被反复推走的原因，不是它可以被推走的理由**——放错刀就是每个对象两行脏数据 |
+| **验收** | `mc cp` 一个 `a/b/中 文.csv`，`file_entries.storage_path` 等于 `a/b/中 文.csv`；预签名下载可直接取回该对象；**新增**：同一对象经 agent 上报与 webhook 两条路径各写一次后，`file_entries` 只有一行 |
 
 ## IC-BUG-20 — bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 🟠 P1
 
@@ -310,7 +349,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **根因** | `buildStoragePath` 在模板无效 / `Compose` 失败 / 结果为空时一律 `return filepath.Base(localPath)`，即把文件平铺到桶根。IC-1 给这三条路径加了 `logger.Warn`，但**行为本身没变** |
 | **精确位置** | `agent/cmd/agent/main.go` `buildStoragePath` 的三条兜底 return |
 | **后果** | ①写入一个**错误的**对象键比让任务失败更糟：IC-6 之后 `object_keys` 按前缀分片对账，桶根平铺的对象会污染分片树，且这些对象的 path_var 永远反解不出来；②Warn 是 per-file 的——规则模板配错时一次投 5000 个文件就是 5000 条 Warn + 5000 个根目录对象，运维会把它当噪音关掉，等于退回静默 |
-| **修复** | 兜底改为**任务失败**（可重试 / 可告警）而不是猜键；Warn 按 `rule_id` 去重（首次记录）或采样。建议随 IC-2 一起做——IC-2 正好要改上报与终态语义 |
+| **修复** | 兜底改为**任务失败**（可重试 / 可告警）而不是猜键；Warn 按 `rule_id` 去重（首次记录）或采样。归 **IC-2b**（agent 侧鲁棒性一刀，与 IC-BUG-20 同刀）——它改的是任务终态语义，与上报通道本身无关 |
 | **验收** | 模板解析不出来时任务进入失败态并可在 UI 看到原因；同一规则连续 N 个文件失败只产生一条 Warn |
 
 ## IC-BUG-22 — `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token 🔴 P0
@@ -353,11 +392,11 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 |------|------|
 | **根因** | `assertAgentUsable` 只在**建流时**跑一次（IC-1 加的闸门）。已建立的流不受任何约束：`AgentConn.CancelFunc` **全仓库无人调用**（唯一的 `Unregister` 是 `Connect` 自己的 defer），REST 的 `Revoke` 只发一条**协作式**命令；`handleAgentMessage` 的四个分支都没有闸门 |
 | **精确位置** | `controlplane/internal/grpcserver/registry.go`（`CancelFunc` 无调用点）；`controlplane/internal/grpcserver/handler.go` `handleAgentMessage`；`controlplane/internal/agent/manager.go` `RevokeAgent` |
-| **后果** | 被入侵的 agent 已连接 → 管理员吊销 → 它忽略 `Revoke` 命令、不断开。于是：①继续心跳刷新 `agent:online:<id>` 与 `last_seen_at`，**UI 上这个已吊销的 agent 一直显示在线，管理员没有任何手段把它踢下线**；②继续上报 `UploadResult`（IC-2 之后就是攻击者可控地直接写 `file_entries`/`upload_logs`）；③继续响应 `ListDirectory` |
+| **后果** | 被入侵的 agent 已连接 → 管理员吊销 → 它忽略 `Revoke` 命令、不断开。于是：①继续心跳刷新 `agent:online:<id>` 与 `last_seen_at`，**UI 上这个已吊销的 agent 一直显示在线，管理员没有任何手段把它踢下线**；②继续上报 `UploadResult`（IC-2a 之后就是攻击者可控地直接写 `file_entries`/`upload_logs`）；③继续响应 `ListDirectory` |
 | **残留窗口（已接受）** | 手里已签发的 STS 会话在 ≤1h 内仍是整桶写。STS 会话本质上不可撤销（除非轮转 MinIO 父用户或加 deny policy），这一条**接受**，但必须在运维文档里写明「吊销不是即时的，最长一个 STS TTL」 |
 | **根因修正** | 初版只加了 `Disconnect`（取消 `stream.Context()` 的子 context）就宣称「切断流」——**不成立**。接收循环阻塞在 `stream.Recv()`，它不观察那个 context；handler 永不返回 → defer `Unregister` 永不执行 → **goroutine 与 registry 条目永久泄漏**，`IsOnline` 恒为 true |
 | **修复** | ✅ **已修（IC-SEC-1，PR #94）**：① registry 加 `Disconnect`，只 cancel、**不** `close(SendCh)`（所有权在 Connect 的 defer 上，重复关闭会 panic，变异测试实证）；② **`Connect` 的接收循环重构**——`Recv` 移入 goroutine 喂 channel，主循环 `select` 同时等 `ctx.Done()`，取消时 handler 真正 `return`（只有返回才终止 RPC，随后阻塞中的 Recv 出错退出，不泄漏）。**`ctx.Done()` 分支刻意不等发送 goroutine**：它只在空闲时观察 ctx，一旦停在 `stream.Send` 里就再也不写 `sendErr`，而 `Send` 阻塞与否由客户端读不读决定——等它会让 handler 以完全相同的形态泄漏（复审 MF-4，已用「客户端不读流」的用例钉住）；**`Recv` 出错分支同样不能等**——agent 可以「灌满流控窗口 + 半关闭」把 handler 钉在该分支之外，此后它根本观察不到 `ctx.Done()`，即 **agent 能把自己变成踢不掉的**（该行 master 就有，随本刀一并删掉，并用半关闭场景的用例钉住）；③ `Revoke` 发完协作式命令后无条件切流 |
-| **备注（本刀未处理）** | `Revoke` 里先 `Send(RevokeCommand)` 再立刻 `Disconnect`，二者存在竞态：发送 goroutine 的 `select` 在 `ctx.Done()` 与 `SendCh` 同时就绪时随机取分支，协作式命令可能被丢弃，agent 因此不清理本地 token。影响很小（命令本就尽力而为，切流才是硬手段），随 IC-2 顺手处理 |
+| **备注（本刀未处理）** | `Revoke` 里先 `Send(RevokeCommand)` 再立刻 `Disconnect`，二者存在竞态：发送 goroutine 的 `select` 在 `ctx.Done()` 与 `SendCh` 同时就绪时随机取分支，协作式命令可能被丢弃，agent 因此不清理本地 token。影响很小（命令本就尽力而为，切流才是硬手段）。**已于 2026-09-10 的 M-2 类扫描升格为独立卡片 IC-BUG-32**，原「随 IC-2 顺手处理」的处置作废——一个已知实例埋在别的卡片注释里而没被当成一类去扫，正是 M-2 长期未被扫描的原因 |
 | **验收** | ✅ bufconn 端到端用例：`Disconnect` 后客户端 `Recv` 返回 `PermissionDenied`（非阻塞），registry 条目被清空（证明 handler 已返回、defer 已跑）。变异验证：退回旧的阻塞 `Recv` 结构后该用例在 5s 超时处失败。**残留**：UI 在线状态靠 Redis 90s TTL 过期而非立即，`handleDirectoryListing` 不带 ctx——见下方备注 |
 
 ## IC-BUG-26 — `DeleteCollectionRule` 无归属约束 🟠 P1
@@ -368,6 +407,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/db/queries/rules.sql:57-58`；调用方 `controlplane/internal/api/handler/agents.go`（`DeleteRule`） |
 | **后果** | `DELETE /api/v1/agents/<A>/rules/<属于 B 的 rule_id>` 会删掉 **B 的**规则，然后把 cancel 命令发给 A——B 那边的采集静默停止，且路径里的 agent id 与实际受影响的 agent 不符，事后排查会指向错误的 agent。当前是单组织 + 管理员鉴权，所以是**越权面**而非直接可利用漏洞，但与 IC-BUG-24 是同一模式 |
 | **修复** | DELETE 加 `AND agent_id = $2 AND org_id = $3`，`:execrows` 返回 0 时 handler 返回 404，与 Update 对齐；经 `make generate` |
+| **归属（2026-09-10）** | 从 IC-2 ⑧ 移到 **IC-SEC-2**（与 IC-BUG-27/28 同刀）。**不挡数据面可用**：单组织 + 管理员鉴权下是越权面而非可利用漏洞，不该混进 IC-2a 的上报链路 review |
 | **验收** | 用 agent A 的路径删 B 的 rule 返回 404 且 B 的规则仍在；删自己的规则仍正常 |
 
 ## IC-BUG-27 — `handleDirectoryListing` 不校验归属 🟡 P2
@@ -378,6 +418,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/grpcserver/handler.go` `handleDirectoryListing`；`controlplane/internal/dirstore/store.go` |
 | **后果** | 任一已连接 agent 可对别人的 `request_id` 投递伪造的目录列表，管理员看到的是伪造内容。与 IC-BUG-24 同为「能力型随机 ID」，需在 30s 窗口内猜中 UUIDv4，实际可利用性低 |
 | **修复** | 与 IC-BUG-24 同解：`dirstore.Store.Register(reqID, agentID)` + `Deliver(reqID, agentID, result)` 比对收件人。IC-SEC-1 已经把 `dryrun.Store` 改成这个形状，照抄即可 |
+| **归属（2026-09-10）** | 从 IC-2 ⑨ 移到 **IC-SEC-2**（与 IC-BUG-26/28 同刀）|
 | **验收** | agent A 对发给 B 的 request_id 投递被丢弃并告警；合法目录列举仍能送达 |
 
 ## IC-BUG-28 — `registry.Register` 覆盖 map，重连时陈旧流会关掉新连接 🟠 P1
@@ -388,7 +429,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/grpcserver/registry.go` `Register` / `Unregister` |
 | **实测（评审）** | `fresh conn SendCh closed by the STALE unregister: closed=true`、`IsOnline=false`，随后再 `Send` → `panic: send on closed channel` |
 | **后果** | 网络抖动导致的重连即可触发：新连接被静默踢出 registry 且 `SendCh` 被关闭，此后规则下发/凭据推送全部失败；`Send` 在 RLock 之外发送、与 `Unregister` 的 `close` 并发还有同一崩溃窗口，而 `SyncRulesOnConnect` 路径上的 panic 在 gRPC handler goroutine 里**没有 recover** |
-| **与 IC-SEC-1 的关系** | 非本刀引入（`Disconnect` 只 cancel、不 close，未新增双重释放）。但 IC-BUG-25 修好后陈旧流会更快消失，两件事宜一起处理 |
+| **归属（2026-09-10）** | 从 IC-2 ⑩ 移到 **IC-SEC-2**（与 IC-BUG-26/27 同刀）。它是并发缺陷，值得单独被人盯着看，不该埋在一个 11 项的 PR 里 |
+| **⚠️ 前置：对着当前 master 验，不要照旧假设写** | IC-BUG-25 **已随 IC-SEC-1 合并**，评审当时说的「两件事宜一起处理」已经过时。当前 master 的事实是：**`Disconnect` 只 cancel、不 `close(SendCh)`**，`SendCh` 的所有权在 `Connect` 的 `defer Unregister` 上（`registry.go` 的 `Disconnect` 注释已写明这一点）。改 `Unregister` 时若顺手在 `Disconnect` 里也 close，就是重复关闭 panic——IC-SEC-1 的变异测试实证过 |
 | **修复** | `Unregister` 改为按 conn 身份而非按 key 删除（比对指针/世代号，只在仍是自己那条时才 close + delete）；`Send` 改为在锁内取 conn 后用 `select` + 关闭标志，或改用 per-conn 的关闭同步 |
 | **验收** | 同一 agent 快速重连后，旧流返回不影响新连接：`IsOnline` 仍为 true、`SendCh` 未关闭、后续 Send 成功；`-race` 下并发 Send/Unregister 无 panic |
 
@@ -399,9 +441,44 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **根因** | `HandleUploadResult` 直接 `uuid.Parse(result.GetRuleId())` 就用（`indexer.go:154-160`），**全程不校验该规则是否属于上报的 agent**——该文件里 `AgentID` 只出现在写入参数中（`:197`、`:233`），从未参与校验 |
 | **精确位置** | `controlplane/internal/indexer/indexer.go:154-160`（取用）、`:167`（`loadRuleMetadata(ctx, orgID, ruleID)`）、`:198`/`:235`/`:495`（写入 `file_entries.rule_id` / `upload_logs` / `SourceRuleID`） |
 | **后果** | 恶意或有缺陷的 agent 可以：①**把自己的上传记到别人的规则名下**，污染 `file_entries.rule_id` 与 `upload_logs` 的归因，事后排查会指向错误的采集器；②更糟的是 `loadRuleMetadata` 按这个 ID 加载 `file_type` / `static_tags` / `path_tag_map`——于是它能**借用任意规则的元数据声明给自己的文件打标**，直接污染 6c 受控标签体系（这些标签会进筛选器、进事件规则、进下游 ETL） |
-| **可利用性** | **当前为零**——agent 从不上报 `UploadResult`（IC-BUG-2），这条路径是死代码。**IC-2 把它变成索引主路径的那一刻起就成立**，与 IC-1 让 IC-BUG-22/23 变得可利用是同一个机制 |
-| **修复** | 在 `HandleUploadResult` 里校验 `rule.AgentID == agentID`（`agentID` 已经是流上的可信身份，函数签名里就有），不匹配则丢弃该 `rule_id` 并告警——是否连整条上报一起拒绝需在 IC-2 定：宽松处理（仅清空 rule_id）保住文件本身的索引，严格处理（整条拒绝）避免半可信数据入库 |
+| **可利用性** | **当前为零**——agent 从不上报 `UploadResult`（IC-BUG-2），这条路径是死代码。**IC-2a 把它变成索引主路径的那一刻起就成立**，与 IC-1 让 IC-BUG-22/23 变得可利用是同一个机制 |
+| **修复** | 在 `HandleUploadResult` 里校验归属（`agentID` 已经是流上的可信身份，函数签名里就有）。**分支是三个，不是两个**——见下行 |
+| **⚠️ 三分支（2026-09-10，因 IC-BUG-30）** | 只写 `rule.AgentID == agentID` 不够：IC-BUG-30 让 agent 会为一条**已删除**的规则继续上报，于是实际要处理 ①**规则不存在** ②**规则属于别的 agent** ③**合法**。①② 的行为须在 **IC-2a ⑧** 显式定义（宽松：仅清空 `rule_id` 保住文件索引；严格：整条拒绝避免半可信数据入库），**不能让 `loadRuleMetadata` 查不到就默默走空 metadata**——那等于把 ① 静默当成「无规则来源」，正是这条缺陷的静默版本 |
 | **验收** | agent A 上报携带 B 的 rule_id → `file_entries.rule_id` 不被写成 B 的规则、`file_tags` 里不出现 B 规则声明的标签、日志有告警；A 用自己的 rule_id 上报一切正常 |
+
+
+## IC-BUG-30 — 规则 cancel 无补偿通道，断连期间删掉的规则 agent 继续跑 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 同步协议**只有增量推送，没有全集语义**。`DispatchRuleCancel` 在 agent 离线时直接 `return nil`（`dispatch.go:102-104`），而重连时的 `SyncRulesOnConnect` **只推 `status == active` 的规则**（`dispatch.go:130`），从不推 cancel。agent 侧 `stopRule` 唯一的触发点是收到 `CancelRule`（`agent/cmd/agent/main.go:235-237`），没有「本次同步的全集之外的规则一律停掉」这条语义 |
+| **精确位置** | `controlplane/internal/agent/dispatch.go:101-115`（离线即放弃）、`:129-132`（只推 active）；`agent/cmd/agent/main.go:159-167`（`stopRule`）、`:169-209`（`applyRule`） |
+| **后果** | agent 断连期间（网络抖动 / CP 重启）管理员停用或删除一条规则 → cancel 命令被丢弃 → agent 重连后**继续按这条已经不存在的规则采集并上传**，且因 D-030 整桶 policy **传得上去**（不会被 403 挡）。DB 与 UI 上该规则已消失，运维没有任何线索。持续到 agent 进程重启为止——`rules` 表只写不读，重启后规则只从 `SyncRulesOnConnect` 来 |
+| **与 IC-2a 的关系** | 上报活过来之后，这些上传会带着一个**已删除的 `rule_id`** 到达 `HandleUploadResult`。因此 IC-BUG-29 的归属校验**不能只写 `rule.AgentID == agentID`**，必须处理三分支：规则不存在 / 规则属于别的 agent / 规则合法 |
+| **修复** | 两半，缺一不可：① **停用**：`SyncRulesOnConnect` 连 inactive 一起推——agent 的 `applyRule` 对 `Enabled == false` 已经会先 `stopRule` 再 return，复用既有分支即可；② **删除**：删掉的行已不在 `ListCollectionRulesByAgent` 的结果里，**推不出来**，必须给同步加全集语义（下发一条「本次同步的 `rule_id` 全集」，agent 停掉集合外的规则）或 CP 侧留 tombstone。推荐全集语义——proto 只增字段，不必引入软删除表 |
+| **验收** | agent 与 CP 断连 → 删除一条规则、停用另一条 → 恢复连接 → 两条都不再产生上传，且 **agent 进程不重启**也成立；单测覆盖「全集里缺失的规则被停掉」 |
+
+## IC-BUG-31 — `registry.Send` 队列满即静默丢弃，且 Connect 在消费者启动前入队 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `AgentRegistry.Send` 是 `select { case conn.SendCh <- msg: ...; default: return false }`——**队满即丢**，`SendCh` cap 32。8 个调用点对 `false` 的处理清一色是 `logger.Warn` 后继续，无一重试或落 outbox；`DispatchRule` 更是在 `Send` 失败时仍 `return nil`，调用方连判断的机会都没有。叠加一个顺序问题：`Connect` 里 `SyncRulesOnConnect`（`handler.go:105`）与 `pushCredentials`（`:110`）都在**发送 goroutine 启动之前**（`:113`）入队，此时通道**没有任何消费者** |
+| **精确位置** | `controlplane/internal/grpcserver/registry.go` `Send` 的 `default:` 分支、`:41`（`make(chan *agentv1.ServerMessage, 32)`）；`controlplane/internal/grpcserver/handler.go:105,110,113`（入队早于消费者）；`controlplane/internal/agent/dispatch.go:94-97`（Send 失败仍 `return nil`） |
+| **实测（静态推导）** | active 规则数 ≥ 32 时，第 33 条起的 `PushRule` 全部被丢弃；紧随其后的 `pushCredentials` 同样被丢弃 |
+| **后果** | ① **规则丢失是永久的**——agent 只在建流时拿规则，下次重连会以完全相同的方式再丢一次；② 凭据丢失可自愈，窗口 ≤1 分钟（agent 侧 1min tick 的刷新 goroutine，IC-1 ⑤ 已去掉 `sts == nil` 短路）；③ **IC-2a 引入 `Acknowledgement` 后，丢一个 ack 就有一个任务永久停在 `reported`、outbox 永不清空** |
+| **修复** | 分两层：① **结构**——`Connect` 里把发送 goroutine 提到 `SyncRulesOnConnect` / `pushCredentials` **之前**启动（顺序调整，消除「无消费者时入队」）；② **语义**——接受 `Send` 仍是 best-effort，但每个消费方自带补偿：规则靠 IC-BUG-30 的全集同步，ack 靠 IC-2a 的重报超时。**不要试图把 `Send` 改成可靠投递**——那正是 M-2 的错误方向（把协作式机制当成强制手段）；可靠性应当由接收方的重试提供，而不是由发送方的保证提供 |
+| **验收** | 给一个 agent 配 40 条 active 规则，重连后 40 条全部生效且凭据到达；单测覆盖「SendCh 满时调用方可观测到失败」（`DispatchRule` 不再吞掉） |
+
+## IC-BUG-32 — `Revoke` 的 `Send` 与 `Disconnect` 竞态，协作式命令约半数丢失 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `Revoke` 先 `registry.Send(RevokeCommand)` 入队，紧接着调 `registry.Disconnect` cancel 掉 context。发送 goroutine 的 `select` 此时**同时就绪**于 `ctx.Done()` 与 `conn.SendCh`，Go 在多个就绪 case 间随机选择——约一半的概率先取 `ctx.Done()` 直接 return，`RevokeCommand` 从未写出 |
+| **精确位置** | `controlplane/internal/api/handler/agents.go:399-411`（`Send` 后立即 `Disconnect`）；`controlplane/internal/grpcserver/handler.go:114-129`（发送 goroutine 的 select） |
+| **后果** | 有限。切流是硬手段且已经生效（IC-SEC-1），协作式命令本就尽力而为。真实损失是**守规矩的 agent 收不到 `Revoke` 就不执行 `handleRevokeCommand`**，本地 token 留在磁盘上直到 30 天 TTL 到期。安全上不构成新暴露面——状态闸门（IC-BUG-23 修复）已拦住它重连 |
+| **来源** | 原埋在 IC-BUG-25 的「备注（本刀未处理）」里，处置写的是「随 IC-2 顺手处理」。2026-09-10 的 M-2 类扫描把它升格为独立卡片 |
+| **修复** | 让切流等一个**有界**的短窗：`Send` 之后不立刻 cancel，等发送 goroutine 确认写出（或固定等 ≤1s）再 `Disconnect`，超时则直接切。**上限必须是硬的**——绝不能无限等一个不读流的 agent，那会重蹈 IC-BUG-25 复审里 MF-4 的覆辙 |
+| **验收** | bufconn 用例：正常 agent 被吊销时先收到 `RevokeCommand`、流随后才断；**不读流的 agent 在上限时间内仍被切断**（不因等待而挂住 handler） |
 
 ---
 
