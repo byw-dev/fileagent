@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16/17 为 2026-09-09 追加）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…19 为 2026-09-09 追加，其中 18/19 是 IC-1 的 live-e2e 中暴露的）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -33,6 +33,8 @@
 | IC-BUG-15 | 预签名下载 URL TTL 硬编码 15 分钟，大文件不够用 | 🟡 P2 | controlplane |
 | IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效 | 🟠 P1 | agent + controlplane |
 | IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 | 🔴 P0 | agent |
+| IC-BUG-18 | Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 | 🔴 P0 | agent |
+| IC-BUG-19 | minio-event 索引 URL 编码后的对象键（`%2F`），与真实键不符 | 🟠 P1 | controlplane |
 
 ---
 
@@ -216,6 +218,28 @@
 | **与 D-030 的关系** | 整桶 policy 让这类「对象键完全跑偏」的写入**不再被 403 挡住**，缺陷会从「上传失败」退化成「静默写错位置」。因此必须与 IC-1 同刀修 |
 | **修复** | 缓存 token 分支补齐身份：从 JWT claims 还原 `agent_id` / `agent_name`（token 里已有，CP 侧就是这么取的），或把两者与 token 一起持久化。另外给 `buildStoragePath` 的 Compose 失败路径加 `logger.Warn`——它现在完全静默 |
 | **验收** | Agent 首次注册后**重启**，落一个文件：对象键仍符合 `dest_path_template`（不是裸 basename）；心跳的 `agent_id` 非空；日志中无 `missing field` |
+
+## IC-BUG-18 — Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 🔴 P0
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `buildDialOpts` 无条件使用 TLS：`TLSCACert` 为空时退回系统根证书池，仍是 TLS。而 CP 的 `grpc.NewServer` 不配 `Creds`，监听明文。`InsecureDialOpts` 存在但注释写明「intended for testing only」，没有任何配置项能启用它 |
+| **精确位置** | `agent/internal/grpcclient/client.go:378-403`（`buildDialOpts`）；`controlplane/internal/grpcserver/server.go:180,202`（`grpc.NewServer` 无 `Creds`） |
+| **实测** | 按 `agent/config.toml.example` 原样配置连本地 CP：`transport: authentication handshake failed: tls: first record does not look like a TLS handshake`。**该示例配置文件本身就是不可用的** |
+| **后果** | **本地开发环境下 Agent 与 CP 之间不存在任何可用的连接方式**——这正是「Agent 数据面从未端到端跑通过」的直接原因之一：没人跑得起来。所有 Agent 侧缺陷（IC-BUG-1…5、10…12、16、17）因此长期不可见 |
+| **修复** | ✅ **已随 IC-1 修**：新增 `server.tls_insecure`（env `AGENT_SERVER_TLS_INSECURE`）。置 `true` 时走 `InsecureDialOpts` 并打印醒目 Warn（bearer token 明文传输）。**刻意用否定式命名**：零值必须是安全的那个，否则在代码里直接构造 `config.Config{}`（不走 `Load`）会静默失去 TLS——初版写成 `tls_enabled bool` 时正是这个 fail-open 缺陷，被既有单测 `TestClient_BuildDialOpts_MissingCACert` 当场逮住 |
+| **验收** | ✅ 已验证：`tls_insecure = true` 时 agent 成功连上本地明文 CP 并完成注册→审批→建流；缺省配置仍走 TLS |
+
+## IC-BUG-19 — minio-event 索引 URL 编码后的对象键（`%2F`）🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | S3 事件通知里的 `s3.object.key` 是 **URL 编码**的（`a/b/c.csv` → `a%2Fb%2Fc.csv`），而 CP 直接把它当作 `storage_path` 落库。全 `controlplane/internal/` 无一处 `url.QueryUnescape` / `PathUnescape`（已 grep 确认） |
+| **精确位置** | `controlplane/internal/api/handler/events.go:764`（`Key` 字段）、`:800`（`bucket, key := rec.S3.Bucket.Name, rec.S3.Object.Key`）→ 传入 `IndexUpload` |
+| **实测** | live-e2e 中 agent 上传 `Miru/tokyo/tokyo_001.csv`，`file_entries.storage_path` 落为 `Miru%2Ftokyo%2Ftokyo_001.csv`；直接 `mc cp` 到 `nested/dir/probe.txt` 同样落为 `nested%2Fdir%2Fprobe.txt` |
+| **后果** | 凡是带层级的对象键（正常情况）索引值都与真实键不符。①预签名下载用 `storage_path` 作 key，必然 404；②path_var 反解拿不到分隔符，打标失效；③IC-6 之后 `object_keys` 的幂等键与对账会把这些行全判成幽灵。**当前 `file_entries` 的唯一写入者就是这条路径**，所以影响是全量的 |
+| **修复** | 在 `MinioEventHandler.Handle` 解析后对 key 做一次 `url.QueryUnescape`（S3 事件用的是 `+`-as-space 的 query 编码，不是 path 编码），失败时退回原值并告警；补带层级键与含空格/中文键的单测 |
+| **验收** | `mc cp` 一个 `a/b/中 文.csv`，`file_entries.storage_path` 等于 `a/b/中 文.csv`；预签名下载可直接取回该对象 |
 
 ---
 

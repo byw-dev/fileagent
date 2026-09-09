@@ -2,7 +2,7 @@
 
 > **状态**：设计（2026-09-08 拍板方向，尚未实施）
 > **决策记录**：[`DECISIONS.md`](../../DECISIONS.md) **D-030** / **D-031**（事件传输改 JetStream）
-> **缺陷清单**：[`docs/tasks/bugs/open.md`](../tasks/bugs/open.md) IC-BUG-1…IC-BUG-17
+> **缺陷清单**：[`docs/tasks/bugs/open.md`](../tasks/bugs/open.md) IC-BUG-1…IC-BUG-19
 > **关联**：`system-design.md` §4.5（上传流程）/ §4.7（凭据轮转）/ §5.7（STS）/ §5.8（索引）/ §6.3（Policy）/ §6.5（事件通知）；
 > [`metadata-model.md`](./metadata-model.md) P2.2（衍生数据入口）/ P2.3（run 血缘）；D-014、D-017、D-025
 >

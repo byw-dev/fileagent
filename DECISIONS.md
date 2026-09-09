@@ -1294,7 +1294,7 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 `proto/v1/agent.proto`（只增字段）、SDK（写入协议）、deploy（MinIO 通知与 ILM 配置）、
 文档（`system-design.md` §4.5/§4.7/§5.7/§5.8/§6.3/§6.5、`contracts.md`）
 **权威设计**：[`docs/design/consistency-and-ingest.md`](docs/design/consistency-and-ingest.md)
-**缺陷清单**：[`docs/tasks/bugs/open.md`](docs/tasks/bugs/open.md) IC-BUG-1…IC-BUG-17
+**缺陷清单**：[`docs/tasks/bugs/open.md`](docs/tasks/bugs/open.md) IC-BUG-1…IC-BUG-19
 **来源**：产品提出两条此前不成立的前提——(1) 必须允许 Agent 之外的进程（ETL）写入 bucket 并记录 tags 与血缘；
 (2) 对象数量级为千万/年、3–5 年上亿。据此对写入链路做全面审计，发现**设计与实现存在系统性反转**。
 
@@ -1410,7 +1410,7 @@ ETL 是否允许就地覆盖同一 key（D）、SDK outbox 最小形态（E）�
 - 前序：**D-014**（minio-event 鉴权）、**D-017**（webhook 索引路径复活）、
   **D-025** 补充 §3（衍生数据入口：ETL 禁止直连 MinIO）、**D-007**（cursor 分页与 `total`）
 - 设计：`docs/design/consistency-and-ingest.md`、`docs/design/metadata-model.md` P2.2/P2.3
-- 缺陷：`docs/tasks/bugs/open.md` IC-BUG-1…IC-BUG-17
+- 缺陷：`docs/tasks/bugs/open.md` IC-BUG-1…IC-BUG-19
 
 ---
 
