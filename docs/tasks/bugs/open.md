@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -21,7 +21,7 @@
 
 | # | 模式 | 已知实例 | 未扫描的面 |
 |---|---|---|---|
-| **M-1** | **客户端指定资源 ID，无人校验归属**——「这个资源是它的吗」这个问题反复没被问 | IC-BUG-24（dry-run）、IC-BUG-26（`DeleteCollectionRule`）、IC-BUG-27（目录列举）；IC-1 修掉的 `rule_id` 越权同源 | 全部 handler 中「从请求体/消息体取 ID 再操作资源」的位置，REST 与 gRPC 两侧 |
+| **M-1** | **客户端指定资源 ID，无人校验归属**——「这个资源是它的吗」这个问题反复没被问 | IC-BUG-24（dry-run，已修）、IC-BUG-26（`DeleteCollectionRule`）、IC-BUG-27（目录列举）、IC-BUG-29（`UploadResult.rule_id`）；IC-1 修掉的 `rule_id` 越权同源 | ✅ **2026-09-10 已完成类扫描**，见下方「M-1 扫描结论」。REST 与 gRPC 两侧均已过一遍，无其余实例 |
 | **M-2** | **协作式机制被当成强制手段**——发个命令就认为对方会照做 | IC-BUG-25（吊销靠 agent 自觉删 token）；IC-SEC-1 评审中的 MF-2 / MF-4（以为 cancel 能中断 `Recv`、以为等 `sendErr` 会返回） | 所有「CP 下发命令后就认为状态已改变」的路径：`CancelRule`、`Revoke`、`PushRule` |
 | **M-3** | **鉴权检查不在使用点**——签发时验过，使用时不验 | IC-BUG-22（`PollApproval` 不验指纹）、IC-BUG-23（吊销后 token 仍可用） | 长生命周期凭据的每个消费点；STS 会话本身仍是 ≤1h 不可撤销（已接受） |
 
@@ -29,6 +29,30 @@
 > agent token 拿到也没用（STS 链路不通），是 IC-1 让它们从死代码里的瑕疵变成「零凭据换
 > 整桶写权限」。正确的问法是：**这次改动让原本无害的东西变得可利用了吗**。
 > 这也是 `.claude/agents/code-reviewer.md` 要求「越过 diff 边界看」的由来。
+
+#### M-1 扫描结论（2026-09-10）
+
+方法：比对 `db/queries/*.sql` 里同表查询的 `WHERE` 收窄差异（仓库自己暴露了意图——
+兄弟查询带 `org_id`/`agent_id` 而某一条只按主键），再逐个回溯调用方是否用了客户端提供的 ID；
+gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
+
+**结论：M-1 在 REST 层只有 1 个实例，比预期少得多；但 gRPC 侧挖出一个新的。**
+
+| 检查面 | 结果 |
+|---|---|
+| 嵌套路由 `/agents/:id/rules/:rid` | ❌ `DELETE` 未校验父子关系（**IC-BUG-26**）。同路由 `PUT` 是安全的——`UpdateCollectionRule` 带 `AND agent_id AND org_id` |
+| 嵌套路由 `/tag-keys/:key/values/:vid` | ✅ 安全，`DeleteTagValue` 带 `AND tag_key_id = $2` |
+| gRPC `DryRunResult` | ✅ 已修（IC-SEC-1，收件人绑在 store 上） |
+| gRPC `DirectoryListing` | ❌ 拿到 agentID 只打日志（**IC-BUG-27**） |
+| gRPC `UploadResult` | ❌ **新发现（IC-BUG-29）** |
+| gRPC `Heartbeat` | ✅ 不含资源 ID |
+
+**一个不是缺陷、但该记的架构事实**：单条按 ID 的 `Get`/`Update`/`Delete` **普遍不带 `org_id`**
+（`GetEventRuleByID`、`UpdateFileType`、`GetFileTypeByID`、`DeleteBucket`、`DeleteUser` …），
+而 `List*` 一律带。所以这不是「DELETE 漏了」，是**单条访问统一不做 org 隔离**。
+第一版单组织 + 管理员鉴权下不可利用（`org_id` 本就是预留字段，见 `DECISIONS.md` 多租户条），
+但多租户落地时会全线失效。**这是一条架构待办，不是缺陷**——建议在多租户开工前做一次统一收窄，
+而不是逐条登记成 bug。
 
 ---
 
@@ -62,6 +86,7 @@
 | IC-BUG-26 | `DeleteCollectionRule` 无归属约束，可删掉别的 agent 的规则 | 🟠 P1 | controlplane |
 | IC-BUG-27 | `handleDirectoryListing` 拿到 agentID 却只用于打日志，不校验归属 | 🟡 P2 | controlplane |
 | IC-BUG-28 | `registry.Register` 覆盖 map，重连时陈旧流的 defer 会关掉新连接的 SendCh | 🟠 P1 | controlplane |
+| IC-BUG-29 | `UploadResult.rule_id` 无归属校验，agent 可把上传记到别人的规则上并借其元数据打标 | 🟠 P1 | controlplane |
 
 ---
 
@@ -366,6 +391,17 @@
 | **与 IC-SEC-1 的关系** | 非本刀引入（`Disconnect` 只 cancel、不 close，未新增双重释放）。但 IC-BUG-25 修好后陈旧流会更快消失，两件事宜一起处理 |
 | **修复** | `Unregister` 改为按 conn 身份而非按 key 删除（比对指针/世代号，只在仍是自己那条时才 close + delete）；`Send` 改为在锁内取 conn 后用 `select` + 关闭标志，或改用 per-conn 的关闭同步 |
 | **验收** | 同一 agent 快速重连后，旧流返回不影响新连接：`IsOnline` 仍为 true、`SendCh` 未关闭、后续 Send 成功；`-race` 下并发 Send/Unregister 无 panic |
+
+## IC-BUG-29 — `UploadResult.rule_id` 无归属校验 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `HandleUploadResult` 直接 `uuid.Parse(result.GetRuleId())` 就用（`indexer.go:154-160`），**全程不校验该规则是否属于上报的 agent**——该文件里 `AgentID` 只出现在写入参数中（`:197`、`:233`），从未参与校验 |
+| **精确位置** | `controlplane/internal/indexer/indexer.go:154-160`（取用）、`:167`（`loadRuleMetadata(ctx, orgID, ruleID)`）、`:198`/`:235`/`:495`（写入 `file_entries.rule_id` / `upload_logs` / `SourceRuleID`） |
+| **后果** | 恶意或有缺陷的 agent 可以：①**把自己的上传记到别人的规则名下**，污染 `file_entries.rule_id` 与 `upload_logs` 的归因，事后排查会指向错误的采集器；②更糟的是 `loadRuleMetadata` 按这个 ID 加载 `file_type` / `static_tags` / `path_tag_map`——于是它能**借用任意规则的元数据声明给自己的文件打标**，直接污染 6c 受控标签体系（这些标签会进筛选器、进事件规则、进下游 ETL） |
+| **可利用性** | **当前为零**——agent 从不上报 `UploadResult`（IC-BUG-2），这条路径是死代码。**IC-2 把它变成索引主路径的那一刻起就成立**，与 IC-1 让 IC-BUG-22/23 变得可利用是同一个机制 |
+| **修复** | 在 `HandleUploadResult` 里校验 `rule.AgentID == agentID`（`agentID` 已经是流上的可信身份，函数签名里就有），不匹配则丢弃该 `rule_id` 并告警——是否连整条上报一起拒绝需在 IC-2 定：宽松处理（仅清空 rule_id）保住文件本身的索引，严格处理（整条拒绝）避免半可信数据入库 |
+| **验收** | agent A 上报携带 B 的 rule_id → `file_entries.rule_id` 不被写成 B 的规则、`file_tags` 里不出现 B 规则声明的标签、日志有告警；A 用自己的 rule_id 上报一切正常 |
 
 ---
 

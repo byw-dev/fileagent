@@ -4,7 +4,7 @@
 > 从「靠事件运气」改造为「有界成本可验证」。
 > **权威设计**：[`docs/design/consistency-and-ingest.md`](../design/consistency-and-ingest.md)
 > **决策**：`DECISIONS.md` **D-030**（总设计）、**D-031**（事件传输改 JetStream）
-> **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-28
+> **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-29
 > **来由**（2026-09-08）：产品提出两条此前不成立的前提——必须允许 ETL 等非 Agent 进程写入并记录
 > tags 与血缘；对象量级为千万/年、3–5 年上亿。据此审计发现 **Agent 数据面从未端到端跑通过**。
 
