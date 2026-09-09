@@ -27,6 +27,17 @@ type ServerConfig struct {
 	Endpoint string `toml:"endpoint"`
 	// TLSCACert is an optional path to a PEM-encoded CA certificate for TLS verification.
 	TLSCACert string `toml:"tls_ca_cert"`
+	// TLSInsecure disables TLS on the gRPC connection. Leave it off outside
+	// local development: a plaintext connection sends the bearer token in clear.
+	//
+	// The switch exists because the dev Control Plane serves gRPC in plaintext
+	// while the agent had no way to dial without TLS, so an agent could never
+	// reach a local Control Plane at all — which is a large part of why the data
+	// plane went so long without ever running end to end (IC-BUG-18).
+	//
+	// It is phrased negatively on purpose: the zero value must be the secure
+	// one, so a Config built in code (not through Load) never silently drops TLS.
+	TLSInsecure bool `toml:"tls_insecure"`
 }
 
 // AgentConfig holds agent identity and local storage settings.
@@ -122,6 +133,12 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AGENT_SERVER_TLS_CA_CERT"); v != "" {
 		cfg.Server.TLSCACert = v
+	}
+	if v := os.Getenv("AGENT_SERVER_TLS_INSECURE"); v != "" {
+		// Parse leniently but fail safe: anything unparseable leaves TLS on.
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.Server.TLSInsecure = b
+		}
 	}
 
 	// [agent]

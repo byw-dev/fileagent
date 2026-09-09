@@ -325,8 +325,12 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// A nil sts used to short-circuit here, so an agent that had
+				// never been given credentials could never ask for any
+				// (IC-BUG-1). Missing credentials are precisely the case that
+				// must trigger a refresh.
 				sts := stsMgr.GetSTS()
-				if sts == nil || time.Until(sts.Expiry) > 10*time.Minute {
+				if sts != nil && time.Until(sts.Expiry) > 10*time.Minute {
 					continue
 				}
 				logger.Info("agent: refreshing STS credentials")
@@ -487,7 +491,7 @@ func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.Collecti
 		ID:          uuid.New().String(),
 		RuleID:      rule.RuleID,
 		LocalPath:   localPath,
-		StoragePath: buildStoragePath(rule, localPath, agentCtx, time.Now().UTC()),
+		StoragePath: buildStoragePath(rule, localPath, agentCtx, time.Now().UTC(), logger),
 		Bucket:      rule.UploadBucket,
 		FileSize:    size,
 		FileMtime:   mtime.Unix(),
@@ -502,11 +506,18 @@ func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.Collecti
 // buildStoragePath resolves the upload path template and returns the object
 // key to use in MinIO.
 //
+// The template is normalised first (trollsift.NormalizeTemplate) so the key the
+// agent writes and the template the Control Plane later reverse-parses agree on
+// the leading separator; see docs/design/contracts.md V-3.
+//
 // If the template contains the {filename} variable it is substituted with the
-// file's base name, and the result is used as-is (leading "/" stripped).
-// Otherwise the resolved prefix is treated as a directory and the file's base
-// name is appended automatically.
-func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx trollsift.AgentContext, now time.Time) string {
+// file's base name, and the result is used as-is. Otherwise the resolved prefix
+// is treated as a directory and the file's base name is appended automatically.
+//
+// Every fallback to the bare base name is logged: a silent fallback is how
+// IC-BUG-17 hid an agent whose identity fields were empty, flattening every
+// upload into the bucket root.
+func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx trollsift.AgentContext, now time.Time, logger *zap.Logger) string {
 	relPath, err := filepath.Rel(rule.BasePath, localPath)
 	if err != nil {
 		relPath = filepath.Base(localPath)
@@ -531,18 +542,35 @@ func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx 
 		fields["time"] = trollsift.T(now)
 	}
 
-	destParser, err := trollsift.New(rule.DestPathTemplate)
+	fallback := filepath.Base(localPath)
+	template := trollsift.NormalizeTemplate(rule.DestPathTemplate)
+
+	destParser, err := trollsift.New(template)
 	if err != nil {
-		return filepath.Base(localPath)
+		logger.Warn("agent: dest_path_template is not a valid pattern, falling back to base name",
+			zap.String("rule_id", rule.RuleID),
+			zap.String("template", rule.DestPathTemplate),
+			zap.String("storage_path", fallback),
+			zap.Error(err))
+		return fallback
 	}
 	storagePath, err := destParser.Compose(fields, false)
 	if err != nil {
-		return filepath.Base(localPath)
+		logger.Warn("agent: cannot resolve dest_path_template, falling back to base name",
+			zap.String("rule_id", rule.RuleID),
+			zap.String("template", rule.DestPathTemplate),
+			zap.String("storage_path", fallback),
+			zap.Error(err))
+		return fallback
 	}
 	if storagePath == "" {
-		return filepath.Base(localPath)
+		logger.Warn("agent: dest_path_template resolved to an empty key, falling back to base name",
+			zap.String("rule_id", rule.RuleID),
+			zap.String("template", rule.DestPathTemplate),
+			zap.String("storage_path", fallback))
+		return fallback
 	}
-	return strings.TrimPrefix(storagePath, "/")
+	return trollsift.NormalizeObjectKey(storagePath)
 }
 
 // matchGlob matches a local absolute path against rule.PathPattern using relative-path semantics.
@@ -628,7 +656,11 @@ func handleDryRun(rule scheduler.CollectionRule, client *grpcclient.Client, agen
 		fields["filename"] = trollsift.S(filepath.Base(path))
 		fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(path), "."))
 
-		destParser, dErr := trollsift.New(rule.DestPathTemplate)
+		// Normalise exactly as buildStoragePath does: the dry-run preview sits
+		// next to the Web UI's own preview in the same form, so showing a
+		// different key than the upload would actually produce is worse than
+		// showing nothing.
+		destParser, dErr := trollsift.New(trollsift.NormalizeTemplate(rule.DestPathTemplate))
 		if dErr != nil {
 			fileResult.ComposeError = dErr.Error()
 		} else {
@@ -636,7 +668,7 @@ func handleDryRun(rule scheduler.CollectionRule, client *grpcclient.Client, agen
 			if cErr != nil {
 				fileResult.ComposeError = cErr.Error()
 			} else {
-				fileResult.UploadPath = uploadPath
+				fileResult.UploadPath = trollsift.NormalizeObjectKey(uploadPath)
 			}
 		}
 

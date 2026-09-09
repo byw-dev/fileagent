@@ -257,12 +257,16 @@ func TestLifecycle_Start_TokenAlreadyExists(t *testing.T) {
 	fpFile := filepath.Join(dir, "fp.txt")
 	tokFile := filepath.Join(dir, "token.enc")
 
-	// Create a syntactically valid JWT (unsigned) with future expiry.
+	// Create a syntactically valid JWT (unsigned) with future expiry. The
+	// Control Plane always mints agent tokens with the agent UUID as "sub" and
+	// the display name as "username", so the fixture carries both.
 	now := time.Now()
 	exp := now.Add(2 * time.Hour).Unix()
 	iat := now.Unix()
 	header := base64Encode(`{"alg":"HS256","typ":"JWT"}`)
-	payload := base64Encode(fmt.Sprintf(`{"exp":%d,"iat":%d}`, exp, iat))
+	payload := base64Encode(fmt.Sprintf(
+		`{"exp":%d,"iat":%d,"sub":"11111111-2222-3333-4444-555555555555","username":"tokyo-site"}`,
+		exp, iat))
 	validJWT := header + "." + payload + ".fakesig"
 
 	tm := credential.NewTokenManager(tokFile, "machine-id")
@@ -287,7 +291,43 @@ func TestLifecycle_Start_TokenAlreadyExists(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, StateApproved, lc2.StateMachine.Current())
 	assert.Equal(t, 0, srv.pollCallCount, "PollApproval should not be called when token is valid")
+
+	// Regression for IC-BUG-17: this path used to return without populating the
+	// identity, leaving AgentID/AgentName empty for the rest of the process and
+	// silently breaking every dest_path_template that referenced them.
+	assert.Equal(t, "11111111-2222-3333-4444-555555555555", lc2.AgentID)
+	assert.Equal(t, "tokyo-site", lc2.AgentName)
 	_ = lc // suppress unused warning
+}
+
+// A cached token we cannot read an identity from is unusable: continuing with
+// empty identity fields is exactly the IC-BUG-17 failure mode, so the agent
+// re-registers instead.
+func TestLifecycle_Start_TokenWithoutSubject_ReRegisters(t *testing.T) {
+	dir := t.TempDir()
+	fpFile := filepath.Join(dir, "fp.txt")
+	tokFile := filepath.Join(dir, "token.enc")
+
+	now := time.Now()
+	header := base64Encode(`{"alg":"HS256","typ":"JWT"}`)
+	payload := base64Encode(fmt.Sprintf(`{"exp":%d,"iat":%d}`,
+		now.Add(2*time.Hour).Unix(), now.Unix()))
+	tm := credential.NewTokenManager(tokFile, "machine-id")
+	require.NoError(t, tm.Save(header+"."+payload+".fakesig"))
+
+	cfg := &config.Config{
+		Agent: config.AgentConfig{FingerprintFile: fpFile, TokenFile: tokFile},
+	}
+	srv := &fakeRegistrationServer{}
+	svc, cleanup := startRegistrationServer(t, srv)
+	defer cleanup()
+
+	lc := NewLifecycle(credential.NewTokenManager(tokFile, "machine-id"), credential.NewSTSManager())
+	// Registration is attempted (the fake server drives it to approval); the
+	// point of the assertion is that the cached token was not silently accepted.
+	_ = lc.Start(context.Background(), svc, cfg, zap.NewNop())
+	assert.Greater(t, srv.pollCallCount, 0,
+		"an identity-less cached token must not short-circuit registration")
 }
 
 // base64Encode returns the base64url (no-padding) encoding of s.

@@ -274,6 +274,27 @@ func (q *Queries) MarkAgentOnlineIfOffline(ctx context.Context, id uuid.UUID) (i
 	return result.RowsAffected()
 }
 
+const markAgentOnlineIfUsable = `-- name: MarkAgentOnlineIfUsable :execrows
+UPDATE agents
+SET status = 'online',
+    updated_at = NOW()
+WHERE id = $1 AND status IN ('approved', 'offline', 'online')
+`
+
+// Transition to online on connect, constrained to the statuses an agent may
+// legitimately connect from. The unconstrained UpdateAgentStatus used here
+// before would resurrect a 'revoked' agent the moment it reconnected, which is
+// the same rule MarkAgentOnlineIfOffline states: terminal states must never be
+// revived. Keeping the constraint in SQL closes the TOCTOU window between the
+// Go-side liveness check and this write.
+func (q *Queries) MarkAgentOnlineIfUsable(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.ExecContext(ctx, markAgentOnlineIfUsable, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const updateAgentAuthToken = `-- name: UpdateAgentAuthToken :one
 UPDATE agents
 SET auth_token_hash = $2,

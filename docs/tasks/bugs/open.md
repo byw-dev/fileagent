@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16/17 为 2026-09-09 追加）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，其中 22/23 已随 IC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -33,6 +33,14 @@
 | IC-BUG-15 | 预签名下载 URL TTL 硬编码 15 分钟，大文件不够用 | 🟡 P2 | controlplane |
 | IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效 | 🟠 P1 | agent + controlplane |
 | IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 | 🔴 P0 | agent |
+| IC-BUG-18 | Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 | 🔴 P0 | agent |
+| IC-BUG-19 | minio-event 索引 URL 编码后的对象键（`%2F`），与真实键不符 | 🟠 P1 | controlplane |
+| IC-BUG-20 | bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 | 🟠 P1 | controlplane + agent |
+| IC-BUG-21 | 模板解析失败时猜一个对象键写进去，污染对账分片 | 🟡 P2 | agent |
+| IC-BUG-22 | `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token | 🔴 P0 | controlplane |
+| IC-BUG-23 | 吊销不生效：被吊销 agent 的 token 仍可用，且重连会把状态刷回 online | 🔴 P0 | controlplane |
+| IC-BUG-24 | `handleDryRunResult` 无归属校验，可对他人 rule 投递伪造试运行结果 | 🟡 P2 | controlplane |
+| IC-BUG-25 | 吊销切不断已建立的流：被吊销 agent 仍可心跳/上报，UI 显示在线且踢不掉 | 🟠 P1 | controlplane |
 
 ---
 
@@ -216,6 +224,91 @@
 | **与 D-030 的关系** | 整桶 policy 让这类「对象键完全跑偏」的写入**不再被 403 挡住**，缺陷会从「上传失败」退化成「静默写错位置」。因此必须与 IC-1 同刀修 |
 | **修复** | 缓存 token 分支补齐身份：从 JWT claims 还原 `agent_id` / `agent_name`（token 里已有，CP 侧就是这么取的），或把两者与 token 一起持久化。另外给 `buildStoragePath` 的 Compose 失败路径加 `logger.Warn`——它现在完全静默 |
 | **验收** | Agent 首次注册后**重启**，落一个文件：对象键仍符合 `dest_path_template`（不是裸 basename）；心跳的 `agent_id` 非空；日志中无 `missing field` |
+
+## IC-BUG-18 — Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 🔴 P0
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `buildDialOpts` 无条件使用 TLS：`TLSCACert` 为空时退回系统根证书池，仍是 TLS。而 CP 的 `grpc.NewServer` 不配 `Creds`，监听明文。`InsecureDialOpts` 存在但注释写明「intended for testing only」，没有任何配置项能启用它 |
+| **精确位置** | `agent/internal/grpcclient/client.go:378-403`（`buildDialOpts`）；`controlplane/internal/grpcserver/server.go:180,202`（`grpc.NewServer` 无 `Creds`） |
+| **实测** | 按 `agent/config.toml.example` 原样配置连本地 CP：`transport: authentication handshake failed: tls: first record does not look like a TLS handshake`。**该示例配置文件本身就是不可用的** |
+| **后果** | **本地开发环境下 Agent 与 CP 之间不存在任何可用的连接方式**——这正是「Agent 数据面从未端到端跑通过」的直接原因之一：没人跑得起来。所有 Agent 侧缺陷（IC-BUG-1…5、10…12、16、17）因此长期不可见 |
+| **修复** | ✅ **已随 IC-1 修**：新增 `server.tls_insecure`（env `AGENT_SERVER_TLS_INSECURE`）。置 `true` 时走 `InsecureDialOpts` 并打印醒目 Warn（bearer token 明文传输）。**刻意用否定式命名**：零值必须是安全的那个，否则在代码里直接构造 `config.Config{}`（不走 `Load`）会静默失去 TLS——初版写成 `tls_enabled bool` 时正是这个 fail-open 缺陷，被既有单测 `TestClient_BuildDialOpts_MissingCACert` 当场逮住 |
+| **验收** | ✅ 已验证：`tls_insecure = true` 时 agent 成功连上本地明文 CP 并完成注册→审批→建流；缺省配置仍走 TLS |
+
+## IC-BUG-19 — minio-event 索引 URL 编码后的对象键（`%2F`）🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | S3 事件通知里的 `s3.object.key` 是 **URL 编码**的（`a/b/c.csv` → `a%2Fb%2Fc.csv`），而 CP 直接把它当作 `storage_path` 落库。全 `controlplane/internal/` 无一处 `url.QueryUnescape` / `PathUnescape`（已 grep 确认） |
+| **精确位置** | `controlplane/internal/api/handler/events.go:764`（`Key` 字段）、`:800`（`bucket, key := rec.S3.Bucket.Name, rec.S3.Object.Key`）→ 传入 `IndexUpload` |
+| **实测** | live-e2e 中 agent 上传 `Miru/tokyo/tokyo_001.csv`，`file_entries.storage_path` 落为 `Miru%2Ftokyo%2Ftokyo_001.csv`；直接 `mc cp` 到 `nested/dir/probe.txt` 同样落为 `nested%2Fdir%2Fprobe.txt` |
+| **后果** | 凡是带层级的对象键（正常情况）索引值都与真实键不符。①预签名下载用 `storage_path` 作 key，必然 404；②path_var 反解拿不到分隔符，打标失效；③IC-6 之后 `object_keys` 的幂等键与对账会把这些行全判成幽灵。**当前 `file_entries` 的唯一写入者就是这条路径**，所以影响是全量的 |
+| **修复** | 在 `MinioEventHandler.Handle` 解析后对 key 做一次 `url.QueryUnescape`（S3 事件用的是 `+`-as-space 的 query 编码，不是 path 编码），失败时退回原值并告警；补带层级键与含空格/中文键的单测 |
+| **验收** | `mc cp` 一个 `a/b/中 文.csv`，`file_entries.storage_path` 等于 `a/b/中 文.csv`；预签名下载可直接取回该对象 |
+
+## IC-BUG-20 — bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 凭据只在 `Connect` 建流时按当时的 active 规则推一次（`pushCredentials`）。`DispatchRule` 推送新规则时**不带凭据**；agent 侧刷新只看过期时间（`agent/cmd/agent/main.go`：tick 1min，剩余 >10min 即 `continue`）；上传失败路径**没有任何 AccessDenied 触发刷新**的逻辑 |
+| **精确位置** | `controlplane/internal/grpcserver/handler.go`（`pushCredentials` 仅 Connect 调用）；`controlplane/internal/agent/dispatch.go`（`DispatchRule` 不推凭据）；`agent/cmd/agent/main.go` 刷新 goroutine；`agent/internal/uploader/`（无 403 分支） |
+| **后果** | agent 已连接、持有覆盖 bucket A 的 1h 会话 → 管理员新建一条指向 **bucket B** 的规则 → 规则立即下发、agent 立即开始 PutObject 到 B → **403**，直到会话剩余 10 分钟才刷新，**最坏约 50 分钟**。期间重试耗尽的任务直接失败，不会自愈。IC-1 任务卡 ② 写的是「按该 Agent **已下发规则**涉及的 bucket 集合签发」——该集合是动态的，当前实现只在建流时快照了一次 |
+| **修复** | 两条都做：① CP 在规则下发/启用导致 bucket 集合变化时重推凭据（`DispatchRule` 成功后调 `pushCredentials`）；② agent 侧上传遇 `AccessDenied` 时作废当前凭据、立即刷新一次并重试**一次**——第二次仍 403 则以独特错误落终态，不做无限重试（否则会把 policy 前缀错配那类缺陷变成静默循环）。②同时是设计文档 §3.2 要求的通用兜底 |
+| **验收** | agent 运行中新建一条指向新 bucket 的规则，首个文件即上传成功（不出现 403）；断开 policy 授权后上传失败两次即落终态并告警 |
+
+## IC-BUG-21 — 模板解析失败时猜一个对象键写进去，污染对账分片 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `buildStoragePath` 在模板无效 / `Compose` 失败 / 结果为空时一律 `return filepath.Base(localPath)`，即把文件平铺到桶根。IC-1 给这三条路径加了 `logger.Warn`，但**行为本身没变** |
+| **精确位置** | `agent/cmd/agent/main.go` `buildStoragePath` 的三条兜底 return |
+| **后果** | ①写入一个**错误的**对象键比让任务失败更糟：IC-6 之后 `object_keys` 按前缀分片对账，桶根平铺的对象会污染分片树，且这些对象的 path_var 永远反解不出来；②Warn 是 per-file 的——规则模板配错时一次投 5000 个文件就是 5000 条 Warn + 5000 个根目录对象，运维会把它当噪音关掉，等于退回静默 |
+| **修复** | 兜底改为**任务失败**（可重试 / 可告警）而不是猜键；Warn 按 `rule_id` 去重（首次记录）或采样。建议随 IC-2 一起做——IC-2 正好要改上报与终态语义 |
+| **验收** | 模板解析不出来时任务进入失败态并可在 UI 看到原因；同一规则连续 N 个文件失败只产生一条 Warn |
+
+## IC-BUG-22 — `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token 🔴 P0
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `PollApprovalRequest` 有 `fingerprint` 字段（`proto/v1/agent.proto:204`），但 `Manager.PollApproval` **从头到尾没读过它**——只 parse agent_id、查库、若 `status == approved` 就签发新 token。而 `PollApproval` 在 `jwtExemptMethods` 里（`interceptor.go:32`），**不需要任何认证** |
+| **精确位置** | `controlplane/internal/agent/manager.go` `PollApproval`；`controlplane/internal/grpcserver/interceptor.go:31-36` |
+| **实测** | dev 环境 grpcurl 用 `"fingerprint":"totally-wrong-fingerprint"` 直接换到 `authToken`，再用它调 `RefreshCredentials` 拿到 `data-sensor` 整桶写的 STS 会话。**攻击者除一个 agent UUID 外什么都不需要** |
+| **后果** | agent UUID 不是秘密——它出现在对象键、日志、NATS 事件、webui 响应里；`Register`（同样免认证）对已存在 fingerprint 还会回吐 agent_id。触发条件是 agent 状态恰为 `approved`（已审批、尚未首次连接），这是每个新 agent 的必经状态，窗口长度由现场决定。**IC-1 之前拿到 agent JWT 基本没用（STS 链路不通），之后它直接等于数据湖整桶写** |
+| **修复** | ✅ **已随 IC-1 修**：`PollApproval` 比对 `agent.Fingerprint`，空或不匹配返回 `PermissionDenied`。校验放在状态检查**之前**，避免向未认证调用方泄露 agent 状态 |
+| **验收** | ✅ 单测覆盖（错误指纹 / 空指纹均拒绝，正确指纹签发）；变异测试确认去掉校验后用例失败 |
+
+## IC-BUG-23 — 吊销不生效：token 仍可用，且重连会把状态刷回 online 🔴 P0
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 三处叠加：① `RevokeAgent` 只置 DB 状态 + 删 Redis 键 + 发事件，**从不调 `jwtSvc.RevokeToken`**；② `Connect` / `RefreshCredentials` / `pushCredentials` **都不查 agent 的 DB 状态**，拦截器只验签 + 黑名单；③ `Connect` 用**无条件**的 `UpdateAgentStatus(online)`，而 `MarkAgentOnlineIfOffline` 的 SQL 注释明写「must never resurrect terminal states such as 'revoked'」——`Connect` 恰恰在做这件事 |
+| **精确位置** | `controlplane/internal/agent/manager.go` `RevokeAgent`；`controlplane/internal/grpcserver/handler.go` `Connect` / `RefreshCredentials`；`controlplane/internal/db/queries/agents.sql:60-70`（那条被绕过的约束） |
+| **实测** | 把已连接 agent 在库里置为 `revoked` 后调 `RefreshCredentials{}`，**照常返回 STS 凭据**；重连后状态被刷回 `online`，UI 上看不出曾被吊销 |
+| **后果** | `AGENT_TOKEN_TTL` 默认 **720h = 30 天**，吊销一个**被入侵的** agent 完全依赖它自愿执行 `handleRevokeCommand` 删本地 token——而被入侵的 agent 正是不会照做的那个。D-030 第八条「授权宽度是管理权限问题」所依赖的管理手段本身失效 |
+| **修复** | ✅ **已随 IC-1 修**：新增 `Server.assertAgentUsable`，`Connect` 与 `RefreshCredentials` 入口查一次 `agents.status`，仅 `approved/online/offline` 放行；查不到 agent 行一律拒绝（fail-closed）。并把 `Connect` 的 online 写入换成条件 SQL `MarkAgentOnlineIfUsable`（`WHERE status IN ('approved','offline','online')`）——**不变式钉在 SQL 里而不是靠「同一函数里更早的一行」**，否则吊销恰好落在闸门与写入之间就会被这条无条件 UPDATE 撤销、此后闸门永久放行。**未做**按 jti 吊销 JWT——CP 只存 token 的 sha256、无法还原 jti，真要做需引入「按 agent 维度的令牌版本号」，成本远高于状态闸门 |
+| **验收** | ✅ 单测覆盖（revoked 拒绝 + 三种可用状态放行 + 查库失败拒绝）；变异测试确认去掉闸门后用例失败 |
+
+## IC-BUG-24 — `handleDryRunResult` 无归属校验 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `handleAgentMessage` 里 `DryRunResult` 是**唯一不传 agentID** 的分支，按 body 里的 `rule_id` 投递进共享的 `dryRunStore` |
+| **精确位置** | `controlplane/internal/grpcserver/handler.go` `handleAgentMessage` 的 `AgentMessage_DryRunResult` 分支 |
+| **后果** | 任一已连接 agent 可对**别人的 `rule_id`** 投递伪造的试运行结果，管理员在 UI 上看到的预览是伪造的。只读、影响面小，但与 IC-BUG-22/23 是同一个模式：**凡是客户端指定资源 ID 的接口，都要问一句「这个资源是它的吗」** |
+| **修复** | 投递前校验该 rule 归属于流上的 agentID（`handleDryRunResult` 增加 agentID 参数）。归 IC-2 一并做 |
+| **验收** | agent A 对 agent B 的 rule_id 投递 DryRunResult 被丢弃并告警 |
+
+## IC-BUG-25 — 吊销切不断已建立的流 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `assertAgentUsable` 只在**建流时**跑一次（IC-1 加的闸门）。已建立的流不受任何约束：`AgentConn.CancelFunc` **全仓库无人调用**（唯一的 `Unregister` 是 `Connect` 自己的 defer），REST 的 `Revoke` 只发一条**协作式**命令；`handleAgentMessage` 的四个分支都没有闸门 |
+| **精确位置** | `controlplane/internal/grpcserver/registry.go`（`CancelFunc` 无调用点）；`controlplane/internal/grpcserver/handler.go` `handleAgentMessage`；`controlplane/internal/agent/manager.go` `RevokeAgent` |
+| **后果** | 被入侵的 agent 已连接 → 管理员吊销 → 它忽略 `Revoke` 命令、不断开。于是：①继续心跳刷新 `agent:online:<id>` 与 `last_seen_at`，**UI 上这个已吊销的 agent 一直显示在线，管理员没有任何手段把它踢下线**；②继续上报 `UploadResult`（IC-2 之后就是攻击者可控地直接写 `file_entries`/`upload_logs`）；③继续响应 `ListDirectory` |
+| **残留窗口（已接受）** | 手里已签发的 STS 会话在 ≤1h 内仍是整桶写。STS 会话本质上不可撤销（除非轮转 MinIO 父用户或加 deny policy），这一条**接受**，但必须在运维文档里写明「吊销不是即时的，最长一个 STS TTL」 |
+| **修复** | `RevokeAgent` 发完命令后主动切流：registry 加 `Disconnect(agentID)` 调用该 conn 的 `CancelFunc`。顺带修掉「已吊销却显示在线」。归 IC-2 |
+| **验收** | 吊销一个不配合的 agent（不处理 `Revoke` 命令的构造版本）后，流在秒级断开、UI 立即显示离线、后续 `UploadResult` 不再入库 |
 
 ---
 

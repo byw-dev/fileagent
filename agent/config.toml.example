@@ -1,6 +1,10 @@
 [server]
 endpoint = "localhost:9090"
 tls_ca_cert = ""
+# Local development only: the dev Control Plane serves gRPC in plaintext, so an
+# agent cannot reach it over TLS. Never set this outside local dev — a plaintext
+# connection sends the bearer token in clear text.
+# tls_insecure = true
 
 [agent]
 fingerprint_file = "/var/lib/fileagent/fingerprint"

@@ -3,7 +3,6 @@ package grpcserver
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"path"
 	"time"
 
@@ -54,6 +53,13 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		return status.Error(codes.Unauthenticated, "missing agent identity in token")
 	}
 
+	// A revoked agent keeps a syntactically valid JWT until it expires (default
+	// 30 days), and revocation never invalidated it. Checking the persisted
+	// status here is what actually makes RevokeAgent take effect.
+	if err := s.assertAgentUsable(stream.Context(), agentID); err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithCancel(stream.Context())
 	conn := s.registry.Register(agentID, stream, cancel)
 	defer func() {
@@ -73,8 +79,21 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	}
 	if s.stateDB != nil {
 		if id, err := uuid.Parse(agentID); err == nil {
-			if _, dbErr := s.stateDB.UpdateAgentStatus(ctx, id, db.AgentStatusOnline); dbErr != nil {
+			// Constrained in SQL rather than relying on the liveness check above:
+			// a revocation landing between the two would otherwise be undone by
+			// an unconditional write, and the agent would then pass the gate on
+			// every subsequent call. Terminal states must never be revived.
+			rows, dbErr := s.stateDB.MarkAgentOnlineIfUsable(ctx, id)
+			switch {
+			case dbErr != nil:
 				s.logger.Warn("connect: update status to online failed", zap.Error(dbErr))
+			case rows == 0:
+				// The status left the usable set between the liveness check and
+				// this write — i.e. the agent was revoked mid-connect. The
+				// constraint did its job; log it, because this is the only place
+				// that race is ever visible.
+				s.logger.Warn("connect: agent left the usable state during connect setup",
+					zap.String("agent_id", agentID))
 			}
 		}
 	}
@@ -87,6 +106,9 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 			s.logger.Warn("connect: sync rules failed", zap.String("agent_id", agentID), zap.Error(err))
 		}
 	}
+
+	// Push an initial STS session so the agent can upload immediately (IC-BUG-1).
+	s.pushCredentials(ctx, agentID)
 
 	// Start send goroutine.
 	sendErr := make(chan error, 1)
@@ -121,8 +143,14 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	}
 }
 
-// RefreshCredentials allows an Agent to request new STS credentials for a
-// specific collection rule.
+// RefreshCredentials allows an Agent to request new STS credentials.
+//
+// rule_id is optional. When omitted the session covers every bucket targeted by
+// the agent's active collection rules, which is what the agent actually needs:
+// it uploads for all of its rules from a single credential and has no reason to
+// track which rule a queued task came from. Requiring rule_id was IC-BUG-1 —
+// the agent never sent one, so the parse failed and no credential was ever
+// issued.
 func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCredentialsRequest) (*agentv1.RefreshCredentialsResponse, error) {
 	if s.stsMgr == nil || s.credDB == nil {
 		s.logger.Debug("RefreshCredentials called (stsMgr/credDB not wired)",
@@ -130,28 +158,33 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 		return nil, status.Error(codes.Unimplemented, "RefreshCredentials not yet implemented")
 	}
 
-	agentID := req.GetAgentId()
-	ruleID := req.GetRuleId()
-
-	// Look up collection rule to find the target bucket.
-	parsedRuleID, err := uuid.Parse(ruleID)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid rule_id: %v", err)
+	// The identity always comes from the verified JWT claims, never from the
+	// request body. request.agent_id is a caller-supplied string; honouring it
+	// would let any approved agent mint credentials for another agent's buckets,
+	// which under the bucket-wide policy of D-030 §8 means full write access to
+	// someone else's data.
+	agentID := extractAgentID(ctx)
+	if agentID == "" {
+		return nil, status.Error(codes.Unauthenticated, "missing agent identity in token")
+	}
+	if claimed := req.GetAgentId(); claimed != "" && claimed != agentID {
+		s.logger.Warn("refresh_credentials: agent_id does not match token subject",
+			zap.String("token_agent_id", agentID),
+			zap.String("claimed_agent_id", claimed),
+		)
+		return nil, status.Error(codes.PermissionDenied, "agent_id does not match authenticated identity")
 	}
 
-	rule, err := s.credDB.GetCollectionRuleByID(ctx, parsedRuleID)
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "collection rule not found: %v", err)
+	if err := s.assertAgentUsable(ctx, agentID); err != nil {
+		return nil, err
 	}
 
-	bucket, err := s.credDB.GetBucketByID(ctx, rule.BucketID)
+	buckets, err := s.bucketsForAgent(ctx, agentID, req.GetRuleId())
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "bucket not found: %v", err)
+		return nil, err
 	}
 
-	creds, err := s.stsMgr.IssueCredentials(ctx, agentID, []storage.BucketAccess{
-		{BucketName: bucket.Name, PathPrefix: fmt.Sprintf("agents/%s/", agentID)},
-	})
+	creds, err := s.stsMgr.IssueCredentials(ctx, agentID, buckets)
 	if err != nil {
 		s.logger.Error("refresh_credentials: issue STS failed",
 			zap.String("agent_id", agentID),
@@ -162,9 +195,152 @@ func (s *Server) RefreshCredentials(ctx context.Context, req *agentv1.RefreshCre
 
 	s.logger.Info("credentials refreshed",
 		zap.String("agent_id", agentID),
-		zap.String("bucket", bucket.Name),
+		zap.Int("buckets", len(buckets)),
 	)
 	return &agentv1.RefreshCredentialsResponse{Credentials: creds}, nil
+}
+
+// assertAgentUsable rejects agents that must no longer act, consulting the
+// persisted status rather than the token.
+//
+// Agent JWTs are long-lived (AGENT_TOKEN_TTL defaults to 30 days) and
+// RevokeAgent never invalidated them, so without this gate revoking a
+// compromised agent depended on that agent voluntarily deleting its own token —
+// which is precisely what a compromised agent will not do. Since D-030 §8 an
+// agent token buys bucket-wide write access, so revocation has to actually bite.
+//
+// It fails open when no state DB is wired (unit-test servers), and treats a
+// lookup failure as fatal: an agent row that cannot be read must not be trusted.
+func (s *Server) assertAgentUsable(ctx context.Context, agentID string) error {
+	if s.stateDB == nil {
+		return nil
+	}
+	id, err := uuid.Parse(agentID)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid agent_id: %v", err)
+	}
+	agent, err := s.stateDB.GetAgentByID(ctx, id)
+	if err != nil {
+		s.logger.Warn("agent liveness check failed", zap.String("agent_id", agentID), zap.Error(err))
+		return status.Error(codes.PermissionDenied, "agent is not in a usable state")
+	}
+	switch agent.Status {
+	case db.AgentStatusApproved, db.AgentStatusOnline, db.AgentStatusOffline:
+		return nil
+	default:
+		s.logger.Warn("rejected agent in non-usable state",
+			zap.String("agent_id", agentID),
+			zap.String("status", string(agent.Status)),
+		)
+		return status.Errorf(codes.PermissionDenied, "agent status is %s", agent.Status)
+	}
+}
+
+// bucketsForAgent resolves the bucket set an STS session should cover.
+//
+// agentID must already be the authenticated identity, never a value taken from
+// the request body. A non-empty ruleID narrows the session to that rule's
+// bucket, but only if the rule belongs to this agent; otherwise every active
+// rule of the agent contributes its bucket. The result is deduplicated by
+// BuildSessionPolicy.
+func (s *Server) bucketsForAgent(ctx context.Context, agentID, ruleID string) ([]storage.BucketAccess, error) {
+	parsedAgentID, err := uuid.Parse(agentID)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid agent_id: %v", err)
+	}
+
+	if ruleID != "" {
+		parsedRuleID, pErr := uuid.Parse(ruleID)
+		if pErr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid rule_id: %v", pErr)
+		}
+		rule, rErr := s.credDB.GetCollectionRuleByID(ctx, parsedRuleID)
+		if rErr != nil {
+			return nil, status.Errorf(codes.NotFound, "collection rule not found: %v", rErr)
+		}
+		// Ownership check: a rule id is caller-supplied, so without this an
+		// agent could name any other agent's rule and receive credentials for
+		// that rule's bucket.
+		if rule.AgentID != parsedAgentID {
+			s.logger.Warn("credentials: rule does not belong to the requesting agent",
+				zap.String("agent_id", agentID),
+				zap.String("rule_id", ruleID),
+			)
+			return nil, status.Error(codes.PermissionDenied, "collection rule does not belong to this agent")
+		}
+		bucket, bErr := s.credDB.GetBucketByID(ctx, rule.BucketID)
+		if bErr != nil {
+			return nil, status.Errorf(codes.NotFound, "bucket not found: %v", bErr)
+		}
+		return []storage.BucketAccess{{BucketName: bucket.Name}}, nil
+	}
+	rules, err := s.credDB.ListCollectionRulesByAgent(ctx, parsedAgentID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list collection rules: %v", err)
+	}
+
+	seen := make(map[uuid.UUID]struct{}, len(rules))
+	var buckets []storage.BucketAccess
+	for _, rule := range rules {
+		if rule.Status != db.RuleStatusActive {
+			continue
+		}
+		if _, dup := seen[rule.BucketID]; dup {
+			continue
+		}
+		seen[rule.BucketID] = struct{}{}
+		bucket, bErr := s.credDB.GetBucketByID(ctx, rule.BucketID)
+		if bErr != nil {
+			s.logger.Warn("credentials: lookup bucket failed, skipping",
+				zap.String("rule_id", rule.ID.String()),
+				zap.Error(bErr))
+			continue
+		}
+		buckets = append(buckets, storage.BucketAccess{BucketName: bucket.Name})
+	}
+	if len(buckets) == 0 {
+		return nil, status.Error(codes.FailedPrecondition,
+			"agent has no active collection rule with a resolvable bucket")
+	}
+	return buckets, nil
+}
+
+// pushCredentials issues an STS session for the agent and delivers it over the
+// open stream.
+//
+// The Control Plane never used to send ServerMessage_Credentials at all, so an
+// agent that had just connected sat there with no credentials and failed every
+// upload (IC-BUG-1). Pushing once at stream setup — alongside the rule sync —
+// means the agent is ready to upload as soon as it has rules to act on.
+func (s *Server) pushCredentials(ctx context.Context, agentID string) {
+	if s.stsMgr == nil || s.credDB == nil {
+		return
+	}
+	buckets, err := s.bucketsForAgent(ctx, agentID, "")
+	if err != nil {
+		// No active rule yet is the normal state for a freshly approved agent;
+		// it will get credentials from the refresh RPC once rules arrive.
+		s.logger.Info("connect: no credentials pushed",
+			zap.String("agent_id", agentID),
+			zap.Error(err))
+		return
+	}
+	creds, err := s.stsMgr.IssueCredentials(ctx, agentID, buckets)
+	if err != nil {
+		s.logger.Error("connect: issue STS failed",
+			zap.String("agent_id", agentID), zap.Error(err))
+		return
+	}
+	if !s.registry.Send(agentID, &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Credentials{Credentials: creds},
+	}) {
+		s.logger.Warn("connect: deliver credentials failed",
+			zap.String("agent_id", agentID))
+		return
+	}
+	s.logger.Info("connect: credentials pushed",
+		zap.String("agent_id", agentID),
+		zap.Int("buckets", len(buckets)))
 }
 
 // handleAgentMessage processes a single incoming message from an agent.

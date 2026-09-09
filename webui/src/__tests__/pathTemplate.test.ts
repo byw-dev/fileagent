@@ -18,6 +18,15 @@ describe('SYSTEM_TEMPLATE_VARIABLES', () => {
 })
 
 describe('renderPathPreview', () => {
+  // IC-BUG-16: the object key never starts with "/", so a preview that shows
+  // one misrepresents what actually lands in MinIO.
+  it('strips the leading slash so the preview matches the real object key', () => {
+    expect(renderPathPreview('/{agent_name}/{filename}')).toBe('my-agent/data.csv')
+    expect(renderPathPreview('{agent_name}/{filename}')).toBe('my-agent/data.csv')
+    // Repeated separators too: the Go side uses TrimLeft, this must match.
+    expect(renderPathPreview('//{agent_name}/{filename}')).toBe('my-agent/data.csv')
+  })
+
   // R-1: LDML time field + system variables
   it('R-1: replaces LDML time field and system variables', () => {
     const preview = renderPathPreview('/{agent_name}/{time:yyyy/MM/dd}/{filename}')
@@ -37,10 +46,11 @@ describe('renderPathPreview', () => {
     expect(preview).toContain('data.csv')
   })
 
-  // R-3: static path unchanged
+  // R-3: static path unchanged apart from the leading-slash normalisation
   it('R-3: returns static path unchanged when no variables are used', () => {
-    const preview = renderPathPreview('/static/path')
-    expect(preview).toBe('/static/path')
+    expect(renderPathPreview('static/path')).toBe('static/path')
+    // The leading "/" is dropped: it is not part of the object key.
+    expect(renderPathPreview('/static/path')).toBe('static/path')
   })
 
   // R-4: empty string
@@ -63,7 +73,7 @@ describe('renderPathPreview', () => {
 
   it('strips |tz= suffix and still renders LDML', () => {
     const preview = renderPathPreview('/{time:yyyy/MM|tz=Asia/Shanghai}')
-    expect(preview).toMatch(/\/\d{4}\/\d{2}/)
+    expect(preview).toMatch(/^\d{4}\/\d{2}$/)
   })
 })
 
@@ -73,9 +83,12 @@ describe('validatePathTemplate', () => {
     expect(validatePathTemplate('')).toBeTruthy()
   })
 
-  // V-2: not starting with /
-  it('V-2: rejects templates not starting with /', () => {
-    expect(validatePathTemplate('year/month')).toBeTruthy()
+  // V-2: a leading "/" is optional — it is stripped before the object key is
+  // built, so requiring it only forced users to type a character that never
+  // reaches MinIO.
+  it('V-2: accepts templates with or without a leading /', () => {
+    expect(validatePathTemplate('{year}/{filename}')).toBeNull()
+    expect(validatePathTemplate('/{year}/{filename}')).toBeNull()
   })
 
   // V-3: double slashes

@@ -121,9 +121,24 @@ func (l *Lifecycle) Start(ctx context.Context, svc agentv1.AgentServiceClient, c
 
 	// Try to use an existing token.
 	if err := l.TokenManager.Load(); err == nil && l.TokenManager.IsTokenValid(0.1) {
-		logger.Info("lifecycle: existing token loaded, skipping registration")
-		_ = l.StateMachine.Transition(StateApproved)
-		return nil
+		// Recover the identity from the token's claims. Skipping this leaves
+		// AgentID/AgentName empty on every restart, which silently breaks
+		// dest_path_template resolution and flattens uploads into the bucket
+		// root (IC-BUG-17). A token we cannot read the identity from is not
+		// usable, so fall through to a full re-registration instead.
+		agentID, agentName, idErr := l.TokenManager.Identity()
+		if idErr != nil {
+			logger.Warn("lifecycle: cached token carries no usable identity, re-registering",
+				zap.Error(idErr))
+		} else {
+			l.AgentID = agentID
+			l.AgentName = agentName
+			logger.Info("lifecycle: existing token loaded, skipping registration",
+				zap.String("agent_id", agentID),
+				zap.String("agent_name", agentName))
+			_ = l.StateMachine.Transition(StateApproved)
+			return nil
+		}
 	}
 
 	_ = l.StateMachine.Transition(StateInit)

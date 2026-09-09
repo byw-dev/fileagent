@@ -3,7 +3,6 @@ package storage
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,58 +15,91 @@ func zapNoopLogger() *zap.Logger {
 	return l
 }
 
-func TestBuildSessionPolicy_SingleBucket(t *testing.T) {
-	policy, err := BuildSessionPolicy([]BucketAccess{
-		{BucketName: "my-bucket", PathPrefix: "uploads/agent-1"},
-	})
-	require.NoError(t, err)
-	require.NotEmpty(t, policy)
-
+// decodePolicy unmarshals a session policy and returns its two statements,
+// bucket-level first.
+func decodePolicy(t *testing.T, policy string) (bucketStmt, objectStmt map[string]interface{}) {
+	t.Helper()
 	var doc map[string]interface{}
 	require.NoError(t, json.Unmarshal([]byte(policy), &doc))
-
 	assert.Equal(t, "2012-10-17", doc["Version"])
 	stmts, ok := doc["Statement"].([]interface{})
 	require.True(t, ok)
-	require.Len(t, stmts, 1)
-
-	stmt := stmts[0].(map[string]interface{})
-	assert.Equal(t, "Allow", stmt["Effect"])
-
-	resources := stmt["Resource"].([]interface{})
-	require.Len(t, resources, 1)
-	assert.Contains(t, resources[0].(string), "my-bucket")
-	assert.Contains(t, resources[0].(string), "uploads/agent-1")
+	require.Len(t, stmts, 2, "policy must split bucket-level and object-level actions")
+	return stmts[0].(map[string]interface{}), stmts[1].(map[string]interface{})
 }
 
-func TestBuildSessionPolicy_NoBuckets(t *testing.T) {
-	policy, err := BuildSessionPolicy(nil)
+func strSlice(t *testing.T, v interface{}) []string {
+	t.Helper()
+	raw, ok := v.([]interface{})
+	require.True(t, ok)
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		out = append(out, item.(string))
+	}
+	return out
+}
+
+func TestBuildSessionPolicy_SingleBucket(t *testing.T) {
+	policy, err := BuildSessionPolicy([]BucketAccess{{BucketName: "my-bucket"}})
 	require.NoError(t, err)
 	require.NotEmpty(t, policy)
-	assert.Contains(t, policy, "arn:aws:s3:::*")
+
+	bucketStmt, objectStmt := decodePolicy(t, policy)
+
+	assert.Equal(t, "Allow", bucketStmt["Effect"])
+	assert.Equal(t, "Allow", objectStmt["Effect"])
+
+	// Bucket-level actions must carry a bucket ARN with no object suffix;
+	// pairing them with "{bucket}/*" makes the grant silently inert (IC-BUG-4).
+	assert.Equal(t, []string{"arn:aws:s3:::my-bucket"}, strSlice(t, bucketStmt["Resource"]))
+	assert.Equal(t, []string{"s3:ListBucketMultipartUploads"}, strSlice(t, bucketStmt["Action"]))
+
+	assert.Equal(t, []string{"arn:aws:s3:::my-bucket/*"}, strSlice(t, objectStmt["Resource"]))
+	assert.ElementsMatch(t, []string{
+		"s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts",
+	}, strSlice(t, objectStmt["Action"]))
+}
+
+// The agent only ever writes. Granting reads or listings on a bucket-wide
+// resource would let any approved agent enumerate and download the whole data
+// lake, which is wider than the write access the policy is meant to convey.
+func TestBuildSessionPolicy_WriteOnly(t *testing.T) {
+	policy, err := BuildSessionPolicy([]BucketAccess{{BucketName: "my-bucket"}})
+	require.NoError(t, err)
+
+	bucketStmt, objectStmt := decodePolicy(t, policy)
+	granted := append(strSlice(t, bucketStmt["Action"]), strSlice(t, objectStmt["Action"])...)
+
+	// Exact match, not substring: "s3:ListBucket" is a prefix of the legitimate
+	// "s3:ListBucketMultipartUploads".
+	for _, forbidden := range []string{"s3:GetObject", "s3:DeleteObject", "s3:ListBucket"} {
+		assert.NotContains(t, granted, forbidden)
+	}
+}
+
+// An empty bucket set used to fall back to "arn:aws:s3:::*", granting every
+// bucket in the deployment — strictly wider than the per-bucket decision above.
+func TestBuildSessionPolicy_NoBuckets(t *testing.T) {
+	_, err := BuildSessionPolicy(nil)
+	require.Error(t, err)
+
+	_, err = BuildSessionPolicy([]BucketAccess{{BucketName: ""}})
+	require.Error(t, err)
 }
 
 func TestBuildSessionPolicy_MultipleBuckets(t *testing.T) {
 	policy, err := BuildSessionPolicy([]BucketAccess{
-		{BucketName: "bucket-a", PathPrefix: ""},
-		{BucketName: "bucket-b", PathPrefix: "path/"},
+		{BucketName: "bucket-b"},
+		{BucketName: "bucket-a"},
+		{BucketName: "bucket-a"}, // duplicate rules may target the same bucket
 	})
 	require.NoError(t, err)
 
-	var doc map[string]interface{}
-	require.NoError(t, json.Unmarshal([]byte(policy), &doc))
-
-	stmts := doc["Statement"].([]interface{})
-	stmt := stmts[0].(map[string]interface{})
-	resources := stmt["Resource"].([]interface{})
-	assert.Len(t, resources, 2)
-
-	var resourceStrings []string
-	for _, r := range resources {
-		resourceStrings = append(resourceStrings, r.(string))
-	}
-	assert.True(t, strings.Contains(strings.Join(resourceStrings, ","), "bucket-a"))
-	assert.True(t, strings.Contains(strings.Join(resourceStrings, ","), "bucket-b"))
+	bucketStmt, objectStmt := decodePolicy(t, policy)
+	assert.Equal(t, []string{"arn:aws:s3:::bucket-a", "arn:aws:s3:::bucket-b"},
+		strSlice(t, bucketStmt["Resource"]))
+	assert.Equal(t, []string{"arn:aws:s3:::bucket-a/*", "arn:aws:s3:::bucket-b/*"},
+		strSlice(t, objectStmt["Resource"]))
 }
 
 func TestSTSManager_IssueCredentials_NoMinIO(t *testing.T) {
@@ -103,7 +135,7 @@ func TestSTSManager_IssueCredentials_ReturnsError(t *testing.T) {
 	// No real MinIO — should fail at credential exchange
 	mgr := NewSTSManager("127.0.0.1:19999", "access", "secret", "arn:minio:sts:::role", false, zapNoopLogger())
 	_, err := mgr.IssueCredentials(context.Background(), "agent-1", []BucketAccess{
-		{BucketName: "test", PathPrefix: "uploads/"},
+		{BucketName: "test"},
 	})
 	require.Error(t, err)
 }
@@ -113,7 +145,7 @@ func TestSTSManager_IssueCredentials_UseSSL_ReturnsError(t *testing.T) {
 	// No real MinIO — should still fail at credential exchange.
 	mgr := NewSTSManager("127.0.0.1:19999", "access", "secret", "arn:minio:sts:::role", true, zapNoopLogger())
 	_, err := mgr.IssueCredentials(context.Background(), "agent-ssl", []BucketAccess{
-		{BucketName: "test", PathPrefix: "uploads/"},
+		{BucketName: "test"},
 	})
 	require.Error(t, err)
 }

@@ -20,6 +20,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/sqlc-dev/pqtype"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // defaultOrgID is the single-org UUID used in Phase 2 (single-tenant mode).
@@ -78,6 +80,13 @@ func NewManager(
 
 // Register handles agent self-registration.
 func (m *Manager) Register(ctx context.Context, req *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
+	// The fingerprint column is NOT NULL UNIQUE, which does not exclude the
+	// empty string — and this RPC needs no authentication, so without this check
+	// anyone could claim the single row with fingerprint '' and then poll it.
+	if req.GetFingerprint() == "" {
+		return nil, status.Error(codes.InvalidArgument, "fingerprint is required")
+	}
+
 	existing, err := m.db.GetAgentByFingerprint(ctx, req.GetFingerprint())
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("register: lookup fingerprint: %w", err)
@@ -151,6 +160,17 @@ func (m *Manager) PollApproval(ctx context.Context, req *agentv1.PollApprovalReq
 	agent, err := m.db.GetAgentByID(ctx, agentID)
 	if err != nil {
 		return nil, fmt.Errorf("poll_approval: get agent: %w", err)
+	}
+	// PollApproval is exempt from JWT auth (it is called before a token exists),
+	// so the fingerprint is the only thing proving the caller is the machine that
+	// registered. Without this check an agent id alone — which is not a secret;
+	// it appears in object keys, logs and API responses — is enough to collect
+	// that agent's token and, since D-030 §8, bucket-wide write credentials.
+	if req.GetFingerprint() == "" || req.GetFingerprint() != agent.Fingerprint {
+		m.logger.Warn("poll_approval: fingerprint mismatch",
+			zap.String("agent_id", agentID.String()),
+		)
+		return nil, status.Error(codes.PermissionDenied, "fingerprint does not match the registered agent")
 	}
 	resp := &agentv1.PollApprovalResponse{
 		Status:    string(agent.Status),

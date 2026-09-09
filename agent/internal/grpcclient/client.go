@@ -376,6 +376,11 @@ func (c *Client) heartbeatLoop(ctx context.Context) {
 // If TLSCACert is set, it loads the CA certificate for server verification;
 // otherwise, the system root CA pool is used. No mTLS in v1.
 func (c *Client) buildDialOpts() ([]grpc.DialOption, error) {
+	if c.cfg.Server.TLSInsecure {
+		c.logger.Warn("grpcclient: TLS DISABLED — the bearer token is sent in clear text; " +
+			"use tls_insecure=true only against a local Control Plane")
+		return InsecureDialOpts(), nil
+	}
 	if c.cfg.Server.TLSCACert == "" {
 		// Use system cert pool with default TLS settings.
 		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}

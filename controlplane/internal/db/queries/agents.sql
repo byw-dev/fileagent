@@ -69,6 +69,18 @@ SET status = 'online',
     updated_at = NOW()
 WHERE id = $1 AND status = 'offline';
 
+-- name: MarkAgentOnlineIfUsable :execrows
+-- Transition to online on connect, constrained to the statuses an agent may
+-- legitimately connect from. The unconstrained UpdateAgentStatus used here
+-- before would resurrect a 'revoked' agent the moment it reconnected, which is
+-- the same rule MarkAgentOnlineIfOffline states: terminal states must never be
+-- revived. Keeping the constraint in SQL closes the TOCTOU window between the
+-- Go-side liveness check and this write.
+UPDATE agents
+SET status = 'online',
+    updated_at = NOW()
+WHERE id = $1 AND status IN ('approved', 'offline', 'online');
+
 -- name: UpdateAgentLastSeen :exec
 UPDATE agents
 SET last_seen_at = NOW(),

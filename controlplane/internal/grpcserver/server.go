@@ -58,13 +58,25 @@ type STSManagerClient interface {
 type CredentialDB interface {
 	GetCollectionRuleByID(ctx context.Context, id uuid.UUID) (*db.CollectionRule, error)
 	GetBucketByID(ctx context.Context, id uuid.UUID) (*db.Bucket, error)
+	// ListCollectionRulesByAgent backs credential issuance when the agent does
+	// not name a specific rule: the session covers every bucket the agent's
+	// active rules target.
+	ListCollectionRulesByAgent(ctx context.Context, agentID uuid.UUID) ([]*db.CollectionRule, error)
 }
 
 // AgentStateDB is the minimal DB interface used by Connect/Disconnect and
 // handleHeartbeat to persist agent lifecycle state.
 type AgentStateDB interface {
+	// GetAgentByID backs the liveness gate on Connect and RefreshCredentials:
+	// a JWT stays valid for its whole TTL, so revocation only takes effect if
+	// the persisted status is consulted at use time.
+	GetAgentByID(ctx context.Context, id uuid.UUID) (*db.Agent, error)
 	UpdateAgentLastSeen(ctx context.Context, id uuid.UUID) error
 	UpdateAgentStatus(ctx context.Context, id uuid.UUID, status db.AgentStatus) (*db.Agent, error)
+	// MarkAgentOnlineIfUsable transitions to online only from a status an agent
+	// may legitimately connect from, so a revocation landing between the
+	// liveness check and this write cannot be undone by it.
+	MarkAgentOnlineIfUsable(ctx context.Context, id uuid.UUID) (int64, error)
 	// MarkAgentOnlineIfOffline restores status to online (rows==1) when a
 	// heartbeat proves the agent is alive but the DB says otherwise — e.g. after
 	// the offline sweeper's reconnect-race false positive.

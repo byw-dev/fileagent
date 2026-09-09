@@ -149,25 +149,36 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 
 ### 前导 `/` 的归一化（三端共享约定）
 
-**对象键 = 模板渲染结果去掉前导 `/`。** 权威实现是 agent 的 `buildStoragePath`
-（`agent/cmd/agent/main.go:545` 的 `strings.TrimPrefix(storagePath, "/")`）。
+**对象键 = 模板渲染结果去掉全部前导 `/`。** 权威实现是
+[`pkg/trollsift/normalize.go`](../../pkg/trollsift/normalize.go) 的
+`NormalizeTemplate` / `NormalizeObjectKey`（`strings.TrimLeft(s, "/")`——剥的是**全部**
+前导分隔符而非一个，因为 agent 侧模板与合成路径各剥一次，只剥一个会让 `//a/{x}` 这类模板
+两端再次失配；REST 建规则对模板无任何形状约束，见 `DECISIONS.md` D-030 第八条）。
 
-这条约定有**三个解释者**，且当前只有一个做对：
+这条约定有**四个解释者**，IC-1 之前只有 agent 一个做对：
 
-| 端 | 位置 | 现状 |
+| 端 | 位置 | 状态 |
 |---|---|---|
-| agent（拼对象键） | `agent/cmd/agent/main.go:545` | ✅ 剥前导 `/` |
-| CP（反解 path_var 打标） | `controlplane/internal/indexer/indexer.go:409` | ❌ 用未归一化的原始模板 `Parse`，模板带 `/` 时必然失配 |
-| webui（模板预览） | `webui/src/utils/pathTemplate.ts:48` | ❌ 不剥，预览显示 `/my-agent/…`，实际键是 `my-agent/…` |
+| agent（拼对象键） | `agent/cmd/agent/main.go` `buildStoragePath` | ✅ 一直正确；IC-1 起改调用共享函数 |
+| CP（反解 path_var 打标） | `controlplane/internal/indexer/indexer.go` `applyPathVarTags` | ✅ IC-1 修复（此前用未归一化的原始模板 `Parse`，模板带 `/` 时必然失配） |
+| webui（模板预览） | `webui/src/utils/pathTemplate.ts` `normalizeTemplate` | ✅ IC-1 修复（此前不剥，预览显示 `/my-agent/…` 而真实键是 `my-agent/…`） |
+| agent（dry-run 试运行） | `agent/cmd/agent/main.go` `handleDryRun` | ✅ IC-1 修复（此前用原始模板，且它与 webui 预览显示在**同一个表单**里，两个字段对同一模板给出不同答案） |
 
-而 webui 新建规则的默认模板就带前导 `/`（`webui/src/pages/Agents/RuleForm.tsx:104` = `/{agent_name}/{time:yyyy/MM/dd}/{filename}`），
-**经 UI 创建的规则全部命中**。见 `docs/tasks/bugs/open.md` **IC-BUG-16**，随 IC-1 修复：
-归一化收敛为单一函数、三端共用，方向是**CP 与 webui 剥模板**（不是让 agent 停止剥路径——那会改写所有既有对象键）。
+webui 新建规则的默认模板就带前导 `/`（`webui/src/pages/Agents/RuleForm.tsx:104` =
+`/{agent_name}/{time:yyyy/MM/dd}/{filename}`），**经 UI 创建的规则全部命中**——这就是
+`docs/tasks/bugs/open.md` **IC-BUG-16** 长期静默的原因。
+
+修复方向是**让 CP 与 webui 剥模板**，不是让 agent 停止剥路径：后者会改写所有既有对象键、需全量重铺。
+
+> **前后端严格度不同是有意的**：webui 的 `validatePathTemplate` 仍拒绝任何 `//`（包括前导），
+> 而 Go 侧的 `TrimLeft` 会容忍前导 `//`。二者不矛盾——UI 是给人的即时提示，Go 侧是给
+> REST/SDK 建规则兜底（那条路径无任何模板校验）。中间位置的 `a//b` 两侧都救不了，也不打算救。
 
 > ⚠️ **漂移风险点**：系统变量清单与时间符号表当前在
 > `pkg/trollsift`（Go，权威）与 `webui/src/utils/pathTemplate.ts`（TS，镜像）**两处手工维护**。
 > 修改任一处务必同步另一处；`pkg/trollsift` 为准。（这正是 G-8 契约单一权威想根治的场景，暂以本注记兜底。）
-> 加上前导 `/` 的归一化，这条模板契约实际有**三个**手工维护点。
+> 加上前导 `/` 的归一化，这条模板契约实际有**四个**手工维护点（Go 侧三处调用 + TS 侧一份镜像实现）。
+> Go 与 TS 的归一化是两份独立实现，语义必须保持一致（`TrimLeft(s,"/")` ↔ `replace(/^\/+/,'')`）。
 
 > **`dest_path_template` 不受任何形状约束**——不强制前缀、不要求首段可解析、不要求含时间字段。
 > 见 `DECISIONS.md` **D-030 第八条**。

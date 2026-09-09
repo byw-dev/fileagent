@@ -103,22 +103,42 @@ func TestProtoToSchedulerRule_MapsAllFields(t *testing.T) {
 
 // ── buildStoragePath ──────────────────────────────────────────────────────────
 
+func testLogger() *zap.Logger { return zap.NewNop() }
+
 func TestBuildStoragePath_WithPrefix(t *testing.T) {
 	rule := scheduler.CollectionRule{BasePath: "/tmp", DestPathTemplate: "data/logs/{filename}"}
-	got := buildStoragePath(rule, "/tmp/file.txt", trollsift.AgentContext{}, time.Now().UTC())
+	got := buildStoragePath(rule, "/tmp/file.txt", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
 	assert.Equal(t, "data/logs/file.txt", got)
 }
 
 func TestBuildStoragePath_EmptyPrefix(t *testing.T) {
 	rule := scheduler.CollectionRule{BasePath: "/tmp", DestPathTemplate: ""}
-	got := buildStoragePath(rule, "/tmp/report.csv", trollsift.AgentContext{}, time.Now().UTC())
+	got := buildStoragePath(rule, "/tmp/report.csv", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
 	assert.Equal(t, "report.csv", got)
 }
 
 func TestBuildStoragePath_TrailingSlash(t *testing.T) {
 	rule := scheduler.CollectionRule{BasePath: "/data", DestPathTemplate: "uploads/{filename}"}
-	got := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, time.Now().UTC())
+	got := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
 	assert.Equal(t, "uploads/out.bin", got)
+}
+
+// A leading "/" must not survive into the object key — the Control Plane
+// reverse-parses the normalised template against exactly this string.
+func TestBuildStoragePath_LeadingSlashTemplate(t *testing.T) {
+	rule := scheduler.CollectionRule{BasePath: "/data", DestPathTemplate: "/{agent_name}/{filename}"}
+	got := buildStoragePath(rule, "/data/out.bin",
+		trollsift.AgentContext{AgentName: "tokyo-site"}, time.Now().UTC(), testLogger())
+	assert.Equal(t, "tokyo-site/out.bin", got)
+}
+
+// Regression for IC-BUG-17: an agent restarted from a cached token used to have
+// an empty AgentContext, so {agent_name} could not resolve and every upload
+// silently collapsed to the bare base name at the bucket root.
+func TestBuildStoragePath_MissingAgentIdentity_FallsBackVisibly(t *testing.T) {
+	rule := scheduler.CollectionRule{BasePath: "/data", DestPathTemplate: "/{agent_name}/{filename}"}
+	got := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
+	assert.Equal(t, "out.bin", got, "unresolvable template still falls back")
 }
 
 // ── submitFile ────────────────────────────────────────────────────────────────
