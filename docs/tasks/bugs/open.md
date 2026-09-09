@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，其中 22/23 已随 IC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -41,6 +41,9 @@
 | IC-BUG-23 | 吊销不生效：被吊销 agent 的 token 仍可用，且重连会把状态刷回 online | 🔴 P0 | controlplane |
 | IC-BUG-24 | `handleDryRunResult` 无归属校验，可对他人 rule 投递伪造试运行结果 | 🟡 P2 | controlplane |
 | IC-BUG-25 | 吊销切不断已建立的流：被吊销 agent 仍可心跳/上报，UI 显示在线且踢不掉 | 🟠 P1 | controlplane |
+| IC-BUG-26 | `DeleteCollectionRule` 无归属约束，可删掉别的 agent 的规则 | 🟠 P1 | controlplane |
+| IC-BUG-27 | `handleDirectoryListing` 拿到 agentID 却只用于打日志，不校验归属 | 🟡 P2 | controlplane |
+| IC-BUG-28 | `registry.Register` 覆盖 map，重连时陈旧流的 defer 会关掉新连接的 SendCh | 🟠 P1 | controlplane |
 
 ---
 
@@ -296,8 +299,10 @@
 | **根因** | `handleAgentMessage` 里 `DryRunResult` 是**唯一不传 agentID** 的分支，按 body 里的 `rule_id` 投递进共享的 `dryRunStore` |
 | **精确位置** | `controlplane/internal/grpcserver/handler.go` `handleAgentMessage` 的 `AgentMessage_DryRunResult` 分支 |
 | **后果** | 任一已连接 agent 可对**别人的 `rule_id`** 投递伪造的试运行结果，管理员在 UI 上看到的预览是伪造的。只读、影响面小，但与 IC-BUG-22/23 是同一个模式：**凡是客户端指定资源 ID 的接口，都要问一句「这个资源是它的吗」** |
-| **修复** | 投递前校验该 rule 归属于流上的 agentID（`handleDryRunResult` 增加 agentID 参数）。归 IC-2 一并做 |
-| **验收** | agent A 对 agent B 的 rule_id 投递 DryRunResult 被丢弃并告警 |
+| **根因修正** | 初版把 `rule_id` 当成 `collection_rules` 的主键去查库——**错了**。它是 CP 为单次试运行 `uuid.New()` 生成的**临时关联 ID**（`agents.go:599`），从不入库，agent 只是原样回显。按 rule 查会让**每一次合法试运行都 fail-closed 被丢弃**，REST 30s 后返回 504，等于打死「试运行」功能 |
+| **威胁模型修正** | 该 ID 是 CP 生成的不可猜随机值（能力型），攻击者需在 30s 窗口内猜中一个 UUIDv4，并非「任一 agent 都能对别人的 rule_id 投递」。真正的不变量是**「这个关联 ID 是不是发给你的」** |
+| **修复** | ✅ **已修（IC-SEC-1，PR #94）**：归属绑在 store 上——`dryrun.Store.Register(reqID, agentID)` 记录收件人，`Deliver(reqID, agentID, result)` 比对后才投递并返回是否接受。零 DB 查询，且校验的是真正的不变量 |
+| **验收** | ✅ agent A 对发给 B 的关联 ID 投递被丢弃并告警；**合法试运行仍能送达**（这条是初版缺的关键回归）；经 `handleAgentMessage` 的用例断言闸门拿到的是流上的 agentID |
 
 ## IC-BUG-25 — 吊销切不断已建立的流 🟠 P1
 
@@ -307,8 +312,42 @@
 | **精确位置** | `controlplane/internal/grpcserver/registry.go`（`CancelFunc` 无调用点）；`controlplane/internal/grpcserver/handler.go` `handleAgentMessage`；`controlplane/internal/agent/manager.go` `RevokeAgent` |
 | **后果** | 被入侵的 agent 已连接 → 管理员吊销 → 它忽略 `Revoke` 命令、不断开。于是：①继续心跳刷新 `agent:online:<id>` 与 `last_seen_at`，**UI 上这个已吊销的 agent 一直显示在线，管理员没有任何手段把它踢下线**；②继续上报 `UploadResult`（IC-2 之后就是攻击者可控地直接写 `file_entries`/`upload_logs`）；③继续响应 `ListDirectory` |
 | **残留窗口（已接受）** | 手里已签发的 STS 会话在 ≤1h 内仍是整桶写。STS 会话本质上不可撤销（除非轮转 MinIO 父用户或加 deny policy），这一条**接受**，但必须在运维文档里写明「吊销不是即时的，最长一个 STS TTL」 |
-| **修复** | `RevokeAgent` 发完命令后主动切流：registry 加 `Disconnect(agentID)` 调用该 conn 的 `CancelFunc`。顺带修掉「已吊销却显示在线」。归 IC-2 |
-| **验收** | 吊销一个不配合的 agent（不处理 `Revoke` 命令的构造版本）后，流在秒级断开、UI 立即显示离线、后续 `UploadResult` 不再入库 |
+| **根因修正** | 初版只加了 `Disconnect`（取消 `stream.Context()` 的子 context）就宣称「切断流」——**不成立**。接收循环阻塞在 `stream.Recv()`，它不观察那个 context；handler 永不返回 → defer `Unregister` 永不执行 → **goroutine 与 registry 条目永久泄漏**，`IsOnline` 恒为 true |
+| **修复** | ✅ **已修（IC-SEC-1，PR #94）**：① registry 加 `Disconnect`，只 cancel、**不** `close(SendCh)`（所有权在 Connect 的 defer 上，重复关闭会 panic，变异测试实证）；② **`Connect` 的接收循环重构**——`Recv` 移入 goroutine 喂 channel，主循环 `select` 同时等 `ctx.Done()`，取消时 handler 真正 `return`（只有返回才终止 RPC，随后阻塞中的 Recv 出错退出，不泄漏）。**`ctx.Done()` 分支刻意不等发送 goroutine**：它只在空闲时观察 ctx，一旦停在 `stream.Send` 里就再也不写 `sendErr`，而 `Send` 阻塞与否由客户端读不读决定——等它会让 handler 以完全相同的形态泄漏（复审 MF-4，已用「客户端不读流」的用例钉住）；**`Recv` 出错分支同样不能等**——agent 可以「灌满流控窗口 + 半关闭」把 handler 钉在该分支之外，此后它根本观察不到 `ctx.Done()`，即 **agent 能把自己变成踢不掉的**（该行 master 就有，随本刀一并删掉，并用半关闭场景的用例钉住）；③ `Revoke` 发完协作式命令后无条件切流 |
+| **备注（本刀未处理）** | `Revoke` 里先 `Send(RevokeCommand)` 再立刻 `Disconnect`，二者存在竞态：发送 goroutine 的 `select` 在 `ctx.Done()` 与 `SendCh` 同时就绪时随机取分支，协作式命令可能被丢弃，agent 因此不清理本地 token。影响很小（命令本就尽力而为，切流才是硬手段），随 IC-2 顺手处理 |
+| **验收** | ✅ bufconn 端到端用例：`Disconnect` 后客户端 `Recv` 返回 `PermissionDenied`（非阻塞），registry 条目被清空（证明 handler 已返回、defer 已跑）。变异验证：退回旧的阻塞 `Recv` 结构后该用例在 5s 超时处失败。**残留**：UI 在线状态靠 Redis 90s TTL 过期而非立即，`handleDirectoryListing` 不带 ctx——见下方备注 |
+
+## IC-BUG-26 — `DeleteCollectionRule` 无归属约束 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `DELETE FROM collection_rules WHERE id = $1`（`db/queries/rules.sql:58`）——**只按主键**。同一文件的 `UpdateCollectionRule`（`:54`）却是 `WHERE id = $1 AND agent_id = $14 AND org_id = $15`，说明这条约束是有意的，只是 DELETE 漏了 |
+| **精确位置** | `controlplane/internal/db/queries/rules.sql:57-58`；调用方 `controlplane/internal/api/handler/agents.go`（`DeleteRule`） |
+| **后果** | `DELETE /api/v1/agents/<A>/rules/<属于 B 的 rule_id>` 会删掉 **B 的**规则，然后把 cancel 命令发给 A——B 那边的采集静默停止，且路径里的 agent id 与实际受影响的 agent 不符，事后排查会指向错误的 agent。当前是单组织 + 管理员鉴权，所以是**越权面**而非直接可利用漏洞，但与 IC-BUG-24 是同一模式 |
+| **修复** | DELETE 加 `AND agent_id = $2 AND org_id = $3`，`:execrows` 返回 0 时 handler 返回 404，与 Update 对齐；经 `make generate` |
+| **验收** | 用 agent A 的路径删 B 的 rule 返回 404 且 B 的规则仍在；删自己的规则仍正常 |
+
+## IC-BUG-27 — `handleDirectoryListing` 不校验归属 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 该分支**拿到了** `agentID`，但只用于打日志，投递仍只按 body 里的 `request_id`（`grpcserver/handler.go` `handleDirectoryListing`）。IC-BUG-24 的卡片称 DryRunResult 是「唯一不传 agentID 的分支」——字面成立，但「传了不校验」是同一个洞 |
+| **精确位置** | `controlplane/internal/grpcserver/handler.go` `handleDirectoryListing`；`controlplane/internal/dirstore/store.go` |
+| **后果** | 任一已连接 agent 可对别人的 `request_id` 投递伪造的目录列表，管理员看到的是伪造内容。与 IC-BUG-24 同为「能力型随机 ID」，需在 30s 窗口内猜中 UUIDv4，实际可利用性低 |
+| **修复** | 与 IC-BUG-24 同解：`dirstore.Store.Register(reqID, agentID)` + `Deliver(reqID, agentID, result)` 比对收件人。IC-SEC-1 已经把 `dryrun.Store` 改成这个形状，照抄即可 |
+| **验收** | agent A 对发给 B 的 request_id 投递被丢弃并告警；合法目录列举仍能送达 |
+
+## IC-BUG-28 — `registry.Register` 覆盖 map，重连时陈旧流会关掉新连接 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `Register` 无条件 `r.conns[agentID] = conn`（`grpcserver/registry.go`）。同一 agent 重连时新条目覆盖旧条目，而**陈旧流最终返回时它的 defer `Unregister(agentID)` 关的是新连接的 `SendCh`** 并把新连接从 registry 删除 |
+| **精确位置** | `controlplane/internal/grpcserver/registry.go` `Register` / `Unregister` |
+| **实测（评审）** | `fresh conn SendCh closed by the STALE unregister: closed=true`、`IsOnline=false`，随后再 `Send` → `panic: send on closed channel` |
+| **后果** | 网络抖动导致的重连即可触发：新连接被静默踢出 registry 且 `SendCh` 被关闭，此后规则下发/凭据推送全部失败；`Send` 在 RLock 之外发送、与 `Unregister` 的 `close` 并发还有同一崩溃窗口，而 `SyncRulesOnConnect` 路径上的 panic 在 gRPC handler goroutine 里**没有 recover** |
+| **与 IC-SEC-1 的关系** | 非本刀引入（`Disconnect` 只 cancel、不 close，未新增双重释放）。但 IC-BUG-25 修好后陈旧流会更快消失，两件事宜一起处理 |
+| **修复** | `Unregister` 改为按 conn 身份而非按 key 删除（比对指针/世代号，只在仍是自己那条时才 close + delete）；`Send` 改为在锁内取 conn 后用 `select` + 关闭标志，或改用 per-conn 的关闭同步 |
+| **验收** | 同一 agent 快速重连后，旧流返回不影响新连接：`IsOnline` 仍为 true、`SendCh` 未关闭、后续 Send 成功；`-race` 下并发 Send/Unregister 无 panic |
 
 ---
 

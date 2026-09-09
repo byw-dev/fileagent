@@ -7,6 +7,7 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/dryrun"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -514,4 +515,90 @@ func TestRefreshCredentials_AgentLookupFails_ReturnsPermissionDenied(t *testing.
 	require.Error(t, err)
 	assert.Equal(t, codes.PermissionDenied, status.Code(err))
 	assert.Zero(t, stsMgr.calls)
+}
+
+// ── dry-run results must be addressed to the reporting agent ─────────────────
+
+// The id on a DryRunResult is a correlation id the Control Plane minted for one
+// specific agent, so the store is the only thing that knows who it was sent to.
+// An earlier attempt looked it up as a collection rule, which rejected every
+// legitimate result because that id is never persisted (IC-BUG-24).
+func TestHandleDryRunResult_AddressedToAnotherAgent_IsDiscarded(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	store := dryrun.New()
+	srv.WithDryRunStore(store)
+
+	reqID := uuid.NewString()
+	ch := store.Register(reqID, uuid.NewString()) // issued to a different agent
+
+	srv.handleDryRunResult(context.Background(), testAgentID,
+		&agentv1.DryRunResult{RuleId: reqID})
+
+	select {
+	case <-ch:
+		t.Fatal("a result from the wrong agent must not reach the waiting caller")
+	default:
+	}
+}
+
+// The correlation id is not a collection rule and is never in the database, so
+// a legitimate result must go through without any rule lookup.
+func TestHandleDryRunResult_AddressedToThisAgent_IsDelivered(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	store := dryrun.New()
+	srv.WithDryRunStore(store)
+
+	reqID := uuid.NewString()
+	ch := store.Register(reqID, testAgentID)
+
+	srv.handleDryRunResult(context.Background(), testAgentID,
+		&agentv1.DryRunResult{RuleId: reqID})
+
+	select {
+	case got := <-ch:
+		require.NotNil(t, got)
+		assert.Equal(t, reqID, got.GetRuleId())
+	default:
+		t.Fatal("a legitimate dry-run result was dropped — this is what breaks 试运行")
+	}
+}
+
+// An unknown id (the caller already timed out and cancelled) is simply dropped.
+func TestHandleDryRunResult_UnknownRequestID_IsDiscarded(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	srv.WithDryRunStore(dryrun.New())
+
+	assert.NotPanics(t, func() {
+		srv.handleDryRunResult(context.Background(), testAgentID,
+			&agentv1.DryRunResult{RuleId: uuid.NewString()})
+	})
+}
+
+// The gate is only worth anything if it receives the *stream's* agent id.
+// Passing "" (or the body's own value) would silently discard every result, and
+// no test above would notice — all of them call handleDryRunResult directly.
+func TestHandleAgentMessage_DryRunResult_UsesStreamIdentity(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	store := dryrun.New()
+	srv.WithDryRunStore(store)
+
+	reqID := uuid.NewString()
+	ch := store.Register(reqID, testAgentID)
+
+	srv.handleAgentMessage(context.Background(), testAgentID, &agentv1.AgentMessage{
+		Payload: &agentv1.AgentMessage_DryRunResult{
+			DryRunResult: &agentv1.DryRunResult{RuleId: reqID},
+		},
+	})
+
+	select {
+	case got := <-ch:
+		require.NotNil(t, got)
+	default:
+		t.Fatal("handleAgentMessage did not pass the stream's agent id to the gate")
+	}
 }

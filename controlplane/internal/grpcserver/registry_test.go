@@ -1,6 +1,7 @@
 package grpcserver
 
 import (
+	"context"
 	"testing"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
@@ -76,4 +77,28 @@ func TestAgentRegistry_Send_ChannelFull(t *testing.T) {
 	// Next send should fail (channel full).
 	ok := r.Send("agent-3", &agentv1.ServerMessage{})
 	assert.False(t, ok)
+}
+
+// Disconnect must cancel the stream context so Connect returns and its deferred
+// Unregister runs. It must not close SendCh itself — that deferred Unregister
+// does, and closing twice would panic.
+func TestAgentRegistry_Disconnect_CancelsStreamContext(t *testing.T) {
+	r := NewAgentRegistry()
+	_, cancel := context.WithCancel(context.Background())
+	cancelled := false
+	conn := r.Register("agent-1", nil, func() { cancelled = true; cancel() })
+	require.NotNil(t, conn)
+
+	assert.True(t, r.Disconnect("agent-1"))
+	assert.True(t, cancelled, "the stream context must be cancelled")
+
+	// SendCh stays open: Connect's deferred Unregister owns closing it.
+	select {
+	case _, ok := <-conn.SendCh:
+		assert.True(t, ok, "Disconnect must not close SendCh")
+	default:
+	}
+
+	r.Unregister("agent-1")
+	assert.False(t, r.Disconnect("agent-1"), "an absent agent reports false")
 }

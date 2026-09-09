@@ -20,33 +20,53 @@ import (
 // Store maps pending dry-run request IDs to single-element result channels.
 // It is safe for concurrent use from multiple goroutines.
 type Store struct {
-	m sync.Map // map[string]chan *agentv1.DryRunResult
+	m sync.Map // map[string]*pending
+}
+
+// pending couples a waiting channel with the agent the request was sent to, so
+// a result can be matched against its intended recipient.
+type pending struct {
+	ch      chan *agentv1.DryRunResult
+	agentID string
 }
 
 // New returns an empty Store.
 func New() *Store { return &Store{} }
 
-// Register allocates a buffered channel for reqID and returns it.
+// Register allocates a buffered channel for reqID, recording which agent the
+// request is being sent to, and returns the channel.
 // The caller MUST call Cancel if it gives up (e.g. on timeout) to prevent
 // the channel from leaking.
-func (s *Store) Register(reqID string) <-chan *agentv1.DryRunResult {
+func (s *Store) Register(reqID, agentID string) <-chan *agentv1.DryRunResult {
 	ch := make(chan *agentv1.DryRunResult, 1)
-	s.m.Store(reqID, ch)
+	s.m.Store(reqID, &pending{ch: ch, agentID: agentID})
 	return ch
 }
 
-// Deliver sends result to the channel registered under reqID and removes
-// the entry from the store. No-op when reqID is not registered (e.g. the
-// caller already timed out and called Cancel).
-func (s *Store) Deliver(reqID string, result *agentv1.DryRunResult) {
-	if v, ok := s.m.LoadAndDelete(reqID); ok {
-		if ch, ok := v.(chan *agentv1.DryRunResult); ok {
-			select {
-			case ch <- result:
-			default:
-			}
-		}
+// Deliver sends result to the channel registered under reqID, but only when
+// agentID matches the agent the request was sent to. It removes the entry on a
+// match, and is a no-op when reqID is unknown (e.g. the caller already timed out).
+//
+// The recipient check is the ownership rule for this path: reqID is a
+// correlation id the Control Plane allocated for one specific agent, so
+// "was this addressed to you" is the question worth asking. Checking it here
+// rather than at the caller keeps the invariant next to the state it protects.
+// A mismatch is reported so the caller can log it.
+func (s *Store) Deliver(reqID, agentID string, result *agentv1.DryRunResult) bool {
+	v, ok := s.m.Load(reqID)
+	if !ok {
+		return false
 	}
+	p, ok := v.(*pending)
+	if !ok || p.agentID != agentID {
+		return false
+	}
+	s.m.Delete(reqID)
+	select {
+	case p.ch <- result:
+	default:
+	}
+	return true
 }
 
 // Cancel removes the entry for reqID without delivering a result.

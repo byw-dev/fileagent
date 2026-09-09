@@ -96,7 +96,9 @@ type DirResultDeliverer interface {
 // DryRunResultDeliverer receives dry-run results from the agent gRPC stream
 // and delivers them to the waiting REST handler.
 type DryRunResultDeliverer interface {
-	Deliver(reqID string, result *agentv1.DryRunResult)
+	// Deliver reports whether the result was accepted; it is refused when the
+	// request id was not issued to this agent.
+	Deliver(reqID, agentID string, result *agentv1.DryRunResult) bool
 }
 
 // Server holds dependencies shared by all gRPC handlers.

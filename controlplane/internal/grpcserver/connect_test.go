@@ -3,6 +3,7 @@ package grpcserver
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -202,4 +203,132 @@ func TestServer_Connect_WithRegistry_Unauthenticated_NoToken(t *testing.T) {
 	_, err = stream.Recv()
 	require.Error(t, err)
 	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+}
+
+// Revocation has to actually end the RPC, not merely cancel a context nobody
+// observes. The first attempt at IC-BUG-25 cancelled a context derived from
+// stream.Context(), which the blocking Recv never looks at: the handler kept
+// running, its registry entry stayed, and the agent went on sending.
+//
+// The assertion is therefore about the stream ending and the registry emptying,
+// not about Disconnect returning true.
+func TestServer_Connect_Disconnect_EndsStreamAndUnregisters(t *testing.T) {
+	agentID := "44444444-4444-4444-4444-444444444444"
+	client, bearer, registry := newFullServerForAgent(t, agentID,
+		&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", bearer))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		2*time.Second, 20*time.Millisecond)
+
+	require.True(t, registry.Disconnect(agentID))
+
+	// The client's Recv must return rather than block forever.
+	recvErr := make(chan error, 1)
+	go func() { _, e := stream.Recv(); recvErr <- e }()
+	select {
+	case e := <-recvErr:
+		require.Error(t, e)
+		assert.Equal(t, codes.PermissionDenied, status.Code(e))
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream still open 5s after Disconnect — the handler never returned")
+	}
+
+	// The handler's deferred Unregister only runs once it returns.
+	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		3*time.Second, 20*time.Millisecond,
+		"registry entry leaked: the handler goroutine is still alive")
+}
+
+// A revoked agent has no reason to keep reading the stream, and once it stops
+// the send goroutine parks inside stream.Send — where cancelling the context
+// cannot reach it. An earlier version waited for that goroutine before
+// returning, which reproduced the very leak IC-BUG-25 is about: the handler
+// never returned, the registry entry stayed, IsOnline stayed true.
+//
+// The agent here deliberately never calls Recv.
+func TestServer_Connect_Disconnect_WhileSendBlocked(t *testing.T) {
+	agentID := "55555555-5555-5555-5555-555555555555"
+	client, bearer, registry := newFullServerForAgent(t, agentID,
+		&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", bearer))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		3*time.Second, 10*time.Millisecond)
+
+	// Fill the flow-control window so the send goroutine is parked in Send.
+	// SendCh refusing a message is the signal that it has stopped draining.
+	big := strings.Repeat("x", 1<<20)
+	sent := 0
+	for ; sent < 200; sent++ {
+		if !registry.Send(agentID, &agentv1.ServerMessage{
+			Payload: &agentv1.ServerMessage_PushRule{
+				PushRule: &agentv1.PushRuleCommand{
+					Rule: &agentv1.CollectionRule{RuleId: "r", BasePath: big},
+				},
+			},
+		}) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// Without this the test silently degrades into a duplicate of the plain
+	// disconnect case: if everything fits, the send path never blocked and the
+	// scenario under test never happened.
+	require.Less(t, sent, 200, "send path never became blocked; nothing was tested")
+
+	require.True(t, registry.Disconnect(agentID))
+
+	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		8*time.Second, 50*time.Millisecond,
+		"handler did not return while the send path was blocked — registry and goroutine leaked")
+}
+
+// The mirror of the case above: an agent can park the send goroutine and then
+// half-close, which drives the receive loop into its error branch. Waiting for
+// the send goroutine there pins the handler outside the select, so it stops
+// observing ctx.Done entirely and revocation can no longer reach it.
+func TestServer_Connect_HalfClose_WhileSendBlocked_StillUnregisters(t *testing.T) {
+	agentID := "66666666-6666-6666-6666-666666666666"
+	client, bearer, registry := newFullServerForAgent(t, agentID,
+		&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", bearer))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		3*time.Second, 10*time.Millisecond)
+
+	big := strings.Repeat("x", 1<<20)
+	sent := 0
+	for ; sent < 200; sent++ {
+		if !registry.Send(agentID, &agentv1.ServerMessage{
+			Payload: &agentv1.ServerMessage_PushRule{
+				PushRule: &agentv1.PushRuleCommand{
+					Rule: &agentv1.CollectionRule{RuleId: "r", BasePath: big},
+				},
+			},
+		}) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	require.Less(t, sent, 200, "send path never became blocked; nothing was tested")
+
+	// Half-close: the server's Recv returns EOF and takes the error branch.
+	require.NoError(t, stream.CloseSend())
+
+	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		10*time.Second, 50*time.Millisecond,
+		"handler pinned in the Recv error branch — the agent made itself unrevokable")
 }

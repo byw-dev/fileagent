@@ -52,6 +52,9 @@ type RuleDispatcher interface {
 type AgentRegistryClient interface {
 	Send(agentID string, msg *agentv1.ServerMessage) bool
 	IsOnline(agentID string) bool
+	// Disconnect cuts the agent's stream. Revocation needs it because the
+	// Revoke command it sends is cooperative and a compromised agent ignores it.
+	Disconnect(agentID string) bool
 }
 
 // AgentCacheClient is the cache interface used by AgentsHandler.
@@ -77,7 +80,9 @@ type DirListingStore interface {
 
 // DryRunStore manages pending dry-run result channels.
 type DryRunStore interface {
-	Register(reqID string) <-chan *agentv1.DryRunResult
+	// Register records which agent reqID was issued to, so the gRPC side can
+	// refuse a result arriving from any other agent.
+	Register(reqID, agentID string) <-chan *agentv1.DryRunResult
 	Cancel(reqID string)
 }
 
@@ -392,11 +397,19 @@ func (h *AgentsHandler) Revoke(c *gin.Context) {
 		return
 	}
 	if h.registry != nil && h.registry.IsOnline(id.String()) {
+		// Ask the agent to clean up its local token…
 		h.registry.Send(id.String(), &agentv1.ServerMessage{
 			Payload: &agentv1.ServerMessage_Revoke{
 				Revoke: &agentv1.RevokeCommand{Reason: "revoked_by_admin"},
 			},
 		})
+		// …then cut the stream regardless. The command above is cooperative and
+		// a compromised agent will ignore it; without this it would keep
+		// heartbeating (appearing online, unkickable) and keep reporting
+		// uploads. See IC-BUG-25.
+		if h.registry.Disconnect(id.String()) {
+			h.logger.Info("revoke: agent stream cut", zap.String("agent_id", id.String()))
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "agent revoked"})
 }
@@ -585,7 +598,7 @@ func (h *AgentsHandler) TestRule(c *gin.Context) {
 
 	// Use a temporary rule_id so the gRPC round-trip can be correlated.
 	ruleID := uuid.New().String()
-	resultCh := h.dryRunStore.Register(ruleID)
+	resultCh := h.dryRunStore.Register(ruleID, agentID)
 	defer h.dryRunStore.Cancel(ruleID)
 
 	msg := &agentv1.ServerMessage{

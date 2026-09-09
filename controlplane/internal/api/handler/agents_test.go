@@ -163,10 +163,11 @@ func (m *mockDispatcher) DispatchRuleCancel(_ context.Context, _, _ string) erro
 }
 
 type mockAgentRegistry struct {
-	online   bool
-	sendOK   bool
-	sentTo   string
-	lastSent *agentv1.ServerMessage
+	online          bool
+	sendOK          bool
+	sentTo          string
+	lastSent        *agentv1.ServerMessage
+	disconnectCalls int
 }
 
 func (m *mockAgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
@@ -175,6 +176,10 @@ func (m *mockAgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) boo
 	return m.sendOK
 }
 func (m *mockAgentRegistry) IsOnline(_ string) bool { return m.online }
+func (m *mockAgentRegistry) Disconnect(_ string) bool {
+	m.disconnectCalls++
+	return m.online
+}
 
 // mockDirStore implements handler.DirListingStore for tests.
 // If result is non-nil, Register immediately sends it into the returned channel.
@@ -435,6 +440,26 @@ func TestAgentsHandler_Revoke_SendsRevokeCommandWhenOnline(t *testing.T) {
 	revoke := registry.lastSent.GetRevoke()
 	require.NotNil(t, revoke)
 	assert.Equal(t, "revoked_by_admin", revoke.GetReason())
+
+	// The command above is cooperative — a compromised agent ignores it and
+	// keeps heartbeating, so the stream has to be cut as well (IC-BUG-25).
+	assert.Equal(t, 1, registry.disconnectCalls,
+		"revocation must cut the stream, not only ask the agent to stand down")
+}
+
+// Revocation must still succeed when the agent is already gone; there is simply
+// nothing to cut.
+func TestAgentsHandler_Revoke_Offline_DoesNotDisconnect(t *testing.T) {
+	registry := &mockAgentRegistry{online: false, sendOK: true}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, &mockAgentMgr{}, nil, registry, newTestLogger())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost,
+		"/api/v1/agents/"+uuid.New().String()+"/revoke", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	assert.Zero(t, registry.disconnectCalls)
 }
 
 func TestAgentsHandler_Revoke_DoesNotSendCommandWhenOffline(t *testing.T) {

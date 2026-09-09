@@ -132,14 +132,64 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	}()
 
 	// Receive loop.
-	for {
-		msg, err := stream.Recv()
-		if err != nil {
-			cancel()
-			<-sendErr
-			return err
+	//
+	// Recv runs in its own goroutine so the loop can also wake on ctx.Done().
+	// Reading Recv directly would block until the agent sends something or the
+	// transport breaks, which means cancelling ctx — the only thing Disconnect
+	// can do — would not end this handler: it would keep its registry entry and
+	// its goroutines forever while an uncooperative agent held the stream open.
+	// Only returning from this function actually terminates the RPC; the pending
+	// Recv then fails and its goroutine exits.
+	type recvResult struct {
+		msg *agentv1.AgentMessage
+		err error
+	}
+	recvCh := make(chan recvResult)
+	go func() {
+		for {
+			msg, err := stream.Recv()
+			select {
+			case recvCh <- recvResult{msg: msg, err: err}:
+				if err != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
 		}
-		s.handleAgentMessage(ctx, agentID, msg)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Cancelled from outside — the agent was revoked (IC-BUG-25).
+			//
+			// Deliberately does not wait for the send goroutine. That goroutine
+			// only checks ctx while idle; if it is parked inside stream.Send it
+			// stays there until the client reads, which a revoked agent has no
+			// reason to do. Waiting here would hang this handler exactly as the
+			// blocking Recv used to, leaking the goroutine and the registry
+			// entry and leaving IsOnline true forever.
+			//
+			// Returning is what actually ends the RPC: the parked Send then
+			// fails, and the goroutine's write to the buffered sendErr channel
+			// completes without a reader.
+			s.logger.Info("connect: stream terminated by control plane",
+				zap.String("agent_id", agentID))
+			return status.Error(codes.PermissionDenied, "agent connection terminated")
+		case r := <-recvCh:
+			if r.err != nil {
+				// Same reasoning as the ctx.Done branch above: waiting for the
+				// send goroutine deadlocks whenever it is parked in stream.Send,
+				// which an agent can arrange by half-closing while refusing to
+				// read. Doing so used to pin this handler outside the select, so
+				// it could no longer observe ctx.Done at all — the agent made
+				// itself unrevokable.
+				cancel()
+				return r.err
+			}
+			s.handleAgentMessage(ctx, agentID, r.msg)
+		}
 	}
 }
 
@@ -353,7 +403,7 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, msg *ag
 	case *agentv1.AgentMessage_DirectoryListing:
 		s.handleDirectoryListing(agentID, p.DirectoryListing)
 	case *agentv1.AgentMessage_DryRunResult:
-		s.handleDryRunResult(p.DryRunResult)
+		s.handleDryRunResult(ctx, agentID, p.DryRunResult)
 	default:
 		s.logger.Debug("agent message received",
 			zap.String("agent_id", agentID),
@@ -542,15 +592,26 @@ func (s *Server) handleDirectoryListing(agentID string, listing *agentv1.Directo
 
 // handleDryRunResult delivers a dry-run result from the agent to the waiting
 // REST handler via the dryRunStore.
-func (s *Server) handleDryRunResult(result *agentv1.DryRunResult) {
+func (s *Server) handleDryRunResult(ctx context.Context, agentID string, result *agentv1.DryRunResult) {
 	if s.dryRunStore == nil {
 		s.logger.Debug("dry_run result received but no dryRunStore wired",
 			zap.String("rule_id", result.GetRuleId()))
 		return
 	}
-	s.dryRunStore.Deliver(result.GetRuleId(), result)
+	// The id here is a correlation id the Control Plane minted for one specific
+	// agent, not a collection rule — so the question is "was this request
+	// addressed to you", which only the store can answer. Looking the id up as a
+	// rule would reject every legitimate result, since it is never persisted.
+	if !s.dryRunStore.Deliver(result.GetRuleId(), agentID, result) {
+		s.logger.Warn("dry_run result discarded: not addressed to this agent, or already timed out",
+			zap.String("agent_id", agentID),
+			zap.String("request_id", result.GetRuleId()),
+		)
+		return
+	}
 	s.logger.Debug("dry_run result delivered",
-		zap.String("rule_id", result.GetRuleId()),
+		zap.String("agent_id", agentID),
+		zap.String("request_id", result.GetRuleId()),
 		zap.Int("files", len(result.GetFiles())),
 	)
 }
