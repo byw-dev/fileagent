@@ -1463,11 +1463,14 @@ JetStream 处于闲置状态。
 - **不消除「MinIO 静默不发事件」的残余风险**——那是 MinIO 内部行为，与传输层无关。
   **D-030 的 L2 分片轮转仍然必需，一项都不能省。**
 - **`queue_dir` 的问题原样存在**。`notify_nats` 同样有 `queue_dir` / `queue_limit`，IC-BUG-9 必须照修。
-- **对象键的 URL 编码原样存在（IC-BUG-19）——2026-09-10 实测补充**。编码发生在 MinIO **构造事件对象**时，
-  不在传输层。dev 环境实测 `notify_nats` 载荷：`"object":{"key":"ic19%2Fnested+dir%2F%E4%B8%AD+%E6%96%87.csv"}`，
-  与 webhook 完全相同（`%2F` 位于 JSON 字符串**内部**，两种传输都不改写它）。**IC-BUG-19 与本条正交，
-  已排在 IC-2a ⑥，不得等 IC-11。** 附带提醒：NATS 载荷有个未编码的顶层 `Key` 字段，但它是 `bucket/key`
-  拼接的 MinIO 私有信封字段，不在 S3 事件规范内，**不要用它绕过 unescape**。
+- **对象键的 URL 编码原样存在（IC-BUG-19）——2026-09-10 双向实测补充**。dev 环境对同一个键同时挂
+  `notify_nats` 与 `notify_webhook` 各抓一次载荷，**两者字节级同构**：顶层字段均为
+  `['EventName','Key','Records']`，而 CP 实际读取的 `Records[].s3.object.key` 两边都是
+  `ic19%2Fnested+dir%2F%E4%B8%AD+%E6%96%87.csv`。编码发生在 MinIO **构造事件对象**时而非传输层
+  （`%2F` 位于 JSON 字符串**内部**，两种传输都不改写它）。**IC-BUG-19 与本条正交，已排在 IC-2a ⑥，
+  不得等 IC-11。** 附带提醒：事件信封有个未编码的顶层 `Key` 字段（**webhook 与 NATS 都有**，CP 当前
+  只解析 `Records[]` 所以从没注意到），但它是 `bucket/key` 拼接的 MinIO 私有字段、不在 S3 事件规范内，
+  **不要用它绕过 unescape**。
 - **新建 bucket 仍需逐个注册通知（IC-BUG-7）**。换传输不改变「`MakeBucket` 之后要不要配通知」这件事，
   只是 ARN 从 `arn:minio:sqs::primary:webhook` 变成 NATS target 的 ARN。**IC-4 ② 的实现须把 ARN 做成可配置**，
   否则 IC-11 落地时会把它打回原形。
