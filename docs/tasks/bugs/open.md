@@ -75,10 +75,12 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 **两条改变 IC-2a 边界的结论**——这正是「先扫完再发刀」的收益，与 M-1 挖出 IC-BUG-29 同理：
 
-1. **IC-BUG-30 决定 IC-BUG-29 修复的分支语义。** agent 会为一条**已删除**的规则继续上报，
-   于是 `HandleUploadResult` 面对的不是「属于我 / 属于别人」两种情况，而是三种：**规则不存在 /
-   规则属于别的 agent / 规则合法**。IC-2a 的 ⑪ 必须显式定义前两种的行为，否则
-   `loadRuleMetadata` 查不到就走空 metadata，静默把上报记成「无规则来源」。
+1. **IC-BUG-30 让 IC-BUG-29 的「规则不存在」分支变得无界。** `HandleUploadResult` 面对的不是
+   「属于我 / 属于别人」两种情况，而是三种：**规则不存在 / 规则属于别的 agent / 规则合法**。
+   ⚠️ **归因要点**：这一支**不是 IC-BUG-30 造成的**——它的根在「队列与规则生命周期解耦」这个
+   结构事实上（`stopRule` 不碰 `upload_tasks`、`DequeuePending` 无 rule 过滤），因此**即使
+   IC-2b 修好 IC-BUG-30，这一支依然存在**。IC-BUG-30 的贡献是把它从「一次排空」放大成
+   「持续产生、直到进程重启」。五条路径与定案见 IC-BUG-29 卡片。
 2. **IC-BUG-31 决定 ack 的可靠性模型。** IC-2a 新增的 `Acknowledgement` 走的是同一个
    best-effort `registry.Send`——丢一个 ack 就有一个任务永久停在 `reported`、outbox 永不清空。
    **修法不是把 `Send` 改成可靠投递**，那恰恰是 M-2 的错误方向；而是让 agent 侧带**重报超时**：
@@ -443,7 +445,11 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **后果** | 恶意或有缺陷的 agent 可以：①**把自己的上传记到别人的规则名下**，污染 `file_entries.rule_id` 与 `upload_logs` 的归因，事后排查会指向错误的采集器；②更糟的是 `loadRuleMetadata` 按这个 ID 加载 `file_type` / `static_tags` / `path_tag_map`——于是它能**借用任意规则的元数据声明给自己的文件打标**，直接污染 6c 受控标签体系（这些标签会进筛选器、进事件规则、进下游 ETL） |
 | **可利用性** | **当前为零**——agent 从不上报 `UploadResult`（IC-BUG-2），这条路径是死代码。**IC-2a 把它变成索引主路径的那一刻起就成立**，与 IC-1 让 IC-BUG-22/23 变得可利用是同一个机制 |
 | **修复** | 在 `HandleUploadResult` 里校验归属（`agentID` 已经是流上的可信身份，函数签名里就有）。**分支是三个，不是两个**——见下行 |
-| **⚠️ 三分支（2026-09-10，因 IC-BUG-30）** | 只写 `rule.AgentID == agentID` 不够：IC-BUG-30 让 agent 会为一条**已删除**的规则继续上报，于是实际要处理 ①**规则不存在** ②**规则属于别的 agent** ③**合法**。①② 的行为须在 **IC-2a ⑧** 显式定义（宽松：仅清空 `rule_id` 保住文件索引；严格：整条拒绝避免半可信数据入库），**不能让 `loadRuleMetadata` 查不到就默默走空 metadata**——那等于把 ① 静默当成「无规则来源」，正是这条缺陷的静默版本 |
+| **⚠️ 三分支** | 只写 `rule.AgentID == agentID` 不够。实际要处理 ①**规则不存在** ②**规则属于别的 agent** ③**合法**，且**不能让 `loadRuleMetadata` 查不到就默默走空 metadata**——那等于把 ① 静默当成「无规则来源」，正是这条缺陷的静默版本 |
+| **① 的来源：队列与规则生命周期解耦（结构性，非缺陷）** | 三个已确认的事实：`stopRule` 只做 `sched.RemoveRule` + cancel ruleCtx（`agent/cmd/agent/main.go:159-167`），**从不触碰 `upload_tasks`**；`DequeuePending` 只按 `WHERE status = ?` 取（`queue.go:293`），**无 rule 过滤**；全仓库无「按 rule 删任务」语句（唯一的 `DELETE FROM upload_tasks` 是容量淘汰 `queue.go:277`）。**任务一旦入队，规则怎么变都不影响它被上传和上报**。于是有五条路径：<br>1. **队列滞留**——任务已入队、`CancelRule` 正常送达并停掉 watcher/cron，但队列照常排空。窗口 = 排空时间；叠加重试（`maxRetries=10`，退避 1/5/15/60min 封顶）可达数小时，大文件再叠加 IC-BUG-5 更久<br>2. **离线积压**——离线期间持续写本地队列（设计行为），期间规则被删，重连补传整批。窗口 = 断线时长<br>3. **IC-BUG-30**——断连期间删规则，重连后 agent 不知道规则没了，**持续产生新任务**。无界，直到进程重启<br>4. **重启残留**——SQLite 队列跨重启存活，规则却只从 `SyncRulesOnConnect` 来<br>5. **恶意/有缺陷的 agent** 伪造 rule_id（本卡片要防的那条）<br>**只有第 3 条能被 IC-2b 消掉。1/2/4 是持久化队列 + 可变规则集的必然结果**——换句话说，**「规则不存在」是稳态下的正常情形，不是异常**：管理员每删一次规则，只要名下还有在途任务就会产生一批 |
+| **✅ 定案（2026-09-10）：宽松——清空 `rule_id`，文件照常入索引** | **严格（整条拒绝）会让「删除一条规则」变成「静默丢弃若干已在 MinIO 里的文件的索引行」**。对象已经写进去了，拒绝入索引只是制造一批要等 IC-13 对账才发现的幽灵，而 L2 那时只能补回存在性、补不回 tags/sha256。一个日常管理动作不该有这种后果 |
+| **⚠️ 告警分级** | ① 与 ② 的告警等级**必须分开**：① 是路径 1/2/4 的正常产物，per-file 告警就是 IC-BUG-21 里「5000 条 Warn 被运维关掉」的翻版，应按 `rule_id` 去重或降为 Info；**② 永远不合法，是唯一值得响的那一支** |
+| **⚠️ 宽松的代价，须可见** | 走 ① 分支的文件拿不到 `loadRuleMetadata` 的 `file_type` / `static_tags` / `path_tag_map`，**永久无类型、无声明标签**——规则已删，retag worker 也没有可回溯的声明。这是接受的代价，但要让它可查（在 `source` 之外记一个「元数据缺失」标记），而不是当正常行写完了事 |
 | **验收** | agent A 上报携带 B 的 rule_id → `file_entries.rule_id` 不被写成 B 的规则、`file_tags` 里不出现 B 规则声明的标签、日志有告警；A 用自己的 rule_id 上报一切正常 |
 
 
@@ -454,7 +460,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **根因** | 同步协议**只有增量推送，没有全集语义**。`DispatchRuleCancel` 在 agent 离线时直接 `return nil`（`dispatch.go:102-104`），而重连时的 `SyncRulesOnConnect` **只推 `status == active` 的规则**（`dispatch.go:130`），从不推 cancel。agent 侧 `stopRule` 唯一的触发点是收到 `CancelRule`（`agent/cmd/agent/main.go:235-237`），没有「本次同步的全集之外的规则一律停掉」这条语义 |
 | **精确位置** | `controlplane/internal/agent/dispatch.go:101-115`（离线即放弃）、`:129-132`（只推 active）；`agent/cmd/agent/main.go:159-167`（`stopRule`）、`:169-209`（`applyRule`） |
 | **后果** | agent 断连期间（网络抖动 / CP 重启）管理员停用或删除一条规则 → cancel 命令被丢弃 → agent 重连后**继续按这条已经不存在的规则采集并上传**，且因 D-030 整桶 policy **传得上去**（不会被 403 挡）。DB 与 UI 上该规则已消失，运维没有任何线索。持续到 agent 进程重启为止——`rules` 表只写不读，重启后规则只从 `SyncRulesOnConnect` 来 |
-| **与 IC-2a 的关系** | 上报活过来之后，这些上传会带着一个**已删除的 `rule_id`** 到达 `HandleUploadResult`。因此 IC-BUG-29 的归属校验**不能只写 `rule.AgentID == agentID`**，必须处理三分支：规则不存在 / 规则属于别的 agent / 规则合法 |
+| **与 IC-2a 的关系** | 上报活过来之后，这些上传会带着一个**已删除的 `rule_id`** 到达 `HandleUploadResult`，因此 IC-BUG-29 的归属校验必须处理三分支。**但注意归因**：那一支的根是「队列与规则生命周期解耦」（见 IC-BUG-29 卡片的五条路径），本条只是把它从「一次排空」放大成「无界产生」。**修好本条不会消掉那一支**，IC-2a ⑧ 仍必须独立处理 |
 | **修复** | 两半，缺一不可：① **停用**：`SyncRulesOnConnect` 连 inactive 一起推——agent 的 `applyRule` 对 `Enabled == false` 已经会先 `stopRule` 再 return，复用既有分支即可；② **删除**：删掉的行已不在 `ListCollectionRulesByAgent` 的结果里，**推不出来**，必须给同步加全集语义（下发一条「本次同步的 `rule_id` 全集」，agent 停掉集合外的规则）或 CP 侧留 tombstone。推荐全集语义——proto 只增字段，不必引入软删除表 |
 | **验收** | agent 与 CP 断连 → 删除一条规则、停用另一条 → 恢复连接 → 两条都不再产生上传，且 **agent 进程不重启**也成立；单测覆盖「全集里缺失的规则被停掉」 |
 
