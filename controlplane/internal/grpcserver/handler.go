@@ -179,8 +179,13 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 			return status.Error(codes.PermissionDenied, "agent connection terminated")
 		case r := <-recvCh:
 			if r.err != nil {
+				// Same reasoning as the ctx.Done branch above: waiting for the
+				// send goroutine deadlocks whenever it is parked in stream.Send,
+				// which an agent can arrange by half-closing while refusing to
+				// read. Doing so used to pin this handler outside the select, so
+				// it could no longer observe ctx.Done at all — the agent made
+				// itself unrevokable.
 				cancel()
-				<-sendErr
 				return r.err
 			}
 			s.handleAgentMessage(ctx, agentID, r.msg)

@@ -267,7 +267,8 @@ func TestServer_Connect_Disconnect_WhileSendBlocked(t *testing.T) {
 	// Fill the flow-control window so the send goroutine is parked in Send.
 	// SendCh refusing a message is the signal that it has stopped draining.
 	big := strings.Repeat("x", 1<<20)
-	for i := 0; i < 200; i++ {
+	sent := 0
+	for ; sent < 200; sent++ {
 		if !registry.Send(agentID, &agentv1.ServerMessage{
 			Payload: &agentv1.ServerMessage_PushRule{
 				PushRule: &agentv1.PushRuleCommand{
@@ -279,10 +280,55 @@ func TestServer_Connect_Disconnect_WhileSendBlocked(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+	// Without this the test silently degrades into a duplicate of the plain
+	// disconnect case: if everything fits, the send path never blocked and the
+	// scenario under test never happened.
+	require.Less(t, sent, 200, "send path never became blocked; nothing was tested")
 
 	require.True(t, registry.Disconnect(agentID))
 
 	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
 		8*time.Second, 50*time.Millisecond,
 		"handler did not return while the send path was blocked — registry and goroutine leaked")
+}
+
+// The mirror of the case above: an agent can park the send goroutine and then
+// half-close, which drives the receive loop into its error branch. Waiting for
+// the send goroutine there pins the handler outside the select, so it stops
+// observing ctx.Done entirely and revocation can no longer reach it.
+func TestServer_Connect_HalfClose_WhileSendBlocked_StillUnregisters(t *testing.T) {
+	agentID := "66666666-6666-6666-6666-666666666666"
+	client, bearer, registry := newFullServerForAgent(t, agentID,
+		&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", bearer))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		3*time.Second, 10*time.Millisecond)
+
+	big := strings.Repeat("x", 1<<20)
+	sent := 0
+	for ; sent < 200; sent++ {
+		if !registry.Send(agentID, &agentv1.ServerMessage{
+			Payload: &agentv1.ServerMessage_PushRule{
+				PushRule: &agentv1.PushRuleCommand{
+					Rule: &agentv1.CollectionRule{RuleId: "r", BasePath: big},
+				},
+			},
+		}) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	require.Less(t, sent, 200, "send path never became blocked; nothing was tested")
+
+	// Half-close: the server's Recv returns EOF and takes the error branch.
+	require.NoError(t, stream.CloseSend())
+
+	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		10*time.Second, 50*time.Millisecond,
+		"handler pinned in the Recv error branch — the agent made itself unrevokable")
 }
