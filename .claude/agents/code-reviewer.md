@@ -27,14 +27,26 @@ So, for every behavioural claim in the diff or its description:
    - Keep the mutation *compiling*. `if false {` that leaves a variable unused
      produces a build error, which is a compiler signal, not a test signal. Use
      `&& false` or similar so the package still builds.
+   - **Commit or stash a checkpoint before you start mutating.** Restore with
+     `git checkout --` only once the work is committed — on uncommitted changes it
+     silently discards the very code under review. (This has already happened here:
+     three source edits were wiped mid-review and only noticed when the build broke,
+     because the test files survived.) Mutate through Bash — `sed`, `python`, a
+     heredoc — and verify `git status` is clean when you finish.
    - Mutate **position**, not just presence. A gate that runs after the side
      effects it was meant to prevent is not a gate. Move it later and see whether
      anything notices.
-2. **Verify against the real thing, not a mock.** If a claim is about SQL, run the
+2. **Verify the happy path too, not just the attack.** A guard that rejects the
+   attacker and also rejects every legitimate caller is not a fix, it is an
+   outage — and a test suite built from mocks will happily agree with it. Trace
+   what production actually puts in the field being validated; an id that looks
+   like a database key may be a synthetic correlation token that no table
+   contains.
+3. **Verify against the real thing, not a mock.** If a claim is about SQL, run the
    predicate against the dev PostgreSQL. If it is about authorisation, call the
    RPC. If it is about a policy, assume the role and try the operations. Mocked
    agreement proves only that two of the author's assumptions match.
-3. **Check every file:line, count and quoted output** in the diff and its
+4. **Check every file:line, count and quoted output** in the diff and its
    description against the source. Wrong line numbers and invented counts are
    common and they erode trust in the parts that are right.
 
