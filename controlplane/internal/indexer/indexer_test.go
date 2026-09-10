@@ -23,6 +23,7 @@ var testAgentID = uuid.New()
 
 type mockNATS struct {
 	published map[string][][]byte
+	err       error
 }
 
 func newMockNATS() *mockNATS {
@@ -30,6 +31,9 @@ func newMockNATS() *mockNATS {
 }
 
 func (m *mockNATS) Publish(subject string, data []byte) error {
+	if m.err != nil {
+		return m.err
+	}
 	m.published[subject] = append(m.published[subject], data)
 	return nil
 }
@@ -46,6 +50,8 @@ type mockIndexerStore struct {
 	deleteSuppressed bool
 	ruleAgentID      uuid.UUID
 	lastLog          CreateUploadLogParams
+	upsertCalls      int
+	uploadLogCalls   int
 	deletedEntry     *db.FileEntry
 	deleteErr        error
 	uploadLog        *db.UploadLog
@@ -67,8 +73,11 @@ type mockIndexerStore struct {
 	insertReturns  bool // whether InsertFileTagIfAbsent reports a fresh insert
 	insertTagErr   error
 	tagKeys        map[string]TagKeyInfo // key → controlled key info
+	tagKeyErr      error
 	existingValues map[string]bool       // "value" → registered in tag_values
+	tagValueErr    error
 	similarValue   string
+	similarErr     error
 	pendingUpserts []UpsertPendingTagValueParams
 	pendingErr     error
 }
@@ -78,6 +87,7 @@ func (m *mockIndexerStore) GetBucketByName(_ context.Context, _ uuid.UUID, _ str
 }
 
 func (m *mockIndexerStore) UpsertFileEntry(_ context.Context, params UpsertFileEntryParams) (*db.FileEntry, bool, error) {
+	m.upsertCalls++
 	m.lastUpsert = params
 	return m.fileEntry, m.suppressed, m.upsertErr
 }
@@ -90,6 +100,7 @@ func (m *mockIndexerStore) MarkFileEntryDeleted(_ context.Context, _ db.DeleteIn
 }
 
 func (m *mockIndexerStore) CreateUploadLog(_ context.Context, p CreateUploadLogParams) (*db.UploadLog, error) {
+	m.uploadLogCalls++
 	m.lastLog = p
 	return m.uploadLog, m.uploadLogErr
 }
@@ -118,16 +129,22 @@ func (m *mockIndexerStore) InsertFileTagIfAbsent(_ context.Context, params Upser
 }
 
 func (m *mockIndexerStore) GetTagKeyByName(_ context.Context, _ uuid.UUID, key string) (TagKeyInfo, bool, error) {
+	if m.tagKeyErr != nil {
+		return TagKeyInfo{}, false, m.tagKeyErr
+	}
 	info, ok := m.tagKeys[key]
 	return info, ok, nil
 }
 
 func (m *mockIndexerStore) TagValueExists(_ context.Context, _ uuid.UUID, value string) (bool, error) {
+	if m.tagValueErr != nil {
+		return false, m.tagValueErr
+	}
 	return m.existingValues[value], nil
 }
 
 func (m *mockIndexerStore) FindSimilarTagValue(_ context.Context, _ uuid.UUID, _ string) (string, error) {
-	return m.similarValue, nil
+	return m.similarValue, m.similarErr
 }
 
 func (m *mockIndexerStore) UpsertPendingTagValue(_ context.Context, params UpsertPendingTagValueParams) error {
@@ -320,6 +337,11 @@ func TestHandleUploadResult_FailedUpload(t *testing.T) {
 	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, result)
 	require.NoError(t, err)
 
+	assert.Zero(t, store.upsertCalls, "failed uploads must not create or overwrite file_entries")
+	assert.Equal(t, 1, store.uploadLogCalls)
+	assert.False(t, store.lastLog.FileEntryID.Valid)
+	assert.Equal(t, "failed", store.lastLog.Status)
+	assert.Equal(t, "network error", store.lastLog.ErrorMessage.String)
 	// NATS event should NOT be published for failed uploads.
 	_, ok := nats.published["events.file.uploaded"]
 	assert.False(t, ok)
