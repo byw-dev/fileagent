@@ -409,24 +409,28 @@ type EventRule struct {
 }
 
 type FileEntry struct {
-	ID           uuid.UUID      `db:"id" json:"id"`
-	OrgID        uuid.UUID      `db:"org_id" json:"org_id"`
-	FileTypeID   uuid.NullUUID  `db:"file_type_id" json:"file_type_id"`
-	AgentID      uuid.NullUUID  `db:"agent_id" json:"agent_id"`
-	RuleID       uuid.NullUUID  `db:"rule_id" json:"rule_id"`
-	BucketID     uuid.UUID      `db:"bucket_id" json:"bucket_id"`
-	StoragePath  string         `db:"storage_path" json:"storage_path"`
-	OriginalPath sql.NullString `db:"original_path" json:"original_path"`
-	FileName     string         `db:"file_name" json:"file_name"`
-	SizeBytes    int64          `db:"size_bytes" json:"size_bytes"`
-	Sha256       sql.NullString `db:"sha256" json:"sha256"`
-	Etag         sql.NullString `db:"etag" json:"etag"`
-	ContentType  sql.NullString `db:"content_type" json:"content_type"`
-	FileMtime    sql.NullTime   `db:"file_mtime" json:"file_mtime"`
-	Status       FileStatus     `db:"status" json:"status"`
-	UploadedAt   sql.NullTime   `db:"uploaded_at" json:"uploaded_at"`
-	CreatedAt    time.Time      `db:"created_at" json:"created_at"`
-	UpdatedAt    time.Time      `db:"updated_at" json:"updated_at"`
+	ID             uuid.UUID      `db:"id" json:"id"`
+	OrgID          uuid.UUID      `db:"org_id" json:"org_id"`
+	FileTypeID     uuid.NullUUID  `db:"file_type_id" json:"file_type_id"`
+	AgentID        uuid.NullUUID  `db:"agent_id" json:"agent_id"`
+	RuleID         uuid.NullUUID  `db:"rule_id" json:"rule_id"`
+	BucketID       uuid.UUID      `db:"bucket_id" json:"bucket_id"`
+	StoragePath    string         `db:"storage_path" json:"storage_path"`
+	OriginalPath   sql.NullString `db:"original_path" json:"original_path"`
+	FileName       string         `db:"file_name" json:"file_name"`
+	SizeBytes      int64          `db:"size_bytes" json:"size_bytes"`
+	Sha256         sql.NullString `db:"sha256" json:"sha256"`
+	Etag           sql.NullString `db:"etag" json:"etag"`
+	ContentType    sql.NullString `db:"content_type" json:"content_type"`
+	FileMtime      sql.NullTime   `db:"file_mtime" json:"file_mtime"`
+	Status         FileStatus     `db:"status" json:"status"`
+	UploadedAt     sql.NullTime   `db:"uploaded_at" json:"uploaded_at"`
+	CreatedAt      time.Time      `db:"created_at" json:"created_at"`
+	UpdatedAt      time.Time      `db:"updated_at" json:"updated_at"`
+	ObservedAt     time.Time      `db:"observed_at" json:"observed_at"`
+	Source         string         `db:"source" json:"source"`
+	EventSeq       sql.NullString `db:"event_seq" json:"event_seq"`
+	MetaIncomplete bool           `db:"meta_incomplete" json:"meta_incomplete"`
 }
 
 type FileTag struct {

@@ -63,7 +63,9 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	ctx, cancel := context.WithCancel(stream.Context())
 	conn := s.registry.Register(agentID, stream, cancel)
 	defer func() {
-		s.registry.Unregister(agentID)
+		if !s.registry.Unregister(conn) {
+			return
+		}
 		if s.cache != nil {
 			_ = s.cache.Del(context.Background(), cache.AgentOnlineKey(agentID))
 		}
@@ -496,6 +498,13 @@ func (s *Server) handleUploadResult(ctx context.Context, agentID string, result 
 			zap.String("agent_id", agentID),
 			zap.Error(err),
 		)
+		return
+	}
+	if s.registry != nil && result.GetTaskId() != "" {
+		ack := &agentv1.ServerMessage{MessageId: uuid.NewString(), Payload: &agentv1.ServerMessage_Ack{Ack: &agentv1.Acknowledgement{RefMessageId: result.GetTaskId(), Success: true}}}
+		if !s.registry.Send(agentID, ack) {
+			s.logger.Debug("upload acknowledgement dropped; agent will retry", zap.String("task_id", result.GetTaskId()))
+		}
 	}
 }
 

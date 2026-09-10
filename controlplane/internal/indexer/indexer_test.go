@@ -17,6 +17,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+var testAgentID = uuid.New()
+
 // ── Mock NATS publisher ──────────────────────────────────────────────────────
 
 type mockNATS struct {
@@ -36,16 +38,20 @@ func (m *mockNATS) Publish(subject string, data []byte) error {
 
 // mockIndexerStore fully implements IndexerStore with configurable responses.
 type mockIndexerStore struct {
-	bucket       *db.Bucket
-	bucketErr    error
-	fileEntry    *db.FileEntry
-	upsertErr    error
-	deletedEntry *db.FileEntry
-	deleteErr    error
-	uploadLog    *db.UploadLog
-	uploadLogErr error
-	typeRules    []*db.FileTypeRule
-	typeRulesErr error
+	bucket           *db.Bucket
+	bucketErr        error
+	fileEntry        *db.FileEntry
+	upsertErr        error
+	suppressed       bool
+	deleteSuppressed bool
+	ruleAgentID      uuid.UUID
+	lastLog          CreateUploadLogParams
+	deletedEntry     *db.FileEntry
+	deleteErr        error
+	uploadLog        *db.UploadLog
+	uploadLogErr     error
+	typeRules        []*db.FileTypeRule
+	typeRulesErr     error
 
 	ruleMeta         json.RawMessage
 	destPathTemplate string
@@ -71,16 +77,20 @@ func (m *mockIndexerStore) GetBucketByName(_ context.Context, _ uuid.UUID, _ str
 	return m.bucket, m.bucketErr
 }
 
-func (m *mockIndexerStore) UpsertFileEntry(_ context.Context, params UpsertFileEntryParams) (*db.FileEntry, error) {
+func (m *mockIndexerStore) UpsertFileEntry(_ context.Context, params UpsertFileEntryParams) (*db.FileEntry, bool, error) {
 	m.lastUpsert = params
-	return m.fileEntry, m.upsertErr
+	return m.fileEntry, m.suppressed, m.upsertErr
 }
 
-func (m *mockIndexerStore) MarkFileEntryDeleted(_ context.Context, _ uuid.UUID, _ string) (*db.FileEntry, error) {
-	return m.deletedEntry, m.deleteErr
+func (m *mockIndexerStore) MarkFileEntryDeleted(_ context.Context, _ db.DeleteIndexedFileParams) (*db.FileEntry, bool, bool, error) {
+	if m.deleteErr == sql.ErrNoRows {
+		return nil, false, false, nil
+	}
+	return m.deletedEntry, m.deleteSuppressed, m.deletedEntry != nil, m.deleteErr
 }
 
-func (m *mockIndexerStore) CreateUploadLog(_ context.Context, _ CreateUploadLogParams) (*db.UploadLog, error) {
+func (m *mockIndexerStore) CreateUploadLog(_ context.Context, p CreateUploadLogParams) (*db.UploadLog, error) {
+	m.lastLog = p
 	return m.uploadLog, m.uploadLogErr
 }
 
@@ -92,7 +102,11 @@ func (m *mockIndexerStore) GetRuleTagInfo(_ context.Context, _, _ uuid.UUID) (Ru
 	if m.ruleMetaErr != nil {
 		return RuleTagInfo{}, m.ruleMetaErr
 	}
-	return RuleTagInfo{Metadata: m.ruleMeta, DestPathTemplate: m.destPathTemplate}, nil
+	owner := m.ruleAgentID
+	if owner == uuid.Nil {
+		owner = testAgentID
+	}
+	return RuleTagInfo{AgentID: owner, Metadata: m.ruleMeta, DestPathTemplate: m.destPathTemplate}, nil
 }
 
 func (m *mockIndexerStore) InsertFileTagIfAbsent(_ context.Context, params UpsertFileTagParams) (bool, error) {
@@ -276,7 +290,7 @@ func TestHandleUploadResult_Success(t *testing.T) {
 		UploadedAt:  timestamppb.New(time.Now()),
 	}
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, result)
 	require.NoError(t, err)
 
 	// Verify NATS event was published.
@@ -303,7 +317,7 @@ func TestHandleUploadResult_FailedUpload(t *testing.T) {
 		ErrorMessage: "network error",
 	}
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, result)
 	require.NoError(t, err)
 
 	// NATS event should NOT be published for failed uploads.
@@ -321,7 +335,7 @@ func TestHandleUploadResult_BucketNotFound(t *testing.T) {
 		Success:     true,
 	}
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), uuid.New(), result)
+	err := ix.HandleUploadResult(context.Background(), testAgentID, uuid.New(), result)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing-bucket")
 }
@@ -340,7 +354,7 @@ func TestHandleUploadResult_UpsertError(t *testing.T) {
 		Success:     true,
 	}
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, result)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "upsert file entry")
 }
@@ -363,9 +377,9 @@ func TestHandleUploadResult_UploadLogError(t *testing.T) {
 		Success:     true,
 	}
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, result)
 	// Should not fail even if upload log creation fails.
-	require.NoError(t, err)
+	require.Error(t, err)
 }
 
 func TestHandleUploadResult_ClassifyError(t *testing.T) {
@@ -387,7 +401,7 @@ func TestHandleUploadResult_ClassifyError(t *testing.T) {
 		Success:     true,
 	}
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, result)
 	require.NoError(t, err)
 }
 
@@ -409,7 +423,7 @@ func TestHandleUploadResult_WithRuleID(t *testing.T) {
 		Success:     true,
 	}
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, result)
 	require.NoError(t, err)
 }
 
@@ -430,7 +444,7 @@ func TestHandleUploadResult_WithFileMtime(t *testing.T) {
 		FileMtime:   timestamppb.New(time.Now().Add(-24 * time.Hour)),
 	}
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, result)
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, result)
 	require.NoError(t, err)
 }
 
@@ -514,14 +528,14 @@ func TestIndexUpload_Success(t *testing.T) {
 		fileEntry: newSampleFileEntry(),
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.IndexUpload(context.Background(), "data-sensor", "uploads/file.csv", 1024, "abc123")
+	err := ix.IndexUpload(context.Background(), "data-sensor", "uploads/file.csv", 1024, "abc123", time.Now().UTC(), "seq")
 	require.NoError(t, err)
 }
 
 func TestIndexUpload_BucketNotFound(t *testing.T) {
 	store := &mockIndexerStore{bucketErr: assert.AnError}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.IndexUpload(context.Background(), "missing-bucket", "key.csv", 0, "")
+	err := ix.IndexUpload(context.Background(), "missing-bucket", "key.csv", 0, "", time.Now().UTC(), "seq")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "get bucket")
 }
@@ -532,7 +546,7 @@ func TestIndexUpload_UpsertError(t *testing.T) {
 		upsertErr: assert.AnError,
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.IndexUpload(context.Background(), "data-sensor", "key.csv", 100, "")
+	err := ix.IndexUpload(context.Background(), "data-sensor", "key.csv", 100, "", time.Now().UTC(), "seq")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "upsert file entry")
 }
@@ -549,7 +563,7 @@ func TestIndexDeletion_Found_MarksDeletedAndPublishes(t *testing.T) {
 	nats := newMockNATS()
 	ix := NewIndexerWithStore(store, nats, newTestLogger())
 
-	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv")
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv", time.Now().UTC(), "seq")
 	require.NoError(t, err)
 	published := nats.published["events.file.deleted"]
 	require.Len(t, published, 1, "events.file.deleted must be published")
@@ -564,7 +578,7 @@ func TestIndexDeletion_NotFound_NoOp(t *testing.T) {
 	nats := newMockNATS()
 	ix := NewIndexerWithStore(store, nats, newTestLogger())
 
-	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/never-indexed.csv")
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/never-indexed.csv", time.Now().UTC(), "seq")
 	require.NoError(t, err, "deleting an unindexed object is a no-op")
 	assert.Empty(t, nats.published["events.file.deleted"], "no event for a no-op delete")
 }
@@ -572,7 +586,7 @@ func TestIndexDeletion_NotFound_NoOp(t *testing.T) {
 func TestIndexDeletion_BucketError(t *testing.T) {
 	store := &mockIndexerStore{bucketErr: assert.AnError}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.IndexDeletion(context.Background(), "data-sensor", "k")
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "k", time.Now().UTC(), "seq")
 	require.Error(t, err)
 }
 
@@ -601,7 +615,7 @@ func TestHandleUploadResult_AppliesStaticTags(t *testing.T) {
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
 	require.NoError(t, err)
 
 	require.Len(t, store.upsertedTags, 2)
@@ -626,7 +640,7 @@ func TestHandleUploadResult_NoRuleMetadata_NoTags(t *testing.T) {
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
 	require.NoError(t, err)
 	assert.Empty(t, store.upsertedTags)
 }
@@ -642,7 +656,7 @@ func TestHandleUploadResult_MalformedMetadata_DegradesGracefully(t *testing.T) {
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
 	require.NoError(t, err)
 	assert.Empty(t, store.upsertedTags)
 }
@@ -663,7 +677,7 @@ func TestHandleUploadResult_DeclaredFileTypeOverridesGlob(t *testing.T) {
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
 	require.NoError(t, err)
 	require.True(t, store.lastUpsert.FileTypeID.Valid)
 	assert.Equal(t, declaredID, store.lastUpsert.FileTypeID.UUID)
@@ -683,7 +697,7 @@ func TestHandleUploadResult_DeclaredFileTypeNotFound_FallsBackToGlob(t *testing.
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
 	require.NoError(t, err)
 	require.True(t, store.lastUpsert.FileTypeID.Valid)
 	assert.Equal(t, globID, store.lastUpsert.FileTypeID.UUID)
@@ -701,7 +715,7 @@ func TestHandleUploadResult_TagUpsertError_DoesNotFailIndexing(t *testing.T) {
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
 	require.NoError(t, err)
 }
 
@@ -717,7 +731,7 @@ func TestHandleUploadResult_SkipsOverlongStaticTag(t *testing.T) {
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "uploads/p.csv"))
 	require.NoError(t, err)
 
 	// The overlong "note" tag is skipped; the valid "vendor" tag still lands.
@@ -745,7 +759,7 @@ func TestHandleUploadResult_ExtractsPathVarTag(t *testing.T) {
 		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
 	require.NoError(t, err)
 
 	require.Len(t, store.insertedTags, 1)
@@ -764,7 +778,7 @@ func TestHandleUploadResult_PathVar_LeadingSlashTemplate(t *testing.T) {
 		`{"path_tag_map":{"site":"{site}"}}`, "/data/{site}/{filename}")
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID,
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID,
 		newTagResult(uuid.New(), "data/tokyo/p.csv"))
 	require.NoError(t, err)
 
@@ -780,7 +794,7 @@ func TestHandleUploadResult_PathVar_TemplateMismatch_NoTag(t *testing.T) {
 		`{"path_tag_map":{"site":"{site}"}}`, "data/{site}/{filename}")
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "totally/different/path.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "totally/different/path.csv"))
 	require.NoError(t, err)
 	assert.Empty(t, store.insertedTags)
 }
@@ -796,7 +810,7 @@ func TestHandleUploadResult_PathVar_UnregisteredControlledValue_Queued(t *testin
 	store.similarValue = "Tokyo"             // case drift suggestion
 
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
 	require.NoError(t, err)
 
 	require.Len(t, store.pendingUpserts, 1)
@@ -816,7 +830,7 @@ func TestHandleUploadResult_PathVar_RegisteredValue_NotQueued(t *testing.T) {
 	store.existingValues = map[string]bool{"tokyo": true} // already approved
 
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
 	require.NoError(t, err)
 	assert.Empty(t, store.pendingUpserts)
 }
@@ -830,7 +844,7 @@ func TestHandleUploadResult_PathVar_UncontrolledKey_NotQueued(t *testing.T) {
 	store.tagKeys = map[string]TagKeyInfo{}
 
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
 	require.NoError(t, err)
 	require.Len(t, store.insertedTags, 1) // tag still recorded
 	assert.Empty(t, store.pendingUpserts) // but not queued
@@ -846,7 +860,7 @@ func TestHandleUploadResult_PathVar_AllowPathVarFalse_Skipped(t *testing.T) {
 	store.existingValues = map[string]bool{}
 
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
 	require.NoError(t, err)
 	assert.Empty(t, store.insertedTags)   // no tag written
 	assert.Empty(t, store.pendingUpserts) // no queue side effect
@@ -862,7 +876,7 @@ func TestHandleUploadResult_PathVar_NotInserted_NotQueued(t *testing.T) {
 	store.existingValues = map[string]bool{}
 
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.HandleUploadResult(context.Background(), uuid.New(), bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
+	err := ix.HandleUploadResult(context.Background(), testAgentID, bucket.OrgID, newTagResult(uuid.New(), "data/tokyo/p.csv"))
 	require.NoError(t, err)
 	assert.Empty(t, store.pendingUpserts) // idempotent: no re-queue on non-insert
 }

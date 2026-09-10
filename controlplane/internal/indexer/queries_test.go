@@ -37,12 +37,12 @@ func TestUpsertFileEntry_Success(t *testing.T) {
 		"id", "org_id", "file_type_id", "agent_id", "rule_id", "bucket_id",
 		"storage_path", "original_path", "file_name", "size_bytes",
 		"sha256", "etag", "content_type", "file_mtime", "status",
-		"uploaded_at", "created_at", "updated_at",
+		"uploaded_at", "created_at", "updated_at", "observed_at", "source", "event_seq", "meta_incomplete",
 	}).AddRow(
 		entryID, orgID, nil, nil, nil, bucketID,
 		"uploads/file.log", nil, "file.log", int64(1024),
 		nil, nil, nil, nil, db.FileStatusCompleted,
-		now, now, now,
+		now, now, now, now, "agent", nil, false,
 	)
 	mock.ExpectQuery("INSERT INTO file_entries").WillReturnRows(rows)
 
@@ -55,7 +55,7 @@ func TestUpsertFileEntry_Success(t *testing.T) {
 		Status:      db.FileStatusCompleted,
 		UploadedAt:  sql.NullTime{Time: now, Valid: true},
 	}
-	fe, err := UpsertFileEntry(context.Background(), mockDB, arg)
+	fe, _, err := UpsertFileEntry(context.Background(), mockDB, arg)
 	require.NoError(t, err)
 	require.NotNil(t, fe)
 	assert.Equal(t, entryID, fe.ID)
@@ -66,7 +66,7 @@ func TestUpsertFileEntry_DBError(t *testing.T) {
 	mockDB, mock := newMockDB(t)
 	mock.ExpectQuery("INSERT INTO file_entries").WillReturnError(assert.AnError)
 
-	_, err := UpsertFileEntry(context.Background(), mockDB, UpsertFileEntryParams{
+	_, _, err := UpsertFileEntry(context.Background(), mockDB, UpsertFileEntryParams{
 		OrgID:    uuid.New(),
 		BucketID: uuid.New(),
 	})
@@ -353,16 +353,16 @@ func TestMarkFileEntryDeleted_Success(t *testing.T) {
 		"id", "org_id", "file_type_id", "agent_id", "rule_id", "bucket_id",
 		"storage_path", "original_path", "file_name", "size_bytes",
 		"sha256", "etag", "content_type", "file_mtime", "status",
-		"uploaded_at", "created_at", "updated_at",
+		"uploaded_at", "created_at", "updated_at", "observed_at", "source", "event_seq", "meta_incomplete",
 	}).AddRow(
 		entryID, uuid.New(), nil, nil, nil, bucketID,
 		"uploads/gone.csv", nil, "gone.csv", int64(10),
 		nil, nil, nil, nil, db.FileStatusDeleted,
-		now, now, now,
+		now, now, now, now, "minio_event", nil, false,
 	)
 	mock.ExpectQuery("UPDATE file_entries").WillReturnRows(rows)
 
-	fe, err := MarkFileEntryDeleted(context.Background(), mockDB, bucketID, "uploads/gone.csv")
+	fe, _, _, err := MarkFileEntryDeleted(context.Background(), mockDB, db.DeleteIndexedFileParams{BucketID: bucketID, StoragePath: "uploads/gone.csv"})
 	require.NoError(t, err)
 	assert.Equal(t, entryID, fe.ID)
 	assert.Equal(t, db.FileStatusDeleted, fe.Status)
@@ -372,8 +372,11 @@ func TestMarkFileEntryDeleted_NotFound(t *testing.T) {
 	mockDB, mock := newMockDB(t)
 	mock.ExpectQuery("UPDATE file_entries").WillReturnError(sql.ErrNoRows)
 
-	_, err := MarkFileEntryDeleted(context.Background(), mockDB, uuid.New(), "missing")
-	require.ErrorIs(t, err, sql.ErrNoRows)
+	mock.ExpectQuery("SELECT .* FROM file_entries").WillReturnError(sql.ErrNoRows)
+	_, suppressed, found, err := MarkFileEntryDeleted(context.Background(), mockDB, db.DeleteIndexedFileParams{BucketID: uuid.New(), StoragePath: "missing"})
+	require.NoError(t, err)
+	require.False(t, suppressed)
+	require.False(t, found)
 }
 
 // ── MT-2/MT-3 tag queries ───────────────────────────────────────────────────────
@@ -406,9 +409,9 @@ func TestGetFileTypeIDByName_FoundAndMissing(t *testing.T) {
 
 func TestGetRuleTagInfo_Success(t *testing.T) {
 	mockDB, mock := newMockDB(t)
-	mock.ExpectQuery("SELECT metadata, dest_path_template FROM collection_rules").
-		WillReturnRows(sqlmock.NewRows([]string{"metadata", "dest_path_template"}).
-			AddRow([]byte(`{"file_type":"pressure"}`), "data/{site}/{filename}"))
+	mock.ExpectQuery("SELECT agent_id, metadata, dest_path_template FROM collection_rules").
+		WillReturnRows(sqlmock.NewRows([]string{"agent_id", "metadata", "dest_path_template"}).
+			AddRow(uuid.New(), []byte(`{"file_type":"pressure"}`), "data/{site}/{filename}"))
 	info, err := GetRuleTagInfo(context.Background(), mockDB, uuid.New(), uuid.New())
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"file_type":"pressure"}`, string(info.Metadata))
@@ -418,7 +421,7 @@ func TestGetRuleTagInfo_Success(t *testing.T) {
 
 func TestGetRuleTagInfo_NotFound(t *testing.T) {
 	mockDB, mock := newMockDB(t)
-	mock.ExpectQuery("SELECT metadata, dest_path_template FROM collection_rules").
+	mock.ExpectQuery("SELECT agent_id, metadata, dest_path_template FROM collection_rules").
 		WillReturnError(sql.ErrNoRows)
 	_, err := GetRuleTagInfo(context.Background(), mockDB, uuid.New(), uuid.New())
 	require.ErrorIs(t, err, sql.ErrNoRows)

@@ -129,6 +129,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-33 | 失败的上报仍写 `file_entries` 行，制造「DB 有、对象无」的反向幽灵 | 🟠 P1 | controlplane |
 | IC-BUG-34 | agent 重启后 `running` 态任务无复位，永久孤儿：不重传也不上报 | 🟠 P1 | agent |
 | IC-BUG-35 | `init-minio.sh` 默认 CP 服务账号 access key 超出 MinIO 20 字符上限，脚本第 4 步必失败 | 🟠 P1 | deploy |
+| IC-BUG-36 | CP 凭据被 `init-minio.sh` 建成 **service account**，而 MinIO 的 service account 不能调 AssumeRole → 全新环境 STS 必然 `Access Denied` | 🔴 P0 | deploy |
 
 ---
 
@@ -545,6 +546,21 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 把默认值改成 ≤20 字符（如 `cpAdmin000000000000`），并在脚本里对长度做前置校验 + 明确报错；同步更新 `init-minio.sh:17` 的注释与部署文档里的示例值。**不存在 `deploy/config/controlplane.env.example`**（`deploy/config/` 整个被 gitignore），仓库里仅 `init-minio.sh:17` 与 `:33` 两处出现该值。**注意这会改变已部署环境的凭据**，需在变更说明里写清 |
 | **验收** | 干净的 MinIO 容器上从头跑一遍 `init-minio.sh` 全程 exit 0；CP 用脚本产出的凭据能成功签发预签名下载 URL 并取回对象 |
 | **归属** | 未排期。与 IC 主线正交（不影响写入准入/一致性），但**挡着任何人复现 live 验收**，宜与 IC-4（同样要动 `init-minio.sh`）合并处理 |
+
+---
+
+## IC-BUG-36 — CP 凭据是 service account，MinIO 不允许其 AssumeRole，全新环境 STS 必然失败 🔴 P0
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `init-minio.sh` 第 4 步用 `mc admin user svcacct add … "${MINIO_ROOT_USER}"` 把 Control Plane 的凭据建成 **root 的 service account**。而 MinIO 的 STS `AssumeRole` **只接受真实 IAM 用户的 access key**，service account（派生凭据）调用一律 `Access Denied`。于是 CP 用这套凭据永远签不出 STS 凭据 |
+| **精确位置** | `deploy/scripts/init-minio.sh:102-104`（`svcacct add`）；消费方 `controlplane/internal/storage/sts.go:92-107`（`credentials.STSAssumeRole`） |
+| **实测（2026-09-10，dev，四路探针）** | 直接对 `http://localhost:9000` 打 `STSAssumeRole`：`svcacct + roleARN` → **Access Denied**；`svcacct + 空 roleARN` → **Access Denied**；`root + 空 roleARN` → **OK**；`root + roleARN` → **OK**。即失败与 `MINIO_ROLE_ARN` 无关，**只取决于调用方是不是 service account** |
+| **后果** | **任何人从头 bootstrap 出来的环境，Agent 数据面都跑不通**：`Connect` 时 `pushCredentials` 报 `sts: get credentials: Access Denied.`（`grpcserver/handler.go:382`），agent 拿不到凭据 → 不上传 → 不上报。IC-2a 的 live 验收第一条（`agent_id`/`rule_id`/`sha256` 非空）**对所有人都执行不了** |
+| **与 IC-1 的关系** | **IC-1（PR #93）声称「STS 链路接通、live-e2e 通过」与本条冲突**，二者不可能同时为真。尚未查实是「当时用的是真实 IAM 用户、后来被换成 svcacct」还是「当时的验收没真正走到 AssumeRole」。**恢复 IC-2a 前必须先查实**——若是前者，说明 dev 环境凭据在 2026-09-10 为修预签名下载（见 IC-BUG-35）时被改坏 |
+| **修复** | CP 凭据改为 `mc admin user add` 建的**真实 IAM 用户**并 attach 一个既能签预签名 URL、又能 AssumeRole 的 policy；`init-minio.sh` 相应改写并在脚本里断言「该 key 能成功 AssumeRole」。**与 IC-BUG-35 同一处代码，应合并修复** |
+| **验收** | 干净 MinIO 上跑完 `init-minio.sh`，用脚本产出的凭据成功 `AssumeRole` 拿到临时凭据；CP 启动后 agent `Connect` 能收到 `Credentials`，且预签名下载仍然可用（两个能力不能顾此失彼） |
+| **归属** | 未排期，但**挡着 IC-2a 的 live 验收**，是恢复 IC-2a 的第一件事 |
 
 ---
 

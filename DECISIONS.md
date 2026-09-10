@@ -1388,6 +1388,16 @@ Agent 的 session policy 体积上限，全部不存在。IC-1 的实现量因�
     **不能说明历史分区没被改过**，因此不能充当正确性机制。这也正是「上传一组历史归档数据」
     这类场景的真实形态。见 `~/workspace/minio-inventory` `docs/01-审计可扩展性设计.md` §2.3。
 
+### IC-2a 契约落地（2026-09-10）
+
+追加迁移 000006，为 `file_entries` 增加 `observed_at TIMESTAMPTZ NOT NULL DEFAULT now()`、
+`source`（仅 agent/api/minio_event/audit）、可空 `event_seq` 与粘性 `meta_incomplete`。
+守卫采用较新时刻优先、相等时任一 NULL sequencer 放行，否则按 32 位补零比较；
+软删除同步推进两列，压制的 upsert 回查现有行并返回 suppressed，避免 ErrNoRows 传播。
+Agent/API 时刻由 PostgreSQL now() 产生；MinIO 用 eventTime，audit 用列举时刻。
+UploadResult 将只增 `task_id` 字段，Agent 持久化 reported 结果并在 ack 后完成，超时重报。
+失败只写 upload_logs；拿不到规则元数据时置 meta_incomplete（从不清位），列表与详情暴露该字段。
+
 ### 分期实施
 
 | 阶段 | 任务 | 内容 | 说明 |

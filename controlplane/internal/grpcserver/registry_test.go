@@ -23,10 +23,10 @@ func TestAgentRegistry_RegisterAndGet(t *testing.T) {
 
 func TestAgentRegistry_Unregister(t *testing.T) {
 	r := NewAgentRegistry()
-	r.Register("agent-1", nil, func() {})
+	conn := r.Register("agent-1", nil, func() {})
 	assert.True(t, r.IsOnline("agent-1"))
 
-	r.Unregister("agent-1")
+	r.Unregister(conn)
 	assert.False(t, r.IsOnline("agent-1"))
 	assert.Nil(t, r.Get("agent-1"))
 }
@@ -99,6 +99,36 @@ func TestAgentRegistry_Disconnect_CancelsStreamContext(t *testing.T) {
 	default:
 	}
 
-	r.Unregister("agent-1")
+	r.Unregister(conn)
 	assert.False(t, r.Disconnect("agent-1"), "an absent agent reports false")
+}
+
+// TestAgentRegistryReconnectWhileSending proves old streams cannot close replacements.
+func TestAgentRegistryReconnectWhileSending(t *testing.T) {
+	r := NewAgentRegistry()
+	current := r.Register("agent", nil, func() {})
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				r.Send("agent", &agentv1.ServerMessage{})
+			}
+		}
+	}()
+	for i := 0; i < 10000; i++ {
+		fresh := r.Register("agent", nil, func() {})
+		require.False(t, r.Unregister(current))
+		require.True(t, r.IsOnline("agent"))
+		current = fresh
+	}
+	close(done)
+	<-finished
+	require.True(t, r.Unregister(current))
+	require.False(t, r.Unregister(current))
+	require.False(t, r.Unregister(nil))
 }

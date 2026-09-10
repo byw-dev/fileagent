@@ -16,94 +16,12 @@ import (
 
 // ── UpsertFileEntry ──────────────────────────────────────────────────────────
 
-// UpsertFileEntryParams holds the parameters for UpsertFileEntry.
-type UpsertFileEntryParams struct {
-	OrgID        uuid.UUID
-	FileTypeID   uuid.NullUUID
-	AgentID      uuid.NullUUID
-	RuleID       uuid.NullUUID
-	BucketID     uuid.UUID
-	StoragePath  string
-	OriginalPath sql.NullString
-	FileName     string
-	SizeBytes    int64
-	Sha256       sql.NullString
-	Etag         sql.NullString
-	ContentType  sql.NullString
-	FileMtime    sql.NullTime
-	Status       db.FileStatus
-	UploadedAt   sql.NullTime
-}
+// UpsertFileEntryParams carries the source-specific observation and file metadata.
+type UpsertFileEntryParams = db.UpsertIndexedFileParams
 
-const upsertFileEntrySQL = `
-INSERT INTO file_entries (
-    org_id, file_type_id, agent_id, rule_id, bucket_id,
-    storage_path, original_path, file_name, size_bytes,
-    sha256, etag, content_type, file_mtime, status, uploaded_at
-) VALUES (
-    $1, $2, $3, $4, $5,
-    $6, $7, $8, $9,
-    $10, $11, $12, $13, $14, $15
-)
-ON CONFLICT (bucket_id, storage_path) DO UPDATE SET
-    file_type_id  = EXCLUDED.file_type_id,
-    agent_id      = EXCLUDED.agent_id,
-    rule_id       = EXCLUDED.rule_id,
-    file_name     = EXCLUDED.file_name,
-    size_bytes    = EXCLUDED.size_bytes,
-    sha256        = EXCLUDED.sha256,
-    etag          = EXCLUDED.etag,
-    content_type  = EXCLUDED.content_type,
-    file_mtime    = EXCLUDED.file_mtime,
-    status        = EXCLUDED.status,
-    uploaded_at   = EXCLUDED.uploaded_at,
-    updated_at    = NOW()
-RETURNING id, org_id, file_type_id, agent_id, rule_id, bucket_id,
-    storage_path, original_path, file_name, size_bytes,
-    sha256, etag, content_type, file_mtime, status, uploaded_at, created_at, updated_at
-`
-
-// UpsertFileEntry inserts or updates a file_entries row.
-func UpsertFileEntry(ctx context.Context, dbtx db.DBTX, arg UpsertFileEntryParams) (*db.FileEntry, error) {
-	row := dbtx.QueryRowContext(ctx, upsertFileEntrySQL,
-		arg.OrgID,
-		arg.FileTypeID,
-		arg.AgentID,
-		arg.RuleID,
-		arg.BucketID,
-		arg.StoragePath,
-		arg.OriginalPath,
-		arg.FileName,
-		arg.SizeBytes,
-		arg.Sha256,
-		arg.Etag,
-		arg.ContentType,
-		arg.FileMtime,
-		arg.Status,
-		arg.UploadedAt,
-	)
-	var i db.FileEntry
-	err := row.Scan(
-		&i.ID,
-		&i.OrgID,
-		&i.FileTypeID,
-		&i.AgentID,
-		&i.RuleID,
-		&i.BucketID,
-		&i.StoragePath,
-		&i.OriginalPath,
-		&i.FileName,
-		&i.SizeBytes,
-		&i.Sha256,
-		&i.Etag,
-		&i.ContentType,
-		&i.FileMtime,
-		&i.Status,
-		&i.UploadedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return &i, err
+// UpsertFileEntry returns the current row and whether the write was suppressed.
+func UpsertFileEntry(ctx context.Context, dbtx db.DBTX, arg UpsertFileEntryParams) (*db.FileEntry, bool, error) {
+	return db.New(dbtx).UpsertObservedFile(ctx, arg)
 }
 
 // ── CreateUploadLog ──────────────────────────────────────────────────────────
@@ -206,42 +124,9 @@ func GetBucketByName(ctx context.Context, dbtx db.DBTX, orgID uuid.UUID, name st
 
 // ── MarkFileEntryDeleted ─────────────────────────────────────────────────────
 
-const markFileEntryDeletedSQL = `
-UPDATE file_entries
-SET status = 'deleted', updated_at = NOW()
-WHERE bucket_id = $1 AND storage_path = $2 AND status != 'deleted'
-RETURNING id, org_id, file_type_id, agent_id, rule_id, bucket_id,
-    storage_path, original_path, file_name, size_bytes,
-    sha256, etag, content_type, file_mtime, status, uploaded_at, created_at, updated_at
-`
-
-// MarkFileEntryDeleted soft-deletes the file entry identified by (bucket, path),
-// returning the updated row. It returns sql.ErrNoRows when no matching entry
-// exists or it was already deleted, so the caller can treat it as a no-op.
-func MarkFileEntryDeleted(ctx context.Context, dbtx db.DBTX, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error) {
-	row := dbtx.QueryRowContext(ctx, markFileEntryDeletedSQL, bucketID, storagePath)
-	var i db.FileEntry
-	err := row.Scan(
-		&i.ID,
-		&i.OrgID,
-		&i.FileTypeID,
-		&i.AgentID,
-		&i.RuleID,
-		&i.BucketID,
-		&i.StoragePath,
-		&i.OriginalPath,
-		&i.FileName,
-		&i.SizeBytes,
-		&i.Sha256,
-		&i.Etag,
-		&i.ContentType,
-		&i.FileMtime,
-		&i.Status,
-		&i.UploadedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return &i, err
+// MarkFileEntryDeleted returns a row plus suppression and existence flags.
+func MarkFileEntryDeleted(ctx context.Context, dbtx db.DBTX, arg db.DeleteIndexedFileParams) (*db.FileEntry, bool, bool, error) {
+	return db.New(dbtx).MarkObservedFileDeleted(ctx, arg)
 }
 
 // ── ListEnabledEventRules ────────────────────────────────────────────────────
@@ -315,25 +200,18 @@ func ListFileTypeRules(ctx context.Context, dbtx db.DBTX) ([]*db.FileTypeRule, e
 // metadata declaration plus the dest_path_template that the storage path was
 // rendered from (needed to reverse-extract path variables).
 type RuleTagInfo struct {
+	AgentID          uuid.UUID
 	Metadata         json.RawMessage
 	DestPathTemplate string
 }
 
-const getRuleTagInfoSQL = `
-SELECT metadata, dest_path_template FROM collection_rules WHERE id = $1 AND org_id = $2 LIMIT 1
-`
-
-// GetRuleTagInfo returns a rule's metadata + dest_path_template scoped to an org,
-// so an agent that sends an arbitrary rule UUID cannot read another tenant's rule
-// (defense-in-depth). It returns sql.ErrNoRows when no such rule exists in the
-// org, so callers can treat it as "no declaration".
+// GetRuleTagInfo fetches a rule's owner and declarations within the organization.
 func GetRuleTagInfo(ctx context.Context, dbtx db.DBTX, orgID, ruleID uuid.UUID) (RuleTagInfo, error) {
-	row := dbtx.QueryRowContext(ctx, getRuleTagInfoSQL, ruleID, orgID)
-	var info RuleTagInfo
-	if err := row.Scan(&info.Metadata, &info.DestPathTemplate); err != nil {
+	row, err := db.New(dbtx).GetIngestRuleInfo(ctx, ruleID, orgID)
+	if err != nil {
 		return RuleTagInfo{}, err
 	}
-	return info, nil
+	return RuleTagInfo{AgentID: row.AgentID, Metadata: row.Metadata, DestPathTemplate: row.DestPathTemplate}, nil
 }
 
 // ── GetFileTypeIDByName ──────────────────────────────────────────────────────

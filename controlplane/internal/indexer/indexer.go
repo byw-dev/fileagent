@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -27,8 +28,8 @@ type NATSPublisher interface {
 // without a real database.
 type IndexerStore interface {
 	GetBucketByName(ctx context.Context, orgID uuid.UUID, name string) (*db.Bucket, error)
-	UpsertFileEntry(ctx context.Context, params UpsertFileEntryParams) (*db.FileEntry, error)
-	MarkFileEntryDeleted(ctx context.Context, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error)
+	UpsertFileEntry(ctx context.Context, params UpsertFileEntryParams) (*db.FileEntry, bool, error)
+	MarkFileEntryDeleted(ctx context.Context, arg db.DeleteIndexedFileParams) (*db.FileEntry, bool, bool, error)
 	CreateUploadLog(ctx context.Context, params CreateUploadLogParams) (*db.UploadLog, error)
 	ListFileTypeRules(ctx context.Context) ([]*db.FileTypeRule, error)
 	GetRuleTagInfo(ctx context.Context, orgID, ruleID uuid.UUID) (RuleTagInfo, error)
@@ -52,13 +53,13 @@ func (d *dbtxIndexerStore) GetBucketByName(ctx context.Context, orgID uuid.UUID,
 }
 
 // UpsertFileEntry delegates to the package-level function.
-func (d *dbtxIndexerStore) UpsertFileEntry(ctx context.Context, params UpsertFileEntryParams) (*db.FileEntry, error) {
+func (d *dbtxIndexerStore) UpsertFileEntry(ctx context.Context, params UpsertFileEntryParams) (*db.FileEntry, bool, error) {
 	return UpsertFileEntry(ctx, d.dbtx, params)
 }
 
 // MarkFileEntryDeleted delegates to the package-level function.
-func (d *dbtxIndexerStore) MarkFileEntryDeleted(ctx context.Context, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error) {
-	return MarkFileEntryDeleted(ctx, d.dbtx, bucketID, storagePath)
+func (d *dbtxIndexerStore) MarkFileEntryDeleted(ctx context.Context, arg db.DeleteIndexedFileParams) (*db.FileEntry, bool, bool, error) {
+	return MarkFileEntryDeleted(ctx, d.dbtx, arg)
 }
 
 // CreateUploadLog delegates to the package-level function.
@@ -113,10 +114,12 @@ func (d *dbtxIndexerStore) UpsertPendingTagValue(ctx context.Context, params Ups
 
 // Indexer processes upload results from agents and maintains the file index.
 type Indexer struct {
-	store      IndexerStore
-	nats       NATSPublisher
-	classifier *Classifier
-	logger     *zap.Logger
+	suppressedWrites atomic.Uint64
+	absentDeletes    atomic.Uint64
+	store            IndexerStore
+	nats             NATSPublisher
+	classifier       *Classifier
+	logger           *zap.Logger
 }
 
 // NewIndexer creates a new Indexer backed by a db.DBTX. This is the primary
@@ -159,13 +162,31 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 		}
 	}
 
-	// Load the rule's metadata declaration (file_type / static_tags / path_tag_map)
-	// and dest_path_template. Best effort: a missing or malformed declaration
-	// degrades to glob-only classification with no tags.
+	// A queued upload outlives its rule; only a foreign owner warrants a warning.
 	var ruleMeta ruleMetadata
 	var destTemplate string
+	metaIncomplete := true
 	if ruleID.Valid {
-		ruleMeta, destTemplate = ix.loadRuleMetadata(ctx, orgID, ruleID.UUID)
+		info, lookupErr := ix.store.GetRuleTagInfo(ctx, orgID, ruleID.UUID)
+		switch {
+		case lookupErr == sql.ErrNoRows:
+			ix.logger.Info("indexer: upload rule no longer exists", zap.String("rule_id", ruleID.UUID.String()))
+			ruleID = uuid.NullUUID{}
+		case lookupErr != nil:
+			return fmt.Errorf("indexer: validate upload rule: %w", lookupErr)
+		case info.AgentID != agentID:
+			ix.logger.Warn("indexer: upload rule belongs to another agent", zap.String("rule_id", ruleID.UUID.String()), zap.String("agent_id", agentID.String()), zap.String("rule_agent_id", info.AgentID.String()))
+			ruleID = uuid.NullUUID{}
+		default:
+			destTemplate = info.DestPathTemplate
+			metaIncomplete = false
+			if len(info.Metadata) > 0 {
+				if err := json.Unmarshal(info.Metadata, &ruleMeta); err != nil {
+					metaIncomplete = true
+					ix.logger.Warn("indexer: parse rule metadata", zap.Error(err))
+				}
+			}
+		}
 	}
 
 	// Classify file type: a rule-declared file_type takes priority over the
@@ -191,36 +212,50 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 	}
 
 	// Upsert file entry.
-	fileEntry, err := ix.store.UpsertFileEntry(ctx, UpsertFileEntryParams{
-		OrgID:        orgID,
-		FileTypeID:   uuid.NullUUID{UUID: fileTypeID, Valid: fileTypeID != uuid.Nil},
-		AgentID:      uuid.NullUUID{UUID: agentID, Valid: true},
-		RuleID:       ruleID,
-		BucketID:     bucket.ID,
-		StoragePath:  result.GetStoragePath(),
-		OriginalPath: sql.NullString{String: result.GetLocalPath(), Valid: result.GetLocalPath() != ""},
-		FileName:     fileNameFromPath(result.GetStoragePath()),
-		SizeBytes:    result.GetSizeBytes(),
-		Sha256:       sql.NullString{String: result.GetSha256(), Valid: result.GetSha256() != ""},
-		Etag:         sql.NullString{String: result.GetEtag(), Valid: result.GetEtag() != ""},
-		FileMtime:    fileMtime,
-		Status:       fileStatus,
-		UploadedAt:   uploadedAt,
-	})
-	if err != nil {
-		return fmt.Errorf("indexer: upsert file entry: %w", err)
+	var fileEntry *db.FileEntry
+	if result.GetSuccess() {
+		var suppressed bool
+		fileEntry, suppressed, err = ix.store.UpsertFileEntry(ctx, UpsertFileEntryParams{
+			OrgID:  orgID,
+			Source: "agent", MetaIncomplete: metaIncomplete,
+			FileTypeID:   uuid.NullUUID{UUID: fileTypeID, Valid: fileTypeID != uuid.Nil},
+			AgentID:      uuid.NullUUID{UUID: agentID, Valid: true},
+			RuleID:       ruleID,
+			BucketID:     bucket.ID,
+			StoragePath:  result.GetStoragePath(),
+			OriginalPath: sql.NullString{String: result.GetLocalPath(), Valid: result.GetLocalPath() != ""},
+			FileName:     fileNameFromPath(result.GetStoragePath()),
+			SizeBytes:    result.GetSizeBytes(),
+			Sha256:       sql.NullString{String: result.GetSha256(), Valid: result.GetSha256() != ""},
+			Etag:         sql.NullString{String: result.GetEtag(), Valid: result.GetEtag() != ""},
+			FileMtime:    fileMtime,
+			Status:       fileStatus,
+			UploadedAt:   uploadedAt,
+		})
+		if err != nil {
+			return fmt.Errorf("indexer: upsert file entry: %w", err)
+		}
+
+		if suppressed {
+			ix.suppressedWrites.Add(1)
+			return nil
+		}
+
+		// Apply rule-declared static tags (source=rule_static), idempotent on
+		// (file_entry_id, key). Best effort: a tag failure is logged but does not
+		// fail indexing (mirrors upload-log handling).
+		ix.applyStaticTags(ctx, fileEntry.ID, ruleMeta.StaticTags)
+
+		// Extract path-variable tags (source=path_var) from the storage path.
+		// Runs after static tags and does not overwrite them (explicit wins).
+		ix.applyPathVarTags(ctx, orgID, fileEntry.ID, result.GetStoragePath(), destTemplate, ruleMeta.PathTagMap, ruleID)
+
 	}
-
-	// Apply rule-declared static tags (source=rule_static), idempotent on
-	// (file_entry_id, key). Best effort: a tag failure is logged but does not
-	// fail indexing (mirrors upload-log handling).
-	ix.applyStaticTags(ctx, fileEntry.ID, ruleMeta.StaticTags)
-
-	// Extract path-variable tags (source=path_var) from the storage path.
-	// Runs after static tags and does not overwrite them (explicit wins).
-	ix.applyPathVarTags(ctx, orgID, fileEntry.ID, result.GetStoragePath(), destTemplate, ruleMeta.PathTagMap, ruleID)
-
 	// Create upload log.
+	var fileEntryID uuid.NullUUID
+	if fileEntry != nil {
+		fileEntryID = uuid.NullUUID{UUID: fileEntry.ID, Valid: true}
+	}
 	logStatus := "completed"
 	var errMsg sql.NullString
 	if !result.GetSuccess() {
@@ -231,7 +266,7 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 	_, err = ix.store.CreateUploadLog(ctx, CreateUploadLogParams{
 		OrgID:            orgID,
 		AgentID:          agentID,
-		FileEntryID:      uuid.NullUUID{UUID: fileEntry.ID, Valid: true},
+		FileEntryID:      fileEntryID,
 		RuleID:           ruleID,
 		OriginalPath:     result.GetLocalPath(),
 		StoragePath:      result.GetStoragePath(),
@@ -244,7 +279,7 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 		FinishedAt:       sql.NullTime{Time: time.Now().UTC(), Valid: true},
 	})
 	if err != nil {
-		ix.logger.Warn("indexer: create upload log failed", zap.Error(err))
+		return fmt.Errorf("indexer: create upload log: %w", err)
 	}
 
 	// Publish NATS event.
@@ -253,7 +288,6 @@ func (ix *Indexer) HandleUploadResult(ctx context.Context, agentID uuid.UUID, or
 	}
 
 	ix.logger.Info("file indexed",
-		zap.String("file_entry_id", fileEntry.ID.String()),
 		zap.String("storage_path", result.GetStoragePath()),
 		zap.String("status", string(fileStatus)),
 	)
@@ -527,7 +561,7 @@ func (ix *Indexer) publishFileUploaded(fe *db.FileEntry, agentID uuid.UUID, resu
 // HandleUploadResult, and a MinIO ObjectCreated webhook fires for the same
 // object, so publishing here would double-emit. This method implements
 // handler.IndexerClient.
-func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string) error {
+func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string) error {
 	bucket, err := ix.store.GetBucketByName(ctx, bootstrap.DefaultOrgID, bucketName)
 	if err != nil {
 		return fmt.Errorf("indexer: get bucket %q for minio event: %w", bucketName, err)
@@ -539,8 +573,9 @@ func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string
 		fileTypeID = uuid.Nil
 	}
 
-	fileEntry, err := ix.store.UpsertFileEntry(ctx, UpsertFileEntryParams{
-		OrgID:       bootstrap.DefaultOrgID,
+	fileEntry, suppressed, err := ix.store.UpsertFileEntry(ctx, UpsertFileEntryParams{
+		OrgID:  bootstrap.DefaultOrgID,
+		Source: "minio_event", ObservedAt: observedAt, EventSeq: sql.NullString{String: eventSeq, Valid: eventSeq != ""}, MetaIncomplete: true,
 		FileTypeID:  uuid.NullUUID{UUID: fileTypeID, Valid: fileTypeID != uuid.Nil},
 		BucketID:    bucket.ID,
 		StoragePath: objectKey,
@@ -548,12 +583,16 @@ func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string
 		SizeBytes:   sizeBytes,
 		Etag:        sql.NullString{String: etag, Valid: etag != ""},
 		Status:      db.FileStatusCompleted,
-		UploadedAt:  sql.NullTime{Time: time.Now().UTC(), Valid: true},
+		UploadedAt:  sql.NullTime{Time: observedAt, Valid: true},
 	})
 	if err != nil {
 		return fmt.Errorf("indexer: upsert file entry for minio event: %w", err)
 	}
 
+	if suppressed {
+		ix.suppressedWrites.Add(1)
+		return nil
+	}
 	ix.logger.Info("minio event indexed",
 		zap.String("file_entry_id", fileEntry.ID.String()),
 		zap.String("bucket", bucketName),
@@ -565,20 +604,23 @@ func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string
 // IndexDeletion handles a MinIO ObjectRemoved event: it soft-deletes the
 // matching file entry and publishes events.file.deleted. Deleting an object that
 // was never indexed (or already deleted) is a no-op.
-func (ix *Indexer) IndexDeletion(ctx context.Context, bucketName, objectKey string) error {
+func (ix *Indexer) IndexDeletion(ctx context.Context, bucketName, objectKey string, observedAt time.Time, eventSeq string) error {
 	bucket, err := ix.store.GetBucketByName(ctx, bootstrap.DefaultOrgID, bucketName)
 	if err != nil {
 		return fmt.Errorf("indexer: get bucket %q for delete event: %w", bucketName, err)
 	}
 
-	fileEntry, err := ix.store.MarkFileEntryDeleted(ctx, bucket.ID, objectKey)
+	fileEntry, suppressed, found, err := ix.store.MarkFileEntryDeleted(ctx, db.DeleteIndexedFileParams{BucketID: bucket.ID, StoragePath: objectKey, ObservedAt: observedAt, EventSeq: sql.NullString{String: eventSeq, Valid: eventSeq != ""}, Source: "minio_event"})
 	if err != nil {
-		if err == sql.ErrNoRows {
-			ix.logger.Info("minio delete event: no matching file entry (no-op)",
-				zap.String("bucket", bucketName), zap.String("key", objectKey))
-			return nil
-		}
-		return fmt.Errorf("indexer: mark file entry deleted for minio event: %w", err)
+		return fmt.Errorf("indexer: mark file entry deleted: %w", err)
+	}
+	if !found {
+		ix.absentDeletes.Add(1)
+		return nil
+	}
+	if suppressed {
+		ix.suppressedWrites.Add(1)
+		return nil
 	}
 
 	ix.publishFileDeleted(fileEntry)
@@ -592,6 +634,9 @@ func (ix *Indexer) IndexDeletion(ctx context.Context, bucketName, objectKey stri
 
 // publishFileDeleted emits events.file.deleted for a soft-deleted entry.
 func (ix *Indexer) publishFileDeleted(fe *db.FileEntry) {
+	if ix.nats == nil {
+		return
+	}
 	payload := map[string]interface{}{
 		"file_entry_id": fe.ID.String(),
 		"bucket_id":     fe.BucketID.String(),

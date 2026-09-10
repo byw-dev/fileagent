@@ -98,6 +98,7 @@ function FileDetailDrawer({ fileId, onClose }: FileDetailDrawerProps) {
     >
       {file && (
         <Descriptions column={1} size="small" bordered>
+          {file.meta_incomplete && <Descriptions.Item label="元数据"><Tag color="warning">元数据不完整</Tag></Descriptions.Item>}
           <Descriptions.Item label="状态">
             <StatusBadge status={file.status} domain="file" />
           </Descriptions.Item>

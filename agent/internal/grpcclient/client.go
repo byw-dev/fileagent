@@ -34,15 +34,16 @@ const (
 // Client manages a gRPC connection to the Control Plane and the long-lived
 // bidirectional Connect stream.
 type Client struct {
+	sendMu sync.Mutex
 	cfg    *config.Config
 	logger *zap.Logger
 
-	mu         sync.Mutex
-	conn       *grpc.ClientConn
-	svc        agentv1.AgentServiceClient
-	stream     agentv1.AgentService_ConnectClient
-	token      string
-	agentID    string
+	mu            sync.Mutex
+	conn          *grpc.ClientConn
+	svc           agentv1.AgentServiceClient
+	stream        agentv1.AgentService_ConnectClient
+	token         string
+	agentID       string
 	msgHandler    func(*agentv1.ServerMessage)
 	reauthFunc    func(context.Context) (string, error)
 	heartbeatFunc func() *agentv1.Heartbeat
@@ -121,6 +122,8 @@ func (c *Client) ServiceClient() agentv1.AgentServiceClient {
 
 // SendMessage writes an AgentMessage to the current stream.
 func (c *Client) SendMessage(msg *agentv1.AgentMessage) error {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
 	c.mu.Lock()
 	stream := c.stream
 	c.mu.Unlock()
@@ -220,7 +223,10 @@ func (c *Client) SendHeartbeat(hb *agentv1.Heartbeat) error {
 	msg := &agentv1.AgentMessage{
 		Payload: &agentv1.AgentMessage_Heartbeat{Heartbeat: hb},
 	}
-	if err := stream.Send(msg); err != nil {
+	c.sendMu.Lock()
+	err := stream.Send(msg)
+	c.sendMu.Unlock()
+	if err != nil {
 		return fmt.Errorf("grpcclient: send heartbeat: %w", err)
 	}
 	return nil

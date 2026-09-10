@@ -11,6 +11,7 @@ import (
 	"github.com/byw-dev/fileagent/agent/internal/executor"
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/byw-dev/fileagent/agent/internal/scheduler"
+	uploadpkg "github.com/byw-dev/fileagent/agent/internal/uploader"
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/pkg/trollsift"
 	"github.com/stretchr/testify/assert"
@@ -154,9 +155,9 @@ func openTestQueue(t *testing.T) *queue.Queue {
 func TestSubmitFile_SubmitsNewFile(t *testing.T) {
 	q := openTestQueue(t)
 	submitted := false
-	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) error {
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		submitted = true
-		return nil
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
 	defer exec.Stop()
@@ -171,9 +172,9 @@ func TestSubmitFile_SubmitsNewFile(t *testing.T) {
 func TestSubmitFile_SkipsDuplicate(t *testing.T) {
 	q := openTestQueue(t)
 	callCount := 0
-	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) error {
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		callCount++
-		return nil
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
 	defer exec.Stop()
@@ -203,9 +204,9 @@ func TestWalkAndSubmit_SubmitsMatchingFiles(t *testing.T) {
 
 	q := openTestQueue(t)
 	var submitted []string
-	exec := executor.New(1, q, func(_ context.Context, task *queue.UploadTask) error {
+	exec := executor.New(1, q, func(_ context.Context, task *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		submitted = append(submitted, task.LocalPath)
-		return nil
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
 	defer exec.Stop()
@@ -219,7 +220,9 @@ func TestWalkAndSubmit_SubmitsMatchingFiles(t *testing.T) {
 
 func TestWalkAndSubmit_NonExistentPathLogsWarning(t *testing.T) {
 	q := openTestQueue(t)
-	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) error { return nil }, zap.NewNop(), 0)
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
+	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
 	defer exec.Stop()
 
@@ -233,7 +236,9 @@ func TestWalkAndSubmit_NonExistentPathLogsWarning(t *testing.T) {
 func TestRunWatcher_CancelExits(t *testing.T) {
 	dir := t.TempDir()
 	q := openTestQueue(t)
-	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) error { return nil }, zap.NewNop(), 0)
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
+	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
 	defer exec.Stop()
 

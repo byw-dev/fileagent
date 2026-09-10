@@ -50,14 +50,17 @@ func (r *AgentRegistry) Register(
 	return conn
 }
 
-// Unregister removes the agent connection.
-func (r *AgentRegistry) Unregister(agentID string) {
+// Unregister removes only the current connection and reports whether it owned
+// the registry entry. Send holds the same lock until its nonblocking send ends.
+func (r *AgentRegistry) Unregister(conn *AgentConn) bool {
 	r.mu.Lock()
-	if conn, ok := r.conns[agentID]; ok {
-		close(conn.SendCh)
-		delete(r.conns, agentID)
+	defer r.mu.Unlock()
+	if conn == nil || r.conns[conn.AgentID] != conn {
+		return false
 	}
-	r.mu.Unlock()
+	close(conn.SendCh)
+	delete(r.conns, conn.AgentID)
+	return true
 }
 
 // Disconnect tears down the agent's stream by cancelling the context Connect
@@ -96,7 +99,7 @@ func (r *AgentRegistry) Get(agentID string) *AgentConn {
 func (r *AgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
 	r.mu.RLock()
 	conn, ok := r.conns[agentID]
-	r.mu.RUnlock()
+	defer r.mu.RUnlock()
 	if !ok {
 		return false
 	}
