@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"path"
 	"regexp"
 	"strings"
@@ -766,6 +767,43 @@ type minioS3Object struct {
 	ETag string `json:"eTag"`
 }
 
+// decodeObjectKey decodes the object key carried by an S3 event notification.
+//
+// MinIO URL-encodes s3.object.key when it builds the notification payload, so
+// "a/b/中 文.csv" arrives as "a%2Fb%2F%E4%B8%AD+%E6%96%87.csv". The encoding is
+// the *query* form (a space becomes "+", not "%20"), which is why this uses
+// url.QueryUnescape rather than url.PathUnescape: PathUnescape leaves "+"
+// untouched, so every key containing a space would keep a literal plus sign. A
+// key that genuinely contains a plus arrives as "%2B", so the round trip is
+// unambiguous.
+//
+// Indexing the raw encoded key breaks every consumer that treats storage_path as
+// a real object key: presigned downloads 404, fileNameFromPath yields the whole
+// encoded key as the file name, Classifier.Classify's filepath.Match/Base see no
+// separator, IndexDeletion's exact-match soft delete never fires, and the
+// agent-reported path (which is not encoded) lands under a different unique key,
+// producing two rows for one object.
+//
+// This applies to keys delivered to a *configured notification target* — MinIO
+// escapes those (ToEvent(escape=true)). The ListenBucketNotification streaming
+// API is fed by the same event with escape=false, so a consumer built on that
+// API must NOT call this function or it will rewrite literal "+" to a space.
+//
+// On failure the raw key is returned along with the error, so the caller can
+// still index something instead of dropping the event; callers must log it. The
+// failure path is effectively unreachable from MinIO (QueryEscape output is
+// always valid escaping) and is symmetric — a create and a later delete of the
+// same undecodable key fall back to the same string, so the soft delete still
+// matches and no undeletable ghost row is created. Once IC-4 adds dead-letter
+// handling, a decode failure should go there rather than into the index.
+func decodeObjectKey(raw string) (string, error) {
+	decoded, err := url.QueryUnescape(raw)
+	if err != nil {
+		return raw, err
+	}
+	return decoded, nil
+}
+
 // Handle handles POST /internal/minio-event.
 func (h *MinioEventHandler) Handle(c *gin.Context) {
 	if !h.authorized(c) {
@@ -784,10 +822,20 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 	}
 
 	for _, rec := range payload.Records {
+		bucket := rec.S3.Bucket.Name
+		// The key is URL-encoded by MinIO; decode it before it reaches the index
+		// or anything else, since storage_path must hold the real object key.
+		key, err := decodeObjectKey(rec.S3.Object.Key)
+		if err != nil {
+			h.logger.Warn("minio event: object key is not valid URL encoding; falling back to the raw key",
+				zap.String("bucket", bucket),
+				zap.String("raw_key", rec.S3.Object.Key),
+				zap.Error(err))
+		}
 		h.logger.Info("minio event received",
 			zap.String("event", rec.EventName),
-			zap.String("bucket", rec.S3.Bucket.Name),
-			zap.String("key", rec.S3.Object.Key),
+			zap.String("bucket", bucket),
+			zap.String("key", key),
 			zap.Int64("size", rec.S3.Object.Size),
 		)
 		if h.indexer == nil {
@@ -797,7 +845,6 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 		// ObjectRemoved:* soft-deletes the entry and emits events.file.deleted.
 		// Previously every event was indexed as an upload, so deletions were
 		// mis-recorded and file_deleted event rules never fired.
-		bucket, key := rec.S3.Bucket.Name, rec.S3.Object.Key
 		switch {
 		case strings.HasPrefix(rec.EventName, "s3:ObjectRemoved:"):
 			if err := h.indexer.IndexDeletion(c.Request.Context(), bucket, key); err != nil {

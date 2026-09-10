@@ -886,6 +886,97 @@ func TestMinioEventHandler_RoutesCreatedToUpload(t *testing.T) {
 	assert.False(t, ix.deleted)
 }
 
+// ── Object key URL decoding (IC-2c / IC-BUG-19) ───────────────────────────────
+
+// minioEventBody builds a one-record MinIO notification payload carrying the
+// given raw (still URL-encoded) object key, exactly as MinIO would send it.
+func minioEventBody(t *testing.T, eventName, bucket, rawKey string) string {
+	t.Helper()
+	rec := map[string]any{
+		"eventName": eventName,
+		"s3": map[string]any{
+			"bucket": map[string]any{"name": bucket},
+			"object": map[string]any{"key": rawKey, "size": 42, "eTag": "etag-1"},
+		},
+	}
+	b, err := json.Marshal(map[string]any{"Records": []any{rec}})
+	require.NoError(t, err)
+	return string(b)
+}
+
+// postMinioEvent posts one notification through the authenticated test router.
+func postMinioEvent(t *testing.T, ix *mockIndexerClient, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	w := httptest.NewRecorder()
+	req, err := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	testMinioEventRouter(h).ServeHTTP(w, req)
+	return w
+}
+
+// TestMinioEventHandler_DecodesObjectKey pins IC-BUG-19: MinIO URL-encodes
+// s3.object.key when it builds the event, so indexing it verbatim stored
+// "a%2Fb%2Fc.csv" as the storage_path of an object whose real key is
+// "a/b/c.csv". The encoding is the query form, so "+" means a space.
+func TestMinioEventHandler_DecodesObjectKey(t *testing.T) {
+	tests := []struct {
+		name   string
+		rawKey string
+		want   string
+	}{
+		{"flat key needs no decoding", "file.csv", "file.csv"},
+		{"hierarchical key", "a%2Fb%2Fc.csv", "a/b/c.csv"},
+		{"space encoded as plus", "nested+dir%2Ffile.csv", "nested dir/file.csv"},
+		{"space encoded as percent-20", "nested%20dir%2Ffile.csv", "nested dir/file.csv"},
+		// The exact payload MinIO produced in dev for "ic19/nested dir/中 文.csv".
+		{"non-ascii key", "ic19%2Fnested+dir%2F%E4%B8%AD+%E6%96%87.csv", "ic19/nested dir/中 文.csv"},
+		// A literal plus in the key arrives percent-encoded, so decoding it as
+		// query form does not corrupt it.
+		{"literal plus in key", "a%2Fb%2Bc.csv", "a/b+c.csv"},
+		{"template-shaped agent key", "Miru%2Ftokyo%2F2026%2F09%2F10%2Ftokyo_001.csv", "Miru/tokyo/2026/09/10/tokyo_001.csv"},
+		// An object whose name literally contains "%2F" arrives double-escaped.
+		// This is the shape that catches a future "helpful" second decode pass,
+		// which is the most likely way this fix gets broken.
+		{"literal %2F text in key", "icrev%2Fpct%252Fnot-a-slash.csv", "icrev/pct%2Fnot-a-slash.csv"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ix := &mockIndexerClient{}
+			w := postMinioEvent(t, ix, minioEventBody(t, "s3:ObjectCreated:Put", "data-sensor", tt.rawKey))
+			assert.Equal(t, http.StatusOK, w.Code)
+			require.True(t, ix.called, "ObjectCreated must reach IndexUpload")
+			assert.Equal(t, tt.want, ix.lastKey)
+			assert.Equal(t, "data-sensor", ix.lastBucket)
+		})
+	}
+}
+
+// TestMinioEventHandler_DecodesObjectKey_Deletion covers the deletion path,
+// which reaches the index through a different call. Leaving it encoded would
+// make IndexDeletion a silent no-op for every hierarchical key (it matches on
+// storage_path), turning deleted objects into permanent ghost rows.
+func TestMinioEventHandler_DecodesObjectKey_Deletion(t *testing.T) {
+	ix := &mockIndexerClient{}
+	w := postMinioEvent(t, ix, minioEventBody(t, "s3:ObjectRemoved:Delete", "data-sensor", "a%2Fb%2F%E4%B8%AD+%E6%96%87.csv"))
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.True(t, ix.deleted, "ObjectRemoved must reach IndexDeletion")
+	assert.Equal(t, "a/b/中 文.csv", ix.deletedKey)
+}
+
+// TestMinioEventHandler_InvalidEncoding_FallsBackToRawKey asserts the decode
+// failure path: an unparseable escape must not drop the event, because losing a
+// create leaves MinIO holding an object the index never learns about. The raw
+// key is indexed instead (and logged as a warning).
+func TestMinioEventHandler_InvalidEncoding_FallsBackToRawKey(t *testing.T) {
+	ix := &mockIndexerClient{}
+	w := postMinioEvent(t, ix, minioEventBody(t, "s3:ObjectCreated:Put", "data-sensor", "a%2Gb.csv"))
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.True(t, ix.called, "an undecodable key must still be indexed, not dropped")
+	assert.Equal(t, "a%2Gb.csv", ix.lastKey)
+}
+
 // ── Webhook authentication (G-3) ──────────────────────────────────────────────
 
 const validMinioBody = `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1}}}]}`
