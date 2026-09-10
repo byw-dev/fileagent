@@ -154,9 +154,9 @@ func openTestQueue(t *testing.T) *queue.Queue {
 
 func TestSubmitFile_SubmitsNewFile(t *testing.T) {
 	q := openTestQueue(t)
-	submitted := false
+	submitted := make(chan struct{}, 1)
 	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
-		submitted = true
+		submitted <- struct{}{}
 		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
@@ -165,15 +165,18 @@ func TestSubmitFile_SubmitsNewFile(t *testing.T) {
 	rule := scheduler.CollectionRule{RuleID: "r1", BasePath: "/tmp", UploadBucket: "bkt", DestPathTemplate: "logs/{filename}"}
 	submitFile(exec, q, rule, "/tmp/f.txt", 100, time.Now(), 0, "", trollsift.AgentContext{}, zap.NewNop())
 
-	// Allow time for async worker to process.
-	require.Eventually(t, func() bool { return submitted }, 1*time.Second, 10*time.Millisecond)
+	select {
+	case <-submitted:
+	case <-time.After(time.Second):
+		t.Fatal("async worker did not process submitted file")
+	}
 }
 
 func TestSubmitFile_SkipsDuplicate(t *testing.T) {
 	q := openTestQueue(t)
-	callCount := 0
+	called := make(chan struct{}, 1)
 	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
-		callCount++
+		called <- struct{}{}
 		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
@@ -190,9 +193,11 @@ func TestSubmitFile_SkipsDuplicate(t *testing.T) {
 	require.NoError(t, err)
 
 	submitFile(exec, q, rule, "/tmp/dup.txt", 100, time.Now(), 0, "", trollsift.AgentContext{}, zap.NewNop())
-	// Wait briefly to make sure no upload was triggered.
-	time.Sleep(100 * time.Millisecond)
-	assert.Equal(t, 0, callCount)
+	select {
+	case <-called:
+		t.Fatal("duplicate file triggered upload")
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
 // ── walkAndSubmit ─────────────────────────────────────────────────────────────
@@ -203,9 +208,9 @@ func TestWalkAndSubmit_SubmitsMatchingFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "b.txt"), []byte("y"), 0o644))
 
 	q := openTestQueue(t)
-	var submitted []string
+	submitted := make(chan string, 1)
 	exec := executor.New(1, q, func(_ context.Context, task *queue.UploadTask) (*uploadpkg.UploadResult, error) {
-		submitted = append(submitted, task.LocalPath)
+		submitted <- task.LocalPath
 		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}, zap.NewNop(), 0)
 	exec.Start(context.Background())
@@ -214,8 +219,12 @@ func TestWalkAndSubmit_SubmitsMatchingFiles(t *testing.T) {
 	rule := scheduler.CollectionRule{RuleID: "r2", BasePath: dir, PathPattern: "*.log", UploadBucket: "bkt", DestPathTemplate: "logs/{filename}"}
 	walkAndSubmit(context.Background(), exec, q, rule, dir, trollsift.AgentContext{}, zap.NewNop())
 
-	require.Eventually(t, func() bool { return len(submitted) == 1 }, 1*time.Second, 10*time.Millisecond)
-	assert.Contains(t, submitted[0], "a.log")
+	select {
+	case path := <-submitted:
+		assert.Contains(t, path, "a.log")
+	case <-time.After(time.Second):
+		t.Fatal("matching file was not submitted")
+	}
 }
 
 func TestWalkAndSubmit_NonExistentPathLogsWarning(t *testing.T) {
