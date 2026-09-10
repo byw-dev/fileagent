@@ -1802,8 +1802,9 @@ mc admin config set myminio notify_webhook:primary \
     queue_limit="10000" \
     queue_dir="/tmp/minio-webhook-queue"
 
-mc event add myminio/data-sensor primary \
-    --event "s3:ObjectCreated:*,s3:ObjectRemoved:*"
+mc event add myminio/data-sensor arn:minio:sqs::primary:webhook \
+    --ignore-existing \
+    --event "put,delete"
 ```
 
 **Control Plane 侧鉴权（D-014）**：`/internal/minio-event` 会把外部输入写入
