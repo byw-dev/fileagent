@@ -936,6 +936,10 @@ func TestMinioEventHandler_DecodesObjectKey(t *testing.T) {
 		// query form does not corrupt it.
 		{"literal plus in key", "a%2Fb%2Bc.csv", "a/b+c.csv"},
 		{"template-shaped agent key", "Miru%2Ftokyo%2F2026%2F09%2F10%2Ftokyo_001.csv", "Miru/tokyo/2026/09/10/tokyo_001.csv"},
+		// An object whose name literally contains "%2F" arrives double-escaped.
+		// This is the shape that catches a future "helpful" second decode pass,
+		// which is the most likely way this fix gets broken.
+		{"literal %2F text in key", "icrev%2Fpct%252Fnot-a-slash.csv", "icrev/pct%2Fnot-a-slash.csv"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

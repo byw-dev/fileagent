@@ -778,12 +778,24 @@ type minioS3Object struct {
 // unambiguous.
 //
 // Indexing the raw encoded key breaks every consumer that treats storage_path as
-// a real object key: presigned downloads 404, path-variable tagging never sees a
-// separator, and the agent-reported path (which is not encoded) lands under a
-// different unique key, producing two rows for one object.
+// a real object key: presigned downloads 404, fileNameFromPath yields the whole
+// encoded key as the file name, Classifier.Classify's filepath.Match/Base see no
+// separator, IndexDeletion's exact-match soft delete never fires, and the
+// agent-reported path (which is not encoded) lands under a different unique key,
+// producing two rows for one object.
+//
+// This applies to keys delivered to a *configured notification target* — MinIO
+// escapes those (ToEvent(escape=true)). The ListenBucketNotification streaming
+// API is fed by the same event with escape=false, so a consumer built on that
+// API must NOT call this function or it will rewrite literal "+" to a space.
 //
 // On failure the raw key is returned along with the error, so the caller can
-// still index something instead of dropping the event; callers must log it.
+// still index something instead of dropping the event; callers must log it. The
+// failure path is effectively unreachable from MinIO (QueryEscape output is
+// always valid escaping) and is symmetric — a create and a later delete of the
+// same undecodable key fall back to the same string, so the soft delete still
+// matches and no undeletable ghost row is created. Once IC-4 adds dead-letter
+// handling, a decode failure should go there rather than into the index.
 func decodeObjectKey(raw string) (string, error) {
 	decoded, err := url.QueryUnescape(raw)
 	if err != nil {
