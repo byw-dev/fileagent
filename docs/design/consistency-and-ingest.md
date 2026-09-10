@@ -229,6 +229,7 @@ object_keys(
     file_entry_id  UUID NOT NULL,
     last_modified  TIMESTAMPTZ,     -- 对象自身的 mtime，对账信号列（见 3.5 警告）
     observed_at    TIMESTAMPTZ NOT NULL,
+    event_seq      TEXT,            -- 事件 sequencer，与 file_entries 同规则参与守卫
     PRIMARY KEY (bucket_id, storage_path)
 );
 
@@ -240,7 +241,7 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 
 - 幂等键完整保留在不分区的窄表上
 - `file_entries` 可按时间分区 → 列表/cursor 分页最优，老数据可归档冷存
-- **对账只扫 `object_keys`，完全不碰宽表**——该窄表只有 5 列（`bucket_id / storage_path / file_entry_id / last_modified / observed_at`），
+- **对账只扫 `object_keys`，完全不碰宽表**——该窄表只有 6 列（`bucket_id / storage_path / file_entry_id / last_modified / observed_at / event_seq`），
   行宽远小于 `file_entries`；但 `storage_path` 是变长 TEXT，主键 btree 的体积高度依赖真实 key 长度，
   **具体容量与「索引能否常驻内存」须随 §6-B 一并实测估算，不要直接引用某个拍脑袋的数字**
 - `object_keys` 在角色上等同于 minio-inventory 项目的 `minio_objects`
@@ -258,9 +259,22 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 | source | 取自 | 客户端可控？ |
 |---|---|---|
 | `minio_event` | 事件载荷的 **`eventTime`** | ❌ MinIO 生成 |
-| `agent` | **CP 受理该 `UploadResult` 的时刻** | ❌ |
-| `api` | CP 受理 `files/register` 的时刻 | ❌ |
-| `audit` | 该轮对账的扫描时刻 | ❌ |
+| `agent` | **PostgreSQL 的 `now()`**（写入事务内取），**不是 CP 进程时钟** | ❌ |
+| `api` | 同上 | ❌ |
+| `audit` | 同上 | ❌ |
+
+> **⚠️ 必须用 PG `now()` 而不是 CP 进程的 `time.Now()`**——这不是风格问题。§3.5「坑 3」已经定死
+> 「**所有参与比较的时间戳必须来自同一个时钟，统一由 PostgreSQL 的 `now()` 产生**」，本表遵从它。
+> **dev 实测（2026-09-10，5 次采样）**：MinIO 的 `eventTime` 比 CP 进程时钟快 **16.0–16.6 ms**，
+> 而 PG 的 `clock_timestamp()` 与 MinIO 同属 docker VM 时钟（比宿主机快 ~11.5 ms）——**掉队的是跑在
+> 宿主机上的 CP 进程**。若 `agent` 源用 CP 进程时钟，则在「agent PUT 完成 → MinIO 立刻发事件 →
+> agent 随后经 gRPC 上报」这条**生产常态**路径上，webhook 的 `observed_at` 恒大于 agent 的，
+> **每一次合法 agent 上报都会被守卫拦掉**，`agent_id`/`rule_id`/`sha256` 恒 NULL——而这正是
+> IC-2a live 验收第一条要断言非空的那几列，症状还是间歇性的，实现者会去查根本不存在的 gRPC 问题。
+>
+> **部署约束（须写进运维文档）**：`minio_event` 用 MinIO 时钟、其余三路用 PG 时钟，
+> **PostgreSQL 与 MinIO 必须处于同一时钟域**（同一宿主/VM，或同一 NTP 源）。当前 compose 拓扑天然满足。
+> 若将来二者分处不同时钟域，本模型须重新评估。
 
 > **⚠️ 绝不采信 `UploadResult.uploaded_at`**（`proto/v1/agent.proto:65`）。它由 agent 提供，一台时钟
 > 跑飞或被入侵的 agent 报 `2099-01-01` 就能把该行永久冻结，此后 webhook / `register` /
@@ -295,13 +309,42 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 > 「拦住攻击者也拦住所有合法调用方」，`code-reviewer.md` 明确要求防的那一类。
 >
 > 补零宽度取 **32**：实测 MinIO 的 `sequencer` 恒为 16 位十六进制，取 32 留冗余且不影响正确性。
+>
+> SQL 里的 `fe` 是 `INSERT INTO file_entries AS fe` 的别名，照抄时别漏掉 `AS fe`。
 
-**软删除同样要守卫，且它不是 upsert。** 软删除走的是独立的 `MarkFileEntryDeleted`
-（`indexer/queries.go:209-216`），当前是 `UPDATE … WHERE bucket_id=$1 AND storage_path=$2
-AND status != 'deleted'`——**没有任何时间围栏**。必须补同一组守卫，否则：key `K` 的删除事件
-E_del 因抖动进重试 → agent 重新采集并上传 `K`（新对象，行被 upsert 成 `completed`）→ E_del 重投成功
-→ 把这行**刚建的活对象**标成 `deleted`。文件在 MinIO 里活着、在 UI 里消失，而 L3 幽灵清理管的是
-反方向（PG 有 / MinIO 无），**检不出来**。
+> ### ⚠️ 守卫落败**不是错误**——`RETURNING` 会返回 0 行
+>
+> 现有 upsert 带 `RETURNING`，`UpsertFileEntry` 用 `QueryRowContext` + `row.Scan` 读**恰好一行**
+> （`indexer/queries.go:61-68,86`）。加上 `WHERE` 守卫后，**被正确压制的写入会返回 0 行 →
+> `sql.ErrNoRows` → `indexer.go:553` 包成 error 上抛**。
+>
+> 后果不是「多一条日志」，而是**索引 feed 停摆**：IC-4 ① 会把这个 error 判为「处理失败」→ 计数 → 返 5xx
+> → 而 MinIO 的 `queue_dir` 是**队头阻塞单队列**（实测：立即重试 1 次 + 之后每 3.0s），这条**本来就该被
+> 压制**的陈旧事件会卡在队头，让该 target 的所有新事件排队数分钟到数十分钟，直到它被落死信放行。
+>
+> **规格要求**：`UpsertFileEntry` 必须**恒返一行**，调用方按成功处理、**不计入 IC-4 ① 的失败计数**。
+> 二选一：
+> - **(推荐) 调用方处理**：`ErrNoRows` 时回查现有行返回，并标记 `suppressed=true` 供日志/指标；
+>   SQL 保持可读。压制是罕见路径，多一次查询可接受。
+> - **纯 SQL**：把每列改成 `col = CASE WHEN <守卫> THEN EXCLUDED.col ELSE fe.col END`、去掉 `WHERE`，
+>   则永远走 UPDATE 分支、恒返一行。代价是 12 列都要重复一遍守卫表达式。
+>
+> **无论选哪个，`ErrNoRows` 都不得作为错误传播到 webhook / gRPC 的响应路径上。**
+
+**软删除同样要守卫，且它不是 upsert——改动面比「加个 WHERE」大。** 软删除走的是独立的
+`MarkFileEntryDeleted`（`indexer/queries.go:209-216`），当前是 `UPDATE … SET status='deleted',
+updated_at=NOW() WHERE bucket_id=$1 AND storage_path=$2 AND status != 'deleted'`——**没有任何时间围栏**。
+
+需要做两件事，**缺第二件会造成已删除的行被复活**：
+
+1. **加守卫**（同上）：否则 key `K` 的删除事件 E_del 滞留重试 → agent 重新采集并上传 `K` →
+   E_del 重投成功 → 把**刚建的活对象**标成 `deleted`。文件在 MinIO 里活着、在 UI 里消失，
+   而 L3 幽灵清理管的是反方向（PG 有 / MinIO 无），**检不出来**。
+2. **新增 `observed_at` / `event_seq` 两个入参并写回**（`SET … observed_at = $3, event_seq = $4`）。
+   只加 `WHERE` 不推进这两列，则删除后行上仍是**创建时**的值，此后任何一次 create 事件重投
+   （IC-11「处理成功才 ack」，重投是设计出来的常态）都会 `observed_at` 打平、`event_seq` 自比自相等
+   而通过守卫，**把已删除的行复活成 `completed`**。实测确认：`create(T1,seqA) → delete(T3,seqB) →
+   create 重投` 在只加 WHERE 的实现下复活。
 
 富字段一律 `COALESCE(EXCLUDED.x, 现有值)`。两条写入路径从此可交换、不再互相踩（修 IC-BUG-8 / IC-BUG-13）。
 
