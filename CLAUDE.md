@@ -338,8 +338,8 @@ docker compose -f deploy/docker-compose.test.yml down -v
 **Agent 数据面从未端到端跑通过**（拿不到 STS 凭据 / 从不上报 `UploadResult` / policy 前缀不匹配 / 缺 multipart 权限），
 且不存在任何 MinIO↔PostgreSQL 对账机制。决策 **D-030**（不换存储层；STS grant + 注册 outbox + 分片对账）、
 **D-031**（事件传输 webhook → NATS JetStream）。设计 `docs/design/consistency-and-ingest.md`，
-追踪 `docs/tasks/consistency-ingest.md`，缺陷 `docs/tasks/bugs/open.md`（IC-BUG-1…IC-BUG-34）。
-顺序：IC-0 文档基线 → 止血 IC-1 → **IC-2c**（webhook 键解码，IC-2a 的硬前置）→ **IC-2a**（上报主路径，原子刀）→（IC-2b / IC-3 / IC-4 / IC-5 / IC-SEC-2 可并行）
+追踪 `docs/tasks/consistency-ingest.md`，缺陷 `docs/tasks/bugs/open.md`（IC-BUG-1…IC-BUG-35）。
+顺序：IC-0 文档基线 → 止血 IC-1 ✅ → **IC-2c** ✅（webhook 键解码，PR #96）→ **IC-2a**（上报主路径，原子刀，下一刀）→（IC-2b / IC-3 / IC-4 / IC-5 / IC-SEC-2 可并行）
 → 地基 IC-6/7 → 准入 IC-8…10 → 对账 IC-11…13 → 血缘 IC-14。**开工前先读 `consistency-ingest.md` 的「分诊结论」**。
 **WR track（Web UI 重做 WR-2…10）暂停让位**，追踪 `docs/tasks/webui-redesign-impl.md`。未排期：proto→buf。
 

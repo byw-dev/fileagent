@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复；35 是 IC-2c 期间顺带发现的部署脚本缺陷）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -16,9 +16,9 @@
 
 ### 缺陷模式（2026-09-10 归纳）
 
-34 条里**有 30 条归得进三类成因**（M-1/M-2/M-3）。M-1 与 M-2 的类扫描均已完成（结论见下方两小节），
-M-3 待扫。**剩下 4 条不属于任何一类**——IC-BUG-33/34 是「持久化状态缺少终态处理」，IC-BUG-5/11 是
-「参数收了不用」，两者实例都太少，暂不立类，但下次归纳时应重新审视。
+35 条里**有 30 条归得进三类成因**（M-1/M-2/M-3）。M-1 与 M-2 的类扫描均已完成（结论见下方两小节），
+M-3 待扫。**剩下 5 条不属于任何一类**——IC-BUG-33/34 是「持久化状态缺少终态处理」，IC-BUG-5/11 是
+「参数收了不用」，IC-BUG-35 是部署脚本与 MinIO 约束不符，三者实例都太少，暂不立类，但下次归纳时应重新审视。
 **逐条等评审撞见是最贵的发现方式**——两次扫描各自挖出了评审没撞见的实例，
 且都直接改变了下一刀的边界，这正是「先扫完再发刀」的收益：
 
@@ -112,7 +112,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效 | 🟠 P1 | agent + controlplane |
 | IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 | 🔴 P0 | agent |
 | IC-BUG-18 | Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 | 🔴 P0 | agent |
-| IC-BUG-19 | minio-event 索引 URL 编码后的对象键（`%2F`），与真实键不符 | 🟠 P1 | controlplane |
+| IC-BUG-19 | minio-event 索引 URL 编码后的对象键（`%2F`），与真实键不符 ✅ 随 IC-2c 修复 | 🟠 P1 | controlplane |
 | IC-BUG-20 | bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 | 🟠 P1 | controlplane + agent |
 | IC-BUG-21 | 模板解析失败时猜一个对象键写进去，污染对账分片 | 🟡 P2 | agent |
 | IC-BUG-22 | `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token | 🔴 P0 | controlplane |
@@ -128,6 +128,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-32 | `Revoke` 的 `Send` 与 `Disconnect` 存在竞态窗口，命令可能在切流前被丢弃 | 🟡 P2 | controlplane |
 | IC-BUG-33 | 失败的上报仍写 `file_entries` 行，制造「DB 有、对象无」的反向幽灵 | 🟠 P1 | controlplane |
 | IC-BUG-34 | agent 重启后 `running` 态任务无复位，永久孤儿：不重传也不上报 | 🟠 P1 | agent |
+| IC-BUG-35 | `init-minio.sh` 默认 CP 服务账号 access key 超出 MinIO 20 字符上限，脚本第 4 步必失败 | 🟠 P1 | deploy |
 
 ---
 
@@ -333,7 +334,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | ✅ **已随 IC-1 修**：新增 `server.tls_insecure`（env `AGENT_SERVER_TLS_INSECURE`）。置 `true` 时走 `InsecureDialOpts` 并打印醒目 Warn（bearer token 明文传输）。**刻意用否定式命名**：零值必须是安全的那个，否则在代码里直接构造 `config.Config{}`（不走 `Load`）会静默失去 TLS——初版写成 `tls_enabled bool` 时正是这个 fail-open 缺陷，被既有单测 `TestClient_BuildDialOpts_MissingCACert` 当场逮住 |
 | **验收** | ✅ 已验证：`tls_insecure = true` 时 agent 成功连上本地明文 CP 并完成注册→审批→建流；缺省配置仍走 TLS |
 
-## IC-BUG-19 — minio-event 索引 URL 编码后的对象键（`%2F`）🟠 P1
+## IC-BUG-19 — minio-event 索引 URL 编码后的对象键（`%2F`）🟠 P1 ✅ 已修（IC-2c，PR #96）
 
 | 字段 | 内容 |
 |------|------|
@@ -341,14 +342,14 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/api/handler/events.go:764`（`Key` 字段）、`:800`（`bucket, key := rec.S3.Bucket.Name, rec.S3.Object.Key`）→ 传入 `IndexUpload` |
 | **实测** | live-e2e 中 agent 上传 `Miru/tokyo/tokyo_001.csv`，`file_entries.storage_path` 落为 `Miru%2Ftokyo%2Ftokyo_001.csv`；直接 `mc cp` 到 `nested/dir/probe.txt` 同样落为 `nested%2Fdir%2Fprobe.txt` |
 | **后果** | 凡是带层级的对象键（正常情况）索引值都与真实键不符。①预签名下载用 `storage_path` 作 key，必然 404；②path_var 反解拿不到分隔符，打标失效；③IC-6 之后 `object_keys` 的幂等键与对账会把这些行全判成幽灵。**当前 `file_entries` 的唯一写入者就是这条路径**，所以影响是全量的 |
-| **修复** | 在 `MinioEventHandler.Handle` 解析后对 key 做一次 `url.QueryUnescape`（S3 事件用的是 `+`-as-space 的 query 编码，不是 path 编码），失败时退回原值并告警；补带层级键与含空格/中文键的单测 |
+| **修复** | ✅ **已随 IC-2c 修（PR #96）**：在 `MinioEventHandler.Handle` 解析后对 key 做一次 `url.QueryUnescape`（S3 事件用的是 `+`-as-space 的 query 编码，不是 path 编码），失败时退回原值并告警——**丢事件比索引一个怪键更糟**（丢的 create 会让 MinIO 里躺着一个索引永远不知道的对象）。单测 10 例覆盖带层级/`+`-空格/`%20`-空格/中文/字面加号/模板形状键 + 删除路径 + 非法编码退回。**变异矩阵验证过能证伪**：不解码 → 6 例失败；换 `PathUnescape` → `+`-空格与中文失败；解码失败不退回原值 → 非法编码用例失败 |
 | **归属（2026-09-10 两次改期：IC-4 → IC-2a ⑥ → 独立的 IC-2c）** | **必须早于 IC-BUG-2 的那一刀**，因为二者会**互相制造重复行**。拆成独立一刀的理由是**顺序约束不等于打包约束**——它只需在上报开启之前到位，且能独立 live 验证（`mc cp` 一个带层级的键即可，不依赖 agent）。证据：`migrations/000001_init_schema.up.sql:165` 的 `UNIQUE (bucket_id, storage_path)`、`controlplane/internal/indexer/queries.go:48` 的 `ON CONFLICT (bucket_id, storage_path)`。IC-2 之后 agent 上报写 `a/b/c.csv`、webhook 仍写 `a%2Fb%2Fc.csv`——**两个不同的 `storage_path`，进不了同一个 conflict target**，于是同一个对象变成两行，IC-2a ⑤ 新加的 `observed_at` 排序键**永远不会被触发**。两个写入方在 IC-11（D-031 换传输）之前一直并存 |
 | **下游传染** | 更严重的是往下游走：IC-6 的 `object_keys` 窄表用**同一个键形状**，重复会被带进对账的输入——L2 分片扫描会把其中一行判成幽灵、另一行判成真的。**等 IC-6 之后再修就要连带清洗历史行** |
 | **⚠️ IC-11（NATS）不解决它——2026-09-10 双向实测** | 曾被问「D-031 换成 NATS JetStream 后是不是就没这问题了」。**不是。** dev 环境对同一个键（`ic19/nested dir/中 文.csv`）同时挂 `notify_nats` 与 `notify_webhook` 两个 target 各抓一次载荷，**两者字节级同构**：<br>顶层字段均为 `['EventName','Key','Records']`；<br>`Records[].s3.object.key`（**CP 实际读的那个**）两边都是 `ic19%2Fnested+dir%2F%E4%B8%AD+%E6%96%87.csv`。<br>编码发生在 MinIO **构造事件对象**时，不在传输层——`%2F` 位于 JSON 字符串字段**内部**，HTTP 与 NATS 都不会改写 JSON 字符串的内容。**因此本条与 IC-11 完全正交，不能等 IC-11 一起解决** |
 | **⚠️ 别用顶层 `Key` 字段绕过** | 同次实测发现 MinIO 的事件信封有个**未编码**的顶层 `"Key":"data-sensor/ic19/nested dir/中 文.csv"`，**webhook 与 NATS 都有**（不是 NATS 独有——CP 当前的 `minioEventRecord` 只解析 `Records[]`，所以从没注意到它）。**仍然不要用它**：它是 `bucket/key` 拼接、且属 MinIO 私有信封字段，不在 S3 事件通知规范内。正解是对 `s3.object.key` 做 `QueryUnescape` |
 | **✅ 历史脏行不清洗（2026-09-10 定案）** | 现存行已是编码键（live PG 里有 `probe%2Fsts.txt`）。**不写迁移**——系统未发布，等 dev 库重建时自然消失。若将来改变前提（保留 dev 数据作 e2e 基线），需另行清洗，届时再开决策 |
 | **⚠️ 归属理由不得省略** | 本条当初被推到 IC-4，正是因为卡片上看不出上面这层交互。**「一行 `url.QueryUnescape` 的事」是它被反复推走的原因，不是它可以被推走的理由**——放错刀就是每个对象两行脏数据 |
-| **验收** | `mc cp` 一个 `a/b/中 文.csv`，`file_entries.storage_path` 等于 `a/b/中 文.csv`；预签名下载可直接取回该对象；**新增**：同一对象经 agent 上报与 webhook 两条路径各写一次后，`file_entries` 只有一行 |
+| **验收** | ✅ **已 live 验证（2026-09-10，dev）**：`mc cp` → `storage_path` = `ic2c/a/b/中 文.csv`（未编码）；预签名下载 `200` + 内容正确；`mc rm` 一个带层级的键 → 对应行 `status=deleted`（修复前对带层级键是静默 no-op）。**字面加号往返实证**：`ic2c/plus+dir/re+port.csv` 落库仍是 `+` 而非空格，证实 MinIO 把真正的加号编成 `%2B`，query-form 解码不误伤。历史编码行按定案保留未清洗。**剩余一条验收归 IC-2a**：「同一对象经 agent 上报与 webhook 两条路径各写一次后 `file_entries` 只有一行」——agent 尚不上报 `UploadResult`，本刀无法执行，拆刀不等于免验 |
 
 ## IC-BUG-20 — bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 🟠 P1
 
@@ -529,6 +530,21 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **与 IC-2a 的关系** | IC-2a 引入 `reported` 后会**多一个同类终态**：ack 丢失 + 进程重启 = 卡在 `reported` 的孤儿。IC-2a ④ 的重报超时若只在内存里计时，重启后同样失效——**复位必须落在启动路径上，不能只靠运行时定时器** |
 | **修复** | agent 启动时（`Queue` 初始化后、executor 启动前）把 `running` 复位为 `pending`；IC-2a 落地后 `reported` 同样需要复位或纳入重报超时的持久化判据。注意与 IC-3 的续传落盘协同——复位后应保留 `upload_id` / `completed_parts` 以便续传而非重传 |
 | **验收** | 上传中途 kill agent，重启后该任务被重新 dequeue 并完成（日志可见）；`queue_depth` 能回落到 0 |
+
+---
+
+## IC-BUG-35 — `init-minio.sh` 的 CP 服务账号 access key 超长，全新环境 bootstrap 必失败 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `CP_ADMIN_ACCESS_KEY` 默认值 `cpAdmin00000000000000` 是 **21 字符**，而 MinIO 的 access key 上限是 **20 字符**。`mc admin user svcacct add` 因此直接失败，而脚本的错误分支只放行 `already exists`，其余一律 `exit 1` |
+| **精确位置** | `deploy/scripts/init-minio.sh:33`（默认值）、`:101-113`（第 4 步创建服务账号 + 错误分支） |
+| **实测（2026-09-10，dev）** | `mc admin user svcacct add --access-key cpAdmin00000000000000 …` → `The access key is invalid. (access key length should be between 3 and 20).`。dev 环境里实际存在的是手工建的 `cpadmin000000000000`（19 字符），与脚本默认值不一致；`docker-compose.dev.yml` 用的是 `minio/minio:latest`（当前 `RELEASE.2025-09-07T16-13-09Z`） |
+| **后果** | **按文档做全新 bootstrap 会在第 4 步中止**——CP 拿不到能用的 MinIO 凭据，所有预签名下载返回 500（`The Access Key Id you provided does not exist in our records`）。dev 环境长期靠手工建的账号绕过，所以没人撞见 |
+| **发现路径** | IC-2c 的 live 验收（预签名下载）在 dev 上 500，追下去发现 `deploy/config/controlplane.env` 里的 key 也是这个 21 字符的值，MinIO 侧根本不可能存在 |
+| **修复** | 把默认值改成 ≤20 字符（如 `cpAdmin000000000000`），并在脚本里对长度做前置校验 + 明确报错；同步更新 `deploy/config/controlplane.env.example` 与部署文档里的示例值。**注意这会改变已部署环境的凭据**，需在变更说明里写清 |
+| **验收** | 干净的 MinIO 容器上从头跑一遍 `init-minio.sh` 全程 exit 0；CP 用脚本产出的凭据能成功签发预签名下载 URL 并取回对象 |
+| **归属** | 未排期。与 IC 主线正交（不影响写入准入/一致性），但**挡着任何人复现 live 验收**，宜与 IC-4（同样要动 `init-minio.sh`）合并处理 |
 
 ---
 
