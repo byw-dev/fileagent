@@ -1491,7 +1491,7 @@ JetStream 处于闲置状态。
 | **IC-BUG-7**（新建 bucket 不注册通知） | ❌ 不解决 | 换传输只改 ARN，不改变「要不要配通知」。**IC-4 ② 的 ARN 须做成可配置** |
 | **IC-BUG-9**（`queue_dir` 在 `/tmp`） | ❌ 不解决 | `notify_nats` 同样有 `queue_dir` / `queue_limit` |
 | **IC-BUG-19**（对象键 URL 编码） | ❌ 不解决 | 双向实测：两种传输载荷字节级同构，编码在 MinIO 构造事件时发生 |
-| **IC-BUG-8**（upsert 无排序键） | ❌ 不解决，**且加重** | 初版写「改善但不解决——让排序键来源更可靠」，与下方「更正」自相矛盾（更正的结论是排序键来源取 `eventTime`，**与传输无关**）。正确表述：IC-11 的至少一次投递与可重放会**增加**重复 upsert，排序键因此**更必要**，而 SQL 侧的 `WHERE` + `COALESCE` 一行都不能省 |
+| **IC-BUG-8**（upsert 无排序键） | ❌ 不解决，**且加重** | 初版写「改善但不解决——让排序键来源更可靠」，与下方「更正」自相矛盾（更正后 `minio_event` 源的排序键取 `eventTime`，**与传输无关**）。正确表述：IC-11 的至少一次投递与可重放会**增加**重复 upsert，排序键因此**更必要**，而 SQL 侧的 `WHERE` + `COALESCE` 一行都不能省 |
 | **IC-BUG-13**（`content_type` 不赋值） | ◐ 相关但不解决 | 载荷里**本来就有** `contentType`（实测确认，两种传输都有），是 CP 侧 `IndexUpload` 没读它。与传输无关 |
 | 其余 **28 条** | 无关 | agent 侧（采集/队列/上传/凭据）、STS policy、gRPC 流与 registry、DB 查询与统计——事件通道碰不到 |
 
@@ -1506,10 +1506,22 @@ JetStream 处于闲置状态。
    而 stream sequence 只对 `minio_event` 这一路单调。拿它当 `observed_at`，另外三路就没法与之比较——
    排序键会退化成「只在同一 source 内有效」，而 IC-BUG-8 要防的恰恰是**跨 source**的覆盖。
 
-**正解（2026-09-10 dev 实测后定案，前置拍板 F 结案）**：`observed_at` 一律取 **CP 受理时刻**（四源统一、客户端碰不到），同 key 的删除/创建因果另用事件的 `sequencer`（存 `event_seq`）。曾担心「全用 CP 时刻会让乱序事件把 delete 判成早于 create」——**实测证伪**：基线与重试路径都严格保序，MinIO 的 `queue_dir` 是队头阻塞单队列。三字段分工与实测数据见 `consistency-and-ingest.md` §3.4。**但 IC-11 的 JetStream consumer 保序取决于配置（`MaxAckPending=1` / ordered consumer），配错即静默失序，因此不得依赖传输保序——`event_seq` 就是为了让它自证。**
+**正解（2026-09-10，两次修订后定稿，前置拍板 F 结案）**：判据是「**这个值客户端能不能左右**」，不是「来自哪个时钟」——
+`observed_at` 按 source 取各自最可信且不可被客户端左右的时刻：`minio_event` ← `eventTime`（**MinIO 生成**）、
+`agent`/`api` ← **CP 受理时刻**、`audit` ← 扫描时刻。`event_seq`（事件的 `sequencer`）只在 `observed_at`
+**相等**时决胜，**任一侧 NULL 必须放行**。
+
+> **一次被证伪的中间版本，记录在此以免重犯**：曾定「四源统一取 CP 受理时刻」。评审用真 PG 证伪——
+> 受理时刻由 CP 在处理那一刻取，**后处理的写入其 `observed_at` 必然更大、`>=` 谓词恒真、闸门变摆设**；
+> 而 `IndexUpload` 写的 `size_bytes`/`status`/`uploaded_at`/`etag` 都是非空值，**`COALESCE` 一列都保护不到**，
+> 等于 IC-BUG-8 根本没修。错因是**过度纠正**：被否掉的是 `UploadResult.uploaded_at`（**agent 提供**），
+> 而 `eventTime` 由 MinIO 生成、是基础设施而非客户端，被顺手一起砍了。
+
+**IC-11 的 JetStream consumer 保序取决于配置（`MaxAckPending=1` / ordered consumer），配错即静默失序，
+因此不得依赖传输保序——`event_seq` 就是为了让它自证。**
 
 此外，JetStream 消息同时带 sequence 与 timestamp，两者各司其职——
-- 事件自身的 `eventTime` 与 `sequencer` 都在载荷里、**与传输无关**，IC-11 落地时不必改（前者可留作参考列，后者即 `event_seq`）；
+- 事件自身的 `eventTime` 与 `sequencer` 都在载荷里、**与传输无关**，IC-11 落地时不必改（前者即 `minio_event` 源的 `observed_at`，后者即 `event_seq`）；
 - stream sequence ← 只喂 `shard_state.last_event_seq`（链路自证，用途仅此一项，见 §3.5）。
 
 即两个字段、两个来源，不是一个。
@@ -1524,7 +1536,7 @@ JetStream 处于闲置状态。
 ### 排期与理由：排在对账阶段，不在止血阶段
 
 - 单独更换传输，增量收益仅为「CP 宕机不丢事件」，而修完 IC-BUG-6 + IC-BUG-9 已能取得其中大部分；
-- 真正的增量价值（重放、序号作排序键、链路自证）须待地基阶段（`observed_at` / `object_keys`，IC-6）与
+- 真正的增量价值（重放、链路自证）须待地基阶段（`observed_at` / `object_keys`，IC-6）与
   对账阶段（IC-12/IC-13）落地后才兑现；
 - 现在切换会使止血阶段复杂化，而止血阶段的唯一目标是**先让数据面端到端跑通**。
 

@@ -245,38 +245,82 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
   **具体容量与「索引能否常驻内存」须随 §6-B 一并实测估算，不要直接引用某个拍脑袋的数字**
 - `object_keys` 在角色上等同于 minio-inventory 项目的 `minio_objects`
 
-**排序键**：`file_entries` 与 `object_keys` 均增加 `observed_at`；
-`ON CONFLICT DO UPDATE` 加 `WHERE EXCLUDED.observed_at >= 现有值`，
-富字段一律 `COALESCE(EXCLUDED.x, 现有值)`。软删除同样加时间围栏。
-两条写入路径从此可交换、不再互相踩（修 IC-BUG-8 / IC-BUG-13）。
-
-`source` 取值：`agent | api | minio_event | audit`。
-
-**排序与因果：三个字段各司其职（2026-09-10 定案，实测见下）**——此前的错误是让一个字段兼两职。
+**排序与因果：三个字段各司其职（2026-09-10 定案，两次修订后定稿）**——最初的错误是让一个字段兼两职。
 
 | 用途 | 字段 | 来源 | 说明 |
 |---|---|---|---|
-| **防覆盖闸门**（`WHERE EXCLUDED.observed_at >= 现有值`）| `observed_at TIMESTAMPTZ NOT NULL` | **CP 受理时刻**，四个 source 统一 | 单一时钟、**客户端碰不到**。绝不采信 `UploadResult.uploaded_at`——它由 agent 提供，一台时钟跑飞或被入侵的 agent 报 `2099-01-01` 就能把该行永久冻结，此后 webhook / `register` / **甚至 IC-13 对账**的写入全被静默丢弃 |
-| **同 key 的删除/创建因果** | `event_seq TEXT`（可空，仅 `minio_event`）| 事件的 **`sequencer`** | S3 专为此定义。**补零后按字典序比较**，且**只在同一 key 内有效**（S3 规范如此，不可跨 key 比较）|
+| **防覆盖闸门** | `observed_at TIMESTAMPTZ NOT NULL` | **每个 source 取自己能提供的、最可信的「对象处于此状态」时刻**（见下表）| 判据是「**这个值客户端能不能左右**」，不是「来自哪个时钟」|
+| **同 key 并列时的决胜** | `event_seq TEXT`（可空，仅 `minio_event` 写）| 事件的 **`sequencer`** | 仅在 `observed_at` **相等**且两侧均非 NULL 时参与比较。S3 专为同 key 排序定义，补零后字典序，**不可跨 key 比较** |
 | **业务事实「文件何时上传」** | `uploaded_at`（列已存在）| agent 上报值 | **只作数据，不作排序键** |
 
-> **为什么 CP 受理时刻是安全的（2026-09-10 dev 实测）**：曾担心「事件乱序到达会把 delete 判成早于
-> create」，从而必须改用事件自身的时间。实测证伪——
-> ① **基线**（`queue_dir` 空、走 `sendSync`）：同一 key 反复 create/delete 12 次，到达顺序与
-> `eventTime`、`sequencer` 三者完全一致，无重复值；
-> ② **重试路径**（配 `queue_dir`，对前 3 次投递返回 500）：MinIO 的队列是**队头阻塞的单队列**——
-> 失败事件重试期间（间隔约 3s）后续事件全部排队，成功后按原序一次性放行。**重试不产生乱序。**
+`observed_at` 的取值来源：
+
+| source | 取自 | 客户端可控？ |
+|---|---|---|
+| `minio_event` | 事件载荷的 **`eventTime`** | ❌ MinIO 生成 |
+| `agent` | **CP 受理该 `UploadResult` 的时刻** | ❌ |
+| `api` | CP 受理 `files/register` 的时刻 | ❌ |
+| `audit` | 该轮对账的扫描时刻 | ❌ |
+
+> **⚠️ 绝不采信 `UploadResult.uploaded_at`**（`proto/v1/agent.proto:65`）。它由 agent 提供，一台时钟
+> 跑飞或被入侵的 agent 报 `2099-01-01` 就能把该行永久冻结，此后 webhook / `register` /
+> **甚至 IC-13 对账**的写入全被静默丢弃、且对账无法纠正。这是 M-1「客户端指定，无人校验」那一类。
 >
-> ⚠️ **但不要把正确性押在「传输保序」上**。IC-11 换 JetStream 后，保序取决于 consumer 配置
-> （`MaxAckPending=1` 或 ordered consumer），配错即静默失序。`event_seq` 的存在就是为了让这条
-> 不变式**自证**而非依赖配置——这正是本 track 反复吃亏的地方。
+> **⚠️ 但也不能因此把 `minio_event` 一并改成 CP 受理时刻**（2026-09-10 曾如此定案，评审证伪后撤回）。
+> `eventTime` 由 **MinIO** 生成——MinIO 是基础设施，不是客户端，与「被入侵的 agent」不是同一类风险。
+> 若四源统一取 CP 受理时刻，则**后处理的写入其 `observed_at` 必然更大、`>=` 谓词恒真、闸门变摆设**。
+> 而 `IndexUpload` 写入的 `size_bytes` / `status` / `uploaded_at` / `etag` 都是非空值
+> （`indexer/indexer.go:542-551`），**`COALESCE` 一列都保护不到**——闸门失效即等于 IC-BUG-8 没修。
+> 真实失败场景：滞留重试中的旧事件 E1(v1) 在 agent 写入 v2 之后到达，把 `size_bytes`/`etag` 写回 v1，
+> 而 `sha256` 因 `COALESCE` 停在 v2 —— 一行自相矛盾的数据，且 IC-13 对账会据此误判。
+>
+> **代价（显式记录的假设）**：`minio_event` 用 MinIO 时钟、其余三路用 CP 时钟，**跨两个时钟比较**。
+> 二者都是我们自己的基础设施、同一 docker 网络 / 同一 NTP 源，这个假设比「信任任意边缘 agent」
+> 弱一个数量级，接受。若将来 MinIO 与 CP 分处不同时钟域，须重新评估。
+
+**写入守卫**（`file_entries` 与 `object_keys` 同规则）：
+
+```sql
+-- upsert：ON CONFLICT ... DO UPDATE ... WHERE
+    EXCLUDED.observed_at > fe.observed_at
+ OR (EXCLUDED.observed_at = fe.observed_at
+     AND (EXCLUDED.event_seq IS NULL OR fe.event_seq IS NULL          -- 任一侧无 seq → 不用它决胜
+          OR lpad(EXCLUDED.event_seq,32,'0') >= lpad(fe.event_seq,32,'0')))
+```
+
+> **⚠️ NULL 必须放行，不能收紧。** 若写成 `AND lpad(EXCLUDED.event_seq,…) >= lpad(fe.event_seq,…)`，
+> 则 agent 上报（`event_seq` 恒 NULL）撞上 webhook 先建的行时 `NULL >= '18D3…'` 求值为 NULL、
+> `WHERE` 不为真 → **每一次合法的 agent 上报都被静默吞掉**。而「webhook 先到、agent 后到」是
+> 生产上的常态（MinIO 在 PUT 完成即发事件，agent 随后才走 gRPC 上报）。这属于
+> 「拦住攻击者也拦住所有合法调用方」，`code-reviewer.md` 明确要求防的那一类。
+>
+> 补零宽度取 **32**：实测 MinIO 的 `sequencer` 恒为 16 位十六进制，取 32 留冗余且不影响正确性。
+
+**软删除同样要守卫，且它不是 upsert。** 软删除走的是独立的 `MarkFileEntryDeleted`
+（`indexer/queries.go:209-216`），当前是 `UPDATE … WHERE bucket_id=$1 AND storage_path=$2
+AND status != 'deleted'`——**没有任何时间围栏**。必须补同一组守卫，否则：key `K` 的删除事件
+E_del 因抖动进重试 → agent 重新采集并上传 `K`（新对象，行被 upsert 成 `completed`）→ E_del 重投成功
+→ 把这行**刚建的活对象**标成 `deleted`。文件在 MinIO 里活着、在 UI 里消失，而 L3 幽灵清理管的是
+反方向（PG 有 / MinIO 无），**检不出来**。
+
+富字段一律 `COALESCE(EXCLUDED.x, 现有值)`。两条写入路径从此可交换、不再互相踩（修 IC-BUG-8 / IC-BUG-13）。
+
+`source` 取值：`agent | api | minio_event | audit`。**该枚举被 D-030 与 IC-13 依赖，不得塞入其他语义**
+（如「元数据缺失」须另立列，见 IC-2a ⑤ 的 `meta_incomplete`）。
+
+> **实测记录（2026-09-10 dev）**：① 基线（`queue_dir` 空、走 `sendSync`）同一 key 反复 create/delete
+> 12 次，到达顺序与 `eventTime`、`sequencer` 三者完全一致、无重复值；② 重试路径（配 `queue_dir`、
+> 对前 3 次投递返回 500）MinIO 的队列是**队头阻塞的单队列**，失败事件重试期间（约 3s 一轮）后续事件
+> 全部排队，成功后按原序放行——**重试不产生乱序**。
+>
+> ⚠️ **但不要把正确性押在「传输保序」上**。IC-11 换 JetStream 后保序取决于 consumer 配置
+> （`MaxAckPending=1` 或 ordered consumer），配错即静默失序。`event_seq` 的存在就是让这条不变式
+> **自证**而非依赖配置——这正是本 track 反复吃亏的地方。
 
 > ⚠️ **不要用 JetStream 的 stream sequence 充当 `observed_at`**。D-031 上文曾写「可直接用作 `observed_at`
 > 来源」，**该说法已在 D-031 就地更正**：sequence 是 `uint64` 与本列的 `TIMESTAMPTZ` 类型不符，
-> 且它只对 `minio_event` 一路单调、与另外三路不可比——而排序键要防的恰恰是**跨 source** 的覆盖。
-> sequence 的正确用途只有一个：喂 `shard_state.last_event_seq` 做链路自证（见 §3.5）。
->
-> 推论：**IC-2a ⑤ 现在就用 `eventTime`，IC-11 落地时这一列不必改**。
+> 且它只对 `minio_event` 一路单调。sequence 的正确用途只有一个：喂 `shard_state.last_event_seq`
+> 做链路自证（见 §3.5）。事件的 `sequencer`（`event_seq`）与它是两回事，不要混淆。
 
 ### 3.5 对账三级
 

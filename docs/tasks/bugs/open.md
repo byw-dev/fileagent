@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…21 为 2026-09-09 追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -191,7 +191,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **根因** | `IndexUpload` / `IndexDeletion` 出错只 `logger.Warn`，处理器最终无条件 `c.Status(http.StatusOK)`；JSON 解析失败同样返回 200 |
 | **精确位置** | `controlplane/internal/api/handler/events.go:803-812`、`:818`、`:779-784` |
 | **后果** | MinIO 看到 200 即从 `queue_dir` 删除该事件、永不重投。一次瞬时 DB 抖动 = 永久丢失文件记录，且无任何机制能发现（当前无对账） |
-| **修复** | 索引失败返回 5xx 让 MinIO 重投；解析失败返回 400（真正的坏载荷不该无限重投）。注意保持幂等——重投会重复索引，由 `UNIQUE (bucket_id, storage_path)` upsert 兜住 |
+| **修复** | 索引失败返回 5xx 让 MinIO 重投。**⚠️ 不得按 4xx/5xx 分流**——初版写「解析失败返回 400，坏载荷不该无限重投」，**dev 实测证伪**：MinIO 对 400 与 500 一视同仁（都走 `sendSync.func1()` 失败分支，日志 `returned '400 Bad Request'`），配上 IC-4 ③ 的持久 `queue_dir` 后 400 会被无限重投并队头阻塞整条流。统一走「计数 → 未超限 5xx → 超限落死信 + 返 200 放行」。注意保持幂等——重投会重复索引，由 `UNIQUE (bucket_id, storage_path)` upsert 兜住 |
 | **⚠️ 5xx 会阻塞整条事件流（2026-09-10 dev 实测）** | MinIO 的 `queue_dir` 是**队头阻塞的单队列**：对前 3 次投递返回 500，实测后续的 delete 与 create **全部排队等待**（约 3s 一次重试），直到那条失败事件成功才按原序一次性放行。**含义**：一个持久失败的事件（如 bucket 行缺失导致 `IndexUpload` 恒错）会让该 target 的**索引 feed 无限期停摆**，止血变断流。**因此 IC-4 ① 必须带毒丸处理**：同一事件重试超过上限 → 落死信（日志/表）→ 返 200 放行队列，而不是无限 5xx。**副作用**（有序性）见 IC-BUG-8 卡片的 `observed_at` 定案 |
 | **验收** | 断开 PG 后触发一次 ObjectCreated，端点返回 5xx；恢复 PG 后 MinIO 重投，`file_entries` 出现该行 |
 
@@ -216,7 +216,9 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/indexer/queries.go:48-60`（DO UPDATE 子句）；`controlplane/internal/indexer/indexer.go:538-548`（IndexUpload 只填 5 个字段） |
 | **后果** | 今天不可见（因 IC-BUG-2，agent 路径是死的）。**一旦修好 IC-BUG-2 就会立刻变成数据损坏**：同一对象的 webhook 事件晚于 agent 上报到达时，会把 agent 写入的 `agent_id` / `rule_id` / `sha256` / `file_mtime` 全部清成 NULL |
 | **修复** | 按 D-030：`file_entries` 增加 `observed_at`（排序键）与 `source`；`DO UPDATE` 加 `WHERE EXCLUDED.observed_at >= file_entries.observed_at`，富字段一律 `COALESCE(EXCLUDED.x, file_entries.x)`。软删除同样加时间围栏 |
-| **`observed_at` 取值来源（2026-09-10 定）** | `minio_event` ← 载荷的 **`eventTime`**（`Records[].eventTime`，实测 webhook 与 NATS 都有，**与传输无关**）；`agent` ← `UploadResult.uploaded_at`（缺失回落到 CP 收到时刻）。**四个 source 必须同量纲**，否则跨 source 不可比、排序键失效——而跨 source 覆盖正是本条要防的。**不要等 IC-11 用 JetStream stream sequence**：它是 `uint64`（本列是 `TIMESTAMPTZ`），且只对 `minio_event` 一路单调；sequence 的正确用途只有 `shard_state.last_event_seq`。用 `eventTime` 则 IC-11 落地时这一列不必改 |
+| **`observed_at` 取值来源（2026-09-10 两次修订后定稿）** | 判据是「**这个值客户端能不能左右**」：`minio_event` ← 载荷的 `eventTime`（**MinIO 生成**）；`agent` / `api` ← **CP 受理时刻**；`audit` ← 扫描时刻。**⚠️ 绝不采信 `UploadResult.uploaded_at`**（agent 提供，报 `2099` 即可永久冻结该行，此后连 IC-13 对账都写不进去）。**⚠️ 也不要因此把 `minio_event` 一并改成 CP 受理时刻**——中间版本曾如此定案，评审用真 PG 证伪：四源统一取受理时刻会让 `>=` 谓词**恒真**、闸门变摆设，而 `IndexUpload` 写的 `size_bytes`/`status`/`uploaded_at`/`etag` 都是非空值、`COALESCE` 一列都保护不到，等于本条根本没修。**完整 SQL 守卫与 NULL 语义见 `consistency-and-ingest.md` §3.4** |
+| **⚠️ 软删除是独立 UPDATE，必须单独补守卫** | `MarkFileEntryDeleted`（`indexer/queries.go:209-216`）是 `UPDATE … WHERE bucket_id AND storage_path AND status != 'deleted'`，**无任何时间围栏**，且不是 upsert——只改 `ON CONFLICT` 子句碰不到它。不补则「删除事件滞留重试 → agent 重传同 key → 删除事件重投」会把刚建的活对象标成 `deleted`，而 L3 幽灵清理管的是反方向（PG 有 / MinIO 无），**检不出来** |
+| **IC-11 只改善不解决** | 换 JetStream 让重复投递变多（至少一次 + 可重放），排序键因此**更必要**；SQL 侧一行都不能省。**不要用 stream sequence 充当 `observed_at`**（`uint64` vs `TIMESTAMPTZ`，且只对一路单调）——它只喂 `shard_state.last_event_seq` |
 | **IC-11 只改善不解决** | D-031 全量扫描结论：换 JetStream 让排序键的**来源**更可靠，但 SQL 侧的 `WHERE` + `COALESCE` 该写还得写 |
 | **验收** | 单测：先以 `source=agent` 写入完整行，再以 `source=minio_event` 用更早/更晚的 `observed_at` 各写一次，富字段均不被清空 |
 
@@ -423,7 +425,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/db/queries/rules.sql:57-58`；调用方 `controlplane/internal/api/handler/agents.go`（`DeleteRule`） |
 | **后果** | `DELETE /api/v1/agents/<A>/rules/<属于 B 的 rule_id>` 会删掉 **B 的**规则，然后把 cancel 命令发给 A——B 那边的采集静默停止，且路径里的 agent id 与实际受影响的 agent 不符，事后排查会指向错误的 agent。当前是单组织 + 管理员鉴权，所以是**越权面**而非直接可利用漏洞，但与 IC-BUG-24 是同一模式 |
 | **修复** | DELETE 加 `AND agent_id = $2 AND org_id = $3`，`:execrows` 返回 0 时 handler 返回 404，与 Update 对齐；经 `make generate` |
-| **归属（2026-09-10）** | 从 IC-2 ⑧ 移到 **IC-SEC-2**（与 IC-BUG-27/28 同刀）。**不挡数据面可用**：单组织 + 管理员鉴权下是越权面而非可利用漏洞，不该混进 IC-2a 的上报链路 review |
+| **归属（2026-09-10）** | 从 IC-2 ⑧ 移到 **IC-SEC-2**（与 IC-BUG-27/32 同刀；IC-BUG-28 已改判移入 IC-2a ⑧）。**不挡数据面可用**：单组织 + 管理员鉴权下是越权面而非可利用漏洞，不该混进 IC-2a 的上报链路 review |
 | **验收** | 用 agent A 的路径删 B 的 rule 返回 404 且 B 的规则仍在；删自己的规则仍正常 |
 
 ## IC-BUG-27 — `handleDirectoryListing` 不校验归属 🟡 P2
@@ -434,7 +436,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `controlplane/internal/grpcserver/handler.go` `handleDirectoryListing`；`controlplane/internal/dirstore/store.go` |
 | **后果** | 任一已连接 agent 可对别人的 `request_id` 投递伪造的目录列表，管理员看到的是伪造内容。与 IC-BUG-24 同为「能力型随机 ID」，需在 30s 窗口内猜中 UUIDv4，实际可利用性低 |
 | **修复** | 与 IC-BUG-24 同解：`dirstore.Store.Register(reqID, agentID)` + `Deliver(reqID, agentID, result)` 比对收件人。IC-SEC-1 已经把 `dryrun.Store` 改成这个形状，照抄即可 |
-| **归属（2026-09-10）** | 从 IC-2 ⑨ 移到 **IC-SEC-2**（与 IC-BUG-26/28 同刀）|
+| **归属（2026-09-10）** | 从 IC-2 ⑨ 移到 **IC-SEC-2**（与 IC-BUG-26/32 同刀；IC-BUG-28 已改判移入 IC-2a ⑧）|
 | **验收** | agent A 对发给 B 的 request_id 投递被丢弃并告警；合法目录列举仍能送达 |
 
 ## IC-BUG-28 — `registry.Register` 覆盖 map，重连时陈旧流会关掉新连接 🟠 P1
@@ -460,7 +462,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **可利用性** | **当前为零**——agent 从不上报 `UploadResult`（IC-BUG-2），这条路径是死代码。**IC-2a 把它变成索引主路径的那一刻起就成立**，与 IC-1 让 IC-BUG-22/23 变得可利用是同一个机制 |
 | **修复** | 在 `HandleUploadResult` 里校验归属（`agentID` 已经是流上的可信身份，函数签名里就有）。**分支是三个，不是两个**——见下行 |
 | **⚠️ 三分支** | 只写 `rule.AgentID == agentID` 不够。实际要处理 ①**规则不存在** ②**规则属于别的 agent** ③**合法**，且**不能让 `loadRuleMetadata` 查不到就默默走空 metadata**——那等于把 ① 静默当成「无规则来源」，正是这条缺陷的静默版本 |
-| **① 的来源：队列与规则生命周期解耦（结构性，非缺陷）** | 三个已确认的事实：`stopRule` 只做 `sched.RemoveRule` + cancel ruleCtx（`agent/cmd/agent/main.go:159-167`），**从不触碰 `upload_tasks`**；`DequeuePending` 只按 `WHERE status = ?` 取（`queue.go:293`），**无 rule 过滤**；全仓库无「按 rule 删任务」语句（唯一的 `DELETE FROM upload_tasks` 是容量淘汰 `queue.go:277`）。**任务一旦入队，规则怎么变都不影响它被上传和上报**。于是有五条路径：<br>1. **队列滞留**——任务已入队、`CancelRule` 正常送达并停掉 watcher/cron，但队列照常排空。窗口 = 排空时间；叠加重试（`maxRetries=10`，退避 1/5/15/60min 封顶）可达数小时，大文件再叠加 IC-BUG-5 更久<br>2. **离线积压**——离线期间持续写本地队列（设计行为），期间规则被删，重连补传整批。窗口 = 断线时长<br>3. **IC-BUG-30**——断连期间删规则，重连后 agent 不知道规则没了，**持续产生新任务**。无界，直到进程重启<br>4. **重启残留**——SQLite 队列跨重启存活，规则却只从 `SyncRulesOnConnect` 来<br>5. **恶意/有缺陷的 agent** 伪造 rule_id（本卡片要防的那条）<br>6. **IC-BUG-26 自己制造的那条（评审补，最难堪的一条）**——`DeleteCollectionRule` 只按 `id` 删（`db/queries/rules.sql:58`），而 `DeleteRule` handler 把 cancel 发给 **URL 里的 agent**（`api/handler/agents.go:1026` 取 `agentID := c.Param("id")`，`:1041` 用它发 cancel）。于是 `DELETE /api/v1/agents/<A>/rules/<属于 B 的 rule>` 会删掉 B 的规则、把 cancel 发给 A——**B 全程在线、连接正常、没有任何断连窗口**，却永远收不到 cancel。这是**唯一一条在全在线稳态下无界产生**的路径<br>**只有第 3 条能被 IC-2b 消掉；第 6 条 IC-SEC-2 的 IC-BUG-26 只能消掉一半**（另一半是收件人错了，需要 `DeleteRule` 先从 DB 读回真实 `agent_id` 再发 cancel）。**1/2/4 是持久化队列 + 可变规则集的必然结果**——换句话说，**「规则不存在」是稳态下的正常情形，不是异常**：管理员每删一次规则，只要名下还有在途任务就会产生一批 |
+| **① 的来源：队列与规则生命周期解耦（结构性，非缺陷）** | 三个已确认的事实：`stopRule` 只做 `sched.RemoveRule` + cancel ruleCtx（`agent/cmd/agent/main.go:159-167`），**从不触碰 `upload_tasks`**；`DequeuePending` 只按 `WHERE status = ?` 取（`queue.go:293`），**无 rule 过滤**；全仓库无「按 rule 删任务」语句（唯一的 `DELETE FROM upload_tasks` 是容量淘汰 `queue.go:277`）。**任务一旦入队，规则怎么变都不影响它被上传和上报**。于是有六条路径：<br>1. **队列滞留**——任务已入队、`CancelRule` 正常送达并停掉 watcher/cron，但队列照常排空。窗口 = 排空时间；叠加重试（`maxRetries=10`，退避 1/5/15/60min 封顶）可达数小时，大文件再叠加 IC-BUG-5 更久<br>2. **离线积压**——离线期间持续写本地队列（设计行为），期间规则被删，重连补传整批。窗口 = 断线时长<br>3. **IC-BUG-30**——断连期间删规则，重连后 agent 不知道规则没了，**持续产生新任务**。无界，直到进程重启<br>4. **重启残留**——SQLite 队列跨重启存活，规则却只从 `SyncRulesOnConnect` 来<br>5. **恶意/有缺陷的 agent** 伪造 rule_id（本卡片要防的那条）<br>6. **IC-BUG-26 自己制造的那条（评审补，最难堪的一条）**——`DeleteCollectionRule` 只按 `id` 删（`db/queries/rules.sql:58`），而 `DeleteRule` handler 把 cancel 发给 **URL 里的 agent**（`api/handler/agents.go:1026` 取 `agentID := c.Param("id")`，`:1041` 用它发 cancel）。于是 `DELETE /api/v1/agents/<A>/rules/<属于 B 的 rule>` 会删掉 B 的规则、把 cancel 发给 A——**B 全程在线、连接正常、没有任何断连窗口**，却永远收不到 cancel。这是**唯一一条在全在线稳态下无界产生**的路径<br>**只有第 3 条能被 IC-2b 消掉；第 6 条 IC-SEC-2 的 IC-BUG-26 只能消掉一半**（另一半是收件人错了，需要 `DeleteRule` 先从 DB 读回真实 `agent_id` 再发 cancel）。**1/2/4 是持久化队列 + 可变规则集的必然结果**——换句话说，**「规则不存在」是稳态下的正常情形，不是异常**：管理员每删一次规则，只要名下还有在途任务就会产生一批 |
 | **✅ 定案（2026-09-10）：宽松——清空 `rule_id`，文件照常入索引** | **严格（整条拒绝）会让「删除一条规则」变成「静默丢弃若干已在 MinIO 里的文件的索引行」**。对象已经写进去了，拒绝入索引只是制造一批要等 IC-13 对账才发现的幽灵，而 L2 那时只能补回存在性、补不回 tags/sha256。一个日常管理动作不该有这种后果 |
 | **⚠️ 告警分级** | ① 与 ② 的告警等级**必须分开**：① 是路径 1/2/4 的正常产物，per-file 告警就是 IC-BUG-21 里「5000 条 Warn 被运维关掉」的翻版，应按 `rule_id` 去重或降为 Info；**② 永远不合法，是唯一值得响的那一支** |
 | **⚠️ 宽松的代价，须可见** | 走 ① 分支的文件拿不到 `loadRuleMetadata` 的规则声明——**永久丢失的是「规则声明的 `file_type` 覆盖」+ `static_tags` + `path_var` 标签**，规则已删，retag worker 也没有可回溯的声明。**注意不是「无类型」**：`indexer.go:333` 仍会走 glob `classifier.Classify` 兜底，文件类型按后缀正常判定（评审证伪，初版措辞过重）。这是接受的代价，但要让它可查（在 `source` 之外记一个「元数据缺失」标记），而不是当正常行写完了事 |
@@ -471,7 +473,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 | 字段 | 内容 |
 |------|------|
-| **根因** | 同步协议**只有增量推送，没有全集语义**。`DispatchRuleCancel` 在 agent 离线时直接 `return nil`（`dispatch.go:102-104`），而重连时的 `SyncRulesOnConnect` **只推 `status == active` 的规则**（`dispatch.go:130`），从不推 cancel。agent 侧 `stopRule` 有两个调用点——`applyRule` 开头（`agent/cmd/agent/main.go:170`）与 `CancelRule` 分支（`:238`），**没有一个来自「同步全集」**，没有「本次同步的全集之外的规则一律停掉」这条语义 |
+| **根因** | 同步协议**只有增量推送，没有全集语义**。`DispatchRuleCancel` 在 agent 离线时直接 `return nil`（`dispatch.go:101-103`），而重连时的 `SyncRulesOnConnect` **只推 `status == active` 的规则**（`dispatch.go:130`），从不推 cancel。agent 侧 `stopRule` 有两个调用点——`applyRule` 开头（`agent/cmd/agent/main.go:170`）与 `CancelRule` 分支（`:238`），**没有一个来自「同步全集」**，没有「本次同步的全集之外的规则一律停掉」这条语义 |
 | **精确位置** | `controlplane/internal/agent/dispatch.go:101-115`（离线即放弃）、`:129-132`（只推 active）；`agent/cmd/agent/main.go:159-167`（`stopRule`）、`:169-209`（`applyRule`） |
 | **后果** | agent 断连期间（网络抖动 / CP 重启）管理员停用或删除一条规则 → cancel 命令被丢弃 → agent 重连后**继续按这条已经不存在的规则采集并上传**，且因 D-030 整桶 policy **传得上去**（不会被 403 挡）。DB 与 UI 上该规则已消失，运维没有任何线索。持续到 agent 进程重启为止——`rules` 表只写不读，重启后规则只从 `SyncRulesOnConnect` 来 |
 | **与 IC-2a 的关系** | 上报活过来之后，这些上传会带着一个**已删除的 `rule_id`** 到达 `HandleUploadResult`，因此 IC-BUG-29 的归属校验必须处理三分支。**但注意归因**：那一支的根是「队列与规则生命周期解耦」（见 IC-BUG-29 卡片的五条路径），本条只是把它从「一次排空」放大成「无界产生」。**修好本条不会消掉那一支**，IC-2a ⑦ 仍必须独立处理 |
