@@ -1508,7 +1508,7 @@ JetStream 处于闲置状态。
 
 **正解（2026-09-10，两次修订后定稿，前置拍板 F 结案）**：判据是「**这个值客户端能不能左右**」，不是「来自哪个时钟」——
 `observed_at` 按 source 取各自最可信且不可被客户端左右的时刻：`minio_event` ← `eventTime`（**MinIO 生成**）、
-`agent`/`api` ← **CP 受理时刻**、`audit` ← 扫描时刻。`event_seq`（事件的 `sequencer`）只在 `observed_at`
+`agent`/`api` ← **PostgreSQL 的 `now()`**（§3.5 坑 3：所有比较的时间戳须同源，且 CP 进程时钟实测比 MinIO/PG 慢约 16ms）、`audit` ← **列举那一刻**（不是写入事务的 `now()`）。`event_seq`（事件的 `sequencer`）只在 `observed_at`
 **相等**时决胜，**任一侧 NULL 必须放行**。
 
 > **一次被证伪的中间版本，记录在此以免重犯**：曾定「四源统一取 CP 受理时刻」。评审用真 PG 证伪——

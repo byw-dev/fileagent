@@ -246,7 +246,15 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
   **具体容量与「索引能否常驻内存」须随 §6-B 一并实测估算，不要直接引用某个拍脑袋的数字**
 - `object_keys` 在角色上等同于 minio-inventory 项目的 `minio_objects`
 
-**排序与因果：三个字段各司其职（2026-09-10 定案，两次修订后定稿）**——最初的错误是让一个字段兼两职。
+> ### ⚠️ 本节的 SQL 以代码为准（2026-09-10，第五轮评审后）
+>
+> 下面这段守卫连续三轮「新写 → 一执行就碎」——谓词恒真、NULL 吞写、`RETURNING` 返 0 行、
+> `audit` 覆盖更新数据，**每一条都是在真 PG 上跑起来才发现的，读文档四轮都没读出来**。
+> 因此 **IC-2a 的第一步（⓪）是把它落成仓库里的真迁移 + 真 upsert + 表驱动测试（含变异开关）**，
+> 此后**本节只表达意图与不变式，SQL 文本以代码为准**（CLAUDE.md：代码是最终真相）。
+> 下面的 SQL 是 PoC 的输入，不是权威。
+
+**排序与因果：三个字段各司其职（2026-09-10 定案，多次修订后定稿）**——最初的错误是让一个字段兼两职。
 
 | 用途 | 字段 | 来源 | 说明 |
 |---|---|---|---|
@@ -261,7 +269,14 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 | `minio_event` | 事件载荷的 **`eventTime`** | ❌ MinIO 生成 |
 | `agent` | **PostgreSQL 的 `now()`**（写入事务内取），**不是 CP 进程时钟** | ❌ |
 | `api` | 同上 | ❌ |
-| `audit` | 同上 | ❌ |
+| `audit` | **列举那一刻**（或对象自身的 `LastModified`，与 `eventTime` 同时钟域）——**不是写入事务的 `now()`** | ❌ |
+
+> **⚠️ `audit` 取写入时刻会让陈旧列举覆盖更新的数据（实测）**：L2 于 10:00 列举到 K = v1(size 55)
+> → 10:01 agent 上报 v2(size 100) → 10:02 审计批次落库，若 `observed_at` 取写入事务的 `now()`=10:02
+> 则 **> 10:01、守卫放行**，`size_bytes` 被写回 55、`etag` 写回 E1、`source` 变 `audit`——正是守卫本该
+> 保护的那几列。更糟的是同一条写入会把 `object_keys.last_modified` 也写回旧值，而 §3.5 坑 1 规定封存
+> 判据**只能看 `last_modified`** → 该分片被误判「未被写过」而封存，真实状态一级对账都查不出。
+> 列举与落库之间天然有延迟（批量对账尤甚），所以这不是边界情形。
 
 > **⚠️ 必须用 PG `now()` 而不是 CP 进程的 `time.Now()`**——这不是风格问题。§3.5「坑 3」已经定死
 > 「**所有参与比较的时间戳必须来自同一个时钟，统一由 PostgreSQL 的 `now()` 产生**」，本表遵从它。
@@ -330,6 +345,11 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 >   则永远走 UPDATE 分支、恒返一行。代价是 12 列都要重复一遍守卫表达式。
 >
 > **无论选哪个，`ErrNoRows` 都不得作为错误传播到 webhook / gRPC 的响应路径上。**
+>
+> **⚠️ 压制路径还必须跳过副作用。** upsert 之后调用方紧接着会 `applyStaticTags` / `applyPathVarTags`
+> （`indexer.go:220-224`）并 `publishFileUploaded`（`indexer.go:252`）。按字面实现，每一条**被正确压制**的
+> 陈旧事件或重发上报都会照常发一条 `events.file.uploaded`，而载荷是**当前那行更新后的数据**——下游
+> 6c 打标与将来的 ETL 拿到的是幽灵事件。**压制路径只记指标，不打标、不发事件。**
 
 **软删除同样要守卫，且它不是 upsert——改动面比「加个 WHERE」大。** 软删除走的是独立的
 `MarkFileEntryDeleted`（`indexer/queries.go:209-216`），当前是 `UPDATE … SET status='deleted',
@@ -345,6 +365,13 @@ updated_at=NOW() WHERE bucket_id=$1 AND storage_path=$2 AND status != 'deleted'`
    （IC-11「处理成功才 ack」，重投是设计出来的常态）都会 `observed_at` 打平、`event_seq` 自比自相等
    而通过守卫，**把已删除的行复活成 `completed`**。实测确认：`create(T1,seqA) → delete(T3,seqB) →
    create 重投` 在只加 WHERE 的实现下复活。
+
+> **⚠️ 剩余缺口（本节不闭合，由 L3 兜）**：删除事件落在**不存在的行**上时 UPDATE 空转、**不留墓碑**，
+> 随后旧的 create 事件被重放会直接走 INSERT 分支建出一行 `completed`——守卫对 INSERT 无能为力
+> （没有旧 `observed_at` 可比）。触发路径真实存在：`queue_dir` 为空时 MinIO `sendSync` 直接丢事件
+> （实测容器日志 `not connected to target server/service`），create 丢、delete 到达即成立；IC-11 的
+> 可重放会让它更易命中。方向是**反向幽灵**（PG 有 / MinIO 无），**由 §3.5 的 L3 收敛**。
+> 若将来要闭合，需引入删除墓碑行，代价另议。
 
 富字段一律 `COALESCE(EXCLUDED.x, 现有值)`。两条写入路径从此可交换、不再互相踩（修 IC-BUG-8 / IC-BUG-13）。
 
