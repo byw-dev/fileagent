@@ -7,7 +7,7 @@
 
 ## 总览
 
-**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
+**IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
@@ -16,8 +16,10 @@
 
 ### 缺陷模式（2026-09-10 归纳）
 
-38 条里**有 30 条归得进三类成因**（M-1/M-2/M-3）。M-1 与 M-2 的类扫描均已完成（结论见下方两小节），
-M-3 待扫。**剩下 8 条不属于任何一类**——IC-BUG-33/34 是「持久化状态缺少终态处理」；IC-BUG-5/11/**38** 是
+41 条里**有 30 条归得进三类成因**（M-1/M-2/M-3）。M-1 与 M-2 的类扫描均已完成（结论见下方两小节），
+M-3 待扫。**剩下 11 条不属于任何一类**——IC-BUG-39/40 是**「配置/契约在两处各写一份，没有任何机制让它们对齐」**
+（脚本硬编码的 session policy vs `storage/policy.go`；CP 的 MinIO 凭据配置 vs MinIO 里的实际账号），
+这一类值得盯，因为它的症状永远出现在离根因很远的地方；IC-BUG-33/34 是「持久化状态缺少终态处理」；IC-BUG-5/11/**38** 是
 **「参数收了不用」——这一类 2026-09-11 起有了第三个实例（`log.output`/`max_size_mb`/`max_backups` 三个字段
 解析了、校验了、写进文档了，就是没人读），够立类了，下一轮归纳应正式收编**；IC-BUG-35/36 是部署脚本与 MinIO
 约束不符（两条同源，且都属于「脚本从未在干净环境跑过」）；IC-BUG-37 是「同一功能的两条实现路径行为不一致」，
@@ -135,6 +137,9 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-36 | CP 凭据被 `init-minio.sh` 建成 **service account**，而 MinIO 的 service account 不能调 AssumeRole → 全新环境 STS 必然 `Access Denied` ✅ 已修（PR #97） | 🔴 P0 | deploy |
 | IC-BUG-37 | watcher 的 fsnotify 分支没有初始扫描，规则指向的**既有文件永不被采集**；而 polling 回退分支却会扫——同一条规则的行为取决于 fsnotify 是否可用 | 🟠 P1 | agent |
 | IC-BUG-38 | agent 的 `log.output` / `log.max_size_mb` / `log.max_backups` 解析了、校验了、写进文档了，就是没人读——日志只落 stdout，无文件、无轮转 | 🟡 P2 | agent |
+| IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 | 🟡 P2 | deploy + controlplane |
+| IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 | 🟠 P1 | controlplane |
+| IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 | 🟡 P2 | deploy |
 
 ---
 
@@ -391,6 +396,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **后果** | agent UUID 不是秘密——它出现在对象键、日志、NATS 事件、webui 响应里；`Register`（同样免认证）对已存在 fingerprint 还会回吐 agent_id。触发条件是 agent 状态恰为 `approved`（已审批、尚未首次连接），这是每个新 agent 的必经状态，窗口长度由现场决定。**IC-1 之前拿到 agent JWT 基本没用（STS 链路不通），之后它直接等于数据湖整桶写** |
 | **修复** | ✅ **已随 IC-1 修**：`PollApproval` 比对 `agent.Fingerprint`，空或不匹配返回 `PermissionDenied`。校验放在状态检查**之前**，避免向未认证调用方泄露 agent 状态 |
 | **验收** | ✅ 单测覆盖（错误指纹 / 空指纹均拒绝，正确指纹签发）；变异测试确认去掉校验后用例失败 |
+| **⚠️ 爆炸半径已扩大（2026-09-11）** | 本条在 IC-1 之前是「拿到 token 也没用」（STS 链路不通），IC-1 之后是「dev 独有」（只有 dev 那台手工建的 IAM 用户能签出 STS）。**PR #97 修好 IC-BUG-36 之后，任何按脚本 bootstrap 出来的环境都能签出 STS**，本条随之从「dev 独有」升级为「所有新环境可利用」。严重度不变，但排期理由变强了——正确的问法一直是「这次改动让原本无害的东西变得可利用了吗」 |
 
 ## IC-BUG-23 — 吊销不生效：token 仍可用，且重连会把状态刷回 online 🔴 P0
 
@@ -402,6 +408,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **后果** | `AGENT_TOKEN_TTL` 默认 **720h = 30 天**，吊销一个**被入侵的** agent 完全依赖它自愿执行 `handleRevokeCommand` 删本地 token——而被入侵的 agent 正是不会照做的那个。D-030 第八条「授权宽度是管理权限问题」所依赖的管理手段本身失效 |
 | **修复** | ✅ **已随 IC-1 修**：新增 `Server.assertAgentUsable`，`Connect` 与 `RefreshCredentials` 入口查一次 `agents.status`，仅 `approved/online/offline` 放行；查不到 agent 行一律拒绝（fail-closed）。并把 `Connect` 的 online 写入换成条件 SQL `MarkAgentOnlineIfUsable`（`WHERE status IN ('approved','offline','online')`）——**不变式钉在 SQL 里而不是靠「同一函数里更早的一行」**，否则吊销恰好落在闸门与写入之间就会被这条无条件 UPDATE 撤销、此后闸门永久放行。**未做**按 jti 吊销 JWT——CP 只存 token 的 sha256、无法还原 jti，真要做需引入「按 agent 维度的令牌版本号」，成本远高于状态闸门 |
 | **验收** | ✅ 单测覆盖（revoked 拒绝 + 三种可用状态放行 + 查库失败拒绝）；变异测试确认去掉闸门后用例失败 |
+| **⚠️ 爆炸半径已扩大（2026-09-11）** | 本条在 IC-1 之前是「拿到 token 也没用」（STS 链路不通），IC-1 之后是「dev 独有」（只有 dev 那台手工建的 IAM 用户能签出 STS）。**PR #97 修好 IC-BUG-36 之后，任何按脚本 bootstrap 出来的环境都能签出 STS**，本条随之从「dev 独有」升级为「所有新环境可利用」。严重度不变，但排期理由变强了——正确的问法一直是「这次改动让原本无害的东西变得可利用了吗」 |
 
 ## IC-BUG-24 — `handleDryRunResult` 无归属校验 🟡 P2
 
@@ -603,6 +610,40 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 用 `lumberjack` 之类的轮转 writer 接上三个字段（`output` 为空或为 `stdout` 时保持现状）；或者**反过来删掉这三个字段**并同步文档——**但不要保持现状**，「配了不生效」比「没有这个功能」更坏 |
 | **验收** | 配 `output` 指向一个文件后重启 agent，日志写进该文件；写满 `max_size_mb` 后发生轮转且保留 `max_backups` 份 |
 | **归属** | 未排期。属「参数收了不用」类（与 IC-BUG-5/11 同类，本条是第三个实例——见上方「缺陷模式」一节） |
+
+
+## IC-BUG-39 — 脚本硬编码的 session policy 与 `storage/policy.go` 无联动 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `deploy/scripts/init-minio.sh` 的自断言里硬编码了一份 STS session policy（`STS_SESSION_POLICY`），用来验证 CP 的父 policy 够宽、能委派 agent 需要的写入权限。但这份 JSON 与真正签发时用的 `controlplane/internal/storage/policy.go`（`bucketActions` / `objectActions`）**是两份各写各的文本，没有任何机制保证一致** |
+| **精确位置** | `deploy/scripts/init-minio.sh` 的 `STS_SESSION_POLICY`；`controlplane/internal/storage/policy.go:43-45,54-57` |
+| **现状** | **当前两者逐字一致**（PR #97 的 code review 比对过），所以今天没有症状 |
+| **后果** | 将来 `policy.go` 加一个 Action（IC-3 / IC-8 都可能要加），父 policy 不同步就会在**交集处被静默削掉**——脚本的自断言用的是旧的 session policy，照样全绿，而真实 agent 拿到的会话缺那条权限。症状是 agent 侧莫名 Access Denied，离根因隔着一个仓库目录 |
+| **修复** | 加交叉引用注释是最低限度；更好的做法是写一个 Go 测试，把脚本里那段 JSON 解出来与 `BuildSessionPolicy` 的输出比对，不一致即红 |
+| **验收** | 故意给 `policy.go` 加一个 Action 而不改脚本 → 必须有东西变红 |
+| **归属** | 未排期。宜与 IC-3 或 IC-8（下一次要动 policy 的刀）同刀 |
+
+## IC-BUG-40 — CP 启动不校验 MinIO 凭据，故障延后到 agent 侧才爆 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `controlplane/cmd/server/main.go:206-221` 构造 MinIO 客户端时只调 `miniogo.New`——那是纯本地构造，**不发任何网络请求**。凭据是错的、账号被删了、secret 被轮换过，CP 都会照常启动并报告健康 |
+| **后果** | 故障延后且移位：预签名下载要等有人点下载才 500；STS 要等 agent 连上来才 `Access Denied`；**若 STS 会话已签发，还要再等 ≤1h 会话过期才开始失败**。报错点在 agent 侧，离根因隔了一小时和两个进程。IC-BUG-36 当初难查、以及 PR #97 评审发现的「重跑脚本静默换密」之所以危险，都有这条在放大 |
+| **修复** | 启动时做一次轻量探活并 fail-fast（例如对配置的 bucket 调一次 `BucketExists`，或直接签一次 STS）。**注意别把 CP 的启动硬绑在 MinIO 可用性上**——探活失败应该是「响亮地记录 + 健康检查置为降级」还是「拒绝启动」，需要拍一下；倾向后者，理由是凭据错配属于配置错误，不是可恢复的依赖抖动 |
+| **验收** | 把 `MINIO_SECRET_KEY` 改错启动 CP → 启动阶段就明确报错，而不是健康启动后在下载/上传时才暴露 |
+| **归属** | 未排期。发现于 PR #97 的 code review |
+
+## IC-BUG-41 — `init-minio.sh` 把 secret 放进命令行 argv 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `mc admin user add ALIAS AK SK`、`mc alias set … SK`、`curl --user "AK:SK"` 三处都把 secret 作为 argv 传递，执行期间同机任意用户 `ps -ef` 可见 |
+| **精确位置** | `deploy/scripts/init-minio.sh` 的 IAM 用户创建、临时 alias 创建、AssumeRole 自检三处 |
+| **后果** | 仅在脚本执行的几秒窗口内可见，且通常在运维自己的机器/跳板机上执行，实际风险低。但这是**部署脚本里唯一一处凭据以明文出现在进程表**的地方 |
+| **修复** | `mc` 支持从环境变量读凭据（`MC_HOST_<alias>`），curl 支持 `--netrc-file`；两者都能把 secret 移出 argv。改动不大但要小心别把 secret 写进会残留的文件 |
+| **同类卫生问题** | `mc share download` 每跑一次会在 `~/.mc/share/downloads.json` 留一条 `.init-check` 的预签名记录，脚本的 `cleanup()` 不清理。不含 secret、5 分钟过期，属同一类卫生问题，宜一并处理 |
+| **归属** | 未排期。发现于 PR #97 的 code review |
 
 
 ---
