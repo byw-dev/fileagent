@@ -1463,7 +1463,68 @@ JetStream 处于闲置状态。
 - **不消除「MinIO 静默不发事件」的残余风险**——那是 MinIO 内部行为，与传输层无关。
   **D-030 的 L2 分片轮转仍然必需，一项都不能省。**
 - **`queue_dir` 的问题原样存在**。`notify_nats` 同样有 `queue_dir` / `queue_limit`，IC-BUG-9 必须照修。
+- **对象键的 URL 编码原样存在（IC-BUG-19）——2026-09-10 双向实测补充**。dev 环境对同一个键同时挂
+  `notify_nats` 与 `notify_webhook` 各抓一次载荷，**两者字节级同构**：顶层字段均为
+  `['EventName','Key','Records']`，而 CP 实际读取的 `Records[].s3.object.key` 两边都是
+  `ic19%2Fnested+dir%2F%E4%B8%AD+%E6%96%87.csv`。编码发生在 MinIO **构造事件对象**时而非传输层
+  （`%2F` 位于 JSON 字符串**内部**，两种传输都不改写它）。**IC-BUG-19 与本条正交，已拆为独立的 IC-2c（排在 IC-2a 之前），
+  不得等 IC-11。** 附带提醒：事件信封有个未编码的顶层 `Key` 字段（**webhook 与 NATS 都有**，CP 当前
+  只解析 `Records[]` 所以从没注意到），但它是 `bucket/key` 拼接的 MinIO 私有字段、不在 S3 事件规范内，
+  **不要用它绕过 unescape**。
+- **新建 bucket 仍需逐个注册通知（IC-BUG-7）**。换传输不改变「`MakeBucket` 之后要不要配通知」这件事，
+  只是 ARN 从 `arn:minio:sqs::primary:webhook` 变成 NATS target 的 ARN。**IC-4 ② 的实现须把 ARN 做成可配置**，
+  否则 IC-11 落地时会把它打回原形。
 - **retention 配置过短 = 静默丢消息**，这恰恰是上面第 3 条「链路自证」存在的理由，不是可选项。
+
+### 全量扫描结论（2026-09-10）
+
+上面这份清单此前是「撞见一条补一条」——IC-BUG-19 与 IC-BUG-7 都是在别的工作里撞上才发现漏了。
+既然清单的价值就在于完整，这次拿 **IC-BUG-1…IC-BUG-34 逐条**问同一个问题：
+**IC-11 实际改变的六件事碰得到它吗？**（六件事 = 投递语义 PubAck + 显式 ack/重投、跨 CP 宕机的持久化、
+可重放、全局单调序号、鉴权载体、`/internal/minio-event` 端点消失）
+
+**结论：34 条里只有 6 条与事件通道有关。**
+
+| 缺陷 | IC-11 的影响 | 结论 |
+|---|---|---|
+| **IC-BUG-6**（索引失败仍返 200） | ✅ **解决** | 「是否重投」由 ack 语义决定，不再依赖 CP 返回什么 HTTP 状态码 |
+| **IC-BUG-7**（新建 bucket 不注册通知） | ❌ 不解决 | 换传输只改 ARN，不改变「要不要配通知」。**IC-4 ② 的 ARN 须做成可配置** |
+| **IC-BUG-9**（`queue_dir` 在 `/tmp`） | ❌ 不解决 | `notify_nats` 同样有 `queue_dir` / `queue_limit` |
+| **IC-BUG-19**（对象键 URL 编码） | ❌ 不解决 | 双向实测：两种传输载荷字节级同构，编码在 MinIO 构造事件时发生 |
+| **IC-BUG-8**（upsert 无排序键） | ❌ 不解决，**且加重** | 初版写「改善但不解决——让排序键来源更可靠」，与下方「更正」自相矛盾（更正后 `minio_event` 源的排序键取 `eventTime`，**与传输无关**）。正确表述：IC-11 的至少一次投递与可重放会**增加**重复 upsert，排序键因此**更必要**，而 SQL 侧的 `WHERE` + `COALESCE` 一行都不能省 |
+| **IC-BUG-13**（`content_type` 不赋值） | ◐ 相关但不解决 | 载荷里**本来就有** `contentType`（实测确认，两种传输都有），是 CP 侧 `IndexUpload` 没读它。与传输无关 |
+| 其余 **28 条** | 无关 | agent 侧（采集/队列/上传/凭据）、STS policy、gRPC 流与 registry、DB 查询与统计——事件通道碰不到 |
+
+### 更正：stream sequence 不能「直接用作 `observed_at`」
+
+本决策上文第 3 条写的是「stream sequence … 可直接用作 D-030 §3.4 的 `observed_at` 排序键来源」。
+**这句话把两个用途混在了一起，落地时会撞墙**：
+
+1. **类型对不上**：`observed_at` 是 `TIMESTAMPTZ NOT NULL`（`consistency-and-ingest.md:231`），
+   而 JetStream 的 stream sequence 是 `uint64`。
+2. **更根本的是不可比**：`observed_at` 要在 **4 个 source 之间**排序（`agent | api | minio_event | audit`），
+   而 stream sequence 只对 `minio_event` 这一路单调。拿它当 `observed_at`，另外三路就没法与之比较——
+   排序键会退化成「只在同一 source 内有效」，而 IC-BUG-8 要防的恰恰是**跨 source**的覆盖。
+
+**正解（2026-09-10，两次修订后定稿，前置拍板 F 结案）**：判据是「**这个值客户端能不能左右**」，不是「来自哪个时钟」——
+`observed_at` 按 source 取各自最可信且不可被客户端左右的时刻：`minio_event` ← `eventTime`（**MinIO 生成**）、
+`agent`/`api` ← **PostgreSQL 的 `now()`**（§3.5 坑 3：所有比较的时间戳须同源，且 CP 进程时钟实测比 MinIO/PG 慢约 16ms）、`audit` ← **列举那一刻**（不是写入事务的 `now()`）。`event_seq`（事件的 `sequencer`）只在 `observed_at`
+**相等**时决胜，**任一侧 NULL 必须放行**。
+
+> **一次被证伪的中间版本，记录在此以免重犯**：曾定「四源统一取 CP 受理时刻」。评审用真 PG 证伪——
+> 受理时刻由 CP 在处理那一刻取，**后处理的写入其 `observed_at` 必然更大、`>=` 谓词恒真、闸门变摆设**；
+> 而 `IndexUpload` 写的 `size_bytes`/`status`/`uploaded_at`/`etag` 都是非空值，**`COALESCE` 一列都保护不到**，
+> 等于 IC-BUG-8 根本没修。错因是**过度纠正**：被否掉的是 `UploadResult.uploaded_at`（**agent 提供**），
+> 而 `eventTime` 由 MinIO 生成、是基础设施而非客户端，被顺手一起砍了。
+
+**IC-11 的 JetStream consumer 保序取决于配置（`MaxAckPending=1` / ordered consumer），配错即静默失序，
+因此不得依赖传输保序——`event_seq` 就是为了让它自证。**
+
+此外，JetStream 消息同时带 sequence 与 timestamp，两者各司其职——
+- 事件自身的 `eventTime` 与 `sequencer` 都在载荷里、**与传输无关**，IC-11 落地时不必改（前者即 `minio_event` 源的 `observed_at`，后者即 `event_seq`）；
+- stream sequence ← 只喂 `shard_state.last_event_seq`（链路自证，用途仅此一项，见 §3.5）。
+
+即两个字段、两个来源，不是一个。
 
 ### 代价
 
@@ -1475,7 +1536,7 @@ JetStream 处于闲置状态。
 ### 排期与理由：排在对账阶段，不在止血阶段
 
 - 单独更换传输，增量收益仅为「CP 宕机不丢事件」，而修完 IC-BUG-6 + IC-BUG-9 已能取得其中大部分；
-- 真正的增量价值（重放、序号作排序键、链路自证）须待地基阶段（`observed_at` / `object_keys`，IC-6）与
+- 真正的增量价值（重放、链路自证）须待地基阶段（`observed_at` / `object_keys`，IC-6）与
   对账阶段（IC-12/IC-13）落地后才兑现；
 - 现在切换会使止血阶段复杂化，而止血阶段的唯一目标是**先让数据面端到端跑通**。
 

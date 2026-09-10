@@ -2,7 +2,7 @@
 
 > **状态**：设计（2026-09-08 拍板方向，尚未实施）
 > **决策记录**：[`DECISIONS.md`](../../DECISIONS.md) **D-030** / **D-031**（事件传输改 JetStream）
-> **缺陷清单**：[`docs/tasks/bugs/open.md`](../tasks/bugs/open.md) IC-BUG-1…IC-BUG-29
+> **缺陷清单**：[`docs/tasks/bugs/open.md`](../tasks/bugs/open.md) IC-BUG-1…IC-BUG-34
 > **关联**：`system-design.md` §4.5（上传流程）/ §4.7（凭据轮转）/ §5.7（STS）/ §5.8（索引）/ §6.3（Policy）/ §6.5（事件通知）；
 > [`metadata-model.md`](./metadata-model.md) P2.2（衍生数据入口）/ P2.3（run 血缘）；D-014、D-017、D-025
 >
@@ -229,6 +229,7 @@ object_keys(
     file_entry_id  UUID NOT NULL,
     last_modified  TIMESTAMPTZ,     -- 对象自身的 mtime，对账信号列（见 3.5 警告）
     observed_at    TIMESTAMPTZ NOT NULL,
+    event_seq      TEXT,            -- 事件 sequencer，与 file_entries 同规则参与守卫
     PRIMARY KEY (bucket_id, storage_path)
 );
 
@@ -240,17 +241,156 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 
 - 幂等键完整保留在不分区的窄表上
 - `file_entries` 可按时间分区 → 列表/cursor 分页最优，老数据可归档冷存
-- **对账只扫 `object_keys`，完全不碰宽表**——该窄表只有 5 列（`bucket_id / storage_path / file_entry_id / last_modified / observed_at`），
+- **对账只扫 `object_keys`，完全不碰宽表**——该窄表只有 6 列（`bucket_id / storage_path / file_entry_id / last_modified / observed_at / event_seq`），
   行宽远小于 `file_entries`；但 `storage_path` 是变长 TEXT，主键 btree 的体积高度依赖真实 key 长度，
   **具体容量与「索引能否常驻内存」须随 §6-B 一并实测估算，不要直接引用某个拍脑袋的数字**
 - `object_keys` 在角色上等同于 minio-inventory 项目的 `minio_objects`
 
-**排序键**：`file_entries` 与 `object_keys` 均增加 `observed_at`；
-`ON CONFLICT DO UPDATE` 加 `WHERE EXCLUDED.observed_at >= 现有值`，
-富字段一律 `COALESCE(EXCLUDED.x, 现有值)`。软删除同样加时间围栏。
-两条写入路径从此可交换、不再互相踩（修 IC-BUG-8 / IC-BUG-13）。
+> ### ⚠️ 本节的 SQL 以代码为准（2026-09-10，第五轮评审后）
+>
+> 下面这段守卫连续三轮「新写 → 一执行就碎」——谓词恒真、NULL 吞写、`RETURNING` 返 0 行、
+> `audit` 覆盖更新数据，**每一条都是在真 PG 上跑起来才发现的，读文档四轮都没读出来**。
+> 因此 **IC-2a 的第一步（⓪）是把它落成仓库里的真迁移 + 真 upsert + 表驱动测试（含变异开关）**，
+> 此后**本节只表达意图与不变式，SQL 文本以代码为准**（CLAUDE.md：代码是最终真相）。
+> 下面的 SQL 是 PoC 的输入，不是权威。
 
-`source` 取值：`agent | api | minio_event | audit`。
+**排序与因果：三个字段各司其职（2026-09-10 定案，多次修订后定稿）**——最初的错误是让一个字段兼两职。
+
+| 用途 | 字段 | 来源 | 说明 |
+|---|---|---|---|
+| **防覆盖闸门** | `observed_at TIMESTAMPTZ NOT NULL` | **每个 source 取自己能提供的、最可信的「对象处于此状态」时刻**（见下表）| 判据是「**这个值客户端能不能左右**」，不是「来自哪个时钟」|
+| **同 key 并列时的决胜** | `event_seq TEXT`（可空，仅 `minio_event` 写）| 事件的 **`sequencer`** | 仅在 `observed_at` **相等**且两侧均非 NULL 时参与比较。S3 专为同 key 排序定义，补零后字典序，**不可跨 key 比较** |
+| **业务事实「文件何时上传」** | `uploaded_at`（列已存在）| agent 上报值 | **只作数据，不作排序键** |
+
+`observed_at` 的取值来源：
+
+| source | 取自 | 客户端可控？ |
+|---|---|---|
+| `minio_event` | 事件载荷的 **`eventTime`** | ❌ MinIO 生成 |
+| `agent` | **PostgreSQL 的 `now()`**（写入事务内取），**不是 CP 进程时钟** | ❌ |
+| `api` | 同上 | ❌ |
+| `audit` | **列举那一刻**（或对象自身的 `LastModified`，与 `eventTime` 同时钟域）——**不是写入事务的 `now()`** | ❌ |
+
+> **⚠️ `audit` 取写入时刻会让陈旧列举覆盖更新的数据（实测）**：L2 于 10:00 列举到 K = v1(size 55)
+> → 10:01 agent 上报 v2(size 100) → 10:02 审计批次落库，若 `observed_at` 取写入事务的 `now()`=10:02
+> 则 **> 10:01、守卫放行**，`size_bytes` 被写回 55、`etag` 写回 E1、`source` 变 `audit`——正是守卫本该
+> 保护的那几列。更糟的是同一条写入会把 `object_keys.last_modified` 也写回旧值，而 §3.5 坑 1 规定封存
+> 判据**只能看 `last_modified`** → 该分片被误判「未被写过」而封存，真实状态一级对账都查不出。
+> 列举与落库之间天然有延迟（批量对账尤甚），所以这不是边界情形。
+
+> **⚠️ 必须用 PG `now()` 而不是 CP 进程的 `time.Now()`**——这不是风格问题。§3.5「坑 3」已经定死
+> 「**所有参与比较的时间戳必须来自同一个时钟，统一由 PostgreSQL 的 `now()` 产生**」，本表遵从它。
+> **dev 实测（2026-09-10，5 次采样）**：MinIO 的 `eventTime` 比 CP 进程时钟快 **16.0–16.6 ms**，
+> 而 PG 的 `clock_timestamp()` 与 MinIO 同属 docker VM 时钟（比宿主机快 ~11.5 ms）——**掉队的是跑在
+> 宿主机上的 CP 进程**。若 `agent` 源用 CP 进程时钟，则在「agent PUT 完成 → MinIO 立刻发事件 →
+> agent 随后经 gRPC 上报」这条**生产常态**路径上，webhook 的 `observed_at` 恒大于 agent 的，
+> **每一次合法 agent 上报都会被守卫拦掉**，`agent_id`/`rule_id`/`sha256` 恒 NULL——而这正是
+> IC-2a live 验收第一条要断言非空的那几列，症状还是间歇性的，实现者会去查根本不存在的 gRPC 问题。
+>
+> **部署约束（须写进运维文档）**：`minio_event` 用 MinIO 时钟、其余三路用 PG 时钟，
+> **PostgreSQL 与 MinIO 必须处于同一时钟域**（同一宿主/VM，或同一 NTP 源）。当前 compose 拓扑天然满足。
+> 若将来二者分处不同时钟域，本模型须重新评估。
+
+> **⚠️ 绝不采信 `UploadResult.uploaded_at`**（`proto/v1/agent.proto:65`）。它由 agent 提供，一台时钟
+> 跑飞或被入侵的 agent 报 `2099-01-01` 就能把该行永久冻结，此后 webhook / `register` /
+> **甚至 IC-13 对账**的写入全被静默丢弃、且对账无法纠正。这是 M-1「客户端指定，无人校验」那一类。
+>
+> **⚠️ 但也不能因此把 `minio_event` 一并改成 CP 受理时刻**（2026-09-10 曾如此定案，评审证伪后撤回）。
+> `eventTime` 由 **MinIO** 生成——MinIO 是基础设施，不是客户端，与「被入侵的 agent」不是同一类风险。
+> 若四源统一取 CP 受理时刻，则**后处理的写入其 `observed_at` 必然更大、`>=` 谓词恒真、闸门变摆设**。
+> 而 `IndexUpload` 写入的 `size_bytes` / `status` / `uploaded_at` / `etag` 都是非空值
+> （`indexer/indexer.go:542-551`），**`COALESCE` 一列都保护不到**——闸门失效即等于 IC-BUG-8 没修。
+> 真实失败场景：滞留重试中的旧事件 E1(v1) 在 agent 写入 v2 之后到达，把 `size_bytes`/`etag` 写回 v1，
+> 而 `sha256` 因 `COALESCE` 停在 v2 —— 一行自相矛盾的数据，且 IC-13 对账会据此误判。
+>
+> **代价（显式记录的假设）**：`minio_event` 用 MinIO 时钟、其余三路用 CP 时钟，**跨两个时钟比较**。
+> 二者都是我们自己的基础设施、同一 docker 网络 / 同一 NTP 源，这个假设比「信任任意边缘 agent」
+> 弱一个数量级，接受。若将来 MinIO 与 CP 分处不同时钟域，须重新评估。
+
+**写入守卫**（`file_entries` 与 `object_keys` 同规则）：
+
+```sql
+-- upsert：ON CONFLICT ... DO UPDATE ... WHERE
+    EXCLUDED.observed_at > fe.observed_at
+ OR (EXCLUDED.observed_at = fe.observed_at
+     AND (EXCLUDED.event_seq IS NULL OR fe.event_seq IS NULL          -- 任一侧无 seq → 不用它决胜
+          OR lpad(EXCLUDED.event_seq,32,'0') >= lpad(fe.event_seq,32,'0')))
+```
+
+> **⚠️ NULL 必须放行，不能收紧。** 若写成 `AND lpad(EXCLUDED.event_seq,…) >= lpad(fe.event_seq,…)`，
+> 则 agent 上报（`event_seq` 恒 NULL）撞上 webhook 先建的行时 `NULL >= '18D3…'` 求值为 NULL、
+> `WHERE` 不为真 → **每一次合法的 agent 上报都被静默吞掉**。而「webhook 先到、agent 后到」是
+> 生产上的常态（MinIO 在 PUT 完成即发事件，agent 随后才走 gRPC 上报）。这属于
+> 「拦住攻击者也拦住所有合法调用方」，`code-reviewer.md` 明确要求防的那一类。
+>
+> 补零宽度取 **32**：实测 MinIO 的 `sequencer` 恒为 16 位十六进制，取 32 留冗余且不影响正确性。
+>
+> SQL 里的 `fe` 是 `INSERT INTO file_entries AS fe` 的别名，照抄时别漏掉 `AS fe`。
+
+> ### ⚠️ 守卫落败**不是错误**——`RETURNING` 会返回 0 行
+>
+> 现有 upsert 带 `RETURNING`，`UpsertFileEntry` 用 `QueryRowContext` + `row.Scan` 读**恰好一行**
+> （`indexer/queries.go:61-68,86`）。加上 `WHERE` 守卫后，**被正确压制的写入会返回 0 行 →
+> `sql.ErrNoRows` → `indexer.go:553` 包成 error 上抛**。
+>
+> 后果不是「多一条日志」，而是**索引 feed 停摆**：IC-4 ① 会把这个 error 判为「处理失败」→ 计数 → 返 5xx
+> → 而 MinIO 的 `queue_dir` 是**队头阻塞单队列**（实测：立即重试 1 次 + 之后每 3.0s），这条**本来就该被
+> 压制**的陈旧事件会卡在队头，让该 target 的所有新事件排队数分钟到数十分钟，直到它被落死信放行。
+>
+> **规格要求**：`UpsertFileEntry` 必须**恒返一行**，调用方按成功处理、**不计入 IC-4 ① 的失败计数**。
+> 二选一：
+> - **(推荐) 调用方处理**：`ErrNoRows` 时回查现有行返回，并标记 `suppressed=true` 供日志/指标；
+>   SQL 保持可读。压制是罕见路径，多一次查询可接受。
+> - **纯 SQL**：把每列改成 `col = CASE WHEN <守卫> THEN EXCLUDED.col ELSE fe.col END`、去掉 `WHERE`，
+>   则永远走 UPDATE 分支、恒返一行。代价是 12 列都要重复一遍守卫表达式。
+>
+> **无论选哪个，`ErrNoRows` 都不得作为错误传播到 webhook / gRPC 的响应路径上。**
+>
+> **⚠️ 压制路径还必须跳过副作用。** upsert 之后调用方紧接着会 `applyStaticTags` / `applyPathVarTags`
+> （`indexer.go:220-224`）并 `publishFileUploaded`（`indexer.go:252`）。按字面实现，每一条**被正确压制**的
+> 陈旧事件或重发上报都会照常发一条 `events.file.uploaded`，而载荷是**当前那行更新后的数据**——下游
+> 6c 打标与将来的 ETL 拿到的是幽灵事件。**压制路径只记指标，不打标、不发事件。**
+
+**软删除同样要守卫，且它不是 upsert——改动面比「加个 WHERE」大。** 软删除走的是独立的
+`MarkFileEntryDeleted`（`indexer/queries.go:209-216`），当前是 `UPDATE … SET status='deleted',
+updated_at=NOW() WHERE bucket_id=$1 AND storage_path=$2 AND status != 'deleted'`——**没有任何时间围栏**。
+
+需要做两件事，**缺第二件会造成已删除的行被复活**：
+
+1. **加守卫**（同上）：否则 key `K` 的删除事件 E_del 滞留重试 → agent 重新采集并上传 `K` →
+   E_del 重投成功 → 把**刚建的活对象**标成 `deleted`。文件在 MinIO 里活着、在 UI 里消失，
+   而 L3 幽灵清理管的是反方向（PG 有 / MinIO 无），**检不出来**。
+2. **新增 `observed_at` / `event_seq` 两个入参并写回**（`SET … observed_at = $3, event_seq = $4`）。
+   只加 `WHERE` 不推进这两列，则删除后行上仍是**创建时**的值，此后任何一次 create 事件重投
+   （IC-11「处理成功才 ack」，重投是设计出来的常态）都会 `observed_at` 打平、`event_seq` 自比自相等
+   而通过守卫，**把已删除的行复活成 `completed`**。实测确认：`create(T1,seqA) → delete(T3,seqB) →
+   create 重投` 在只加 WHERE 的实现下复活。
+
+> **⚠️ 剩余缺口（本节不闭合，由 L3 兜）**：删除事件落在**不存在的行**上时 UPDATE 空转、**不留墓碑**，
+> 随后旧的 create 事件被重放会直接走 INSERT 分支建出一行 `completed`——守卫对 INSERT 无能为力
+> （没有旧 `observed_at` 可比）。触发路径真实存在：`queue_dir` 为空时 MinIO `sendSync` 直接丢事件
+> （实测容器日志 `not connected to target server/service`），create 丢、delete 到达即成立；IC-11 的
+> 可重放会让它更易命中。方向是**反向幽灵**（PG 有 / MinIO 无），**由 §3.5 的 L3 收敛**。
+> 若将来要闭合，需引入删除墓碑行，代价另议。
+
+富字段一律 `COALESCE(EXCLUDED.x, 现有值)`。两条写入路径从此可交换、不再互相踩（修 IC-BUG-8 / IC-BUG-13）。
+
+`source` 取值：`agent | api | minio_event | audit`。**该枚举被 D-030 与 IC-13 依赖，不得塞入其他语义**
+（如「元数据缺失」须另立列，见 IC-2a ⑤ 的 `meta_incomplete`）。
+
+> **实测记录（2026-09-10 dev）**：① 基线（`queue_dir` 空、走 `sendSync`）同一 key 反复 create/delete
+> 12 次，到达顺序与 `eventTime`、`sequencer` 三者完全一致、无重复值；② 重试路径（配 `queue_dir`、
+> 对前 3 次投递返回 500）MinIO 的队列是**队头阻塞的单队列**，失败事件重试期间（约 3s 一轮）后续事件
+> 全部排队，成功后按原序放行——**重试不产生乱序**。
+>
+> ⚠️ **但不要把正确性押在「传输保序」上**。IC-11 换 JetStream 后保序取决于 consumer 配置
+> （`MaxAckPending=1` 或 ordered consumer），配错即静默失序。`event_seq` 的存在就是让这条不变式
+> **自证**而非依赖配置——这正是本 track 反复吃亏的地方。
+
+> ⚠️ **不要用 JetStream 的 stream sequence 充当 `observed_at`**。D-031 上文曾写「可直接用作 `observed_at`
+> 来源」，**该说法已在 D-031 就地更正**：sequence 是 `uint64` 与本列的 `TIMESTAMPTZ` 类型不符，
+> 且它只对 `minio_event` 一路单调。sequence 的正确用途只有一个：喂 `shard_state.last_event_seq`
+> 做链路自证（见 §3.5）。事件的 `sequencer`（`event_seq`）与它是两回事，不要混淆。
 
 ### 3.5 对账三级
 
