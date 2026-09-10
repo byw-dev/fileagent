@@ -41,6 +41,10 @@ Control Plane 启动时会**快速失败**（fail-fast）——任一依赖不�
 POSTGRES_PASSWORD=<强随机>
 MINIO_ROOT_USER=<改我>
 MINIO_ROOT_PASSWORD=<强随机>
+# Control Plane 的真实 IAM 用户凭据；须与 A.3 初始化命令一致。
+# access key 3–20 字符，secret key 8–40 字符。
+CP_ADMIN_ACCESS_KEY=<3–20 字符>
+CP_ADMIN_SECRET_KEY=<8–40 字符>
 JWT_SECRET=<强随机，≥32 字节>
 INTERNAL_WEBHOOK_SECRET=<强随机>
 # 必填：MinIO 对外（客户端）可达地址（host:port）。CP 用它构造交给浏览器/agent 的
@@ -61,16 +65,23 @@ docker compose -f deploy/docker-compose.prod.yml up -d --build
 CP 依赖各服务 healthcheck，会等其就绪后再启动；启动时自动应用内嵌迁移
 （日志出现 `db migrate: migrations applied successfully`）。
 
-### A.3 初始化 MinIO（仅首次）
+### A.3 初始化 MinIO
 
-建桶（`data-sensor`、`tmp-uploads`）+ 生命周期 + webhook，只需跑一次：
+建桶（`data-sensor`、`tmp-uploads`）+ 生命周期 + webhook + Control Plane 最小权限 IAM 用户，并自检
+STS AssumeRole 与预签名下载。脚本可幂等重跑：
 
 ```bash
 MINIO_ENDPOINT=http://localhost:9000 \
 MINIO_ROOT_USER=<同上> MINIO_ROOT_PASSWORD=<同上> \
+CP_ADMIN_ACCESS_KEY=<同 A.1> CP_ADMIN_SECRET_KEY=<同 A.1> \
 WEBHOOK_AUTH_TOKEN=<同 INTERNAL_WEBHOOK_SECRET> \
 bash deploy/scripts/init-minio.sh
 ```
+
+> ⚠️ 同名 IAM 用户已存在时，脚本会把其 secret 重置为本次传入值，并覆盖更新最小权限 policy。
+> 因而每次重跑后都要确认 Control Plane 的 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` 与本次值一致，
+> 不一致则更新并重启 CP。不得用 root 的 service account 代替：MinIO 不允许 service account 调
+> `AssumeRole`，脚本的内置自检会直接失败。
 
 > ⚠️ 注意变量同名但格式不同：`init-minio.sh` 的 `MINIO_ENDPOINT` 是 **`mc` 用的完整 URL**（含
 > `http://`/`https://` scheme），而 Control Plane 的同名配置 `MINIO_ENDPOINT` 是 **`host:port`**（无 scheme，

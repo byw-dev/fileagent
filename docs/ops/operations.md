@@ -16,7 +16,7 @@ CP **仅从环境变量**读取配置，启动时校验并一次性报出所有�
 | `REDIS_URL` | `redis://[:pass@]host:6379/0`（`rediss://` 走 TLS） |
 | `JWT_SECRET` | JWT 签名密钥（HMAC-SHA256），强随机 ≥32 字节 |
 | `MINIO_ENDPOINT` | 内网端点，CP 自身调用（STS AssumeRole + 建桶）用；`host:port`（无 scheme，由 `MINIO_USE_SSL` 决定） |
-| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | CP 访问 MinIO 的凭据（用于签发 STS） |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | `init-minio.sh` 创建的真实 IAM 用户凭据（用于 STS AssumeRole、预签名 GET 与建桶）；不得使用 root 的 service account |
 | `NATS_URL` | `nats://host:4222`（JetStream 需开启） |
 
 ### 可选（含默认值）
@@ -105,6 +105,7 @@ K8s livenessProbe / LB 心跳。**Readiness**（依赖是否 OK）通过实际�
 |------|-----------------|
 | CP 启动即退出 | 某依赖不可达（fail-fast，无重试）；看日志定位 PG/Redis/NATS/MinIO；编排层会重拉 |
 | webhook 全被拒 / 无 file 事件 | `INTERNAL_WEBHOOK_SECRET` 未设或与 `init-minio.sh` 的 `WEBHOOK_AUTH_TOKEN` 不一致 |
+| Agent 获取 STS 凭据报 `Access Denied` | 确认 CP 用的是 `init-minio.sh` 创建的真实 IAM 用户，而非 MinIO service account；重跑初始化脚本后须同步 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` 并重启 CP |
 | Web UI 打开 404 | 用了纯 API 构建（`make build`）而非 `make bundle`；或反代未指向 CP:8080 |
 | 深链硬刷新 404 | 反代未回退 SPA；CP 内嵌 SPA 已处理，确认请求确实到达 CP |
 | Agent 一直不采集 | 处于 PENDING，未在 Web UI 审批 |

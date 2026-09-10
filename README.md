@@ -118,7 +118,7 @@ React 管理后台，供管理员操作。
 |------|------|
 | `docker-compose.dev.yml` | 本地开发环境（PostgreSQL / Redis / MinIO / NATS） |
 | `docker-compose.test.yml` | 集成测试专用环境（固定端口，isolated） |
-| `scripts/init-minio.sh` | 初始化 MinIO：创建 Bucket、配置 Lifecycle、创建服务账号、配置 Webhook |
+| `scripts/init-minio.sh` | 初始化 MinIO：创建 Bucket、配置 Lifecycle、创建最小权限 IAM 用户、配置 Webhook 并自检 STS/预签名下载 |
 
 ---
 
@@ -214,7 +214,9 @@ migrate -database "$DATABASE_URL" -path ./migrations up
 bash deploy/scripts/init-minio.sh
 ```
 
-脚本幂等，重复执行不报错。执行内容：创建 `data-sensor` 和 `tmp-uploads` Bucket，配置 7 天 Lifecycle，创建 `controlplane-admin` 服务账号，配置 Webhook 事件通知。
+脚本幂等，重复执行不报错。执行内容：创建 `data-sensor` 和 `tmp-uploads` Bucket，配置 7 天 Lifecycle，创建供 Control Plane 使用的真实 IAM 用户及最小权限 policy，配置 Webhook 事件通知，并用该用户自检 STS AssumeRole 与预签名下载。脚本默认 access key 为 `cpAdminIAM000000000`；若覆盖 `CP_ADMIN_ACCESS_KEY`，长度须为 3–20 字符，`CP_ADMIN_SECRET_KEY` 须为 8–40 字符。
+
+> 重跑脚本会把同名 IAM 用户的 secret 收敛为本次传入值。已部署环境必须同步更新 Control Plane 的 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` 并重启，否则旧进程会因凭据失效收到 Access Denied。
 
 ### 4. 构建二进制
 

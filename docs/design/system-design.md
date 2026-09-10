@@ -1745,9 +1745,13 @@ MINIO_VOLUMES="https://minio{1...4}.internal:9000/data{1...4} \
 
 | 账号类型            | 权限范围                   | 用途                 |
 |-----------------|------------------------|--------------------|
-| **admin-sa**    | 全部权限                   | Control Plane 管理账号 |
+| **controlplane-user** | 最小权限：AssumeRole、预签名 GET、建桶及委派写入 | Control Plane 真实 IAM 用户 |
 | **agent-role**  | STS AssumeRole 角色      | Agent 临时扮演         |
-| **readonly-sa** | 所有 Bucket s3:GetObject | 预签名下载 URL          |
+
+> Control Plane 必须使用真实 IAM 用户：MinIO service account 不能调用 `AssumeRole`。其父 policy
+> 只包含 CP 直接需要的 `CreateBucket` / `GetObject`，以及下方 session policy 可委派的四个写入 Action；
+> 不使用 `readwrite` / `consoleAdmin`，避免额外授出删除、列举与管理权限。资源使用 bucket 通配是因为
+> `POST /api/v1/buckets` 可在运行时动态建桶，静态桶清单会令新桶上的预签名下载和 STS 委派失效。
 
 **STS Session Policy（按 Agent 已下发规则涉及的 bucket 集合生成）：**
 
@@ -1813,7 +1817,7 @@ mc event add myminio/data-sensor primary \
 |-----------------------|--------------------------------------|----------------------|
 | **创建 Bucket**         | madmin.MakeBucket()                  | POST /api/v1/buckets |
 | **设置 Policy**         | madmin.SetBucketPolicy()             | Bucket 创建后           |
-| **创建 ServiceAccount** | madmin.AddServiceAccount()           | 系统初始化                |
+| **创建 IAM 用户 + 最小 policy** | `mc admin user add` + `policy create/attach` | `init-minio.sh` 系统初始化 |
 | **STS AssumeRole**    | credentials.NewSTSAssumeRole()       | Agent 连接时            |
 | **Bucket 存储用量**       | madmin.BucketUsageInfo()             | Dashboard，每 5 分钟缓存   |
 | **Lifecycle 规则**      | s3.PutBucketLifecycleConfiguration() | tmp-uploads 7天清理     |
