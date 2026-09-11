@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"os"
 	"path/filepath"
 	"strings"
@@ -874,4 +875,36 @@ func TestCredentialHolder_RejectsStaleGeneration_Whole(t *testing.T) {
 	assert.Equal(t, "AK-b", holder.Current().AccessKey, "uploader config must not be half-updated")
 	assert.Equal(t, uint64(7), holder.Generation())
 	assert.False(t, holder.Apply(nil, 8), "nil payload is a no-op")
+}
+
+// ── R1（IC-2b review 三轮）：Apply 的原子性 ────────────────────────────────────
+
+// 并发 Apply 不得出现「generation=N 而 uploader 凭据=N-1」的撕裂中间态——
+// 那会让所有上传拿着旧凭据失败直到下一次获取（codex 并发探针第 43 轮实测
+// 复现 generation=64 / uploader=AK-63）。观察点：每轮两个并发 Apply，
+// 收敛后 generation 与 Current() 必须指向同一个（较新的）凭据。
+func TestCredentialHolder_ApplyIsAtomicUnderConcurrency(t *testing.T) {
+	holder := newCredentialHolder(credential.NewSTSManager(), 64, 1, zap.NewNop())
+	const rounds = 400
+	for r := 0; r < rounds; r++ {
+		older, newer := uint64(2*r+1), uint64(2*r+2)
+		wantAK := fmt.Sprintf("AK-%d", newer)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			holder.Apply(testCredPayload(fmt.Sprintf("AK-%d", older)), older)
+		}()
+		go func() {
+			defer wg.Done()
+			holder.Apply(testCredPayload(fmt.Sprintf("AK-%d", newer)), newer)
+		}()
+		wg.Wait()
+		cfg := holder.Current()
+		require.NotNil(t, cfg)
+		require.Equal(t, wantAK, cfg.AccessKey,
+			"round %d: generation %d is in force but the uploader holds %q — the apply is not atomic",
+			r, newer, cfg.AccessKey)
+		require.Equal(t, newer, holder.Generation())
+	}
 }

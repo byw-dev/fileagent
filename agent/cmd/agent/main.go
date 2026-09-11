@@ -486,7 +486,23 @@ func newCredentialHolder(sts *credential.STSManager, partSizeMB, concurrency int
 }
 
 // Apply validates the generation, then applies the payload to both the STS
-// session and the uploader config atomically. Returns whether it was applied.
+// session and the uploader config in ONE critical section, and reports
+// whether it was applied.
+//
+// The single critical section is the point: with two concurrent writers (the
+// periodic refresh and the AccessDenied retry), a split application lets an
+// older-but-late response slip between the generation check and the config
+// write — the observed state becomes "generation N, uploader credentials N-1"
+// and every upload then fails on stale credentials until the next
+// acquisition. A concurrency probe reproduced exactly that (generation=64 /
+// uploader=AK-63); the review (R1) requires the check, both writes and the
+// publication to be inseparable. Nothing here may be moved outside h.mu.
+//
+// Consistency scope: readers of Current() take the same mutex, so an upload
+// never sees a torn pair. The periodic refresh ticker reads only sts.Expiry
+// through the STS manager's own lock; a mid-apply read of a newer expiry
+// there is conservative-correct (it defers a refresh that is unnecessary —
+// newer credentials are being installed at that very moment).
 func (h *credentialHolder) Apply(cred *agentv1.CredentialsPayload, generation uint64) bool {
 	if cred == nil {
 		return false
@@ -496,12 +512,6 @@ func (h *credentialHolder) Apply(cred *agentv1.CredentialsPayload, generation ui
 		SecretKey:    cred.GetSecretKey(),
 		SessionToken: cred.GetSessionToken(),
 		Expiry:       cred.GetExpiresAt().AsTime(),
-	}
-	if !h.sts.SetSTS(newSTS, generation) {
-		h.logger.Info("agent: stale credentials response dropped",
-			zap.Uint64("generation", generation),
-			zap.Uint64("current_generation", h.sts.Generation()))
-		return false
 	}
 	cfg := &uploader.Config{
 		Endpoint:     cred.GetEndpoint(),
@@ -513,8 +523,14 @@ func (h *credentialHolder) Apply(cred *agentv1.CredentialsPayload, generation ui
 		Concurrency:  h.concurrency,
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.sts.SetSTS(newSTS, generation) {
+		h.logger.Info("agent: stale credentials response dropped",
+			zap.Uint64("generation", generation),
+			zap.Uint64("current_generation", h.sts.Generation()))
+		return false
+	}
 	h.cfg = cfg
-	h.mu.Unlock()
 	h.logger.Info("agent: STS credentials updated",
 		zap.Uint64("generation", generation),
 		zap.Time("expiry", newSTS.Expiry),
