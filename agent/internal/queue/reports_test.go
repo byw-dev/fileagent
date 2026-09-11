@@ -40,7 +40,7 @@ func TestReportsPersistAndAcknowledge(t *testing.T) {
 	require.Len(t, due, 1)
 	require.Equal(t, []byte("result"), due[0].Payload)
 	require.NoError(t, q.CompleteReported(ctx, task.ID, true, "sha"))
-	processed, err := q.IsProcessed("rule", "file")
+	processed, err := q.IsProcessed(ctx, "rule", "file", task.FileMtime, task.FileSize)
 	require.NoError(t, err)
 	require.True(t, processed)
 	_, err = q.GetReport(ctx, task.ID)
@@ -67,7 +67,7 @@ func TestReportFailureDoesNotMarkProcessed(t *testing.T) {
 	require.NoError(t, q.MarkFailed(task.ID, "failure"))
 	require.NoError(t, q.SaveReport(ctx, task.ID, []byte("failure")))
 	require.NoError(t, q.CompleteReported(ctx, task.ID, false, ""))
-	processed, err := q.IsProcessed("rule", "file")
+	processed, err := q.IsProcessed(ctx, "rule", "file", task.FileMtime, task.FileSize)
 	require.NoError(t, err)
 	require.False(t, processed)
 }

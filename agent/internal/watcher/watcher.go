@@ -13,6 +13,8 @@ import (
 	"go.uber.org/zap"
 )
 
+var newFSWatcher = fsnotify.NewWatcher
+
 // FileEvent represents a file system change detected by the Watcher.
 type FileEvent struct {
 	// Path is the absolute path of the affected file.
@@ -80,7 +82,7 @@ func New(sourcePath, fileGlob string, recursive bool, pollInterval time.Duration
 // transparently falls back to periodic polling. Start blocks until ctx is
 // cancelled.
 func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
-	fw, err := fsnotify.NewWatcher()
+	fw, err := newFSWatcher()
 	if err != nil {
 		w.logger.Warn("watcher: fsnotify unavailable, using polling", zap.Error(err))
 		return w.runPolling(ctx, events)
@@ -91,6 +93,11 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 		w.logger.Warn("watcher: cannot add watch paths, using polling", zap.Error(err))
 		return w.runPolling(ctx, events)
 	}
+
+	// Use the same scan as the polling fallback so files that predate watcher
+	// startup are collected consistently on both paths. Register watches first
+	// so changes made during the scan are still observed by fsnotify.
+	w.pollScan(ctx, events, make(map[string]time.Time))
 
 	w.logger.Info("watcher: fsnotify started", zap.String("path", w.sourcePath))
 	if w.appendMode == AppendModeCloseWait {

@@ -37,6 +37,8 @@ import (
 // registration/approval flow takes before the heartbeat builder is installed.
 var processStart = time.Now()
 
+const assumedUploadBytesPerSecond int64 = 1024 * 1024
+
 // ruleHandle holds the cancel function for an active rule's watcher or scheduler entry.
 type ruleHandle struct {
 	cancel context.CancelFunc
@@ -84,6 +86,13 @@ func main() {
 		logger.Fatal("queue open failed", zap.String("path", queuePath), zap.Error(err))
 	}
 	defer q.Close()
+	resetTasks, err := q.ResetRunningToPending(ctx)
+	if err != nil {
+		logger.Fatal("queue recovery failed", zap.Error(err))
+	}
+	if resetTasks > 0 {
+		logger.Info("agent: recovered interrupted upload tasks", zap.Int64("task_count", resetTasks))
+	}
 
 	// ── 4. Credential managers ───────────────────────────────────────────────
 	fp, err := grpcclient.LoadOrCreateFingerprint(cfg.Agent.FingerprintFile)
@@ -139,7 +148,12 @@ func main() {
 		if err != nil {
 			return nil, fmt.Errorf("agent: create uploader: %w", err)
 		}
-		return u.UploadFile(uploadCtx, task)
+		return uploadWithTimeout(
+			uploadCtx,
+			task,
+			time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
+			u.UploadFile,
+		)
 	}
 
 	// ── 7. Worker pool (starts goroutines after exec.Start is called) ────────
@@ -358,6 +372,42 @@ func main() {
 	logger.Info("agent: shutdown signal received, stopping…")
 }
 
+// uploadWithTimeout gives each upload its own size-derived deadline so a
+// stalled object-store request cannot occupy an executor worker forever.
+func uploadWithTimeout(parent context.Context, task *queue.UploadTask, minimum time.Duration, upload executor.UploadFunc) (*uploader.UploadResult, error) {
+	uploadSize := task.FileSize
+	if task.AppendMode == watcher.AppendModeTail && task.FileOffset > 0 {
+		uploadSize -= task.FileOffset
+		if uploadSize < 0 {
+			uploadSize = 0
+		}
+	}
+	uploadCtx, cancel := context.WithTimeout(parent, uploadTimeoutForSize(uploadSize, minimum))
+	defer cancel()
+	return upload(uploadCtx, task)
+}
+
+// uploadTimeoutForSize derives a conservative deadline at one mebibyte per
+// second while never returning less than the configured minimum.
+func uploadTimeoutForSize(fileSize int64, minimum time.Duration) time.Duration {
+	if fileSize <= 0 {
+		return minimum
+	}
+	seconds := fileSize / assumedUploadBytesPerSecond
+	if fileSize%assumedUploadBytesPerSecond != 0 {
+		seconds++
+	}
+	const maxDurationSeconds = int64((1<<63 - 1) / int64(time.Second))
+	if seconds > maxDurationSeconds {
+		return time.Duration(1<<63 - 1)
+	}
+	derived := time.Duration(seconds) * time.Second
+	if derived < minimum {
+		return minimum
+	}
+	return derived
+}
+
 // handleRevokeCommand clears local credentials and triggers graceful shutdown.
 func handleRevokeCommand(tokenMgr *credential.TokenManager, stsMgr *credential.STSManager, client grpcClientTokenSetter, stop context.CancelFunc, logger *zap.Logger, reason string) {
 	logger.Warn("agent: token revoked by Control Plane", zap.String("reason", reason))
@@ -447,7 +497,7 @@ func runWatcher(ctx context.Context, rule scheduler.CollectionRule, exec *execut
 			if !matched {
 				continue
 			}
-			submitFile(exec, q, rule, ev.Path, ev.Size, ev.ModTime, ev.FileOffset, rule.AppendMode, agentCtx, logger)
+			submitFile(ctx, exec, q, rule, ev.Path, ev.Size, ev.ModTime, ev.FileOffset, rule.AppendMode, agentCtx, logger)
 		}
 	}
 }
@@ -475,7 +525,7 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 		if err != nil {
 			return nil
 		}
-		submitFile(exec, q, rule, path, info.Size(), info.ModTime(), 0, "", agentCtx, logger)
+		submitFile(ctx, exec, q, rule, path, info.Size(), info.ModTime(), 0, rule.AppendMode, agentCtx, logger)
 		return nil
 	})
 	if err != nil && ctx.Err() == nil {
@@ -485,8 +535,8 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 }
 
 // submitFile checks deduplication and enqueues an upload task.
-func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
-	done, err := q.IsProcessed(rule.RuleID, localPath)
+func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
+	done, err := q.IsProcessed(ctx, rule.RuleID, localPath, mtime.Unix(), size)
 	if err != nil {
 		logger.Warn("agent: check processed failed", zap.String("path", localPath), zap.Error(err))
 	}
@@ -502,8 +552,10 @@ func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.Collecti
 		FileSize:    size,
 		FileMtime:   mtime.Unix(),
 		Status:      queue.StatusPending,
+		FileOffset:  fileOffset,
+		AppendMode:  appendMode,
 	}
-	if err := exec.Submit(task); err != nil {
+	if err := exec.Submit(ctx, task); err != nil {
 		logger.Warn("agent: submit task failed",
 			zap.String("rule_id", rule.RuleID), zap.String("path", localPath), zap.Error(err))
 	}

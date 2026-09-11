@@ -5,6 +5,7 @@
 package queue
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -171,14 +172,7 @@ func (q *Queue) Close() error {
 // Enqueue inserts a new upload task with status "pending". The caller is
 // responsible for setting task.ID (UUID), task.CreatedAt and task.UpdatedAt.
 func (q *Queue) Enqueue(task *UploadTask) error {
-	now := time.Now().Unix()
-	if task.CreatedAt == 0 {
-		task.CreatedAt = now
-	}
-	if task.UpdatedAt == 0 {
-		task.UpdatedAt = now
-	}
-	task.Status = StatusPending
+	prepareEnqueue(task)
 
 	_, err := q.db.Exec(`
         INSERT INTO upload_tasks
@@ -195,6 +189,53 @@ func (q *Queue) Enqueue(task *UploadTask) error {
 		return fmt.Errorf("queue: enqueue task %q: %w", task.ID, err)
 	}
 	return nil
+}
+
+// EnqueueIfNoActive inserts task unless the same rule, path, modification
+// time, and size already has a pending, running, or reported task. The guard
+// and insert are one SQLite statement so concurrent producers cannot enqueue
+// the same active file version twice. Failed and completed rows do not block a
+// later collection attempt.
+func (q *Queue) EnqueueIfNoActive(ctx context.Context, task *UploadTask) (bool, error) {
+	prepareEnqueue(task)
+	result, err := q.db.ExecContext(ctx, `
+        INSERT INTO upload_tasks
+            (id, rule_id, local_path, storage_path, bucket, upload_id,
+             completed_parts, file_size, file_mtime, sha256, status,
+             retry_count, last_error, created_at, updated_at, file_offset, append_mode)
+        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM upload_tasks
+            WHERE rule_id=? AND local_path=? AND file_mtime=? AND file_size=?
+              AND status IN (?, ?, ?)
+        )`,
+		task.ID, task.RuleID, task.LocalPath, task.StoragePath, task.Bucket,
+		task.UploadID, task.CompletedParts, task.FileSize, task.FileMtime,
+		task.SHA256, task.Status, task.RetryCount, task.LastError,
+		task.CreatedAt, task.UpdatedAt, task.FileOffset, task.AppendMode,
+		task.RuleID, task.LocalPath, task.FileMtime, task.FileSize,
+		StatusPending, StatusRunning, StatusReported,
+	)
+	if err != nil {
+		return false, fmt.Errorf("queue: enqueue task %q if inactive: %w", task.ID, err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("queue: inspect enqueue task %q: %w", task.ID, err)
+	}
+	return inserted > 0, nil
+}
+
+// prepareEnqueue fills queue-owned defaults before an upload task is inserted.
+func prepareEnqueue(task *UploadTask) {
+	now := time.Now().Unix()
+	if task.CreatedAt == 0 {
+		task.CreatedAt = now
+	}
+	if task.UpdatedAt == 0 {
+		task.UpdatedAt = now
+	}
+	task.Status = StatusPending
 }
 
 // CountPending returns the number of tasks currently waiting to be uploaded
@@ -331,6 +372,21 @@ func (q *Queue) DequeuePending(limit int) ([]*UploadTask, error) {
 	return tasks, nil
 }
 
+// ResetRunningToPending makes tasks interrupted by a prior agent process
+// eligible for dequeue again. Reported tasks are intentionally untouched:
+// their objects are already uploaded and the durable report replay path must
+// resend only metadata rather than retransmitting file content.
+func (q *Queue) ResetRunningToPending(ctx context.Context) (int64, error) {
+	result, err := q.db.ExecContext(ctx, `
+        UPDATE upload_tasks
+        SET status=?, updated_at=?
+        WHERE status=?`, StatusPending, time.Now().Unix(), StatusRunning)
+	if err != nil {
+		return 0, fmt.Errorf("queue: reset running tasks: %w", err)
+	}
+	return result.RowsAffected()
+}
+
 // UpdateStatus sets the status of a task identified by id.
 func (q *Queue) UpdateStatus(id, status string) error {
 	res, err := q.db.Exec(
@@ -406,13 +462,13 @@ func (q *Queue) UpsertProcessedFile(f *ProcessedFile) error {
 	return nil
 }
 
-// IsProcessed returns true if a record for (ruleID, localPath) already exists
-// in processed_files.
-func (q *Queue) IsProcessed(ruleID, localPath string) (bool, error) {
+// IsProcessed returns true if processed_files contains the same rule, path,
+// modification time, and size as the candidate file.
+func (q *Queue) IsProcessed(ctx context.Context, ruleID, localPath string, fileMtime, fileSize int64) (bool, error) {
 	var count int
-	err := q.db.QueryRow(
-		`SELECT COUNT(*) FROM processed_files WHERE rule_id=? AND local_path=?`,
-		ruleID, localPath,
+	err := q.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM processed_files WHERE rule_id=? AND local_path=? AND file_mtime=? AND file_size=?`,
+		ruleID, localPath, fileMtime, fileSize,
 	).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("queue: is processed: %w", err)

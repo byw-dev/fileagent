@@ -21,6 +21,8 @@ concurrency = 3
 part_size_mb = 64
 queue_max_size = 10000
 retry_max = 10
+# Each upload gets max(this floor, file size at 1 MiB/s) before cancellation.
+min_timeout_seconds = 300
 
 [metrics]
 enabled = true

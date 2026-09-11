@@ -80,12 +80,22 @@ func New(workers int, q *queue.Queue, uploader UploadFunc, logger *zap.Logger, q
 // Submit enqueues task into the SQLite queue and signals workers. The caller
 // must have set task.LocalPath, task.Bucket, task.StoragePath, and task.RuleID.
 // Submit assigns a new UUID if task.ID is empty.
-func (e *Executor) Submit(task *queue.UploadTask) error {
+func (e *Executor) Submit(ctx context.Context, task *queue.UploadTask) error {
 	if task.ID == "" {
 		task.ID = uuid.New().String()
 	}
-	if err := e.queue.Enqueue(task); err != nil {
+	enqueued, err := e.queue.EnqueueIfNoActive(ctx, task)
+	if err != nil {
 		return fmt.Errorf("executor: enqueue task: %w", err)
+	}
+	if !enqueued {
+		e.logger.Debug("executor: skipped duplicate active task",
+			zap.String("rule_id", task.RuleID),
+			zap.String("path", task.LocalPath),
+			zap.Int64("file_mtime", task.FileMtime),
+			zap.Int64("file_size", task.FileSize),
+		)
+		return nil
 	}
 	// Trim the queue back to the cap only after the new task is safely persisted,
 	// so a failed Enqueue never costs us already-queued tasks.
@@ -206,8 +216,8 @@ func (e *Executor) drainQueue(ctx context.Context) {
 // processTask handles deduplication, invokes the upload function, and manages
 // retry scheduling.
 func (e *Executor) processTask(ctx context.Context, task *queue.UploadTask) {
-	// Deduplication: skip if already processed with the same path+mtime+size.
-	already, err := e.queue.IsProcessed(task.RuleID, task.LocalPath)
+	// Deduplication: skip only when rule, path, mtime, and size all match.
+	already, err := e.queue.IsProcessed(ctx, task.RuleID, task.LocalPath, task.FileMtime, task.FileSize)
 	if err != nil {
 		e.logger.Warn("executor: dedup check error", zap.String("task_id", task.ID), zap.Error(err))
 	}

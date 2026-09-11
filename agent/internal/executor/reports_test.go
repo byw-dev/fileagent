@@ -70,7 +70,7 @@ func TestReportingFailurePayloadAndTransportFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	require.NoError(t, e.HandleAcknowledgement(ctx, &agentv1.Acknowledgement{RefMessageId: task.ID, Success: true}))
-	processed, err := q.IsProcessed(task.RuleID, task.LocalPath)
+	processed, err := q.IsProcessed(context.Background(), task.RuleID, task.LocalPath, task.FileMtime, task.FileSize)
 	require.NoError(t, err)
 	require.False(t, processed)
 	require.NoError(t, q.Close())

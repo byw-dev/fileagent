@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -141,6 +142,51 @@ func TestWatcher_FsnotifyStart_ContextCancel(t *testing.T) {
 		assert.ErrorIs(t, err, context.Canceled)
 	case <-time.After(2*time.Second):
 		t.Fatal("Start did not return after context cancel")
+	}
+}
+
+func TestWatcher_FsnotifyUnavailableFallsBackToPolling(t *testing.T) {
+	dir := t.TempDir()
+	original := newFSWatcher
+	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("unavailable") }
+	t.Cleanup(func() { newFSWatcher = original })
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = w.Start(ctx, make(chan FileEvent, 1))
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestWatcher_AddPathFailureFallsBackToPolling(t *testing.T) {
+	w, err := New(filepath.Join(t.TempDir(), "missing"), "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = w.Start(ctx, make(chan FileEvent, 1))
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestWatcher_FsnotifyInitialScanEmitsExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "existing.txt")
+	require.NoError(t, os.WriteFile(path, []byte("already here"), 0o644))
+	w, err := New(dir, "*.txt", false, 10*time.Second, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	events := make(chan FileEvent, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.Start(ctx, events) }()
+
+	select {
+	case event := <-events:
+		assert.Equal(t, path, event.Path)
+		assert.Equal(t, "create", event.Op)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("fsnotify startup did not scan the existing file")
 	}
 }
 
