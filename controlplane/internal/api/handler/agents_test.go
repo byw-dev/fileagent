@@ -1072,3 +1072,23 @@ func TestAgentsHandler_ListDir_AgentOfflineNoCache_Returns409(t *testing.T) {
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusConflict, w.Code)
 }
+
+// ── F3（IC-2b review）：单 agent 规则数硬上限（快照体积不可能超限的第一道闸）───
+
+// 创建第 1001 条规则被拒绝（422），错误信息说明上限与理由——快照同步整条发送，
+// 规则数不受控时快照会超过 gRPC 4MiB 上限并退化为降级状态。
+func TestAgentsHandler_CreateRule_RuleCountCap(t *testing.T) {
+	rules := make([]*db.CollectionRule, handler.MaxRulesPerAgent)
+	for i := range rules {
+		rules[i] = &db.CollectionRule{ID: uuid.New(), AgentID: uuid.New(), Status: db.RuleStatusActive}
+	}
+	dispatcher := &mockDispatcher{}
+	h := handler.NewAgentsHandler(&mockAgentsDB{rules: rules}, nil, dispatcher, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"one-too-many","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"logs/"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	assert.Contains(t, w.Body.String(), "rule count limit")
+}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
@@ -19,6 +20,11 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
+
+// MaxRulesPerAgent caps the collection rules a single agent may own
+// (IC-2b review F3): the reconnect sync delivers the whole rule set as one
+// snapshot message, and the count must stay far below the gRPC message limit.
+const MaxRulesPerAgent = 1000
 
 // AgentsDB is the minimal database interface needed by AgentsHandler.
 type AgentsDB interface {
@@ -765,6 +771,30 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 	bucketID, err := uuid.Parse(req.BucketID)
 	if err != nil {
 		middleware.RespondError(c, http.StatusBadRequest, "INVALID_BUCKET_ID", "invalid bucket_id", nil)
+		return
+	}
+
+	// Per-agent rule-count cap (IC-2b review F3): the reconnect sync delivers
+	// the agent's whole rule set as ONE snapshot message, so an unbounded
+	// count would eventually exceed the gRPC message limit and degrade that
+	// agent into the oversized-snapshot keep-alive state. Capping at creation
+	// makes that state structurally unreachable. 1000 rules is far above any
+	// real deployment (~1 KB/rule worst case ≈ 1 MB, vs the 4 MiB gRPC limit
+	// and the dispatcher's 3 MiB pre-flight check).
+	rules, err := h.db.ListCollectionRulesByAgent(c.Request.Context(), agentID)
+	if err != nil {
+		h.logger.Error("create rule: count existing rules", zap.Error(err))
+		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to check rule count", nil)
+		return
+	}
+	if len(rules) >= MaxRulesPerAgent {
+		h.logger.Warn("create rule: per-agent rule count limit reached",
+			zap.String("agent_id", agentID.String()),
+			zap.Int("limit", MaxRulesPerAgent))
+		middleware.RespondError(c, http.StatusUnprocessableEntity,
+			"RULE_COUNT_LIMIT",
+			fmt.Sprintf("rule count limit: an agent may have at most %d collection rules (the reconnect sync delivers them as one snapshot message)", MaxRulesPerAgent),
+			nil)
 		return
 	}
 

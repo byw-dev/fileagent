@@ -11,6 +11,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/proto"
 )
 
 // DispatchDB is the database interface required by Dispatcher.
@@ -205,6 +206,14 @@ func (d *Dispatcher) DispatchRuleCancel(ctx context.Context, ruleID, agentID str
 	return nil
 }
 
+// maxRulesSnapshotBytes is the snapshot size at which SyncRulesOnConnect
+// degrades instead of sending. The gRPC default receive limit is 4 MiB; a
+// snapshot beyond it fails the stream deterministically, and failing the
+// stream forces a reconnect that deterministically re-sends the same oversized
+// snapshot — an infinite reconnect loop (review F3). The margin absorbs
+// protobuf framing and per-message overhead.
+const maxRulesSnapshotBytes = 3 << 20
+
 // SyncRulesOnConnect pushes the agent's complete rule snapshot on (re)connect
 // as ONE message (IC-BUG-30 / D-033).
 //
@@ -233,6 +242,13 @@ func (d *Dispatcher) DispatchRuleCancel(ctx context.Context, ruleID, agentID str
 // from a disconnected agent: a repeating full-buffer failure would mean the
 // message is oversized and would turn reconnect-and-resync into a reconnect
 // loop — that must be visible at a glance.
+//
+// Oversized snapshots are the one failure that is NOT rare: they fail on
+// every reconnect by construction. They never reach the transport — the sync
+// degrades instead: skip the send, alarm at ERROR level, keep the connection.
+// The agent keeps its previous rule view (stale but functional) instead of
+// looping forever; creation-time rule-count capping makes this state
+// practically unreachable (see MaxRulesPerAgent in the REST handler).
 func (d *Dispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) error {
 	parsed, err := uuid.Parse(agentID)
 	if err != nil {
@@ -266,6 +282,20 @@ func (d *Dispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) err
 		Payload: &agentv1.ServerMessage_RulesSync{
 			RulesSync: &agentv1.RulesSyncCommand{Rules: snapshot},
 		},
+	}
+	// Pre-flight size check (review F3): a snapshot beyond the gRPC receive
+	// limit fails the stream deterministically, and disconnecting on it would
+	// loop forever on the same input. Degrade instead: skip the send, alarm,
+	// keep the connection.
+	if size := proto.Size(syncMsg); size > maxRulesSnapshotBytes {
+		d.logger.Error("sync_rules: rule snapshot oversized, degrading to keep-alive — "+
+			"agent keeps its previous rule view; reduce this agent's rule count or template sizes "+
+			"(creation is capped at maxRulesPerAgent, this agent has legacy or oversized rules)",
+			zap.String("agent_id", agentID),
+			zap.Int("rules", len(snapshot)),
+			zap.Int("bytes", size),
+			zap.Int("limit", maxRulesSnapshotBytes))
+		return nil
 	}
 	if !d.registry.Send(agentID, syncMsg) {
 		// See the godoc above: the snapshot is the delete half of IC-BUG-30 in

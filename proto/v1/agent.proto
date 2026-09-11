@@ -142,11 +142,14 @@ message ServerMessage {
 // them. One snapshot message cannot overflow. SyncRulesOnConnect sends
 // exactly this message; PushRuleCommand remains the incremental path.
 //
-// Size: a rule snapshot scales with rule count (tens of rules ≈ KBs). Far
-// beyond gRPC's default 4MB receive limit the single message fails WHOLE —
-// intentionally a loud failure (disconnect, reconnect, resync), never a
-// partial delivery. Notably better than per-message pushes, whose failure
-// mode above the buffer was silent loss.
+// Size: a rule snapshot scales with rule count (tens of rules ≈ KBs). Rules
+// per agent are capped at creation (MaxRulesPerAgent, REST) so the snapshot
+// stays far below gRPC's default 4 MiB receive limit. If a snapshot is still
+// oversized (legacy data, pathological template sizes) the Control Plane
+// degrades INSTEAD of failing the stream: it skips the send, alarms at ERROR
+// and keeps the connection — the agent keeps its previous (stale but
+// functional) rule view. Failing the stream here would loop forever on the
+// same input, since every reconnect re-sends the same oversized snapshot.
 message RulesSyncCommand {
   repeated CollectionRule rules = 1;
 }

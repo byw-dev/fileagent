@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -558,4 +559,29 @@ func TestSyncRulesOnConnect_RuleCreatedDuringSnapshotSurvives(t *testing.T) {
 		"a rule created while the snapshot was being built must survive the sync — "+
 			"the snapshot (older world) must not stop it")
 	assert.True(t, view[existing.ID.String()])
+}
+
+// ── F3（IC-2b review）：快照体积超限时不得进入确定性重连循环 ─────────────────────
+
+// 快照序列化后超过 gRPC 默认 4MiB 上限时，整条发送必然失败；若仍走
+// 「失败即断连」，则同一输入每次重连都必然再失败——无限重连循环（实测确定）。
+// 降级形态：跳过发送、ERROR 告警（带 agent_id 与规则数）、连接保持——稳定的
+// 降级状态，绝不以同样输入无限重试。
+func TestSyncRulesOnConnect_OversizedSnapshot_DegradesWithoutDisconnect(t *testing.T) {
+	core, logs := observer.New(zapcore.ErrorLevel)
+	logger := zap.New(core)
+	agentID := uuid.New()
+	reg := newMockRegistry()
+	reg.online[agentID.String()] = true
+	// 单条规则的 name 撑到 5MiB，保证快照必然超限（病态数据即可，机制与条数无关）。
+	huge := &db.CollectionRule{ID: uuid.New(), AgentID: agentID, Name: strings.Repeat("x", 5<<20), Status: db.RuleStatusActive}
+	d := NewDispatcher(&mockDispatchDB{rules: []*db.CollectionRule{huge}}, newMockBucketQuerier(), newMockDispatchCache(), reg, logger)
+
+	err := d.SyncRulesOnConnect(context.Background(), agentID.String())
+	require.NoError(t, err, "oversized snapshot must degrade, not end the stream — that would loop")
+	assert.Empty(t, reg.sent, "an oversized snapshot must not be pushed to a transport that cannot carry it")
+	entries := logs.All()
+	require.Len(t, entries, 1)
+	assert.Contains(t, entries[0].Message, "oversized")
+	assert.Contains(t, entries[0].Context, zap.String("agent_id", agentID.String()))
 }
