@@ -648,6 +648,13 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 }
 
 // submitFile checks deduplication and enqueues an upload task.
+//
+// Since IC-BUG-21 a dest_path_template that cannot be resolved refuses the
+// task: nothing is enqueued, so nothing is ever written to a guessed object
+// key. The task is not enqueued in a doomed state either — a broken-template
+// rule watching a busy directory would otherwise flood the queue and its
+// capacity eviction would shed healthy backlog. Files re-collect naturally
+// once the template is fixed (cron walk / next write event).
 func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
 	done, err := q.IsProcessed(ctx, rule.RuleID, localPath, mtime.Unix(), size)
 	if err != nil {
@@ -656,11 +663,22 @@ func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, ru
 	if done {
 		return
 	}
+	storagePath, pathErr := buildStoragePath(rule, localPath, agentCtx, time.Now().UTC(), logger)
+	if pathErr != nil {
+		// The first occurrence carries the full detail; duplicates for the same
+		// rule are Debug-logged inside buildStoragePath (IC-BUG-21: one Warn,
+		// not 5000).
+		logger.Debug("agent: upload task refused, object key unresolved",
+			zap.String("rule_id", rule.RuleID),
+			zap.String("path", localPath),
+			zap.Error(pathErr))
+		return
+	}
 	task := &queue.UploadTask{
 		ID:          uuid.New().String(),
 		RuleID:      rule.RuleID,
 		LocalPath:   localPath,
-		StoragePath: buildStoragePath(rule, localPath, agentCtx, time.Now().UTC(), logger),
+		StoragePath: storagePath,
 		Bucket:      rule.UploadBucket,
 		FileSize:    size,
 		FileMtime:   mtime.Unix(),
@@ -674,21 +692,25 @@ func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, ru
 	}
 }
 
+// templateRefusals deduplicates the per-rule dest_path_template failure
+// warning over the process lifetime (IC-BUG-21): one misconfigured rule
+// watching 5000 files must produce one full Warn, not 5000 that an operator
+// will mute — a per-file warning storm is how IC-BUG-21 degraded into noise.
+var templateRefusals sync.Map
+
 // buildStoragePath resolves the upload path template and returns the object
-// key to use in MinIO.
+// key to use in MinIO, or an error when the template cannot be resolved.
 //
 // The template is normalised first (trollsift.NormalizeTemplate) so the key the
 // agent writes and the template the Control Plane later reverse-parses agree on
 // the leading separator; see docs/design/contracts.md V-3.
 //
-// If the template contains the {filename} variable it is substituted with the
-// file's base name, and the result is used as-is. Otherwise the resolved prefix
-// is treated as a directory and the file's base name is appended automatically.
-//
-// Every fallback to the bare base name is logged: a silent fallback is how
-// IC-BUG-17 hid an agent whose identity fields were empty, flattening every
-// upload into the bucket root.
-func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx trollsift.AgentContext, now time.Time, logger *zap.Logger) string {
+// Since IC-BUG-21 resolution failure fails the task instead of guessing a key:
+// with D-030's bucket-wide policy a wrong object key is no longer caught by any
+// 403 — a guessed key silently lands in the wrong place, polluting the index
+// and the IC-6 reconciliation shard tree. A silent fallback was exactly how
+// IC-BUG-17 flattened every upload into the bucket root.
+func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx trollsift.AgentContext, now time.Time, logger *zap.Logger) (string, error) {
 	relPath, err := filepath.Rel(rule.BasePath, localPath)
 	if err != nil {
 		relPath = filepath.Base(localPath)
@@ -713,35 +735,34 @@ func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx 
 		fields["time"] = trollsift.T(now)
 	}
 
-	fallback := filepath.Base(localPath)
-	template := trollsift.NormalizeTemplate(rule.DestPathTemplate)
-
-	destParser, err := trollsift.New(template)
-	if err != nil {
-		logger.Warn("agent: dest_path_template is not a valid pattern, falling back to base name",
+	fail := func(cause string, causeErr error) (string, error) {
+		err := fmt.Errorf("dest_path_template for rule %s cannot be resolved (%s): template %q: %w",
+			rule.RuleID, cause, rule.DestPathTemplate, causeErr)
+		if _, dup := templateRefusals.LoadOrStore(rule.RuleID, true); dup {
+			logger.Debug("agent: dest_path_template still unresolvable for this rule (first occurrence already logged)",
+				zap.String("rule_id", rule.RuleID))
+			return "", err
+		}
+		logger.Warn("agent: dest_path_template unresolvable, refusing to guess an object key — task will not be enqueued "+
+			"(fix the rule's dest_path_template; existing files are re-collected on the next cron walk or write event)",
 			zap.String("rule_id", rule.RuleID),
 			zap.String("template", rule.DestPathTemplate),
-			zap.String("storage_path", fallback),
-			zap.Error(err))
-		return fallback
+			zap.Error(causeErr))
+		return "", err
+	}
+
+	destParser, err := trollsift.New(trollsift.NormalizeTemplate(rule.DestPathTemplate))
+	if err != nil {
+		return fail("not a valid pattern", err)
 	}
 	storagePath, err := destParser.Compose(fields, false)
 	if err != nil {
-		logger.Warn("agent: cannot resolve dest_path_template, falling back to base name",
-			zap.String("rule_id", rule.RuleID),
-			zap.String("template", rule.DestPathTemplate),
-			zap.String("storage_path", fallback),
-			zap.Error(err))
-		return fallback
+		return fail("unresolvable field", err)
 	}
 	if storagePath == "" {
-		logger.Warn("agent: dest_path_template resolved to an empty key, falling back to base name",
-			zap.String("rule_id", rule.RuleID),
-			zap.String("template", rule.DestPathTemplate),
-			zap.String("storage_path", fallback))
-		return fallback
+		return fail("resolved to an empty key", fmt.Errorf("composed key is empty"))
 	}
-	return trollsift.NormalizeObjectKey(storagePath)
+	return trollsift.NormalizeObjectKey(storagePath), nil
 }
 
 // matchGlob matches a local absolute path against rule.PathPattern using relative-path semantics.

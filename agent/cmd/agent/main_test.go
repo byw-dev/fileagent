@@ -22,6 +22,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type mockTokenSetter struct {
@@ -113,19 +115,27 @@ func testLogger() *zap.Logger { return zap.NewNop() }
 
 func TestBuildStoragePath_WithPrefix(t *testing.T) {
 	rule := scheduler.CollectionRule{BasePath: "/tmp", DestPathTemplate: "data/logs/{filename}"}
-	got := buildStoragePath(rule, "/tmp/file.txt", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
+	got, err := buildStoragePath(rule, "/tmp/file.txt", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
+	require.NoError(t, err)
 	assert.Equal(t, "data/logs/file.txt", got)
 }
 
-func TestBuildStoragePath_EmptyPrefix(t *testing.T) {
+// An empty template cannot produce an object key. Since D-030 the key is
+// produced entirely by dest_path_template (and REST create-rule already
+// requires it, agents.go binding:"required"), so "" fails the task rather
+// than flattening the file into the bucket root — IC-BUG-21's "empty result"
+// fallback path.
+func TestBuildStoragePath_EmptyPrefix_FailsTask(t *testing.T) {
 	rule := scheduler.CollectionRule{BasePath: "/tmp", DestPathTemplate: ""}
-	got := buildStoragePath(rule, "/tmp/report.csv", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
-	assert.Equal(t, "report.csv", got)
+	got, err := buildStoragePath(rule, "/tmp/report.csv", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
+	require.Error(t, err, "empty template must fail, not flatten to the bucket root")
+	assert.Empty(t, got)
 }
 
 func TestBuildStoragePath_TrailingSlash(t *testing.T) {
 	rule := scheduler.CollectionRule{BasePath: "/data", DestPathTemplate: "uploads/{filename}"}
-	got := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
+	got, err := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
+	require.NoError(t, err)
 	assert.Equal(t, "uploads/out.bin", got)
 }
 
@@ -133,18 +143,54 @@ func TestBuildStoragePath_TrailingSlash(t *testing.T) {
 // reverse-parses the normalised template against exactly this string.
 func TestBuildStoragePath_LeadingSlashTemplate(t *testing.T) {
 	rule := scheduler.CollectionRule{BasePath: "/data", DestPathTemplate: "/{agent_name}/{filename}"}
-	got := buildStoragePath(rule, "/data/out.bin",
+	got, err := buildStoragePath(rule, "/data/out.bin",
 		trollsift.AgentContext{AgentName: "tokyo-site"}, time.Now().UTC(), testLogger())
+	require.NoError(t, err)
 	assert.Equal(t, "tokyo-site/out.bin", got)
 }
 
 // Regression for IC-BUG-17: an agent restarted from a cached token used to have
 // an empty AgentContext, so {agent_name} could not resolve and every upload
-// silently collapsed to the bare base name at the bucket root.
-func TestBuildStoragePath_MissingAgentIdentity_FallsBackVisibly(t *testing.T) {
+// silently collapsed to the bare base name at the bucket root. After
+// IC-BUG-21 an unresolvable template must fail the task, never guess a key:
+// with D-030's bucket-wide policy a wrong key is not caught by any 403 and
+// would silently land in the wrong place.
+func TestBuildStoragePath_MissingAgentIdentity_FailsTask(t *testing.T) {
 	rule := scheduler.CollectionRule{BasePath: "/data", DestPathTemplate: "/{agent_name}/{filename}"}
-	got := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
-	assert.Equal(t, "out.bin", got, "unresolvable template still falls back")
+	got, err := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
+	require.Error(t, err, "unresolvable template must fail, not fall back")
+	assert.Empty(t, got, "no object key may be produced on template failure")
+	assert.Contains(t, err.Error(), "agent_name")
+}
+
+// A syntactically invalid template must return an error naming the rule, the
+// template and the cause — never a guessed key.
+func TestBuildStoragePath_InvalidTemplate_FailsTask(t *testing.T) {
+	rule := scheduler.CollectionRule{
+		RuleID:           "r-broken",
+		BasePath:         "/data",
+		DestPathTemplate: "/logs/{unclosed/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/out.bin",
+		trollsift.AgentContext{AgentName: "tokyo-site"}, time.Now().UTC(), testLogger())
+	require.Error(t, err, "invalid template must fail, not fall back")
+	assert.Empty(t, got)
+	assert.Contains(t, err.Error(), "r-broken")
+	assert.Contains(t, err.Error(), "logs/{unclosed/{filename")
+}
+
+// A template that resolves to an empty key must fail the task — an empty key
+// is not a legal object key and falling back would guess one.
+func TestBuildStoragePath_EmptyResolvedKey_FailsTask(t *testing.T) {
+	rule := scheduler.CollectionRule{
+		RuleID:           "r-empty",
+		BasePath:         "/data",
+		DestPathTemplate: "{ext}",
+	}
+	got, err := buildStoragePath(rule, "/data/noext",
+		trollsift.AgentContext{}, time.Now().UTC(), testLogger())
+	require.Error(t, err, "empty resolved key must fail, not fall back")
+	assert.Empty(t, got)
 }
 
 // ── submitFile ────────────────────────────────────────────────────────────────
@@ -589,4 +635,38 @@ func TestUploadWithAccessDeniedRetry_OtherError_PassThrough(t *testing.T) {
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, executor.ErrTerminalUpload))
 	assert.Zero(t, refreshes, "other error classes must not burn a credential refresh")
+}
+
+// IC-BUG-21: an unresolved dest_path_template refuses the task — nothing is
+// enqueued, so nothing can ever land under a guessed key. One misconfigured
+// rule must produce one Warn for the rule, not one per file.
+func TestSubmitFile_UnresolvedTemplate_RefusesTask(t *testing.T) {
+	q := openTestQueue(t)
+	core, logs := observer.New(zapcore.WarnLevel)
+	logger := zap.New(core)
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		t.Error("no task may reach the uploader with an unresolved object key")
+		return nil, fmt.Errorf("must not upload")
+	}, zap.NewNop(), 0)
+	exec.Start(context.Background())
+	defer exec.Stop()
+
+	rule := scheduler.CollectionRule{
+		RuleID:           "submit-refusal-1",
+		BasePath:         "/tmp",
+		UploadBucket:     "bkt",
+		DestPathTemplate: "/{agent_name}/{filename}",
+	}
+	// The rule watches a busy directory: many files, same broken template.
+	for i := 0; i < 3; i++ {
+		submitFile(context.Background(), exec, q, rule,
+			fmt.Sprintf("/tmp/f%d.txt", i), 100, time.Now(), 0, "", trollsift.AgentContext{}, logger)
+	}
+
+	depth, err := q.CountPending()
+	require.NoError(t, err)
+	assert.Zero(t, depth, "a task with an unresolved object key must never be enqueued")
+
+	entries := logs.FilterMessageSnippet("refusing to guess an object key").All()
+	require.Len(t, entries, 1, "one broken rule must Warn exactly once, not per file")
 }
