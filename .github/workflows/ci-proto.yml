@@ -73,6 +73,10 @@ jobs:
       # cwd=tools/ — so build the pinned buf binary into a scratch dir and run it here.
       - name: buf lint + buf breaking (against master)
         run: |
+          # actions/checkout leaves a detached HEAD without refs/heads/master, which
+          # buf's '.git#branch=master' input cannot resolve — point the local ref at
+          # origin/master first.
+          git branch --force master origin/master
           rm -rf .tmp-proto-tools
           GOWORK=off go -C tools build -o ../.tmp-proto-tools/ github.com/bufbuild/buf/cmd/buf
           PATH=$PWD/.tmp-proto-tools:$PATH .tmp-proto-tools/buf lint
