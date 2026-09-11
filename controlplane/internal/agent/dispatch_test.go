@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // ── Mock implementations ────────────────────────────────────────────────────
@@ -64,6 +66,9 @@ func (m *mockDispatchCache) Del(_ context.Context, keys ...string) error {
 type mockRegistry struct {
 	online map[string]bool
 	sent   []*agentv1.ServerMessage
+	// sendFails simulates a full SendCh / disconnected agent: Send reports
+	// failure (IC-BUG-30 rules_sync + IC-BUG-31 DispatchRule propagation).
+	sendFails bool
 }
 
 func newMockRegistry() *mockRegistry {
@@ -72,6 +77,9 @@ func newMockRegistry() *mockRegistry {
 
 func (r *mockRegistry) IsOnline(agentID string) bool { return r.online[agentID] }
 func (r *mockRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
+	if r.sendFails {
+		return false
+	}
 	r.sent = append(r.sent, msg)
 	return true
 }
@@ -150,15 +158,46 @@ func TestSyncRulesOnConnect(t *testing.T) {
 	agentID := uuid.New()
 	reg.online[agentID.String()] = true
 
-	dispDB.rules = []*db.CollectionRule{
-		{ID: uuid.New(), AgentID: agentID, Name: "rule-1", Status: db.RuleStatusActive},
-		{ID: uuid.New(), AgentID: agentID, Name: "rule-2", Status: db.RuleStatusInactive},
-	}
+	active := &db.CollectionRule{ID: uuid.New(), AgentID: agentID, Name: "rule-1", Status: db.RuleStatusActive}
+	inactive := &db.CollectionRule{ID: uuid.New(), AgentID: agentID, Name: "rule-2", Status: db.RuleStatusInactive}
+	dispDB.rules = []*db.CollectionRule{active, inactive}
 
 	err := d.SyncRulesOnConnect(context.Background(), agentID.String())
 	require.NoError(t, err)
-	// Only the active rule should be sent.
-	assert.Len(t, reg.sent, 1)
+	// The sync is ONE snapshot message (D-033 snapshot form): per-rule pushes
+	// burst-overflow the bounded send buffer at >32 rules.
+	require.Len(t, reg.sent, 1)
+	syncMsg := reg.sent[0]
+	require.NotNil(t, syncMsg.GetRulesSync(), "the sync must be a single snapshot message")
+	rules := syncMsg.GetRulesSync().GetRules()
+	require.Len(t, rules, 2)
+	snapshot := map[string]bool{}
+	for _, r := range rules {
+		snapshot[r.GetRuleId()] = r.GetEnabled()
+	}
+	assert.True(t, snapshot[active.ID.String()], "active rule in snapshot, enabled")
+	assert.False(t, snapshot[inactive.ID.String()],
+		"inactive rule in snapshot too — the agent stops it via applyRule's Enabled=false branch")
+}
+
+// The snapshot must be hole-free: a rule whose bucket cannot be resolved must
+// fail the whole sync (connection ends, agent reconnects and resyncs) rather
+// than be omitted — an omitted rule exists in the DB, and the agent would stop
+// a rule that actually still runs.
+func TestSyncRulesOnConnect_BucketLookupError_FailsSync(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	agentID := uuid.New()
+	reg := newMockRegistry()
+	reg.online[agentID.String()] = true
+	dispDB := &mockDispatchDB{
+		rules: []*db.CollectionRule{
+			{ID: uuid.New(), AgentID: agentID, Status: db.RuleStatusActive},
+		},
+	}
+	d := NewDispatcher(dispDB, &errBucketQuerier{err: assert.AnError}, newMockDispatchCache(), reg, logger)
+	err := d.SyncRulesOnConnect(context.Background(), agentID.String())
+	require.Error(t, err, "a hole-free snapshot must not silently drop a DB-existing rule")
+	assert.Empty(t, reg.sent, "no snapshot may be delivered with holes")
 }
 
 func TestDispatchRule_LockAlreadyHeld(t *testing.T) {
@@ -305,19 +344,48 @@ func TestDispatchRule_BucketLookupError(t *testing.T) {
 	assert.Empty(t, reg.sent)
 }
 
-func TestSyncRulesOnConnect_BucketLookupError_SkipsRule(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
+// 硬化 1 / D-033：快照 Send 失败必须区分「缓冲满」与「agent 已断连」。
+// 「断连重试」的安全性建立在「这条消息失败是罕见的」之上——若快照大到缓冲
+// 装不下，每次重连都会必然失败，退化为重连循环。日志必须一眼分得出。
+func TestSyncRulesOnConnect_SnapshotSendFailed_ChannelFull_LogsCause(t *testing.T) {
+	core, logs := observer.New(zapcore.ErrorLevel)
+	logger := zap.New(core)
 	agentID := uuid.New()
-	reg := newMockRegistry()
-	reg.online[agentID.String()] = true
 	dispDB := &mockDispatchDB{
 		rules: []*db.CollectionRule{
 			{ID: uuid.New(), AgentID: agentID, Status: db.RuleStatusActive},
 		},
 	}
-	d := NewDispatcher(dispDB, &errBucketQuerier{err: assert.AnError}, newMockDispatchCache(), reg, logger)
-	// Should not return an error; rules with failed bucket lookup are skipped.
+	reg := newMockRegistry()
+	reg.online[agentID.String()] = true
+	reg.sendFails = true
+	d := NewDispatcher(dispDB, newMockBucketQuerier(), newMockDispatchCache(), reg, logger)
+
 	err := d.SyncRulesOnConnect(context.Background(), agentID.String())
-	require.NoError(t, err)
-	assert.Empty(t, reg.sent)
+	require.Error(t, err)
+	entries := logs.All()
+	require.Len(t, entries, 1)
+	assert.Contains(t, entries[0].Message, "send channel full")
+	assert.NotContains(t, entries[0].Message, "agent disconnected")
+}
+
+func TestSyncRulesOnConnect_SnapshotSendFailed_Disconnected_LogsCause(t *testing.T) {
+	core, logs := observer.New(zapcore.ErrorLevel)
+	logger := zap.New(core)
+	agentID := uuid.New()
+	dispDB := &mockDispatchDB{
+		rules: []*db.CollectionRule{
+			{ID: uuid.New(), AgentID: agentID, Status: db.RuleStatusActive},
+		},
+	}
+	reg := newMockRegistry()
+	reg.online[agentID.String()] = false
+	reg.sendFails = true
+	d := NewDispatcher(dispDB, newMockBucketQuerier(), newMockDispatchCache(), reg, logger)
+
+	err := d.SyncRulesOnConnect(context.Background(), agentID.String())
+	require.Error(t, err)
+	entries := logs.All()
+	require.Len(t, entries, 1)
+	assert.Contains(t, entries[0].Message, "agent disconnected")
 }

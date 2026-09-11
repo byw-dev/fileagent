@@ -1671,3 +1671,110 @@ buf 不模拟 protoc 版本，重新生成的 diff **只有生成物头部两行
 - proto 契约的破坏性变更从「口头约定」变为「机器强制」。
 - tools/go.mod 里 grpc / genproto 等依赖因 buf 的依赖被 MVS 抬升（patch 级），sqlc 输出
   不受影响——`ci-cp.yml` 的 sqlc drift guard 绿为证。
+
+## D-033：规则同步补「全集」语义——ServerMessage oneof 新增 `rules_sync`（IC-BUG-30）
+
+**决策日期**：2026-09-11
+**影响范围**：`proto/v1/agent.proto`、`api/v1/*.pb.go`（仅经 make generate）、
+`controlplane/internal/agent/dispatch.go`（SyncRulesOnConnect）、
+`controlplane/internal/grpcserver/handler.go`（Connect 的同步错误传播）、
+`agent/cmd/agent/main.go`（ServerMessage handler 新分支）
+**关联**：IC-BUG-30（docs/tasks/bugs/open.md）、D-030（整桶 policy）、D-032（buf 生成链）、
+IC-2b ③（docs/tasks/consistency-ingest.md）
+
+### 背景：同步协议只有增量推送，没有全集语义
+
+`SyncRulesOnConnect` 重连时只推 active 规则，从不推 cancel。agent 断连期间管理员
+**停用**或**删除**一条规则，cancel 命令被 `DispatchRuleCancel` 的离线分支直接丢弃
+（`dispatch.go` 的 `IsOnline` 短路），agent 重连后对规则的死活一无所知：
+
+- **停用那半**：把 inactive 规则连起来一起推即可修——agent 的 `applyRule` 对
+  `Enabled == false` 本来就会先 `stopRule` 再 return，复用既有分支，不需要新消息。
+- **删除那半**：**只推 inactive 修不掉**——删掉的行根本不在
+  `ListCollectionRulesByAgent` 的结果里，没有任何增量消息可以表达「这条已经没了」。
+  D-030 整桶 policy 之后陈旧规则的上传**不会被 403 挡**，无界持续到进程重启。
+
+卡片给出的两个方向：全集语义（proto 只增字段）或 CP 侧 tombstone（软删除表）。
+**选全集**：tombstone 需要新表 + 迁移 + 清理策略，而本语义只需要一条消息。
+
+### 决策
+
+1. `ServerMessage` oneof **新增成员 `rules_sync`（字段号 17，现用到 16）**，
+   payload 为新 message `RulesSyncCommand`：
+   ```proto
+   message RulesSyncCommand {
+     repeated string rule_ids = 1;
+   }
+   ```
+   纯追加：不动任何既有字段编号、不删任何字段，`buf breaking`（对 master 比对，
+   D-032 落地）机器强制。
+2. **语义钉死**：`rule_ids` 是**本次同步时 DB 中该 agent 的所有规则 ID**
+   （active + inactive 都算），**不含已删除的——「不含已删除」正是语义所在**，
+   不是「所有曾经存在过的」。agent 收到后停掉自己手里**不在集合内**的任何规则；
+   集合内的规则由紧邻的逐条 push 供给（inactive 的 push 即停用，复用 `applyRule`
+   既有分支）。消息在 `SyncRulesOnConnect` **逐条推完全量之后**最后发送。
+3. **agent 只停内存句柄，不清理 SQLite `rules` 表**——那张表只写不读
+   （`GetRule` 仅测试调用，M-2 扫描已记录），清理它超出本语义范围。
+4. **`rules_sync` 送达失败必须让这次连接失败（Connect 返回错误结束 RPC），
+   而不是只记日志。** 理由：这条消息承载的是删除半边的**全部**修复——它丢了，
+   agent 的规则视图就静默退回修复前的样子，且没有任何信号（正是本 track 判据
+   第四条要拦的「改动制造新单点」）。agent 此刻手里的规则视图已不可信，
+   **带着不可信的视图继续跑，比断开重来危险**；断开是干净的失败模式——重连
+   会走一遍完整 `SyncRulesOnConnect`。只告警则等于把修复押在一条 best-effort
+   消息上还假装它可靠。逐条规则 push 的失败仍按 IC-BUG-31 ② 接受 best-effort
+   （补偿 = 重连后的再同步），**不**因此断连——逐条 push 失败即断连会让缓冲
+   瞬时打满的慢链路 agent 陷入重连循环，让原本无害的瞬时拥塞变得有害。
+
+### 否决了什么
+
+- **CP 侧 tombstone / 软删除表**：需新表 + 迁移 + 清理策略；全集语义一条消息即可，
+  proto 纯追加零迁移成本。
+- **只推 inactive（不加全集消息）**：修不掉删除那半，删除的行推不出来（本决策的出发点）。
+- **`rules_sync` 失败只告警不断连**：见决策 4——制造无信号的静默回退单点。
+- **把 41 条压成 1 条的「整体规则快照」消息**（一条消息携带 `repeated CollectionRule`）：
+  结构上更稳（不受 SendCh 缓冲时序影响），但改动面大得多（agent 整体替换规则集、
+  dry-run 语义要重新钉），且缓冲时序在 ④ 修好消费者顺序后经验证不构成实际失败
+  （40 条验收重复跑 ×5）。留作后续形态演化的备选，本刀不采。
+
+### 影响
+
+- 断连期间删除/停用的规则，恢复连接后不重启 agent 即停止采集（IC-BUG-30 的两条半边）。
+- 同步一次的消息量 = N 条 push + 1 条 rules_sync（N = 该 agent 的规则总数，
+  active + inactive）。N 超过 SendCh 缓冲（32）时的送达依赖消费者并发排空
+  （④ 把发送 goroutine 提前），40 条验收为直接证据。
+- `ci-proto.yml` 的 `buf breaking` 对本变更为纯追加校验；drift guard 保证生成物与源同步。
+
+**补记（2026-09-11，实现评审后改形：逐条 push + 全集 ID → 快照）**：
+
+初版按本决策落地为「SyncRulesOnConnect 逐条 push（active + inactive）+ 最后一条
+rules_sync 只携带 `rule_ids`」。行为级验证立即证伪了该形态：
+**burst-vs-drain 是结构性丢失，不是时序问题**——40 条 push + 1 条 rules_sync +
+1 条 credentials 共 41 条消息经 32 缓冲的非阻塞 Send 入队，即使发送 goroutine
+已提前启动（消费者先于生产者，IC-BUG-31 ④ 修复），40 条的紧循环仍 5/5 确定性失败：
+恰好送达 32 条，其余 8 条与凭据被 `select/default` 静默丢弃。生产速率是微秒级
+循环，消费是逐条 `stream.Send`（gRPC 帧封装 + 流控），生产恒快于消费；
+dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
+
+更糟的是**判据第四条拦到了协调者自己的指令**：硬化 1 的「rules_sync 失败即断连
+重连」在「一次同步只发 1 条」前提下是干净的失败模式，但与 41 连发组合即
+「>32 规则的 agent 每回合必丢 8 条 + 必断一次」——无限重连循环。
+
+**因此 `RulesSyncCommand` 改为快照形态：`repeated CollectionRule rules = 1`**，
+`SyncRulesOnConnect` 不再逐条 push，只发这一条；`PushRuleCommand` 保留为增量
+通道（单条 create/update，缓冲无压力）。agent 收到后原子替换规则集：停掉集合
+外的一切（`stopRulesOutsideSync`），再逐条 upsert+apply 集合内的
+（`Enabled == false` 走 `applyRule` 既有停用分支）。语义不变：快照 = DB 真相
+（active + inactive，不含已删除——「不含」正是删除半边的语义）。
+
+两条配套语义：
+
+- **快照必须无洞**：某条规则的 bucket lookup 失败时，**整条同步失败**
+  （Connect 结束流、agent 重连重同步），而不是跳过该规则——被省略的规则在 DB
+  里存在，快照缺了它 agent 就会停掉一条实际还在的规则。
+- **快照体积**：随规则数线性增长（几十条 ≈ KBs）。远超 gRPC 默认 4MB 接收上限
+  时整条失败（连接错误、重连、重同步）——**响而不是静默部分丢失**，这是有意选择
+  的更好失败模式，但运维需知：规则数极大时快照会整体失败，须拆分 agent 而非调大上限。
+
+（另注：`DispatchRule` / `DispatchRuleCancel` 的单条增量推送仍走同一 32 缓冲。
+正常单操作 1–2 条消息无压力，但**经 API 批量改动大量规则时同样的 burst 会重现**——
+本刀不修，留给协调者决定是否立卡。）

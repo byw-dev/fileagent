@@ -670,3 +670,85 @@ func TestSubmitFile_UnresolvedTemplate_RefusesTask(t *testing.T) {
 	entries := logs.FilterMessageSnippet("refusing to guess an object key").All()
 	require.Len(t, entries, 1, "one broken rule must Warn exactly once, not per file")
 }
+
+// ── IC-BUG-30: agent stops rules outside the synced full set ─────────────────
+
+// Rules deleted while disconnected are absent from RulesSyncCommand.rule_ids;
+// the agent must stop every held rule outside the set. Inactive rules are NOT
+// here — they arrive as ordinary pushes whose Enabled=false stops them.
+func TestStopRulesOutsideSync(t *testing.T) {
+	stopped := make([]string, 0, 2)
+	stop := func(ruleID string) { stopped = append(stopped, ruleID) }
+
+	stopRulesOutsideSync(
+		[]string{"keep-a", "keep-b"},
+		func() []string { return []string{"keep-a", "stale-deleted", "stale-also-deleted", "keep-b"} },
+		stop,
+		zap.NewNop(),
+	)
+	assert.ElementsMatch(t, []string{"stale-deleted", "stale-also-deleted"}, stopped)
+
+	// A rule that is in the set must never be stopped, even if it was pushed
+	// just before the sync (the normal reconnect order).
+	stopped = nil
+	stopRulesOutsideSync([]string{"r1"}, func() []string { return []string{"r1"} }, stop, zap.NewNop())
+	assert.Empty(t, stopped)
+}
+
+func TestStopRulesOutsideSync_EmptySetStopsEverything(t *testing.T) {
+	stopped := make([]string, 0, 2)
+	stop := func(ruleID string) { stopped = append(stopped, ruleID) }
+	stopRulesOutsideSync(nil, func() []string { return []string{"a", "b"} }, stop, zap.NewNop())
+	assert.ElementsMatch(t, []string{"a", "b"}, stopped,
+		"an empty full-set means every rule was deleted while disconnected")
+}
+
+// ── IC-BUG-30 (D-033 快照形态): agent 以快照原子替换规则集 ─────────────────────
+
+// The snapshot is the agent's complete rule set: rules outside it were deleted
+// while disconnected (stop them); rules inside it are applied as-is —
+// Enabled=false runs applyRule's existing stop branch, so pausing is covered
+// without new code.
+func TestApplyRulesSnapshot_ReplacesRuleSet(t *testing.T) {
+	type applied struct {
+		id      string
+		enabled bool
+	}
+	var stopped []string
+	var got []applied
+
+	active := scheduler.CollectionRule{RuleID: "r-active", Enabled: true}
+	inactive := scheduler.CollectionRule{RuleID: "r-inactive", Enabled: false}
+	deleted := "r-deleted-while-offline"
+
+	applyRulesSnapshot(
+		[]scheduler.CollectionRule{active, inactive},
+		func() []string { return []string{"r-active", deleted} },
+		func(ruleID string) { stopped = append(stopped, ruleID) },
+		func(r scheduler.CollectionRule) { got = append(got, applied{r.RuleID, r.Enabled}) },
+		zap.NewNop(),
+	)
+
+	assert.Equal(t, []string{deleted}, stopped,
+		"a held rule absent from the snapshot was deleted while disconnected")
+	assert.Len(t, got, 2, "every snapshot rule is applied")
+	assert.Equal(t, "r-active", got[0].id)
+	assert.True(t, got[0].enabled)
+	assert.Equal(t, "r-inactive", got[1].id)
+	assert.False(t, got[1].enabled, "inactive snapshot rules go through applyRule's stop branch")
+}
+
+// An empty snapshot means every rule was deleted while disconnected — the
+// agent must stop everything and start nothing.
+func TestApplyRulesSnapshot_EmptySnapshot_StopsAll(t *testing.T) {
+	var stopped []string
+	var applied []string
+	applyRulesSnapshot(nil,
+		func() []string { return []string{"a", "b"} },
+		func(ruleID string) { stopped = append(stopped, ruleID) },
+		func(r scheduler.CollectionRule) { applied = append(applied, r.RuleID) },
+		zap.NewNop(),
+	)
+	assert.ElementsMatch(t, []string{"a", "b"}, stopped)
+	assert.Empty(t, applied)
+}

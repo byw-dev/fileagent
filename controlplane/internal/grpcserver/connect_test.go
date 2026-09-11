@@ -2,6 +2,7 @@ package grpcserver
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -331,4 +332,170 @@ func TestServer_Connect_HalfClose_WhileSendBlocked_StillUnregisters(t *testing.T
 	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
 		10*time.Second, 50*time.Millisecond,
 		"handler pinned in the Recv error branch — the agent made itself unrevokable")
+}
+
+// IC-BUG-30 (D-033 hardening): a failed rule sync must END the stream. The
+// rules_sync full-set message is the entire delete half of the fix — if it is
+// dropped and the agent keeps running, its rule view silently falls back to
+// the pre-fix behaviour with no signal. Running with an untrustworthy rule
+// view is worse than disconnecting: the agent reconnects into a clean full
+// re-sync.
+func TestServer_Connect_RuleSyncFailure_EndsStream(t *testing.T) {
+	agentID := "77777777-7777-7777-7777-777777777777"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	srv := New(logger)
+	srv.WithDeps(registry, newMockCache(), jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&mockDispatcher{err: assert.AnError}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+
+	// The handler must return after the sync failure, ending the RPC — the
+	// client's Recv must come back with an error rather than block forever.
+	recvErr := make(chan error, 1)
+	go func() { _, e := stream.Recv(); recvErr <- e }()
+	select {
+	case e := <-recvErr:
+		require.Error(t, e, "a failed rule sync must end the stream, not be swallowed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream still open 5s after rule-sync failure — the sync error was swallowed")
+	}
+	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		3*time.Second, 20*time.Millisecond, "registry entry must be cleaned up")
+}
+
+// ── IC-BUG-31 结构半边：≥33 条规则的送达（行为级）─────────────────────────────
+//
+// ⚠️ 旧形态的实证（决定本测试形状的证据，勿删）：初版实现是「逐条 push 全量 +
+// 最后一条 rules_sync + 凭据」共 41 条消息，全部经 32 缓冲的非阻塞 Send 入队。
+// 即使发送 goroutine 已提前启动（消费者先于生产者），40 条的 burst 仍然
+// 5/5 确定性失败：恰好送达 32 条、其余 8 条与凭据全被 select/default 静默丢弃
+// （生产是微秒级紧循环，消费是逐条 stream.Send 含 gRPC 帧封装 + 流控，
+// 生产速率恒大于消费速率——这是结构性丢失，不是 flaky）。
+// 因此 D-033 改为快照形态：一次同步只发 1 条 RulesSyncCommand，
+// 逐条 PushRuleCommand 只留给单条增量下发。本测试由此改证快照路径不丢。
+//
+// bulkSyncDispatcher reproduces the sync as Connect drives it: one snapshot
+// message with every rule, then the credentials push behind it.
+type bulkSyncDispatcher struct {
+	registry *AgentRegistry
+	rules    int
+}
+
+func (d *bulkSyncDispatcher) SyncRulesOnConnect(_ context.Context, agentID string) error {
+	snapshot := make([]*agentv1.CollectionRule, 0, d.rules)
+	for i := 0; i < d.rules; i++ {
+		snapshot = append(snapshot, &agentv1.CollectionRule{RuleId: fmt.Sprintf("rule-%02d", i)})
+	}
+	d.registry.Send(agentID, &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_RulesSync{
+			RulesSync: &agentv1.RulesSyncCommand{Rules: snapshot},
+		},
+	})
+	// Mirror pushCredentials: the credentials push follows the rule sync.
+	d.registry.Send(agentID, &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Credentials{
+			Credentials: &agentv1.CredentialsPayload{AccessKey: "AKID"},
+		},
+	})
+	return nil
+}
+
+// 40 active rules must ALL reach the agent, and the credentials push behind
+// them must arrive. 40 > 32 is deliberate — it is exactly the count that
+// structurally dropped 8 rules and the credentials under the old per-message
+// push form (see the comment above); under the snapshot form the same 40
+// arrive as one message with room to spare.
+func TestServer_Connect_FortyRules_AllDelivered(t *testing.T) {
+	agentID := "88888888-8888-8888-8888-888888888888"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	srv := New(logger)
+	srv.WithDeps(registry, newMockCache(), jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&bulkSyncDispatcher{registry: registry, rules: 40}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+
+	rules := make(map[string]bool)
+	gotCreds := false
+	for {
+		msg, rErr := stream.Recv()
+		if rErr != nil {
+			break
+		}
+		switch p := msg.GetPayload().(type) {
+		case *agentv1.ServerMessage_RulesSync:
+			for _, r := range p.RulesSync.GetRules() {
+				rules[r.GetRuleId()] = true
+			}
+		case *agentv1.ServerMessage_Credentials:
+			gotCreds = true
+		}
+		if len(rules) == 40 && gotCreds {
+			break
+		}
+	}
+	assert.Len(t, rules, 40, "every pushed rule must reach the agent")
+	assert.True(t, gotCreds, "the credentials push behind the rules must arrive")
 }

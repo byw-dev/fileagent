@@ -102,17 +102,12 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	s.publishEvent("events.agent.online", agentID)
 	s.logger.Info("agent connected", zap.String("agent_id", agentID))
 
-	// Sync all active rules to the freshly connected agent (CP-W3 / CP-W4).
-	if s.dispatcher != nil {
-		if err := s.dispatcher.SyncRulesOnConnect(ctx, agentID); err != nil {
-			s.logger.Warn("connect: sync rules failed", zap.String("agent_id", agentID), zap.Error(err))
-		}
-	}
-
-	// Push an initial STS session so the agent can upload immediately (IC-BUG-1).
-	s.pushCredentials(ctx, agentID)
-
-	// Start send goroutine.
+	// Start the send goroutine BEFORE anything is enqueued (IC-BUG-31):
+	// SyncRulesOnConnect and pushCredentials both write into conn.SendCh, and
+	// with the buffered channel (cap 32) having no consumer those writes are
+	// plain drops — with ≥32 active rules the rules themselves started
+	// dropping, and with exactly 32 the credentials after them did. The
+	// goroutine is the consumer, so it must exist before the producers run.
 	sendErr := make(chan error, 1)
 	go func() {
 		for {
@@ -132,6 +127,22 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 			}
 		}
 	}()
+
+	// Sync all rules — active and inactive — and finish with the rule full-set
+	// message (IC-BUG-30 / D-033). A sync failure must end the stream: the
+	// full-set message is the entire delete half of the fix, and an agent that
+	// keeps running with an untrustworthy rule view is worse than one that
+	// disconnects — a reconnect runs a clean full re-sync.
+	if s.dispatcher != nil {
+		if err := s.dispatcher.SyncRulesOnConnect(ctx, agentID); err != nil {
+			s.logger.Error("connect: rule sync failed, ending stream for a clean re-sync",
+				zap.String("agent_id", agentID), zap.Error(err))
+			return status.Error(codes.Internal, "rule sync incomplete; the agent must reconnect and re-sync")
+		}
+	}
+
+	// Push an initial STS session so the agent can upload immediately (IC-BUG-1).
+	s.pushCredentials(ctx, agentID)
 
 	// Receive loop.
 	//

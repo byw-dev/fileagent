@@ -176,7 +176,34 @@ func (d *Dispatcher) DispatchRuleCancel(ctx context.Context, ruleID, agentID str
 	return nil
 }
 
-// SyncRulesOnConnect pushes all active rules to an agent that just connected.
+// SyncRulesOnConnect pushes the agent's complete rule snapshot on (re)connect
+// as ONE message (IC-BUG-30 / D-033).
+//
+// The snapshot is every rule in the database for this agent — active AND
+// inactive (the agent's applyRule stops a rule whose Enabled is false, which
+// is the disconnect-window enable-toggle half) — and deleted rules are absent
+// by design; their absence is the only way the agent can learn they were
+// deleted, so the snapshot must be hole-free: a bucket lookup failure fails
+// the whole sync rather than quietly omitting a rule the agent would then
+// stop even though it still exists.
+//
+// Snapshot, not per-rule pushes: with ≥33 rules a per-message push burst
+// overflows the connection's bounded send buffer faster than the send
+// goroutine drains it — measured 5/5 runs losing 8 of 40 rules plus the
+// credentials push behind them (deterministic, not flaky: production rate is
+// a microsecond-scale loop, consumption is per-message stream.Send with gRPC
+// framing). One snapshot message cannot overflow the buffer, and its failure
+// mode is loud (whole message) rather than silent partial loss. PushRuleCommand
+// remains the incremental path for live rule create/update.
+//
+// Send failure must fail the connection (Connect ends the stream and the
+// agent reconnects into a clean full re-sync): the snapshot is the agent's
+// entire rule view — running with an untrustworthy view is worse than
+// disconnecting. The safety of that choice rests on the failure being rare
+// (one message into an empty buffer), so the log distinguishes a full buffer
+// from a disconnected agent: a repeating full-buffer failure would mean the
+// message is oversized and would turn reconnect-and-resync into a reconnect
+// loop — that must be visible at a glance.
 func (d *Dispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) error {
 	parsed, err := uuid.Parse(agentID)
 	if err != nil {
@@ -188,30 +215,36 @@ func (d *Dispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) err
 		return fmt.Errorf("sync_rules: list rules: %w", err)
 	}
 
+	snapshot := make([]*agentv1.CollectionRule, 0, len(rules))
 	for _, rule := range rules {
-		if rule.Status != db.RuleStatusActive {
-			continue
-		}
 		bucketName, err := d.lookupBucketName(ctx, rule.BucketID)
 		if err != nil {
-			d.logger.Warn("sync_rules: lookup bucket failed",
-				zap.String("rule_id", rule.ID.String()),
-				zap.Error(err),
-			)
-			continue
+			return fmt.Errorf("sync_rules: lookup bucket for rule %s: %w", rule.ID, err)
 		}
-		protoRule := ruleToProto(rule, bucketName)
-		msg := &agentv1.ServerMessage{
-			Payload: &agentv1.ServerMessage_PushRule{
-				PushRule: &agentv1.PushRuleCommand{Rule: protoRule},
-			},
-		}
-		if !d.registry.Send(agentID, msg) {
-			d.logger.Warn("sync_rules: failed to send rule",
+		snapshot = append(snapshot, ruleToProto(rule, bucketName))
+	}
+
+	syncMsg := &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_RulesSync{
+			RulesSync: &agentv1.RulesSyncCommand{Rules: snapshot},
+		},
+	}
+	if !d.registry.Send(agentID, syncMsg) {
+		// See the godoc above: the snapshot is the delete half of IC-BUG-30 in
+		// its entirety, so this failure must end the connection — but the two
+		// causes call for very different responses (rare transient vs a
+		// would-be reconnect loop), so the log names them apart.
+		if d.registry.IsOnline(agentID) {
+			d.logger.Error("sync_rules: rule snapshot not delivered: send channel full (cap 32) — "+
+				"if this repeats, the snapshot is oversized and disconnect-and-resync becomes a reconnect loop",
 				zap.String("agent_id", agentID),
-				zap.String("rule_id", rule.ID.String()),
-			)
+				zap.Int("rules", len(snapshot)))
+			return fmt.Errorf("sync_rules: send channel full for agent %s (%d rules)", agentID, len(snapshot))
 		}
+		d.logger.Error("sync_rules: rule snapshot not delivered: agent disconnected",
+			zap.String("agent_id", agentID),
+			zap.Int("rules", len(snapshot)))
+		return fmt.Errorf("sync_rules: agent %s disconnected before rule snapshot delivery", agentID)
 	}
 	return nil
 }

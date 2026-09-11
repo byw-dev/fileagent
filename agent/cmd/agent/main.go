@@ -284,6 +284,27 @@ exec := executor.New(cfg.Upload.Concurrency, q, func(uploadCtx context.Context, 
 			logger.Info("agent: cancel rule", zap.String("rule_id", ruleID))
 			stopRule(ruleID)
 
+		case *agentv1.ServerMessage_RulesSync:
+			// IC-BUG-30 delete half, snapshot form (D-033): the snapshot is the
+			// agent's complete rule set. Inactive rules stop through
+			// applyRule's Enabled=false branch; rules deleted while
+			// disconnected only exist as absences here.
+			applyRulesSnapshot(
+				protoToSchedulerRules(p.RulesSync.GetRules()),
+				func() []string {
+					ruleHandlesMu.Lock()
+					defer ruleHandlesMu.Unlock()
+					ids := make([]string, 0, len(ruleHandles))
+					for id := range ruleHandles {
+						ids = append(ids, id)
+					}
+					return ids
+				},
+				stopRule,
+				applyRule,
+				logger,
+			)
+
 		case *agentv1.ServerMessage_Revoke:
 			handleRevokeCommand(tokenMgr, stsMgr, grpcClient, stop, logger, p.Revoke.GetReason())
 
@@ -559,6 +580,16 @@ func protoToSchedulerRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 	}
 }
 
+// protoToSchedulerRules converts a snapshot of protobuf CollectionRules to the
+// scheduler type (D-033).
+func protoToSchedulerRules(rs []*agentv1.CollectionRule) []scheduler.CollectionRule {
+	out := make([]scheduler.CollectionRule, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, protoToSchedulerRule(r))
+	}
+	return out
+}
+
 // runWatcher starts a file-system watcher for the given watch-mode rule and
 // submits upload tasks to the executor for every create/write event.
 func runWatcher(ctx context.Context, rule scheduler.CollectionRule, exec *executor.Executor, q *queue.Queue, agentCtx trollsift.AgentContext, logger *zap.Logger) {
@@ -763,6 +794,46 @@ func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx 
 		return fail("resolved to an empty key", fmt.Errorf("composed key is empty"))
 	}
 	return trollsift.NormalizeObjectKey(storagePath), nil
+}
+
+// applyRulesSnapshot replaces the agent's whole rule set with the synced
+// snapshot (IC-BUG-30 / D-033). Rules held but absent from the snapshot were
+// deleted while the agent was disconnected — their absence is the only signal
+// it ever gets, and with D-030's bucket-wide policy their uploads would
+// otherwise continue unchecked until process restart. Snapshot rules are then
+// applied through applyRule, whose Enabled=false branch stops paused rules;
+// an empty snapshot therefore means "everything was deleted".
+func applyRulesSnapshot(rules []scheduler.CollectionRule, held func() []string, stop func(ruleID string), apply func(scheduler.CollectionRule), logger *zap.Logger) {
+	ids := make([]string, 0, len(rules))
+	for _, r := range rules {
+		ids = append(ids, r.RuleID)
+	}
+	stopRulesOutsideSync(ids, held, stop, logger)
+	for _, r := range rules {
+		apply(r)
+	}
+}
+
+// stopRulesOutsideSync stops every currently-held rule outside the synced
+// full set (IC-BUG-30, D-033). RulesSyncCommand.rule_ids is the complete set
+// of rule ids the Control Plane still has for this agent; rules deleted while
+// the agent was disconnected are absent by design, and their absence is the
+// only signal it ever gets — with D-030's bucket-wide policy their uploads
+// would otherwise continue unchecked until process restart. Inactive rules do
+// not pass through here: they arrive as ordinary pushes whose Enabled=false
+// makes applyRule stop them.
+func stopRulesOutsideSync(ruleIDs []string, held func() []string, stop func(ruleID string), logger *zap.Logger) {
+	inSet := make(map[string]struct{}, len(ruleIDs))
+	for _, id := range ruleIDs {
+		inSet[id] = struct{}{}
+	}
+	for _, id := range held() {
+		if _, ok := inSet[id]; !ok {
+			logger.Info("agent: stopping rule outside the synced full set (deleted while disconnected)",
+				zap.String("rule_id", id))
+			stop(id)
+		}
+	}
 }
 
 // matchGlob matches a local absolute path against rule.PathPattern using relative-path semantics.
