@@ -22,6 +22,15 @@ type AgentConn struct {
 	SendCh      chan *agentv1.ServerMessage
 	ConnectedAt time.Time
 	CancelFunc  context.CancelFunc
+	// SyncDegraded records whether THIS connection's rule sync ran degraded
+	// (snapshot over the size budget, delivered as the keep-alive marker
+	// instead). The Control Plane — not the cache — is the authority on the
+	// degraded condition: the cache is a projection that can lose keys to
+	// eviction or restart, and heartbeat renewal must rebuild from this state,
+	// not from key existence (review R6). Written once during Connect setup
+	// and read by the same connection's heartbeat handling — no concurrent
+	// access.
+	SyncDegraded bool
 }
 
 // AgentRegistry tracks all active bidirectional agent connections.

@@ -804,9 +804,12 @@ func TestServer_Heartbeat_RenewsDegradedMarker(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	mc := newMockCache()
 	mc.sets[cache.AgentSyncDegradedKey(agentID)] = "1" // 连接建立时的降级标记（已到期临界）
+	registry := NewAgentRegistry()
 	s := New(logger)
 	s.cache = mc
-	s.publishEvent("noop", agentID) // nothing to publish; guards nil deps
+	s.registry = registry
+	conn := registry.Register(agentID, nil, nil)
+	conn.SyncDegraded = true // 该连接的同步处于降级——CP 自身的权威状态
 
 	s.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 1})
 
@@ -884,4 +887,73 @@ func TestServer_Connect_ClearsDegradedMarkerOnDisconnect(t *testing.T) {
 		return false
 	}, 3*time.Second, 50*time.Millisecond,
 		"disconnect must clear the degraded marker — after that there is no degraded condition to observe (R5-B)")
+}
+
+// ── R6（IC-2b review 五轮）：续期以 CP 自身的连接状态为准，Redis 只是投影 ──────
+
+// 标记被外部删除（Redis 驱逐/重启）后，下一次心跳必须把它重建——降级条件在
+// CP 手里（连接状态），不在 Redis 键上；以「键还在」为续期前提意味着丢键后
+// 永久失去可观测性，与 R5-B 的目标正好相反。
+func TestServer_Heartbeat_RebuildsDegradedMarkerAfterExternalDelete(t *testing.T) {
+	agentID := "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	mc := newMockCache()
+	srv := New(logger)
+	srv.WithDeps(registry, mc, jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&degradedSyncDispatcher{}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		5*time.Second, 20*time.Millisecond)
+
+	key := cache.AgentSyncDegradedKey(agentID)
+	require.Eventually(t, func() bool {
+		_, ok := mc.sets[key]
+		return ok
+	}, 3*time.Second, 50*time.Millisecond, "the degraded sync must mark the agent")
+
+	// 模拟 Redis 驱逐/重启：键没了，但降级条件仍在（连接仍降级）。
+	delete(mc.sets, key)
+
+	// 下一次心跳必须重建标记。
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hb-1",
+		Payload: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{UptimeSeconds: 2}}}))
+	assert.Eventually(t, func() bool {
+		_, ok := mc.sets[key]
+		return ok
+	}, 3*time.Second, 50*time.Millisecond,
+		"the next heartbeat must rebuild the marker from the connection's own degraded state — "+
+			"renewal conditioned on key existence cannot self-heal a lost key (R6)")
 }

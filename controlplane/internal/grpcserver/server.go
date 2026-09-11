@@ -24,9 +24,6 @@ import (
 type CacheClient interface {
 	Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error
 	Del(ctx context.Context, keys ...string) error
-	// Exists backs the degraded-marker renewal: a heartbeat refreshes the
-	// marker only when it is actually present (IC-2b review R5-B).
-	Exists(ctx context.Context, keys ...string) (int64, error)
 }
 
 // NATSPublisher is the messaging interface required by the gRPC server.

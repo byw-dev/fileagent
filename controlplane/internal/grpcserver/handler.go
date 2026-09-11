@@ -176,6 +176,7 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	if s.dispatcher != nil {
 		if err := s.dispatcher.SyncRulesOnConnect(ctx, agentID); err != nil {
 			if errors.Is(err, agent.ErrRulesSyncDegraded) {
+				conn.SyncDegraded = true
 				if s.cache != nil {
 					if setErr := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); setErr != nil {
 						s.logger.Warn("connect: mark sync degraded failed", zap.String("agent_id", agentID), zap.Error(setErr))
@@ -492,14 +493,19 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 		// A degraded rule sync must stay observable for as long as the
 		// degraded connection lives — which can exceed the marker's TTL, and
 		// a long-lived degraded connection is exactly the state that most
-		// needs to be seen (review R5-B). A heartbeat proves the connection
-		// is alive, so an existing marker is renewed; absence costs one
-		// Exists round-trip per heartbeat, and the next sync re-marks or
-		// clears anyway. The TTL itself remains only the crash-recovery
-		// backstop, not the mechanism.
-		if n, err := s.cache.Exists(ctx, cache.AgentSyncDegradedKey(agentID)); err == nil && n > 0 {
-			if err := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); err != nil {
-				s.logger.Warn("heartbeat: renew degraded marker failed", zap.String("agent_id", agentID), zap.Error(err))
+		// needs to be seen (review R5-B). The authority on the condition is
+		// the connection's own state, so the heartbeat sets the marker
+		// UNCONDITIONALLY while the connection is degraded: a key lost to
+		// cache eviction or a restart is rebuilt by the next heartbeat
+		// (review R6). Conditioning the renewal on key existence would make
+		// the cache authoritative and the lost key permanent until reconnect.
+		// Clearing stays where it is: a successful sync and disconnect both
+		// delete, so the projection can never outlive its condition.
+		if s.registry != nil {
+			if conn := s.registry.Get(agentID); conn != nil && conn.SyncDegraded {
+				if err := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); err != nil {
+					s.logger.Warn("heartbeat: renew degraded marker failed", zap.String("agent_id", agentID), zap.Error(err))
+				}
 			}
 		}
 	}
