@@ -28,6 +28,7 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/pkg/trollsift"
 	"github.com/google/uuid"
+	"github.com/minio/minio-go/v7"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -104,6 +105,11 @@ func main() {
 	var (
 		uploaderCfgMu      sync.RWMutex
 		currentUploaderCfg *uploader.Config
+
+		// grpcClient is declared early so the credential-refresh closure below
+		// (used when a put is denied, IC-BUG-20) can capture it; the client is
+		// only created after the queue exists (section 5).
+		grpcClient *grpcclient.Client
 	)
 
 	// updateCreds applies a fresh CredentialsPayload to both stsMgr and the
@@ -134,30 +140,53 @@ func main() {
 			zap.String("endpoint", cred.GetEndpoint()))
 	}
 
-	// ── Upload function: creates a fresh Uploader per call using current STS ─
-	uploadFn := func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
-		uploaderCfgMu.RLock()
-		ucfg := currentUploaderCfg
-		uploaderCfgMu.RUnlock()
-		if ucfg == nil {
-			return nil, fmt.Errorf("agent: no upload credentials available yet")
-		}
-		u, err := uploader.New(*ucfg, q, logger)
-		if err != nil {
-			return nil, fmt.Errorf("agent: create uploader: %w", err)
-		}
-		return uploadWithTimeout(
-			uploadCtx,
-			task,
-			time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
-			cfg.Upload.AssumedUploadBytesPerSecond,
-			logger,
-			u.UploadFile,
-		)
+// ── Upload function: creates a fresh Uploader per call using current STS ─
+singleAttemptUpload := func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
+	uploaderCfgMu.RLock()
+	ucfg := currentUploaderCfg
+	uploaderCfgMu.RUnlock()
+	if ucfg == nil {
+		return nil, fmt.Errorf("agent: no upload credentials available yet")
 	}
+	u, err := uploader.New(*ucfg, q, logger)
+	if err != nil {
+		return nil, fmt.Errorf("agent: create uploader: %w", err)
+	}
+	return uploadWithTimeout(
+		uploadCtx,
+		task,
+		time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
+		cfg.Upload.AssumedUploadBytesPerSecond,
+		logger,
+		u.UploadFile,
+	)
+}
 
-	// ── 7. Worker pool (starts goroutines after exec.Start is called) ────────
-	exec := executor.New(cfg.Upload.Concurrency, q, uploadFn, logger, cfg.Upload.QueueMaxSize)
+// refreshSTS invalidates the held STS session and mints a fresh one from the
+// Control Plane. Used by uploadWithAccessDeniedRetry when a put is denied —
+// the held session covers only the bucket set known at mint time (IC-BUG-20).
+refreshSTS := func(refreshCtx context.Context) error {
+	stsMgr.Clear()
+	cred, err := grpcClient.RefreshCredentials(refreshCtx)
+	if err != nil {
+		return fmt.Errorf("agent: refresh credentials: %w", err)
+	}
+	updateCreds(cred)
+	return nil
+}
+
+// ── 7. Worker pool (starts goroutines after exec.Start is called) ────────
+exec := executor.New(cfg.Upload.Concurrency, q, func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
+	return uploadWithAccessDeniedRetry(
+		uploadCtx,
+		task,
+		time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
+		cfg.Upload.AssumedUploadBytesPerSecond,
+		logger,
+		singleAttemptUpload,
+		refreshSTS,
+	)
+}, logger, cfg.Upload.QueueMaxSize)
 
 	// ── Scheduler (cron-mode rules) ──────────────────────────────────────────
 	sched := scheduler.New(logger)
@@ -222,7 +251,7 @@ func main() {
 	}
 
 	// ── 5. gRPC client ───────────────────────────────────────────────────────
-	grpcClient := grpcclient.New(cfg, logger)
+	grpcClient = grpcclient.New(cfg, logger)
 	if err := grpcClient.Dial(); err != nil {
 		logger.Error("grpc dial failed", zap.Error(err))
 		return
@@ -417,6 +446,67 @@ func uploadTimeoutForSize(fileSize int64, minimum time.Duration, assumedBytesPer
 		return minimum
 	}
 	return derived
+}
+
+// isAccessDenied reports whether err is (or wraps) a MinIO AccessDenied
+// response — the signal that the held STS session cannot write the target
+// bucket (IC-BUG-20). The uploader wraps transport errors with %w, so the
+// chain is unwrapped rather than the surface type inspected.
+func isAccessDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	var resp minio.ErrorResponse
+	return errors.As(err, &resp) && resp.Code == "AccessDenied"
+}
+
+// uploadWithAccessDeniedRetry runs one upload attempt and, on AccessDenied,
+// invalidates the held STS session, refreshes it once and retries exactly one
+// more time (IC-BUG-20).
+//
+// The held session covers only the bucket set known when the Control Plane
+// minted it, so a rule pointing at a newly added bucket denies every put
+// until the session is re-issued — up to ~50 minutes on the agent's own
+// refresh tick, retrying exhausted without self-healing.
+//
+// A second AccessDenied is terminally failed (executor.ErrTerminalUpload) and
+// alarmed: a persistent denial means bucket policy or rule configuration is
+// wrong, and retrying would turn that into a silent refresh loop. A refresh
+// failure propagates the original AccessDenied unchanged — that is transient,
+// not a policy verdict, so the executor's backoff may retry later.
+func uploadWithAccessDeniedRetry(
+	parent context.Context,
+	task *queue.UploadTask,
+	minimum time.Duration,
+	assumedBytesPerSecond int64,
+	logger *zap.Logger,
+	upload executor.UploadFunc,
+	refresh func(ctx context.Context) error,
+) (*uploader.UploadResult, error) {
+	result, err := uploadWithTimeout(parent, task, minimum, assumedBytesPerSecond, logger, upload)
+	if !isAccessDenied(err) {
+		return result, err
+	}
+	logger.Warn("agent: upload denied, invalidating credentials and refreshing once",
+		zap.String("task_id", task.ID),
+		zap.String("bucket", task.Bucket),
+		zap.Error(err))
+	if rErr := refresh(parent); rErr != nil {
+		logger.Error("agent: credential refresh after AccessDenied failed, will retry on executor backoff",
+			zap.String("task_id", task.ID), zap.Error(rErr))
+		return nil, err
+	}
+	result, err = uploadWithTimeout(parent, task, minimum, assumedBytesPerSecond, logger, upload)
+	if isAccessDenied(err) {
+		logger.Error("agent: upload still denied after one credential refresh; failing task terminally "+
+			"(check the bucket policy and the rule's template/configuration)",
+			zap.String("task_id", task.ID),
+			zap.String("bucket", task.Bucket),
+			zap.Error(err))
+		return nil, fmt.Errorf("%w: still AccessDenied after one credential refresh: %v",
+			executor.ErrTerminalUpload, err)
+	}
+	return result, err
 }
 
 // handleRevokeCommand clears local credentials and triggers graceful shutdown.

@@ -364,6 +364,18 @@ func (s *Server) bucketsForAgent(ctx context.Context, agentID, ruleID string) ([
 // agent that had just connected sat there with no credentials and failed every
 // upload (IC-BUG-1). Pushing once at stream setup — alongside the rule sync —
 // means the agent is ready to upload as soon as it has rules to act on.
+// PushCredentials issues an STS session for the agent and delivers it over
+// the agent's open stream. Exported so the Dispatcher can re-push credentials
+// when a dispatched rule changes the agent's bucket set (IC-BUG-20) — the
+// session the agent already holds covers only the bucket set known at mint
+// time.
+//
+// Best-effort: with no STS manager or no rule with a resolvable bucket it
+// logs and returns; the agent's own refresh tick compensates.
+func (s *Server) PushCredentials(ctx context.Context, agentID string) {
+	s.pushCredentials(ctx, agentID)
+}
+
 func (s *Server) pushCredentials(ctx context.Context, agentID string) {
 	if s.stsMgr == nil || s.credDB == nil {
 		return

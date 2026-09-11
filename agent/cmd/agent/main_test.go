@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"github.com/byw-dev/fileagent/agent/internal/watcher"
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/pkg/trollsift"
+	"github.com/minio/minio-go/v7"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -464,4 +467,126 @@ func TestRunWatcher_CancelExits(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("runWatcher did not exit after context cancellation")
 	}
+}
+
+// ── IC-BUG-20: AccessDenied invalidates credentials, refreshes and retries once ─
+
+func accessDeniedError(bucket string) error {
+	return fmt.Errorf("uploader: put object: %w", minio.ErrorResponse{
+		Code:       "AccessDenied",
+		Message:    "Access Denied",
+		BucketName: bucket,
+	})
+}
+
+func otherForbiddenError(bucket string) error {
+	return fmt.Errorf("uploader: put object: %w", minio.ErrorResponse{
+		Code:       "InvalidAccessKeyId",
+		Message:    "bad key",
+		BucketName: bucket,
+	})
+}
+
+func TestIsAccessDenied(t *testing.T) {
+	assert.True(t, isAccessDenied(accessDeniedError("bkt")), "wrapped minio AccessDenied must be detected")
+	assert.False(t, isAccessDenied(otherForbiddenError("bkt")), "other S3 codes must not match")
+	assert.False(t, isAccessDenied(assert.AnError))
+	assert.False(t, isAccessDenied(nil))
+}
+
+func writeLocalFile(t *testing.T, name string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o600))
+	return path
+}
+
+func testUploadTask(path string) *queue.UploadTask {
+	return &queue.UploadTask{ID: "task-1", RuleID: "r1", LocalPath: path, Bucket: "bkt", StoragePath: "logs/f.bin"}
+}
+
+// A first AccessDenied must trigger exactly one invalidate+refresh+retry; the
+// refreshed attempt succeeding must surface its result.
+func TestUploadWithAccessDeniedRetry_RefreshesAndSucceedsOnce(t *testing.T) {
+	path := writeLocalFile(t, "f.bin")
+	task := testUploadTask(path)
+	attempts := 0
+	uploads := make([]string, 0, 2)
+	upload := func(_ context.Context, tk *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		attempts++
+		uploads = append(uploads, tk.Bucket)
+		if attempts == 1 {
+			return nil, accessDeniedError("bkt")
+		}
+		return &uploadpkg.UploadResult{StoragePath: tk.StoragePath, Bucket: tk.Bucket, SizeBytes: 5}, nil
+	}
+	refreshes := 0
+	refresh := func(_ context.Context) error { refreshes++; return nil }
+
+	result, err := uploadWithAccessDeniedRetry(context.Background(), task, 30*time.Second,
+		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, 2, attempts, "exactly one retry after AccessDenied")
+	assert.Equal(t, 1, refreshes, "credentials must be refreshed exactly once")
+}
+
+// A second AccessDenied must land terminally with no further refresh/retry
+// cycle — policy errors must not spin into a silent refresh loop.
+func TestUploadWithAccessDeniedRetry_SecondDenied_Terminal(t *testing.T) {
+	path := writeLocalFile(t, "f.bin")
+	task := testUploadTask(path)
+	attempts := 0
+	upload := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		attempts++
+		return nil, accessDeniedError("bkt")
+	}
+	refreshes := 0
+	refresh := func(_ context.Context) error { refreshes++; return nil }
+
+	_, err := uploadWithAccessDeniedRetry(context.Background(), task, 30*time.Second,
+		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh)
+	require.Error(t, err)
+	assert.Equal(t, 2, attempts, "no attempt beyond the single refresh retry")
+	assert.Equal(t, 1, refreshes)
+	assert.ErrorIs(t, err, executor.ErrTerminalUpload, "second AccessDenied must be terminal, not retried")
+}
+
+// If the refresh itself fails the original AccessDenied propagates unchanged
+// (non-terminal): a transient control-plane failure must not fail the task
+// terminally — the executor's backoff will retry it later.
+func TestUploadWithAccessDeniedRetry_RefreshFails_Propagates(t *testing.T) {
+	path := writeLocalFile(t, "f.bin")
+	task := testUploadTask(path)
+	attempts := 0
+	upload := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		attempts++
+		return nil, accessDeniedError("bkt")
+	}
+	refresh := func(_ context.Context) error { return assert.AnError }
+
+	_, err := uploadWithAccessDeniedRetry(context.Background(), task, 30*time.Second,
+		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh)
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, executor.ErrTerminalUpload),
+		"refresh failure is transient, not a policy verdict")
+	assert.Equal(t, 1, attempts, "no retry without refreshed credentials")
+	assert.Error(t, refresh(context.Background()))
+}
+
+// Non-AccessDenied failures must pass through untouched — no refresh, no retry.
+func TestUploadWithAccessDeniedRetry_OtherError_PassThrough(t *testing.T) {
+	path := writeLocalFile(t, "f.bin")
+	task := testUploadTask(path)
+	upload := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		return nil, otherForbiddenError("bkt")
+	}
+	refreshes := 0
+	refresh := func(_ context.Context) error { refreshes++; return nil }
+
+	_, err := uploadWithAccessDeniedRetry(context.Background(), task, 30*time.Second,
+		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh)
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, executor.ErrTerminalUpload))
+	assert.Zero(t, refreshes, "other error classes must not burn a credential refresh")
 }

@@ -76,6 +76,16 @@ func (r *mockRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
 	return true
 }
 
+// mockCredentialPusher records PushCredentials invocations made by the
+// Dispatcher when an agent's bucket set changes (IC-BUG-20).
+type mockCredentialPusher struct {
+	agentIDs []string
+}
+
+func (p *mockCredentialPusher) PushCredentials(_ context.Context, agentID string) {
+	p.agentIDs = append(p.agentIDs, agentID)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 func newTestDispatcher(t *testing.T) (*Dispatcher, *mockDispatchDB, *mockDispatchCache, *mockRegistry) {
@@ -178,6 +188,76 @@ func TestDispatchRuleCancel_AgentOffline(t *testing.T) {
 	err := d.DispatchRuleCancel(context.Background(), uuid.New().String(), "agent-1")
 	require.NoError(t, err)
 	assert.Empty(t, reg.sent)
+}
+
+// IC-BUG-20: dispatching a rule whose bucket is not yet covered by the agent's
+// other active rules must re-push credentials, otherwise the agent keeps
+// putting 403s for up to ~50 minutes on the old STS session.
+func TestDispatchRule_NewBucket_TriggersCredentialPush(t *testing.T) {
+	d, dispDB, _, reg := newTestDispatcher(t)
+	pusher := &mockCredentialPusher{}
+	d.SetCredentialPusher(pusher)
+	agentID := uuid.New()
+	bucketA, bucketB := uuid.New(), uuid.New()
+	reg.online[agentID.String()] = true
+	dispDB.rules = []*db.CollectionRule{
+		{ID: uuid.New(), AgentID: agentID, BucketID: bucketA, Status: db.RuleStatusActive},
+	}
+
+	rule := &db.CollectionRule{
+		ID:       uuid.New(),
+		AgentID:  agentID,
+		BucketID: bucketB,
+		Status:   db.RuleStatusActive,
+	}
+	require.NoError(t, d.DispatchRule(context.Background(), rule))
+	require.Len(t, reg.sent, 1)
+	require.Len(t, pusher.agentIDs, 1, "a rule pointing at a new bucket must trigger a credentials re-push")
+	assert.Equal(t, agentID.String(), pusher.agentIDs[0])
+}
+
+// IC-BUG-20 coupling check: a rule whose bucket is already covered by the
+// agent's other active rules must NOT re-push credentials — the held session
+// already covers it and re-issuing on every rule change would churn STS.
+func TestDispatchRule_SameBucket_NoCredentialPush(t *testing.T) {
+	d, dispDB, _, reg := newTestDispatcher(t)
+	pusher := &mockCredentialPusher{}
+	d.SetCredentialPusher(pusher)
+	agentID := uuid.New()
+	bucket := uuid.New()
+	reg.online[agentID.String()] = true
+	dispDB.rules = []*db.CollectionRule{
+		{ID: uuid.New(), AgentID: agentID, BucketID: bucket, Status: db.RuleStatusActive},
+	}
+
+	rule := &db.CollectionRule{
+		ID:       uuid.New(),
+		AgentID:  agentID,
+		BucketID: bucket,
+		Status:   db.RuleStatusActive,
+	}
+	require.NoError(t, d.DispatchRule(context.Background(), rule))
+	require.Len(t, reg.sent, 1)
+	assert.Empty(t, pusher.agentIDs, "covered bucket must not trigger a credentials re-push")
+}
+
+// IC-BUG-20: the re-push only makes sense for rules that add a bucket, i.e.
+// active ones; inactive rules are cancelled, not dispatched.
+func TestDispatchRule_InactiveRule_NoCredentialPush(t *testing.T) {
+	d, _, _, reg := newTestDispatcher(t)
+	pusher := &mockCredentialPusher{}
+	d.SetCredentialPusher(pusher)
+	agentID := uuid.New()
+	reg.online[agentID.String()] = true
+
+	rule := &db.CollectionRule{
+		ID:       uuid.New(),
+		AgentID:  agentID,
+		BucketID: uuid.New(),
+		Status:   db.RuleStatusInactive,
+	}
+	require.NoError(t, d.DispatchRule(context.Background(), rule))
+	assert.Empty(t, pusher.agentIDs)
 }
 
 func TestSyncRulesOnConnect_InvalidAgentID(t *testing.T) {
