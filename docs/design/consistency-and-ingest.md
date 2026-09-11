@@ -261,7 +261,7 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 >   —— 六项基线 + 七种变异开关，**每种变异都会被它声称防的那条用例杀掉**。跑法：
 >   `TEST_DATABASE_URL=postgres://fileagent:fileagent@localhost:5432/fileagent_test?sslmode=disable go test ./controlplane/internal/db/ -tags=integration -run TestObservationMutationMatrix -v`
 >
-> **软删除走的是另一条语句**（`MarkObservedFileDeleted`），它同样带守卫**并推进 `observed_at`/`event_seq`——
+> **软删除走的是另一条语句**——`ingest.sql` 里叫 **`DeleteIndexedFile`**（Go 侧包装叫 `MarkObservedFileDeleted`，在 `db/ingest.go`；`indexer` 侧还有一层 `MarkFileEntryDeleted`——**三个名字指同一条守卫**，去 `ingest.sql` 里 grep Go 的名字会一无所获）。它同样带守卫**并推进 `observed_at`/`event_seq`**——
 > 只加 WHERE 不推进这两列，会让已删除的行被任一次 create 事件重投复活。改一条就要想另一条。
 
 **排序与因果：三个字段各司其职（2026-09-10 定案，多次修订后定稿）**——最初的错误是让一个字段兼两职。
