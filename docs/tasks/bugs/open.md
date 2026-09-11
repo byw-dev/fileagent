@@ -103,7 +103,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-2 | Agent 从不上报 `UploadResult`，索引主路径是死代码 ✅ 随 IC-2a 修复 | 🔴 P0 | agent |
 | IC-BUG-3 | STS session policy 前缀与实际对象键不匹配 | 🔴 P0 | controlplane |
 | IC-BUG-4 | STS session policy 缺 multipart 权限、多授 DeleteObject | 🔴 P0 | controlplane |
-| IC-BUG-5 | 断点续传状态从未落盘，重试永远从头重传 + 孤儿分片累积 | 🟠 P1 | agent |
+| IC-BUG-5 | 断点续传状态从未落盘，重试永远从头重传 + 孤儿分片累积 ✅ 随 IC-3 修复 | 🟠 P1 | agent |
 | IC-BUG-6 | minio-event 索引失败仍返回 200，MinIO 丢弃事件 | 🟠 P1 | controlplane |
 | IC-BUG-7 | 通过 API 新建的 bucket 不注册事件通知，文件永不入索引 | 🟠 P1 | controlplane + deploy |
 | IC-BUG-8 | `UpsertFileEntry` 无排序键，webhook 会把 agent 富字段覆盖为 NULL ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
@@ -137,7 +137,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-36 | CP 凭据被 `init-minio.sh` 建成 **service account**，而 MinIO 的 service account 不能调 AssumeRole → 全新环境 STS 必然 `Access Denied` ✅ 已修（PR #97） | 🔴 P0 | deploy |
 | IC-BUG-37 | watcher 的 fsnotify 分支没有初始扫描，规则指向的**既有文件永不被采集**；而 polling 回退分支却会扫——同一条规则的行为取决于 fsnotify 是否可用 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
 | IC-BUG-38 | agent 的 `log.output` / `log.max_size_mb` / `log.max_backups` 解析了、校验了、写进文档了，就是没人读——日志只落 stdout，无文件、无轮转 | 🟡 P2 | agent |
-| IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 | 🟡 P2 | deploy + controlplane |
+| IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 ✅ 随 IC-3 修复 | 🟡 P2 | deploy + controlplane |
 | IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 | 🟠 P1 | controlplane |
 | IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 | 🟡 P2 | deploy |
 | IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT | 🟡 P2 | agent |
@@ -632,6 +632,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 加交叉引用注释是最低限度；更好的做法是写一个 Go 测试，把脚本里那段 JSON 解出来与 `BuildSessionPolicy` 的输出比对，不一致即红 |
 | **验收** | 故意给 `policy.go` 加一个 Action 而不改脚本 → 必须有东西变红 |
 | **归属** | 未排期。宜与 IC-3 或 IC-8（下一次要动 policy 的刀）同刀 |
+| **✅ 已修（IC-3，2026-09-12）** | 新增 `controlplane/internal/storage/policy_script_test.go`：解出脚本里的 `STS_SESSION_POLICY` JSON 与 `BuildSessionPolicy`（对脚本钉定的同一 bucket `data-sensor`）逐文档比对（`TestSessionPolicyMatchesInitScript` + 逐 statement 的 Action 集合断言 `TestSessionPolicyActionSetsMatch`）。反向变异已自验：给 `objectActions` 加 `s3:GetObject` 而不改脚本 → `go build` 通过且两条用例红；还原后 5/5 稳定绿。本刀未改 `policy.go`（IC-1 已把 `AbortMultipartUpload` 放进 `objectActions`），脚本无需同步 |
 
 ## IC-BUG-40 — CP 启动不校验 MinIO 凭据，故障延后到 agent 侧才爆 🟠 P1
 
