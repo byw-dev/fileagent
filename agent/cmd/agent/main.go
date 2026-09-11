@@ -79,11 +79,18 @@ func main() {
 
 	// ── 3. Open SQLite queue ─────────────────────────────────────────────────
 	queuePath := filepath.Join(cfg.Agent.DataDir, "queue.db")
-	q, err := queue.Open(queuePath)
+	q, err := queue.OpenWithLogger(queuePath, logger)
 	if err != nil {
 		logger.Fatal("queue open failed", zap.String("path", queuePath), zap.Error(err))
 	}
 	defer q.Close()
+	resetTasks, err := q.ResetRunningToPending(ctx)
+	if err != nil {
+		logger.Fatal("queue recovery failed", zap.Error(err))
+	}
+	if resetTasks > 0 {
+		logger.Info("agent: recovered interrupted upload tasks", zap.Int64("task_count", resetTasks))
+	}
 
 	// ── 4. Credential managers ───────────────────────────────────────────────
 	fp, err := grpcclient.LoadOrCreateFingerprint(cfg.Agent.FingerprintFile)
@@ -139,7 +146,14 @@ func main() {
 		if err != nil {
 			return nil, fmt.Errorf("agent: create uploader: %w", err)
 		}
-		return u.UploadFile(uploadCtx, task)
+		return uploadWithTimeout(
+			uploadCtx,
+			task,
+			time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
+			cfg.Upload.AssumedUploadBytesPerSecond,
+			logger,
+			u.UploadFile,
+		)
 	}
 
 	// ── 7. Worker pool (starts goroutines after exec.Start is called) ────────
@@ -358,6 +372,53 @@ func main() {
 	logger.Info("agent: shutdown signal received, stopping…")
 }
 
+// uploadWithTimeout gives each upload its own size-derived deadline so a
+// stalled object-store request cannot occupy an executor worker forever.
+// The deadline is derived from the file's CURRENT size (os.Stat at upload
+// time), because uploader.UploadFile stats the file itself and moves that
+// many bytes; task.FileSize is frozen at detection time and understates
+// files that grew while waiting in the queue (PR #100 review R2). Never
+// derived from the tail increment: multipart uploads ignore FileOffset and
+// move the whole file, and UploadFile hashes the entire file before
+// transferring (PR #100 review F4). The deadline is a safety net; wider is
+// better than shorter.
+func uploadWithTimeout(parent context.Context, task *queue.UploadTask, minimum time.Duration, assumedBytesPerSecond int64, logger *zap.Logger, upload executor.UploadFunc) (*uploader.UploadResult, error) {
+	uploadSize := task.FileSize
+	if info, err := os.Stat(task.LocalPath); err != nil {
+		logger.Warn("agent: cannot stat file for upload deadline, using stored size",
+			zap.String("path", task.LocalPath), zap.Error(err))
+	} else {
+		uploadSize = info.Size()
+	}
+	uploadCtx, cancel := context.WithTimeout(parent, uploadTimeoutForSize(uploadSize, minimum, assumedBytesPerSecond))
+	defer cancel()
+	return upload(uploadCtx, task)
+}
+
+// uploadTimeoutForSize derives a conservative deadline from the configured
+// assumed upload throughput while never returning less than the configured
+// minimum. The rate comes from config (upload.assumed_upload_bytes_per_second):
+// a hardwired 1 MiB/s made any large file permanently fail on slow links
+// (PR #100 review R3).
+func uploadTimeoutForSize(fileSize int64, minimum time.Duration, assumedBytesPerSecond int64) time.Duration {
+	if fileSize <= 0 {
+		return minimum
+	}
+	seconds := fileSize / assumedBytesPerSecond
+	if fileSize%assumedBytesPerSecond != 0 {
+		seconds++
+	}
+	const maxDurationSeconds = int64((1<<63 - 1) / int64(time.Second))
+	if seconds > maxDurationSeconds {
+		return time.Duration(1<<63 - 1)
+	}
+	derived := time.Duration(seconds) * time.Second
+	if derived < minimum {
+		return minimum
+	}
+	return derived
+}
+
 // handleRevokeCommand clears local credentials and triggers graceful shutdown.
 func handleRevokeCommand(tokenMgr *credential.TokenManager, stsMgr *credential.STSManager, client grpcClientTokenSetter, stop context.CancelFunc, logger *zap.Logger, reason string) {
 	logger.Warn("agent: token revoked by Control Plane", zap.String("reason", reason))
@@ -417,6 +478,18 @@ func runWatcher(ctx context.Context, rule scheduler.CollectionRule, exec *execut
 			zap.String("rule_id", rule.RuleID), zap.Error(err))
 		return
 	}
+	// Rebuild tail offsets from persisted state before the initial scan:
+	// without this, a restart re-sends already-stored bytes from offset 0
+	// because the watcher's in-memory map starts empty (PR #100 review F3).
+	if rule.AppendMode == watcher.AppendModeTail {
+		offsets, err := q.TailOffsets(ctx, rule.RuleID)
+		if err != nil {
+			logger.Warn("agent: cannot restore tail offsets, tail uploads will restart from 0",
+				zap.String("rule_id", rule.RuleID), zap.Error(err))
+		} else {
+			w.SeedTailOffsets(offsets)
+		}
+	}
 	events := make(chan watcher.FileEvent, 64)
 	go func() {
 		if err := w.Start(ctx, events); err != nil && ctx.Err() == nil {
@@ -447,7 +520,7 @@ func runWatcher(ctx context.Context, rule scheduler.CollectionRule, exec *execut
 			if !matched {
 				continue
 			}
-			submitFile(exec, q, rule, ev.Path, ev.Size, ev.ModTime, ev.FileOffset, rule.AppendMode, agentCtx, logger)
+			submitFile(ctx, exec, q, rule, ev.Path, ev.Size, ev.ModTime, ev.FileOffset, rule.AppendMode, agentCtx, logger)
 		}
 	}
 }
@@ -475,7 +548,7 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 		if err != nil {
 			return nil
 		}
-		submitFile(exec, q, rule, path, info.Size(), info.ModTime(), 0, "", agentCtx, logger)
+		submitFile(ctx, exec, q, rule, path, info.Size(), info.ModTime(), 0, rule.AppendMode, agentCtx, logger)
 		return nil
 	})
 	if err != nil && ctx.Err() == nil {
@@ -485,8 +558,8 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 }
 
 // submitFile checks deduplication and enqueues an upload task.
-func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
-	done, err := q.IsProcessed(rule.RuleID, localPath)
+func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
+	done, err := q.IsProcessed(ctx, rule.RuleID, localPath, mtime.Unix(), size)
 	if err != nil {
 		logger.Warn("agent: check processed failed", zap.String("path", localPath), zap.Error(err))
 	}
@@ -502,8 +575,10 @@ func submitFile(exec *executor.Executor, q *queue.Queue, rule scheduler.Collecti
 		FileSize:    size,
 		FileMtime:   mtime.Unix(),
 		Status:      queue.StatusPending,
+		FileOffset:  fileOffset,
+		AppendMode:  appendMode,
 	}
-	if err := exec.Submit(task); err != nil {
+	if err := exec.Submit(ctx, task); err != nil {
 		logger.Warn("agent: submit task failed",
 			zap.String("rule_id", rule.RuleID), zap.String("path", localPath), zap.Error(err))
 	}

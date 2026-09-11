@@ -5,13 +5,16 @@
 package queue
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"go.uber.org/zap"
 )
 
 const schema = `
@@ -60,6 +63,13 @@ CREATE TABLE IF NOT EXISTS rules (
 
 CREATE INDEX IF NOT EXISTS idx_upload_tasks_status
     ON upload_tasks (status, created_at);
+
+-- Supports the EnqueueIfNoActive dedup guard: its NOT EXISTS subquery filters
+-- by (rule_id, local_path). Without this index every enqueue scans the whole
+-- active backlog, which serialises the initial scan behind O(N x backlog)
+-- write-lock work on the single SQLite connection (PR #100 review F6).
+CREATE INDEX IF NOT EXISTS idx_upload_tasks_dedup
+    ON upload_tasks (rule_id, local_path);
 
 CREATE INDEX IF NOT EXISTS idx_processed_files_rule
     ON processed_files (rule_id, local_path);
@@ -134,11 +144,19 @@ type Rule struct {
 // Queue wraps a SQLite database providing queue operations for the Agent.
 type Queue struct {
 	db *sql.DB
+	// logger is optional; nil keeps queue operations silent. Used only for
+	// warnings such as failing to refresh task metadata on reset.
+	logger *zap.Logger
 }
 
 // Open opens (or creates) a SQLite database at dsn and initialises the schema.
 // Use ":memory:" for in-process testing without file I/O.
 func Open(dsn string) (*Queue, error) {
+	return OpenWithLogger(dsn, nil)
+}
+
+// OpenWithLogger is Open with an optional logger for operational warnings.
+func OpenWithLogger(dsn string, logger *zap.Logger) (*Queue, error) {
 	db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("queue: open %q: %w", dsn, err)
@@ -158,7 +176,7 @@ func Open(dsn string) (*Queue, error) {
 			}
 		}
 	}
-	return &Queue{db: db}, nil
+	return &Queue{db: db, logger: logger}, nil
 }
 
 // Close releases the underlying database connection.
@@ -171,14 +189,7 @@ func (q *Queue) Close() error {
 // Enqueue inserts a new upload task with status "pending". The caller is
 // responsible for setting task.ID (UUID), task.CreatedAt and task.UpdatedAt.
 func (q *Queue) Enqueue(task *UploadTask) error {
-	now := time.Now().Unix()
-	if task.CreatedAt == 0 {
-		task.CreatedAt = now
-	}
-	if task.UpdatedAt == 0 {
-		task.UpdatedAt = now
-	}
-	task.Status = StatusPending
+	prepareEnqueue(task)
 
 	_, err := q.db.Exec(`
         INSERT INTO upload_tasks
@@ -195,6 +206,53 @@ func (q *Queue) Enqueue(task *UploadTask) error {
 		return fmt.Errorf("queue: enqueue task %q: %w", task.ID, err)
 	}
 	return nil
+}
+
+// EnqueueIfNoActive inserts task unless the same rule, path, modification
+// time, and size already has a pending, running, or reported task. The guard
+// and insert are one SQLite statement so concurrent producers cannot enqueue
+// the same active file version twice. Failed and completed rows do not block a
+// later collection attempt.
+func (q *Queue) EnqueueIfNoActive(ctx context.Context, task *UploadTask) (bool, error) {
+	prepareEnqueue(task)
+	result, err := q.db.ExecContext(ctx, `
+        INSERT INTO upload_tasks
+            (id, rule_id, local_path, storage_path, bucket, upload_id,
+             completed_parts, file_size, file_mtime, sha256, status,
+             retry_count, last_error, created_at, updated_at, file_offset, append_mode)
+        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM upload_tasks
+            WHERE rule_id=? AND local_path=? AND file_mtime=? AND file_size=?
+              AND status IN (?, ?, ?)
+        )`,
+		task.ID, task.RuleID, task.LocalPath, task.StoragePath, task.Bucket,
+		task.UploadID, task.CompletedParts, task.FileSize, task.FileMtime,
+		task.SHA256, task.Status, task.RetryCount, task.LastError,
+		task.CreatedAt, task.UpdatedAt, task.FileOffset, task.AppendMode,
+		task.RuleID, task.LocalPath, task.FileMtime, task.FileSize,
+		StatusPending, StatusRunning, StatusReported,
+	)
+	if err != nil {
+		return false, fmt.Errorf("queue: enqueue task %q if inactive: %w", task.ID, err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("queue: inspect enqueue task %q: %w", task.ID, err)
+	}
+	return inserted > 0, nil
+}
+
+// prepareEnqueue fills queue-owned defaults before an upload task is inserted.
+func prepareEnqueue(task *UploadTask) {
+	now := time.Now().Unix()
+	if task.CreatedAt == 0 {
+		task.CreatedAt = now
+	}
+	if task.UpdatedAt == 0 {
+		task.UpdatedAt = now
+	}
+	task.Status = StatusPending
 }
 
 // CountPending returns the number of tasks currently waiting to be uploaded
@@ -331,6 +389,88 @@ func (q *Queue) DequeuePending(limit int) ([]*UploadTask, error) {
 	return tasks, nil
 }
 
+// ResetRunningToPending makes tasks interrupted by a prior agent process
+// eligible for dequeue again. Reported tasks are intentionally untouched:
+// their objects are already uploaded and the durable report replay path must
+// resend only metadata rather than retransmitting file content.
+//
+// Each reset row's file_size/file_mtime is refreshed from the filesystem:
+// files may have been appended to while the agent was down, and uploader
+// re-stats at upload time, so a frozen stale tuple would diverge from what the
+// initial scan sees and the EnqueueIfNoActive guard would let a duplicate task
+// enqueue — both uploading the same current bytes (PR #100 review R1). A stat
+// failure keeps the original values and does not block the reset.
+//
+// The whole reset is one transaction: refreshed metadata is written first,
+// then the status is flipped, so a task can never become visible as pending
+// while still carrying a stale tuple, and a crash (or write failure) mid-reset
+// rolls back to a consistent running state. The reads and writes all run on
+// the same tx so the listed rows cannot change underneath the refresh.
+func (q *Queue) ResetRunningToPending(ctx context.Context) (int64, error) {
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("queue: begin reset transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+        SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
+               completed_parts, file_size, file_mtime, sha256, status,
+               retry_count, last_error, created_at, updated_at,
+               file_offset, append_mode
+        FROM upload_tasks
+        WHERE status = ?
+        ORDER BY created_at ASC`, StatusRunning)
+	if err != nil {
+		return 0, fmt.Errorf("queue: list running tasks for reset: %w", err)
+	}
+	running, err := scanTasks(rows)
+	rows.Close()
+	if err != nil {
+		return 0, fmt.Errorf("queue: scan running tasks for reset: %w", err)
+	}
+
+	// Refresh each row's metadata from the filesystem while still inside the
+	// transaction, BEFORE the status flip: an executor dequeues only pending
+	// rows, so this ordering guarantees a dequeued task always carries the
+	// refreshed tuple (PR #100 review R1, round-2 atomicity fix). A stat
+	// failure keeps the original values and does not block the reset.
+	for _, t := range running {
+		info, statErr := os.Stat(t.LocalPath)
+		if statErr != nil {
+			if q.logger != nil {
+				q.logger.Warn("queue: cannot refresh task file metadata on reset, keeping stored values",
+					zap.String("task_id", t.ID), zap.String("path", t.LocalPath), zap.Error(statErr))
+			}
+			continue
+		}
+		t.FileSize = info.Size()
+		t.FileMtime = info.ModTime().Unix()
+		if _, err := tx.ExecContext(ctx, `
+            UPDATE upload_tasks
+            SET file_size=?, file_mtime=?, updated_at=?
+            WHERE id=?`, t.FileSize, t.FileMtime, time.Now().Unix(), t.ID); err != nil {
+			return 0, fmt.Errorf("queue: refresh task %q metadata on reset: %w", t.ID, err)
+		}
+	}
+
+	result, err := tx.ExecContext(ctx, `
+        UPDATE upload_tasks
+        SET status=?, updated_at=?
+        WHERE status=?`, StatusPending, time.Now().Unix(), StatusRunning)
+	if err != nil {
+		return 0, fmt.Errorf("queue: reset running tasks: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("queue: reset running tasks: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("queue: commit reset transaction: %w", err)
+	}
+	return n, nil
+}
+
 // UpdateStatus sets the status of a task identified by id.
 func (q *Queue) UpdateStatus(id, status string) error {
 	res, err := q.db.Exec(
@@ -384,6 +524,34 @@ func (q *Queue) ListByStatus(status string) ([]*UploadTask, error) {
 
 // ── Processed Files ───────────────────────────────────────────────────────────
 
+// TailOffsets returns, for every processed file of the rule, the byte size at
+// its last successful upload. processed_files.file_size is the full file size
+// as of the completed upload, which is exactly where the next tail upload must
+// resume. Used to rebuild the watcher's in-memory offsets after an agent
+// restart (PR #100 review F3).
+func (q *Queue) TailOffsets(ctx context.Context, ruleID string) (map[string]int64, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT local_path, file_size FROM processed_files WHERE rule_id = ?`, ruleID)
+	if err != nil {
+		return nil, fmt.Errorf("queue: tail offsets for rule %q: %w", ruleID, err)
+	}
+	defer rows.Close()
+
+	offsets := make(map[string]int64)
+	for rows.Next() {
+		var path string
+		var size int64
+		if err := rows.Scan(&path, &size); err != nil {
+			return nil, fmt.Errorf("queue: scan tail offsets for rule %q: %w", ruleID, err)
+		}
+		offsets[path] = size
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("queue: iterate tail offsets for rule %q: %w", ruleID, err)
+	}
+	return offsets, nil
+}
+
 // UpsertProcessedFile inserts or replaces a processed-file record. On conflict
 // on (rule_id, local_path) the existing row is overwritten.
 func (q *Queue) UpsertProcessedFile(f *ProcessedFile) error {
@@ -406,13 +574,13 @@ func (q *Queue) UpsertProcessedFile(f *ProcessedFile) error {
 	return nil
 }
 
-// IsProcessed returns true if a record for (ruleID, localPath) already exists
-// in processed_files.
-func (q *Queue) IsProcessed(ruleID, localPath string) (bool, error) {
+// IsProcessed returns true if processed_files contains the same rule, path,
+// modification time, and size as the candidate file.
+func (q *Queue) IsProcessed(ctx context.Context, ruleID, localPath string, fileMtime, fileSize int64) (bool, error) {
 	var count int
-	err := q.db.QueryRow(
-		`SELECT COUNT(*) FROM processed_files WHERE rule_id=? AND local_path=?`,
-		ruleID, localPath,
+	err := q.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM processed_files WHERE rule_id=? AND local_path=? AND file_mtime=? AND file_size=?`,
+		ruleID, localPath, fileMtime, fileSize,
 	).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("queue: is processed: %w", err)

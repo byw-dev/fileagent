@@ -201,16 +201,10 @@ func TestUploadMainPathLive(t *testing.T) {
 	config := fmt.Sprintf("[server]\nendpoint=%q\ntls_insecure=true\n[agent]\nfingerprint_file=%q\ntoken_file=%q\ndata_dir=%q\n[upload]\nreport_timeout_seconds=1\n[metrics]\nenabled=false\n[log]\noutput=%q\nlevel=\"debug\"\n", listener.Addr().String(), filepath.Join(artifacts, "fingerprint"), filepath.Join(artifacts, "token"), artifacts, filepath.Join(artifacts, "agent.json.log"))
 	configPath := filepath.Join(artifacts, "agent.toml")
 	require.NoError(t, os.WriteFile(configPath, []byte(config), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(input, "tokyo", "first.csv"), []byte("a,b\n1,2\n"), 0600))
 	agentLog := filepath.Join(artifacts, "agent-process.log")
 	stopAgent := liveProcess(t, root, agentLog, "agent", "--config", configPath)
 	defer stopAgent()
-	// IC-BUG-37: fsnotify does not scan files that predate watcher startup, so
-	// create the live stimulus only after the watch is active.
-	require.Eventually(t, func() bool {
-		contents, readErr := os.ReadFile(agentLog)
-		return readErr == nil && bytes.Contains(contents, []byte("watcher: fsnotify started"))
-	}, 60*time.Second, 100*time.Millisecond)
-	require.NoError(t, os.WriteFile(filepath.Join(input, "tokyo", "first.csv"), []byte("a,b\n1,2\n"), 0600))
 	select {
 	case id := <-proxy.dropped:
 		t.Log("deliberately dropped first ack:", id)

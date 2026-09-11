@@ -87,7 +87,7 @@ func TestExecutor_SubmitPropagatesEnqueueError(t *testing.T) {
 	e := New(1, q, successUploader, zap.NewNop(), 0)
 	require.NoError(t, q.Close())
 
-	err := e.Submit(newTask("r1", "/f.txt"))
+	err := e.Submit(context.Background(), newTask("r1", "/f.txt"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "executor: enqueue task")
 }
@@ -296,13 +296,13 @@ func TestExecutor_EvictionFailureWarnsAndKeepsTask(t *testing.T) {
 	core, logs := observer.New(zapcore.InfoLevel)
 	e := New(1, q, successUploader, zap.New(core), 1) // cap of 1
 
-	require.NoError(t, e.Submit(taskWithTime("old", "/old", 1)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("old", "/old", 1)))
 	// Only the DELETE fails; the capacity count that precedes it still works,
 	// which is exactly the state this branch exists for.
 	failStatement(t, dsn, "no_evict", "DELETE", "upload_tasks")
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- e.Submit(taskWithTime("new", "/new", 2)) }()
+	go func() { errCh <- e.Submit(context.Background(), taskWithTime("new", "/new", 2)) }()
 	select {
 	case err := <-errCh:
 		require.NoError(t, err, "a failed eviction must not fail the submit")
@@ -407,7 +407,7 @@ func TestExecutor_AcknowledgementOfUndecodableReportErrors(t *testing.T) {
 	reported, err := q.ListByStatus(queue.StatusReported)
 	require.NoError(t, err)
 	assert.Len(t, reported, 1, "an undecodable report must stay reported, not be completed")
-	processed, err := q.IsProcessed(task.RuleID, task.LocalPath)
+	processed, err := q.IsProcessed(context.Background(), task.RuleID, task.LocalPath, task.FileMtime, task.FileSize)
 	require.NoError(t, err)
 	assert.False(t, processed, "dedup state must not be written from an unreadable payload")
 }

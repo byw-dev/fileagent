@@ -21,6 +21,11 @@ concurrency = 3
 part_size_mb = 64
 queue_max_size = 10000
 retry_max = 10
+# Each upload gets max(this floor, file size / assumed_upload_bytes_per_second)
+# before cancellation. Lower the rate on slow links (edge/cellular/VPN) so
+# large files still get a workable deadline.
+min_timeout_seconds = 300
+assumed_upload_bytes_per_second = 1048576
 
 [metrics]
 enabled = true

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/byw-dev/fileagent/agent/internal/scheduler"
 	uploadpkg "github.com/byw-dev/fileagent/agent/internal/uploader"
+	"github.com/byw-dev/fileagent/agent/internal/watcher"
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/pkg/trollsift"
 	"github.com/stretchr/testify/assert"
@@ -163,7 +165,7 @@ func TestSubmitFile_SubmitsNewFile(t *testing.T) {
 	defer exec.Stop()
 
 	rule := scheduler.CollectionRule{RuleID: "r1", BasePath: "/tmp", UploadBucket: "bkt", DestPathTemplate: "logs/{filename}"}
-	submitFile(exec, q, rule, "/tmp/f.txt", 100, time.Now(), 0, "", trollsift.AgentContext{}, zap.NewNop())
+	submitFile(context.Background(), exec, q, rule, "/tmp/f.txt", 100, time.Now(), 0, "", trollsift.AgentContext{}, zap.NewNop())
 
 	select {
 	case <-submitted:
@@ -192,12 +194,203 @@ func TestSubmitFile_SkipsDuplicate(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	submitFile(exec, q, rule, "/tmp/dup.txt", 100, time.Now(), 0, "", trollsift.AgentContext{}, zap.NewNop())
+	submitFile(context.Background(), exec, q, rule, "/tmp/dup.txt", 0, time.Unix(0, 0), 0, "", trollsift.AgentContext{}, zap.NewNop())
 	select {
 	case <-called:
 		t.Fatal("duplicate file triggered upload")
 	case <-time.After(100 * time.Millisecond):
 	}
+}
+
+func TestSubmitFile_SubmitsModifiedFile(t *testing.T) {
+	q := openTestQueue(t)
+	called := make(chan struct{}, 1)
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		called <- struct{}{}
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 200}, nil
+	}, zap.NewNop(), 0)
+	exec.Start(context.Background())
+	defer exec.Stop()
+
+	rule := scheduler.CollectionRule{RuleID: "r1", BasePath: "/tmp", UploadBucket: "bkt", DestPathTemplate: "logs/{filename}"}
+	oldMtime := time.Unix(1_700_000_000, 0)
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID:         "pf-old",
+		RuleID:     rule.RuleID,
+		LocalPath:  "/tmp/changed.txt",
+		FileSize:   100,
+		FileMtime:  oldMtime.Unix(),
+		UploadedAt: oldMtime.Unix(),
+	}))
+
+	submitFile(context.Background(), exec, q, rule, "/tmp/changed.txt", 200, oldMtime.Add(time.Second), 0, "", trollsift.AgentContext{}, zap.NewNop())
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("modified file was incorrectly treated as already processed")
+	}
+}
+
+func TestSubmitFile_PersistsTailFields(t *testing.T) {
+	q := openTestQueue(t)
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		return nil, nil
+	}, zap.NewNop(), 0)
+	rule := scheduler.CollectionRule{RuleID: "r-tail", BasePath: "/tmp", UploadBucket: "bkt", DestPathTemplate: "logs/{filename}"}
+
+	submitFile(context.Background(), exec, q, rule, "/tmp/tail.log", 256, time.Unix(1_700_000_000, 0), 128, watcher.AppendModeTail, trollsift.AgentContext{}, zap.NewNop())
+	tasks, err := q.DequeuePending(1)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, int64(128), tasks[0].FileOffset)
+	assert.Equal(t, watcher.AppendModeTail, tasks[0].AppendMode)
+}
+
+func TestUploadWithTimeout_CancelsBlockedUpload(t *testing.T) {
+	task := &queue.UploadTask{FileSize: 1}
+	started := time.Now()
+	_, err := uploadWithTimeout(context.Background(), task, 20*time.Millisecond, defaultAssumedUploadBytesPerSecond, zap.NewNop(), func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	elapsed := time.Since(started)
+	assert.GreaterOrEqual(t, elapsed, 900*time.Millisecond)
+	assert.Less(t, elapsed, 2*time.Second)
+}
+
+// Regression for PR #100 review F4: multipart ignores FileOffset and the
+// whole file is hashed before transfer, so the uploader actually moves
+// task.FileSize bytes regardless of tail mode. Deriving the deadline from the
+// tail increment made large files always time out and retry to exhaustion.
+// The deadline must be derived from FileSize; it is a safety net, wider is
+// better than shorter.
+func TestUploadWithTimeout_UsesFullFileSizeForDeadline(t *testing.T) {
+	task := &queue.UploadTask{
+		FileSize:   120 * 1024 * 1024,
+		FileOffset: 119 * 1024 * 1024,
+		AppendMode: watcher.AppendModeTail,
+	}
+	before := time.Now()
+	result, err := uploadWithTimeout(context.Background(), task, 30*time.Second, defaultAssumedUploadBytesPerSecond, zap.NewNop(), func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		// Full 120 MiB at 1 MiB/s → ~120s, NOT the 1 MiB increment → 30s min.
+		assert.WithinDuration(t, before.Add(2*time.Minute), deadline, time.Second)
+		return &uploadpkg.UploadResult{SizeBytes: 1024 * 1024}, nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
+func TestUploadWithTimeout_ClampsInvalidTailOffset(t *testing.T) {
+	task := &queue.UploadTask{FileSize: 10, FileOffset: 20, AppendMode: watcher.AppendModeTail}
+	result, err := uploadWithTimeout(context.Background(), task, 30*time.Second, defaultAssumedUploadBytesPerSecond, zap.NewNop(), func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		assert.WithinDuration(t, time.Now().Add(30*time.Second), deadline, time.Second)
+		return &uploadpkg.UploadResult{}, nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
+// Regression for PR #100 review R2: the deadline must be derived from the
+// file size at upload time (os.Stat), not the size frozen at detection time.
+// A file that keeps growing between enqueue and worker pickup would get a
+// deadline from the stale size, time out at the minimum, and retry to
+// exhaustion — a regression this PR introduced. Stat failure falls back to
+// the stored size.
+func TestUploadWithTimeout_UsesCurrentFileSizeFromStat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "growing.log")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("x", 120*1024*1024)), 0o644))
+	// The frozen detection-time size is tiny; the real file is 120 MiB.
+	task := &queue.UploadTask{LocalPath: path, FileSize: 1024}
+
+	before := time.Now()
+	result, err := uploadWithTimeout(context.Background(), task, 30*time.Second, defaultAssumedUploadBytesPerSecond, zap.NewNop(), func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		// Current 120 MiB at 1 MiB/s → ~120s, NOT the frozen 1 KiB → 30s min.
+		assert.WithinDuration(t, before.Add(2*time.Minute), deadline, time.Second)
+		return &uploadpkg.UploadResult{SizeBytes: 1024}, nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
+const defaultAssumedUploadBytesPerSecond int64 = 1024 * 1024
+
+// PR #100 review R3: the assumed upload rate is now configuration, not a const.
+func TestUploadTimeoutForSize_ScalesAndHonorsMinimum(t *testing.T) {
+	rate := defaultAssumedUploadBytesPerSecond
+	assert.Equal(t, 30*time.Second, uploadTimeoutForSize(0, 30*time.Second, rate))
+	assert.Equal(t, 30*time.Second, uploadTimeoutForSize(1, 30*time.Second, rate))
+	assert.Equal(t, 2*time.Minute, uploadTimeoutForSize(120*1024*1024, 30*time.Second, rate))
+	assert.Equal(t, time.Duration(1<<63-1), uploadTimeoutForSize(1<<63-1, time.Second, rate))
+}
+
+// A slow link must be able to get a workable deadline by lowering the rate.
+func TestUploadTimeoutForSize_SlowLinkConfig(t *testing.T) {
+	assert.Equal(t, 200*time.Second,
+		uploadTimeoutForSize(100*1024*1024, 30*time.Second, 512*1024),
+		"500 KiB/s over 100 MiB must yield ~200s, not the 1 MiB/s default")
+}
+
+// Regression for PR #100 review F3: runWatcher must rebuild tail offsets from
+// processed_files before the initial scan, otherwise a restart re-sends
+// already-stored bytes from offset 0.
+func TestRunWatcher_TailOffsetSeededFromPersistedState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("x", 1500)), 0o644))
+
+	q := openTestQueue(t)
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID: "pf-1", RuleID: "r-tail", LocalPath: path, FileSize: 1000, FileMtime: 111,
+	}))
+
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		return nil, nil
+	}, zap.NewNop(), 0)
+
+	rule := scheduler.CollectionRule{
+		RuleID: "r-tail", BasePath: dir, PathPattern: "*.log",
+		UploadBucket: "bkt", DestPathTemplate: "logs/{filename}", AppendMode: watcher.AppendModeTail,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runWatcher(ctx, rule, exec, q, trollsift.AgentContext{}, zap.NewNop())
+	}()
+
+	// The task must appear with the persisted offset, not 0.
+	var tasks []*queue.UploadTask
+	deadline := time.After(5 * time.Second)
+	for {
+		var err error
+		tasks, err = q.ListByStatus(queue.StatusPending)
+		require.NoError(t, err)
+		if len(tasks) > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("runWatcher did not submit the grown file within deadline")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+
+	require.Len(t, tasks, 1)
+	assert.Equal(t, path, tasks[0].LocalPath)
+	assert.Equal(t, int64(1000), tasks[0].FileOffset,
+		"task must resume tail from the persisted offset, not 0")
 }
 
 // ── walkAndSubmit ─────────────────────────────────────────────────────────────

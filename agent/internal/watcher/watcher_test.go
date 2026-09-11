@@ -2,8 +2,11 @@ package watcher
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/byw-dev/fileagent/agent/internal/queue"
 )
 
 func TestNew_DefaultPollInterval(t *testing.T) {
@@ -141,6 +146,51 @@ func TestWatcher_FsnotifyStart_ContextCancel(t *testing.T) {
 		assert.ErrorIs(t, err, context.Canceled)
 	case <-time.After(2*time.Second):
 		t.Fatal("Start did not return after context cancel")
+	}
+}
+
+func TestWatcher_FsnotifyUnavailableFallsBackToPolling(t *testing.T) {
+	dir := t.TempDir()
+	original := newFSWatcher
+	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("unavailable") }
+	t.Cleanup(func() { newFSWatcher = original })
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = w.Start(ctx, make(chan FileEvent, 1))
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestWatcher_AddPathFailureFallsBackToPolling(t *testing.T) {
+	w, err := New(filepath.Join(t.TempDir(), "missing"), "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = w.Start(ctx, make(chan FileEvent, 1))
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestWatcher_FsnotifyInitialScanEmitsExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "existing.txt")
+	require.NoError(t, os.WriteFile(path, []byte("already here"), 0o644))
+	w, err := New(dir, "*.txt", false, 10*time.Second, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	events := make(chan FileEvent, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.Start(ctx, events) }()
+
+	select {
+	case event := <-events:
+		assert.Equal(t, path, event.Path)
+		assert.Equal(t, "create", event.Op)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("fsnotify startup did not scan the existing file")
 	}
 }
 
@@ -315,6 +365,151 @@ fe2, err := w.buildEvent(path, "write")
 require.NoError(t, err)
 assert.Equal(t, int64(10), fe2.FileOffset, "second event: offset should be previous size")
 assert.Equal(t, int64(15), fe2.Size)
+}
+
+// Regression for PR #100 review F1 (same product symptom as IC-BUG-37): the
+// initial scan must not silently drop files when the event channel backs up.
+// Before the fix, emit was non-blocking, seen[] was marked before emit, and
+// the fsnotify path never rescans — so any file beyond the 64-slot consumer
+// buffer was dropped forever. This test pins: many files (> buffer) + a slow
+// consumer => every single file is still delivered.
+func TestWatcher_InitialScan_BacklogBeyondBufferNoneDropped(t *testing.T) {
+	const numFiles = 200
+	dir := t.TempDir()
+	for i := 0; i < numFiles; i++ {
+		require.NoError(t, os.WriteFile(
+			filepath.Join(dir, fmt.Sprintf("file-%03d.txt", i)), []byte("data"), 0o644))
+	}
+
+	w, err := New(dir, "*.txt", false, time.Hour, "", zap.NewNop())
+	require.NoError(t, err)
+
+	// Far smaller than numFiles, mirroring the consumer buffer in main.go.
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Slow consumer: reads one event every 2ms; the scan must block on the
+	// full channel instead of dropping.
+	got := make(chan FileEvent, numFiles)
+	go func() {
+		defer close(got)
+		for fe := range events {
+			time.Sleep(2 * time.Millisecond)
+			got <- fe
+		}
+	}()
+
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		w.pollScan(ctx, events, make(map[string]time.Time))
+		cancel()
+	}()
+
+	received := make(map[string]bool)
+	deadline := time.After(30 * time.Second)
+	for len(received) < numFiles {
+		select {
+		case fe, ok := <-got:
+			if !ok {
+				t.Fatalf("consumer closed early; got %d of %d files", len(received), numFiles)
+			}
+			received[fe.Path] = true
+		case <-deadline:
+			t.Fatalf("timed out; got %d of %d files (backlog dropped)", len(received), numFiles)
+		case <-scanDone:
+			// Producer finished; keep draining until count met or timeout.
+		}
+	}
+	cancel()
+	assert.Len(t, received, numFiles, "every backlog file must be delivered, none dropped")
+}
+
+// Regression for PR #100 review F2: the initial scan bypasses the close_wait
+// debounce in runCloseWait, so a file being written at agent startup was
+// emitted immediately at its truncated size. Because buildStoragePath bakes
+// time.Now() into {time…} keys, that truncated object got its own key and the
+// later full upload never overwrote it — a permanently truncated object plus
+// a fake file_entries row. Pins: close_wait initial scan must only emit files
+// whose mtime is older than the debounce window; still-being-written files
+// are left to the close_wait flow.
+func TestWatcher_CloseWait_InitialScan_SkipsStillWriting(t *testing.T) {
+	dir := t.TempDir()
+
+	oldPath := filepath.Join(dir, "settled.log")
+	require.NoError(t, os.WriteFile(oldPath, []byte("complete"), 0o644))
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(oldPath, past, past))
+
+	activePath := filepath.Join(dir, "active.log")
+	require.NoError(t, os.WriteFile(activePath, []byte("partial-write"), 0o644))
+	now := time.Now()
+	require.NoError(t, os.Chtimes(activePath, now, now))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	w.pollScan(ctx, events, make(map[string]time.Time))
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, oldPath, fe.Path, "only the settled file should be emitted by the initial scan")
+	default:
+		t.Fatal("settled file was not emitted by the close_wait initial scan")
+	}
+
+	select {
+	case fe := <-events:
+		t.Fatalf("file still being written was emitted by the initial scan: %s", fe.Path)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// Regression for PR #100 review F3: after a restart the watcher's tailOffsets
+// map was empty, so the initial scan emitted FileOffset=0 for files that had
+// already been partially uploaded, and the uploader re-sent the whole file.
+// Pins the full restart scenario: processed_files has /x at 1000 bytes, the
+// file has since grown to 1500 → the scan must emit FileOffset=1000.
+func TestWatcher_TailMode_SeededOffsets_SurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("x", 1500)), 0o644))
+
+	// Persisted state from before the restart: last upload ended at 1000 bytes.
+	q, err := queue.Open(":memory:")
+	require.NoError(t, err)
+	defer q.Close()
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID: "pf-1", RuleID: "r-tail", LocalPath: path, FileSize: 1000, FileMtime: 111,
+	}))
+
+	offsets, err := q.TailOffsets(context.Background(), "r-tail")
+	require.NoError(t, err)
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeTail, zap.NewNop())
+	require.NoError(t, err)
+	w.SeedTailOffsets(offsets)
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	w.pollScan(ctx, events, make(map[string]time.Time))
+
+	select {
+	case fe := <-events:
+		require.Equal(t, path, fe.Path)
+		assert.Equal(t, int64(1500), fe.Size, "file grew to 1500 bytes")
+		assert.Equal(t, int64(1000), fe.FileOffset,
+			"after restart the initial scan must resume from the persisted offset, not 0")
+	default:
+		t.Fatal("initial scan did not emit the grown file")
+	}
 }
 
 func TestWatcher_TailMode_PollScan_FileOffset(t *testing.T) {

@@ -64,7 +64,7 @@ func TestExecutor_SubmitAndProcess(t *testing.T) {
 	e.Start(ctx)
 
 	task := newTask("r1", "/path/file.txt")
-	require.NoError(t, e.Submit(task))
+	require.NoError(t, e.Submit(context.Background(), task))
 
 	require.Eventually(t, func() bool {
 		return processed.Load() == 1
@@ -88,7 +88,7 @@ func TestExecutor_Dedup(t *testing.T) {
 
 	// Submit a task and let it complete.
 	t1 := newTask("r1", "/path/file.txt")
-	require.NoError(t, e.Submit(t1))
+	require.NoError(t, e.Submit(context.Background(), t1))
 
 	require.Eventually(t, func() bool {
 		return uploadCount.Load() == 1
@@ -97,9 +97,11 @@ func TestExecutor_Dedup(t *testing.T) {
 	require.Eventually(t, func() bool { r, _ := q.GetReport(context.Background(), t1.ID); return len(r) > 0 }, time.Second, time.Millisecond)
 	require.NoError(t, e.HandleAcknowledgement(context.Background(), &agentv1.Acknowledgement{RefMessageId: t1.ID, Success: true}))
 
-	// Submit a second task for the same path — should be skipped.
+	// Submit a second task with the same path and metadata — should be skipped.
 	t2 := newTask("r1", "/path/file.txt")
-	require.NoError(t, e.Submit(t2))
+	t2.FileMtime = t1.FileMtime
+	t2.FileSize = t1.FileSize
+	require.NoError(t, e.Submit(context.Background(), t2))
 
 	time.Sleep(300 * time.Millisecond)
 	assert.Equal(t, int32(1), uploadCount.Load(), "duplicate file should not be uploaded again")
@@ -161,7 +163,7 @@ func TestExecutor_ConcurrentWorkers(t *testing.T) {
 	const n = 8
 	for i := 0; i < n; i++ {
 		task := newTask("r1", fmt.Sprintf("/path/file%d.txt", i))
-		require.NoError(t, e.Submit(task))
+		require.NoError(t, e.Submit(context.Background(), task))
 	}
 
 	require.Eventually(t, func() bool {
@@ -188,7 +190,7 @@ func TestExecutor_GracefulShutdown(t *testing.T) {
 	e.Start(ctx)
 
 	task := newTask("r1", "/path/slow.txt")
-	require.NoError(t, e.Submit(task))
+	require.NoError(t, e.Submit(context.Background(), task))
 	<-started // wait until worker started processing
 
 	stopDone := make(chan struct{})
@@ -215,8 +217,31 @@ func TestExecutor_SubmitAssignsID(t *testing.T) {
 		StoragePath: "key",
 		Bucket:      "bucket",
 	}
-	require.NoError(t, e.Submit(task))
+	require.NoError(t, e.Submit(context.Background(), task))
 	assert.NotEmpty(t, task.ID)
+}
+
+func TestExecutor_SubmitSkipsOnlySameActiveVersion(t *testing.T) {
+	q := newTestQueue(t)
+	e := New(1, q, successUploader, zap.NewNop(), 0)
+	first := newTask("r1", "/path/active.txt")
+	require.NoError(t, e.Submit(context.Background(), first))
+
+	duplicate := newTask("r1", first.LocalPath)
+	duplicate.FileMtime = first.FileMtime
+	duplicate.FileSize = first.FileSize
+	require.NoError(t, e.Submit(context.Background(), duplicate))
+	pending, err := q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	assert.Len(t, pending, 1)
+
+	modified := newTask("r1", first.LocalPath)
+	modified.FileMtime = first.FileMtime + 1
+	modified.FileSize = first.FileSize + 1
+	require.NoError(t, e.Submit(context.Background(), modified))
+	pending, err = q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	assert.Len(t, pending, 2)
 }
 
 func TestExecutor_RetryRequeues(t *testing.T) {
@@ -240,7 +265,7 @@ func TestExecutor_RetryRequeues(t *testing.T) {
 	e.Start(ctx)
 
 	task := newTask("r1", "/path/retry.txt")
-	require.NoError(t, e.Submit(task))
+	require.NoError(t, e.Submit(context.Background(), task))
 
 	require.Eventually(t, func() bool {
 		return callCount.Load() >= 2
@@ -264,12 +289,12 @@ func TestExecutor_Submit_EnforcesQueueMaxSize(t *testing.T) {
 	// cap of 3, no workers started so tasks stay pending.
 	e := New(1, q, successUploader, zap.NewNop(), 3)
 
-	require.NoError(t, e.Submit(taskWithTime("t1", "/f1", 1)))
-	require.NoError(t, e.Submit(taskWithTime("t2", "/f2", 2)))
-	require.NoError(t, e.Submit(taskWithTime("t3", "/f3", 3)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("t1", "/f1", 1)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("t2", "/f2", 2)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("t3", "/f3", 3)))
 
 	// Fourth submit is at cap → oldest pending (t1) must be evicted.
-	require.NoError(t, e.Submit(taskWithTime("t4", "/f4", 4)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("t4", "/f4", 4)))
 
 	pending, err := q.ListByStatus(queue.StatusPending)
 	require.NoError(t, err)
@@ -288,8 +313,8 @@ func TestExecutor_Submit_UnlimitedWhenCapZero(t *testing.T) {
 	e := New(1, q, successUploader, zap.NewNop(), 0) // cap disabled
 
 	for i := 0; i < 5; i++ {
-		require.NoError(t, e.Submit(taskWithTime(
-			uuid.New().String(), "/f", int64(i+1))))
+		require.NoError(t, e.Submit(context.Background(), taskWithTime(
+			uuid.New().String(), fmt.Sprintf("/f%d", i+1), int64(i+1))))
 	}
 
 	pending, err := q.ListByStatus(queue.StatusPending)
@@ -302,14 +327,14 @@ func TestExecutor_Submit_AtCapButNothingPendingToEvict(t *testing.T) {
 	e := New(1, q, successUploader, zap.NewNop(), 2)
 
 	// Fill to cap, then move both to running so no pending task can be evicted.
-	require.NoError(t, e.Submit(taskWithTime("t1", "/f1", 1)))
-	require.NoError(t, e.Submit(taskWithTime("t2", "/f2", 2)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("t1", "/f1", 1)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("t2", "/f2", 2)))
 	running, err := q.DequeuePending(10)
 	require.NoError(t, err)
 	require.Len(t, running, 2)
 
 	// At cap (2 active, both running) → eviction finds nothing; task is accepted anyway.
-	require.NoError(t, e.Submit(taskWithTime("t3", "/f3", 3)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("t3", "/f3", 3)))
 
 	n, err := q.CountActive()
 	require.NoError(t, err)
@@ -322,8 +347,8 @@ func TestExecutor_Submit_KeepsNewTaskEvictsOld(t *testing.T) {
 	q := newTestQueue(t)
 	e := New(1, q, successUploader, zap.NewNop(), 1) // cap of 1
 
-	require.NoError(t, e.Submit(taskWithTime("old", "/old", 1)))
-	require.NoError(t, e.Submit(taskWithTime("new", "/new", 2)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("old", "/old", 1)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("new", "/new", 2)))
 
 	pending, err := q.ListByStatus(queue.StatusPending)
 	require.NoError(t, err)
@@ -338,12 +363,12 @@ func TestExecutor_Submit_NeverEvictsOnlyTheNewTask(t *testing.T) {
 	e := New(1, q, successUploader, zap.NewNop(), 1) // cap of 1
 
 	// Occupy the cap with a running (in-flight, non-evictable) task.
-	require.NoError(t, e.Submit(taskWithTime("running", "/r", 1)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("running", "/r", 1)))
 	running, err := q.DequeuePending(10)
 	require.NoError(t, err)
 	require.Len(t, running, 1)
 
-	require.NoError(t, e.Submit(taskWithTime("new", "/new", 2)))
+	require.NoError(t, e.Submit(context.Background(), taskWithTime("new", "/new", 2)))
 
 	pending, err := q.ListByStatus(queue.StatusPending)
 	require.NoError(t, err)

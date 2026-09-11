@@ -13,6 +13,8 @@ import (
 	"go.uber.org/zap"
 )
 
+var newFSWatcher = fsnotify.NewWatcher
+
 // FileEvent represents a file system change detected by the Watcher.
 type FileEvent struct {
 	// Path is the absolute path of the affected file.
@@ -75,12 +77,23 @@ func New(sourcePath, fileGlob string, recursive bool, pollInterval time.Duration
 	}, nil
 }
 
+// SeedTailOffsets pre-loads per-file byte offsets recovered from persisted
+// state (processed_files) so that tail-mode events emitted after an agent
+// restart resume from where the last upload finished instead of re-sending
+// the whole file (PR #100 review F3). Only meaningful in tail mode; merging
+// into the existing map keeps any offsets recorded earlier in this process.
+func (w *Watcher) SeedTailOffsets(offsets map[string]int64) {
+	for path, off := range offsets {
+		w.tailOffsets[path] = off
+	}
+}
+
 // Start begins watching the source directory and emits FileEvents on events.
 // It first attempts to use fsnotify; if adding the watch path fails, it
 // transparently falls back to periodic polling. Start blocks until ctx is
 // cancelled.
 func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
-	fw, err := fsnotify.NewWatcher()
+	fw, err := newFSWatcher()
 	if err != nil {
 		w.logger.Warn("watcher: fsnotify unavailable, using polling", zap.Error(err))
 		return w.runPolling(ctx, events)
@@ -91,6 +104,11 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 		w.logger.Warn("watcher: cannot add watch paths, using polling", zap.Error(err))
 		return w.runPolling(ctx, events)
 	}
+
+	// Use the same scan as the polling fallback so files that predate watcher
+	// startup are collected consistently on both paths. Register watches first
+	// so changes made during the scan are still observed by fsnotify.
+	w.pollScan(ctx, events, make(map[string]time.Time))
 
 	w.logger.Info("watcher: fsnotify started", zap.String("path", w.sourcePath))
 	if w.appendMode == AppendModeCloseWait {
@@ -250,18 +268,25 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 		if err != nil {
 			return nil
 		}
+		// close_wait must never emit a file that is still being written: the
+		// scan path bypasses the debounce timer in runCloseWait, so emitting
+		// here would upload a truncated file under its own {time} storage key
+		// that the later full upload never overwrites (PR #100 review F2).
+		// Skip it without marking seen — the close_wait flow (or a later scan,
+		// once the file is quiet) picks it up.
+		if w.appendMode == AppendModeCloseWait && time.Since(info.ModTime()) < closeWaitDebounce {
+			return nil
+		}
 		prev, known := seen[path]
 		if !known || info.ModTime().After(prev) {
 			op := "write"
 			if !known {
 				op = "create"
 			}
-			seen[path] = info.ModTime()
 
 			var offset int64
 			if w.appendMode == AppendModeTail {
 				offset = w.tailOffsets[path]
-				w.tailOffsets[path] = info.Size()
 			}
 
 			fe := FileEvent{
@@ -271,7 +296,17 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 				Op:         op,
 				FileOffset: offset,
 			}
-			w.emit(ctx, events, fe)
+			// Mark as seen and record the tail offset only after the event has
+			// been delivered: if the send is aborted (ctx cancelled) or would
+			// drop the event, the next scan must retry the file instead of
+			// silently skipping it forever (PR #100 review F1).
+			if !w.emitBlocking(ctx, events, fe) {
+				return errWalkAborted
+			}
+			seen[path] = info.ModTime()
+			if w.appendMode == AppendModeTail {
+				w.tailOffsets[path] = info.Size()
+			}
 		}
 		return nil
 	}
@@ -288,7 +323,9 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 			if d.IsDir() {
 				continue
 			}
-			_ = walk(filepath.Join(w.sourcePath, d.Name()), d, nil)
+			if walk(filepath.Join(w.sourcePath, d.Name()), d, nil) != nil {
+				return // ctx cancelled, stop scanning
+			}
 		}
 	}
 }
@@ -322,6 +359,21 @@ func (w *Watcher) buildEvent(path, op string) (FileEvent, error) {
 		Op:         op,
 		FileOffset: offset,
 	}, nil
+}
+
+// emitBlocking sends fe to the events channel, blocking until the consumer
+// takes it or ctx is cancelled. It returns false only when the context was
+// cancelled before the event could be delivered. Backpressure is the correct
+// semantics for scan paths: the producer is a bounded one-shot walk and the
+// consumer keeps draining, so blocking here prevents silent data loss (PR #100
+// review F1). Unlike emit, no event is ever dropped.
+func (w *Watcher) emitBlocking(ctx context.Context, events chan<- FileEvent, fe FileEvent) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case events <- fe:
+		return true
+	}
 }
 
 // emit sends fe to the events channel in a non-blocking manner. If the channel
@@ -367,6 +419,11 @@ func opString(ev fsnotify.Event) string {
 
 // errSkipped is returned internally when a file does not match the glob filter.
 var errSkipped = skippedErr("skipped")
+
+// errWalkAborted signals that a scan's event delivery was cancelled by ctx;
+// it is swallowed by WalkDir (the walk simply stops marking progress) and is
+// never surfaced to callers.
+var errWalkAborted = skippedErr("walk aborted")
 
 type skippedErr string
 
