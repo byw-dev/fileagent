@@ -222,7 +222,7 @@ func TestSTSManager_SetGet(t *testing.T) {
 		SessionToken: "token",
 		Expiry:       time.Now().Add(time.Hour),
 	}
-	mgr.SetSTS(cred)
+	mgr.SetSTS(cred, nextSTSGeneration())
 	got := mgr.GetSTS()
 	require.NotNil(t, got)
 	assert.Equal(t, cred.AccessKey, got.AccessKey)
@@ -230,19 +230,19 @@ func TestSTSManager_SetGet(t *testing.T) {
 
 func TestSTSManager_IsSTSValid_Fresh(t *testing.T) {
 	mgr := NewSTSManager()
-	mgr.SetSTS(&STSCredentials{Expiry: time.Now().Add(time.Hour)})
+	mgr.SetSTS(&STSCredentials{Expiry: time.Now().Add(time.Hour)}, nextSTSGeneration())
 	assert.True(t, mgr.IsSTSValid())
 }
 
 func TestSTSManager_IsSTSValid_ExpiringInUnderTenMin(t *testing.T) {
 	mgr := NewSTSManager()
-	mgr.SetSTS(&STSCredentials{Expiry: time.Now().Add(9 * time.Minute)})
+	mgr.SetSTS(&STSCredentials{Expiry: time.Now().Add(9 * time.Minute)}, nextSTSGeneration())
 	assert.False(t, mgr.IsSTSValid())
 }
 
 func TestSTSManager_IsSTSValid_Expired(t *testing.T) {
 	mgr := NewSTSManager()
-	mgr.SetSTS(&STSCredentials{Expiry: time.Now().Add(-time.Minute)})
+	mgr.SetSTS(&STSCredentials{Expiry: time.Now().Add(-time.Minute)}, nextSTSGeneration())
 	assert.False(t, mgr.IsSTSValid())
 }
 
@@ -253,9 +253,39 @@ func TestSTSManager_IsSTSValid_NoCredentials(t *testing.T) {
 
 func TestSTSManager_Clear(t *testing.T) {
 	mgr := NewSTSManager()
-	mgr.SetSTS(&STSCredentials{Expiry: time.Now().Add(time.Hour)})
+	mgr.SetSTS(&STSCredentials{Expiry: time.Now().Add(time.Hour)}, nextSTSGeneration())
 	require.NotNil(t, mgr.GetSTS())
 
 	mgr.Clear()
 	assert.Nil(t, mgr.GetSTS())
+}
+
+// ── F2（IC-2b review）：STS 凭据代际保护 ──────────────────────────────────────
+
+// SetSTS 只接受严格更新的代际：更早发出、更晚返回的刷新响应不得覆盖新会话，
+// 否则旧凭据（不覆盖新加 bucket）会复活并把 AccessDenied 重试固化成终态失败。
+var stsGenSeq uint64
+
+func nextSTSGeneration() uint64 { stsGenSeq++; return stsGenSeq }
+
+func TestSTSManager_SetSTS_RejectsStaleGeneration(t *testing.T) {
+	s := NewSTSManager()
+	fresh := &STSCredentials{AccessKey: "AK-new", Expiry: time.Now().Add(time.Hour)}
+	stale := &STSCredentials{AccessKey: "AK-old", Expiry: time.Now().Add(time.Hour)}
+
+	assert.True(t, s.SetSTS(stale, 1))
+	assert.True(t, s.SetSTS(fresh, 5), "newer generation applies")
+	assert.False(t, s.SetSTS(stale, 3), "a stale response must be dropped")
+	assert.Equal(t, "AK-new", s.GetSTS().AccessKey, "held credentials must not be overwritten")
+	assert.Equal(t, uint64(5), s.Generation())
+
+	// Equal generation is also rejected (only strictly newer wins).
+	assert.False(t, s.SetSTS(fresh, 5))
+
+	// Clear keeps the watermark: a stale response after a clear must not pass.
+	s.Clear()
+	assert.Nil(t, s.GetSTS())
+	assert.Equal(t, uint64(5), s.Generation(), "Clear must not lower the watermark")
+	assert.False(t, s.SetSTS(stale, 4))
+	assert.True(t, s.SetSTS(fresh, 6))
 }

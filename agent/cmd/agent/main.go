@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -103,90 +104,77 @@ func main() {
 
 	// ── Upload credentials (set when CredentialsPayload arrives via stream) ──
 	var (
-		uploaderCfgMu      sync.RWMutex
-		currentUploaderCfg *uploader.Config
-
 		// grpcClient is declared early so the credential-refresh closure below
 		// (used when a put is denied, IC-BUG-20) can capture it; the client is
 		// only created after the queue exists (section 5).
 		grpcClient *grpcclient.Client
+
+		// credGen assigns a strictly monotonic generation to every credential
+		// acquisition — bumped when an acquisition STARTS (RPC) or when a pushed
+		// payload is received. With two concurrent writers (periodic refresh and
+		// the AccessDenied retry), a response requested earlier but arriving later
+		// must never overwrite a newer session (review F2).
+		credGen atomic.Uint64
 	)
+	creds := newCredentialHolder(stsMgr, cfg.Upload.PartSizeMB, cfg.Upload.Concurrency, logger)
 
 	// updateCreds applies a fresh CredentialsPayload to both stsMgr and the
-	// upload config captured by uploadFn.
-	updateCreds := func(cred *agentv1.CredentialsPayload) {
-		newSTS := &credential.STSCredentials{
-			AccessKey:    cred.GetAccessKey(),
-			SecretKey:    cred.GetSecretKey(),
-			SessionToken: cred.GetSessionToken(),
-			Expiry:       cred.GetExpiresAt().AsTime(),
+	// upload config captured by uploadFn. A payload whose generation is not
+	// strictly newer is dropped whole — half-applying it would desync the
+	// session from the uploader config.
+	updateCreds := func(cred *agentv1.CredentialsPayload, generation uint64) {
+		creds.Apply(cred, generation)
+	}
+
+	// ── Upload function: creates a fresh Uploader per call using current STS ─
+	singleAttemptUpload := func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
+		ucfg := creds.Current()
+		if ucfg == nil {
+			return nil, fmt.Errorf("agent: no upload credentials available yet")
 		}
-		stsMgr.SetSTS(newSTS)
-
-		uploaderCfgMu.Lock()
-		currentUploaderCfg = &uploader.Config{
-			Endpoint:     cred.GetEndpoint(),
-			AccessKey:    cred.GetAccessKey(),
-			SecretKey:    cred.GetSecretKey(),
-			SessionToken: cred.GetSessionToken(),
-			UseSSL:       cred.GetUseSsl(),
-			PartSizeMB:   cfg.Upload.PartSizeMB,
-			Concurrency:  cfg.Upload.Concurrency,
+		u, err := uploader.New(*ucfg, q, logger)
+		if err != nil {
+			return nil, fmt.Errorf("agent: create uploader: %w", err)
 		}
-		uploaderCfgMu.Unlock()
-
-		logger.Info("agent: STS credentials updated",
-			zap.Time("expiry", newSTS.Expiry),
-			zap.String("endpoint", cred.GetEndpoint()))
+		return uploadWithTimeout(
+			uploadCtx,
+			task,
+			time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
+			cfg.Upload.AssumedUploadBytesPerSecond,
+			logger,
+			u.UploadFile,
+		)
 	}
 
-// ── Upload function: creates a fresh Uploader per call using current STS ─
-singleAttemptUpload := func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
-	uploaderCfgMu.RLock()
-	ucfg := currentUploaderCfg
-	uploaderCfgMu.RUnlock()
-	if ucfg == nil {
-		return nil, fmt.Errorf("agent: no upload credentials available yet")
+	// refreshSTS invalidates the held STS session and mints a fresh one from the
+	// Control Plane. Used by uploadWithAccessDeniedRetry when a put is denied —
+	// the held session covers only the bucket set known at mint time (IC-BUG-20).
+	// The generation is taken when the request STARTS, so a response that raced
+	// with a newer acquisition is dropped instead of overwriting it (review F2).
+	refreshSTS := func(refreshCtx context.Context) error {
+		stsMgr.Clear()
+		generation := credGen.Add(1)
+		cred, err := grpcClient.RefreshCredentials(refreshCtx)
+		if err != nil {
+			return fmt.Errorf("agent: refresh credentials: %w", err)
+		}
+		updateCreds(cred, generation)
+		return nil
 	}
-	u, err := uploader.New(*ucfg, q, logger)
-	if err != nil {
-		return nil, fmt.Errorf("agent: create uploader: %w", err)
-	}
-	return uploadWithTimeout(
-		uploadCtx,
-		task,
-		time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
-		cfg.Upload.AssumedUploadBytesPerSecond,
-		logger,
-		u.UploadFile,
-	)
-}
 
-// refreshSTS invalidates the held STS session and mints a fresh one from the
-// Control Plane. Used by uploadWithAccessDeniedRetry when a put is denied —
-// the held session covers only the bucket set known at mint time (IC-BUG-20).
-refreshSTS := func(refreshCtx context.Context) error {
-	stsMgr.Clear()
-	cred, err := grpcClient.RefreshCredentials(refreshCtx)
-	if err != nil {
-		return fmt.Errorf("agent: refresh credentials: %w", err)
-	}
-	updateCreds(cred)
-	return nil
-}
-
-// ── 7. Worker pool (starts goroutines after exec.Start is called) ────────
-exec := executor.New(cfg.Upload.Concurrency, q, func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
-	return uploadWithAccessDeniedRetry(
-		uploadCtx,
-		task,
-		time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
-		cfg.Upload.AssumedUploadBytesPerSecond,
-		logger,
-		singleAttemptUpload,
-		refreshSTS,
-	)
-}, logger, cfg.Upload.QueueMaxSize)
+	// ── 7. Worker pool (starts goroutines after exec.Start is called) ────────
+	exec := executor.New(cfg.Upload.Concurrency, q, func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
+		return uploadWithAccessDeniedRetry(
+			uploadCtx,
+			task,
+			time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
+			cfg.Upload.AssumedUploadBytesPerSecond,
+			logger,
+			singleAttemptUpload,
+			refreshSTS,
+			creds.Generation,
+		)
+	}, logger, cfg.Upload.QueueMaxSize)
 
 	// ── Scheduler (cron-mode rules) ──────────────────────────────────────────
 	sched := scheduler.New(logger)
@@ -267,7 +255,11 @@ exec := executor.New(cfg.Upload.Concurrency, q, func(uploadCtx context.Context, 
 	grpcClient.SetMessageHandler(func(msg *agentv1.ServerMessage) {
 		switch p := msg.GetPayload().(type) {
 		case *agentv1.ServerMessage_Credentials:
-			updateCreds(p.Credentials)
+			// A pushed payload carries no generation of its own — it takes the
+			// next one at receipt. An in-flight refresh RPC that started
+			// before this push therefore loses, which is correct: whatever the
+			// CP pushed is at least as fresh as anything requested earlier.
+			updateCreds(p.Credentials, credGen.Add(1))
 
 		case *agentv1.ServerMessage_PushRule:
 			rule := protoToSchedulerRule(p.PushRule.GetRule())
@@ -404,12 +396,15 @@ exec := executor.New(cfg.Upload.Concurrency, q, func(uploadCtx context.Context, 
 					continue
 				}
 				logger.Info("agent: refreshing STS credentials")
+				// Generation taken at REQUEST time (review F2): a response that
+				// races with a newer acquisition is dropped on arrival.
+				generation := credGen.Add(1)
 				cred, err := grpcClient.RefreshCredentials(ctx)
 				if err != nil {
 					logger.Warn("agent: refresh credentials failed", zap.Error(err))
 					continue
 				}
-				updateCreds(cred)
+				updateCreds(cred, generation)
 			}
 		}
 	}()
@@ -469,6 +464,75 @@ func uploadTimeoutForSize(fileSize int64, minimum time.Duration, assumedBytesPer
 	return derived
 }
 
+// credentialHolder owns the agent's live STS session and the uploader config
+// derived from it, keyed by a strictly monotonic generation (review F2). The
+// two writers — the periodic refresh goroutine and the AccessDenied retry
+// path — both funnel through Apply; a payload whose generation is not newer
+// than the held one is dropped WHOLE, so a late response can never resurrect
+// stale credentials (e.g. ones not covering a just-added bucket) and turn the
+// retry's second attempt into a terminal failure.
+type credentialHolder struct {
+	sts         *credential.STSManager
+	mu          sync.RWMutex
+	cfg         *uploader.Config
+	partSizeMB  int
+	concurrency int
+	logger      *zap.Logger
+}
+
+// newCredentialHolder creates a holder over the given STS manager.
+func newCredentialHolder(sts *credential.STSManager, partSizeMB, concurrency int, logger *zap.Logger) *credentialHolder {
+	return &credentialHolder{sts: sts, logger: logger, partSizeMB: partSizeMB, concurrency: concurrency}
+}
+
+// Apply validates the generation, then applies the payload to both the STS
+// session and the uploader config atomically. Returns whether it was applied.
+func (h *credentialHolder) Apply(cred *agentv1.CredentialsPayload, generation uint64) bool {
+	if cred == nil {
+		return false
+	}
+	newSTS := &credential.STSCredentials{
+		AccessKey:    cred.GetAccessKey(),
+		SecretKey:    cred.GetSecretKey(),
+		SessionToken: cred.GetSessionToken(),
+		Expiry:       cred.GetExpiresAt().AsTime(),
+	}
+	if !h.sts.SetSTS(newSTS, generation) {
+		h.logger.Info("agent: stale credentials response dropped",
+			zap.Uint64("generation", generation),
+			zap.Uint64("current_generation", h.sts.Generation()))
+		return false
+	}
+	cfg := &uploader.Config{
+		Endpoint:     cred.GetEndpoint(),
+		AccessKey:    cred.GetAccessKey(),
+		SecretKey:    cred.GetSecretKey(),
+		SessionToken: cred.GetSessionToken(),
+		UseSSL:       cred.GetUseSsl(),
+		PartSizeMB:   h.partSizeMB,
+		Concurrency:  h.concurrency,
+	}
+	h.mu.Lock()
+	h.cfg = cfg
+	h.mu.Unlock()
+	h.logger.Info("agent: STS credentials updated",
+		zap.Uint64("generation", generation),
+		zap.Time("expiry", newSTS.Expiry),
+		zap.String("endpoint", cfg.Endpoint))
+	return true
+}
+
+// Current returns the uploader config derived from the applied credentials,
+// or nil when no credentials have been applied yet.
+func (h *credentialHolder) Current() *uploader.Config {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.cfg
+}
+
+// Generation reports the generation of the held STS session.
+func (h *credentialHolder) Generation() uint64 { return h.sts.Generation() }
+
 // isAccessDenied reports whether err is (or wraps) a MinIO AccessDenied
 // response — the signal that the held STS session cannot write the target
 // bucket (IC-BUG-20). The uploader wraps transport errors with %w, so the
@@ -482,19 +546,30 @@ func isAccessDenied(err error) bool {
 }
 
 // uploadWithAccessDeniedRetry runs one upload attempt and, on AccessDenied,
-// invalidates the held STS session, refreshes it once and retries exactly one
-// more time (IC-BUG-20).
+// invalidates the held STS session, refreshes it and retries (IC-BUG-20).
 //
 // The held session covers only the bucket set known when the Control Plane
 // minted it, so a rule pointing at a newly added bucket denies every put
 // until the session is re-issued — up to ~50 minutes on the agent's own
 // refresh tick, retrying exhausted without self-healing.
 //
-// A second AccessDenied is terminally failed (executor.ErrTerminalUpload) and
-// alarmed: a persistent denial means bucket policy or rule configuration is
-// wrong, and retrying would turn that into a silent refresh loop. A refresh
-// failure propagates the original AccessDenied unchanged — that is transient,
-// not a policy verdict, so the executor's backoff may retry later.
+// generation reports the credential generation in force (review F2). Two
+// writers race here: the periodic refresh goroutine and this path. The
+// generation guard in the credential holder already drops stale responses, so
+// the retry normally runs on exactly the credentials this path refreshed. But
+// if the generation CHANGES while the second attempt runs, that attempt may
+// have executed on someone else's credentials — in that case one further
+// attempt is made on the newest credentials instead of declaring the task
+// terminally failed on possibly-stale grounds. A terminal verdict requires
+// the generation to be stable across an attempt (at most one bounce; every
+// attempt re-reads the newest credentials).
+//
+// A second AccessDenied on stable credentials is terminally failed
+// (executor.ErrTerminalUpload) and alarmed: a persistent denial means bucket
+// policy or rule configuration is wrong, and retrying would turn that into a
+// silent refresh loop. A refresh failure propagates the original
+// AccessDenied unchanged — that is transient, not a policy verdict, so the
+// executor's backoff may retry later.
 func uploadWithAccessDeniedRetry(
 	parent context.Context,
 	task *queue.UploadTask,
@@ -503,6 +578,7 @@ func uploadWithAccessDeniedRetry(
 	logger *zap.Logger,
 	upload executor.UploadFunc,
 	refresh func(ctx context.Context) error,
+	generation func() uint64,
 ) (*uploader.UploadResult, error) {
 	result, err := uploadWithTimeout(parent, task, minimum, assumedBytesPerSecond, logger, upload)
 	if !isAccessDenied(err) {
@@ -517,14 +593,38 @@ func uploadWithAccessDeniedRetry(
 			zap.String("task_id", task.ID), zap.Error(rErr))
 		return nil, err
 	}
+	genBefore := generation()
 	result, err = uploadWithTimeout(parent, task, minimum, assumedBytesPerSecond, logger, upload)
-	if isAccessDenied(err) {
+	if !isAccessDenied(err) {
+		return result, err
+	}
+	if generation() == genBefore {
+		// The generation held steady across the attempt: these ARE the
+		// credentials this path refreshed, and they are still denied — a
+		// genuine policy/configuration verdict, not a race.
 		logger.Error("agent: upload still denied after one credential refresh; failing task terminally "+
 			"(check the bucket policy and the rule's template/configuration)",
 			zap.String("task_id", task.ID),
 			zap.String("bucket", task.Bucket),
 			zap.Error(err))
 		return nil, fmt.Errorf("%w: still AccessDenied after one credential refresh: %v",
+			executor.ErrTerminalUpload, err)
+	}
+	// The generation moved while the attempt ran: the attempt may have
+	// executed on someone else's credentials. One further attempt on the
+	// newest credentials — a policy verdict requires stable credentials.
+	logger.Warn("agent: credential generation changed during retry, attempting once more on the newest credentials",
+		zap.String("task_id", task.ID),
+		zap.Uint64("generation_before", genBefore),
+		zap.Uint64("generation_now", generation()))
+	result, err = uploadWithTimeout(parent, task, minimum, assumedBytesPerSecond, logger, upload)
+	if isAccessDenied(err) {
+		logger.Error("agent: upload denied on the newest credentials; failing task terminally "+
+			"(check the bucket policy and the rule's template/configuration)",
+			zap.String("task_id", task.ID),
+			zap.String("bucket", task.Bucket),
+			zap.Error(err))
+		return nil, fmt.Errorf("%w: still AccessDenied on the newest credentials: %v",
 			executor.ErrTerminalUpload, err)
 	}
 	return result, err

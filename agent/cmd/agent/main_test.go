@@ -24,6 +24,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type mockTokenSetter struct {
@@ -38,7 +39,7 @@ func TestHandleRevokeCommand_ClearsCredentialsAndStops(t *testing.T) {
 	require.NoError(t, tokenMgr.Save("jwt-token"))
 
 	stsMgr := credential.NewSTSManager()
-	stsMgr.SetSTS(&credential.STSCredentials{Expiry: time.Now().Add(time.Hour)})
+	stsMgr.SetSTS(&credential.STSCredentials{Expiry: time.Now().Add(time.Hour)}, 1)
 
 	client := &mockTokenSetter{token: "jwt-token"}
 	stopped := false
@@ -533,6 +534,9 @@ func otherForbiddenError(bucket string) error {
 	})
 }
 
+// stableGeneration 模拟无并发覆盖的重试窗口：代际恒定，第二次 403 即终态。
+var stableGeneration = func() uint64 { return 1 }
+
 func TestIsAccessDenied(t *testing.T) {
 	assert.True(t, isAccessDenied(accessDeniedError("bkt")), "wrapped minio AccessDenied must be detected")
 	assert.False(t, isAccessDenied(otherForbiddenError("bkt")), "other S3 codes must not match")
@@ -570,7 +574,7 @@ func TestUploadWithAccessDeniedRetry_RefreshesAndSucceedsOnce(t *testing.T) {
 	refresh := func(_ context.Context) error { refreshes++; return nil }
 
 	result, err := uploadWithAccessDeniedRetry(context.Background(), task, 30*time.Second,
-		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh)
+		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh, stableGeneration)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.Equal(t, 2, attempts, "exactly one retry after AccessDenied")
@@ -591,7 +595,7 @@ func TestUploadWithAccessDeniedRetry_SecondDenied_Terminal(t *testing.T) {
 	refresh := func(_ context.Context) error { refreshes++; return nil }
 
 	_, err := uploadWithAccessDeniedRetry(context.Background(), task, 30*time.Second,
-		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh)
+		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh, stableGeneration)
 	require.Error(t, err)
 	assert.Equal(t, 2, attempts, "no attempt beyond the single refresh retry")
 	assert.Equal(t, 1, refreshes)
@@ -612,7 +616,7 @@ func TestUploadWithAccessDeniedRetry_RefreshFails_Propagates(t *testing.T) {
 	refresh := func(_ context.Context) error { return assert.AnError }
 
 	_, err := uploadWithAccessDeniedRetry(context.Background(), task, 30*time.Second,
-		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh)
+		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh, stableGeneration)
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, executor.ErrTerminalUpload),
 		"refresh failure is transient, not a policy verdict")
@@ -631,7 +635,7 @@ func TestUploadWithAccessDeniedRetry_OtherError_PassThrough(t *testing.T) {
 	refresh := func(_ context.Context) error { refreshes++; return nil }
 
 	_, err := uploadWithAccessDeniedRetry(context.Background(), task, 30*time.Second,
-		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh)
+		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh, stableGeneration)
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, executor.ErrTerminalUpload))
 	assert.Zero(t, refreshes, "other error classes must not burn a credential refresh")
@@ -784,4 +788,90 @@ func TestSubmitFile_QueueClosed_LogsAndSurvives(t *testing.T) {
 	rule := scheduler.CollectionRule{RuleID: "r-closed", BasePath: "/tmp", UploadBucket: "bkt", DestPathTemplate: "p/{filename}"}
 	require.NoError(t, q.Close())
 	submitFile(context.Background(), exec, q, rule, "/tmp/f.txt", 1, time.Now(), 0, "", trollsift.AgentContext{}, zap.NewNop())
+}
+
+// ── F2（IC-2b review）：并发覆盖下旧刷新响应不得复活旧凭据 ─────────────────────
+
+func testCredPayload(accessKey string) *agentv1.CredentialsPayload {
+	return &agentv1.CredentialsPayload{
+		AccessKey: accessKey,
+		ExpiresAt: timestamppb.New(time.Now().Add(time.Hour)),
+		Endpoint:  "localhost:9000",
+	}
+}
+
+// 评审验收场景：重试路径刚拿到指向新 bucket 的新凭据（gen 2），一个更早发出、
+// 更晚返回的后台刷新响应（gen 1）到达——它不得覆盖新凭据；第二次尝试必须用
+// 新凭据成功，任务不得落终态失败。
+// 无代际保护的实现里这个响应会覆盖新凭据 → 第二次尝试 403 → 落终态（红）。
+func TestUploadWithAccessDeniedRetry_StaleResponseDoesNotOverrideFresh(t *testing.T) {
+	path := writeLocalFile(t, "f.bin")
+	task := testUploadTask(path)
+	holder := newCredentialHolder(credential.NewSTSManager(), 64, 1, zap.NewNop())
+	require.True(t, holder.Apply(testCredPayload("AK-old"), 1))
+
+	attempts := 0
+	upload := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		attempts++
+		if attempts == 2 {
+			// 模拟后台刷新的迟到旧响应恰在第二次尝试读取凭据前落地。
+			holder.Apply(testCredPayload("AK-old"), 1)
+		}
+		if holder.Current().AccessKey != "AK-new" {
+			return nil, accessDeniedError("new-bucket")
+		}
+		return &uploadpkg.UploadResult{StoragePath: task.StoragePath, Bucket: task.Bucket, SizeBytes: 5}, nil
+	}
+	refreshes := 0
+	refresh := func(_ context.Context) error {
+		refreshes++
+		require.True(t, holder.Apply(testCredPayload("AK-new"), 2))
+		return nil
+	}
+
+	result, err := uploadWithAccessDeniedRetry(context.Background(), task, 30*time.Second,
+		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh, holder.Generation)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, "AK-new", holder.Current().AccessKey, "the fresh credentials must remain in force")
+	assert.Equal(t, 2, attempts)
+	assert.Equal(t, 1, refreshes)
+}
+
+// 代际在重试期间被别人改动过：第二次尝试可能跑在别人的凭据上——再多试一次，
+// 而不是判死刑；终态要求代际稳定。
+func TestUploadWithAccessDeniedRetry_GenerationChangedDuringRetry_OneMoreAttempt(t *testing.T) {
+	path := writeLocalFile(t, "f.bin")
+	task := testUploadTask(path)
+	genSeq := uint64(1)
+	gen := func() uint64 { return genSeq }
+	attempts := 0
+	upload := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		attempts++
+		if attempts == 2 {
+			// 第二次尝试期间另一个写入方应用了新代际。
+			genSeq = 2
+		}
+		return nil, accessDeniedError("bkt")
+	}
+	refreshes := 0
+	refresh := func(_ context.Context) error { refreshes++; return nil }
+
+	_, err := uploadWithAccessDeniedRetry(context.Background(), task, 30*time.Second,
+		defaultAssumedUploadBytesPerSecond, zap.NewNop(), upload, refresh, gen)
+	require.Error(t, err)
+	assert.Equal(t, 3, attempts, "a generation change buys exactly one more attempt")
+	assert.ErrorIs(t, err, executor.ErrTerminalUpload, "still terminal on stable generation")
+	assert.Equal(t, 1, refreshes)
+}
+
+// credentialHolder：迟到旧响应整体丢弃，STS 会话与 uploader 配置不得半更新。
+func TestCredentialHolder_RejectsStaleGeneration_Whole(t *testing.T) {
+	holder := newCredentialHolder(credential.NewSTSManager(), 64, 2, zap.NewNop())
+	require.True(t, holder.Apply(testCredPayload("AK-b"), 7))
+	require.NotNil(t, holder.Current())
+	require.False(t, holder.Apply(testCredPayload("AK-a"), 6), "stale generation must be dropped")
+	assert.Equal(t, "AK-b", holder.Current().AccessKey, "uploader config must not be half-updated")
+	assert.Equal(t, uint64(7), holder.Generation())
+	assert.False(t, holder.Apply(nil, 8), "nil payload is a no-op")
 }
