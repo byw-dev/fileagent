@@ -3,10 +3,12 @@ package grpcserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path"
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"github.com/byw-dev/fileagent/controlplane/internal/agent"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
@@ -20,6 +22,10 @@ import (
 )
 
 const agentOnlineTTL = 90 * time.Second
+
+// agentSyncDegradedTTL bounds how long the rule-sync degraded marker lives in
+// the cache when no further sync refreshes it (review R3).
+const agentSyncDegradedTTL = 24 * time.Hour
 
 // Register handles the initial Agent registration request.
 func (s *Server) Register(ctx context.Context, req *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
@@ -156,12 +162,28 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	// message (IC-BUG-30 / D-033). A sync failure must end the stream: the
 	// full-set message is the entire delete half of the fix, and an agent that
 	// keeps running with an untrustworthy rule view is worse than one that
-	// disconnects — a reconnect runs a clean full re-sync.
+	// disconnects — a reconnect runs a clean full re-sync. The one exception
+	// is degradation (review R3): an oversized snapshot fails on every
+	// reconnect by construction, so disconnecting would loop forever on the
+	// same input — instead the connection stays and the degraded state is
+	// marked in the cache, where the agents API reads it as
+	// rule_sync_degraded (nothing is only a log line). A successful sync
+	// clears the marker.
 	if s.dispatcher != nil {
 		if err := s.dispatcher.SyncRulesOnConnect(ctx, agentID); err != nil {
-			s.logger.Error("connect: rule sync failed, ending stream for a clean re-sync",
-				zap.String("agent_id", agentID), zap.Error(err))
-			return status.Error(codes.Internal, "rule sync incomplete; the agent must reconnect and re-sync")
+			if errors.Is(err, agent.ErrRulesSyncDegraded) {
+				if s.cache != nil {
+					if setErr := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); setErr != nil {
+						s.logger.Warn("connect: mark sync degraded failed", zap.String("agent_id", agentID), zap.Error(setErr))
+					}
+				}
+			} else {
+				s.logger.Error("connect: rule sync failed, ending stream for a clean re-sync",
+					zap.String("agent_id", agentID), zap.Error(err))
+				return status.Error(codes.Internal, "rule sync incomplete; the agent must reconnect and re-sync")
+			}
+		} else if s.cache != nil {
+			_ = s.cache.Del(ctx, cache.AgentSyncDegradedKey(agentID))
 		}
 	}
 

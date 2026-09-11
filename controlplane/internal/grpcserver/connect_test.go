@@ -10,6 +10,7 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"github.com/byw-dev/fileagent/controlplane/internal/agent"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
@@ -723,4 +724,73 @@ func TestServer_Connect_CredentialsDeliveredBeforeRuleSync(t *testing.T) {
 	assert.True(t, credFirst,
 		"credentials must reach the agent before the rule snapshot — a rule arriving first "+
 			"starts the watcher and IC-5's initial scan uploads with no credentials (review F5)")
+}
+
+// ── R3（IC-2b review 三轮）：降级态必须可观测、可查询 ─────────────────────────
+
+// degradedSyncDispatcher 报告降级（ErrRulesSyncDegraded）。Connect 必须把它与
+// 致命同步失败区分开：保持连接，并在缓存里留下可被 API 读取的降级标记。
+type degradedSyncDispatcher struct{}
+
+func (d *degradedSyncDispatcher) SyncRulesOnConnect(_ context.Context, _ string) error {
+	return fmt.Errorf("sync_rules: snapshot oversized for agent x: %w", agent.ErrRulesSyncDegraded)
+}
+
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (d *degradedSyncDispatcher) ReleaseAgent(_ string) {}
+
+func TestServer_Connect_RuleSyncDegraded_KeepsStreamAndMarksCache(t *testing.T) {
+	agentID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	mc := newMockCache()
+	srv := New(logger)
+	srv.WithDeps(registry, mc, jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&degradedSyncDispatcher{}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+
+	// 连接必须保持：降级不是断流理由，agent 仍可收发（心跳往返作证）。
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		5*time.Second, 20*time.Millisecond, "a degraded sync must not end the stream")
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hb-1",
+		Payload: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{UptimeSeconds: 1}}}))
+	assert.True(t, registry.IsOnline(agentID), "the stream must still be alive after a degraded sync")
+
+	// 降级标记必须落缓存（API/UI 可读），而不是只有一条 ERROR 日志。
+	assert.Eventually(t, func() bool {
+		_, ok := mc.sets[cache.AgentSyncDegradedKey(agentID)]
+		return ok
+	}, 3*time.Second, 50*time.Millisecond, "the degraded state must be observable via the cache")
 }

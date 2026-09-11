@@ -33,6 +33,16 @@ func AgentStatsKey(agentID string) string {
 	return fmt.Sprintf("agent:%s:stats", agentID)
 }
 
+// AgentSyncDegradedKey returns the Redis key marking that an agent's rule
+// sync currently runs degraded (its snapshot exceeds the size budget and was
+// not delivered — the agent keeps its previous rule view). Set by the gRPC
+// Connect handler when the dispatcher reports a degraded sync, cleared by the
+// next successful sync; read by the agents API so the state is queryable, not
+// only logged (IC-2b review R3).
+func AgentSyncDegradedKey(agentID string) string {
+	return fmt.Sprintf("agent:%s:rulesync_degraded", agentID)
+}
+
 // JWTBlacklistKey returns the Redis key for a revoked JWT token identified by
 // its jti (JWT ID) claim. Presence of this key means the token is revoked.
 func JWTBlacklistKey(jti string) string {

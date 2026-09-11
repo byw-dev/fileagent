@@ -12,6 +12,7 @@ import (
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"github.com/byw-dev/fileagent/controlplane/internal/agent"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
@@ -25,6 +26,26 @@ import (
 // (IC-2b review F3): the reconnect sync delivers the whole rule set as one
 // snapshot message, and the count must stay far below the gRPC message limit.
 const MaxRulesPerAgent = 1000
+
+// estimatedRuleBytes is the snapshot budget a request-built rule is assumed
+// to consume: the serialized byte length of every free-form string field plus
+// a generous fixed overhead (uuids, timestamps, booleans, map keys) so the
+// creation-time estimate never undershoots the dispatcher's exact proto.Size
+// pre-flight (IC-2b review R3).
+func estimatedRuleBytes(req createRuleRequest) int {
+	fixed := 512
+	return fixed + len(req.Name) + len(req.BasePath) + len(req.PathPattern) +
+		len(req.DestPathTemplate) + len(req.CronExpr) + len(req.Metadata)
+}
+
+// estimatedRuleBytesFromDB is estimatedRuleBytes for rules already persisted.
+func estimatedRuleBytesFromDB(r *db.CollectionRule) int {
+	fixed := 512
+	cron := len(r.CronExpr.String)
+	meta := len(r.Metadata)
+	return fixed + len(r.Name) + len(r.BasePath) + len(r.PathPattern) +
+		len(r.DestPathTemplate) + cron + meta
+}
 
 // AgentsDB is the minimal database interface needed by AgentsHandler.
 type AgentsDB interface {
@@ -152,6 +173,11 @@ type agentResponse struct {
 	// Live telemetry from the latest heartbeat (present only while online).
 	QueueDepth    *int32 `json:"queue_depth,omitempty"`
 	UptimeSeconds *int64 `json:"uptime_seconds,omitempty"`
+	// True when the agent's rule snapshot exceeded the size budget and the
+	// last sync ran degraded: the agent keeps its previous rule view until
+	// the rule set shrinks below the budget and the agent reconnects
+	// (IC-2b review R3). Read from the cache; unaffected by is_online.
+	RuleSyncDegraded bool `json:"rule_sync_degraded"`
 }
 
 // mapFrontendStatusToDB converts a frontend AgentStatus (uppercase, using RUNNING
@@ -226,6 +252,12 @@ func (h *AgentsHandler) toAgentResponseWithOnline(ctx context.Context, a *db.Age
 	}
 	if n, err := h.cache.Exists(ctx, cache.AgentOnlineKey(a.ID.String())); err == nil {
 		r.IsOnline = n > 0
+	}
+	// Independent of is_online: the marker is (re)set by every sync and
+	// cleared by the next successful one, so it reflects the last sync's
+	// outcome even while the agent is between connections (IC-2b review R3).
+	if n, err := h.cache.Exists(ctx, cache.AgentSyncDegradedKey(a.ID.String())); err == nil {
+		r.RuleSyncDegraded = n > 0
 	}
 	// Only surface live telemetry for agents we consider online, so the fields
 	// never contradict is_online under partial cache desync (e.g. the stats key
@@ -794,6 +826,33 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 		middleware.RespondError(c, http.StatusUnprocessableEntity,
 			"RULE_COUNT_LIMIT",
 			fmt.Sprintf("rule count limit: an agent may have at most %d collection rules (the reconnect sync delivers them as one snapshot message)", MaxRulesPerAgent),
+			nil)
+		return
+	}
+
+	// Byte-budget gate (IC-2b review R3): the count cap alone does not bound
+	// the snapshot — a single rule with a 3 MiB TEXT field overshoots the
+	// gRPC limit in ~200 such rules (measured). The quantity that actually
+	// decides failure is serialized bytes, so creation estimates the
+	// projected snapshot (existing rules + the new one) against the same
+	// budget the dispatcher enforces (agent.MaxRulesSnapshotBytes). The
+	// estimate is deliberately generous (fixed per-rule overhead); the
+	// dispatcher's exact proto.Size pre-flight stays authoritative. Not
+	// airtight by construction — concurrent creates and direct DB writes can
+	// still race past it — that residual is the review's explicit card.
+	projected := estimatedRuleBytes(req)
+	for _, r := range rules {
+		projected += estimatedRuleBytesFromDB(r)
+	}
+	if projected > agent.MaxRulesSnapshotBytes {
+		h.logger.Warn("create rule: projected rule snapshot exceeds the size budget",
+			zap.String("agent_id", agentID.String()),
+			zap.Int("rules", len(rules)+1),
+			zap.Int("projected_bytes", projected),
+			zap.Int("limit", agent.MaxRulesSnapshotBytes))
+		middleware.RespondError(c, http.StatusUnprocessableEntity,
+			"RULE_SNAPSHOT_SIZE_LIMIT",
+			fmt.Sprintf("rule snapshot size limit: this agent's rules would serialize to about %d bytes, above the %d-byte snapshot budget; reduce path/template sizes or move rules to other agents", projected, agent.MaxRulesSnapshotBytes),
 			nil)
 		return
 	}

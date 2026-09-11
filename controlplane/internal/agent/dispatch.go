@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -286,13 +287,24 @@ func (d *Dispatcher) DispatchRuleCancel(ctx context.Context, ruleID, agentID str
 	return nil
 }
 
-// maxRulesSnapshotBytes is the snapshot size at which SyncRulesOnConnect
+// ErrRulesSyncDegraded is returned by SyncRulesOnConnect when the rule
+// snapshot exceeds MaxRulesSnapshotBytes and was therefore not delivered. It
+// is neither success (the agent's rule view is stale and the Control Plane
+// must leave a queryable degraded marker) nor a stream-fatal failure
+// (disconnecting would loop deterministically on the same input, review F3).
+// The gRPC handler distinguishes it and marks the agent in the cache (see
+// AgentSyncDegradedKey); the agents API surfaces it as
+// rule_sync_degraded (review R3).
+var ErrRulesSyncDegraded = errors.New("rule snapshot exceeds the size budget, sync degraded")
+
+// MaxRulesSnapshotBytes is the snapshot size at which SyncRulesOnConnect
 // degrades instead of sending. The gRPC default receive limit is 4 MiB; a
 // snapshot beyond it fails the stream deterministically, and failing the
 // stream forces a reconnect that deterministically re-sends the same oversized
 // snapshot — an infinite reconnect loop (review F3). The margin absorbs
-// protobuf framing and per-message overhead.
-const maxRulesSnapshotBytes = 3 << 20
+// protobuf framing and per-message overhead. The REST rule-creation gate uses
+// the same budget so the degraded state stays structurally unreachable.
+const MaxRulesSnapshotBytes = 3 << 20
 
 // SyncRulesOnConnect pushes the agent's complete rule snapshot on (re)connect
 // as ONE message (IC-BUG-30 / D-033).
@@ -380,16 +392,19 @@ func (d *Dispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) err
 	// Pre-flight size check (review F3): a snapshot beyond the gRPC receive
 	// limit fails the stream deterministically, and disconnecting on it would
 	// loop forever on the same input. Degrade instead: skip the send, alarm,
-	// keep the connection.
-	if size := proto.Size(syncMsg); size > maxRulesSnapshotBytes {
+	// keep the connection — and report the degradation as a sentinel (review
+	// R3) so the gRPC handler can leave a queryable marker instead of
+	// silently swallowing it as success.
+	if size := proto.Size(syncMsg); size > MaxRulesSnapshotBytes {
 		d.logger.Error("sync_rules: rule snapshot oversized, degrading to keep-alive — "+
 			"agent keeps its previous rule view; reduce this agent's rule count or template sizes "+
-			"(creation is capped at maxRulesPerAgent, this agent has legacy or oversized rules)",
+			"(creation is capped at MaxRulesPerAgent, this agent has legacy or oversized rules)",
 			zap.String("agent_id", agentID),
 			zap.Int("rules", len(snapshot)),
 			zap.Int("bytes", size),
-			zap.Int("limit", maxRulesSnapshotBytes))
-		return nil
+			zap.Int("limit", MaxRulesSnapshotBytes))
+		return fmt.Errorf("sync_rules: %w (%d rules, %d bytes, limit %d)",
+			ErrRulesSyncDegraded, len(snapshot), size, MaxRulesSnapshotBytes)
 	}
 	if !d.registry.Send(agentID, syncMsg) {
 		// See the godoc above: the snapshot is the delete half of IC-BUG-30 in

@@ -578,7 +578,9 @@ func TestSyncRulesOnConnect_OversizedSnapshot_DegradesWithoutDisconnect(t *testi
 	d := NewDispatcher(&mockDispatchDB{rules: []*db.CollectionRule{huge}}, newMockBucketQuerier(), newMockDispatchCache(), reg, logger)
 
 	err := d.SyncRulesOnConnect(context.Background(), agentID.String())
-	require.NoError(t, err, "oversized snapshot must degrade, not end the stream — that would loop")
+	require.Error(t, err, "oversized snapshot must degrade, not end the stream — that would loop")
+	assert.ErrorIs(t, err, ErrRulesSyncDegraded,
+		"degradation is reported as a sentinel so Connect can mark the state without ending the stream")
 	assert.Empty(t, reg.sent, "an oversized snapshot must not be pushed to a transport that cannot carry it")
 	entries := logs.All()
 	require.Len(t, entries, 1)
@@ -663,4 +665,22 @@ func TestDispatcher_ReleaseAgent_ReclaimsEntry(t *testing.T) {
 	_, exists := d.agentLocks.entries[agentID]
 	d.agentLocks.mu.Unlock()
 	assert.False(t, exists)
+}
+
+// ── R3（IC-2b review 三轮）：超限降级必须是可辨识的哨兵错误 ─────────────────────
+
+// 降级不是成功（Connect 要据此打可查询的标记），也不是失败（不能断流）——
+// 必须返回独立的哨兵错误，由调用方按类型处置。
+func TestSyncRulesOnConnect_OversizedSnapshot_ReportsDegradedSentinel(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	agentID := uuid.New()
+	reg := newMockRegistry()
+	reg.online[agentID.String()] = true
+	huge := &db.CollectionRule{ID: uuid.New(), AgentID: agentID, Name: strings.Repeat("x", 5<<20), Status: db.RuleStatusActive}
+	d := NewDispatcher(&mockDispatchDB{rules: []*db.CollectionRule{huge}}, newMockBucketQuerier(), newMockDispatchCache(), reg, logger)
+
+	err := d.SyncRulesOnConnect(context.Background(), agentID.String())
+	require.Error(t, err, "degradation must be reported, not silently swallowed as success")
+	assert.ErrorIs(t, err, ErrRulesSyncDegraded)
+	assert.Empty(t, reg.sent)
 }
