@@ -464,6 +464,17 @@ func uploadTimeoutForSize(fileSize int64, minimum time.Duration, assumedBytesPer
 	return derived
 }
 
+// credentialSession is the STS-session dependency of credentialHolder.
+// A small interface (not the concrete manager) so tests can inject a store
+// whose SetSTS blocks deterministically and thereby construct the exact
+// interleaving that tears generation and uploader credentials apart (review
+// R4 — the probabilistic version of that test needed scheduling luck and
+// survived the split mutation 5/5).
+type credentialSession interface {
+	SetSTS(cred *credential.STSCredentials, generation uint64) bool
+	Generation() uint64
+}
+
 // credentialHolder owns the agent's live STS session and the uploader config
 // derived from it, keyed by a strictly monotonic generation (review F2). The
 // two writers — the periodic refresh goroutine and the AccessDenied retry
@@ -472,7 +483,7 @@ func uploadTimeoutForSize(fileSize int64, minimum time.Duration, assumedBytesPer
 // stale credentials (e.g. ones not covering a just-added bucket) and turn the
 // retry's second attempt into a terminal failure.
 type credentialHolder struct {
-	sts         *credential.STSManager
+	sts         credentialSession
 	mu          sync.RWMutex
 	cfg         *uploader.Config
 	partSizeMB  int
@@ -480,8 +491,8 @@ type credentialHolder struct {
 	logger      *zap.Logger
 }
 
-// newCredentialHolder creates a holder over the given STS manager.
-func newCredentialHolder(sts *credential.STSManager, partSizeMB, concurrency int, logger *zap.Logger) *credentialHolder {
+// newCredentialHolder creates a holder over the given STS session store.
+func newCredentialHolder(sts credentialSession, partSizeMB, concurrency int, logger *zap.Logger) *credentialHolder {
 	return &credentialHolder{sts: sts, logger: logger, partSizeMB: partSizeMB, concurrency: concurrency}
 }
 

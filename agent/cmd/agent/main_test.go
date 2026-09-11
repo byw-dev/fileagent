@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -879,32 +879,98 @@ func TestCredentialHolder_RejectsStaleGeneration_Whole(t *testing.T) {
 
 // ── R1（IC-2b review 三轮）：Apply 的原子性 ────────────────────────────────────
 
-// 并发 Apply 不得出现「generation=N 而 uploader 凭据=N-1」的撕裂中间态——
-// 那会让所有上传拿着旧凭据失败直到下一次获取（codex 并发探针第 43 轮实测
-// 复现 generation=64 / uploader=AK-63）。观察点：每轮两个并发 Apply，
-// 收敛后 generation 与 Current() 必须指向同一个（较新的）凭据。
-func TestCredentialHolder_ApplyIsAtomicUnderConcurrency(t *testing.T) {
-	holder := newCredentialHolder(credential.NewSTSManager(), 64, 1, zap.NewNop())
-	const rounds = 400
-	for r := 0; r < rounds; r++ {
-		older, newer := uint64(2*r+1), uint64(2*r+2)
-		wantAK := fmt.Sprintf("AK-%d", newer)
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			holder.Apply(testCredPayload(fmt.Sprintf("AK-%d", older)), older)
-		}()
-		go func() {
-			defer wg.Done()
-			holder.Apply(testCredPayload(fmt.Sprintf("AK-%d", newer)), newer)
-		}()
-		wg.Wait()
-		cfg := holder.Current()
-		require.NotNil(t, cfg)
-		require.Equal(t, wantAK, cfg.AccessKey,
-			"round %d: generation %d is in force but the uploader holds %q — the apply is not atomic",
-			r, newer, cfg.AccessKey)
-		require.Equal(t, newer, holder.Generation())
+// ── R1/R4（IC-2b review）：Apply 的原子性 —— 确定性交错 ───────────────────────
+
+// hookableSession wraps the real STS manager with a test hook that can park a
+// goroutine right after SetSTS returns — before Apply continues. In the fixed
+// implementation that point sits INSIDE h.mu (the parker holds the whole
+// critical section); in the split mutation it sits outside, which is what
+// makes the tear constructible deterministically instead of by scheduling
+// luck (review R4: the probabilistic probe survived the mutation 5/5).
+type hookableSession struct {
+	inner *credential.STSManager
+	// afterSet, when set, is invoked with the generation after every SetSTS.
+	afterSet func(generation uint64)
+}
+
+func (h *hookableSession) SetSTS(cred *credential.STSCredentials, generation uint64) bool {
+	ok := h.inner.SetSTS(cred, generation)
+	if h.afterSet != nil {
+		h.afterSet(generation)
 	}
+	return ok
+}
+
+func (h *hookableSession) Generation() uint64 { return h.inner.Generation() }
+
+// The interleaving under test: an older generation completes SetSTS, is then
+// suspended; a newer generation completes the WHOLE apply; the suspended
+// goroutine resumes and overwrites the uploader credentials with the older
+// payload — generation=N, uploader=N-1, and every upload fails on stale
+// credentials until the next acquisition.
+//
+// Protocol (no scheduling luck involved):
+//  1. A (gen 1) parks at its post-SetSTS hook — signalled, in both
+//     implementations (under h.mu in the fixed one, outside it in the split).
+//  2. B (gen 2) runs. In the SPLIT mutation it completes without needing A's
+//     lock → doneB fires. In the fixed implementation it is structurally
+//     blocked on h.mu (A parks holding it) → doneB cannot fire.
+//  3. A is released either strictly AFTER doneB (split: A's cfg write then
+//     lands after B's — deterministic tear) or after a grace period (fixed:
+//     B is queued on the mutex, so it writes last regardless of when the
+//     grace expires — deterministic green). The grace only picks between two
+//     deterministic outcomes; no assertion depends on timing.
+func TestCredentialHolder_ApplyIsAtomic_DeterministicInterleave(t *testing.T) {
+	aParked := make(chan struct{})
+	proceedA := make(chan struct{})
+	var proceedAOnce sync.Once
+	inner := &hookableSession{
+		inner: credential.NewSTSManager(),
+		afterSet: func(generation uint64) {
+			if generation == 1 {
+				close(aParked)
+				<-proceedA
+			}
+		},
+	}
+	holder := newCredentialHolder(inner, 64, 1, zap.NewNop())
+
+	// A: older generation, parks right after SetSTS succeeds.
+	doneA := make(chan struct{})
+	go func() {
+		defer close(doneA)
+		require.True(t, holder.Apply(testCredPayload("AK-1"), 1))
+	}()
+	<-aParked
+
+	// B: newer generation, full apply.
+	doneB := make(chan struct{})
+	go func() {
+		defer close(doneB)
+		holder.Apply(testCredPayload("AK-2"), 2)
+	}()
+
+	// Release A strictly after B's completion when B can complete (split
+	// mutation), otherwise after a grace period (fixed implementation). Either
+	// way the final state is deterministic.
+	go func() {
+		select {
+		case <-doneB:
+		case <-time.After(2 * time.Second):
+		}
+		proceedAOnce.Do(func() { close(proceedA) })
+	}()
+	<-doneA
+	select {
+	case <-doneB:
+	case <-time.After(2 * time.Second):
+		t.Fatal("B's apply never completed")
+	}
+
+	cfg := holder.Current()
+	require.NotNil(t, cfg)
+	require.Equal(t, "AK-2", cfg.AccessKey,
+		"generation 2 is in force; the uploader credentials must not lag behind it — "+
+			"the apply is not atomic (R1/R4)")
+	require.Equal(t, uint64(2), holder.Generation())
 }
