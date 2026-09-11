@@ -483,9 +483,14 @@ type credentialSession interface {
 // stale credentials (e.g. ones not covering a just-added bucket) and turn the
 // retry's second attempt into a terminal failure.
 type credentialHolder struct {
-	sts         credentialSession
-	mu          sync.RWMutex
+	sts credentialSession
+	mu  sync.RWMutex
+	// cfg and generation are the published credential pair: both are written
+	// inside Apply's single critical section and both are read under the same
+	// mutex, so no reader — Current(), Generation(), or Snapshot() — can ever
+	// see a generation whose credentials have not been published (R5-A).
 	cfg         *uploader.Config
+	generation  uint64
 	partSizeMB  int
 	concurrency int
 	logger      *zap.Logger
@@ -538,10 +543,11 @@ func (h *credentialHolder) Apply(cred *agentv1.CredentialsPayload, generation ui
 	if !h.sts.SetSTS(newSTS, generation) {
 		h.logger.Info("agent: stale credentials response dropped",
 			zap.Uint64("generation", generation),
-			zap.Uint64("current_generation", h.sts.Generation()))
+			zap.Uint64("current_generation", h.generation))
 		return false
 	}
 	h.cfg = cfg
+	h.generation = generation
 	h.logger.Info("agent: STS credentials updated",
 		zap.Uint64("generation", generation),
 		zap.Time("expiry", newSTS.Expiry),
@@ -557,8 +563,29 @@ func (h *credentialHolder) Current() *uploader.Config {
 	return h.cfg
 }
 
-// Generation reports the generation of the held STS session.
-func (h *credentialHolder) Generation() uint64 { return h.sts.Generation() }
+// Snapshot returns the uploader config and the generation of the credentials
+// it was built from, read under one lock — the pair always comes from the
+// same Apply. Callers that need both values must use this, never Current()
+// followed by Generation(): two separate reads can straddle an Apply and
+// yield a pair from two different publications (R5-A).
+func (h *credentialHolder) Snapshot() (*uploader.Config, uint64) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.cfg, h.generation
+}
+
+// Generation reports the generation of the held credentials, served from the
+// holder's own cache under the same mutex as Current(). It deliberately does
+// NOT consult the STS manager's internal lock: reading the session store
+// directly let a generation slip out while the credentials it describes were
+// still unpublished, and uploadWithAccessDeniedRetry — which decides terminal
+// failure from this value — would then judge on a torn view (R5-A: the write
+// side was made atomic in R1, the read side had to follow).
+func (h *credentialHolder) Generation() uint64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.generation
+}
 
 // isAccessDenied reports whether err is (or wraps) a MinIO AccessDenied
 // response — the signal that the held STS session cannot write the target

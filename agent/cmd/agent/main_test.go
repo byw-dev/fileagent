@@ -974,3 +974,70 @@ func TestCredentialHolder_ApplyIsAtomic_DeterministicInterleave(t *testing.T) {
 			"the apply is not atomic (R1/R4)")
 	require.Equal(t, uint64(2), holder.Generation())
 }
+
+// ── R5-A（IC-2b review 四轮）：读侧撕裂——Generation() 必须与发布对同源 ──────────
+
+// 中间态构造：Apply(gen 2) 在 SetSTS 成功后停在钩子上——STS 会话已知道 gen 2，
+// 但 (AK-2, 2) 这一对尚未发布（cfg 仍是 AK-1/1）。此时读 Generation()：
+//
+//	绕过 h.mu 的实现（缺陷形态）立即返回 2——一个其凭据尚未发布的代际，
+//	  uploadWithAccessDeniedRetry 拿它做终态判断，等于撕裂读重新进来（R1 白修）；
+//	正确实现阻塞在 h.mu 上，直到 (AK-2, 2) 整体发布后才返回 2——恒一致。
+func TestCredentialHolder_GenerationReadConsistentWithPublishedPair(t *testing.T) {
+	aParked := make(chan struct{})
+	proceedA := make(chan struct{})
+	var proceedOnce sync.Once
+	inner := &hookableSession{
+		inner: credential.NewSTSManager(),
+		afterSet: func(generation uint64) {
+			if generation == 2 {
+				close(aParked)
+				<-proceedA
+			}
+		},
+	}
+	holder := newCredentialHolder(inner, 64, 1, zap.NewNop())
+	require.True(t, holder.Apply(testCredPayload("AK-1"), 1))
+
+	// A：Apply(gen 2) 停在发布中途，占住 h.mu。
+	doneA := make(chan struct{})
+	go func() {
+		defer close(doneA)
+		holder.Apply(testCredPayload("AK-2"), 2)
+	}()
+	<-aParked
+
+	// 读侧：Generation() 必须等发布对更新后才能返回。
+	doneR := make(chan uint64, 1)
+	go func() { doneR <- holder.Generation() }()
+
+	// 与 R4 相同的双分支放行：读立即返回（变异）→ 撕裂实锤；2s 内未返回
+	// （修复：读被 A 持有的 h.mu 挡住）→ 放行 A，读随后拿到已发布的 2。
+	// 两个分支的终态都确定，断言不依赖时序。
+	tornCh := make(chan uint64, 1)
+	releaseDone := make(chan struct{})
+	go func() {
+		select {
+		case g := <-doneR:
+			tornCh <- g
+		case <-time.After(2 * time.Second):
+		}
+		proceedOnce.Do(func() { close(proceedA) })
+		close(releaseDone)
+	}()
+	<-releaseDone
+	<-doneA
+
+	cfg, gen := holder.Snapshot()
+	require.NotNil(t, cfg)
+	require.Equal(t, "AK-2", cfg.AccessKey)
+	require.Equal(t, uint64(2), gen)
+
+	select {
+	case g := <-tornCh:
+		require.FailNow(t, "Generation() returned while its credentials were unpublished",
+			"a torn read slipped through: generation %d was visible while cfg was still AK-1 "+
+				"— the read bypassed the holder's critical section (R5-A)", g)
+	default:
+	}
+}
