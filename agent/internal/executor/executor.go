@@ -20,6 +20,12 @@ import (
 // executor calls this for every task dequeued from the SQLite queue.
 type UploadFunc func(ctx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error)
 
+// ErrTerminalUpload marks an upload failure whose cause will not go away by
+// retrying — e.g. a second AccessDenied after one credential refresh
+// (IC-BUG-20). Tasks failing with it are failed terminally: no backoff retry,
+// reported with success=false so the UI shows the reason.
+var ErrTerminalUpload = errors.New("terminal upload failure")
+
 // retryDelays defines the wait duration before each retry attempt (1-indexed).
 // Indices beyond the slice length use the last value.
 var defaultRetryDelays = []time.Duration{
@@ -245,7 +251,8 @@ func (e *Executor) processTask(ctx context.Context, task *queue.UploadTask) {
 }
 
 // handleFailure marks a task as failed and re-queues it with exponential
-// backoff unless the retry limit has been reached.
+// backoff unless the retry limit has been reached. Terminal failures
+// (ErrTerminalUpload) skip the retry entirely and report immediately.
 func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 	e.logger.Warn("executor: task failed",
 		zap.String("task_id", task.ID),
@@ -253,6 +260,18 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 		zap.Int("retry_count", task.RetryCount),
 		zap.Error(err),
 	)
+
+	if errors.Is(err, ErrTerminalUpload) {
+		e.logger.Error("executor: task failed terminally, not retrying",
+			zap.String("task_id", task.ID),
+			zap.String("path", task.LocalPath),
+			zap.Error(err),
+		)
+		_ = e.queue.MarkFailed(task.ID, err.Error())
+		task.RetryCount++
+		e.persistResult(context.Background(), task, nil, err)
+		return
+	}
 
 	_ = e.queue.MarkFailed(task.ID, err.Error())
 

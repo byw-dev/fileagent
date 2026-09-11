@@ -9,6 +9,12 @@ import (
 	"google.golang.org/grpc"
 )
 
+// sendChCapacity is the buffer size of each connection's send channel. It is
+// also the threshold past which a burst enqueued with no active consumer
+// starts dropping silently — tests pin that the send goroutine (the consumer)
+// is running before anything is enqueued (IC-BUG-31).
+const sendChCapacity = 32
+
 // AgentConn represents a single connected agent stream.
 type AgentConn struct {
 	AgentID     string
@@ -16,6 +22,15 @@ type AgentConn struct {
 	SendCh      chan *agentv1.ServerMessage
 	ConnectedAt time.Time
 	CancelFunc  context.CancelFunc
+	// SyncDegraded records whether THIS connection's rule sync ran degraded
+	// (snapshot over the size budget, delivered as the keep-alive marker
+	// instead). The Control Plane — not the cache — is the authority on the
+	// degraded condition: the cache is a projection that can lose keys to
+	// eviction or restart, and heartbeat renewal must rebuild from this state,
+	// not from key existence (review R6). Written once during Connect setup
+	// and read by the same connection's heartbeat handling — no concurrent
+	// access.
+	SyncDegraded bool
 }
 
 // AgentRegistry tracks all active bidirectional agent connections.
@@ -40,7 +55,7 @@ func (r *AgentRegistry) Register(
 	conn := &AgentConn{
 		AgentID:     agentID,
 		Stream:      stream,
-		SendCh:      make(chan *agentv1.ServerMessage, 32),
+		SendCh:      make(chan *agentv1.ServerMessage, sendChCapacity),
 		ConnectedAt: time.Now(),
 		CancelFunc:  cancelFn,
 	}

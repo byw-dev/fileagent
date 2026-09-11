@@ -411,3 +411,31 @@ func TestExecutor_AcknowledgementOfUndecodableReportErrors(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, processed, "dedup state must not be written from an unreadable payload")
 }
+
+// IC-BUG-20: a task failing with ErrTerminalUpload must be failed terminally —
+// no backoff retry, reported with success=false so the UI shows the reason.
+// Endless retries would turn persistent policy denials into silent loops.
+func TestExecutor_TerminalUploadError_NoRetry(t *testing.T) {
+	q := newTestQueue(t)
+	attempts := atomic.Int32{}
+	exec := New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		attempts.Add(1)
+		return nil, fmt.Errorf("%w: still AccessDenied after refresh", ErrTerminalUpload)
+	}, zap.NewNop(), 0)
+	exec.Start(context.Background())
+	defer exec.Stop()
+
+	task := newTask("r1", "/f.bin")
+	task.ID = "term-1"
+	require.NoError(t, exec.Submit(context.Background(), task))
+
+	require.Eventually(t, func() bool { return attempts.Load() == 1 }, 2*time.Second, 20*time.Millisecond)
+	// The retry loop must never pick the task up again.
+	assert.Never(t, func() bool { return attempts.Load() > 1 },
+		500*time.Millisecond, 50*time.Millisecond, "terminal error must not be retried")
+	// The failure must be reported (outbox) rather than silently dropped.
+	require.Eventually(t, func() bool {
+		reports, err := q.ListByStatus(queue.StatusReported)
+		return err == nil && len(reports) == 1
+	}, 2*time.Second, 20*time.Millisecond, "terminal failure must produce a success=false report")
+}

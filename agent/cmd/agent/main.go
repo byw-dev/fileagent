@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/pkg/trollsift"
 	"github.com/google/uuid"
+	"github.com/minio/minio-go/v7"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -102,43 +104,31 @@ func main() {
 
 	// ── Upload credentials (set when CredentialsPayload arrives via stream) ──
 	var (
-		uploaderCfgMu      sync.RWMutex
-		currentUploaderCfg *uploader.Config
+		// grpcClient is declared early so the credential-refresh closure below
+		// (used when a put is denied, IC-BUG-20) can capture it; the client is
+		// only created after the queue exists (section 5).
+		grpcClient *grpcclient.Client
+
+		// credGen assigns a strictly monotonic generation to every credential
+		// acquisition — bumped when an acquisition STARTS (RPC) or when a pushed
+		// payload is received. With two concurrent writers (periodic refresh and
+		// the AccessDenied retry), a response requested earlier but arriving later
+		// must never overwrite a newer session (review F2).
+		credGen atomic.Uint64
 	)
+	creds := newCredentialHolder(stsMgr, cfg.Upload.PartSizeMB, cfg.Upload.Concurrency, logger)
 
 	// updateCreds applies a fresh CredentialsPayload to both stsMgr and the
-	// upload config captured by uploadFn.
-	updateCreds := func(cred *agentv1.CredentialsPayload) {
-		newSTS := &credential.STSCredentials{
-			AccessKey:    cred.GetAccessKey(),
-			SecretKey:    cred.GetSecretKey(),
-			SessionToken: cred.GetSessionToken(),
-			Expiry:       cred.GetExpiresAt().AsTime(),
-		}
-		stsMgr.SetSTS(newSTS)
-
-		uploaderCfgMu.Lock()
-		currentUploaderCfg = &uploader.Config{
-			Endpoint:     cred.GetEndpoint(),
-			AccessKey:    cred.GetAccessKey(),
-			SecretKey:    cred.GetSecretKey(),
-			SessionToken: cred.GetSessionToken(),
-			UseSSL:       cred.GetUseSsl(),
-			PartSizeMB:   cfg.Upload.PartSizeMB,
-			Concurrency:  cfg.Upload.Concurrency,
-		}
-		uploaderCfgMu.Unlock()
-
-		logger.Info("agent: STS credentials updated",
-			zap.Time("expiry", newSTS.Expiry),
-			zap.String("endpoint", cred.GetEndpoint()))
+	// upload config captured by uploadFn. A payload whose generation is not
+	// strictly newer is dropped whole — half-applying it would desync the
+	// session from the uploader config.
+	updateCreds := func(cred *agentv1.CredentialsPayload, generation uint64) {
+		creds.Apply(cred, generation)
 	}
 
 	// ── Upload function: creates a fresh Uploader per call using current STS ─
-	uploadFn := func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
-		uploaderCfgMu.RLock()
-		ucfg := currentUploaderCfg
-		uploaderCfgMu.RUnlock()
+	singleAttemptUpload := func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
+		ucfg := creds.Current()
 		if ucfg == nil {
 			return nil, fmt.Errorf("agent: no upload credentials available yet")
 		}
@@ -156,8 +146,35 @@ func main() {
 		)
 	}
 
+	// refreshSTS invalidates the held STS session and mints a fresh one from the
+	// Control Plane. Used by uploadWithAccessDeniedRetry when a put is denied —
+	// the held session covers only the bucket set known at mint time (IC-BUG-20).
+	// The generation is taken when the request STARTS, so a response that raced
+	// with a newer acquisition is dropped instead of overwriting it (review F2).
+	refreshSTS := func(refreshCtx context.Context) error {
+		stsMgr.Clear()
+		generation := credGen.Add(1)
+		cred, err := grpcClient.RefreshCredentials(refreshCtx)
+		if err != nil {
+			return fmt.Errorf("agent: refresh credentials: %w", err)
+		}
+		updateCreds(cred, generation)
+		return nil
+	}
+
 	// ── 7. Worker pool (starts goroutines after exec.Start is called) ────────
-	exec := executor.New(cfg.Upload.Concurrency, q, uploadFn, logger, cfg.Upload.QueueMaxSize)
+	exec := executor.New(cfg.Upload.Concurrency, q, func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
+		return uploadWithAccessDeniedRetry(
+			uploadCtx,
+			task,
+			time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
+			cfg.Upload.AssumedUploadBytesPerSecond,
+			logger,
+			singleAttemptUpload,
+			refreshSTS,
+			creds.Generation,
+		)
+	}, logger, cfg.Upload.QueueMaxSize)
 
 	// ── Scheduler (cron-mode rules) ──────────────────────────────────────────
 	sched := scheduler.New(logger)
@@ -222,7 +239,7 @@ func main() {
 	}
 
 	// ── 5. gRPC client ───────────────────────────────────────────────────────
-	grpcClient := grpcclient.New(cfg, logger)
+	grpcClient = grpcclient.New(cfg, logger)
 	if err := grpcClient.Dial(); err != nil {
 		logger.Error("grpc dial failed", zap.Error(err))
 		return
@@ -238,7 +255,11 @@ func main() {
 	grpcClient.SetMessageHandler(func(msg *agentv1.ServerMessage) {
 		switch p := msg.GetPayload().(type) {
 		case *agentv1.ServerMessage_Credentials:
-			updateCreds(p.Credentials)
+			// A pushed payload carries no generation of its own — it takes the
+			// next one at receipt. An in-flight refresh RPC that started
+			// before this push therefore loses, which is correct: whatever the
+			// CP pushed is at least as fresh as anything requested earlier.
+			updateCreds(p.Credentials, credGen.Add(1))
 
 		case *agentv1.ServerMessage_PushRule:
 			rule := protoToSchedulerRule(p.PushRule.GetRule())
@@ -254,6 +275,27 @@ func main() {
 			ruleID := p.CancelRule.GetRuleId()
 			logger.Info("agent: cancel rule", zap.String("rule_id", ruleID))
 			stopRule(ruleID)
+
+		case *agentv1.ServerMessage_RulesSync:
+			// IC-BUG-30 delete half, snapshot form (D-033): the snapshot is the
+			// agent's complete rule set. Inactive rules stop through
+			// applyRule's Enabled=false branch; rules deleted while
+			// disconnected only exist as absences here.
+			applyRulesSnapshot(
+				protoToSchedulerRules(p.RulesSync.GetRules()),
+				func() []string {
+					ruleHandlesMu.Lock()
+					defer ruleHandlesMu.Unlock()
+					ids := make([]string, 0, len(ruleHandles))
+					for id := range ruleHandles {
+						ids = append(ids, id)
+					}
+					return ids
+				},
+				stopRule,
+				applyRule,
+				logger,
+			)
 
 		case *agentv1.ServerMessage_Revoke:
 			handleRevokeCommand(tokenMgr, stsMgr, grpcClient, stop, logger, p.Revoke.GetReason())
@@ -354,12 +396,15 @@ func main() {
 					continue
 				}
 				logger.Info("agent: refreshing STS credentials")
+				// Generation taken at REQUEST time (review F2): a response that
+				// races with a newer acquisition is dropped on arrival.
+				generation := credGen.Add(1)
 				cred, err := grpcClient.RefreshCredentials(ctx)
 				if err != nil {
 					logger.Warn("agent: refresh credentials failed", zap.Error(err))
 					continue
 				}
-				updateCreds(cred)
+				updateCreds(cred, generation)
 			}
 		}
 	}()
@@ -419,6 +464,226 @@ func uploadTimeoutForSize(fileSize int64, minimum time.Duration, assumedBytesPer
 	return derived
 }
 
+// credentialSession is the STS-session dependency of credentialHolder.
+// A small interface (not the concrete manager) so tests can inject a store
+// whose SetSTS blocks deterministically and thereby construct the exact
+// interleaving that tears generation and uploader credentials apart (review
+// R4 — the probabilistic version of that test needed scheduling luck and
+// survived the split mutation 5/5).
+type credentialSession interface {
+	SetSTS(cred *credential.STSCredentials, generation uint64) bool
+	Generation() uint64
+}
+
+// credentialHolder owns the agent's live STS session and the uploader config
+// derived from it, keyed by a strictly monotonic generation (review F2). The
+// two writers — the periodic refresh goroutine and the AccessDenied retry
+// path — both funnel through Apply; a payload whose generation is not newer
+// than the held one is dropped WHOLE, so a late response can never resurrect
+// stale credentials (e.g. ones not covering a just-added bucket) and turn the
+// retry's second attempt into a terminal failure.
+type credentialHolder struct {
+	sts credentialSession
+	mu  sync.RWMutex
+	// cfg and generation are the published credential pair: both are written
+	// inside Apply's single critical section and both are read under the same
+	// mutex, so no reader — Current(), Generation(), or Snapshot() — can ever
+	// see a generation whose credentials have not been published (R5-A).
+	cfg         *uploader.Config
+	generation  uint64
+	partSizeMB  int
+	concurrency int
+	logger      *zap.Logger
+}
+
+// newCredentialHolder creates a holder over the given STS session store.
+func newCredentialHolder(sts credentialSession, partSizeMB, concurrency int, logger *zap.Logger) *credentialHolder {
+	return &credentialHolder{sts: sts, logger: logger, partSizeMB: partSizeMB, concurrency: concurrency}
+}
+
+// Apply validates the generation, then applies the payload to both the STS
+// session and the uploader config in ONE critical section, and reports
+// whether it was applied.
+//
+// The single critical section is the point: with two concurrent writers (the
+// periodic refresh and the AccessDenied retry), a split application lets an
+// older-but-late response slip between the generation check and the config
+// write — the observed state becomes "generation N, uploader credentials N-1"
+// and every upload then fails on stale credentials until the next
+// acquisition. A concurrency probe reproduced exactly that (generation=64 /
+// uploader=AK-63); the review (R1) requires the check, both writes and the
+// publication to be inseparable. Nothing here may be moved outside h.mu.
+//
+// Consistency scope: readers of Current() take the same mutex, so an upload
+// never sees a torn pair. The periodic refresh ticker reads only sts.Expiry
+// through the STS manager's own lock; a mid-apply read of a newer expiry
+// there is conservative-correct (it defers a refresh that is unnecessary —
+// newer credentials are being installed at that very moment).
+func (h *credentialHolder) Apply(cred *agentv1.CredentialsPayload, generation uint64) bool {
+	if cred == nil {
+		return false
+	}
+	newSTS := &credential.STSCredentials{
+		AccessKey:    cred.GetAccessKey(),
+		SecretKey:    cred.GetSecretKey(),
+		SessionToken: cred.GetSessionToken(),
+		Expiry:       cred.GetExpiresAt().AsTime(),
+	}
+	cfg := &uploader.Config{
+		Endpoint:     cred.GetEndpoint(),
+		AccessKey:    cred.GetAccessKey(),
+		SecretKey:    cred.GetSecretKey(),
+		SessionToken: cred.GetSessionToken(),
+		UseSSL:       cred.GetUseSsl(),
+		PartSizeMB:   h.partSizeMB,
+		Concurrency:  h.concurrency,
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.sts.SetSTS(newSTS, generation) {
+		h.logger.Info("agent: stale credentials response dropped",
+			zap.Uint64("generation", generation),
+			zap.Uint64("current_generation", h.generation))
+		return false
+	}
+	h.cfg = cfg
+	h.generation = generation
+	h.logger.Info("agent: STS credentials updated",
+		zap.Uint64("generation", generation),
+		zap.Time("expiry", newSTS.Expiry),
+		zap.String("endpoint", cfg.Endpoint))
+	return true
+}
+
+// Current returns the uploader config derived from the applied credentials,
+// or nil when no credentials have been applied yet.
+func (h *credentialHolder) Current() *uploader.Config {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.cfg
+}
+
+// Snapshot returns the uploader config and the generation of the credentials
+// it was built from, read under one lock — the pair always comes from the
+// same Apply. Callers that need both values must use this, never Current()
+// followed by Generation(): two separate reads can straddle an Apply and
+// yield a pair from two different publications (R5-A).
+func (h *credentialHolder) Snapshot() (*uploader.Config, uint64) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.cfg, h.generation
+}
+
+// Generation reports the generation of the held credentials, served from the
+// holder's own cache under the same mutex as Current(). It deliberately does
+// NOT consult the STS manager's internal lock: reading the session store
+// directly let a generation slip out while the credentials it describes were
+// still unpublished, and uploadWithAccessDeniedRetry — which decides terminal
+// failure from this value — would then judge on a torn view (R5-A: the write
+// side was made atomic in R1, the read side had to follow).
+func (h *credentialHolder) Generation() uint64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.generation
+}
+
+// isAccessDenied reports whether err is (or wraps) a MinIO AccessDenied
+// response — the signal that the held STS session cannot write the target
+// bucket (IC-BUG-20). The uploader wraps transport errors with %w, so the
+// chain is unwrapped rather than the surface type inspected.
+func isAccessDenied(err error) bool {
+	if err == nil {
+		return false
+	}
+	var resp minio.ErrorResponse
+	return errors.As(err, &resp) && resp.Code == "AccessDenied"
+}
+
+// uploadWithAccessDeniedRetry runs one upload attempt and, on AccessDenied,
+// invalidates the held STS session, refreshes it and retries (IC-BUG-20).
+//
+// The held session covers only the bucket set known when the Control Plane
+// minted it, so a rule pointing at a newly added bucket denies every put
+// until the session is re-issued — up to ~50 minutes on the agent's own
+// refresh tick, retrying exhausted without self-healing.
+//
+// generation reports the credential generation in force (review F2). Two
+// writers race here: the periodic refresh goroutine and this path. The
+// generation guard in the credential holder already drops stale responses, so
+// the retry normally runs on exactly the credentials this path refreshed. But
+// if the generation CHANGES while the second attempt runs, that attempt may
+// have executed on someone else's credentials — in that case one further
+// attempt is made on the newest credentials instead of declaring the task
+// terminally failed on possibly-stale grounds. A terminal verdict requires
+// the generation to be stable across an attempt (at most one bounce; every
+// attempt re-reads the newest credentials).
+//
+// A second AccessDenied on stable credentials is terminally failed
+// (executor.ErrTerminalUpload) and alarmed: a persistent denial means bucket
+// policy or rule configuration is wrong, and retrying would turn that into a
+// silent refresh loop. A refresh failure propagates the original
+// AccessDenied unchanged — that is transient, not a policy verdict, so the
+// executor's backoff may retry later.
+func uploadWithAccessDeniedRetry(
+	parent context.Context,
+	task *queue.UploadTask,
+	minimum time.Duration,
+	assumedBytesPerSecond int64,
+	logger *zap.Logger,
+	upload executor.UploadFunc,
+	refresh func(ctx context.Context) error,
+	generation func() uint64,
+) (*uploader.UploadResult, error) {
+	result, err := uploadWithTimeout(parent, task, minimum, assumedBytesPerSecond, logger, upload)
+	if !isAccessDenied(err) {
+		return result, err
+	}
+	logger.Warn("agent: upload denied, invalidating credentials and refreshing once",
+		zap.String("task_id", task.ID),
+		zap.String("bucket", task.Bucket),
+		zap.Error(err))
+	if rErr := refresh(parent); rErr != nil {
+		logger.Error("agent: credential refresh after AccessDenied failed, will retry on executor backoff",
+			zap.String("task_id", task.ID), zap.Error(rErr))
+		return nil, err
+	}
+	genBefore := generation()
+	result, err = uploadWithTimeout(parent, task, minimum, assumedBytesPerSecond, logger, upload)
+	if !isAccessDenied(err) {
+		return result, err
+	}
+	if generation() == genBefore {
+		// The generation held steady across the attempt: these ARE the
+		// credentials this path refreshed, and they are still denied — a
+		// genuine policy/configuration verdict, not a race.
+		logger.Error("agent: upload still denied after one credential refresh; failing task terminally "+
+			"(check the bucket policy and the rule's template/configuration)",
+			zap.String("task_id", task.ID),
+			zap.String("bucket", task.Bucket),
+			zap.Error(err))
+		return nil, fmt.Errorf("%w: still AccessDenied after one credential refresh: %v",
+			executor.ErrTerminalUpload, err)
+	}
+	// The generation moved while the attempt ran: the attempt may have
+	// executed on someone else's credentials. One further attempt on the
+	// newest credentials — a policy verdict requires stable credentials.
+	logger.Warn("agent: credential generation changed during retry, attempting once more on the newest credentials",
+		zap.String("task_id", task.ID),
+		zap.Uint64("generation_before", genBefore),
+		zap.Uint64("generation_now", generation()))
+	result, err = uploadWithTimeout(parent, task, minimum, assumedBytesPerSecond, logger, upload)
+	if isAccessDenied(err) {
+		logger.Error("agent: upload denied on the newest credentials; failing task terminally "+
+			"(check the bucket policy and the rule's template/configuration)",
+			zap.String("task_id", task.ID),
+			zap.String("bucket", task.Bucket),
+			zap.Error(err))
+		return nil, fmt.Errorf("%w: still AccessDenied on the newest credentials: %v",
+			executor.ErrTerminalUpload, err)
+	}
+	return result, err
+}
+
 // handleRevokeCommand clears local credentials and triggers graceful shutdown.
 func handleRevokeCommand(tokenMgr *credential.TokenManager, stsMgr *credential.STSManager, client grpcClientTokenSetter, stop context.CancelFunc, logger *zap.Logger, reason string) {
 	logger.Warn("agent: token revoked by Control Plane", zap.String("reason", reason))
@@ -467,6 +732,16 @@ func protoToSchedulerRule(r *agentv1.CollectionRule) scheduler.CollectionRule {
 		AppendMode:       r.GetAppendMode(),
 		Enabled:          r.GetEnabled(),
 	}
+}
+
+// protoToSchedulerRules converts a snapshot of protobuf CollectionRules to the
+// scheduler type (D-033).
+func protoToSchedulerRules(rs []*agentv1.CollectionRule) []scheduler.CollectionRule {
+	out := make([]scheduler.CollectionRule, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, protoToSchedulerRule(r))
+	}
+	return out
 }
 
 // runWatcher starts a file-system watcher for the given watch-mode rule and
@@ -558,6 +833,13 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 }
 
 // submitFile checks deduplication and enqueues an upload task.
+//
+// Since IC-BUG-21 a dest_path_template that cannot be resolved refuses the
+// task: nothing is enqueued, so nothing is ever written to a guessed object
+// key. The task is not enqueued in a doomed state either — a broken-template
+// rule watching a busy directory would otherwise flood the queue and its
+// capacity eviction would shed healthy backlog. Files re-collect naturally
+// once the template is fixed (cron walk / next write event).
 func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
 	done, err := q.IsProcessed(ctx, rule.RuleID, localPath, mtime.Unix(), size)
 	if err != nil {
@@ -566,11 +848,22 @@ func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, ru
 	if done {
 		return
 	}
+	storagePath, pathErr := buildStoragePath(rule, localPath, agentCtx, time.Now().UTC(), logger)
+	if pathErr != nil {
+		// The first occurrence carries the full detail; duplicates for the same
+		// rule are Debug-logged inside buildStoragePath (IC-BUG-21: one Warn,
+		// not 5000).
+		logger.Debug("agent: upload task refused, object key unresolved",
+			zap.String("rule_id", rule.RuleID),
+			zap.String("path", localPath),
+			zap.Error(pathErr))
+		return
+	}
 	task := &queue.UploadTask{
 		ID:          uuid.New().String(),
 		RuleID:      rule.RuleID,
 		LocalPath:   localPath,
-		StoragePath: buildStoragePath(rule, localPath, agentCtx, time.Now().UTC(), logger),
+		StoragePath: storagePath,
 		Bucket:      rule.UploadBucket,
 		FileSize:    size,
 		FileMtime:   mtime.Unix(),
@@ -584,21 +877,25 @@ func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, ru
 	}
 }
 
+// templateRefusals deduplicates the per-rule dest_path_template failure
+// warning over the process lifetime (IC-BUG-21): one misconfigured rule
+// watching 5000 files must produce one full Warn, not 5000 that an operator
+// will mute — a per-file warning storm is how IC-BUG-21 degraded into noise.
+var templateRefusals sync.Map
+
 // buildStoragePath resolves the upload path template and returns the object
-// key to use in MinIO.
+// key to use in MinIO, or an error when the template cannot be resolved.
 //
 // The template is normalised first (trollsift.NormalizeTemplate) so the key the
 // agent writes and the template the Control Plane later reverse-parses agree on
 // the leading separator; see docs/design/contracts.md V-3.
 //
-// If the template contains the {filename} variable it is substituted with the
-// file's base name, and the result is used as-is. Otherwise the resolved prefix
-// is treated as a directory and the file's base name is appended automatically.
-//
-// Every fallback to the bare base name is logged: a silent fallback is how
-// IC-BUG-17 hid an agent whose identity fields were empty, flattening every
-// upload into the bucket root.
-func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx trollsift.AgentContext, now time.Time, logger *zap.Logger) string {
+// Since IC-BUG-21 resolution failure fails the task instead of guessing a key:
+// with D-030's bucket-wide policy a wrong object key is no longer caught by any
+// 403 — a guessed key silently lands in the wrong place, polluting the index
+// and the IC-6 reconciliation shard tree. A silent fallback was exactly how
+// IC-BUG-17 flattened every upload into the bucket root.
+func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx trollsift.AgentContext, now time.Time, logger *zap.Logger) (string, error) {
 	relPath, err := filepath.Rel(rule.BasePath, localPath)
 	if err != nil {
 		relPath = filepath.Base(localPath)
@@ -623,35 +920,74 @@ func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx 
 		fields["time"] = trollsift.T(now)
 	}
 
-	fallback := filepath.Base(localPath)
-	template := trollsift.NormalizeTemplate(rule.DestPathTemplate)
-
-	destParser, err := trollsift.New(template)
-	if err != nil {
-		logger.Warn("agent: dest_path_template is not a valid pattern, falling back to base name",
+	fail := func(cause string, causeErr error) (string, error) {
+		err := fmt.Errorf("dest_path_template for rule %s cannot be resolved (%s): template %q: %w",
+			rule.RuleID, cause, rule.DestPathTemplate, causeErr)
+		if _, dup := templateRefusals.LoadOrStore(rule.RuleID, true); dup {
+			logger.Debug("agent: dest_path_template still unresolvable for this rule (first occurrence already logged)",
+				zap.String("rule_id", rule.RuleID))
+			return "", err
+		}
+		logger.Warn("agent: dest_path_template unresolvable, refusing to guess an object key — task will not be enqueued "+
+			"(fix the rule's dest_path_template; existing files are re-collected on the next cron walk or write event)",
 			zap.String("rule_id", rule.RuleID),
 			zap.String("template", rule.DestPathTemplate),
-			zap.String("storage_path", fallback),
-			zap.Error(err))
-		return fallback
+			zap.Error(causeErr))
+		return "", err
+	}
+
+	destParser, err := trollsift.New(trollsift.NormalizeTemplate(rule.DestPathTemplate))
+	if err != nil {
+		return fail("not a valid pattern", err)
 	}
 	storagePath, err := destParser.Compose(fields, false)
 	if err != nil {
-		logger.Warn("agent: cannot resolve dest_path_template, falling back to base name",
-			zap.String("rule_id", rule.RuleID),
-			zap.String("template", rule.DestPathTemplate),
-			zap.String("storage_path", fallback),
-			zap.Error(err))
-		return fallback
+		return fail("unresolvable field", err)
 	}
 	if storagePath == "" {
-		logger.Warn("agent: dest_path_template resolved to an empty key, falling back to base name",
-			zap.String("rule_id", rule.RuleID),
-			zap.String("template", rule.DestPathTemplate),
-			zap.String("storage_path", fallback))
-		return fallback
+		return fail("resolved to an empty key", fmt.Errorf("composed key is empty"))
 	}
-	return trollsift.NormalizeObjectKey(storagePath)
+	return trollsift.NormalizeObjectKey(storagePath), nil
+}
+
+// applyRulesSnapshot replaces the agent's whole rule set with the synced
+// snapshot (IC-BUG-30 / D-033). Rules held but absent from the snapshot were
+// deleted while the agent was disconnected — their absence is the only signal
+// it ever gets, and with D-030's bucket-wide policy their uploads would
+// otherwise continue unchecked until process restart. Snapshot rules are then
+// applied through applyRule, whose Enabled=false branch stops paused rules;
+// an empty snapshot therefore means "everything was deleted".
+func applyRulesSnapshot(rules []scheduler.CollectionRule, held func() []string, stop func(ruleID string), apply func(scheduler.CollectionRule), logger *zap.Logger) {
+	ids := make([]string, 0, len(rules))
+	for _, r := range rules {
+		ids = append(ids, r.RuleID)
+	}
+	stopRulesOutsideSync(ids, held, stop, logger)
+	for _, r := range rules {
+		apply(r)
+	}
+}
+
+// stopRulesOutsideSync stops every currently-held rule outside the synced
+// full set (IC-BUG-30, D-033). RulesSyncCommand.rule_ids is the complete set
+// of rule ids the Control Plane still has for this agent; rules deleted while
+// the agent was disconnected are absent by design, and their absence is the
+// only signal it ever gets — with D-030's bucket-wide policy their uploads
+// would otherwise continue unchecked until process restart. Inactive rules do
+// not pass through here: they arrive as ordinary pushes whose Enabled=false
+// makes applyRule stop them.
+func stopRulesOutsideSync(ruleIDs []string, held func() []string, stop func(ruleID string), logger *zap.Logger) {
+	inSet := make(map[string]struct{}, len(ruleIDs))
+	for _, id := range ruleIDs {
+		inSet[id] = struct{}{}
+	}
+	for _, id := range held() {
+		if _, ok := inSet[id]; !ok {
+			logger.Info("agent: stopping rule outside the synced full set (deleted while disconnected)",
+				zap.String("rule_id", id))
+			stop(id)
+		}
+	}
 }
 
 // matchGlob matches a local absolute path against rule.PathPattern using relative-path semantics.

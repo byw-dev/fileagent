@@ -231,6 +231,9 @@ func main() {
 	grpcSrv := grpcserver.New(logger)
 	grpcSrv.WithDeps(registry, redisClient, authSvc, nats, agentMgr)
 	grpcSrv.WithExtraDeps(dispatcher, ix, stsMgr, queries)
+	// IC-BUG-20: a dispatched rule pointing at a bucket the agent's held STS
+	// session does not cover must trigger a credentials re-push.
+	dispatcher.SetCredentialPusher(grpcSrv)
 	grpcSrv.WithStateDB(queries)
 	grpcSrv.WithDirResultStore(dirStore)
 	grpcSrv.WithDryRunStore(dryRunStore)

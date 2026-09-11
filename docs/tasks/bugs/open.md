@@ -379,6 +379,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **后果** | agent 已连接、持有覆盖 bucket A 的 1h 会话 → 管理员新建一条指向 **bucket B** 的规则 → 规则立即下发、agent 立即开始 PutObject 到 B → **403**，直到会话剩余 10 分钟才刷新，**最坏约 50 分钟**。期间重试耗尽的任务直接失败，不会自愈。IC-1 任务卡 ② 写的是「按该 Agent **已下发规则**涉及的 bucket 集合签发」——该集合是动态的，当前实现只在建流时快照了一次 |
 | **修复** | 两条都做：① CP 在规则下发/启用导致 bucket 集合变化时重推凭据（`DispatchRule` 成功后调 `pushCredentials`）；② agent 侧上传遇 `AccessDenied` 时作废当前凭据、立即刷新一次并重试**一次**——第二次仍 403 则以独特错误落终态，不做无限重试（否则会把 policy 前缀错配那类缺陷变成静默循环）。②同时是设计文档 §3.2 要求的通用兜底 |
 | **验收** | agent 运行中新建一条指向新 bucket 的规则，首个文件即上传成功（不出现 403）；断开 policy 授权后上传失败两次即落终态并告警 |
+| **✅ 已修（IC-2b ①）** | CP：`Dispatcher.SetCredentialPusher` 接线到 `Server.PushCredentials`——`DispatchRule` 成功后若新规则的 bucket 未被该 agent 其他 active 规则覆盖（集合变化）即重推（移除 bucket 是超集无害，只对新增触发）。agent：`uploadWithAccessDeniedRetry`——首次 403 作废 STS + `RefreshCredentials` + 重试一次；二次 403 以 `executor.ErrTerminalUpload` 落终态（不进 backoff，立即 success=false 上报）；刷新本身失败原样上抛（transient 走既有 backoff）。live：运行中新建指向新 bucket 的规则，首个文件即成功、日志零 AccessDenied（`TestIC2BLive` act 2） |
 
 ## IC-BUG-21 — 模板解析失败时猜一个对象键写进去，污染对账分片 🟡 P2
 
@@ -389,6 +390,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **后果** | ①写入一个**错误的**对象键比让任务失败更糟：IC-6 之后 `object_keys` 按前缀分片对账，桶根平铺的对象会污染分片树，且这些对象的 path_var 永远反解不出来；②Warn 是 per-file 的——规则模板配错时一次投 5000 个文件就是 5000 条 Warn + 5000 个根目录对象，运维会把它当噪音关掉，等于退回静默 |
 | **修复** | 兜底改为**任务失败**（可重试 / 可告警）而不是猜键；Warn 按 `rule_id` 去重（首次记录）或采样。归 **IC-2b**（agent 侧鲁棒性一刀，与 IC-BUG-20 同刀）——它改的是任务终态语义，与上报通道本身无关 |
 | **验收** | 模板解析不出来时任务进入失败态并可在 UI 看到原因；同一规则连续 N 个文件失败只产生一条 Warn |
+| **✅ 已修（IC-2b ②）** | `buildStoragePath` 三条兜底（模板无效 / Compose 失败 / 结果为空，含空模板——REST create 本就 `binding:"required"`）全部改为返回错误；`submitFile` 拿不到键即拒绝入队，不得再猜对象键。**刻意取舍**：不走「入队空路径→上传期失败」——一条配错模板的 busy 规则会泛洪队列、容量淘汰甩掉健康积压（让无害变有害）；代价是失败不落 `upload_logs`（UI 看不到行），可见性 = 按 `rule_id` 去重的恰一条 Warn（首条全量细节），文件在模板修复后由 cron walk / 下次写事件自然重采。UI 行可见性欠账记在报告，如需可在后续刀补（属于 webui/queue 范围） |
 
 ## IC-BUG-22 — `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token 🔴 P0 ✅ 已修（IC-1，PR #93）
 
@@ -503,6 +505,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **与 IC-2a 的关系** | 上报活过来之后，这些上传会带着一个**已删除的 `rule_id`** 到达 `HandleUploadResult`，因此 IC-BUG-29 的归属校验必须处理三分支。**但注意归因**：那一支的根是「队列与规则生命周期解耦」（见 IC-BUG-29 卡片的五条路径），本条只是把它从「一次排空」放大成「无界产生」。**修好本条不会消掉那一支**，IC-2a ⑦ 仍必须独立处理 |
 | **修复** | 两半，缺一不可：① **停用**：`SyncRulesOnConnect` 连 inactive 一起推——agent 的 `applyRule` 对 `Enabled == false` 已经会先 `stopRule` 再 return，复用既有分支即可；② **删除**：删掉的行已不在 `ListCollectionRulesByAgent` 的结果里，**推不出来**，必须给同步加全集语义（下发一条「本次同步的 `rule_id` 全集」，agent 停掉集合外的规则）或 CP 侧留 tombstone。推荐全集语义——proto 只增字段，不必引入软删除表 |
 | **验收** | agent 与 CP 断连 → 删除一条规则、停用另一条 → 恢复连接 → 两条都不再产生上传，且 **agent 进程不重启**也成立；单测覆盖「全集里缺失的规则被停掉」 |
+| **✅ 已修（IC-2b ③，D-033）** | **快照形态**：`ServerMessage` oneof 新增 `rules_sync = 17`（`RulesSyncCommand`），`SyncRulesOnConnect` 一次同步只发一条携带 DB 全部规则（active + inactive，不含已删除——「不含」正是删除半边语义）的快照；agent `applyRulesSnapshot` 原子替换规则集（集合外停掉，`Enabled==false` 走 `applyRule` 既有停用分支）。**为什么不是逐条 push + 全集 ID**：初版行为级验证 5/5 确定性失败——41 条消息经 32 缓冲，burst-vs-drain 结构性丢失 8 条 + 凭据（生产微秒级循环恒快于逐条 `stream.Send`），且与「快照失败即断连」组合对 >32 规则 agent 是无限重连循环。快照失败仍断连重连（单条消息失败罕见，安全），日志区分缓冲满 / 断连；快照超 gRPC 4MB 上限整条响式失败。单条增量 `DispatchRule`/`DispatchRuleCancel` 不变；**经 API 批量改动大量规则时 burst 会重现（本刀未修，待立卡）**。live：断连期间删除/停用规则，恢复后不重启 agent 不再上传（`TestIC2BLive` act 1）；40 条规则重连后 40 条全部生效（act 3） |
 
 ## IC-BUG-31 — `registry.Send` 队列满即静默丢弃，且 Connect 在消费者启动前入队 🟠 P1
 
@@ -514,7 +517,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **后果** | ① **规则丢失是永久的**——agent 只在建流时拿规则，下次重连会以完全相同的方式再丢一次；② 凭据丢失可自愈，窗口 ≤1 分钟（agent 侧 1min tick 的刷新 goroutine，IC-1 ⑤ 已去掉 `sts == nil` 短路）；③ **IC-2a 引入 `Acknowledgement` 后，丢一个 ack 就有一个任务永久停在 `reported`、outbox 永不清空** |
 | **修复** | 分两层：① **结构**——`Connect` 里把发送 goroutine 提到 `SyncRulesOnConnect` / `pushCredentials` **之前**启动（顺序调整，消除「无消费者时入队」）；② **语义**——接受 `Send` 仍是 best-effort，但每个消费方自带补偿：规则靠 IC-BUG-30 的全集同步，ack 靠 IC-2a 的重报超时。**不要试图把 `Send` 改成可靠投递**——那正是 M-2 的错误方向（把协作式机制当成强制手段）；可靠性应当由接收方的重试提供，而不是由发送方的保证提供 |
 | **验收** | 给一个 agent 配 40 条 active 规则，重连后 40 条全部生效且凭据到达；单测覆盖「SendCh 满时调用方可观测到失败」（`DispatchRule` 不再吞掉） |
-| **ack 半边已随 IC-2a ④ 关闭（2026-09-11）** | ack 仍走 best-effort 的 `registry.Send`（**没有**去把 `Send` 改成可靠——那正是 M-2 的错误方向），改法是 agent 侧 `reported` 超时回退重发；幂等由 `task_id` + `(bucket_id, storage_path)` + `observed_at` 三者保证。live 回归：代理**故意丢掉第一个 ack**，任务仍自愈完成（`upload_logs` 因此有 2 行，首报 + 重报）。**结构半边（`SendCh` 满即静默丢弃）仍开着，归 IC-2b**，本卡片保持 open
+| **ack 半边已随 IC-2a ④ 关闭（2026-09-11）** | ack 仍走 best-effort 的 `registry.Send`（**没有**去把 `Send` 改成可靠——那正是 M-2 的错误方向），改法是 agent 侧 `reported` 超时回退重发；幂等由 `task_id` + `(bucket_id, storage_path)` + `observed_at` 三者保证。live 回归：代理**故意丢掉第一个 ack**，任务仍自愈完成（`upload_logs` 因此有 2 行，首报 + 重报）。**结构半边已随 IC-2b ④ 关闭（2026-09-11）**：`Connect` 的发送 goroutine 提前到 `SyncRulesOnConnect`/`pushCredentials` 之前启动（消除无消费者入队），`DispatchRule` 不再吞 `Send` 失败（返回错误给调用方）。行为级证据：40 条规则 + 凭据在旧形态下 5/5 确定性丢 8 条 + 凭据（恰好送达 32 条）→ 快照形态（IC-BUG-30 的 D-033）下 5/5 全部送达。ack 半边仍按 IC-2a ④ 的超时回退模型（`Send` 保持 best-effort）。**残留**：单次同步 1 条消息无压力，但经 API 批量改动大量规则时增量通道的 burst 会重现（未修，待立卡）；`registry.Send` 仍是 `select/default` 队满即丢，靠各消费方自带补偿
 
 ## IC-BUG-32 — `Revoke` 的 `Send` 与 `Disconnect` 存在竞态窗口，命令可能在切流前被丢弃 🟡 P2
 

@@ -2,6 +2,7 @@ package grpcserver
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -9,9 +10,11 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"github.com/byw-dev/fileagent/controlplane/internal/agent"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -331,4 +334,626 @@ func TestServer_Connect_HalfClose_WhileSendBlocked_StillUnregisters(t *testing.T
 	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
 		10*time.Second, 50*time.Millisecond,
 		"handler pinned in the Recv error branch — the agent made itself unrevokable")
+}
+
+// IC-BUG-30 (D-033 hardening): a failed rule sync must END the stream. The
+// rules_sync full-set message is the entire delete half of the fix — if it is
+// dropped and the agent keeps running, its rule view silently falls back to
+// the pre-fix behaviour with no signal. Running with an untrustworthy rule
+// view is worse than disconnecting: the agent reconnects into a clean full
+// re-sync.
+func TestServer_Connect_RuleSyncFailure_EndsStream(t *testing.T) {
+	agentID := "77777777-7777-7777-7777-777777777777"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	srv := New(logger)
+	srv.WithDeps(registry, newMockCache(), jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&mockDispatcher{err: assert.AnError}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+
+	// The handler must return after the sync failure, ending the RPC — the
+	// client's Recv must come back with an error rather than block forever.
+	recvErr := make(chan error, 1)
+	go func() { _, e := stream.Recv(); recvErr <- e }()
+	select {
+	case e := <-recvErr:
+		require.Error(t, e, "a failed rule sync must end the stream, not be swallowed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream still open 5s after rule-sync failure — the sync error was swallowed")
+	}
+	assert.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		3*time.Second, 20*time.Millisecond, "registry entry must be cleaned up")
+}
+
+// ── IC-BUG-31 结构半边：≥33 条规则的送达（行为级）─────────────────────────────
+//
+// ⚠️ 旧形态的实证（决定本测试形状的证据，勿删）：初版实现是「逐条 push 全量 +
+// 最后一条 rules_sync + 凭据」共 41 条消息，全部经 32 缓冲的非阻塞 Send 入队。
+// 即使发送 goroutine 已提前启动（消费者先于生产者），40 条的 burst 仍然
+// 5/5 确定性失败：恰好送达 32 条、其余 8 条与凭据全被 select/default 静默丢弃
+// （生产是微秒级紧循环，消费是逐条 stream.Send 含 gRPC 帧封装 + 流控，
+// 生产速率恒大于消费速率——这是结构性丢失，不是 flaky）。
+// 因此 D-033 改为快照形态：一次同步只发 1 条 RulesSyncCommand，
+// 逐条 PushRuleCommand 只留给单条增量下发。本测试由此改证快照路径不丢。
+//
+// bulkSyncDispatcher reproduces the sync as Connect drives it: one snapshot
+// message with every rule, then the credentials push behind it.
+type bulkSyncDispatcher struct {
+	registry *AgentRegistry
+	rules    int
+}
+
+func (d *bulkSyncDispatcher) SyncRulesOnConnect(_ context.Context, agentID string) error {
+	snapshot := make([]*agentv1.CollectionRule, 0, d.rules)
+	for i := 0; i < d.rules; i++ {
+		snapshot = append(snapshot, &agentv1.CollectionRule{RuleId: fmt.Sprintf("rule-%02d", i)})
+	}
+	d.registry.Send(agentID, &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_RulesSync{
+			RulesSync: &agentv1.RulesSyncCommand{Rules: snapshot},
+		},
+	})
+	// Mirror pushCredentials: the credentials push follows the rule sync.
+	d.registry.Send(agentID, &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Credentials{
+			Credentials: &agentv1.CredentialsPayload{AccessKey: "AKID"},
+		},
+	})
+	return nil
+}
+
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (d *bulkSyncDispatcher) ReleaseAgent(_ string) {}
+
+// 40 active rules must ALL reach the agent, and the credentials push behind
+// them must arrive. 40 > 32 is deliberate — it is exactly the count that
+// structurally dropped 8 rules and the credentials under the old per-message
+// push form (see the comment above); under the snapshot form the same 40
+// arrive as one message with room to spare.
+func TestServer_Connect_FortyRules_AllDelivered(t *testing.T) {
+	agentID := "88888888-8888-8888-8888-888888888888"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	srv := New(logger)
+	srv.WithDeps(registry, newMockCache(), jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&bulkSyncDispatcher{registry: registry, rules: 40}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+
+	rules := make(map[string]bool)
+	gotCreds := false
+	for {
+		msg, rErr := stream.Recv()
+		if rErr != nil {
+			break
+		}
+		switch p := msg.GetPayload().(type) {
+		case *agentv1.ServerMessage_RulesSync:
+			for _, r := range p.RulesSync.GetRules() {
+				rules[r.GetRuleId()] = true
+			}
+		case *agentv1.ServerMessage_Credentials:
+			gotCreds = true
+		}
+		if len(rules) == 40 && gotCreds {
+			break
+		}
+	}
+	assert.Len(t, rules, 40, "every pushed rule must reach the agent")
+	assert.True(t, gotCreds, "the credentials push behind the rules must arrive")
+}
+
+// ── F4（IC-2b review）：钉住「消费者先于生产者启动」的行为级用例 ────────────────
+//
+// 快照形态下一次同步只有 1 条消息，「消费者后置」变异没有消息丢失的行为差异，
+// 40 条快照用例杀不死它。本用例钉住顺序本身的行为签名：同步期间把 SendCh 打满，
+// 第 33 条只有在**存在正在排空的消费者**时才可能被接受——
+//   消费者先于同步启动（现状）：33 条立即被接受，全部送达（结构性保证，无时序运气）；
+//   消费者被移回同步之后（变异）：同步期间永远没有消费者 → 2s 内第 33 条必然
+//   不被接受 → SyncRulesOnConnect 返回错误 → Connect 结束流 → 用例红。
+
+// consumerPinningDispatcher 模拟任意在同步期间入队的下发方：打满缓冲后，
+// 要求观察到排空才继续，最后再补一条凭据（复刻 sync + pushCredentials 两股生产）。
+type consumerPinningDispatcher struct {
+	registry *AgentRegistry
+	total    int // 要送达的规则消息数，必须 > sendChCapacity
+}
+
+func (d *consumerPinningDispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) error {
+	pushRule := func(i int) *agentv1.ServerMessage {
+		return &agentv1.ServerMessage{
+			Payload: &agentv1.ServerMessage_PushRule{
+				PushRule: &agentv1.PushRuleCommand{
+					Rule: &agentv1.CollectionRule{RuleId: fmt.Sprintf("rule-%02d", i)},
+				},
+			},
+		}
+	}
+	for i := 0; i < sendChCapacity; i++ {
+		if !d.registry.Send(agentID, pushRule(i)) {
+			return fmt.Errorf("buffer rejected message %d with no burst — unexpected", i)
+		}
+	}
+	deadline := time.After(2 * time.Second)
+	for i := sendChCapacity; i < d.total; i++ {
+		for {
+			if d.registry.Send(agentID, pushRule(i)) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-deadline:
+				return fmt.Errorf(
+					"no consumer drained SendCh during the sync: send goroutine started after the producers (IC-BUG-31)")
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	d.registry.Send(agentID, &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Credentials{
+			Credentials: &agentv1.CredentialsPayload{AccessKey: "AKID"},
+		},
+	})
+	return nil
+}
+
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (d *consumerPinningDispatcher) ReleaseAgent(_ string) {}
+
+// The send goroutine must be RUNNING before SyncRulesOnConnect is invoked:
+// the dispatcher is only able to deliver past the buffer capacity if a
+// consumer is actively draining. This is a structural guarantee, not a timing
+// bet — with the consumer started late the sync can never complete.
+func TestServer_Connect_SendConsumerRunsBeforeSync(t *testing.T) {
+	const total = sendChCapacity + 8
+	agentID := "99999999-9999-9999-9999-999999999999"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	srv := New(logger)
+	srv.WithDeps(registry, newMockCache(), jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&consumerPinningDispatcher{registry: registry, total: total}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+
+	rules := make(map[string]bool)
+	gotCreds := false
+	for {
+		msg, rErr := stream.Recv()
+		if rErr != nil {
+			break
+		}
+		switch p := msg.GetPayload().(type) {
+		case *agentv1.ServerMessage_PushRule:
+			rules[p.PushRule.GetRule().GetRuleId()] = true
+		case *agentv1.ServerMessage_Credentials:
+			gotCreds = true
+		}
+		if len(rules) == total && gotCreds {
+			break
+		}
+	}
+	assert.Len(t, rules, total,
+		"every message enqueued during the sync must be delivered — which requires the send consumer to run before the sync")
+	assert.True(t, gotCreds)
+}
+
+// ── F5（IC-2b review 二轮）：凭据必须先于规则到达 ──────────────────────────────
+//
+// ④ 把发送 goroutine 提前后，快照立即送达而 pushCredentials（内含一次 MinIO
+// AssumeRole 往返）随后才发——agent 收到规则即启动 watcher，IC-5 的初始扫描
+// 立刻发现既有文件并尝试上传，此时凭据未到 → 任务失败 → 吃掉 1 分钟退避，
+// TestUploadMainPathLive 因此在 PR #103 上红（master 绿）。修法：凭据先于规则。
+// 本用例钉住消息序：Credentials 必须先于任何 RulesSync 到达。
+
+// singleSnapshotDispatcher mimics SyncRulesOnConnect: exactly one snapshot.
+type singleSnapshotDispatcher struct {
+	registry *AgentRegistry
+}
+
+func (d *singleSnapshotDispatcher) SyncRulesOnConnect(_ context.Context, agentID string) error {
+	d.registry.Send(agentID, &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_RulesSync{
+			RulesSync: &agentv1.RulesSyncCommand{Rules: []*agentv1.CollectionRule{
+				{RuleId: "r1"},
+			}},
+		},
+	})
+	return nil
+}
+
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (d *singleSnapshotDispatcher) ReleaseAgent(_ string) {}
+
+// The agent cannot act on rules without credentials (IC-5's initial scan
+// uploads the moment a rule arrives), so the credentials push must be
+// enqueued BEFORE the rule snapshot. The channel is FIFO, so the payload
+// order the client observes is the enqueue order.
+func TestServer_Connect_CredentialsDeliveredBeforeRuleSync(t *testing.T) {
+	agentID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	srv := New(logger)
+	srv.WithDeps(registry, newMockCache(), jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&singleSnapshotDispatcher{registry: registry}, nil,
+		&mockSTSMgr{creds: &agentv1.CredentialsPayload{AccessKey: "AKID"}},
+		&mockCredDB{
+			bucket: &db.Bucket{Name: "data-sensor"},
+			rules: []*db.CollectionRule{
+				{ID: uuid.New(), AgentID: uuid.MustParse(agentID), Status: db.RuleStatusActive},
+			},
+		})
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+
+	gotCreds, gotSync := false, false
+	var credFirst bool
+	for !(gotCreds && gotSync) {
+		msg, rErr := stream.Recv()
+		require.NoError(t, rErr)
+		switch msg.GetPayload().(type) {
+		case *agentv1.ServerMessage_Credentials:
+			gotCreds = true
+			credFirst = !gotSync
+		case *agentv1.ServerMessage_RulesSync:
+			gotSync = true
+		}
+	}
+	assert.True(t, credFirst,
+		"credentials must reach the agent before the rule snapshot — a rule arriving first "+
+			"starts the watcher and IC-5's initial scan uploads with no credentials (review F5)")
+}
+
+// ── R3（IC-2b review 三轮）：降级态必须可观测、可查询 ─────────────────────────
+
+// degradedSyncDispatcher 报告降级（ErrRulesSyncDegraded）。Connect 必须把它与
+// 致命同步失败区分开：保持连接，并在缓存里留下可被 API 读取的降级标记。
+type degradedSyncDispatcher struct{}
+
+func (d *degradedSyncDispatcher) SyncRulesOnConnect(_ context.Context, _ string) error {
+	return fmt.Errorf("sync_rules: snapshot oversized for agent x: %w", agent.ErrRulesSyncDegraded)
+}
+
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (d *degradedSyncDispatcher) ReleaseAgent(_ string) {}
+
+func TestServer_Connect_RuleSyncDegraded_KeepsStreamAndMarksCache(t *testing.T) {
+	agentID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	mc := newMockCache()
+	srv := New(logger)
+	srv.WithDeps(registry, mc, jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&degradedSyncDispatcher{}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+
+	// 连接必须保持：降级不是断流理由，agent 仍可收发（心跳往返作证）。
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		5*time.Second, 20*time.Millisecond, "a degraded sync must not end the stream")
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hb-1",
+		Payload: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{UptimeSeconds: 1}}}))
+	assert.True(t, registry.IsOnline(agentID), "the stream must still be alive after a degraded sync")
+
+	// 降级标记必须落缓存（API/UI 可读），而不是只有一条 ERROR 日志。
+	assert.Eventually(t, func() bool {
+		_, ok := mc.sets[cache.AgentSyncDegradedKey(agentID)]
+		return ok
+	}, 3*time.Second, 50*time.Millisecond, "the degraded state must be observable via the cache")
+}
+
+// ── R5-B（IC-2b review 四轮）：降级标记的生命周期与降级条件一致 ────────────────
+
+// 降级连接可以活得比标记的 TTL 久：心跳必须给仍存在的降级标记续期，否则
+// 长期在线且持续降级的连接在 24h 后静默失去可观测性——恰是最该被发现的状态。
+func TestServer_Heartbeat_RenewsDegradedMarker(t *testing.T) {
+	agentID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	logger, _ := zap.NewDevelopment()
+	mc := newMockCache()
+	mc.sets[cache.AgentSyncDegradedKey(agentID)] = "1" // 连接建立时的降级标记（已到期临界）
+	registry := NewAgentRegistry()
+	s := New(logger)
+	s.cache = mc
+	s.registry = registry
+	conn := registry.Register(agentID, nil, nil)
+	conn.SyncDegraded = true // 该连接的同步处于降级——CP 自身的权威状态
+
+	s.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 1})
+
+	renewals := 0
+	for _, k := range mc.setLog {
+		if k == cache.AgentSyncDegradedKey(agentID) {
+			renewals++
+		}
+	}
+	assert.Positive(t, renewals,
+		"a heartbeat on a degraded connection must renew the degraded marker — "+
+			"otherwise the TTL outlives the observability of a still-degraded connection (R5-B)")
+}
+
+// 条件结束（断开）必须清除标记：断开后不再有降级条件，重连会重新判定。
+func TestServer_Connect_ClearsDegradedMarkerOnDisconnect(t *testing.T) {
+	agentID := "dddddddd-dddd-dddd-dddd-dddddddddddd"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	mc := newMockCache()
+	mc.sets[cache.AgentSyncDegradedKey(agentID)] = "1"
+	srv := New(logger)
+	srv.WithDeps(registry, mc, jwtSvc, &mockNATS{}, nil)
+	// The sync itself is DEGRADED — the marker is (re)written by this
+	// connection and must be cleared when the connection ends, not only on a
+	// successful sync (the success-path Del must not satisfy this assertion).
+	srv.WithExtraDeps(&degradedSyncDispatcher{}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		5*time.Second, 20*time.Millisecond)
+
+	// Half-close: the handler returns and its deferred cleanup must run.
+	require.NoError(t, stream.CloseSend())
+	require.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		5*time.Second, 20*time.Millisecond, "handler must return on half-close")
+
+	assert.Eventually(t, func() bool {
+		for _, k := range mc.dels {
+			if k == cache.AgentSyncDegradedKey(agentID) {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second, 50*time.Millisecond,
+		"disconnect must clear the degraded marker — after that there is no degraded condition to observe (R5-B)")
+}
+
+// ── R6（IC-2b review 五轮）：续期以 CP 自身的连接状态为准，Redis 只是投影 ──────
+
+// 标记被外部删除（Redis 驱逐/重启）后，下一次心跳必须把它重建——降级条件在
+// CP 手里（连接状态），不在 Redis 键上；以「键还在」为续期前提意味着丢键后
+// 永久失去可观测性，与 R5-B 的目标正好相反。
+func TestServer_Heartbeat_RebuildsDegradedMarkerAfterExternalDelete(t *testing.T) {
+	agentID := "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	mc := newMockCache()
+	srv := New(logger)
+	srv.WithDeps(registry, mc, jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&degradedSyncDispatcher{}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		5*time.Second, 20*time.Millisecond)
+
+	key := cache.AgentSyncDegradedKey(agentID)
+	require.Eventually(t, func() bool {
+		_, ok := mc.sets[key]
+		return ok
+	}, 3*time.Second, 50*time.Millisecond, "the degraded sync must mark the agent")
+
+	// 模拟 Redis 驱逐/重启：键没了，但降级条件仍在（连接仍降级）。
+	delete(mc.sets, key)
+
+	// 下一次心跳必须重建标记。
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hb-1",
+		Payload: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{UptimeSeconds: 2}}}))
+	assert.Eventually(t, func() bool {
+		_, ok := mc.sets[key]
+		return ok
+	}, 3*time.Second, 50*time.Millisecond,
+		"the next heartbeat must rebuild the marker from the connection's own degraded state — "+
+			"renewal conditioned on key existence cannot self-heal a lost key (R6)")
 }

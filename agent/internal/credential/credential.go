@@ -162,10 +162,19 @@ type STSCredentials struct {
 	Expiry       time.Time
 }
 
-// STSManager manages in-memory STS credentials.
+// STSManager manages in-memory STS credentials with monotonic generations.
+//
+// There are two concurrent writers — the periodic refresh goroutine and the
+// AccessDenied retry path — both issuing RefreshCredentials RPCs. A response
+// that was requested EARLIER but arrives LATER must not overwrite a newer
+// session: that would resurrect stale credentials (e.g. ones that do not
+// cover a just-added bucket) and turn the AccessDenied retry into a terminal
+// failure. SetSTS therefore only accepts a strictly newer generation; stale
+// responses are dropped by the caller.
 type STSManager struct {
-	mu   sync.RWMutex
-	cred *STSCredentials
+	mu         sync.RWMutex
+	cred       *STSCredentials
+	generation uint64
 }
 
 // NewSTSManager constructs an empty STSManager.
@@ -174,10 +183,18 @@ func NewSTSManager() *STSManager {
 }
 
 // SetSTS stores a new set of STS credentials, replacing any existing ones.
-func (s *STSManager) SetSTS(cred *STSCredentials) {
+// It reports whether the credentials were applied: a generation that is not
+// strictly newer than the currently held one is rejected (a stale response
+// from a request issued before the current credentials were minted).
+func (s *STSManager) SetSTS(cred *STSCredentials, generation uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if generation <= s.generation {
+		return false
+	}
 	s.cred = cred
+	s.generation = generation
+	return true
 }
 
 // GetSTS returns the current STS credentials, or nil if none are set.
@@ -187,7 +204,18 @@ func (s *STSManager) GetSTS() *STSCredentials {
 	return s.cred
 }
 
-// Clear removes any in-memory STS credentials.
+// Generation returns the generation of the currently held credentials.
+// Monotonically increasing across the manager's lifetime, including across
+// Clear — a clear must not lower the water mark, or a stale response arriving
+// after the clear would be accepted.
+func (s *STSManager) Generation() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.generation
+}
+
+// Clear removes any in-memory STS credentials. The generation watermark is
+// deliberately kept: it must only ever move forward.
 func (s *STSManager) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

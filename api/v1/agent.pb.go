@@ -888,6 +888,7 @@ type ServerMessage struct {
 	//	*ServerMessage_Credentials
 	//	*ServerMessage_Revoke
 	//	*ServerMessage_Ack
+	//	*ServerMessage_RulesSync
 	Payload       isServerMessage_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1000,6 +1001,15 @@ func (x *ServerMessage) GetAck() *Acknowledgement {
 	return nil
 }
 
+func (x *ServerMessage) GetRulesSync() *RulesSyncCommand {
+	if x != nil {
+		if x, ok := x.Payload.(*ServerMessage_RulesSync); ok {
+			return x.RulesSync
+		}
+	}
+	return nil
+}
+
 type isServerMessage_Payload interface {
 	isServerMessage_Payload()
 }
@@ -1032,6 +1042,10 @@ type ServerMessage_Ack struct {
 	Ack *Acknowledgement `protobuf:"bytes,16,opt,name=ack,proto3,oneof"`
 }
 
+type ServerMessage_RulesSync struct {
+	RulesSync *RulesSyncCommand `protobuf:"bytes,17,opt,name=rules_sync,json=rulesSync,proto3,oneof"`
+}
+
 func (*ServerMessage_Ping) isServerMessage_Payload() {}
 
 func (*ServerMessage_ListDirectory) isServerMessage_Payload() {}
@@ -1046,6 +1060,75 @@ func (*ServerMessage_Revoke) isServerMessage_Payload() {}
 
 func (*ServerMessage_Ack) isServerMessage_Payload() {}
 
+func (*ServerMessage_RulesSync) isServerMessage_Payload() {}
+
+// RulesSyncCommand carries the FULL rule snapshot of one sync.
+//
+// rules is every rule the agent owns in the Control Plane database at sync
+// time (active + inactive); rules deleted while the agent was disconnected are
+// absent by design — that absence is what lets the agent stop them (IC-BUG-30).
+// The agent replaces its whole rule set with the snapshot: stop everything
+// outside it, apply everything inside it (Enabled=false stops, reusing the
+// existing applyRule branch).
+//
+// Snapshot, not per-rule pushes: with ≥33 rules a per-message push burst
+// overflows the connection's bounded send buffer faster than it drains —
+// measured 5/5 runs losing 8 of 40 rules and the credentials push behind
+// them. One snapshot message cannot overflow. SyncRulesOnConnect sends
+// exactly this message; PushRuleCommand remains the incremental path.
+//
+// Size: a rule snapshot scales with rule count (tens of rules ≈ KBs). Rules
+// per agent are capped at creation (MaxRulesPerAgent, REST) so the snapshot
+// stays far below gRPC's default 4 MiB receive limit. If a snapshot is still
+// oversized (legacy data, pathological template sizes) the Control Plane
+// degrades INSTEAD of failing the stream: it skips the send, alarms at ERROR
+// and keeps the connection — the agent keeps its previous (stale but
+// functional) rule view. Failing the stream here would loop forever on the
+// same input, since every reconnect re-sends the same oversized snapshot.
+type RulesSyncCommand struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Rules         []*CollectionRule      `protobuf:"bytes,1,rep,name=rules,proto3" json:"rules,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RulesSyncCommand) Reset() {
+	*x = RulesSyncCommand{}
+	mi := &file_proto_v1_agent_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RulesSyncCommand) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RulesSyncCommand) ProtoMessage() {}
+
+func (x *RulesSyncCommand) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_v1_agent_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RulesSyncCommand.ProtoReflect.Descriptor instead.
+func (*RulesSyncCommand) Descriptor() ([]byte, []int) {
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *RulesSyncCommand) GetRules() []*CollectionRule {
+	if x != nil {
+		return x.Rules
+	}
+	return nil
+}
+
 type PingCommand struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -1054,7 +1137,7 @@ type PingCommand struct {
 
 func (x *PingCommand) Reset() {
 	*x = PingCommand{}
-	mi := &file_proto_v1_agent_proto_msgTypes[11]
+	mi := &file_proto_v1_agent_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1066,7 +1149,7 @@ func (x *PingCommand) String() string {
 func (*PingCommand) ProtoMessage() {}
 
 func (x *PingCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[11]
+	mi := &file_proto_v1_agent_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1079,7 +1162,7 @@ func (x *PingCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingCommand.ProtoReflect.Descriptor instead.
 func (*PingCommand) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{11}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{12}
 }
 
 type ListDirectoryCommand struct {
@@ -1094,7 +1177,7 @@ type ListDirectoryCommand struct {
 
 func (x *ListDirectoryCommand) Reset() {
 	*x = ListDirectoryCommand{}
-	mi := &file_proto_v1_agent_proto_msgTypes[12]
+	mi := &file_proto_v1_agent_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1106,7 +1189,7 @@ func (x *ListDirectoryCommand) String() string {
 func (*ListDirectoryCommand) ProtoMessage() {}
 
 func (x *ListDirectoryCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[12]
+	mi := &file_proto_v1_agent_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1119,7 +1202,7 @@ func (x *ListDirectoryCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListDirectoryCommand.ProtoReflect.Descriptor instead.
 func (*ListDirectoryCommand) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{12}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ListDirectoryCommand) GetRequestId() string {
@@ -1159,7 +1242,7 @@ type PushRuleCommand struct {
 
 func (x *PushRuleCommand) Reset() {
 	*x = PushRuleCommand{}
-	mi := &file_proto_v1_agent_proto_msgTypes[13]
+	mi := &file_proto_v1_agent_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1171,7 +1254,7 @@ func (x *PushRuleCommand) String() string {
 func (*PushRuleCommand) ProtoMessage() {}
 
 func (x *PushRuleCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[13]
+	mi := &file_proto_v1_agent_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1184,7 +1267,7 @@ func (x *PushRuleCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PushRuleCommand.ProtoReflect.Descriptor instead.
 func (*PushRuleCommand) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{13}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *PushRuleCommand) GetRule() *CollectionRule {
@@ -1215,7 +1298,7 @@ type CollectionRule struct {
 
 func (x *CollectionRule) Reset() {
 	*x = CollectionRule{}
-	mi := &file_proto_v1_agent_proto_msgTypes[14]
+	mi := &file_proto_v1_agent_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1227,7 +1310,7 @@ func (x *CollectionRule) String() string {
 func (*CollectionRule) ProtoMessage() {}
 
 func (x *CollectionRule) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[14]
+	mi := &file_proto_v1_agent_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1240,7 +1323,7 @@ func (x *CollectionRule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CollectionRule.ProtoReflect.Descriptor instead.
 func (*CollectionRule) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{14}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *CollectionRule) GetRuleId() string {
@@ -1343,7 +1426,7 @@ type CancelRuleCommand struct {
 
 func (x *CancelRuleCommand) Reset() {
 	*x = CancelRuleCommand{}
-	mi := &file_proto_v1_agent_proto_msgTypes[15]
+	mi := &file_proto_v1_agent_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1355,7 +1438,7 @@ func (x *CancelRuleCommand) String() string {
 func (*CancelRuleCommand) ProtoMessage() {}
 
 func (x *CancelRuleCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[15]
+	mi := &file_proto_v1_agent_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1368,7 +1451,7 @@ func (x *CancelRuleCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelRuleCommand.ProtoReflect.Descriptor instead.
 func (*CancelRuleCommand) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{15}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *CancelRuleCommand) GetRuleId() string {
@@ -1392,7 +1475,7 @@ type CredentialsPayload struct {
 
 func (x *CredentialsPayload) Reset() {
 	*x = CredentialsPayload{}
-	mi := &file_proto_v1_agent_proto_msgTypes[16]
+	mi := &file_proto_v1_agent_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1404,7 +1487,7 @@ func (x *CredentialsPayload) String() string {
 func (*CredentialsPayload) ProtoMessage() {}
 
 func (x *CredentialsPayload) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[16]
+	mi := &file_proto_v1_agent_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1417,7 +1500,7 @@ func (x *CredentialsPayload) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialsPayload.ProtoReflect.Descriptor instead.
 func (*CredentialsPayload) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{16}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *CredentialsPayload) GetAccessKey() string {
@@ -1471,7 +1554,7 @@ type RevokeCommand struct {
 
 func (x *RevokeCommand) Reset() {
 	*x = RevokeCommand{}
-	mi := &file_proto_v1_agent_proto_msgTypes[17]
+	mi := &file_proto_v1_agent_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1483,7 +1566,7 @@ func (x *RevokeCommand) String() string {
 func (*RevokeCommand) ProtoMessage() {}
 
 func (x *RevokeCommand) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[17]
+	mi := &file_proto_v1_agent_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1496,7 +1579,7 @@ func (x *RevokeCommand) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevokeCommand.ProtoReflect.Descriptor instead.
 func (*RevokeCommand) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{17}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *RevokeCommand) GetReason() string {
@@ -1517,7 +1600,7 @@ type Acknowledgement struct {
 
 func (x *Acknowledgement) Reset() {
 	*x = Acknowledgement{}
-	mi := &file_proto_v1_agent_proto_msgTypes[18]
+	mi := &file_proto_v1_agent_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1529,7 +1612,7 @@ func (x *Acknowledgement) String() string {
 func (*Acknowledgement) ProtoMessage() {}
 
 func (x *Acknowledgement) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[18]
+	mi := &file_proto_v1_agent_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1542,7 +1625,7 @@ func (x *Acknowledgement) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Acknowledgement.ProtoReflect.Descriptor instead.
 func (*Acknowledgement) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{18}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *Acknowledgement) GetRefMessageId() string {
@@ -1581,7 +1664,7 @@ type RegisterRequest struct {
 
 func (x *RegisterRequest) Reset() {
 	*x = RegisterRequest{}
-	mi := &file_proto_v1_agent_proto_msgTypes[19]
+	mi := &file_proto_v1_agent_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1593,7 +1676,7 @@ func (x *RegisterRequest) String() string {
 func (*RegisterRequest) ProtoMessage() {}
 
 func (x *RegisterRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[19]
+	mi := &file_proto_v1_agent_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1606,7 +1689,7 @@ func (x *RegisterRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterRequest.ProtoReflect.Descriptor instead.
 func (*RegisterRequest) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{19}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *RegisterRequest) GetFingerprint() string {
@@ -1671,7 +1754,7 @@ type RegisterResponse struct {
 
 func (x *RegisterResponse) Reset() {
 	*x = RegisterResponse{}
-	mi := &file_proto_v1_agent_proto_msgTypes[20]
+	mi := &file_proto_v1_agent_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1683,7 +1766,7 @@ func (x *RegisterResponse) String() string {
 func (*RegisterResponse) ProtoMessage() {}
 
 func (x *RegisterResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[20]
+	mi := &file_proto_v1_agent_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1696,7 +1779,7 @@ func (x *RegisterResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterResponse.ProtoReflect.Descriptor instead.
 func (*RegisterResponse) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{20}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *RegisterResponse) GetAgentId() string {
@@ -1744,7 +1827,7 @@ type PollApprovalRequest struct {
 
 func (x *PollApprovalRequest) Reset() {
 	*x = PollApprovalRequest{}
-	mi := &file_proto_v1_agent_proto_msgTypes[21]
+	mi := &file_proto_v1_agent_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1756,7 +1839,7 @@ func (x *PollApprovalRequest) String() string {
 func (*PollApprovalRequest) ProtoMessage() {}
 
 func (x *PollApprovalRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[21]
+	mi := &file_proto_v1_agent_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1769,7 +1852,7 @@ func (x *PollApprovalRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PollApprovalRequest.ProtoReflect.Descriptor instead.
 func (*PollApprovalRequest) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{21}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *PollApprovalRequest) GetAgentId() string {
@@ -1798,7 +1881,7 @@ type PollApprovalResponse struct {
 
 func (x *PollApprovalResponse) Reset() {
 	*x = PollApprovalResponse{}
-	mi := &file_proto_v1_agent_proto_msgTypes[22]
+	mi := &file_proto_v1_agent_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1810,7 +1893,7 @@ func (x *PollApprovalResponse) String() string {
 func (*PollApprovalResponse) ProtoMessage() {}
 
 func (x *PollApprovalResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[22]
+	mi := &file_proto_v1_agent_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1823,7 +1906,7 @@ func (x *PollApprovalResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PollApprovalResponse.ProtoReflect.Descriptor instead.
 func (*PollApprovalResponse) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{22}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *PollApprovalResponse) GetStatus() string {
@@ -1864,7 +1947,7 @@ type RefreshCredentialsRequest struct {
 
 func (x *RefreshCredentialsRequest) Reset() {
 	*x = RefreshCredentialsRequest{}
-	mi := &file_proto_v1_agent_proto_msgTypes[23]
+	mi := &file_proto_v1_agent_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1876,7 +1959,7 @@ func (x *RefreshCredentialsRequest) String() string {
 func (*RefreshCredentialsRequest) ProtoMessage() {}
 
 func (x *RefreshCredentialsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[23]
+	mi := &file_proto_v1_agent_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1889,7 +1972,7 @@ func (x *RefreshCredentialsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshCredentialsRequest.ProtoReflect.Descriptor instead.
 func (*RefreshCredentialsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{23}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *RefreshCredentialsRequest) GetAgentId() string {
@@ -1915,7 +1998,7 @@ type RefreshCredentialsResponse struct {
 
 func (x *RefreshCredentialsResponse) Reset() {
 	*x = RefreshCredentialsResponse{}
-	mi := &file_proto_v1_agent_proto_msgTypes[24]
+	mi := &file_proto_v1_agent_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1927,7 +2010,7 @@ func (x *RefreshCredentialsResponse) String() string {
 func (*RefreshCredentialsResponse) ProtoMessage() {}
 
 func (x *RefreshCredentialsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_v1_agent_proto_msgTypes[24]
+	mi := &file_proto_v1_agent_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1940,7 +2023,7 @@ func (x *RefreshCredentialsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshCredentialsResponse.ProtoReflect.Descriptor instead.
 func (*RefreshCredentialsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_v1_agent_proto_rawDescGZIP(), []int{24}
+	return file_proto_v1_agent_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *RefreshCredentialsResponse) GetCredentials() *CredentialsPayload {
@@ -2040,7 +2123,7 @@ const file_proto_v1_agent_proto_rawDesc = "" +
 	"\rcompose_error\x18\x04 \x01(\tR\fcomposeError\x1a?\n" +
 	"\x11ParsedFieldsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe9\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xaa\x04\n" +
 	"\rServerMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x12/\n" +
@@ -2052,8 +2135,12 @@ const file_proto_v1_agent_proto_rawDesc = "" +
 	"cancelRule\x12D\n" +
 	"\vcredentials\x18\x0e \x01(\v2 .fileagent.v1.CredentialsPayloadH\x00R\vcredentials\x125\n" +
 	"\x06revoke\x18\x0f \x01(\v2\x1b.fileagent.v1.RevokeCommandH\x00R\x06revoke\x121\n" +
-	"\x03ack\x18\x10 \x01(\v2\x1d.fileagent.v1.AcknowledgementH\x00R\x03ackB\t\n" +
-	"\apayload\"\r\n" +
+	"\x03ack\x18\x10 \x01(\v2\x1d.fileagent.v1.AcknowledgementH\x00R\x03ack\x12?\n" +
+	"\n" +
+	"rules_sync\x18\x11 \x01(\v2\x1e.fileagent.v1.RulesSyncCommandH\x00R\trulesSyncB\t\n" +
+	"\apayload\"F\n" +
+	"\x10RulesSyncCommand\x122\n" +
+	"\x05rules\x18\x01 \x03(\v2\x1c.fileagent.v1.CollectionRuleR\x05rules\"\r\n" +
 	"\vPingCommand\"\x84\x01\n" +
 	"\x14ListDirectoryCommand\x12\x1d\n" +
 	"\n" +
@@ -2148,7 +2235,7 @@ func file_proto_v1_agent_proto_rawDescGZIP() []byte {
 	return file_proto_v1_agent_proto_rawDescData
 }
 
-var file_proto_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
+var file_proto_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_proto_v1_agent_proto_goTypes = []any{
 	(*AgentMessage)(nil),               // 0: fileagent.v1.AgentMessage
 	(*Heartbeat)(nil),                  // 1: fileagent.v1.Heartbeat
@@ -2161,22 +2248,23 @@ var file_proto_v1_agent_proto_goTypes = []any{
 	(*DryRunResult)(nil),               // 8: fileagent.v1.DryRunResult
 	(*DryRunFileResult)(nil),           // 9: fileagent.v1.DryRunFileResult
 	(*ServerMessage)(nil),              // 10: fileagent.v1.ServerMessage
-	(*PingCommand)(nil),                // 11: fileagent.v1.PingCommand
-	(*ListDirectoryCommand)(nil),       // 12: fileagent.v1.ListDirectoryCommand
-	(*PushRuleCommand)(nil),            // 13: fileagent.v1.PushRuleCommand
-	(*CollectionRule)(nil),             // 14: fileagent.v1.CollectionRule
-	(*CancelRuleCommand)(nil),          // 15: fileagent.v1.CancelRuleCommand
-	(*CredentialsPayload)(nil),         // 16: fileagent.v1.CredentialsPayload
-	(*RevokeCommand)(nil),              // 17: fileagent.v1.RevokeCommand
-	(*Acknowledgement)(nil),            // 18: fileagent.v1.Acknowledgement
-	(*RegisterRequest)(nil),            // 19: fileagent.v1.RegisterRequest
-	(*RegisterResponse)(nil),           // 20: fileagent.v1.RegisterResponse
-	(*PollApprovalRequest)(nil),        // 21: fileagent.v1.PollApprovalRequest
-	(*PollApprovalResponse)(nil),       // 22: fileagent.v1.PollApprovalResponse
-	(*RefreshCredentialsRequest)(nil),  // 23: fileagent.v1.RefreshCredentialsRequest
-	(*RefreshCredentialsResponse)(nil), // 24: fileagent.v1.RefreshCredentialsResponse
-	nil,                                // 25: fileagent.v1.DryRunFileResult.ParsedFieldsEntry
-	(*timestamppb.Timestamp)(nil),      // 26: google.protobuf.Timestamp
+	(*RulesSyncCommand)(nil),           // 11: fileagent.v1.RulesSyncCommand
+	(*PingCommand)(nil),                // 12: fileagent.v1.PingCommand
+	(*ListDirectoryCommand)(nil),       // 13: fileagent.v1.ListDirectoryCommand
+	(*PushRuleCommand)(nil),            // 14: fileagent.v1.PushRuleCommand
+	(*CollectionRule)(nil),             // 15: fileagent.v1.CollectionRule
+	(*CancelRuleCommand)(nil),          // 16: fileagent.v1.CancelRuleCommand
+	(*CredentialsPayload)(nil),         // 17: fileagent.v1.CredentialsPayload
+	(*RevokeCommand)(nil),              // 18: fileagent.v1.RevokeCommand
+	(*Acknowledgement)(nil),            // 19: fileagent.v1.Acknowledgement
+	(*RegisterRequest)(nil),            // 20: fileagent.v1.RegisterRequest
+	(*RegisterResponse)(nil),           // 21: fileagent.v1.RegisterResponse
+	(*PollApprovalRequest)(nil),        // 22: fileagent.v1.PollApprovalRequest
+	(*PollApprovalResponse)(nil),       // 23: fileagent.v1.PollApprovalResponse
+	(*RefreshCredentialsRequest)(nil),  // 24: fileagent.v1.RefreshCredentialsRequest
+	(*RefreshCredentialsResponse)(nil), // 25: fileagent.v1.RefreshCredentialsResponse
+	nil,                                // 26: fileagent.v1.DryRunFileResult.ParsedFieldsEntry
+	(*timestamppb.Timestamp)(nil),      // 27: google.protobuf.Timestamp
 }
 var file_proto_v1_agent_proto_depIdxs = []int32{
 	1,  // 0: fileagent.v1.AgentMessage.heartbeat:type_name -> fileagent.v1.Heartbeat
@@ -2186,35 +2274,37 @@ var file_proto_v1_agent_proto_depIdxs = []int32{
 	7,  // 4: fileagent.v1.AgentMessage.error_report:type_name -> fileagent.v1.ErrorReport
 	8,  // 5: fileagent.v1.AgentMessage.dry_run_result:type_name -> fileagent.v1.DryRunResult
 	2,  // 6: fileagent.v1.Heartbeat.disks:type_name -> fileagent.v1.DiskInfo
-	26, // 7: fileagent.v1.UploadResult.file_mtime:type_name -> google.protobuf.Timestamp
-	26, // 8: fileagent.v1.UploadResult.uploaded_at:type_name -> google.protobuf.Timestamp
+	27, // 7: fileagent.v1.UploadResult.file_mtime:type_name -> google.protobuf.Timestamp
+	27, // 8: fileagent.v1.UploadResult.uploaded_at:type_name -> google.protobuf.Timestamp
 	5,  // 9: fileagent.v1.DirectoryListing.entries:type_name -> fileagent.v1.FsEntry
-	26, // 10: fileagent.v1.FsEntry.modified_at:type_name -> google.protobuf.Timestamp
+	27, // 10: fileagent.v1.FsEntry.modified_at:type_name -> google.protobuf.Timestamp
 	9,  // 11: fileagent.v1.DryRunResult.files:type_name -> fileagent.v1.DryRunFileResult
-	25, // 12: fileagent.v1.DryRunFileResult.parsed_fields:type_name -> fileagent.v1.DryRunFileResult.ParsedFieldsEntry
-	11, // 13: fileagent.v1.ServerMessage.ping:type_name -> fileagent.v1.PingCommand
-	12, // 14: fileagent.v1.ServerMessage.list_directory:type_name -> fileagent.v1.ListDirectoryCommand
-	13, // 15: fileagent.v1.ServerMessage.push_rule:type_name -> fileagent.v1.PushRuleCommand
-	15, // 16: fileagent.v1.ServerMessage.cancel_rule:type_name -> fileagent.v1.CancelRuleCommand
-	16, // 17: fileagent.v1.ServerMessage.credentials:type_name -> fileagent.v1.CredentialsPayload
-	17, // 18: fileagent.v1.ServerMessage.revoke:type_name -> fileagent.v1.RevokeCommand
-	18, // 19: fileagent.v1.ServerMessage.ack:type_name -> fileagent.v1.Acknowledgement
-	14, // 20: fileagent.v1.PushRuleCommand.rule:type_name -> fileagent.v1.CollectionRule
-	26, // 21: fileagent.v1.CredentialsPayload.expires_at:type_name -> google.protobuf.Timestamp
-	16, // 22: fileagent.v1.RefreshCredentialsResponse.credentials:type_name -> fileagent.v1.CredentialsPayload
-	0,  // 23: fileagent.v1.AgentService.Connect:input_type -> fileagent.v1.AgentMessage
-	19, // 24: fileagent.v1.AgentService.Register:input_type -> fileagent.v1.RegisterRequest
-	21, // 25: fileagent.v1.AgentService.PollApproval:input_type -> fileagent.v1.PollApprovalRequest
-	23, // 26: fileagent.v1.AgentService.RefreshCredentials:input_type -> fileagent.v1.RefreshCredentialsRequest
-	10, // 27: fileagent.v1.AgentService.Connect:output_type -> fileagent.v1.ServerMessage
-	20, // 28: fileagent.v1.AgentService.Register:output_type -> fileagent.v1.RegisterResponse
-	22, // 29: fileagent.v1.AgentService.PollApproval:output_type -> fileagent.v1.PollApprovalResponse
-	24, // 30: fileagent.v1.AgentService.RefreshCredentials:output_type -> fileagent.v1.RefreshCredentialsResponse
-	27, // [27:31] is the sub-list for method output_type
-	23, // [23:27] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	26, // 12: fileagent.v1.DryRunFileResult.parsed_fields:type_name -> fileagent.v1.DryRunFileResult.ParsedFieldsEntry
+	12, // 13: fileagent.v1.ServerMessage.ping:type_name -> fileagent.v1.PingCommand
+	13, // 14: fileagent.v1.ServerMessage.list_directory:type_name -> fileagent.v1.ListDirectoryCommand
+	14, // 15: fileagent.v1.ServerMessage.push_rule:type_name -> fileagent.v1.PushRuleCommand
+	16, // 16: fileagent.v1.ServerMessage.cancel_rule:type_name -> fileagent.v1.CancelRuleCommand
+	17, // 17: fileagent.v1.ServerMessage.credentials:type_name -> fileagent.v1.CredentialsPayload
+	18, // 18: fileagent.v1.ServerMessage.revoke:type_name -> fileagent.v1.RevokeCommand
+	19, // 19: fileagent.v1.ServerMessage.ack:type_name -> fileagent.v1.Acknowledgement
+	11, // 20: fileagent.v1.ServerMessage.rules_sync:type_name -> fileagent.v1.RulesSyncCommand
+	15, // 21: fileagent.v1.RulesSyncCommand.rules:type_name -> fileagent.v1.CollectionRule
+	15, // 22: fileagent.v1.PushRuleCommand.rule:type_name -> fileagent.v1.CollectionRule
+	27, // 23: fileagent.v1.CredentialsPayload.expires_at:type_name -> google.protobuf.Timestamp
+	17, // 24: fileagent.v1.RefreshCredentialsResponse.credentials:type_name -> fileagent.v1.CredentialsPayload
+	0,  // 25: fileagent.v1.AgentService.Connect:input_type -> fileagent.v1.AgentMessage
+	20, // 26: fileagent.v1.AgentService.Register:input_type -> fileagent.v1.RegisterRequest
+	22, // 27: fileagent.v1.AgentService.PollApproval:input_type -> fileagent.v1.PollApprovalRequest
+	24, // 28: fileagent.v1.AgentService.RefreshCredentials:input_type -> fileagent.v1.RefreshCredentialsRequest
+	10, // 29: fileagent.v1.AgentService.Connect:output_type -> fileagent.v1.ServerMessage
+	21, // 30: fileagent.v1.AgentService.Register:output_type -> fileagent.v1.RegisterResponse
+	23, // 31: fileagent.v1.AgentService.PollApproval:output_type -> fileagent.v1.PollApprovalResponse
+	25, // 32: fileagent.v1.AgentService.RefreshCredentials:output_type -> fileagent.v1.RefreshCredentialsResponse
+	29, // [29:33] is the sub-list for method output_type
+	25, // [25:29] is the sub-list for method input_type
+	25, // [25:25] is the sub-list for extension type_name
+	25, // [25:25] is the sub-list for extension extendee
+	0,  // [0:25] is the sub-list for field type_name
 }
 
 func init() { file_proto_v1_agent_proto_init() }
@@ -2238,6 +2328,7 @@ func file_proto_v1_agent_proto_init() {
 		(*ServerMessage_Credentials)(nil),
 		(*ServerMessage_Revoke)(nil),
 		(*ServerMessage_Ack)(nil),
+		(*ServerMessage_RulesSync)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -2245,7 +2336,7 @@ func file_proto_v1_agent_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_v1_agent_proto_rawDesc), len(file_proto_v1_agent_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   26,
+			NumMessages:   27,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

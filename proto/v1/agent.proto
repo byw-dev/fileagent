@@ -123,7 +123,35 @@ message ServerMessage {
     CredentialsPayload   credentials        = 14;
     RevokeCommand        revoke             = 15;
     Acknowledgement      ack                = 16;
+    RulesSyncCommand     rules_sync         = 17;
   }
+}
+
+// RulesSyncCommand carries the FULL rule snapshot of one sync.
+//
+// rules is every rule the agent owns in the Control Plane database at sync
+// time (active + inactive); rules deleted while the agent was disconnected are
+// absent by design — that absence is what lets the agent stop them (IC-BUG-30).
+// The agent replaces its whole rule set with the snapshot: stop everything
+// outside it, apply everything inside it (Enabled=false stops, reusing the
+// existing applyRule branch).
+//
+// Snapshot, not per-rule pushes: with ≥33 rules a per-message push burst
+// overflows the connection's bounded send buffer faster than it drains —
+// measured 5/5 runs losing 8 of 40 rules and the credentials push behind
+// them. One snapshot message cannot overflow. SyncRulesOnConnect sends
+// exactly this message; PushRuleCommand remains the incremental path.
+//
+// Size: a rule snapshot scales with rule count (tens of rules ≈ KBs). Rules
+// per agent are capped at creation (MaxRulesPerAgent, REST) so the snapshot
+// stays far below gRPC's default 4 MiB receive limit. If a snapshot is still
+// oversized (legacy data, pathological template sizes) the Control Plane
+// degrades INSTEAD of failing the stream: it skips the send, alarms at ERROR
+// and keeps the connection — the agent keeps its previous (stale but
+// functional) rule view. Failing the stream here would loop forever on the
+// same input, since every reconnect re-sends the same oversized snapshot.
+message RulesSyncCommand {
+  repeated CollectionRule rules = 1;
 }
 
 message PingCommand {}

@@ -30,6 +30,9 @@ func (m *mockDispatcher) SyncRulesOnConnect(_ context.Context, agentID string) e
 	return m.err
 }
 
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (m *mockDispatcher) ReleaseAgent(_ string) {}
+
 // ── Mock IndexerClient ────────────────────────────────────────────────────────
 
 type mockIndexer struct {
@@ -635,4 +638,30 @@ func TestUploadAcknowledgement(t *testing.T) {
 			}
 		})
 	}
+}
+
+// PushCredentials is the exported hook the Dispatcher uses to re-push STS
+// credentials when a dispatched rule adds a bucket (IC-BUG-20). With no STS
+// wiring it is a no-op; with mocks it delivers over the open stream's buffer.
+func TestPushCredentials_Wrapper(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	// No deps: must be a silent no-op, not a panic.
+	New(logger).PushCredentials(context.Background(), uuid.NewString())
+
+	// Wired: delivers one credentials message into the connection buffer.
+	agentID := uuid.NewString()
+	registry := NewAgentRegistry()
+	conn := registry.Register(agentID, nil, nil)
+	srv := New(logger)
+	srv.WithDeps(registry, nil, nil, nil, nil)
+	srv.WithExtraDeps(nil, nil,
+		&mockSTSMgr{creds: &agentv1.CredentialsPayload{AccessKey: "AK"}},
+		&mockCredDB{
+			bucket: &db.Bucket{Name: "data-sensor"},
+			rules: []*db.CollectionRule{
+				{ID: uuid.New(), AgentID: uuid.MustParse(agentID), Status: db.RuleStatusActive},
+			},
+		})
+	srv.PushCredentials(context.Background(), agentID)
+	assert.Equal(t, 1, len(conn.SendCh), "the re-pushed credentials must be queued for the agent")
 }

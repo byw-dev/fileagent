@@ -3,10 +3,12 @@ package grpcserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path"
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"github.com/byw-dev/fileagent/controlplane/internal/agent"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
@@ -20,6 +22,10 @@ import (
 )
 
 const agentOnlineTTL = 90 * time.Second
+
+// agentSyncDegradedTTL bounds how long the rule-sync degraded marker lives in
+// the cache when no further sync refreshes it (review R3).
+const agentSyncDegradedTTL = 24 * time.Hour
 
 // Register handles the initial Agent registration request.
 func (s *Server) Register(ctx context.Context, req *agentv1.RegisterRequest) (*agentv1.RegisterResponse, error) {
@@ -66,8 +72,19 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		if !s.registry.Unregister(conn) {
 			return
 		}
+		// The agent is gone: reclaim its dispatch serialisation entry so the
+		// dispatcher's map does not grow with every agent ever seen (review
+		// R2). Safe across reconnects — the reclaim only retires the entry;
+		// in-flight holders finish, and a reconnecting agent gets a fresh one.
+		if s.dispatcher != nil {
+			s.dispatcher.ReleaseAgent(agentID)
+		}
 		if s.cache != nil {
 			_ = s.cache.Del(context.Background(), cache.AgentOnlineKey(agentID))
+			// The connection is gone, so the degraded condition it carried is
+			// gone with it — the next sync (on reconnect) re-marks or clears
+			// (review R5-B: the marker must not outlive its condition).
+			_ = s.cache.Del(context.Background(), cache.AgentSyncDegradedKey(agentID))
 		}
 		s.markOfflineOnDisconnect(agentID)
 		s.logger.Info("agent disconnected", zap.String("agent_id", agentID))
@@ -102,17 +119,12 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	s.publishEvent("events.agent.online", agentID)
 	s.logger.Info("agent connected", zap.String("agent_id", agentID))
 
-	// Sync all active rules to the freshly connected agent (CP-W3 / CP-W4).
-	if s.dispatcher != nil {
-		if err := s.dispatcher.SyncRulesOnConnect(ctx, agentID); err != nil {
-			s.logger.Warn("connect: sync rules failed", zap.String("agent_id", agentID), zap.Error(err))
-		}
-	}
-
-	// Push an initial STS session so the agent can upload immediately (IC-BUG-1).
-	s.pushCredentials(ctx, agentID)
-
-	// Start send goroutine.
+	// Start the send goroutine BEFORE anything is enqueued (IC-BUG-31):
+	// SyncRulesOnConnect and pushCredentials both write into conn.SendCh, and
+	// with the buffered channel (cap 32) having no consumer those writes are
+	// plain drops — with ≥32 active rules the rules themselves started
+	// dropping, and with exactly 32 the credentials after them did. The
+	// goroutine is the consumer, so it must exist before the producers run.
 	sendErr := make(chan error, 1)
 	go func() {
 		for {
@@ -132,6 +144,53 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 			}
 		}
 	}()
+
+	// Push an initial STS session BEFORE the rule sync (IC-BUG-1), and the
+	// rule sync before anything else can act on it.
+	//
+	// The order is load-bearing: with the send goroutine started first
+	// (IC-BUG-31), whatever is enqueued reaches the agent immediately. If the
+	// rule snapshot went first, the agent starts its watchers right away and
+	// IC-5's initial scan submits uploads for existing files — while
+	// pushCredentials is still mid-flight (it contains a live MinIO
+	// AssumeRole round-trip), so those uploads fail with "no upload
+	// credentials available yet", hit the executor's 1-minute backoff, and
+	// the file is delayed by a full retry cycle. That broke
+	// TestUploadMainPathLive on this branch (green on master) — PR #103
+	// review F5. Credentials carry no dependency on the sync (bucketsForAgent
+	// reads the DB directly), so pushing them first is always safe; an agent
+	// with credentials but no rules simply does nothing until rules arrive.
+	s.pushCredentials(ctx, agentID)
+
+	// Sync all rules — active and inactive — and finish with the rule full-set
+	// message (IC-BUG-30 / D-033). A sync failure must end the stream: the
+	// full-set message is the entire delete half of the fix, and an agent that
+	// keeps running with an untrustworthy rule view is worse than one that
+	// disconnects — a reconnect runs a clean full re-sync. The one exception
+	// is degradation (review R3): an oversized snapshot fails on every
+	// reconnect by construction, so disconnecting would loop forever on the
+	// same input — instead the connection stays and the degraded state is
+	// marked in the cache, where the agents API reads it as
+	// rule_sync_degraded (nothing is only a log line). A successful sync
+	// clears the marker.
+	if s.dispatcher != nil {
+		if err := s.dispatcher.SyncRulesOnConnect(ctx, agentID); err != nil {
+			if errors.Is(err, agent.ErrRulesSyncDegraded) {
+				conn.SyncDegraded = true
+				if s.cache != nil {
+					if setErr := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); setErr != nil {
+						s.logger.Warn("connect: mark sync degraded failed", zap.String("agent_id", agentID), zap.Error(setErr))
+					}
+				}
+			} else {
+				s.logger.Error("connect: rule sync failed, ending stream for a clean re-sync",
+					zap.String("agent_id", agentID), zap.Error(err))
+				return status.Error(codes.Internal, "rule sync incomplete; the agent must reconnect and re-sync")
+			}
+		} else if s.cache != nil {
+			_ = s.cache.Del(ctx, cache.AgentSyncDegradedKey(agentID))
+		}
+	}
 
 	// Receive loop.
 	//
@@ -364,6 +423,18 @@ func (s *Server) bucketsForAgent(ctx context.Context, agentID, ruleID string) ([
 // agent that had just connected sat there with no credentials and failed every
 // upload (IC-BUG-1). Pushing once at stream setup — alongside the rule sync —
 // means the agent is ready to upload as soon as it has rules to act on.
+// PushCredentials issues an STS session for the agent and delivers it over
+// the agent's open stream. Exported so the Dispatcher can re-push credentials
+// when a dispatched rule changes the agent's bucket set (IC-BUG-20) — the
+// session the agent already holds covers only the bucket set known at mint
+// time.
+//
+// Best-effort: with no STS manager or no rule with a resolvable bucket it
+// logs and returns; the agent's own refresh tick compensates.
+func (s *Server) PushCredentials(ctx context.Context, agentID string) {
+	s.pushCredentials(ctx, agentID)
+}
+
 func (s *Server) pushCredentials(ctx context.Context, agentID string) {
 	if s.stsMgr == nil || s.credDB == nil {
 		return
@@ -418,6 +489,24 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 	if s.cache != nil {
 		if err := s.cache.Set(ctx, cache.AgentOnlineKey(agentID), "1", agentOnlineTTL); err != nil {
 			s.logger.Warn("heartbeat: refresh online TTL failed", zap.Error(err))
+		}
+		// A degraded rule sync must stay observable for as long as the
+		// degraded connection lives — which can exceed the marker's TTL, and
+		// a long-lived degraded connection is exactly the state that most
+		// needs to be seen (review R5-B). The authority on the condition is
+		// the connection's own state, so the heartbeat sets the marker
+		// UNCONDITIONALLY while the connection is degraded: a key lost to
+		// cache eviction or a restart is rebuilt by the next heartbeat
+		// (review R6). Conditioning the renewal on key existence would make
+		// the cache authoritative and the lost key permanent until reconnect.
+		// Clearing stays where it is: a successful sync and disconnect both
+		// delete, so the projection can never outlive its condition.
+		if s.registry != nil {
+			if conn := s.registry.Get(agentID); conn != nil && conn.SyncDegraded {
+				if err := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); err != nil {
+					s.logger.Warn("heartbeat: renew degraded marker failed", zap.String("agent_id", agentID), zap.Error(err))
+				}
+			}
 		}
 	}
 	if s.stateDB != nil {

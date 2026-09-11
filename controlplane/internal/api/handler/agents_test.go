@@ -14,6 +14,7 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
+	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
 	"github.com/gin-gonic/gin"
@@ -897,12 +898,18 @@ func TestAgentsHandler_ListUploadLogs_ItemsEnvelope(t *testing.T) {
 // mockAgentCacheClient satisfies handler.AgentCacheClient for tests.
 type mockAgentCacheClient struct {
 	exists int64
+	// existsKeys, when non-nil, is consulted per key first (a key absent from
+	// it falls back to exists) so tests can distinguish cache keys.
+	existsKeys map[string]int64
 	// statsJSON, when non-empty, is returned by Get for any key (the stats blob).
 	statsJSON string
 	getErr    error
 }
 
-func (m *mockAgentCacheClient) Exists(_ context.Context, _ ...string) (int64, error) {
+func (m *mockAgentCacheClient) Exists(_ context.Context, keys ...string) (int64, error) {
+	if m.existsKeys != nil && len(keys) > 0 {
+		return m.existsKeys[keys[0]], nil
+	}
 	return m.exists, nil
 }
 
@@ -1071,4 +1078,59 @@ func TestAgentsHandler_ListDir_AgentOfflineNoCache_Returns409(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusConflict, w.Code)
+}
+
+// ── F3（IC-2b review）：单 agent 规则数硬上限（快照体积不可能超限的第一道闸）───
+
+// 创建第 1001 条规则被拒绝（422），错误信息说明上限与理由——快照同步整条发送，
+// 规则数不受控时快照会超过 gRPC 4MiB 上限并退化为降级状态。
+func TestAgentsHandler_CreateRule_RuleCountCap(t *testing.T) {
+	rules := make([]*db.CollectionRule, handler.MaxRulesPerAgent)
+	for i := range rules {
+		rules[i] = &db.CollectionRule{ID: uuid.New(), AgentID: uuid.New(), Status: db.RuleStatusActive}
+	}
+	dispatcher := &mockDispatcher{}
+	h := handler.NewAgentsHandler(&mockAgentsDB{rules: rules}, nil, dispatcher, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"one-too-many","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"logs/"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	assert.Contains(t, w.Body.String(), "rule count limit")
+}
+
+// ── R3（IC-2b review 三轮）：创建闸从条数改为序列化字节数 ──────────────────────
+
+// 条数闸拦不住「单条含 3MiB TEXT 字段」的规则——201 条就越过 4MiB（codex 实测）。
+// 真正对应失败条件的量是序列化后的字节：预估（含新规则）超预算即 422。
+func TestAgentsHandler_CreateRule_SnapshotSizeLimit(t *testing.T) {
+	dispatcher := &mockDispatcher{}
+	h := handler.NewAgentsHandler(&mockAgentsDB{rules: nil}, nil, dispatcher, nil, newTestLogger())
+	huge := strings.Repeat("x", 4<<20)
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"huge","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"` + huge + `"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code, "a rule whose serialized size alone exceeds the snapshot budget must be rejected")
+	assert.Contains(t, w.Body.String(), "snapshot size")
+}
+
+// 降级标记可被 API 读取：agentResponse.rule_sync_degraded 来自缓存键。
+func TestAgentsHandler_Get_RuleSyncDegradedFlag(t *testing.T) {
+	a := newSampleAgent()
+	mockDB := &mockAgentsDB{agent: a}
+	cacheMock := &mockAgentCacheClient{existsKeys: map[string]int64{
+		cache.AgentSyncDegradedKey(a.ID.String()): 1,
+	}}
+	h := handler.NewAgentsHandler(mockDB, nil, nil, nil, newTestLogger()).WithCache(cacheMock)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/agents/"+a.ID.String(), nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	assert.Equal(t, true, out["rule_sync_degraded"],
+		"the degraded rule-sync state must be readable through the API, not only logged")
 }
