@@ -41,6 +41,11 @@ Control Plane 启动时会**快速失败**（fail-fast）——任一依赖不�
 POSTGRES_PASSWORD=<强随机>
 MINIO_ROOT_USER=<改我>
 MINIO_ROOT_PASSWORD=<强随机>
+# Control Plane 的真实 IAM 用户凭据；须与 A.3 初始化命令一致。
+# 脚本按 3–20 / 8–40 字符校验：MinIO 对 IAM 用户只强制下界（access key ≥3、secret ≥8），
+# 上界 20 / 40 是 service account 的限制，脚本主动收敛到该窗口以便两种账号形态互换。
+CP_ADMIN_ACCESS_KEY=<3–20 字符>
+CP_ADMIN_SECRET_KEY=<8–40 字符>
 JWT_SECRET=<强随机，≥32 字节>
 INTERNAL_WEBHOOK_SECRET=<强随机>
 # 必填：MinIO 对外（客户端）可达地址（host:port）。CP 用它构造交给浏览器/agent 的
@@ -61,23 +66,51 @@ docker compose -f deploy/docker-compose.prod.yml up -d --build
 CP 依赖各服务 healthcheck，会等其就绪后再启动；启动时自动应用内嵌迁移
 （日志出现 `db migrate: migrations applied successfully`）。
 
-### A.3 初始化 MinIO（仅首次）
+### A.3 初始化 MinIO
 
-建桶（`data-sensor`、`tmp-uploads`）+ 生命周期 + webhook，只需跑一次：
+建桶（`data-sensor`、`tmp-uploads`）+ 生命周期 + webhook + Control Plane 最小权限 IAM 用户，并用该
+用户自检 CP 运行时真正会用到的三件事：STS AssumeRole、建桶（`POST /api/v1/buckets`）、预签名下载。
+脚本可幂等重跑：
 
 ```bash
 MINIO_ENDPOINT=http://localhost:9000 \
 MINIO_ROOT_USER=<同上> MINIO_ROOT_PASSWORD=<同上> \
+CP_ADMIN_ACCESS_KEY=<同 A.1> CP_ADMIN_SECRET_KEY=<同 A.1> \
 WEBHOOK_AUTH_TOKEN=<同 INTERNAL_WEBHOOK_SECRET> \
 bash deploy/scripts/init-minio.sh
 ```
+
+> ⚠️ 重跑时脚本**不会**擅自改写已存在 IAM 用户的 secret：它先用传入的凭据试一次 AssumeRole，
+> 通过就原样保留（policy 仍会覆盖更新）。若传入的 secret 与线上不符，脚本**报错退出、不做任何改动**，
+> 以免把正在运行的 CP 凭据换掉——那种故障要等 agent 的 STS 会话过期（≤1h）才在 agent 侧爆出来。
+> 确实要轮换时显式加 `CP_ADMIN_ROTATE=1`，脚本会在结论里明确告知已轮换；随后同步更新 CP 的
+> `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` 并重启。
+>
+> 不得用 root 的 service account 代替：MinIO 不允许 service account 调 `AssumeRole`，
+> 脚本的内置自检会直接失败。
 
 > ⚠️ 注意变量同名但格式不同：`init-minio.sh` 的 `MINIO_ENDPOINT` 是 **`mc` 用的完整 URL**（含
 > `http://`/`https://` scheme），而 Control Plane 的同名配置 `MINIO_ENDPOINT` 是 **`host:port`**（无 scheme，
 > 由 `MINIO_USE_SSL` 决定协议）。别把两者的取值互相照搬。
 
-> 需要本机有 `mc`（MinIO Client）。或用容器执行：
-> `docker run --rm --network <compose 网络> -v $PWD/deploy/scripts:/s minio/mc sh /s/init-minio.sh`。
+> 执行环境需同时具备 **`mc`** 与 **`curl`**（≥7.75，自检要用 `--aws-sigv4`）。宿主机没装 `mc` 时，
+> 用 compose 已 pin 的 **`minio/minio`** 镜像执行——它同时自带 mc 和 curl。
+> **不要用 `minio/mc` 镜像：它没有 curl**，脚本会在建任何资源之前就报错退出。
+>
+> ```bash
+> docker run --rm --network <compose 网络> \
+>   -v "$PWD/deploy/scripts:/s:ro" \
+>   -e MINIO_ENDPOINT=http://minio:9000 \
+>   -e MINIO_ROOT_USER=<同上> -e MINIO_ROOT_PASSWORD=<同上> \
+>   -e CP_ADMIN_ACCESS_KEY=<同 A.1> -e CP_ADMIN_SECRET_KEY=<同 A.1> \
+>   -e WEBHOOK_AUTH_TOKEN=<同 INTERNAL_WEBHOOK_SECRET> \
+>   --entrypoint bash minio/minio:RELEASE.2025-04-22T22-12-26Z /s/init-minio.sh
+> ```
+>
+> 说明：镜像 tag 与 `docker-compose.prod.yml` 里 pin 的一致（换 tag 前先确认镜像里仍有 `mc` 与
+> `curl`）；`--entrypoint bash` 是必须的，镜像默认 entrypoint 是 MinIO 自己的启动脚本。容器内用
+> compose 网络里的服务名 `minio:9000`，不是宿主的 `localhost:9000`。脚本刻意不依赖 grep/sed/awk，
+> 正是为了能在这个只带 mc + curl 的镜像里跑完。
 
 ### A.4 TLS
 

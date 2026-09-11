@@ -118,7 +118,7 @@ React 管理后台，供管理员操作。
 |------|------|
 | `docker-compose.dev.yml` | 本地开发环境（PostgreSQL / Redis / MinIO / NATS） |
 | `docker-compose.test.yml` | 集成测试专用环境（固定端口，isolated） |
-| `scripts/init-minio.sh` | 初始化 MinIO：创建 Bucket、配置 Lifecycle、创建服务账号、配置 Webhook |
+| `scripts/init-minio.sh` | 初始化 MinIO：创建 Bucket、配置 Lifecycle、创建最小权限 IAM 用户、配置 Webhook 并自检 STS/预签名下载 |
 
 ---
 
@@ -214,7 +214,9 @@ migrate -database "$DATABASE_URL" -path ./migrations up
 bash deploy/scripts/init-minio.sh
 ```
 
-脚本幂等，重复执行不报错。执行内容：创建 `data-sensor` 和 `tmp-uploads` Bucket，配置 7 天 Lifecycle，创建 `controlplane-admin` 服务账号，配置 Webhook 事件通知。
+脚本幂等，重复执行不报错。需要 `mc` 与 `curl` 均在 PATH（自检要用 curl 的 `--aws-sigv4`）。执行内容：创建 `data-sensor` 和 `tmp-uploads` Bucket，配置 7 天 Lifecycle，创建供 Control Plane 使用的真实 IAM 用户及最小权限 policy，配置 Webhook 事件通知，并用该用户自检 CP 运行时真正要用的三件事——STS AssumeRole、建桶、预签名下载。脚本默认 access key 为 `cpAdminIAM000000000`；若覆盖 `CP_ADMIN_ACCESS_KEY`，长度须为 3–20 字符，`CP_ADMIN_SECRET_KEY` 须为 8–40 字符（这是脚本自己的收敛口径：MinIO 对 IAM 用户只强制下界 3 / 8，20 / 40 上界是 service account 的限制，收敛到同一窗口便于两种账号形态互换）。
+
+> 重跑脚本**不会**擅自换掉已存在 IAM 用户的 secret：先用传入凭据试一次 AssumeRole，通过就保留原样；不通过则报错退出、不做改动。确实要轮换时显式传 `CP_ADMIN_ROTATE=1`，之后必须同步更新 Control Plane 的 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` 并重启。
 
 ### 4. 构建二进制
 
