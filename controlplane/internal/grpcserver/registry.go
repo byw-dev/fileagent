@@ -9,6 +9,12 @@ import (
 	"google.golang.org/grpc"
 )
 
+// sendChCapacity is the buffer size of each connection's send channel. It is
+// also the threshold past which a burst enqueued with no active consumer
+// starts dropping silently — tests pin that the send goroutine (the consumer)
+// is running before anything is enqueued (IC-BUG-31).
+const sendChCapacity = 32
+
 // AgentConn represents a single connected agent stream.
 type AgentConn struct {
 	AgentID     string
@@ -40,7 +46,7 @@ func (r *AgentRegistry) Register(
 	conn := &AgentConn{
 		AgentID:     agentID,
 		Stream:      stream,
-		SendCh:      make(chan *agentv1.ServerMessage, 32),
+		SendCh:      make(chan *agentv1.ServerMessage, sendChCapacity),
 		ConnectedAt: time.Now(),
 		CancelFunc:  cancelFn,
 	}

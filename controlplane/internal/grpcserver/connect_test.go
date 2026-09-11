@@ -499,3 +499,125 @@ func TestServer_Connect_FortyRules_AllDelivered(t *testing.T) {
 	assert.Len(t, rules, 40, "every pushed rule must reach the agent")
 	assert.True(t, gotCreds, "the credentials push behind the rules must arrive")
 }
+
+// ── F4（IC-2b review）：钉住「消费者先于生产者启动」的行为级用例 ────────────────
+//
+// 快照形态下一次同步只有 1 条消息，「消费者后置」变异没有消息丢失的行为差异，
+// 40 条快照用例杀不死它。本用例钉住顺序本身的行为签名：同步期间把 SendCh 打满，
+// 第 33 条只有在**存在正在排空的消费者**时才可能被接受——
+//   消费者先于同步启动（现状）：33 条立即被接受，全部送达（结构性保证，无时序运气）；
+//   消费者被移回同步之后（变异）：同步期间永远没有消费者 → 2s 内第 33 条必然
+//   不被接受 → SyncRulesOnConnect 返回错误 → Connect 结束流 → 用例红。
+
+// consumerPinningDispatcher 模拟任意在同步期间入队的下发方：打满缓冲后，
+// 要求观察到排空才继续，最后再补一条凭据（复刻 sync + pushCredentials 两股生产）。
+type consumerPinningDispatcher struct {
+	registry *AgentRegistry
+	total    int // 要送达的规则消息数，必须 > sendChCapacity
+}
+
+func (d *consumerPinningDispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) error {
+	pushRule := func(i int) *agentv1.ServerMessage {
+		return &agentv1.ServerMessage{
+			Payload: &agentv1.ServerMessage_PushRule{
+				PushRule: &agentv1.PushRuleCommand{
+					Rule: &agentv1.CollectionRule{RuleId: fmt.Sprintf("rule-%02d", i)},
+				},
+			},
+		}
+	}
+	for i := 0; i < sendChCapacity; i++ {
+		if !d.registry.Send(agentID, pushRule(i)) {
+			return fmt.Errorf("buffer rejected message %d with no burst — unexpected", i)
+		}
+	}
+	deadline := time.After(2 * time.Second)
+	for i := sendChCapacity; i < d.total; i++ {
+		for {
+			if d.registry.Send(agentID, pushRule(i)) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-deadline:
+				return fmt.Errorf(
+					"no consumer drained SendCh during the sync: send goroutine started after the producers (IC-BUG-31)")
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	d.registry.Send(agentID, &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_Credentials{
+			Credentials: &agentv1.CredentialsPayload{AccessKey: "AKID"},
+		},
+	})
+	return nil
+}
+
+// The send goroutine must be RUNNING before SyncRulesOnConnect is invoked:
+// the dispatcher is only able to deliver past the buffer capacity if a
+// consumer is actively draining. This is a structural guarantee, not a timing
+// bet — with the consumer started late the sync can never complete.
+func TestServer_Connect_SendConsumerRunsBeforeSync(t *testing.T) {
+	const total = sendChCapacity + 8
+	agentID := "99999999-9999-9999-9999-999999999999"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	srv := New(logger)
+	srv.WithDeps(registry, newMockCache(), jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&consumerPinningDispatcher{registry: registry, total: total}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+
+	rules := make(map[string]bool)
+	gotCreds := false
+	for {
+		msg, rErr := stream.Recv()
+		if rErr != nil {
+			break
+		}
+		switch p := msg.GetPayload().(type) {
+		case *agentv1.ServerMessage_PushRule:
+			rules[p.PushRule.GetRule().GetRuleId()] = true
+		case *agentv1.ServerMessage_Credentials:
+			gotCreds = true
+		}
+		if len(rules) == total && gotCreds {
+			break
+		}
+	}
+	assert.Len(t, rules, total,
+		"every message enqueued during the sync must be delivered — which requires the send consumer to run before the sync")
+	assert.True(t, gotCreds)
+}
