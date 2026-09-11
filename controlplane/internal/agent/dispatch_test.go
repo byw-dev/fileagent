@@ -389,3 +389,36 @@ func TestSyncRulesOnConnect_SnapshotSendFailed_Disconnected_LogsCause(t *testing
 	require.Len(t, entries, 1)
 	assert.Contains(t, entries[0].Message, "agent disconnected")
 }
+
+// IC-BUG-20 边界：bucket 集合算不出来（DB 列规则失败）时，只告警不报错——
+// DispatchRule 本体已成功，凭据重推是尽力而为。
+func TestDispatchRule_BucketSetComputationError_NoPush_NoError(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	agentID := uuid.New()
+	reg := newMockRegistry()
+	reg.online[agentID.String()] = true
+	d := NewDispatcher(&errDispatchDB{err: assert.AnError}, newMockBucketQuerier(), newMockDispatchCache(), reg, logger)
+	pusher := &mockCredentialPusher{}
+	d.SetCredentialPusher(pusher)
+
+	rule := &db.CollectionRule{ID: uuid.New(), AgentID: agentID, BucketID: uuid.New(), Status: db.RuleStatusActive}
+	require.NoError(t, d.DispatchRule(context.Background(), rule))
+	require.Len(t, reg.sent, 1)
+	assert.Empty(t, pusher.agentIDs, "uncomputable bucket set must not re-push credentials")
+}
+
+func TestOtherRulesCoverBucket_DBError(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	d := NewDispatcher(&errDispatchDB{err: assert.AnError}, newMockBucketQuerier(), newMockDispatchCache(), newMockRegistry(), logger)
+	covers, err := d.otherRulesCoverBucket(context.Background(), uuid.NewString(), &db.CollectionRule{ID: uuid.New()})
+	require.Error(t, err)
+	assert.False(t, covers)
+}
+
+func TestOtherRulesCoverBucket_InvalidAgentID(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	d := NewDispatcher(&mockDispatchDB{}, newMockBucketQuerier(), newMockDispatchCache(), newMockRegistry(), logger)
+	covers, err := d.otherRulesCoverBucket(context.Background(), "not-a-uuid", &db.CollectionRule{ID: uuid.New()})
+	require.Error(t, err)
+	assert.False(t, covers)
+}

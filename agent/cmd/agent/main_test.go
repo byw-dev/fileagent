@@ -752,3 +752,36 @@ func TestApplyRulesSnapshot_EmptySnapshot_StopsAll(t *testing.T) {
 	assert.ElementsMatch(t, []string{"a", "b"}, stopped)
 	assert.Empty(t, applied)
 }
+
+// buildStoragePath 分支补齐： trollsift path_pattern 提供变量、{time} 注入、
+// 相对路径推导失败回退 Base。
+func TestBuildStoragePath_PathPatternFieldsAndTime(t *testing.T) {
+	rule := scheduler.CollectionRule{
+		RuleID:           "r-fields",
+		BasePath:         "/data",
+		PathPattern:      "{site}/{filename}",
+		DestPathTemplate: "{time:yyyy}/{site}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/tokyo/out.bin",
+		trollsift.AgentContext{}, time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC), testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "2026/tokyo/out.bin", got)
+}
+
+func TestBuildStoragePath_RelError_FallsBackToBase(t *testing.T) {
+	rule := scheduler.CollectionRule{BasePath: "relative", DestPathTemplate: "p/{filename}"}
+	got, err := buildStoragePath(rule, "/abs/path/f.bin", trollsift.AgentContext{}, time.Now().UTC(), testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "p/f.bin", got)
+}
+
+// submitFile 对 IsProcessed / 入队失败的分支：队列已关闭时只告警，不 panic。
+func TestSubmitFile_QueueClosed_LogsAndSurvives(t *testing.T) {
+	q := openTestQueue(t)
+	exec := executor.New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		return &uploadpkg.UploadResult{}, nil
+	}, zap.NewNop(), 0)
+	rule := scheduler.CollectionRule{RuleID: "r-closed", BasePath: "/tmp", UploadBucket: "bkt", DestPathTemplate: "p/{filename}"}
+	require.NoError(t, q.Close())
+	submitFile(context.Background(), exec, q, rule, "/tmp/f.txt", 1, time.Now(), 0, "", trollsift.AgentContext{}, zap.NewNop())
+}
