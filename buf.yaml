@@ -1,0 +1,33 @@
+# buf 工作区配置（D-032）。模块根 = 仓库根：这样 buf 看到的文件名是 proto/v1/agent.proto，
+# 与 protoc 时代生成物头部的 `// source: proto/v1/agent.proto` 署名保持一致，重新生成时
+# 除了生成器版本行之外零 diff。
+# excludes：仓库其余目录不是本模块的一部分，显式排除，避免 buf 误扫描（webui/node_modules 等）。
+version: v2
+modules:
+  - path: .
+    excludes:
+      - agent
+      - api
+      - bin
+      - controlplane
+      - deploy
+      - docs
+      - pkg
+      - sdk
+      - tools
+      - webui
+lint:
+  use:
+    - STANDARD
+  # proto 文件在 proto/v1/ 而包名是 fileagent.v1，目录不匹配是既有事实；
+  # 移动文件会改变生成物的 source 署名与落点，超出契约维护范围，豁免该规则。
+  # RPC_REQUEST_STANDARD_NAME：Connect 流的消息名是 AgentMessage/ServerMessage（D-032 之前
+  # 就存在的契约，改名字等于改 gRPC 契约本身），豁免。
+  except:
+    - PACKAGE_DIRECTORY_MATCH
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+breaking:
+  # 契约规矩「只增字段，不改字段编号，不删除字段」由 CI 的 buf breaking（对 master 比对）机器强制。
+  use:
+    - FILE

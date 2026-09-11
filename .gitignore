@@ -173,3 +173,7 @@ bootstrap_admin_credentials.txt.*
 
 # 设计稿 / 导出的 HTML：保持本地未跟踪，不入库（既定政策，见 DECISIONS.md 与 CLAUDE.md 的文档约定）
 docs/design/mockups/
+
+# buf proto 生成 scratch 目录（make generate-proto / ci-proto.yml，见 D-032）
+/.tmp-proto-tools/
+/.tmp-proto-gen/

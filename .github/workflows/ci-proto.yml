@@ -1,0 +1,80 @@
+name: CI — Proto
+
+# PR / push correctness gate for the proto contract (proto/v1/agent.proto), which is
+# shared by controlplane and agent (see DECISIONS.md D-032). Three checks:
+#   1. drift guard: regenerating with the versions pinned in tools/ must reproduce the
+#      committed api/v1/*.pb.go byte-for-byte. This doubles as the cross-platform check:
+#      committed files were generated on macOS, so a green job proves the ubuntu output
+#      is byte-identical.
+#   2. buf lint.
+#   3. buf breaking against master — machine-enforces the contract rule "only add
+#      fields, never renumber or delete fields" (previously human-enforced only).
+# proto affects both controlplane and agent, and ci-cp.yml's paths don't include
+# proto/**, so this is a separate workflow.
+
+on:
+  pull_request:
+    paths:
+      - 'proto/**'
+      - 'api/**'
+      - 'tools/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
+      - 'Makefile'
+      - '.github/workflows/ci-proto.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'proto/**'
+      - 'api/**'
+      - 'tools/**'
+      - 'buf.yaml'
+      - 'buf.gen.yaml'
+      - 'Makefile'
+      - '.github/workflows/ci-proto.yml'
+
+jobs:
+  check:
+    name: proto-drift + buf lint + buf breaking
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # buf breaking compares against the local master ref; full history needed.
+          fetch-depth: 0
+
+      # The codegen tools live in tools/go.mod (which requires the newest Go);
+      # using its version also satisfies the older controlplane module.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go.mod
+          cache-dependency-path: |
+            tools/go.sum
+            controlplane/go.sum
+
+      # Regenerate with the versions pinned in tools/ and fail if anything drifts
+      # from the committed generated code. Same command local and CI run (make).
+      - name: proto drift guard
+        run: |
+          make generate-proto
+          # git status --porcelain catches modified AND new/untracked/deleted
+          # files (git diff --exit-code misses untracked), so a newly-generated
+          # output can't slip through.
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Generated proto code is out of sync with its sources. Run 'make generate-proto' and commit the result."
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+
+      # buf runs from the repo root (its module root): buf.yaml / buf.gen.yaml / .git
+      # are all resolved relative to cwd, while `go -C tools tool buf` executes with
+      # cwd=tools/ — so build the pinned buf binary into a scratch dir and run it here.
+      - name: buf lint + buf breaking (against master)
+        run: |
+          rm -rf .tmp-proto-tools
+          GOWORK=off go -C tools build -o ../.tmp-proto-tools/ github.com/bufbuild/buf/cmd/buf
+          PATH=$PWD/.tmp-proto-tools:$PATH .tmp-proto-tools/buf lint
+          PATH=$PWD/.tmp-proto-tools:$PATH .tmp-proto-tools/buf breaking --against '.git#branch=master'
+          rm -rf .tmp-proto-tools
