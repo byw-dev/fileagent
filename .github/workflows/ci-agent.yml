@@ -1,0 +1,59 @@
+name: CI — Agent
+
+# PR / push correctness gate for the Agent: build + vet + test across
+# ubuntu-latest and windows-latest. This is the module's regression net —
+# it does NOT run integration tests (needs a real MinIO / TLS endpoint,
+# so `-tags=integration` is deliberately omitted, same as ci-cp.yml).
+# The cross-platform matrix is the point: agent targets Windows/Linux
+# (see build-agent.yml) but had only ever been verified on macOS locally.
+# Release-artifact builds stay in build-agent.yml (manual workflow_dispatch).
+
+on:
+  pull_request:
+    paths:
+      - 'agent/**'
+      - '.github/workflows/ci-agent.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'agent/**'
+      - '.github/workflows/ci-agent.yml'
+
+jobs:
+  test:
+    name: build + vet + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # mattn/go-sqlite3 needs CGO. On windows-latest, GCC is provided by the
+      # pre-installed MSYS2 (mingw64). We just need to put it on PATH.
+      # (Same treatment as build-agent.yml.)
+      - name: Add GCC to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: echo "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # Agent is an independent Go module; pin to the version it declares
+      # (do NOT use tools/go.mod — that newer Go is only required by sqlc).
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+
+      - name: build
+        working-directory: agent
+        run: go build ./...
+
+      - name: vet
+        working-directory: agent
+        run: go vet ./...
+
+      - name: test
+        working-directory: agent
+        run: go test ./... -count=1

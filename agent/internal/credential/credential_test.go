@@ -3,6 +3,7 @@ package credential
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,8 +91,11 @@ func TestTokenManager_SaveLoad(t *testing.T) {
 func TestTokenManager_LoadMissingFile(t *testing.T) {
 	mgr := NewTokenManager("/nonexistent/token.enc", "id")
 	err := mgr.Load()
+	// errors.Is unwraps the fmt.Errorf("%w") wrapper and is OS-independent:
+	// os.IsNotExist does not unwrap, and the message text ("no such file" on
+	// POSIX, "The system cannot find the path specified." on Windows) differs.
 	require.Error(t, err)
-	assert.True(t, os.IsNotExist(err) || strings.Contains(err.Error(), "no such file"))
+	assert.True(t, errors.Is(err, os.ErrNotExist))
 }
 
 func TestTokenManager_Save_WrongKeyOnLoad(t *testing.T) {

@@ -11,7 +11,7 @@
 | ID | 任务 | 内容摘要 | 状态 |
 |----|------|---------|------|
 | T4-1 | 监控配置 | Prometheus 抓取端点 + Grafana Dashboard 模板 + 告警规则 + Loki/Promtail 日志采集 | ⬜ |
-| T4-2 | CI 配置 | GitHub Actions Workflows：controlplane / agent / webui / sdk-python 四条流水线（lint + test + build） | ⬜ |
+| T4-2 | CI 配置 | GitHub Actions Workflows：controlplane / agent / webui / sdk-python 四条流水线（lint + test + build） | ◐ 部分：controlplane 已有 `ci-cp.yml`；agent 已交付 `ci-agent.yml`（build + vet + test，ubuntu/windows 矩阵，见 PR chore/t4-2-agent-ci）；webui / sdk-python 仍缺 |
 | T4-3 | 部署脚本与文档 | 迁移嵌入二进制（D-023）；Dockerfile + prod compose + Caddyfile；systemd service 文件；Windows NSSM 脚本；README 生产部署段；`docs/ops/` 部署+运维手册 | ✅ |
 | T4-4 | Java SDK | OkHttp3 + Jackson + Lombok；JUnit 5 + MockWebServer；功能对齐 Python SDK | ⬜ |
 | T4-5 | Agent 重命名 | 管理员可在 Web UI 为采集器设置自定义显示名 | ✅ 已作为 CC-8 交付（PR #58 / D-021） |
