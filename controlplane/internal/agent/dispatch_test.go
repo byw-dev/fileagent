@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -421,4 +422,140 @@ func TestOtherRulesCoverBucket_InvalidAgentID(t *testing.T) {
 	covers, err := d.otherRulesCoverBucket(context.Background(), "not-a-uuid", &db.CollectionRule{ID: uuid.New()})
 	require.Error(t, err)
 	assert.False(t, covers)
+}
+
+// ── F1：快照与增量推送的竞态（IC-2b review）────────────────────────────────────
+//
+// 场景：SyncRulesOnConnect 在 T1 拿到规则集，之后还要走一圈 bucket lookup 才把
+// 快照发出去。窗口内管理员新建规则 R、DispatchRule 的增量 push 先于快照到达
+// agent，旧快照（T1 世界）里没有 R——「缺席即停」会把 R 永久停掉。
+// 修法：按 agent 的互斥锁，让「构建快照+发送」与增量发送互斥，线序=逻辑序。
+//
+// 本测试用 agent 语义模拟器处理 mockRegistry 收到的消息序（push→应用、
+// rulesync→集合外交替），断言 R 最终处于运行状态。当前实现下 R 被停 → 红。
+
+// statefulListDB 是取决于调用时机的规则列表：新建规则前返回旧集合，之后返回
+// 包含新规则的集合——模拟真库的提交可见性。首次调用时发 listDone 信号。
+type statefulListDB struct {
+	mu       sync.Mutex
+	existing *db.CollectionRule
+	newRule  *db.CollectionRule
+	created  bool
+	listDone chan struct{}
+}
+
+func (m *statefulListDB) ListCollectionRulesByAgent(_ context.Context, _ uuid.UUID) ([]*db.CollectionRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rules := []*db.CollectionRule{m.existing}
+	if m.created && m.newRule != nil {
+		rules = append(rules, m.newRule)
+	}
+	if m.listDone != nil {
+		m.listDone <- struct{}{}
+	}
+	return rules, nil
+}
+
+// createSimulatesCommit marks the new rule as visible to subsequent lists.
+func (m *statefulListDB) createSimulatesCommit(r *db.CollectionRule) {
+	m.mu.Lock()
+	m.newRule = r
+	m.created = true
+	m.mu.Unlock()
+}
+
+// blockingBucketQuerier 让快照构建中的第一次 bucket lookup 阻塞，制造
+// 「已列表、未发送」的确定性窗口；测试在增量「完成或被锁挡住」后放行。
+type blockingBucketQuerier struct {
+	mu      sync.Mutex
+	arrived int
+	release chan struct{}
+}
+
+// GetBucketByID blocks only the FIRST caller (the snapshot build); later
+// callers (incremental dispatch lookups) pass through immediately. sync.Once
+// would also park the second caller behind the first, which is not the shape
+// we need.
+func (b *blockingBucketQuerier) GetBucketByID(_ context.Context, id uuid.UUID) (*db.Bucket, error) {
+	b.mu.Lock()
+	b.arrived++
+	first := b.arrived == 1
+	b.mu.Unlock()
+	if first {
+		<-b.release
+	}
+	return &db.Bucket{ID: id, Name: "test-bucket"}, nil
+}
+
+// simulateAgentRuleView 按 agent 的真实语义回放 CP 下发的消息序：
+// PushRule → upsert+apply（Enabled=false 即停）；RulesSync → 集合外停、集合内按快照生效。
+func simulateAgentRuleView(sent []*agentv1.ServerMessage) map[string]bool {
+	running := map[string]bool{}
+	for _, m := range sent {
+		switch p := m.GetPayload().(type) {
+		case *agentv1.ServerMessage_PushRule:
+			r := p.PushRule.GetRule()
+			running[r.GetRuleId()] = r.GetEnabled()
+		case *agentv1.ServerMessage_RulesSync:
+			inSnap := map[string]bool{}
+			for _, r := range p.RulesSync.GetRules() {
+				inSnap[r.GetRuleId()] = true
+			}
+			for id := range running {
+				if !inSnap[id] {
+					delete(running, id)
+				}
+			}
+			for _, r := range p.RulesSync.GetRules() {
+				running[r.GetRuleId()] = r.GetEnabled()
+			}
+		}
+	}
+	return running
+}
+
+func TestSyncRulesOnConnect_RuleCreatedDuringSnapshotSurvives(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	agentID := uuid.New()
+	reg := newMockRegistry()
+	reg.online[agentID.String()] = true
+	existing := &db.CollectionRule{ID: uuid.New(), AgentID: agentID, Status: db.RuleStatusActive}
+	listDB := &statefulListDB{existing: existing, listDone: make(chan struct{}, 1)}
+	bq := &blockingBucketQuerier{release: make(chan struct{})}
+	d := NewDispatcher(listDB, bq, newMockDispatchCache(), reg, logger)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		require.NoError(t, d.SyncRulesOnConnect(context.Background(), agentID.String()))
+	}()
+	<-listDB.listDone // 快照已锁住本 agent 的同步窗口（或已列表），集合尚不含新规则
+
+	// 窗口内：管理员新建 R 并经 DispatchRule 增量下发。
+	newRule := &db.CollectionRule{ID: uuid.New(), AgentID: agentID, Status: db.RuleStatusActive}
+	listDB.createSimulatesCommit(newRule)
+	rSent := make(chan struct{})
+	go func() {
+		require.NoError(t, d.DispatchRule(context.Background(), newRule))
+		close(rSent)
+	}()
+
+	// 无锁实现（变异）：增量在快照发送前完成——rSent 在窗口内出现（红路径）。
+	// 有锁实现：同步窗口持锁阻塞在 lookup 里，增量只能在快照之后送达。
+	// 给红路径 500ms 出现的机会，随后无条件放行 lookup，两条路径都确定收敛。
+	select {
+	case <-rSent:
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(bq.release)
+	wg.Wait()
+	<-rSent
+
+	view := simulateAgentRuleView(reg.sent)
+	assert.True(t, view[newRule.ID.String()],
+		"a rule created while the snapshot was being built must survive the sync — "+
+			"the snapshot (older world) must not stop it")
+	assert.True(t, view[existing.ID.String()])
 }

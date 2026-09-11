@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
@@ -53,6 +54,21 @@ type Dispatcher struct {
 	logger   *zap.Logger
 
 	pusher CredentialPusher
+
+	// agentMu serialises a single agent's rule traffic: building + sending the
+	// full snapshot (which spans several DB round-trips) must not interleave
+	// with incremental DispatchRule / DispatchRuleCancel sends, or a rule
+	// created while the snapshot is in flight gets pushed incrementally and
+	// then stopped by the older snapshot's absence (review F1). Per agent —
+	// never global: agents are independent and a global lock would serialise
+	// all dispatch traffic behind one slow sync.
+	agentMu sync.Map // agentID string -> *sync.Mutex
+}
+
+// agentLock returns the per-agent dispatch mutex, creating it on first use.
+func (d *Dispatcher) agentLock(agentID string) *sync.Mutex {
+	m, _ := d.agentMu.LoadOrStore(agentID, &sync.Mutex{})
+	return m.(*sync.Mutex)
 }
 
 // SetCredentialPusher wires the callback used to re-push STS credentials when
@@ -110,11 +126,19 @@ func (d *Dispatcher) DispatchRule(ctx context.Context, rule *db.CollectionRule) 
 		},
 	}
 
+	// Serialize against snapshot sync (review F1): the incremental push must
+	// land strictly before or after the snapshot's build+send window, never
+	// inside it — a push landing inside an older snapshot's window would be
+	// stopped by that snapshot's absence semantics.
+	mu := d.agentLock(agentID)
+	mu.Lock()
 	if !d.registry.Send(agentID, msg) {
+		mu.Unlock()
 		d.logger.Warn("dispatch_rule: failed to send to agent", zap.String("agent_id", agentID))
 		return fmt.Errorf("dispatch_rule: failed to send rule %s to agent %s: channel full or disconnected",
 			rule.ID, agentID)
 	}
+	mu.Unlock()
 
 	// IC-BUG-20: credentials are minted for the bucket set of the agent's
 	// active rules at issue time. If this rule points at a bucket no other
@@ -170,6 +194,11 @@ func (d *Dispatcher) DispatchRuleCancel(ctx context.Context, ruleID, agentID str
 			CancelRule: &agentv1.CancelRuleCommand{RuleId: ruleID},
 		},
 	}
+	// Serialize against snapshot sync (review F1): a cancel landing inside the
+	// snapshot's window could be undone by the snapshot re-pushing the rule.
+	mu := d.agentLock(agentID)
+	mu.Lock()
+	defer mu.Unlock()
 	if !d.registry.Send(agentID, msg) {
 		d.logger.Warn("dispatch_rule_cancel: failed to send", zap.String("agent_id", agentID))
 	}
@@ -210,6 +239,15 @@ func (d *Dispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) err
 		return fmt.Errorf("sync_rules: invalid agent_id: %w", err)
 	}
 
+	// Serialize the whole build+send window against incremental dispatch
+	// (review F1): the snapshot reflects the DB as of the list below, so a
+	// rule created while it is in flight must be pushed AFTER the snapshot
+	// arrives, or the snapshot's absence semantics would permanently stop a
+	// rule that still exists. The lock spans the DB round-trips — bounded by
+	// the rule list size, and only for this one agent.
+	mu := d.agentLock(agentID)
+	mu.Lock()
+	defer mu.Unlock()
 	rules, err := d.db.ListCollectionRulesByAgent(ctx, parsed)
 	if err != nil {
 		return fmt.Errorf("sync_rules: list rules: %w", err)
