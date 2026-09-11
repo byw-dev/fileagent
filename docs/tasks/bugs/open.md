@@ -143,7 +143,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 ---
 
-## IC-BUG-1 — Agent 永远拿不到 STS 凭据，所有上传直接失败 🔴 P0
+## IC-BUG-1 — Agent 永远拿不到 STS 凭据，所有上传直接失败 🔴 P0 ✅ 已修（IC-1，PR #93）
 
 | 字段 | 内容 |
 |------|------|
@@ -164,7 +164,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 上传一个文件后，`file_entries` 的 `agent_id`/`rule_id`/`sha256` 非空，`upload_logs` 有对应行，NATS 上能收到 `events.file.uploaded` |
 | **✅ 已修（IC-2a ①②③，2026-09-11）** | `UploadFunc` 签名改为 `(*uploader.UploadResult, error)`，executor 成功后经回调上报；proto 的 `UploadResult` 增 `task_id`（只增字段）；CP 处理完回发 `Acknowledgement`（消息本就存在，只是从来没人发），agent 队列增 `reported` 态、**收到 ack 才置 `completed`**。**live 实证（dev，真 gRPC/STS/MinIO/PG/NATS）**：落一个文件后 `file_entries` 的 `agent_id`/`rule_id`/`sha256` 非空、`upload_logs` 有行、NATS 收到 `events.file.uploaded`；协调者独立复跑一遍同样全绿（36.19s）
 
-## IC-BUG-3 — STS session policy 前缀与实际对象键不匹配 🔴 P0
+## IC-BUG-3 — STS session policy 前缀与实际对象键不匹配 🔴 P0 ✅ 已修（IC-1，PR #93）
 
 | 字段 | 内容 |
 |------|------|
@@ -175,7 +175,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | **已定（D-030 第八条，2026-09-09）**：policy 资源改为整桶 `arn:aws:s3:::{bucket}/*`，`dest_path_template` 不受任何约束。此前考虑的两个方案（强制模板前缀 / 按静态前缀动态生成）均已否决，理由见 D-030 备选方案 |
 | **验收** | 用签发的 STS 凭据直接 `PutObject` 到规则实际生成的 `storage_path`，返回 200（任意模板形状均成立，包括以 `/` 开头与首段为 `{filename}` 的） |
 
-## IC-BUG-4 — STS session policy 缺 multipart 权限、多授 DeleteObject 🔴 P0
+## IC-BUG-4 — STS session policy 缺 multipart 权限、多授 DeleteObject 🔴 P0 ✅ 已修（IC-1，PR #93）
 
 | 字段 | 内容 |
 |------|------|
@@ -314,7 +314,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 提为配置项（默认保持 15min），并在响应的 `expires_in` 中如实返回 |
 | **验收** | 改配置后 `expires_in` 随之变化 |
 
-## IC-BUG-16 — 模板前导 `/` 使 path_var 打标对多数规则静默失效 🟠 P1
+## IC-BUG-16 — 模板前导 `/` 使 path_var 打标对多数规则静默失效 🟠 P1 ✅ 已修（IC-1，PR #93）
 
 | 字段 | 内容 |
 |------|------|
@@ -326,7 +326,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 抽一个模板归一化函数（去前导 `/`，其余规则集中），**agent 拼路径 / CP 反解 / webui 预览三端共用**；放在 `pkg/trollsift` 或其相邻位置，使各端不可能再分叉。**方向必须是「CP 与 webui 剥模板的前导 `/`」，不是「agent 停止剥路径」**——后者会改写所有对象键、需全量重铺。约定写入 [`contracts.md`](../../design/contracts.md) V-3 |
 | **验收** | 建一条 `path_tag_map` 非空、模板以 `/` 开头的规则，上传文件后 `file_tags` 中出现 `source='path_var'` 的行；单测覆盖「模板带/不带前导 `/`」两种写法均能反解；webui 预览与实际对象键一致（都不带前导 `/`） |
 
-## IC-BUG-17 — 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 🔴 P0
+## IC-BUG-17 — 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 🔴 P0 ✅ 已修（IC-1，PR #93）
 
 | 字段 | 内容 |
 |------|------|
@@ -338,7 +338,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 缓存 token 分支补齐身份：从 JWT claims 还原 `agent_id` / `agent_name`（token 里已有，CP 侧就是这么取的），或把两者与 token 一起持久化。另外给 `buildStoragePath` 的 Compose 失败路径加 `logger.Warn`——它现在完全静默 |
 | **验收** | Agent 首次注册后**重启**，落一个文件：对象键仍符合 `dest_path_template`（不是裸 basename）；心跳的 `agent_id` 非空；日志中无 `missing field` |
 
-## IC-BUG-18 — Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 🔴 P0
+## IC-BUG-18 — Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 🔴 P0 ✅ 已修（IC-1，PR #93）
 
 | 字段 | 内容 |
 |------|------|
@@ -386,7 +386,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 兜底改为**任务失败**（可重试 / 可告警）而不是猜键；Warn 按 `rule_id` 去重（首次记录）或采样。归 **IC-2b**（agent 侧鲁棒性一刀，与 IC-BUG-20 同刀）——它改的是任务终态语义，与上报通道本身无关 |
 | **验收** | 模板解析不出来时任务进入失败态并可在 UI 看到原因；同一规则连续 N 个文件失败只产生一条 Warn |
 
-## IC-BUG-22 — `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token 🔴 P0
+## IC-BUG-22 — `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token 🔴 P0 ✅ 已修（IC-1，PR #93）
 
 | 字段 | 内容 |
 |------|------|
@@ -398,7 +398,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | ✅ 单测覆盖（错误指纹 / 空指纹均拒绝，正确指纹签发）；变异测试确认去掉校验后用例失败 |
 | **⚠️ 爆炸半径已扩大（2026-09-11）** | 本条在 IC-1 之前是「拿到 token 也没用」（STS 链路不通），IC-1 之后是「dev 独有」（只有 dev 那台手工建的 IAM 用户能签出 STS）。**PR #97 修好 IC-BUG-36 之后，任何按脚本 bootstrap 出来的环境都能签出 STS**，本条随之从「dev 独有」升级为「所有新环境可利用」。严重度不变，但排期理由变强了——正确的问法一直是「这次改动让原本无害的东西变得可利用了吗」 |
 
-## IC-BUG-23 — 吊销不生效：token 仍可用，且重连会把状态刷回 online 🔴 P0
+## IC-BUG-23 — 吊销不生效：token 仍可用，且重连会把状态刷回 online 🔴 P0 ✅ 已修（IC-1，PR #93）
 
 | 字段 | 内容 |
 |------|------|
@@ -410,7 +410,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | ✅ 单测覆盖（revoked 拒绝 + 三种可用状态放行 + 查库失败拒绝）；变异测试确认去掉闸门后用例失败 |
 | **⚠️ 爆炸半径已扩大（2026-09-11）** | 本条在 IC-1 之前是「拿到 token 也没用」（STS 链路不通），IC-1 之后是「dev 独有」（只有 dev 那台手工建的 IAM 用户能签出 STS）。**PR #97 修好 IC-BUG-36 之后，任何按脚本 bootstrap 出来的环境都能签出 STS**，本条随之从「dev 独有」升级为「所有新环境可利用」。严重度不变，但排期理由变强了——正确的问法一直是「这次改动让原本无害的东西变得可利用了吗」 |
 
-## IC-BUG-24 — `handleDryRunResult` 无归属校验 🟡 P2
+## IC-BUG-24 — `handleDryRunResult` 无归属校验 🟡 P2 ✅ 已修（IC-SEC-1，PR #94）
 
 | 字段 | 内容 |
 |------|------|
@@ -422,7 +422,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | ✅ **已修（IC-SEC-1，PR #94）**：归属绑在 store 上——`dryrun.Store.Register(reqID, agentID)` 记录收件人，`Deliver(reqID, agentID, result)` 比对后才投递并返回是否接受。零 DB 查询，且校验的是真正的不变量 |
 | **验收** | ✅ agent A 对发给 B 的关联 ID 投递被丢弃并告警；**合法试运行仍能送达**（这条是初版缺的关键回归）；经 `handleAgentMessage` 的用例断言闸门拿到的是流上的 agentID |
 
-## IC-BUG-25 — 吊销切不断已建立的流 🟠 P1
+## IC-BUG-25 — 吊销切不断已建立的流 🟠 P1 ✅ 已修（IC-SEC-1，PR #94）
 
 | 字段 | 内容 |
 |------|------|
@@ -563,9 +563,11 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **实测（2026-09-10，dev）** | `mc admin user svcacct add --access-key cpAdmin00000000000000 …` → `The access key is invalid. (access key length should be between 3 and 20).`。dev 环境里实际存在的是手工建的 `cpadmin000000000000`（19 字符），与脚本默认值不一致；`docker-compose.dev.yml` 用的是 `minio/minio:latest`（当前 `RELEASE.2025-09-07T16-13-09Z`） |
 | **后果** | **按文档做全新 bootstrap 会在第 4 步中止**——CP 拿不到能用的 MinIO 凭据，所有预签名下载返回 500（`The Access Key Id you provided does not exist in our records`）。dev 环境长期靠手工建的账号绕过，所以没人撞见 |
 | **发现路径** | IC-2c 的 live 验收（预签名下载）在 dev 上 500，追下去发现本地 `deploy/config/controlplane.env`（未跟踪，`.gitignore:167` 忽略整个 `deploy/config/`）里的 key 也是这个 21 字符的值，MinIO 侧根本不可能存在。**该本地文件已于同日改为 19 字符的 `cpAdmin000000000000` 好让验收跑起来**，所以现在照着它复现不出来了——仓库里仍然错的是 `init-minio.sh:33` |
-| **修复** | 把默认值改成 ≤20 字符（如 `cpAdmin000000000000`），并在脚本里对长度做前置校验 + 明确报错；同步更新 `init-minio.sh:17` 的注释与部署文档里的示例值。**不存在 `deploy/config/controlplane.env.example`**（`deploy/config/` 整个被 gitignore），仓库里仅 `init-minio.sh:17` 与 `:33` 两处出现该值。**注意这会改变已部署环境的凭据**，需在变更说明里写清 |
+| **修复** | 把默认值改成 ≤20 字符（如 `cpAdmin000000000000`），并在脚本里对长度做前置校验 + 明确报错；同步更新脚本头部注释与部署文档里的示例值（**⚠️ 原文写的 `init-minio.sh:17` / `:33` 两处行号在 PR #97 之后已失效，现在分别是 `:24` 与 `:43`**）。**不存在 `deploy/config/controlplane.env.example`**（`deploy/config/` 整个被 gitignore），仓库里仅 `init-minio.sh:17` 与 `:33` 两处出现该值。**注意这会改变已部署环境的凭据**，需在变更说明里写清 |
 | **验收** | 干净的 MinIO 容器上从头跑一遍 `init-minio.sh` 全程 exit 0；CP 用脚本产出的凭据能成功签发预签名下载 URL 并取回对象 |
 | **归属** | 未排期。与 IC 主线正交（不影响写入准入/一致性），但**挡着任何人复现 live 验收**，宜与 IC-4（同样要动 `init-minio.sh`）合并处理 |
+| **✅ 已修（PR #97，2026-09-11）** | 与 IC-BUG-36 同刀修掉：默认值改为 19 字符，并加了 access(3–20)/secret(8–40) 的**前置**长度校验（在任何集群变更之前退出） |
+| **⚠️ 关闭时必须带上的限定** | **「20 字符上限」只对 service account 成立。** 2026-09-11 实测（同镜像）：`mc admin user add` 收下 21 字符 access key 并能正常 `AssumeRole` + 预签名 GET；`mc admin user svcacct add` 才报 `access key length should be between 3 and 20`。**改用真实 IAM 用户之后，本条的根因描述已不再适用**——脚本保留 3–20 校验是**主动收敛到两种账号形态的公共窗口**（便于互换），不是 MinIO 的要求。若将来有人拿「MinIO 限制 20 字符」当依据做别的决定，那是从这张卡片误读出去的 |
 
 ---
 
