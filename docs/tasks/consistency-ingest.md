@@ -4,7 +4,7 @@
 > 从「靠事件运气」改造为「有界成本可验证」。
 > **权威设计**：[`docs/design/consistency-and-ingest.md`](../design/consistency-and-ingest.md)
 > **决策**：`DECISIONS.md` **D-030**（总设计）、**D-031**（事件传输改 JetStream）
-> **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-41
+> **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-42
 > **来由**（2026-09-08）：产品提出两条此前不成立的前提——必须允许 ETL 等非 Agent 进程写入并记录
 > tags 与血缘；对象量级为千万/年、3–5 年上亿。据此审计发现 **Agent 数据面从未端到端跑通过**。
 
@@ -46,7 +46,9 @@ dev 上落一个文件 → MinIO 出现对象 → `file_entries` 的 `agent_id`/
 
 ### 下一刀怎么选
 
-**在 IC-2b / IC-3 / IC-4 / IC-5 / IC-SEC-2 之间选，五者彼此可并行**，之后才是有时间窗口的地基 IC-6/7。
+**IC-5 已于 2026-09-11 收官（PR #100）。下一刀在 IC-2b / IC-3 / IC-4 / IC-SEC-2 之间选，四者彼此可并行**，
+之后才是有时间窗口的地基 IC-6/7。**推荐 IC-2b**——重判时点名的两条「稳态就错」缺陷里，
+IC-BUG-10 已随 IC-5 关闭，只剩它手上的 **IC-BUG-21**（整桶 policy 之后错键不再被 403 挡住，静默写错位置）。
 **这五刀各做什么，看下方「任务清单」里对应的行**（每行都有子项与验收），不要只看名字猜。
 选之前**读一遍下方「分诊结论」的 2026-09-11 重判**——判据已经从「挡着能不能跑通」变成
 「挡着能不能扛住故障」，上一轮按旧口径给的「可推」不能直接沿用（尤其 IC-SEC-2 那三条，
@@ -92,7 +94,7 @@ dev 上落一个文件 → MinIO 出现对象 → `file_entries` 的 `agent_id`/
 | 类别 | 编号 | 说明 |
 |---|---|---|
 | 任务 | **`IC-0` … `IC-14`** | Ingest & Consistency，对应 `consistency-and-ingest.md`。按依赖顺序编号 |
-| 缺陷 | **`IC-BUG-1` … `IC-BUG-41`** | 见 [`bugs/open.md`](bugs/open.md)，沿用 `T3-5-BUG-x` 的既有形状。**新编号接着往后取**，不要以为序号只到某个旧上限 |
+| 缺陷 | **`IC-BUG-1` … `IC-BUG-42`** | 见 [`bugs/open.md`](bugs/open.md)，沿用 `T3-5-BUG-x` 的既有形状。**新编号接着往后取**，不要以为序号只到某个旧上限 |
 | 拆刀 | **`IC-2a` / `IC-2b`**、**`IC-SEC-n`** | 一刀过大时就地加后缀，**不消耗新序号**——`IC-15` 留给真正的新任务，否则「按依赖顺序编号」的性质会被破坏 |
 | 阶段 | **不编号** | 仅作描述性小标题（止血 / 地基 / 准入 / 对账 / 血缘） |
 
@@ -117,19 +119,23 @@ dev 上落一个文件 → MinIO 出现对象 → `file_entries` 的 `agent_id`/
 > **⚠️ 2026-09-11 重判（不是把数字减一减）**：止血阶段收官后，有几条的**性质**变了而不只是状态变了，
 > 数字对上而性质没重判，比数字不对更能骗人。逐条见下表与其后的「本次重判了什么」。
 
-**41 条中已关闭 18 条**：IC-1 关 1/3/4/16/17/18/22/23，IC-SEC-1 关 24/25，IC-2c 关 19，
-**IC-2a（PR #98）关 2/8/28/29/33**，**PR #97 关 35/36**。
-**未关闭 23 条：12 条挡、8 条可推、3 条拆半**（12/13/31 各关掉一半）。
-「挡」的 12 条是 5/6/7/9/10/11/20/21/30/34/37/40——**其中 6/7/37 是「挡（收窄）」，仍算挡，不要当成可推**。
+**42 条中已关闭 23 条**：IC-1 关 1/3/4/16/17/18/22/23，IC-SEC-1 关 24/25，IC-2c 关 19，
+**IC-2a（PR #98）关 2/8/28/29/33**，**PR #97 关 35/36**，**IC-5（PR #100）关 10/11/34/37 并补上 12 的超时半边**。
+**未关闭 19 条：8 条挡、9 条可推、2 条拆半**（13/31 各关掉一半；**12 已两半齐全、不再是拆半**）。
+「挡」的 8 条是 5/6/7/9/20/21/30/40——**其中 6/7 是「挡（收窄）」，仍算挡，不要当成可推**。
+**IC-BUG-42 是 PR #100 的 code review 新立的**（`EnqueueIfNoActive` 不拦 `failed`，退避重试期间重复提交会双传），
+判为可推并写明了刻意不修的理由，见其卡片。
 
 **这 23 条里没有一条再挡着「首次写入能否落地并记准」**——`file_entries` 有且只有一行、富字段不被清空、
 上报与 webhook 两个写入方不打架，这些在 IC-1 + IC-2c + IC-2a + PR #97 之后已有 live 证据。
 **剩下的「挡」大多是挡着「能不能扛住故障」**（重试、断连、崩溃恢复、事件丢失）。
 
-> **⚠️ 但不要据此认为「正确性已经做完、只剩鲁棒性」——有两条例外，它们是产品语义缺口而非容错缺口**：
-> **IC-BUG-10**（`IsProcessed` 忽略 mtime/size，**文件改了内容永远不会被重新采集**）直接对应判据里的
-> 「不倒退（…改文件都不丢不重）」；**IC-BUG-21**（模板解析失败时猜一个对象键写进去）直接对应
-> 「落得进（按模板落到正确的对象键）」。把 IC-5 / IC-2b 往后排之前，先看这两条。
+> **⚠️ 但不要据此认为「正确性已经做完、只剩鲁棒性」——原有两条例外是产品语义缺口而非容错缺口**：
+> **IC-BUG-10**（`IsProcessed` 忽略 mtime/size，**文件改了内容永远不会被重新采集**）与
+> **IC-BUG-21**（模板解析失败时猜一个对象键写进去）。
+> **IC-BUG-10 已随 IC-5（PR #100）关闭**，同刀还关掉了 IC-BUG-37（既有文件永不采集）。
+> **剩下的那条是 IC-BUG-21，归 IC-2b**——IC-1 把 policy 改成整桶之后，错键不再被 403 挡住，
+> 退化成**静默写错位置**。把 IC-2b 往后排之前，先看这一条。
 
 | ID | 判定 | 归属 | 理由 |
 |---|---|---|---|
@@ -139,7 +145,7 @@ dev 上落一个文件 → MinIO 出现对象 → `file_entries` 的 `agent_id`/
 | 7 | 🟠 挡（收窄）| IC-4 ② | IC-2a 前是「UI 建的桶文件永不入索引」，之后降级为补偿通道缺失 |
 | 8 | ✅ **已关闭** | **IC-2a ⑤（PR #98）** | **不与 2 同刀即数据损坏**——webhook 晚到清空富字段 |
 | 9 | 🟠 挡 | IC-4 ③ | `/tmp` 易失，事件丢了无补偿。**⚠️ 2026-09-10 改判**：初版写「IC-11 会连 `queue_dir` 一起删掉，别花第二次力气」——**实测证伪**，`mc admin config get myminio notify_nats` 显示它同样有 `queue_dir=` / `queue_limit=`。D-031 的全量扫描结论才是对的（`❌ 不解决`），此处从「挡但一行·别修」改判为「挡·照修」 |
-| 10 | 🟠 挡 | IC-5 ① | 改了内容不重采 = 一次性上传器，不是同步系统 |
+| 10 | ✅ **已关闭** | **IC-5 ①（PR #100）** | 改了内容不重采 = 一次性上传器，不是同步系统 |
 | 19 | ✅ **已关闭** | **IC-2c（PR #96）** | **与 2 互相制造重复行**——两个写入方的键编码不同，进不了同一个 conflict target。**须早于 IC-2a**。2026-09-10 已修并 live 验证；「同一对象经两条路径只有一行」那条回归**仍欠在 IC-2a**（agent 尚不上报，本刀执行不了） |
 | 20 | 🔴 挡 | IC-2b ① | 新建指向新桶的规则 → 最长约 50 分钟持续 403，重试耗尽不自愈 |
 | 21 | 🟠 挡 | IC-2b ② | 整桶 policy 后错键不再被 403 挡住，退化成**静默写错位置** |
@@ -148,9 +154,9 @@ dev 上落一个文件 → MinIO 出现对象 → `file_entries` 的 `agent_id`/
 | 30 | 🟠 挡 | IC-2b ③ | 断连期间删掉的规则 agent 继续跑，**无界**直到进程重启 |
 | 31 | ◐ 拆半 | **IC-2a ④（PR #98，ack 半边已关）** / IC-2b ④ | ack 半边已修（`reported` 超时回退重发，**不是**让 `Send` 变可靠——后者正是 M-2 的错误方向），live 回归「故意丢一个 ack 后任务自愈」通过；**结构半边（`SendCh` 满即静默丢弃）仍开着，归 IC-2b** |
 | 33 | ✅ **已关闭** | **IC-2a ⑥（PR #98）** | ⑥ 一落地即常态产出「DB 有、对象无」的反向幽灵，污染 IC-13 对账输入 |
-| 34 | 🟠 挡 | IC-5 ④ | 崩溃时在传的任务永久卡死，既不重传也不上报，且**无任何信号** |
-| 11 | 🟡 挡（低） | IC-5 ② | 只影响 `append_mode=tail` 规则、当前无消费方，**但修法只是给 `UploadTask` 补两个字段赋值**，比单独排期便宜。**⚠️ 2026-09-10 改判**：初版写「可推到准入阶段之后」，与任务表把它排进 IC-5 ②（并给了验收、算进止血归档范围）矛盾，按后者对齐 |
-| 12 | ◐ 拆半 | **IC-2a ⑥（PR #98，上报半边已关）** / IC-5 ③ | 重试耗尽已以 `success=false` 上报；**超时半边（per-upload timeout）仍开着，归 IC-5 ③** |
+| 34 | ✅ **已关闭** | **IC-5 ④（PR #100）** | 崩溃时在传的任务永久卡死，既不重传也不上报，且**无任何信号**。`reported` 刻意不复位（对象已在 MinIO，复位即全量重传），走 IC-2a 的重报路径 |
+| 11 | ✅ **已关闭** | **IC-5 ②（PR #100）** | 只影响 `append_mode=tail` 规则、当前无消费方，**但修法只是给 `UploadTask` 补两个字段赋值**，比单独排期便宜。**⚠️ 2026-09-10 改判**：初版写「可推到准入阶段之后」，与任务表把它排进 IC-5 ②（并给了验收、算进止血归档范围）矛盾，按后者对齐 |
+| 12 | ✅ **已关闭（两半齐全）** | **IC-2a ⑥（PR #98）+ IC-5 ③（PR #100）** | 重试耗尽以 `success=false` 上报（IC-2a）；per-upload timeout 已落地（IC-5）。**⚠️ review 修正**：deadline 按 `FileSize` 而非 tail 增量推导——multipart 忽略 offset 且传输前先对全文件算 SHA256，按增量算会让大文件永远超时重试 |
 | 13 | ◐ 拆半 | **IC-2a ⑤（PR #98，防清空半边已关）** / 未排期 | `COALESCE` 已落地，后到的 webhook 不再清空已有值；**填值半边仍开着**——webhook 那一路今天就能做（载荷里本来就有 `contentType`），agent 那一路需 proto 增字段 |
 | 14 | ⬜ 可推 | IC-7 ① | 百万行内无感 |
 | 15 | ⬜ 可推 | IC-7 ③ | ⚠️ 但 19 不修则 presign 本来就 404，TTL 长短无意义 |
@@ -159,7 +165,7 @@ dev 上落一个文件 → MinIO 出现对象 → `file_entries` 的 `agent_id`/
 | 32 | ⬜ 可推 | IC-SEC-2 | 稳态下命令实际能送达（评审实测证伪了初版「约半数丢失」） |
 | 35 | ✅ **已关闭** | **PR #97** | `init-minio.sh` 默认 access key 21 字符。**⚠️ 关闭时的限定**：20 字符上限只对 **service account** 成立，`mc admin user add` 收 21 字符（2026-09-11 实测）——改用 IAM 用户后该根因已不适用，脚本保留 3–20 校验是主动收敛，不是 MinIO 的要求 |
 | 36 | ✅ **已关闭** | **PR #97** | CP 凭据被建成 root 的 **service account**，而 MinIO 不允许 service account 调 `AssumeRole` → **全新环境从来签不出 STS**。与 IC-1「STS 链路接通」的表面冲突已查实：IC-1 当时用的是 dev 上手工建的真实 IAM 用户，后来被换成 svcacct |
-| 37 | 🟠 挡（收窄）| IC-5（与 10 同刀） | watcher 的 fsnotify 分支**无初始扫描**，规则指向的既有文件永不采集；polling 回退分支却会扫——**同一条规则的行为取决于 fsnotify 是否可用**。不挡「能不能跑通」，挡「规则建好了为什么什么都没发生」 |
+| 37 | ✅ **已关闭** | **IC-5 ⑤（PR #100，与 10 同刀）** | watcher 的 fsnotify 分支**无初始扫描**，规则指向的既有文件永不采集；polling 回退分支却会扫——**同一条规则的行为取决于 fsnotify 是否可用**。不挡「能不能跑通」，挡「规则建好了为什么什么都没发生」 |
 | 38 | ⬜ 可推 | 未排期 | agent 的 `log.output`/`max_size_mb`/`max_backups` 收了不用，日志只落 stdout。部署形态下等于没有日志留存 |
 | 39 | ⬜ 可推 | 宜并入下一次动 policy 的刀（IC-3 / IC-8） | `init-minio.sh` 硬编码的 session policy 与 `storage/policy.go` 无联动。**今天逐字一致所以无症状**，改一边不改另一边会在交集处静默削权 |
 | 40 | 🟠 挡（诊断性）| 未排期 | CP 启动**不校验 MinIO 凭据**，凭据错了照常起，故障延后到 agent 连接、甚至要等 STS 会话过期（≤1h）才爆。**它不制造故障，它放大所有 MinIO 侧故障的排查成本**——IC-BUG-36 当初难查有它一份 |
@@ -221,7 +227,7 @@ grep -rEn '\b(CI|DP)-[0-9]+|\b(CI|DP)\s*系列' --include='*.md' .
 | **IC-2b** | CP + agent | **下发链路鲁棒性**（IC-BUG-20 + IC-BUG-21 + IC-BUG-30 + IC-BUG-31 的结构半边）。① **凭据随 bucket 集合变化补发**（修 IC-BUG-20）：**CP 侧** `DispatchRule` 成功后若该 Agent 的 bucket 集合变了就重推一次 `Credentials`；**agent 侧**上传遇 `AccessDenied` 时作废凭据、刷新并重试一次，二次仍 403 则落终态告警；② **模板解析失败改为任务失败而非猜键**（修 IC-BUG-21）；③ **规则同步补全集语义**（修 IC-BUG-30，M-2 扫描新增）：`SyncRulesOnConnect` 连 inactive 一起推（agent 的 `applyRule` 对 `Enabled == false` 已会 `stopRule`，复用既有分支），**并另下发一条「本次同步的 `rule_id` 全集」让 agent 停掉集合外的规则**——删除的行已不在 `ListCollectionRulesByAgent` 里，只推 inactive 修不掉删除那半；④ **`Connect` 里把发送 goroutine 提到 `SyncRulesOnConnect` / `pushCredentials` 之前启动**（IC-BUG-31 的结构半边：当前两处都在无消费者时入队，≥32 条 active 规则即静默丢弃），并让 `DispatchRule` 不再吞掉 `Send` 失败 | agent 与 CP 断连期间删除/停用规则，恢复连接后**不重启 agent** 也不再产生上传；运行中新建指向新 bucket 的规则，首个文件即成功（不出现 403）；配 40 条 active 规则重连后 40 条全部生效且凭据到达 | ⬜ |
 | **IC-3** | agent + deploy | **续传落盘 + 分片清理**（IC-BUG-5）。① 新增 `Queue.SaveMultipartProgress(id, uploadID, partsJSON)`，每片完成即落盘；② 任务进入终态（completed / 放弃）时调 `AbortMultipartUpload`；③ 数据桶加 `AbortIncompleteMultipartUpload` 的 ILM 规则兜底。**依赖 IC-1 已签发桶级 `s3:ListBucketMultipartUploads`**，否则本条验收会 403 卡住 | >64MB 文件传输中途 kill agent，重启后从断点续传（日志可见跳过分片数）；放弃的任务在 `mc ls --incomplete` 无残留 | ⬜ |
 | **IC-4** | CP + deploy | **webhook 可靠性止血**（IC-BUG-6 + IC-BUG-7 + IC-BUG-9；**IC-BUG-19 已于 2026-09-10 拆为独立的 IC-2c，排在 IC-2a 之前**）。① **失败语义 + 毒丸**。**⚠️ 不得按 4xx/5xx 分流**——dev 实测 MinIO 对 400 与 500 **一视同仁**（都走 `sendSync.func1()` 失败分支，日志 `returned '400 Bad Request'`）。原方案「解析失败返回 400，坏载荷不该无限重投」**不成立**：配上本刀 ③ 的持久 `queue_dir` 后，400 会被无限重投并**队头阻塞整条流**（实测 `queue_dir` 是队头阻塞单队列，失败事件重试期间后续 delete/create 全部排队、约 3s 一轮）。**统一走一条路径**：失败 → 计数 → 未超限返 5xx（MinIO 重投）→ 超限落死信 + 返 200 放行队列。三个必须定义清楚的实现点：**(a) 事件身份**——实测 webhook 请求头只有 `Host / User-Agent / Content-Length / Authorization / Content-Type`，**没有事件 ID、没有重试计数**，须用 `bucket + key + sequencer` 构造去重键；**(b) 计数器必须持久化**（Redis 或表）——放进程内存则毒丸打崩 CP 或运维重启后计数归零，永远到不了上限、毒丸永不失效；**(c) 死信要落表并写明谁 redrive**，只落日志等于无声丢数据。**(c-2) 顺带把 IC-2c 的解码失败兜底改判到死信**（PR #96 评审建议，写在这里免得靠遗忘变成永久现状）：IC-2c 现在对解码失败的键「索引原值 + Warn」，理由是丢 create 比索引怪键更糟。该兜底**从 MinIO 实际上不可达**（`QueryEscape` 的输出必然是合法转义，解码失败即意味着载荷不是 MinIO 发的）**且是对称的**（create 与后续 delete 退回同一个原值串，软删仍能精确命中，不制造删不掉的幽灵）——所以当前形态无害。但本刀有了死信表之后，解码失败应当进死信而不是进索引，属严格改进。**⚠️ (d) 落死信的 `ObjectRemoved` 必须把对应分片强制置 `active`**——「靠 IC-13 兜底」对删除类事件**不成立**：丢失的 create 是「MinIO 有 / PG 无」，L2 兜底列举能找回；而丢失的 delete 是「PG 有 / MinIO 无」，属 L3 方向，但**删除不推进 `object_keys.last_modified`**（§3.5 坑 1 只准用它判「分片被写过」），已封存的归档分片将**永不解封**，那些行成为永久幽灵（UI 可见、预签名 404、三级对账一级都检不出）。死信表里有 `bucket+key`，强制置 active 的成本近乎零。**⚠️ 与本刀 ③ 的硬序**：③ 把 `queue_dir` 改成持久卷之后，失败事件才会真正无限重投——**① 必须与 ③ 同时或先于 ③ 生效**，否则中间态就是无限重投 + 队头阻塞。**注意与本条既有验收的张力**：「断开 PG → 5xx → 恢复后补齐」在上限过小时会失败，上限须大于预期的故障时长 ÷ 3s；② `MakeBucket` 后调 `SetBucketNotification`，并在启动时对 `buckets` 表逐个 ensure（幂等补注册）。**ensure 必须是幂等替换而非追加**（否则配置越攒越乱）。**⚠️ 2026-09-10 更正**：初版称「dev 上两条重叠订阅导致删除事件双投」——**实测证伪**，订阅确实是两条（同一 ARN），但 6 次 `mc rm` 精确产生 6 个 `ObjectRemoved` 事件，MinIO 按 ARN 归并、**没有双投**。要求本身保留，但**不要照着「双投」去设计幂等去重，那个问题不存在**。**ARN 须做成可配置**——IC-11 换 NATS 后 ARN 会变（`arn:minio:sqs::primary:webhook` → NATS target 的 ARN），写死会让 IC-11 把这条打回原形；③ `queue_dir` 迁至持久卷。**⚠️ 改脚本不等于生效**——dev 实测 `notify_webhook:primary` 的 `queue_dir` 实际为**空**，与 `init-minio.sh:125` 写的 `/tmp/minio-webhook-queue` 不符（`queue_dir` 为空时 MinIO 走 `sendSync`，投递失败即丢，日志可见 `Error: not connected to target server/service`）。验收须查**生效值**（`mc admin config get`）而非脚本文本 | 断开 PG 触发 ObjectCreated → 端点 5xx → 恢复 PG 后 MinIO 重投、`file_entries` 补齐；通过 API 新建 bucket 后直接 `mc cp` 一个对象，索引出现该行 | ⬜ |
-| **IC-5** | agent | **采集正确性**（IC-BUG-10 + IC-BUG-11 + IC-BUG-34 + IC-BUG-12 的超时半边）。① `IsProcessed` 改为比较 `(rule_id, local_path, file_mtime, file_size)`，并修正与实现不符的注释；② `submitFile` 补齐 `FileOffset` / `AppendMode` 赋值，tail 偏移随任务落盘；③ 按文件大小推导 per-upload timeout（可配置下限）；④ **启动时把 `running` 复位为 `pending`**（修 IC-BUG-34——当前无任何复位，崩溃时在传的任务永久卡死、既不重传也不上报；`reported` 落地后同样需要，且**必须在启动路径上做，不能只靠运行时定时器**。**⚠️ `reported` 的复位是「重发上报」不是「重传」**——对象已经在 MinIO 里了，复位成 `pending` 会让 >64MB 文件完整重传一遍；它应走 IC-2a ④ 的重报路径） | 改文件内容后能被重新采集；`append_mode=tail` 规则第二次只传增量且重启后偏移不丢；不可达 MinIO 下 worker 会超时释放而非永久占用；上传中途 kill agent，重启后任务被重新 dequeue 并完成、`queue_depth` 回落到 0 | ⬜ |
+| **IC-5** | agent | **采集正确性**（IC-BUG-10 + IC-BUG-11 + IC-BUG-34 + IC-BUG-12 的超时半边）。① `IsProcessed` 改为比较 `(rule_id, local_path, file_mtime, file_size)`，并修正与实现不符的注释；② `submitFile` 补齐 `FileOffset` / `AppendMode` 赋值，tail 偏移随任务落盘；③ 按文件大小推导 per-upload timeout（可配置下限）；④ **启动时把 `running` 复位为 `pending`**（修 IC-BUG-34——当前无任何复位，崩溃时在传的任务永久卡死、既不重传也不上报；`reported` 落地后同样需要，且**必须在启动路径上做，不能只靠运行时定时器**。**⚠️ `reported` 的复位是「重发上报」不是「重传」**——对象已经在 MinIO 里了，复位成 `pending` 会让 >64MB 文件完整重传一遍；它应走 IC-2a ④ 的重报路径） | 改文件内容后能被重新采集；`append_mode=tail` 规则第二次只传增量且重启后偏移不丢；不可达 MinIO 下 worker 会超时释放而非永久占用；上传中途 kill agent，重启后任务被重新 dequeue 并完成、`queue_depth` 回落到 0；**既有文件在 agent 启动前落盘也必须被采集**（IC-BUG-37），且**积压远超事件缓冲时一个都不能丢**（PR #100 review F1） | ✅ PR #100 |
 
 > **IC-2c 与 IC-11 正交**（2026-09-10 实测确认）：`notify_nats` 载荷的对象键编码与 webhook 完全相同，
 > 编码发生在 MinIO 构造事件时而非传输层——**不能等 IC-11 一起解决**，理由与实测数据见 `bugs/open.md` IC-BUG-19。
@@ -232,7 +238,7 @@ grep -rEn '\b(CI|DP)-[0-9]+|\b(CI|DP)\s*系列' --include='*.md' .
 > 拆刀不等于免验，那条回归验的是两刀合起来的效果。
 >
 > **止血阶段顺序**：IC-1 ✅ → **IC-2c** ✅（PR #96）→ **IC-2a** ✅（PR #98，前置 PR #97 修 IC-BUG-36/35）→
-> （IC-2b / IC-3 / IC-4 / IC-5 / IC-SEC-2 可并行）。
+> **IC-5** ✅（PR #100）→（IC-2b / IC-3 / IC-4 / IC-SEC-2 可并行）。
 > **IC-2c 必须早于 IC-2a**（不是「宜早」，是硬序：见 IC-2c 一栏）——**该硬序已满足，IC-2a 已于 2026-09-11 收官**。
 > **下一刀在 IC-2b / IC-3 / IC-4 / IC-5 / IC-SEC-2 之间选**（彼此可并行）。IC-2a 的 live 验收过程中新立了
 > **IC-BUG-37**（watcher 的 fsnotify 分支无初始扫描，既有文件永不采集——归 IC-5，与 IC-BUG-10 同刀）与

@@ -374,15 +374,13 @@ func main() {
 
 // uploadWithTimeout gives each upload its own size-derived deadline so a
 // stalled object-store request cannot occupy an executor worker forever.
+// The deadline is derived from task.FileSize, never from the tail increment:
+// multipart uploads ignore FileOffset and move the whole file, and UploadFile
+// hashes the entire file before transferring. Deriving from the increment
+// would make large tail files time out on every attempt (PR #100 review F4).
+// The deadline is a safety net; wider is better than shorter.
 func uploadWithTimeout(parent context.Context, task *queue.UploadTask, minimum time.Duration, upload executor.UploadFunc) (*uploader.UploadResult, error) {
-	uploadSize := task.FileSize
-	if task.AppendMode == watcher.AppendModeTail && task.FileOffset > 0 {
-		uploadSize -= task.FileOffset
-		if uploadSize < 0 {
-			uploadSize = 0
-		}
-	}
-	uploadCtx, cancel := context.WithTimeout(parent, uploadTimeoutForSize(uploadSize, minimum))
+	uploadCtx, cancel := context.WithTimeout(parent, uploadTimeoutForSize(task.FileSize, minimum))
 	defer cancel()
 	return upload(uploadCtx, task)
 }
@@ -466,6 +464,18 @@ func runWatcher(ctx context.Context, rule scheduler.CollectionRule, exec *execut
 		logger.Warn("agent: watcher init failed",
 			zap.String("rule_id", rule.RuleID), zap.Error(err))
 		return
+	}
+	// Rebuild tail offsets from persisted state before the initial scan:
+	// without this, a restart re-sends already-stored bytes from offset 0
+	// because the watcher's in-memory map starts empty (PR #100 review F3).
+	if rule.AppendMode == watcher.AppendModeTail {
+		offsets, err := q.TailOffsets(ctx, rule.RuleID)
+		if err != nil {
+			logger.Warn("agent: cannot restore tail offsets, tail uploads will restart from 0",
+				zap.String("rule_id", rule.RuleID), zap.Error(err))
+		} else {
+			w.SeedTailOffsets(offsets)
+		}
 	}
 	events := make(chan watcher.FileEvent, 64)
 	go func() {

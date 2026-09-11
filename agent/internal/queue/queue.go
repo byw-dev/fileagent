@@ -62,6 +62,13 @@ CREATE TABLE IF NOT EXISTS rules (
 CREATE INDEX IF NOT EXISTS idx_upload_tasks_status
     ON upload_tasks (status, created_at);
 
+-- Supports the EnqueueIfNoActive dedup guard: its NOT EXISTS subquery filters
+-- by (rule_id, local_path). Without this index every enqueue scans the whole
+-- active backlog, which serialises the initial scan behind O(N x backlog)
+-- write-lock work on the single SQLite connection (PR #100 review F6).
+CREATE INDEX IF NOT EXISTS idx_upload_tasks_dedup
+    ON upload_tasks (rule_id, local_path);
+
 CREATE INDEX IF NOT EXISTS idx_processed_files_rule
     ON processed_files (rule_id, local_path);
 `
@@ -439,6 +446,34 @@ func (q *Queue) ListByStatus(status string) ([]*UploadTask, error) {
 }
 
 // ── Processed Files ───────────────────────────────────────────────────────────
+
+// TailOffsets returns, for every processed file of the rule, the byte size at
+// its last successful upload. processed_files.file_size is the full file size
+// as of the completed upload, which is exactly where the next tail upload must
+// resume. Used to rebuild the watcher's in-memory offsets after an agent
+// restart (PR #100 review F3).
+func (q *Queue) TailOffsets(ctx context.Context, ruleID string) (map[string]int64, error) {
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT local_path, file_size FROM processed_files WHERE rule_id = ?`, ruleID)
+	if err != nil {
+		return nil, fmt.Errorf("queue: tail offsets for rule %q: %w", ruleID, err)
+	}
+	defer rows.Close()
+
+	offsets := make(map[string]int64)
+	for rows.Next() {
+		var path string
+		var size int64
+		if err := rows.Scan(&path, &size); err != nil {
+			return nil, fmt.Errorf("queue: scan tail offsets for rule %q: %w", ruleID, err)
+		}
+		offsets[path] = size
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("queue: iterate tail offsets for rule %q: %w", ruleID, err)
+	}
+	return offsets, nil
+}
 
 // UpsertProcessedFile inserts or replaces a processed-file record. On conflict
 // on (rule_id, local_path) the existing row is overwritten.

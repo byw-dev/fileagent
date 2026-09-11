@@ -108,9 +108,9 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-7 | 通过 API 新建的 bucket 不注册事件通知，文件永不入索引 | 🟠 P1 | controlplane + deploy |
 | IC-BUG-8 | `UpsertFileEntry` 无排序键，webhook 会把 agent 富字段覆盖为 NULL ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-9 | webhook `queue_dir` 位于 `/tmp`，MinIO 重启即丢未投递事件 | 🟠 P1 | deploy |
-| IC-BUG-10 | `IsProcessed` 忽略 mtime/size，文件修改后永不重传 | 🟡 P2 | agent |
-| IC-BUG-11 | tail 模式 `file_offset` / `append_mode` 是死参数 | 🟡 P2 | agent |
-| IC-BUG-12 | 上传无超时；重试耗尽后不通知 Control Plane | 🟡 P2 | agent |
+| IC-BUG-10 | `IsProcessed` 忽略 mtime/size，文件修改后永不重传 ✅ 随 IC-5 修复 | 🟡 P2 | agent |
+| IC-BUG-11 | tail 模式 `file_offset` / `append_mode` 是死参数 ✅ 随 IC-5 修复 | 🟡 P2 | agent |
+| IC-BUG-12 | 上传无超时；重试耗尽后不通知 Control Plane ✅ 两半均已修复（上报半边随 IC-2a，超时半边随 IC-5）| 🟡 P2 | agent |
 | IC-BUG-13 | `content_type` 两条索引路径都不赋值，且会被 upsert 清空 | 🟡 P2 | controlplane |
 | IC-BUG-14 | Dashboard `COUNT(*)` / `SUM` 全表扫描（规模隐患） | 🟡 P2 | controlplane |
 | IC-BUG-15 | 预签名下载 URL TTL 硬编码 15 分钟，大文件不够用 | 🟡 P2 | controlplane |
@@ -132,14 +132,15 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-31 | `registry.Send` 队列满即静默丢弃，且 Connect 在消费者启动前入队 | 🟠 P1 | controlplane |
 | IC-BUG-32 | `Revoke` 的 `Send` 与 `Disconnect` 存在竞态窗口，命令可能在切流前被丢弃 | 🟡 P2 | controlplane |
 | IC-BUG-33 | 失败的上报仍写 `file_entries` 行，制造「DB 有、对象无」的反向幽灵 ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
-| IC-BUG-34 | agent 重启后 `running` 态任务无复位，永久孤儿：不重传也不上报 | 🟠 P1 | agent |
+| IC-BUG-34 | agent 重启后 `running` 态任务无复位，永久孤儿：不重传也不上报 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
 | IC-BUG-35 | `init-minio.sh` 默认 CP 服务账号 access key 超出 MinIO 20 字符上限，脚本第 4 步必失败 ✅ 已修（PR #97） | 🟠 P1 | deploy |
 | IC-BUG-36 | CP 凭据被 `init-minio.sh` 建成 **service account**，而 MinIO 的 service account 不能调 AssumeRole → 全新环境 STS 必然 `Access Denied` ✅ 已修（PR #97） | 🔴 P0 | deploy |
-| IC-BUG-37 | watcher 的 fsnotify 分支没有初始扫描，规则指向的**既有文件永不被采集**；而 polling 回退分支却会扫——同一条规则的行为取决于 fsnotify 是否可用 | 🟠 P1 | agent |
+| IC-BUG-37 | watcher 的 fsnotify 分支没有初始扫描，规则指向的**既有文件永不被采集**；而 polling 回退分支却会扫——同一条规则的行为取决于 fsnotify 是否可用 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
 | IC-BUG-38 | agent 的 `log.output` / `log.max_size_mb` / `log.max_backups` 解析了、校验了、写进文档了，就是没人读——日志只落 stdout，无文件、无轮转 | 🟡 P2 | agent |
 | IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 | 🟡 P2 | deploy + controlplane |
 | IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 | 🟠 P1 | controlplane |
 | IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 | 🟡 P2 | deploy |
+| IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT | 🟡 P2 | agent |
 
 ---
 
@@ -248,7 +249,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 改为持久卷路径；同步更新 §6.5 的示例配置 |
 | **验收** | 停 CP → 写入若干对象 → 重启 MinIO 容器 → 启 CP，事件仍被投递、`file_entries` 补齐 |
 
-## IC-BUG-10 — `IsProcessed` 忽略 mtime/size，文件修改后永不重传 🟡 P2
+## IC-BUG-10 — `IsProcessed` 忽略 mtime/size，文件修改后永不重传 🟡 P2 ✅ 已修（IC-5，PR #100）
 
 | 字段 | 内容 |
 |------|------|
@@ -258,7 +259,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | `IsProcessed` 改为比较 `(rule_id, local_path, file_mtime, file_size)`；同步修正注释 |
 | **验收** | 上传一个文件后修改其内容并触发再次采集，MinIO 中对象被更新、`file_entries.size_bytes` 随之变化 |
 
-## IC-BUG-11 — tail 模式 `file_offset` / `append_mode` 是死参数 🟡 P2
+## IC-BUG-11 — tail 模式 `file_offset` / `append_mode` 是死参数 🟡 P2 ✅ 已修（IC-5，PR #100）
 
 | 字段 | 内容 |
 |------|------|
@@ -268,7 +269,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 在 `UploadTask` 字面量中补 `FileOffset` / `AppendMode`；tail 偏移随任务落盘 |
 | **验收** | 配一条 `append_mode=tail` 的规则，向文件追加两次，第二次只上传增量 |
 
-## IC-BUG-12 — 上传无超时；重试耗尽后不通知 Control Plane 🟡 P2
+## IC-BUG-12 — 上传无超时；重试耗尽后不通知 Control Plane 🟡 P2 ✅ 两半均已修（上报半边 IC-2a / PR #98，超时半边 IC-5 / PR #100）
 
 | 字段 | 内容 |
 |------|------|
@@ -541,7 +542,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 制造一个不可达的 MinIO，任务重试耗尽后：`upload_logs` 有失败行；`file_entries` 或无该行、或该行被对账显式排除（按选定方案二选一断言） |
 | **✅ 已修（IC-2a ⑥，2026-09-11）** | 失败上报**只写 `upload_logs`**（`FileEntryID` 置 `Valid:false`），不再 upsert `file_entries`——原实现的 `DO UPDATE` 会无条件覆盖 `status`，把「已成功上传、后来重传失败」的**活对象标成 `failed`**。连带摘掉 Files 页的「失败」筛选项，失败信号统一走 Logs 页 / `upload_logs`（那张表才有 `error_message`/`retry_count`）。单测断言「失败上报时 `UpsertFileEntry` 调用数为 0」
 
-## IC-BUG-34 — agent 重启后 `running` 态任务永久孤儿 🟠 P1
+## IC-BUG-34 — agent 重启后 `running` 态任务永久孤儿 🟠 P1 ✅ 已修（IC-5，PR #100）
 
 | 字段 | 内容 |
 |------|------|
@@ -589,7 +590,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 ---
 
-## IC-BUG-37 — watcher 的 fsnotify 分支没有初始扫描，规则指向的既有文件永不被采集 🟠 P1
+## IC-BUG-37 — watcher 的 fsnotify 分支没有初始扫描，规则指向的既有文件永不被采集 🟠 P1 ✅ 已修（IC-5，PR #100）
 
 | 字段 | 内容 |
 |------|------|
@@ -647,6 +648,18 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **同类卫生问题** | `mc share download` 每跑一次会在 `~/.mc/share/downloads.json` 留一条 `.init-check` 的预签名记录，脚本的 `cleanup()` 不清理。不含 secret、5 分钟过期，属同一类卫生问题，宜一并处理 |
 | **归属** | 未排期。发现于 PR #97 的 code review |
 
+
+## IC-BUG-42 — `EnqueueIfNoActive` 不拦 `failed`，退避重试期间重复提交会双传 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `EnqueueIfNoActive`（`agent/internal/queue/queue.go`）的 active 集合是 `pending` + `running` + `reported`，**不含 `failed`**。而 `handleFailure` 把任务置为 `failed` 后会起一个退避 goroutine，稍后再把它翻回 `pending`——在这段退避窗口里，该四元组在库里是 `failed`，守卫不拦 |
+| **精确位置** | `agent/internal/queue/queue.go` `EnqueueIfNoActive` 的 `status IN (...)`；退避路径见 `agent/internal/executor/executor.go` 的 `handleFailure` |
+| **后果** | MinIO 抖动导致任务 A 失败进入退避 → 同一文件被 cron 规则重跑或重复的 fsnotify 事件再次提交 → 任务 B 入队 → 退避结束后 A 翻回 `pending` → **两个任务各传一次**，且因 `{time}` 键各自落到不同对象上。与 IC-5 修掉的「④+⑤ 组合双 PUT」是同一类问题，只是经由 `failed` 这条状态路径 |
+| **发现路径** | PR #100（IC-5）的 code review，2026-09-11。**当时刻意未修**：把 `failed` 直接算进 active 会让一次失败在重试真正被调度之前持续屏蔽该文件，而「终态不拦截后续重采」是该守卫的设计意图之一（一次失败不得永久静默一个文件）。正确修法需要区分「失败且已安排重试」与「失败且已放弃」，属独立一刀 |
+| **修复** | 二选一：(a) 给 `upload_tasks` 增加「下次重试时刻」列，守卫把「`failed` 且重试仍已安排」视为 active；(b) 退避改为不落 `failed`，而用一个显式的 `retry_wait` 状态并计入 active。(b) 更干净但要动状态机，需评估与 IC-2a 上报路径的交互 |
+| **验收** | 任务失败进入退避期间重复提交同一四元组 → 只产生一个任务；退避结束后正常重试；而一个**已放弃**（重试耗尽）的任务不得阻止该文件日后被重新采集 |
+| **归属** | 未排期。宜与 IC-3（续传落盘，同样要动 `upload_tasks` 的状态与列）同刀 |
 
 ---
 

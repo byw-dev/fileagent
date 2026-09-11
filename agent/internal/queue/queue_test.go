@@ -261,6 +261,37 @@ func TestEnqueueIfNoActive_ModifiedFileAfterCrashRestartReset(t *testing.T) {
 		"old version stays, new version is added — guard is not a two-tuple")
 }
 
+// Regression for PR #100 review F3: tail offsets live in the watcher's
+// in-memory map and were never rebuilt from persisted state after a restart,
+// so the initial scan re-sent already-stored bytes. processed_files.file_size
+// is the size at last successful upload — the correct next tail offset.
+func TestTailOffsets_ReturnsLastUploadedSizes(t *testing.T) {
+	q := openMemQueue(t)
+	ctx := context.Background()
+
+	require.NoError(t, q.UpsertProcessedFile(&ProcessedFile{
+		ID: "pf-1", RuleID: "r-tail", LocalPath: "/logs/a.log", FileSize: 1000, FileMtime: 111,
+	}))
+	require.NoError(t, q.UpsertProcessedFile(&ProcessedFile{
+		ID: "pf-2", RuleID: "r-tail", LocalPath: "/logs/b.log", FileSize: 2000, FileMtime: 222,
+	}))
+	// Another rule must not leak into the result.
+	require.NoError(t, q.UpsertProcessedFile(&ProcessedFile{
+		ID: "pf-3", RuleID: "r-other", LocalPath: "/logs/a.log", FileSize: 9999, FileMtime: 333,
+	}))
+
+	offsets, err := q.TailOffsets(ctx, "r-tail")
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int64{"/logs/a.log": 1000, "/logs/b.log": 2000}, offsets)
+}
+
+func TestTailOffsets_EmptyRule(t *testing.T) {
+	q := openMemQueue(t)
+	offsets, err := q.TailOffsets(context.Background(), "r-none")
+	require.NoError(t, err)
+	assert.Empty(t, offsets)
+}
+
 func TestResetRunningToPending_PreservesReported(t *testing.T) {
 	q := openMemQueue(t)
 	require.NoError(t, q.Enqueue(newTask("running-task", "")))
