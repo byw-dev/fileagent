@@ -307,15 +307,12 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 > 二者都是我们自己的基础设施、同一 docker 网络 / 同一 NTP 源，这个假设比「信任任意边缘 agent」
 > 弱一个数量级，接受。若将来 MinIO 与 CP 分处不同时钟域，须重新评估。
 
-**写入守卫**（`file_entries` 与 `object_keys` 同规则）：
-
-```sql
--- upsert：ON CONFLICT ... DO UPDATE ... WHERE
-    EXCLUDED.observed_at > fe.observed_at
- OR (EXCLUDED.observed_at = fe.observed_at
-     AND (EXCLUDED.event_seq IS NULL OR fe.event_seq IS NULL          -- 任一侧无 seq → 不用它决胜
-          OR lpad(EXCLUDED.event_seq,32,'0') >= lpad(fe.event_seq,32,'0')))
-```
+**写入守卫的不变式**（IC-2a PoC 已在真实 PostgreSQL 验证）：
+较大的 `observed_at` 放行；相等时任一侧 `event_seq` 为 NULL 放行，否则比较 32 位补零 sequencer。
+富字段 COALESCE、粘性 meta_incomplete、软删除同步推进观察时刻与 sequencer。
+**完整可执行 SQL 的唯一权威**：[ingest.sql](../../controlplane/internal/db/queries/ingest.sql)；
+恒返现有行与 suppressed 标志见 [ingest.go](../../controlplane/internal/db/ingest.go)。
+[集成变异矩阵](../../controlplane/internal/db/ingest_integration_test.go)覆盖 A1/A2/A3′/P2/A4b 与合成 LPAD。
 
 > **⚠️ NULL 必须放行，不能收紧。** 若写成 `AND lpad(EXCLUDED.event_seq,…) >= lpad(fe.event_seq,…)`，
 > 则 agent 上报（`event_seq` 恒 NULL）撞上 webhook 先建的行时 `NULL >= '18D3…'` 求值为 NULL、

@@ -64,6 +64,7 @@ message UploadResult {
   google.protobuf.Timestamp file_mtime   = 10;
   google.protobuf.Timestamp uploaded_at  = 11;
   int32   retry_count   = 12;
+  string  task_id       = 13; // Persistent upload task, echoed by Acknowledgement.
 }
 
 message DirectoryListing {

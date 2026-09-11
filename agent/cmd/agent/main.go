@@ -128,19 +128,18 @@ func main() {
 	}
 
 	// ── Upload function: creates a fresh Uploader per call using current STS ─
-	uploadFn := func(uploadCtx context.Context, task *queue.UploadTask) error {
+	uploadFn := func(uploadCtx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error) {
 		uploaderCfgMu.RLock()
 		ucfg := currentUploaderCfg
 		uploaderCfgMu.RUnlock()
 		if ucfg == nil {
-			return fmt.Errorf("agent: no upload credentials available yet")
+			return nil, fmt.Errorf("agent: no upload credentials available yet")
 		}
 		u, err := uploader.New(*ucfg, q, logger)
 		if err != nil {
-			return fmt.Errorf("agent: create uploader: %w", err)
+			return nil, fmt.Errorf("agent: create uploader: %w", err)
 		}
-		_, err = u.UploadFile(uploadCtx, task)
-		return err
+		return u.UploadFile(uploadCtx, task)
 	}
 
 	// ── 7. Worker pool (starts goroutines after exec.Start is called) ────────
@@ -216,6 +215,11 @@ func main() {
 	}
 	defer grpcClient.Close()
 
+	if err := exec.ConfigureReporting(grpcClient.SendMessage, time.Duration(cfg.Upload.ReportTimeoutSeconds)*time.Second, cfg.Upload.RetryMax); err != nil {
+		logger.Error("configure reporting", zap.Error(err))
+		return
+	}
+
 	// ── 8. Register ServerMessage handler ────────────────────────────────────
 	grpcClient.SetMessageHandler(func(msg *agentv1.ServerMessage) {
 		switch p := msg.GetPayload().(type) {
@@ -252,7 +256,9 @@ func main() {
 			}
 
 		case *agentv1.ServerMessage_Ack:
-			// No-op: acknowledgements are informational.
+			if err := exec.HandleAcknowledgement(ctx, p.Ack); err != nil {
+				logger.Warn("agent: acknowledgement persistence failed", zap.Error(err))
+			}
 		}
 	})
 

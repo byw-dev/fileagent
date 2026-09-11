@@ -1388,6 +1388,16 @@ Agent 的 session policy 体积上限，全部不存在。IC-1 的实现量因�
     **不能说明历史分区没被改过**，因此不能充当正确性机制。这也正是「上传一组历史归档数据」
     这类场景的真实形态。见 `~/workspace/minio-inventory` `docs/01-审计可扩展性设计.md` §2.3。
 
+### IC-2a 契约落地（2026-09-10）
+
+追加迁移 000006，为 `file_entries` 增加 `observed_at TIMESTAMPTZ NOT NULL DEFAULT now()`、
+`source`（仅 agent/api/minio_event/audit）、可空 `event_seq` 与粘性 `meta_incomplete`。
+守卫采用较新时刻优先、相等时任一 NULL sequencer 放行，否则按 32 位补零比较；
+软删除同步推进两列，压制的 upsert 回查现有行并返回 suppressed，避免 ErrNoRows 传播。
+Agent/API 时刻由 PostgreSQL now() 产生；MinIO 用 eventTime，audit 用列举时刻。
+UploadResult 将只增 `task_id` 字段，Agent 持久化 reported 结果并在 ack 后完成，超时重报。
+失败只写 upload_logs；拿不到规则元数据时置 meta_incomplete（从不清位），列表与详情暴露该字段。
+
 ### 分期实施
 
 | 阶段 | 任务 | 内容 | 说明 |
@@ -1411,6 +1421,32 @@ ETL 是否允许就地覆盖同一 key（D）、SDK outbox 最小形态（E）�
   **D-025** 补充 §3（衍生数据入口：ETL 禁止直连 MinIO）、**D-007**（cursor 分页与 `total`）
 - 设计：`docs/design/consistency-and-ingest.md`、`docs/design/metadata-model.md` P2.2/P2.3
 - 缺陷：`docs/tasks/bugs/open.md` IC-BUG-1…IC-BUG-29
+
+### 落地记录（IC-2a，上报主路径，2026-09-11，PR #98）
+
+**止血阶段的第二刀落地，数据面主路径首次真的通了**（不是「单测通过」——九条 live 验收在 dev 上逐条留证）。
+落地的是本决策第三条（`observed_at` 排序键）与第五条（写入来源标记）的**止血子集**，宽表/窄表分家与三级对账仍在后面。
+
+- **迁移** `000006_index_observation`：`file_entries` 增 `observed_at` / `source` / `event_seq` / `meta_incomplete`。
+  回填后 **`DROP DEFAULT`**——把 `DEFAULT now()` / `DEFAULT 'minio_event'` 永久留在列上，会让漏传这两个值的
+  写入静默拿到错误时钟与错误来源，比报错更坏。
+- **守卫的权威是代码，不是文档**：`consistency-and-ingest.md` §3.4 的 SQL 文本连续三轮「新写 → 一执行就碎」
+  （谓词恒真 / NULL 吞写 / `RETURNING` 返 0 行 / audit 覆盖），四轮读文档都没读出来。因此本刀第一步是把守卫
+  做成仓库里**可执行**的东西：真迁移 + 真 upsert + 表驱动变异矩阵（`db/ingest_integration_test.go`，真 PostgreSQL，
+  A1/A2/A3′/P2/A4b/LPAD 六项，七种变异各自被它声称防的那条用例杀掉）。**§3.4 自此降为「意图与不变式」**。
+- **`RETURNING` 的语义坑已处理**：加 `WHERE` 后被正确压制的写入返 0 行 → `sql.ErrNoRows`。若当 error 上抛，
+  IC-4 ① 会判为处理失败并重投，而 `queue_dir` 是队头阻塞单队列——**一条本该被压制的陈旧事件会让索引 feed
+  停摆数分钟**。实现区分「守卫压制」与「行不存在」，两者都不是错误。
+- **`meta_incomplete` 只由 `agent`/`api` 源改写**：初版是粘性 OR，但「webhook 先到」是生产常态且 webhook
+  永远不知道规则，粘性 OR 会把几乎每个文件永久标成「元数据不完整」。
+- **失败上报只写 `upload_logs`**（IC-BUG-33）：另一个选项有损坏真实数据的分支——`DO UPDATE` 无条件覆盖
+  `status`，会把「已成功上传、后来重传失败」的活对象标成 `failed`。
+- **`rule_id` 归属三分支，宽松处理**（IC-BUG-29）：「规则不存在」是稳态正常情形（队列与规则生命周期解耦），
+  严格拒绝等于让「删规则」静默丢弃已在 MinIO 里的文件的索引行，只是把幽灵推给 IC-13。
+- **前置**：`init-minio.sh` 把 CP 凭据建成 root 的 **service account**，而 MinIO 不允许 service account 调
+  `AssumeRole`——**任何从头 bootstrap 的环境都签不出 STS**（IC-BUG-36，PR #97 先行修掉，改为真实 IAM 用户
+  + 具名最小权限 policy + 脚本自断言）。这条与 IC-1「STS 链路接通」的表面冲突已查实：IC-1 当时用的是 dev 上
+  手工建的真实 IAM 用户，2026-09-10 为修预签名下载才被换成 svcacct。**「脚本跑完 ≠ 环境可用」现在由脚本自己断言**。
 
 ---
 

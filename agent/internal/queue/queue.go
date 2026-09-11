@@ -35,6 +35,12 @@ CREATE TABLE IF NOT EXISTS upload_tasks (
     append_mode    TEXT    NOT NULL DEFAULT 'overwrite'
 );
 
+CREATE TABLE IF NOT EXISTS upload_reports (
+    task_id TEXT PRIMARY KEY REFERENCES upload_tasks(id) ON DELETE CASCADE,
+    payload BLOB NOT NULL,
+    last_reported_at INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS processed_files (
     id          TEXT    PRIMARY KEY,
     rule_id     TEXT    NOT NULL,
@@ -72,6 +78,7 @@ var schemaMigrations = []string{
 const (
 	StatusPending   = "pending"
 	StatusRunning   = "running"
+	StatusReported  = "reported"
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
 )
@@ -215,8 +222,8 @@ func (q *Queue) CountPending() (int, error) {
 func (q *Queue) CountActive() (int, error) {
 	var n int
 	if err := q.db.QueryRow(
-		`SELECT COUNT(*) FROM upload_tasks WHERE status IN (?, ?, ?)`,
-		StatusPending, StatusRunning, StatusFailed,
+		`SELECT COUNT(*) FROM upload_tasks WHERE status IN (?, ?, ?, ?)`,
+		StatusPending, StatusRunning, StatusFailed, StatusReported,
 	).Scan(&n); err != nil {
 		return 0, fmt.Errorf("queue: count active: %w", err)
 	}

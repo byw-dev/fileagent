@@ -1407,10 +1407,27 @@ func (s *STSManager) IssueCredentials(agentID string,
 
 ## 5.8 文件索引与归类引擎
 
-> ⚠️ **实现状态（D-030）**：本节的 `HandleUploadResult` 是死代码（Agent 从不上报，IC-BUG-2），
-> 因此 `agent_id` / `rule_id` / `sha256` / `file_mtime` 恒为 NULL、`upload_logs` 恒空、
-> `events.file.uploaded` 从未发布。另外 `UpsertFileEntry` 无排序键，webhook 路径会把富字段覆盖为 NULL（IC-BUG-8）。
-> 目标模型（`observed_at` 排序键 + `source` + 宽表/窄表分家 + 三级对账）见
+> ✅ **实现状态（D-030；IC-2a 于 2026-09-11 落地，PR #98）**：`HandleUploadResult` **已是索引主路径**，
+> 不再是死代码。下面的伪代码是意图，**权威以代码为准**（`controlplane/internal/indexer/indexer.go`
+> 与 `controlplane/internal/db/queries/ingest.sql`）。相对本节伪代码，实现多了四件事：
+>
+> 1. **写入守卫与来源标记**：`file_entries` 增 `observed_at` / `source` / `event_seq` / `meta_incomplete`
+>    四列（迁移 `000006_index_observation`）。upsert 的 `DO UPDATE` 带守卫——**较新的观测才准覆盖**
+>    （`observed_at` 更大，或相等时由 `event_seq` 决胜；任一侧为 NULL 一律放行），且富字段一律
+>    `COALESCE(EXCLUDED.x, file_entries.x)`。**软删除走独立的带守卫 UPDATE 并推进这两列**，
+>    否则删除事件重投会把刚重建的活对象再标成 `deleted`。修 IC-BUG-8 / IC-BUG-13 的防清空半边。
+> 2. **`observed_at` 按来源取各自最可信、且客户端左右不了的时刻**：`minio_event` ← 载荷的 `eventTime`
+>    （MinIO 生成）；`agent` / `api` ← **PostgreSQL 的 `now()`**（不是 CP 进程时钟——dev 实测进程时钟
+>    比 PG/MinIO 慢约 16ms，用它会让每一次合法上报都被守卫拦掉）；`audit` ← 列举那一刻。
+>    **绝不采信 `UploadResult.uploaded_at`**（由 agent 提供，报 `2099` 即可永久冻结该行）。
+> 3. **失败上报不写 `file_entries`，只写 `upload_logs`**（`file_entry_id` 置空）。原实现无论成败都 upsert，
+>    而 `DO UPDATE` 会无条件覆盖 `status`，能把「已成功上传、后来重传失败」的**活对象标成 `failed`**（IC-BUG-33）。
+> 4. **`UploadResult.rule_id` 做归属校验，三分支**：规则不存在（**稳态正常情形**，队列与规则生命周期解耦）
+>    → 清空 `rule_id`、文件照常入索引、置 `meta_incomplete=true`；规则属于别的 agent → 拒绝该 `rule_id`
+>    并告警；合法 → 正常打标（IC-BUG-29）。`meta_incomplete` 的语义是「索引该行时拿不到规则声明的元数据」，
+>    **从不清位**，由 `GET /api/v1/files` 与文件详情向 UI 暴露。
+>
+> 目标模型的其余部分（宽表/窄表分家 + 三级对账）尚未落地，见
 > [`consistency-and-ingest.md`](./consistency-and-ingest.md) §3.4–§3.5。
 
 ```go

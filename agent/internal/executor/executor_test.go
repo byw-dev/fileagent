@@ -3,11 +3,13 @@ package executor
 import (
 	"context"
 	"fmt"
+	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/byw-dev/fileagent/agent/internal/queue"
+	uploadpkg "github.com/byw-dev/fileagent/agent/internal/uploader"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -38,12 +40,12 @@ func newTask(ruleID, path string) *queue.UploadTask {
 	}
 }
 
-func successUploader(_ context.Context, _ *queue.UploadTask) error {
-	return nil
+func successUploader(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+	return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 }
 
-func failUploader(_ context.Context, _ *queue.UploadTask) error {
-	return fmt.Errorf("upload failed")
+func failUploader(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+	return nil, fmt.Errorf("upload failed")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -51,9 +53,9 @@ func failUploader(_ context.Context, _ *queue.UploadTask) error {
 func TestExecutor_SubmitAndProcess(t *testing.T) {
 	q := newTestQueue(t)
 	var processed atomic.Int32
-	uploader := func(_ context.Context, _ *queue.UploadTask) error {
+	uploader := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		processed.Add(1)
-		return nil
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}
 
 	e := New(2, q, uploader, zap.NewNop(), 0)
@@ -74,9 +76,9 @@ func TestExecutor_SubmitAndProcess(t *testing.T) {
 func TestExecutor_Dedup(t *testing.T) {
 	q := newTestQueue(t)
 	var uploadCount atomic.Int32
-	uploader := func(_ context.Context, _ *queue.UploadTask) error {
+	uploader := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		uploadCount.Add(1)
-		return nil
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}
 
 	e := New(1, q, uploader, zap.NewNop(), 0)
@@ -91,6 +93,9 @@ func TestExecutor_Dedup(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return uploadCount.Load() == 1
 	}, 3*time.Second, 50*time.Millisecond)
+
+	require.Eventually(t, func() bool { r, _ := q.GetReport(context.Background(), t1.ID); return len(r) > 0 }, time.Second, time.Millisecond)
+	require.NoError(t, e.HandleAcknowledgement(context.Background(), &agentv1.Acknowledgement{RefMessageId: t1.ID, Success: true}))
 
 	// Submit a second task for the same path — should be skipped.
 	t2 := newTask("r1", "/path/file.txt")
@@ -133,7 +138,7 @@ func TestExecutor_GivenUpAfterMaxRetries(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 	// Task should remain failed and not be re-queued.
-	failed, err := q.ListByStatus(queue.StatusFailed)
+	failed, err := q.ListByStatus(queue.StatusReported)
 	require.NoError(t, err)
 	assert.Len(t, failed, 1)
 	assert.False(t, requeued.Load())
@@ -142,10 +147,10 @@ func TestExecutor_GivenUpAfterMaxRetries(t *testing.T) {
 func TestExecutor_ConcurrentWorkers(t *testing.T) {
 	q := newTestQueue(t)
 	var processed atomic.Int32
-	uploader := func(_ context.Context, _ *queue.UploadTask) error {
+	uploader := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		time.Sleep(20 * time.Millisecond)
 		processed.Add(1)
-		return nil
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}
 
 	e := New(4, q, uploader, zap.NewNop(), 0)
@@ -171,11 +176,11 @@ func TestExecutor_GracefulShutdown(t *testing.T) {
 	started := make(chan struct{})
 	done := make(chan struct{})
 
-	uploader := func(_ context.Context, _ *queue.UploadTask) error {
+	uploader := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		close(started)
 		time.Sleep(100 * time.Millisecond)
 		close(done)
-		return nil
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}
 
 	e := New(1, q, uploader, zap.NewNop(), 0)
@@ -195,7 +200,7 @@ func TestExecutor_GracefulShutdown(t *testing.T) {
 	select {
 	case <-stopDone:
 		// Stop may return before or after the task finishes — both are valid.
-	case <-time.After(3*time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("Stop did not return in time")
 	}
 }
@@ -218,12 +223,12 @@ func TestExecutor_RetryRequeues(t *testing.T) {
 	q := newTestQueue(t)
 
 	var callCount atomic.Int32
-	uploader := func(_ context.Context, _ *queue.UploadTask) error {
+	uploader := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		n := callCount.Add(1)
 		if n < 2 {
-			return fmt.Errorf("transient error")
+			return nil, fmt.Errorf("transient error")
 		}
-		return nil
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
 	}
 
 	e := New(1, q, uploader, zap.NewNop(), 0)

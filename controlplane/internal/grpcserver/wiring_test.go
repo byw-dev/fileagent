@@ -602,3 +602,37 @@ func TestHandleAgentMessage_DryRunResult_UsesStreamIdentity(t *testing.T) {
 		t.Fatal("handleAgentMessage did not pass the stream's agent id to the gate")
 	}
 }
+
+// TestUploadAcknowledgement confirms acceptance, error and queue-full semantics.
+func TestUploadAcknowledgement(t *testing.T) {
+	for _, name := range []string{"success", "index_error", "full"} {
+		t.Run(name, func(t *testing.T) {
+			srv := New(zap.NewNop())
+			srv.registry = NewAgentRegistry()
+			ix := &mockIndexer{}
+			srv.WithExtraDeps(nil, ix, nil, nil)
+			id := uuid.NewString()
+			conn := srv.registry.Register(id, nil, func() {})
+			if name == "index_error" {
+				ix.err = assert.AnError
+			}
+			if name == "full" {
+				for len(conn.SendCh) < cap(conn.SendCh) {
+					conn.SendCh <- &agentv1.ServerMessage{}
+				}
+			}
+			srv.handleUploadResult(context.Background(), id, &agentv1.UploadResult{TaskId: "task", Success: true})
+			switch name {
+			case "success":
+				require.Len(t, conn.SendCh, 1)
+				ack := (<-conn.SendCh).GetAck()
+				require.True(t, ack.GetSuccess())
+				require.Equal(t, "task", ack.GetRefMessageId())
+			case "index_error":
+				require.Empty(t, conn.SendCh)
+			case "full":
+				require.Len(t, conn.SendCh, cap(conn.SendCh))
+			}
+		})
+	}
+}

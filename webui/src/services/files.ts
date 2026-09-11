@@ -15,6 +15,7 @@ export interface FileEntry {
   storage_key: string
   filename: string
   size: number
+  meta_incomplete: boolean
   sha256: string
   mime_type: string
   status: 'UPLOADING' | 'COMPLETED' | 'FAILED' | 'DELETED'

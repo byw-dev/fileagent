@@ -71,34 +71,36 @@ func (h *FilesHandler) fetchOwnedEntry(c *gin.Context, id uuid.UUID) (*db.FileEn
 
 // fileEntryResponse is the outbound JSON shape for a file entry.
 type fileEntryResponse struct {
-	ID           string            `json:"id"`
-	OrgID        string            `json:"org_id"`
-	AgentID      string            `json:"agent_id,omitempty"`
-	BucketID     string            `json:"bucket_id"`
-	FileTypeID   string            `json:"file_type_id,omitempty"`
-	StorageKey   string            `json:"storage_key"`
-	OriginalPath string            `json:"original_path,omitempty"`
-	Filename     string            `json:"filename"`
-	Size         int64             `json:"size"`
-	SHA256       string            `json:"sha256,omitempty"`
-	MimeType     string            `json:"mime_type,omitempty"`
-	Status       string            `json:"status"`
-	UploadedAt   string            `json:"uploaded_at,omitempty"`
-	CreatedAt    string            `json:"created_at"`
-	Tags         map[string]string `json:"tags,omitempty"`
+	MetaIncomplete bool              `json:"meta_incomplete"`
+	ID             string            `json:"id"`
+	OrgID          string            `json:"org_id"`
+	AgentID        string            `json:"agent_id,omitempty"`
+	BucketID       string            `json:"bucket_id"`
+	FileTypeID     string            `json:"file_type_id,omitempty"`
+	StorageKey     string            `json:"storage_key"`
+	OriginalPath   string            `json:"original_path,omitempty"`
+	Filename       string            `json:"filename"`
+	Size           int64             `json:"size"`
+	SHA256         string            `json:"sha256,omitempty"`
+	MimeType       string            `json:"mime_type,omitempty"`
+	Status         string            `json:"status"`
+	UploadedAt     string            `json:"uploaded_at,omitempty"`
+	CreatedAt      string            `json:"created_at"`
+	Tags           map[string]string `json:"tags,omitempty"`
 }
 
 func toFileEntryResponse(e *db.FileEntry, tags map[string]string) fileEntryResponse {
 	r := fileEntryResponse{
-		ID:         e.ID.String(),
-		OrgID:      e.OrgID.String(),
-		BucketID:   e.BucketID.String(),
-		StorageKey: e.StoragePath,
-		Filename:   e.FileName,
-		Size:       e.SizeBytes,
-		Status:     strings.ToUpper(string(e.Status)),
-		CreatedAt:  e.CreatedAt.UTC().Format(time.RFC3339),
-		Tags:       tags,
+		MetaIncomplete: e.MetaIncomplete,
+		ID:             e.ID.String(),
+		OrgID:          e.OrgID.String(),
+		BucketID:       e.BucketID.String(),
+		StorageKey:     e.StoragePath,
+		Filename:       e.FileName,
+		Size:           e.SizeBytes,
+		Status:         strings.ToUpper(string(e.Status)),
+		CreatedAt:      e.CreatedAt.UTC().Format(time.RFC3339),
+		Tags:           tags,
 	}
 	if e.AgentID.Valid {
 		r.AgentID = e.AgentID.UUID.String()

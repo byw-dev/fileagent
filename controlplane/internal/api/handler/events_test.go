@@ -753,14 +753,14 @@ type mockIndexerClient struct {
 	deletedKey string
 }
 
-func (m *mockIndexerClient) IndexUpload(_ context.Context, bucketName, objectKey string, _ int64, _ string) error {
+func (m *mockIndexerClient) IndexUpload(_ context.Context, bucketName, objectKey string, _ int64, _ string, _ time.Time, _ string) error {
 	m.called = true
 	m.lastBucket = bucketName
 	m.lastKey = objectKey
 	return m.err
 }
 
-func (m *mockIndexerClient) IndexDeletion(_ context.Context, bucketName, objectKey string) error {
+func (m *mockIndexerClient) IndexDeletion(_ context.Context, bucketName, objectKey string, _ time.Time, _ string) error {
 	m.deleted = true
 	m.lastBucket = bucketName
 	m.deletedKey = objectKey

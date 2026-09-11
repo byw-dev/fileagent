@@ -545,8 +545,8 @@ type uploadLogResponse struct {
 	// Retry trail fields let a failed row expand to show why/when it failed
 	// (retry count, transferred bytes, timing). All already in the UploadLog
 	// model; additive to the contract — see DECISIONS.md D-027.
-	RetryCount       int32  `json:"retry_count"`
-	BytesTransferred int64  `json:"bytes_transferred"`
+	RetryCount       int32 `json:"retry_count"`
+	BytesTransferred int64 `json:"bytes_transferred"`
 	// started_at is NOT NULL and always set → always present. finished_at is
 	// nullable (null until the upload reaches a terminal state) → omitempty.
 	StartedAt  string `json:"started_at"`
@@ -685,10 +685,10 @@ type IndexerClient interface {
 	// IndexUpload records an ObjectCreated event in the file index.
 	// It is called in a best-effort, non-blocking fashion; errors are only
 	// logged (warn level) and do not affect the HTTP response.
-	IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string) error
+	IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string) error
 	// IndexDeletion records an ObjectRemoved event: it soft-deletes the matching
 	// file entry and publishes events.file.deleted. Best-effort like IndexUpload.
-	IndexDeletion(ctx context.Context, bucketName, objectKey string) error
+	IndexDeletion(ctx context.Context, bucketName, objectKey string, observedAt time.Time, eventSeq string) error
 }
 
 // MinioEventHandler handles POST /internal/minio-event — the MinIO S3 event
@@ -748,8 +748,9 @@ type minioS3Event struct {
 }
 
 type minioEventRecord struct {
-	EventName string  `json:"eventName"`
-	S3        minioS3 `json:"s3"`
+	EventTime time.Time `json:"eventTime"`
+	EventName string    `json:"eventName"`
+	S3        minioS3   `json:"s3"`
 }
 
 type minioS3 struct {
@@ -762,9 +763,10 @@ type minioS3Bucket struct {
 }
 
 type minioS3Object struct {
-	Key  string `json:"key"`
-	Size int64  `json:"size"`
-	ETag string `json:"eTag"`
+	Sequencer string `json:"sequencer"`
+	Key       string `json:"key"`
+	Size      int64  `json:"size"`
+	ETag      string `json:"eTag"`
 }
 
 // decodeObjectKey decodes the object key carried by an S3 event notification.
@@ -847,12 +849,12 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 		// mis-recorded and file_deleted event rules never fired.
 		switch {
 		case strings.HasPrefix(rec.EventName, "s3:ObjectRemoved:"):
-			if err := h.indexer.IndexDeletion(c.Request.Context(), bucket, key); err != nil {
+			if err := h.indexer.IndexDeletion(c.Request.Context(), bucket, key, rec.EventTime, rec.S3.Object.Sequencer); err != nil {
 				h.logger.Warn("minio event: index deletion failed",
 					zap.String("bucket", bucket), zap.String("key", key), zap.Error(err))
 			}
 		case strings.HasPrefix(rec.EventName, "s3:ObjectCreated:"):
-			if err := h.indexer.IndexUpload(c.Request.Context(), bucket, key, rec.S3.Object.Size, rec.S3.Object.ETag); err != nil {
+			if err := h.indexer.IndexUpload(c.Request.Context(), bucket, key, rec.S3.Object.Size, rec.S3.Object.ETag, rec.EventTime, rec.S3.Object.Sequencer); err != nil {
 				h.logger.Warn("minio event: index upload failed",
 					zap.String("bucket", bucket), zap.String("key", key), zap.Error(err))
 			}

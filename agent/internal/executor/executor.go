@@ -11,13 +11,14 @@ import (
 	"time"
 
 	"github.com/byw-dev/fileagent/agent/internal/queue"
+	"github.com/byw-dev/fileagent/agent/internal/uploader"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
 // UploadFunc is the function signature for uploading a single task. The
 // executor calls this for every task dequeued from the SQLite queue.
-type UploadFunc func(ctx context.Context, task *queue.UploadTask) error
+type UploadFunc func(ctx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error)
 
 // retryDelays defines the wait duration before each retry attempt (1-indexed).
 // Indices beyond the slice length use the last value.
@@ -33,12 +34,16 @@ const maxRetries = 10
 
 // Executor manages a pool of upload workers consuming from the queue.
 type Executor struct {
-	workers      int
-	queue        *queue.Queue
-	uploader     UploadFunc
-	logger       *zap.Logger
-	retryDelays  []time.Duration
-	queueMaxSize int
+	workers       int
+	queue         *queue.Queue
+	uploader      UploadFunc
+	logger        *zap.Logger
+	retryDelays   []time.Duration
+	queueMaxSize  int
+	reportSender  ReportSender
+	reportTimeout time.Duration
+	reportNotify  chan struct{}
+	retryMax      int
 
 	mu      sync.Mutex
 	notify  chan struct{}
@@ -66,8 +71,9 @@ func New(workers int, q *queue.Queue, uploader UploadFunc, logger *zap.Logger, q
 		logger:       logger,
 		retryDelays:  defaultRetryDelays,
 		queueMaxSize: queueMaxSize,
-		notify:       make(chan struct{}, 1),
-		stopCh:       make(chan struct{}),
+		retryMax:     maxRetries, reportNotify: make(chan struct{}, 1),
+		notify: make(chan struct{}, 1),
+		stopCh: make(chan struct{}),
 	}
 }
 
@@ -143,6 +149,13 @@ func (e *Executor) enforceCapacity(newID string) {
 // Start launches the worker goroutines. It returns immediately; workers run
 // until Stop is called or ctx is cancelled.
 func (e *Executor) Start(ctx context.Context) {
+	if e.reportSender != nil {
+		if err := e.queue.ResetReportTimers(ctx); err != nil {
+			e.logger.Error("executor: reset report timers", zap.Error(err))
+		}
+		e.wg.Add(1)
+		go e.runReporter(ctx)
+	}
 	for i := 0; i < e.workers; i++ {
 		e.wg.Add(1)
 		go e.runWorker(ctx)
@@ -207,22 +220,18 @@ func (e *Executor) processTask(ctx context.Context, task *queue.UploadTask) {
 		return
 	}
 
-	if err := e.uploader(ctx, task); err != nil {
+	result, err := e.uploader(ctx, task)
+	if err != nil {
 		e.handleFailure(task, err)
 		return
 	}
 
-	// Success path.
-	_ = e.queue.UpdateStatus(task.ID, queue.StatusCompleted)
-	_ = e.queue.UpsertProcessedFile(&queue.ProcessedFile{
-		ID:        uuid.New().String(),
-		RuleID:    task.RuleID,
-		LocalPath: task.LocalPath,
-		FileSize:  task.FileSize,
-		FileMtime: task.FileMtime,
-		SHA256:    task.SHA256,
-	})
-	e.logger.Info("executor: task completed", zap.String("task_id", task.ID), zap.String("path", task.LocalPath))
+	if result == nil {
+		e.handleFailure(task, fmt.Errorf("uploader returned nil result"))
+		return
+	}
+	e.persistResult(ctx, task, result, nil)
+
 }
 
 // handleFailure marks a task as failed and re-queues it with exponential
@@ -238,11 +247,13 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 	_ = e.queue.MarkFailed(task.ID, err.Error())
 
 	newRetry := task.RetryCount + 1
-	if newRetry >= maxRetries {
+	if newRetry >= e.retryMax {
 		e.logger.Error("executor: task exceeded max retries, giving up",
 			zap.String("task_id", task.ID),
 			zap.String("path", task.LocalPath),
 		)
+		task.RetryCount = newRetry
+		e.persistResult(context.Background(), task, nil, err)
 		return
 	}
 
@@ -259,7 +270,11 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 	e.retryWg.Add(1)
 	go func() {
 		defer e.retryWg.Done()
-		time.Sleep(delay)
+		select {
+		case <-time.After(delay):
+		case <-e.stopCh:
+			return
+		}
 		// Re-queue by resetting status to pending.
 		if rerr := e.queue.UpdateStatus(task.ID, queue.StatusPending); rerr != nil {
 			// A not-found row was evicted to honour queue_max_size while this

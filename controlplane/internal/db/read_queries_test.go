@@ -18,7 +18,7 @@ var fileEntryColumns = []string{
 	"id", "org_id", "file_type_id", "agent_id", "rule_id", "bucket_id",
 	"storage_path", "original_path", "file_name", "size_bytes",
 	"sha256", "etag", "content_type", "file_mtime", "status", "uploaded_at",
-	"created_at", "updated_at",
+	"created_at", "updated_at", "observed_at", "source", "event_seq", "meta_incomplete",
 }
 
 var uploadLogColumns = []string{
@@ -43,7 +43,7 @@ func fileEntryRow(id, orgID uuid.UUID, storagePath string) *sqlmock.Rows {
 		storagePath, nil, "file.txt", int64(1024),
 		nil, nil, nil, nil, // sha256, etag, content_type, file_mtime
 		"completed", now,
-		now, now,
+		now, now, now, "agent", nil, false,
 	)
 }
 

@@ -70,6 +70,7 @@ const sampleFile: FileEntry = {
   storage_key: 'sensor/x.parquet',
   filename: 'x.parquet',
   size: 2048,
+  meta_incomplete: true,
   sha256: 'abc',
   mime_type: 'application/octet-stream',
   status: 'COMPLETED',

@@ -129,3 +129,66 @@ FileDetailDrawer / Agents/Detail / Agents/Logs）各自复制；单位表 `['B',
 6 处改为引用，去掉重复定义。
 
 **优先级**：⚪ 低（纯健壮性/去重，无真实触发场景）。
+
+---
+
+## `agent/cmd/agent` 包的覆盖率欠账（历史，非本刀引入）
+
+**来源**：IC-2a 收尾（2026-09-11）量覆盖率时确认——agent 模块整体 **66.0%（master 基线）/ 67.4%（IC-2a 后）**，
+低于 `CLAUDE.md` 要求的 80%。缺口集中在 **`agent/cmd/agent/main.go`（753 行）**：进程装配、信号处理、
+gRPC 长连接主循环、凭据刷新 goroutine 这些「只有跑起来才走得到」的路径，几乎没有单测。
+**这不是 IC-2a 引入的**——IC-2a 让该模块从 66.0% 升到 67.4%，是净改善。
+
+**为什么当时没顺手补**：补它意味着把 `main.go` 拆成可注入的小单元，那是一次独立的重构，
+会静默把一把已经很大的原子刀撑得更大（PR 评审纪律不允许）。
+
+**内容**（真做时）：把 `main.go` 的装配逻辑按职责拆出可测单元（凭据刷新时序、uploadFn 组装、
+规则同步回调、优雅退出），保留 `main()` 作为薄壳；补齐单测到 80%。
+**注意**：`buildLogger` 附近还有 **IC-BUG-38**（`log.output`/`max_size_mb`/`max_backups` 收了不用），
+两件事碰同一块代码，宜同刀。
+
+**优先级**：⚪ 低。数字欠账不影响正确性，且 IC track 的每一刀都在补真实回归（live e2e + 变异矩阵），
+比把 `main.go` 的装配代码硬凑进单测更有价值。触发信号：`main.go` 因别的原因需要重构时顺带做掉。
+
+---
+
+## 部署脚本的自动化测试（shellcheck + 行为矩阵）
+
+**来源**：PR #97（IC-BUG-36/35）的 code review（2026-09-11）暴露——`deploy/` 下的脚本**没有任何 CI 覆盖**
+（`ci-cp.yml` 只在 `controlplane/**`/`tools/**`/`Makefile` 变更时触发）。该轮评审在一个 250 行的 bash 脚本里
+挖出四条必修，其中两条会让「全新环境 bootstrap 跑不完」——**全部是人工实跑才发现的**。
+
+**⚠️ 形态上有一个反直觉的约束，先想清楚再动手**：不要专门造一个装满 `mc`/`curl`/`shellcheck` 的「测试工具镜像」。
+MF-1 的本质就是**「文档教运维用的那个镜像里没有 curl」**；如果测试 runner 什么都有，CI 会全绿而运维照样卡死——
+把刚修的坑换个姿势又挖一遍。**行为测试的 runner 必须就是部署文档教人用的那个镜像**
+（当前是已 pin 的 `minio/minio:RELEASE.2025-04-22T22-12-26Z`，产品决定不解 pin，作为测试基线反而稳），
+这样测试顺带回答了「我们文档教的那条路今天还能跑吗」。
+
+**拆成两件，它们需要的东西不一样**：
+
+1. **shellcheck（静态 lint，不需要 MinIO）**：容器跑，不依赖宿主机——
+   `docker run --rm -v "$PWD:/mnt" koalaman/shellcheck-alpine shellcheck deploy/scripts/*.sh`。成本几分钟。
+2. **行为矩阵（真跑脚本）**：加在 `deploy/docker-compose.test.yml`，用 `profiles: ["tools"]` 门控成
+   `docker compose run --rm` 的一次性 runner，不要做成常驻服务。
+
+**用例矩阵**（都是 PR #97 那轮「先红后绿」验过的场景，直接沉淀成回归，否则测试会退化成「跑一遍没报错」）：
+
+- 干净环境 bootstrap → exit 0；连跑两次仍 exit 0（幂等）
+- 换个 secret 重跑且**不带** `CP_ADMIN_ROTATE=1` → **exit 1 且原凭据仍可用**（MF-3）
+- `CP_ADMIN_ROTATE=1` → 确实轮换，且结论里明说
+- policy 里删掉 `s3:CreateBucket` → **脚本必须 exit 非零**（S-1；修之前是 exit 0）
+- **svcacct 负向对照** → `AssumeRole` 被拒（IC-BUG-36 的看门狗，防止哪天有人「顺手简化」回 service account）
+- 21 字符 access key → 在**任何集群变更之前**退出
+- **非 localhost 端点**跑通（MF-2 的那一半）
+
+**⚠️ 有一类 CI 抓不到，别假装抓得到**：MF-2（`set -u` 下展开空数组）**只在 bash 3.2 复现**，
+Linux CI 是 bash 5，**跑绿也证明不了任何事**。GitHub 的 macOS runner 确实是 `/bin/bash` 3.2，
+但那上面没有 Docker，起不了 MinIO，两个条件凑不到一起。所以这一类只能靠 lint + 约定兜：
+先实测 shellcheck 会不会报（它不建模 bash 版本差异，**不确定**），兜底是加一条 grep 断言
+「脚本里所有数组展开必须写成 `${arr[@]+"${arr[@]}"}`」。笨，但诚实——比一个在 bash 5 上永远绿的行为测试有用。
+
+**落地形态**：`deploy/scripts/test-init-minio.sh`（矩阵）+ compose 的 tools profile +
+`.github/workflows/ci-deploy.yml`（`paths: deploy/**`，跑 shellcheck + 矩阵）。
+
+**优先级**：🟡 中。不是纯健壮性——`deploy/` 是**唯一一处「改坏了单测和 live e2e 都不会红」的地方**，
+而它恰恰决定新环境能不能起来。**排期**：产品已定在 PR #97 + #98 合并之后开工（2026-09-11）。

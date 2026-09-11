@@ -52,6 +52,8 @@ type AgentConfig struct {
 
 // UploadConfig holds file upload behaviour settings.
 type UploadConfig struct {
+	// ReportTimeoutSeconds is the ack deadline before retrying a persisted result (default 30).
+	ReportTimeoutSeconds int `toml:"report_timeout_seconds"`
 	// Concurrency is the number of concurrent upload workers (default 3).
 	Concurrency int `toml:"concurrency"`
 	// PartSizeMB is the multipart upload part size in mebibytes (default 64).
@@ -86,10 +88,11 @@ type LogConfig struct {
 func defaults() Config {
 	return Config{
 		Upload: UploadConfig{
-			Concurrency:  3,
-			PartSizeMB:   64,
-			QueueMaxSize: 10000,
-			RetryMax:     10,
+			Concurrency:          3,
+			PartSizeMB:           64,
+			QueueMaxSize:         10000,
+			RetryMax:             10,
+			ReportTimeoutSeconds: 30,
 		},
 		Metrics: MetricsConfig{
 			Enabled: true,
@@ -168,6 +171,11 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Upload.QueueMaxSize = n
 		}
 	}
+	if v := os.Getenv("AGENT_UPLOAD_REPORT_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Upload.ReportTimeoutSeconds = n
+		}
+	}
 	if v := os.Getenv("AGENT_UPLOAD_RETRY_MAX"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Upload.RetryMax = n
@@ -218,6 +226,9 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Upload.QueueMaxSize <= 0 {
 		errs = append(errs, "upload.queue_max_size must be > 0")
+	}
+	if cfg.Upload.ReportTimeoutSeconds <= 0 {
+		return errors.New("upload.report_timeout_seconds must be positive")
 	}
 	if cfg.Upload.RetryMax < 0 {
 		errs = append(errs, "upload.retry_max must be >= 0")

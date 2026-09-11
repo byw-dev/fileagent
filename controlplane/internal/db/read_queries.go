@@ -61,19 +61,6 @@ type ListFileEntriesParams struct {
 	Limit           int32
 }
 
-const listFileEntriesSelect = `
-SELECT id, org_id, file_type_id, agent_id, rule_id, bucket_id,
-       storage_path, original_path, file_name, size_bytes,
-       sha256, etag, content_type, file_mtime, status, uploaded_at,
-       created_at, updated_at
-FROM file_entries
-WHERE org_id = $1
-  AND ($2::UUID IS NULL OR agent_id = $2)
-  AND ($3::UUID IS NULL OR bucket_id = $3)
-  AND ($4::UUID IS NULL OR file_type_id = $4)
-  AND ($5::file_status IS NULL OR status = $5)
-  AND ($6::TIMESTAMPTZ IS NULL OR (created_at, id) < ($6, $7::UUID))`
-
 // ListFileEntries returns a cursor-paginated list of file entries with optional filters.
 func (q *Queries) ListFileEntries(ctx context.Context, arg ListFileEntriesParams) ([]*FileEntry, error) {
 	args := []interface{}{
@@ -86,7 +73,7 @@ func (q *Queries) ListFileEntries(ctx context.Context, arg ListFileEntriesParams
 		arg.CursorID,
 	}
 	var sb strings.Builder
-	sb.WriteString(listFileEntriesSelect)
+	sb.WriteString(strings.TrimSuffix(strings.TrimSpace(listFileEntriesBase), ";"))
 	sb.WriteString(tagFilterClause(arg.Tags, &args))
 	args = append(args, arg.Limit)
 	fmt.Fprintf(&sb, "\nORDER BY created_at DESC, id DESC\nLIMIT $%d", len(args))
@@ -118,6 +105,7 @@ func (q *Queries) ListFileEntries(ctx context.Context, arg ListFileEntriesParams
 			&i.UploadedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ObservedAt, &i.Source, &i.EventSeq, &i.MetaIncomplete,
 		); err != nil {
 			return nil, err
 		}
@@ -127,43 +115,6 @@ func (q *Queries) ListFileEntries(ctx context.Context, arg ListFileEntriesParams
 }
 
 // ── GetFileEntryByID ─────────────────────────────────────────────────────────
-
-const getFileEntryByIDSQL = `
-SELECT id, org_id, file_type_id, agent_id, rule_id, bucket_id,
-       storage_path, original_path, file_name, size_bytes,
-       sha256, etag, content_type, file_mtime, status, uploaded_at,
-       created_at, updated_at
-FROM file_entries
-WHERE id = $1
-LIMIT 1
-`
-
-// GetFileEntryByID returns a single file entry by its UUID.
-func (q *Queries) GetFileEntryByID(ctx context.Context, id uuid.UUID) (*FileEntry, error) {
-	row := q.db.QueryRowContext(ctx, getFileEntryByIDSQL, id)
-	var i FileEntry
-	err := row.Scan(
-		&i.ID,
-		&i.OrgID,
-		&i.FileTypeID,
-		&i.AgentID,
-		&i.RuleID,
-		&i.BucketID,
-		&i.StoragePath,
-		&i.OriginalPath,
-		&i.FileName,
-		&i.SizeBytes,
-		&i.Sha256,
-		&i.Etag,
-		&i.ContentType,
-		&i.FileMtime,
-		&i.Status,
-		&i.UploadedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return &i, err
-}
 
 // ── ListUploadLogs ────────────────────────────────────────────────────────────
 

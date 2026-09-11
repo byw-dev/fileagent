@@ -34,7 +34,6 @@ const STATUS_OPTIONS: { label: string; value: FileStatusFilter | '' }[] = [
   { label: '全部', value: '' },
   { label: '已完成', value: 'completed' },
   { label: '上传中', value: 'uploading' },
-  { label: '失败', value: 'failed' },
   { label: '已删除', value: 'deleted' },
 ]
 

@@ -22,14 +22,20 @@
 - **设计**：[`docs/design/consistency-and-ingest.md`](../design/consistency-and-ingest.md)
 - **决策**：[`DECISIONS.md`](../../DECISIONS.md) **D-030**（不换存储层；STS grant + 注册 outbox + 分片对账）、
   **D-031**（MinIO 事件传输 webhook → NATS JetStream，排期对账阶段 IC-11）
-- **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-35（8 个 P0 / 17 个 P1 / 10 个 P2；30…32 来自 2026-09-10 的 M-2 类扫描，33/34 来自同日评审，35 来自 IC-2c 的 live 验收）。**分诊结论见 [`consistency-ingest.md`](consistency-ingest.md) 「分诊结论」一节**——未关闭 24 条中 15 条挡着数据面可用、7 条可推、2 条拆半
+- **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-38（30…32 来自 2026-09-10 的 M-2 类扫描，33/34 来自同日评审，35 来自 IC-2c 的 live 验收，36 是 IC-2a 开工时挡路的那条，37/38 来自 IC-2a 的 live 验收）。**分诊结论见 [`consistency-ingest.md`](consistency-ingest.md) 「分诊结论」一节**。2026-09-11 随 IC-2a 关闭 **2/8/28/29/33**（另 12/13/31 各关掉一半），随 PR #97 关闭 **35/36**
 
-**顺序**：IC-0 文档基线 ✅ → 止血 IC-1 ✅ → **IC-2c** ✅（硬前置，PR #96）→ **IC-2a**（下一刀）→（IC-2b / IC-3 / IC-4 / IC-5 / IC-SEC-2 可并行）
+**顺序**：IC-0 文档基线 ✅ → 止血 IC-1 ✅ → **IC-2c** ✅（硬前置，PR #96）→ **IC-2a** ✅（PR #98；前置 PR #97 修 IC-BUG-36/35）→ **下一刀在 IC-2b / IC-3 / IC-4 / IC-5 / IC-SEC-2 之间选（可并行）**
 → 地基 IC-6/7 → 准入 IC-8…10 → 对账 IC-11…13 → 血缘 IC-14。
 
 > ⚠️ 两条硬约束：**IC-1 必须第一个做**（在它之前 Agent 一个文件都传不上去，任何 live 验收都无法执行）；
 > **IC-2c 是 IC-2a 的硬前置**（webhook 对象键 `url.QueryUnescape`，IC-BUG-19）——反序会给每个对象造两行。
-> **该硬序已于 2026-09-10 满足（PR #96），IC-2a 可以开工。**
+> **该硬序已于 2026-09-10 满足（PR #96）；IC-2a 已于 2026-09-11 收官（PR #98）。**
+>
+> **✅ 数据面主路径现在是真的通了**（不是「单测通过」）：dev 上落一个文件 → MinIO 出现对象 →
+> `file_entries` 的 `agent_id`/`rule_id`/`sha256` 非空 → `upload_logs` 有行 → NATS 收到
+> `events.file.uploaded` → `file_tags` 出现 `source='path_var'` 行。九条 live 验收逐条留证，
+> 协调者独立复跑一遍同样全绿。**开工前先修掉了挡路的 IC-BUG-36**（CP 凭据被建成 root 的
+> service account，而 MinIO 不允许 service account 调 `AssumeRole`——**全新环境从来签不出 STS**，PR #97）。
 > **IC-2a 本身是不可再拆的原子刀**——IC-BUG-8（排序键）、IC-BUG-33（失败上报不写索引行）、
 > IC-BUG-29（rule_id 归属）、IC-BUG-31 的 ack 半边、IC-BUG-28（`Unregister` 按 conn 身份，否则每文件一次
 > `Send` 会撞上无 recovery 的 CP 崩溃）都必须与「上报」同刀，否则每一条都会**引入新缺陷**而非只是留着
