@@ -794,3 +794,94 @@ func TestServer_Connect_RuleSyncDegraded_KeepsStreamAndMarksCache(t *testing.T) 
 		return ok
 	}, 3*time.Second, 50*time.Millisecond, "the degraded state must be observable via the cache")
 }
+
+// ── R5-B（IC-2b review 四轮）：降级标记的生命周期与降级条件一致 ────────────────
+
+// 降级连接可以活得比标记的 TTL 久：心跳必须给仍存在的降级标记续期，否则
+// 长期在线且持续降级的连接在 24h 后静默失去可观测性——恰是最该被发现的状态。
+func TestServer_Heartbeat_RenewsDegradedMarker(t *testing.T) {
+	agentID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	logger, _ := zap.NewDevelopment()
+	mc := newMockCache()
+	mc.sets[cache.AgentSyncDegradedKey(agentID)] = "1" // 连接建立时的降级标记（已到期临界）
+	s := New(logger)
+	s.cache = mc
+	s.publishEvent("noop", agentID) // nothing to publish; guards nil deps
+
+	s.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 1})
+
+	renewals := 0
+	for _, k := range mc.setLog {
+		if k == cache.AgentSyncDegradedKey(agentID) {
+			renewals++
+		}
+	}
+	assert.Positive(t, renewals,
+		"a heartbeat on a degraded connection must renew the degraded marker — "+
+			"otherwise the TTL outlives the observability of a still-degraded connection (R5-B)")
+}
+
+// 条件结束（断开）必须清除标记：断开后不再有降级条件，重连会重新判定。
+func TestServer_Connect_ClearsDegradedMarkerOnDisconnect(t *testing.T) {
+	agentID := "dddddddd-dddd-dddd-dddd-dddddddddddd"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	mc := newMockCache()
+	mc.sets[cache.AgentSyncDegradedKey(agentID)] = "1"
+	srv := New(logger)
+	srv.WithDeps(registry, mc, jwtSvc, &mockNATS{}, nil)
+	// The sync itself is DEGRADED — the marker is (re)written by this
+	// connection and must be cleared when the connection ends, not only on a
+	// successful sync (the success-path Del must not satisfy this assertion).
+	srv.WithExtraDeps(&degradedSyncDispatcher{}, nil, nil, nil)
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hello"}))
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		5*time.Second, 20*time.Millisecond)
+
+	// Half-close: the handler returns and its deferred cleanup must run.
+	require.NoError(t, stream.CloseSend())
+	require.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		5*time.Second, 20*time.Millisecond, "handler must return on half-close")
+
+	assert.Eventually(t, func() bool {
+		for _, k := range mc.dels {
+			if k == cache.AgentSyncDegradedKey(agentID) {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second, 50*time.Millisecond,
+		"disconnect must clear the degraded marker — after that there is no degraded condition to observe (R5-B)")
+}

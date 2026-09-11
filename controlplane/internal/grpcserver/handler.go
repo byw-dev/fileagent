@@ -81,6 +81,10 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		}
 		if s.cache != nil {
 			_ = s.cache.Del(context.Background(), cache.AgentOnlineKey(agentID))
+			// The connection is gone, so the degraded condition it carried is
+			// gone with it — the next sync (on reconnect) re-marks or clears
+			// (review R5-B: the marker must not outlive its condition).
+			_ = s.cache.Del(context.Background(), cache.AgentSyncDegradedKey(agentID))
 		}
 		s.markOfflineOnDisconnect(agentID)
 		s.logger.Info("agent disconnected", zap.String("agent_id", agentID))
@@ -484,6 +488,19 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 	if s.cache != nil {
 		if err := s.cache.Set(ctx, cache.AgentOnlineKey(agentID), "1", agentOnlineTTL); err != nil {
 			s.logger.Warn("heartbeat: refresh online TTL failed", zap.Error(err))
+		}
+		// A degraded rule sync must stay observable for as long as the
+		// degraded connection lives — which can exceed the marker's TTL, and
+		// a long-lived degraded connection is exactly the state that most
+		// needs to be seen (review R5-B). A heartbeat proves the connection
+		// is alive, so an existing marker is renewed; absence costs one
+		// Exists round-trip per heartbeat, and the next sync re-marks or
+		// clears anyway. The TTL itself remains only the crash-recovery
+		// backstop, not the mechanism.
+		if n, err := s.cache.Exists(ctx, cache.AgentSyncDegradedKey(agentID)); err == nil && n > 0 {
+			if err := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); err != nil {
+				s.logger.Warn("heartbeat: renew degraded marker failed", zap.String("agent_id", agentID), zap.Error(err))
+			}
 		}
 	}
 	if s.stateDB != nil {

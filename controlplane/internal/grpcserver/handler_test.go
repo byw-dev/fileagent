@@ -37,8 +37,9 @@ func (m *mockAgentMgr) PollApproval(ctx context.Context, req *agentv1.PollApprov
 // ── Mock CacheClient ──────────────────────────────────────────────────────────
 
 type mockCache struct {
-	sets map[string]string
-	dels []string
+	sets   map[string]string
+	setLog []string // every Set, in order — lets tests tell a renewal from a seed
+	dels   []string
 }
 
 func newMockCache() *mockCache {
@@ -48,7 +49,19 @@ func newMockCache() *mockCache {
 func (m *mockCache) Set(_ context.Context, key string, value interface{}, _ time.Duration) error {
 	s, _ := value.(string)
 	m.sets[key] = s
+	m.setLog = append(m.setLog, key)
 	return nil
+}
+
+// Exists satisfies the extended CacheClient used by the degraded-marker
+// renewal; presence follows the last Set.
+func (m *mockCache) Exists(_ context.Context, keys ...string) (int64, error) {
+	for _, k := range keys {
+		if _, ok := m.sets[k]; ok {
+			return 1, nil
+		}
+	}
+	return 0, nil
 }
 
 func (m *mockCache) Del(_ context.Context, keys ...string) error {
