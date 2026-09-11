@@ -118,8 +118,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 | 🔴 P0 | agent |
 | IC-BUG-18 | Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 | 🔴 P0 | agent |
 | IC-BUG-19 | minio-event 索引 URL 编码后的对象键（`%2F`），与真实键不符 ✅ 随 IC-2c 修复 | 🟠 P1 | controlplane |
-| IC-BUG-20 | bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 | 🟠 P1 | controlplane + agent |
-| IC-BUG-21 | 模板解析失败时猜一个对象键写进去，污染对账分片 | 🟡 P2 | agent |
+| IC-BUG-20 | bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 ✅ 随 IC-2b 修复 | 🟠 P1 | controlplane + agent |
+| IC-BUG-21 | 模板解析失败时猜一个对象键写进去，污染对账分片 ✅ 随 IC-2b 修复 | 🟡 P2 | agent |
 | IC-BUG-22 | `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token | 🔴 P0 | controlplane |
 | IC-BUG-23 | 吊销不生效：被吊销 agent 的 token 仍可用，且重连会把状态刷回 online | 🔴 P0 | controlplane |
 | IC-BUG-24 | `handleDryRunResult` 无归属校验，可对他人 rule 投递伪造试运行结果 | 🟡 P2 | controlplane |
@@ -128,8 +128,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-27 | `handleDirectoryListing` 拿到 agentID 却只用于打日志，不校验归属 | 🟡 P2 | controlplane |
 | IC-BUG-28 | `registry.Register` 覆盖 map，重连时陈旧流的 defer 会关掉新连接的 SendCh ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-29 | `UploadResult.rule_id` 无归属校验，agent 可把上传记到别人的规则上并借其元数据打标 ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
-| IC-BUG-30 | 规则 cancel 无补偿通道：断连期间删除的规则，agent 重连后继续采集上传 | 🟠 P1 | controlplane + agent |
-| IC-BUG-31 | `registry.Send` 队列满即静默丢弃，且 Connect 在消费者启动前入队 | 🟠 P1 | controlplane |
+| IC-BUG-30 | 规则 cancel 无补偿通道：断连期间删除的规则，agent 重连后继续采集上传 ✅ 随 IC-2b 修复（快照形态）| 🟠 P1 | controlplane + agent |
+| IC-BUG-31 | `registry.Send` 队列满即静默丢弃，且 Connect 在消费者启动前入队 ✅ 两半均已修复（ack 半边随 IC-2a，结构半边随 IC-2b）| 🟠 P1 | controlplane |
 | IC-BUG-32 | `Revoke` 的 `Send` 与 `Disconnect` 存在竞态窗口，命令可能在切流前被丢弃 | 🟡 P2 | controlplane |
 | IC-BUG-33 | 失败的上报仍写 `file_entries` 行，制造「DB 有、对象无」的反向幽灵 ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-34 | agent 重启后 `running` 态任务无复位，永久孤儿：不重传也不上报 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
@@ -370,7 +370,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **⚠️ 归属理由不得省略** | 本条当初被推到 IC-4，正是因为卡片上看不出上面这层交互。**「一行 `url.QueryUnescape` 的事」是它被反复推走的原因，不是它可以被推走的理由**——放错刀就是每个对象两行脏数据 |
 | **验收** | ✅ **已 live 验证（2026-09-10，dev）**：`mc cp` → `storage_path` = `ic2c/a/b/中 文.csv`（未编码）；预签名下载 `200` + 内容正确；`mc rm` 一个带层级的键 → 对应行 `status=deleted`（修复前对带层级键是静默 no-op）。**字面加号往返实证**：`ic2c/plus+dir/re+port.csv` 落库仍是 `+` 而非空格，证实 MinIO 把真正的加号编成 `%2B`，query-form 解码不误伤。历史编码行按定案保留未清洗。**剩余一条验收归 IC-2a**：「同一对象经 agent 上报与 webhook 两条路径各写一次后 `file_entries` 只有一行」——agent 尚不上报 `UploadResult`，本刀无法执行，拆刀不等于免验 |
 
-## IC-BUG-20 — bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 🟠 P1
+## IC-BUG-20 — bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 🟠 P1 ✅ 已修（IC-2b，PR #103）
 
 | 字段 | 内容 |
 |------|------|
@@ -381,7 +381,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | agent 运行中新建一条指向新 bucket 的规则，首个文件即上传成功（不出现 403）；断开 policy 授权后上传失败两次即落终态并告警 |
 | **✅ 已修（IC-2b ①）** | CP：`Dispatcher.SetCredentialPusher` 接线到 `Server.PushCredentials`——`DispatchRule` 成功后若新规则的 bucket 未被该 agent 其他 active 规则覆盖（集合变化）即重推（移除 bucket 是超集无害，只对新增触发）。agent：`uploadWithAccessDeniedRetry`——首次 403 作废 STS + `RefreshCredentials` + 重试一次；二次 403 以 `executor.ErrTerminalUpload` 落终态（不进 backoff，立即 success=false 上报）；刷新本身失败原样上抛（transient 走既有 backoff）。live：运行中新建指向新 bucket 的规则，首个文件即成功、日志零 AccessDenied（`TestIC2BLive` act 2） |
 
-## IC-BUG-21 — 模板解析失败时猜一个对象键写进去，污染对账分片 🟡 P2
+## IC-BUG-21 — 模板解析失败时猜一个对象键写进去，污染对账分片 🟡 P2 ✅ 已修（IC-2b，PR #103）
 
 | 字段 | 内容 |
 |------|------|
@@ -495,7 +495,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **✅ 已修（IC-2a ⑦，2026-09-11）** | 三分支按定案落地：①**规则不存在**（稳态正常情形）→ 清空 `rule_id`、文件**照常入索引**、置 `meta_incomplete=true`、告警降噪；②**规则属于别的 agent** → 拒绝该 `rule_id`、不借用其标签声明、**这是唯一值得响的一支**；③合法 → 正常打标。单测 `controlplane/internal/indexer/observation_test.go` 的 `TestUploadRuleOwnership`
 
 
-## IC-BUG-30 — 规则 cancel 无补偿通道，断连期间删掉的规则 agent 继续跑 🟠 P1
+## IC-BUG-30 — 规则 cancel 无补偿通道，断连期间删掉的规则 agent 继续跑 🟠 P1 ✅ 已修（IC-2b，PR #103，快照形态）
 
 | 字段 | 内容 |
 |------|------|
@@ -507,7 +507,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | agent 与 CP 断连 → 删除一条规则、停用另一条 → 恢复连接 → 两条都不再产生上传，且 **agent 进程不重启**也成立；单测覆盖「全集里缺失的规则被停掉」 |
 | **✅ 已修（IC-2b ③，D-033）** | **快照形态**：`ServerMessage` oneof 新增 `rules_sync = 17`（`RulesSyncCommand`），`SyncRulesOnConnect` 一次同步只发一条携带 DB 全部规则（active + inactive，不含已删除——「不含」正是删除半边语义）的快照；agent `applyRulesSnapshot` 原子替换规则集（集合外停掉，`Enabled==false` 走 `applyRule` 既有停用分支）。**为什么不是逐条 push + 全集 ID**：初版行为级验证 5/5 确定性失败——41 条消息经 32 缓冲，burst-vs-drain 结构性丢失 8 条 + 凭据（生产微秒级循环恒快于逐条 `stream.Send`），且与「快照失败即断连」组合对 >32 规则 agent 是无限重连循环。快照失败仍断连重连（单条消息失败罕见，安全），日志区分缓冲满 / 断连；快照超 gRPC 4MB 上限整条响式失败。单条增量 `DispatchRule`/`DispatchRuleCancel` 不变；**经 API 批量改动大量规则时 burst 会重现（本刀未修，待立卡）**。live：断连期间删除/停用规则，恢复后不重启 agent 不再上传（`TestIC2BLive` act 1）；40 条规则重连后 40 条全部生效（act 3） |
 
-## IC-BUG-31 — `registry.Send` 队列满即静默丢弃，且 Connect 在消费者启动前入队 🟠 P1
+## IC-BUG-31 — `registry.Send` 队列满即静默丢弃，且 Connect 在消费者启动前入队 🟠 P1 ✅ 两半均已修（ack 半边 IC-2a / PR #98，结构半边 IC-2b / PR #103）
 
 | 字段 | 内容 |
 |------|------|
