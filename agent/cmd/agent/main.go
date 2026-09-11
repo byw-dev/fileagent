@@ -37,8 +37,6 @@ import (
 // registration/approval flow takes before the heartbeat builder is installed.
 var processStart = time.Now()
 
-const assumedUploadBytesPerSecond int64 = 1024 * 1024
-
 // ruleHandle holds the cancel function for an active rule's watcher or scheduler entry.
 type ruleHandle struct {
 	cancel context.CancelFunc
@@ -81,7 +79,7 @@ func main() {
 
 	// ── 3. Open SQLite queue ─────────────────────────────────────────────────
 	queuePath := filepath.Join(cfg.Agent.DataDir, "queue.db")
-	q, err := queue.Open(queuePath)
+	q, err := queue.OpenWithLogger(queuePath, logger)
 	if err != nil {
 		logger.Fatal("queue open failed", zap.String("path", queuePath), zap.Error(err))
 	}
@@ -152,6 +150,8 @@ func main() {
 			uploadCtx,
 			task,
 			time.Duration(cfg.Upload.MinTimeoutSeconds)*time.Second,
+			cfg.Upload.AssumedUploadBytesPerSecond,
+			logger,
 			u.UploadFile,
 		)
 	}
@@ -374,25 +374,38 @@ func main() {
 
 // uploadWithTimeout gives each upload its own size-derived deadline so a
 // stalled object-store request cannot occupy an executor worker forever.
-// The deadline is derived from task.FileSize, never from the tail increment:
-// multipart uploads ignore FileOffset and move the whole file, and UploadFile
-// hashes the entire file before transferring. Deriving from the increment
-// would make large tail files time out on every attempt (PR #100 review F4).
-// The deadline is a safety net; wider is better than shorter.
-func uploadWithTimeout(parent context.Context, task *queue.UploadTask, minimum time.Duration, upload executor.UploadFunc) (*uploader.UploadResult, error) {
-	uploadCtx, cancel := context.WithTimeout(parent, uploadTimeoutForSize(task.FileSize, minimum))
+// The deadline is derived from the file's CURRENT size (os.Stat at upload
+// time), because uploader.UploadFile stats the file itself and moves that
+// many bytes; task.FileSize is frozen at detection time and understates
+// files that grew while waiting in the queue (PR #100 review R2). Never
+// derived from the tail increment: multipart uploads ignore FileOffset and
+// move the whole file, and UploadFile hashes the entire file before
+// transferring (PR #100 review F4). The deadline is a safety net; wider is
+// better than shorter.
+func uploadWithTimeout(parent context.Context, task *queue.UploadTask, minimum time.Duration, assumedBytesPerSecond int64, logger *zap.Logger, upload executor.UploadFunc) (*uploader.UploadResult, error) {
+	uploadSize := task.FileSize
+	if info, err := os.Stat(task.LocalPath); err != nil {
+		logger.Warn("agent: cannot stat file for upload deadline, using stored size",
+			zap.String("path", task.LocalPath), zap.Error(err))
+	} else {
+		uploadSize = info.Size()
+	}
+	uploadCtx, cancel := context.WithTimeout(parent, uploadTimeoutForSize(uploadSize, minimum, assumedBytesPerSecond))
 	defer cancel()
 	return upload(uploadCtx, task)
 }
 
-// uploadTimeoutForSize derives a conservative deadline at one mebibyte per
-// second while never returning less than the configured minimum.
-func uploadTimeoutForSize(fileSize int64, minimum time.Duration) time.Duration {
+// uploadTimeoutForSize derives a conservative deadline from the configured
+// assumed upload throughput while never returning less than the configured
+// minimum. The rate comes from config (upload.assumed_upload_bytes_per_second):
+// a hardwired 1 MiB/s made any large file permanently fail on slow links
+// (PR #100 review R3).
+func uploadTimeoutForSize(fileSize int64, minimum time.Duration, assumedBytesPerSecond int64) time.Duration {
 	if fileSize <= 0 {
 		return minimum
 	}
-	seconds := fileSize / assumedUploadBytesPerSecond
-	if fileSize%assumedUploadBytesPerSecond != 0 {
+	seconds := fileSize / assumedBytesPerSecond
+	if fileSize%assumedBytesPerSecond != 0 {
 		seconds++
 	}
 	const maxDurationSeconds = int64((1<<63 - 1) / int64(time.Second))

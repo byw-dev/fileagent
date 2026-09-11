@@ -56,6 +56,10 @@ type UploadConfig struct {
 	ReportTimeoutSeconds int `toml:"report_timeout_seconds"`
 	// MinTimeoutSeconds is the minimum deadline for one upload attempt (default 300).
 	MinTimeoutSeconds int `toml:"min_timeout_seconds"`
+	// AssumedUploadBytesPerSecond is the conservative throughput assumed when
+	// deriving an upload deadline from the file size. Tune it down for slow
+	// links so large files still get a workable deadline (default 1048576).
+	AssumedUploadBytesPerSecond int64 `toml:"assumed_upload_bytes_per_second"`
 	// Concurrency is the number of concurrent upload workers (default 3).
 	Concurrency int `toml:"concurrency"`
 	// PartSizeMB is the multipart upload part size in mebibytes (default 64).
@@ -96,6 +100,8 @@ func defaults() Config {
 			RetryMax:             10,
 			ReportTimeoutSeconds: 30,
 			MinTimeoutSeconds:    300,
+
+			AssumedUploadBytesPerSecond: 1024 * 1024,
 		},
 		Metrics: MetricsConfig{
 			Enabled: true,
@@ -184,6 +190,11 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Upload.MinTimeoutSeconds = n
 		}
 	}
+	if v := os.Getenv("AGENT_UPLOAD_ASSUMED_UPLOAD_BYTES_PER_SECOND"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.Upload.AssumedUploadBytesPerSecond = n
+		}
+	}
 	if v := os.Getenv("AGENT_UPLOAD_RETRY_MAX"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Upload.RetryMax = n
@@ -240,6 +251,9 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Upload.MinTimeoutSeconds <= 0 {
 		errs = append(errs, "upload.min_timeout_seconds must be > 0")
+	}
+	if cfg.Upload.AssumedUploadBytesPerSecond <= 0 {
+		errs = append(errs, "upload.assumed_upload_bytes_per_second must be > 0")
 	}
 	if cfg.Upload.RetryMax < 0 {
 		errs = append(errs, "upload.retry_max must be >= 0")

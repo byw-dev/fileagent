@@ -210,6 +210,45 @@ func TestApplyEnvOverrides_InvalidNumbers(t *testing.T) {
 	assert.Equal(t, 3, cfg.Upload.Concurrency)
 }
 
+// PR #100 review R3: the assumed upload rate must be configurable, not a
+// hardwired const — slow links make any large file permanently fail to upload.
+func TestLoad_Defaults_AssumedUploadBytesPerSecond(t *testing.T) {
+	p := writeTOML(t, `
+[server]
+endpoint = "cp.internal:9090"
+`)
+	cfg, err := Load(p)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1024*1024), cfg.Upload.AssumedUploadBytesPerSecond,
+		"default assumed upload rate must stay at 1 MiB/s")
+}
+
+func TestLoad_AssumedUploadBytesPerSecondOverride(t *testing.T) {
+	p := writeTOML(t, `
+[server]
+endpoint = "cp.internal:9090"
+
+[upload]
+assumed_upload_bytes_per_second = 262144
+`)
+	cfg, err := Load(p)
+	require.NoError(t, err)
+	assert.Equal(t, int64(262144), cfg.Upload.AssumedUploadBytesPerSecond)
+}
+
+func TestValidate_AssumedUploadBytesPerSecondMustBePositive(t *testing.T) {
+	p := writeTOML(t, `
+[server]
+endpoint = "cp.internal:9090"
+
+[upload]
+assumed_upload_bytes_per_second = 0
+`)
+	_, err := Load(p)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "upload.assumed_upload_bytes_per_second must be > 0")
+}
+
 func TestValidate_MultipleErrors(t *testing.T) {
 	p := writeTOML(t, `
 [server]

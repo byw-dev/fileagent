@@ -249,7 +249,7 @@ func TestSubmitFile_PersistsTailFields(t *testing.T) {
 func TestUploadWithTimeout_CancelsBlockedUpload(t *testing.T) {
 	task := &queue.UploadTask{FileSize: 1}
 	started := time.Now()
-	_, err := uploadWithTimeout(context.Background(), task, 20*time.Millisecond, func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+	_, err := uploadWithTimeout(context.Background(), task, 20*time.Millisecond, defaultAssumedUploadBytesPerSecond, zap.NewNop(), func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	})
@@ -272,7 +272,7 @@ func TestUploadWithTimeout_UsesFullFileSizeForDeadline(t *testing.T) {
 		AppendMode: watcher.AppendModeTail,
 	}
 	before := time.Now()
-	result, err := uploadWithTimeout(context.Background(), task, 30*time.Second, func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+	result, err := uploadWithTimeout(context.Background(), task, 30*time.Second, defaultAssumedUploadBytesPerSecond, zap.NewNop(), func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		deadline, ok := ctx.Deadline()
 		require.True(t, ok)
 		// Full 120 MiB at 1 MiB/s → ~120s, NOT the 1 MiB increment → 30s min.
@@ -285,7 +285,7 @@ func TestUploadWithTimeout_UsesFullFileSizeForDeadline(t *testing.T) {
 
 func TestUploadWithTimeout_ClampsInvalidTailOffset(t *testing.T) {
 	task := &queue.UploadTask{FileSize: 10, FileOffset: 20, AppendMode: watcher.AppendModeTail}
-	result, err := uploadWithTimeout(context.Background(), task, 30*time.Second, func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+	result, err := uploadWithTimeout(context.Background(), task, 30*time.Second, defaultAssumedUploadBytesPerSecond, zap.NewNop(), func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		deadline, ok := ctx.Deadline()
 		require.True(t, ok)
 		assert.WithinDuration(t, time.Now().Add(30*time.Second), deadline, time.Second)
@@ -295,11 +295,47 @@ func TestUploadWithTimeout_ClampsInvalidTailOffset(t *testing.T) {
 	require.NotNil(t, result)
 }
 
+// Regression for PR #100 review R2: the deadline must be derived from the
+// file size at upload time (os.Stat), not the size frozen at detection time.
+// A file that keeps growing between enqueue and worker pickup would get a
+// deadline from the stale size, time out at the minimum, and retry to
+// exhaustion — a regression this PR introduced. Stat failure falls back to
+// the stored size.
+func TestUploadWithTimeout_UsesCurrentFileSizeFromStat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "growing.log")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("x", 120*1024*1024)), 0o644))
+	// The frozen detection-time size is tiny; the real file is 120 MiB.
+	task := &queue.UploadTask{LocalPath: path, FileSize: 1024}
+
+	before := time.Now()
+	result, err := uploadWithTimeout(context.Background(), task, 30*time.Second, defaultAssumedUploadBytesPerSecond, zap.NewNop(), func(ctx context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		// Current 120 MiB at 1 MiB/s → ~120s, NOT the frozen 1 KiB → 30s min.
+		assert.WithinDuration(t, before.Add(2*time.Minute), deadline, time.Second)
+		return &uploadpkg.UploadResult{SizeBytes: 1024}, nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
+const defaultAssumedUploadBytesPerSecond int64 = 1024 * 1024
+
+// PR #100 review R3: the assumed upload rate is now configuration, not a const.
 func TestUploadTimeoutForSize_ScalesAndHonorsMinimum(t *testing.T) {
-	assert.Equal(t, 30*time.Second, uploadTimeoutForSize(0, 30*time.Second))
-	assert.Equal(t, 30*time.Second, uploadTimeoutForSize(1, 30*time.Second))
-	assert.Equal(t, 2*time.Minute, uploadTimeoutForSize(120*1024*1024, 30*time.Second))
-	assert.Equal(t, time.Duration(1<<63-1), uploadTimeoutForSize(1<<63-1, time.Second))
+	rate := defaultAssumedUploadBytesPerSecond
+	assert.Equal(t, 30*time.Second, uploadTimeoutForSize(0, 30*time.Second, rate))
+	assert.Equal(t, 30*time.Second, uploadTimeoutForSize(1, 30*time.Second, rate))
+	assert.Equal(t, 2*time.Minute, uploadTimeoutForSize(120*1024*1024, 30*time.Second, rate))
+	assert.Equal(t, time.Duration(1<<63-1), uploadTimeoutForSize(1<<63-1, time.Second, rate))
+}
+
+// A slow link must be able to get a workable deadline by lowering the rate.
+func TestUploadTimeoutForSize_SlowLinkConfig(t *testing.T) {
+	assert.Equal(t, 200*time.Second,
+		uploadTimeoutForSize(100*1024*1024, 30*time.Second, 512*1024),
+		"500 KiB/s over 100 MiB must yield ~200s, not the 1 MiB/s default")
 }
 
 // Regression for PR #100 review F3: runWatcher must rebuild tail offsets from

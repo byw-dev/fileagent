@@ -9,10 +9,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"go.uber.org/zap"
 )
 
 const schema = `
@@ -142,11 +144,19 @@ type Rule struct {
 // Queue wraps a SQLite database providing queue operations for the Agent.
 type Queue struct {
 	db *sql.DB
+	// logger is optional; nil keeps queue operations silent. Used only for
+	// warnings such as failing to refresh task metadata on reset.
+	logger *zap.Logger
 }
 
 // Open opens (or creates) a SQLite database at dsn and initialises the schema.
 // Use ":memory:" for in-process testing without file I/O.
 func Open(dsn string) (*Queue, error) {
+	return OpenWithLogger(dsn, nil)
+}
+
+// OpenWithLogger is Open with an optional logger for operational warnings.
+func OpenWithLogger(dsn string, logger *zap.Logger) (*Queue, error) {
 	db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("queue: open %q: %w", dsn, err)
@@ -166,7 +176,7 @@ func Open(dsn string) (*Queue, error) {
 			}
 		}
 	}
-	return &Queue{db: db}, nil
+	return &Queue{db: db, logger: logger}, nil
 }
 
 // Close releases the underlying database connection.
@@ -383,15 +393,82 @@ func (q *Queue) DequeuePending(limit int) ([]*UploadTask, error) {
 // eligible for dequeue again. Reported tasks are intentionally untouched:
 // their objects are already uploaded and the durable report replay path must
 // resend only metadata rather than retransmitting file content.
+//
+// Each reset row's file_size/file_mtime is refreshed from the filesystem:
+// files may have been appended to while the agent was down, and uploader
+// re-stats at upload time, so a frozen stale tuple would diverge from what the
+// initial scan sees and the EnqueueIfNoActive guard would let a duplicate task
+// enqueue — both uploading the same current bytes (PR #100 review R1). A stat
+// failure keeps the original values and does not block the reset.
+//
+// The whole reset is one transaction: refreshed metadata is written first,
+// then the status is flipped, so a task can never become visible as pending
+// while still carrying a stale tuple, and a crash (or write failure) mid-reset
+// rolls back to a consistent running state. The reads and writes all run on
+// the same tx so the listed rows cannot change underneath the refresh.
 func (q *Queue) ResetRunningToPending(ctx context.Context) (int64, error) {
-	result, err := q.db.ExecContext(ctx, `
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("queue: begin reset transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+        SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
+               completed_parts, file_size, file_mtime, sha256, status,
+               retry_count, last_error, created_at, updated_at,
+               file_offset, append_mode
+        FROM upload_tasks
+        WHERE status = ?
+        ORDER BY created_at ASC`, StatusRunning)
+	if err != nil {
+		return 0, fmt.Errorf("queue: list running tasks for reset: %w", err)
+	}
+	running, err := scanTasks(rows)
+	rows.Close()
+	if err != nil {
+		return 0, fmt.Errorf("queue: scan running tasks for reset: %w", err)
+	}
+
+	// Refresh each row's metadata from the filesystem while still inside the
+	// transaction, BEFORE the status flip: an executor dequeues only pending
+	// rows, so this ordering guarantees a dequeued task always carries the
+	// refreshed tuple (PR #100 review R1, round-2 atomicity fix). A stat
+	// failure keeps the original values and does not block the reset.
+	for _, t := range running {
+		info, statErr := os.Stat(t.LocalPath)
+		if statErr != nil {
+			if q.logger != nil {
+				q.logger.Warn("queue: cannot refresh task file metadata on reset, keeping stored values",
+					zap.String("task_id", t.ID), zap.String("path", t.LocalPath), zap.Error(statErr))
+			}
+			continue
+		}
+		t.FileSize = info.Size()
+		t.FileMtime = info.ModTime().Unix()
+		if _, err := tx.ExecContext(ctx, `
+            UPDATE upload_tasks
+            SET file_size=?, file_mtime=?, updated_at=?
+            WHERE id=?`, t.FileSize, t.FileMtime, time.Now().Unix(), t.ID); err != nil {
+			return 0, fmt.Errorf("queue: refresh task %q metadata on reset: %w", t.ID, err)
+		}
+	}
+
+	result, err := tx.ExecContext(ctx, `
         UPDATE upload_tasks
         SET status=?, updated_at=?
         WHERE status=?`, StatusPending, time.Now().Unix(), StatusRunning)
 	if err != nil {
 		return 0, fmt.Errorf("queue: reset running tasks: %w", err)
 	}
-	return result.RowsAffected()
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("queue: reset running tasks: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("queue: commit reset transaction: %w", err)
+	}
+	return n, nil
 }
 
 // UpdateStatus sets the status of a task identified by id.

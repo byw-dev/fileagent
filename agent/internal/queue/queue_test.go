@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -231,34 +233,98 @@ func TestEnqueueIfNoActive_NoDuplicateAfterCrashRestartReset(t *testing.T) {
 }
 
 func TestEnqueueIfNoActive_ModifiedFileAfterCrashRestartReset(t *testing.T) {
-	// Guards the ④+⑤ fix from the other side: a file modified while the old
-	// task sat pending after restart must be re-collected. Proves the guard is
-	// the four-tuple (mtime/size), not (rule_id, local_path) — i.e. the
-	// IsProcessed mtime/size fix was not broken by the dedup.
+	// Guards PR #100 review R1: the running task's frozen (mtime, size) tuple
+	// diverges from the file the initial scan sees after a crash, so the
+	// four-tuple guard would let a second task enqueue and both would upload
+	// the same current bytes — the double PUT this PR claims to close.
+	// ResetRunningToPending therefore refreshes each reset row's size/mtime
+	// from the filesystem, which FLIPS this test's old semantics ("a changed
+	// file must re-enqueue") to "a changed file must have exactly one task in
+	// flight": after the reset the task's tuple matches what the scan sees, so
+	// the guard must reject the scan's duplicate. Re-collection after a file
+	// changes is covered by the terminal-state test below.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 1000)), 0o644))
+	oldInfo, err := os.Stat(path)
+	require.NoError(t, err)
+
 	q := openMemQueue(t)
 	ctx := context.Background()
 
 	stale := newTask("stale-version", "")
+	stale.LocalPath = path
+	stale.FileSize = oldInfo.Size()
+	stale.FileMtime = oldInfo.ModTime().Unix()
 	require.NoError(t, q.Enqueue(stale))
 	require.NoError(t, q.UpdateStatus(stale.ID, StatusRunning))
+
+	// Crash → the writer appends 500 more bytes → restart.
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 1500)), 0o644))
+	newInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NotEqual(t, oldInfo.Size(), newInfo.Size())
 
 	reset, err := q.ResetRunningToPending(ctx)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), reset)
 
-	modified := newTask("modified", "")
-	modified.LocalPath = stale.LocalPath
-	modified.FileMtime = stale.FileMtime + 1
-	modified.FileSize = stale.FileSize + 1
+	// The initial scan rediscovers the file at its current size.
+	rescanned := newTask("rescanned", "")
+	rescanned.LocalPath = path
+	rescanned.FileSize = newInfo.Size()
+	rescanned.FileMtime = newInfo.ModTime().Unix()
 
-	enqueued, err := q.EnqueueIfNoActive(ctx, modified)
+	enqueued, err := q.EnqueueIfNoActive(ctx, rescanned)
 	require.NoError(t, err)
-	assert.True(t, enqueued, "a changed file version must be re-collected")
+	assert.False(t, enqueued,
+		"the reset task was refreshed to the current tuple, so the scan's duplicate must be rejected")
 
-	assert.Equal(t, 1, countTupleRows(t, q, modified.RuleID, modified.LocalPath, modified.FileMtime, modified.FileSize),
-		"exactly one row for the new version")
-	assert.Equal(t, 2, countPathRows(t, q, stale.RuleID, stale.LocalPath),
-		"old version stays, new version is added — guard is not a two-tuple")
+	pending, err := q.ListByStatus(StatusPending)
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "exactly one in-flight task for the file — no double upload")
+	assert.Equal(t, stale.ID, pending[0].ID)
+	assert.Equal(t, newInfo.Size(), pending[0].FileSize,
+		"the reset task must carry the refreshed size so the upload matches the file")
+}
+
+// Guards ① (IsProcessed mtime/size fix): once a task reached a terminal state,
+// a later change to the file must still be collected. Refresh-on-reset must
+// not break this — terminal rows are never reset, so the guard only sees an
+// active-row conflict when there genuinely is one.
+func TestEnqueueIfNoActive_ChangedFileAfterTerminalStateRecovers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "done.log")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 1000)), 0o644))
+	oldInfo, err := os.Stat(path)
+	require.NoError(t, err)
+
+	q := openMemQueue(t)
+	ctx := context.Background()
+
+	done := newTask("done-version", "")
+	done.LocalPath = path
+	done.FileSize = oldInfo.Size()
+	done.FileMtime = oldInfo.ModTime().Unix()
+	require.NoError(t, q.Enqueue(done))
+	require.NoError(t, q.UpdateStatus(done.ID, StatusCompleted))
+
+	// File changes after completion.
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 1500)), 0o644))
+	newInfo, err := os.Stat(path)
+	require.NoError(t, err)
+
+	_, err = q.ResetRunningToPending(ctx)
+	require.NoError(t, err)
+
+	recollected := newTask("recollected", "")
+	recollected.LocalPath = path
+	recollected.FileSize = newInfo.Size()
+	recollected.FileMtime = newInfo.ModTime().Unix()
+
+	enqueued, err := q.EnqueueIfNoActive(ctx, recollected)
+	require.NoError(t, err)
+	assert.True(t, enqueued, "a file changed after its task reached a terminal state must be re-collected")
 }
 
 // Regression for PR #100 review F3: tail offsets live in the watcher's
@@ -311,6 +377,90 @@ func TestResetRunningToPending_PreservesReported(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, reported, 1)
 	assert.Equal(t, "reported-task", reported[0].ID)
+}
+
+// Guards the atomicity of R1's refresh-on-reset (round-2 fix): the metadata
+// refresh and the running→pending flip must be one transaction, refreshed
+// metadata FIRST. Falsifies the old order (status flipped outside/first, then
+// per-row metadata): there a failing metadata update left the status flipped
+// but the tuple stale — and since only status=running rows ever get reset
+// again, that stale tuple could never be corrected. The new implementation
+// must roll back everything when any metadata write fails.
+func TestResetRunningToPending_MetadataFailureRollsBackWholeReset(t *testing.T) {
+	dir := t.TempDir()
+	dsn := filepath.Join(dir, "test.db")
+	q, err := Open(dsn)
+	require.NoError(t, err)
+	defer q.Close()
+
+	// A real file so the reset attempts a metadata refresh.
+	path := filepath.Join(dir, "app.log")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 1000)), 0o644))
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	tk := newTask("running-1", "")
+	tk.LocalPath = path
+	tk.FileSize = info.Size()
+	tk.FileMtime = info.ModTime().Unix()
+	require.NoError(t, q.Enqueue(tk))
+	require.NoError(t, q.UpdateStatus(tk.ID, StatusRunning))
+
+	// Force the per-row metadata UPDATE inside the reset to fail while letting
+	// the status UPDATE through: the trigger fires only on writes touching
+	// file_size, which is exactly the write the old order performed second,
+	// after the status had already been flipped.
+	_, err = q.db.Exec(`CREATE TRIGGER block_task_meta BEFORE UPDATE OF file_size ON upload_tasks
+        BEGIN SELECT RAISE(ABORT, 'injected failure'); END`)
+	require.NoError(t, err)
+
+	_, err = q.ResetRunningToPending(context.Background())
+	require.Error(t, err, "the injected metadata-write failure must abort the reset")
+
+	// The whole reset must have rolled back: the task stays running with its
+	// original tuple — never flipped-but-unrefreshed.
+	tasks, err := q.ListByStatus(StatusRunning)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1, "status must NOT have been flipped when the reset failed")
+	assert.Equal(t, tk.ID, tasks[0].ID)
+	assert.Equal(t, info.Size(), tasks[0].FileSize, "tuple must be untouched")
+	assert.Equal(t, info.ModTime().Unix(), tasks[0].FileMtime)
+}
+
+// Atomic visibility companion: after a successful reset, the row must expose
+// the refreshed size AND pending status together — the combination the old
+// two-step (flip status first, write metadata after) order could split across
+// an executor dequeue.
+func TestResetRunningToPending_RefreshedTupleVisibleWithPendingStatus(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 1000)), 0o644))
+	oldInfo, err := os.Stat(path)
+	require.NoError(t, err)
+
+	q := openMemQueue(t)
+	tk := newTask("reset-me", "")
+	tk.LocalPath = path
+	tk.FileSize = oldInfo.Size()
+	tk.FileMtime = oldInfo.ModTime().Unix()
+	require.NoError(t, q.Enqueue(tk))
+	require.NoError(t, q.UpdateStatus(tk.ID, StatusRunning))
+
+	// Crash → file grows → restart.
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("a", 1500)), 0o644))
+	newInfo, err := os.Stat(path)
+	require.NoError(t, err)
+
+	reset, err := q.ResetRunningToPending(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int64(1), reset)
+
+	pending, err := q.ListByStatus(StatusPending)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	assert.Equal(t, newInfo.Size(), pending[0].FileSize,
+		"pending status and refreshed size must be visible atomically")
+	assert.Equal(t, newInfo.ModTime().Unix(), pending[0].FileMtime)
 }
 
 func TestResetRunningToPending_ClosedQueue(t *testing.T) {

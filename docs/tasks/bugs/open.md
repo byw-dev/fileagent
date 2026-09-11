@@ -141,6 +141,9 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 | 🟠 P1 | controlplane |
 | IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 | 🟡 P2 | deploy |
 | IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT | 🟡 P2 | agent |
+| IC-BUG-43 | close_wait 初始扫描跳过「仍在写」的文件，但 fsnotify 分支只扫一次、也没有后续事件兜底——写完即停的文件会被永久跳过 | 🟡 P2 | agent |
+| IC-BUG-44 | 阻塞式初始扫描在事件循环启动**之前**跑，大目录下 inotify 内核队列可能溢出（`IN_Q_OVERFLOW`），期间新建的文件静默丢失 | 🟡 P2 | agent |
+| IC-BUG-45 | tail 偏移在**事件发出时**推进而非**上传确认后**，一次彻底失败的 tail 上传会静默丢掉一段字节区间且无任何信号 | 🟡 P2 | agent |
 
 ---
 
@@ -660,6 +663,40 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 二选一：(a) 给 `upload_tasks` 增加「下次重试时刻」列，守卫把「`failed` 且重试仍已安排」视为 active；(b) 退避改为不落 `failed`，而用一个显式的 `retry_wait` 状态并计入 active。(b) 更干净但要动状态机，需评估与 IC-2a 上报路径的交互 |
 | **验收** | 任务失败进入退避期间重复提交同一四元组 → 只产生一个任务；退避结束后正常重试；而一个**已放弃**（重试耗尽）的任务不得阻止该文件日后被重新采集 |
 | **归属** | 未排期。宜与 IC-3（续传落盘，同样要动 `upload_tasks` 的状态与列）同刀 |
+
+## IC-BUG-43 — close_wait 初始扫描跳过的文件没有兜底路径 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | IC-5（PR #100）的 review F2 修复让 `pollScan` 在 close_wait 模式下跳过 `time.Since(mtime) < closeWaitDebounce` 的文件（避免上传写了一半的文件）。注释称它会被「close_wait 流程或后续扫描」拾取，但**fsnotify 分支只在 `Start` 里调一次 `pollScan`**，而 `runCloseWait` 只对**后续到达的** fsnotify 事件生效 |
+| **精确位置** | `agent/internal/watcher/watcher.go` `pollScan` 的 close_wait 跳过分支；`Start` 中 `pollScan` 的唯一调用点 |
+| **后果** | logrotate 写完并关闭 `/data/app.log` 后 100ms agent 启动 → 扫描认为它还在去抖窗口内、跳过且不标 `seen` → 写入方已退出、永不再有 Write/Create 事件 → **该文件永不被采集**。窗口很窄（≤ 去抖时长），但症状与 IC-BUG-37 完全相同 |
+| **修复** | 二选一：(a) 给跳过的路径挂一个一次性定时器，去抖窗口过后单独重查这些路径；(b) 在 fsnotify 分支加一次有界的延迟重扫（只针对上一轮跳过的集合，不是全量重扫）。(a) 更省，且不引入周期性全量扫描的成本 |
+| **验收** | 写完并关闭一个文件后立即启动 agent（落在去抖窗口内），该文件最终必须被采集；且仍不得上传处于写入中的文件（不能把 F2 修复退回去）|
+| **归属** | 未排期。归 agent 采集路径，宜与 IC-BUG-44 同刀（都是初始扫描的时序边界）|
+
+## IC-BUG-44 — 阻塞式初始扫描先于事件循环，inotify 队列可能溢出 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | IC-5（PR #100）的 review F1 修复把初始扫描改成**阻塞发送**（背压取代丢弃），但扫描仍在**进入事件循环之前**执行。`fsnotify` 的 `Events` channel 无缓冲，在 `runFsnotify` / `runCloseWait` 启动前没有任何消费者 |
+| **精确位置** | `agent/internal/watcher/watcher.go` `Start` 中 `pollScan` 的调用位置（在 `runFsnotify` / `runCloseWait` 之前）|
+| **后果** | 5 万个既有文件 + 消费端受限于 SQLite 写入时，扫描会把 `Start` 阻塞数分钟；这期间新建的文件冲爆内核队列（`max_queued_events` 默认 16384）→ `IN_Q_OVERFLOW` → **这些 create 事件被静默丢弃，且没有任何后续扫描会找回它们** |
+| **注意** | 这是 F1 修复的**代价而非退步**：改成阻塞之前，同样的积压是直接被 `emit` 丢掉的（那更糟且无声）。本条是把风险从「必然丢」降到「极端规模下可能丢」之后剩下的尾巴 |
+| **修复** | 把初始扫描放进独立 goroutine，在事件循环**已经在消费**之后再跑；扫描与实时事件并发写同一个 channel 是安全的（`seen` map 的并发访问需加锁或改为扫描独占）|
+| **验收** | 大目录（万级）下启动 agent，同时持续创建新文件，既有文件与新建文件**都不丢** |
+| **归属** | 未排期。宜与 IC-BUG-43 同刀 |
+
+## IC-BUG-45 — tail 偏移在发出事件时推进，而非上传确认后 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `pollScan` 与 `buildEvent` 在**事件发出成功时**就把 `w.tailOffsets[path]` 推进到 `info.Size()`，而不是等上传被确认。与之相对，IC-5 新增的 `TailOffsets` / `SeedTailOffsets` 恢复路径读的是**已 ack 的** `processed_files.file_size`——两者口径不一致 |
+| **精确位置** | `agent/internal/watcher/watcher.go` `pollScan` 与 `buildEvent` 中对 `tailOffsets` 的赋值 |
+| **后果** | 扫描发出 `offset=1000, size=1500` 并把内存偏移推到 1500 → 该上传耗尽 `retry_max`（MinIO 不可达）→ 日志继续涨到 2000 → 下一个事件以 `offset=1500` 发出 → **字节 1000–1500 永远不会被上传，且没有任何信号**。进程内乐观推进、跨重启却按 ack 恢复，这个不一致本身也是后续踩坑的来源 |
+| **修复** | 让偏移推进与上传确认对齐：要么在 `CompleteReported` 之后回写偏移，要么让 watcher 不再持有权威偏移、每次都从 `processed_files` 读。后者更简单且与恢复路径天然一致 |
+| **验收** | tail 规则下让一次上传彻底失败，随后文件继续增长——下一次上传必须覆盖失败的那段字节，不得出现空洞 |
+| **归属** | 未排期。与 **IC-BUG-42** 同源（都是「任务失败后的状态推进」），宜同刀 |
 
 ---
 
