@@ -200,6 +200,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **文档冲突** | `system-design.md` §4.5 详细描述了续传流程，CLAUDE.md「关键实现模式」也写着「断点续传状态保存在 SQLite」——设计正确，实现缺失 |
 | **修复** | (1) 新增 `Queue.SaveMultipartProgress(id, uploadID, partsJSON)`，每片完成后落盘；(2) 任务终态（completed / 放弃）时调用 `AbortMultipartUpload`；(3) 给数据桶加 `AbortIncompleteMultipartUpload` ILM 规则兜底 |
 | **验收** | 上传 >64MB 文件，中途 kill agent，重启后从断点续传（日志可见跳过的分片数）；放弃的任务在 MinIO 侧无残留分片 |
+| **✅ 已修（IC-3，PR #105，2026-09-12）** | (1) `Queue.SaveMultipartProgress`（`queue.go`）在 initiate 与每片完成时落盘 `upload_id`/`completed_parts`；(2) 终态清理走 executor 的 `AbandonFunc` hook（`ConfigureAbandon` + `uploader.AbandonUpload`）：**放弃（重试耗尽）/ 终态失败（`ErrTerminalUpload`）/ 任务被逐出（capacity 逐出、退避中发现行已删）** 时 Abort，**`completed` 不 Abort**（`CompleteMultipartUpload` 已消费 uploadID，再 Abort 必然报错）；(3) `verifyRemoteParts` 对账保留为续传正确性的权威（本地记录仅是输入），验证失败（可能只是瞬时网络）**不** abort，宁可留给下一次对账。**IC-5 协同**：`ResetRunningToPending` 不清这两列 → 复位任务天然续传，**「大文件复位后全量重传」的已知限制由本刀关闭**。**⚠️ ILM 兜底一条在当前 MinIO 上不可实现**：实测（RELEASE.2025-09-07T16-13-09Z，直连 S3 XML PUT 复现）当前 MinIO 的 lifecycle schema 根本没有实现 `AbortIncompleteMultipartUpload`（`internal/bucket/lifecycle/rule.go` 自 2021 重构起该字段被注释成 FIXME，直到归档前的最终版 2025-10-15 仍在）——abort-only 规则 400 被拒、与其他动作共存则被**静默剥离**。`init-minio.sh` 仍写入该规则（面向将来实现了该 action 的构建），并读回生效值、不生效时响亮告警 |
+| **验收（live，已执行）** | ① 320MB 文件（part 5MiB——S3 非末片下限）传输中途 `SIGKILL` agent，重启后日志出现 `resuming multipart upload … skipped_parts=1` 且 upload_id 与 kill 前一致（非 part 1 重传），对象完整落桶、`file_entries` 一行；② `retry_max=0` agent 传中途删源文件 → 放弃 → 日志出现 `aborted multipart upload of abandoned task`，`ListMultipartUploads` 与 `mc ls --incomplete` 均无该 upload 的分片、无对象。live 用例 `ic3_live_integration_test.go`（开关 `IC3_LIVE=1`），两次运行均 PASS |
 
 ## IC-BUG-6 — minio-event 索引失败仍返回 200，MinIO 丢弃事件 🟠 P1
 
@@ -632,7 +634,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 加交叉引用注释是最低限度；更好的做法是写一个 Go 测试，把脚本里那段 JSON 解出来与 `BuildSessionPolicy` 的输出比对，不一致即红 |
 | **验收** | 故意给 `policy.go` 加一个 Action 而不改脚本 → 必须有东西变红 |
 | **归属** | 未排期。宜与 IC-3 或 IC-8（下一次要动 policy 的刀）同刀 |
-| **✅ 已修（IC-3，2026-09-12）** | 新增 `controlplane/internal/storage/policy_script_test.go`：解出脚本里的 `STS_SESSION_POLICY` JSON 与 `BuildSessionPolicy`（对脚本钉定的同一 bucket `data-sensor`）逐文档比对（`TestSessionPolicyMatchesInitScript` + 逐 statement 的 Action 集合断言 `TestSessionPolicyActionSetsMatch`）。反向变异已自验：给 `objectActions` 加 `s3:GetObject` 而不改脚本 → `go build` 通过且两条用例红；还原后 5/5 稳定绿。本刀未改 `policy.go`（IC-1 已把 `AbortMultipartUpload` 放进 `objectActions`），脚本无需同步 |
+| **✅ 已修（IC-3，PR #105，2026-09-12）** | 新增 `controlplane/internal/storage/policy_script_test.go`：解出脚本里的 `STS_SESSION_POLICY` JSON 与 `BuildSessionPolicy`（对脚本钉定的同一 bucket `data-sensor`）逐文档比对（`TestSessionPolicyMatchesInitScript` + 逐 statement 的 Action 集合断言 `TestSessionPolicyActionSetsMatch`）。反向变异已自验：给 `objectActions` 加 `s3:GetObject` 而不改脚本 → `go build` 通过且两条用例红；还原后 5/5 稳定绿。本刀未改 `policy.go`（IC-1 已把 `AbortMultipartUpload` 放进 `objectActions`），脚本无需同步 |
 
 ## IC-BUG-40 — CP 启动不校验 MinIO 凭据，故障延后到 agent 侧才爆 🟠 P1
 

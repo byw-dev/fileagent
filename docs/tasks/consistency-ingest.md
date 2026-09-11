@@ -120,7 +120,7 @@ dev 上落一个文件 → MinIO 出现对象 → `file_entries` 的 `agent_id`/
 
 **45 条中已关闭 29 条**：IC-1 关 1/3/4/16/17/18/22/23，IC-SEC-1 关 24/25，IC-2c 关 19，
 **IC-2a（PR #98）关 2/8/28/29/33**，**PR #97 关 35/36**，**IC-5（PR #100）关 10/11/34/37 并补上 12 的超时半边**，
-**IC-2b（PR #103）关 20/21/30**，**IC-3 关 5/39**（ILM 兜底一条见卡片——当前 MinIO 全代系不实现该 action，脚本照写并响亮告警）。
+**IC-2b（PR #103）关 20/21/30**，**IC-3（PR #105）关 5/39**（ILM 兜底一条见卡片——当前 MinIO 全代系不实现该 action，脚本照写并响亮告警）。
 **未关闭 16 条：4 条挡、11 条可推、1 条拆半**（仅 13 仍是拆半；**12 与 31 均已两半齐全**）。
 **IC-2b（PR #103）关 20/21/30 并补齐 31 的结构半边**——重判时点名的两条产品语义缺口至此**全部关闭**
 （10 随 IC-5，21 随 IC-2b）。
@@ -146,7 +146,7 @@ inotify 队列可能溢出）、45（tail 偏移按发出而非确认推进）�
 | ID | 判定 | 归属 | 理由 |
 |---|---|---|---|
 | 2 | ✅ **已关闭** | **IC-2a ③（PR #98）** | 索引主路径是死代码，富字段恒 NULL、无 NATS 事件、6c 声明式打标从不触发 |
-| 5 | ✅ **已关闭** | **IC-3** | 续传状态落盘 + 终态 AbortMultipartUpload 落地（live 证据见 bugs/open.md 卡片）。⚠️ ILM 兜底在当前 MinIO 全代系上不可实现（lifecycle schema 无该 action，脚本已照写并响亮告警）——「agent 永不再起」场景在该版本上仅由 ② 的显式 abort 覆盖 |
+| 5 | ✅ **已关闭** | **IC-3（PR #105）** | 续传状态落盘 + 终态 AbortMultipartUpload 落地（live 证据见 bugs/open.md 卡片）。⚠️ ILM 兜底在当前 MinIO 全代系上不可实现（lifecycle schema 无该 action，脚本已照写并响亮告警）——「agent 永不再起」场景在该版本上仅由 ② 的显式 abort 覆盖 |
 | 6 | 🟠 挡（收窄）| IC-4 ① | IC-2a 后 agent 路径有 ack 兜底，但非 agent 写入只有 webhook 一条命 |
 | 7 | 🟠 挡（收窄）| IC-4 ② | IC-2a 前是「UI 建的桶文件永不入索引」，之后降级为补偿通道缺失 |
 | 8 | ✅ **已关闭** | **IC-2a ⑤（PR #98）** | **不与 2 同刀即数据损坏**——webhook 晚到清空富字段 |
@@ -173,7 +173,7 @@ inotify 队列可能溢出）、45（tail 偏移按发出而非确认推进）�
 | 36 | ✅ **已关闭** | **PR #97** | CP 凭据被建成 root 的 **service account**，而 MinIO 不允许 service account 调 `AssumeRole` → **全新环境从来签不出 STS**。与 IC-1「STS 链路接通」的表面冲突已查实：IC-1 当时用的是 dev 上手工建的真实 IAM 用户，后来被换成 svcacct |
 | 37 | ✅ **已关闭** | **IC-5 ⑤（PR #100，与 10 同刀）** | watcher 的 fsnotify 分支**无初始扫描**，规则指向的既有文件永不采集；polling 回退分支却会扫——**同一条规则的行为取决于 fsnotify 是否可用**。不挡「能不能跑通」，挡「规则建好了为什么什么都没发生」 |
 | 38 | ⬜ 可推 | 未排期 | agent 的 `log.output`/`max_size_mb`/`max_backups` 收了不用，日志只落 stdout。部署形态下等于没有日志留存 |
-| 39 | ✅ **已关闭** | **IC-3 ④** | Go 测试把脚本 `STS_SESSION_POLICY` 解出与 `BuildSessionPolicy` 比对；反向变异（policy.go 加 Action 不改脚本）变红已自验 |
+| 39 | ✅ **已关闭** | **IC-3 ④（PR #105）** | Go 测试把脚本 `STS_SESSION_POLICY` 解出与 `BuildSessionPolicy` 比对；反向变异（policy.go 加 Action 不改脚本）变红已自验 |
 | 40 | 🟠 挡（诊断性）| 未排期 | CP 启动**不校验 MinIO 凭据**，凭据错了照常起，故障延后到 agent 连接、甚至要等 STS 会话过期（≤1h）才爆。**它不制造故障，它放大所有 MinIO 侧故障的排查成本**——IC-BUG-36 当初难查有它一份 |
 | 41 | ⬜ 可推 | 未排期 | `init-minio.sh` 三处把 secret 放进 argv，`ps` 可见。执行窗口短、通常在运维自己机器上，实际风险低 |
 
