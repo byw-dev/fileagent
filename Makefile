@@ -10,7 +10,9 @@
 #   make build-agent-windows — 交叉编译 Windows agent.exe（需 mingw-w64；权威产物见 CI）
 #   make bundle           — 构建含 Web UI 的单文件 controlplane（+ agent）；需 Node 24 / pnpm 11
 #   make build-webui      — 编译 webui 并拷贝 dist 至 controlplane 嵌入目录
-#   make generate         — 重新生成所有代码生成产物（sqlc → controlplane/internal/db）
+#   make generate         — 重新生成所有代码生成产物（sqlc → controlplane/internal/db；proto → api/v1）
+#   make generate-sqlc    — 仅重新生成 sqlc DB 代码
+#   make generate-proto   — 仅重新生成 proto 契约代码（buf，不需要系统 protoc）
 #   make test             — 运行全部单元测试
 #   make tidy             — 整理所有模块的 go.mod / go.sum
 #   make clean            — 删除 bin/ 目录
@@ -22,7 +24,11 @@ BIN_DIR := bin
 
 WEBUI_EMBED_DIR := controlplane/internal/webui/dist
 
-.PHONY: build build-controlplane build-agent build-agent-windows bundle build-webui build-controlplane-bundle generate generate-sqlc test tidy clean
+# buf 生成用的 scratch 目录（构建钉定版本的工具二进制 + 临时落点），见 generate-proto。
+PROTO_TOOLS_DIR := .tmp-proto-tools
+PROTO_OUT_DIR := .tmp-proto-gen
+
+.PHONY: build build-controlplane build-agent build-agent-windows bundle build-webui build-controlplane-bundle generate generate-sqlc generate-proto test tidy clean
 
 ## build: 构建全部二进制（纯 Go，不含前端）
 build: build-controlplane build-agent
@@ -67,12 +73,29 @@ build-controlplane-bundle: build-webui
 	cd controlplane && go build -tags webui -o ../$(BIN_DIR)/controlplane ./cmd/server
 
 ## generate: 重新生成所有代码生成产物（工具版本由 tools/ 子模块钉定）
-generate: generate-sqlc
+generate: generate-sqlc generate-proto
 
 ## generate-sqlc: 用 tools/ 钉定的 sqlc 重新生成 controlplane DB 代码
 #  GOWORK=off 让 tools/ 独立解析（不并入 go.work），保持依赖隔离。
 generate-sqlc:
 	GOWORK=off go -C tools tool sqlc generate -f ../controlplane/sqlc.yaml
+
+## generate-proto: 用 tools/ 钉定的 buf + protoc-gen-go(-grpc) 重新生成 api/v1 契约代码
+#  GOWORK=off 让 tools/ 独立解析（不并入 go.work），保持依赖隔离。
+#  buf 自带编译器，不依赖系统 protoc；buf.gen.yaml 的插件是 local:（D-032 硬约束，严禁
+#  remote:），protoc-gen-go / protoc-gen-go-grpc 也钉在 tools/go.mod。但 go tool 不会把
+#  同模块的其他工具加进 PATH，所以先把三个工具构建到 scratch 目录再注入 PATH 后运行 buf
+#  （buf 输出与插件版本只由 PATH 决定，因此 scratch 目录只是构建缓存，不影响产物内容）。
+#  生成先落到 scratch 目录再 mv 回既有位置 api/v1/，保持生成物路径与 source 署名不变。
+generate-proto:
+	@rm -rf $(PROTO_TOOLS_DIR) $(PROTO_OUT_DIR)
+	GOWORK=off go -C tools build -o ../$(PROTO_TOOLS_DIR)/ \
+		github.com/bufbuild/buf/cmd/buf \
+		google.golang.org/protobuf/cmd/protoc-gen-go \
+		google.golang.org/grpc/cmd/protoc-gen-go-grpc
+	PATH=$$PWD/$(PROTO_TOOLS_DIR):$$PATH $(PROTO_TOOLS_DIR)/buf generate
+	@mv $(PROTO_OUT_DIR)/proto/v1/agent.pb.go $(PROTO_OUT_DIR)/proto/v1/agent_grpc.pb.go api/v1/
+	@rm -rf $(PROTO_TOOLS_DIR) $(PROTO_OUT_DIR)
 
 ## test: 运行全部单元测试
 test:

@@ -1,0 +1,20 @@
+# buf 代码生成配置（D-032）：proto/v1/agent.proto → api/v1/agent.pb.go / agent_grpc.pb.go
+#
+# ⚠️ 硬约束（D-032）：插件必须用 local:，严禁 remote:。
+# remote: buf.build/... 插件的版本来自 buf 远程注册中心，输入不变也会随注册中心漂移，
+# 破坏「同一输入 → 逐字节相同输出」的复现性保证——这正是 D-032 要消灭的东西。
+# local: 插件由 make generate-proto 经 tools/go.mod 的 tool 指令构建并注入 PATH，
+# 版本钉定见 tools/go.mod（protoc-gen-go v1.36.10 / protoc-gen-go-grpc v1.6.2，
+# 与仓库现有生成物的署名一致），与 sqlc 同一套机制。
+version: v2
+# 模块根 = 仓库根（见 buf.yaml），生成物路径是 proto/v1/agent.pb.go。
+# 生成落点是既有位置 api/v1/（go_package 不变）：先输出到 scratch 目录（out 字段）
+# .tmp-proto-gen，再由 make generate-proto 移回 api/v1/，保证文件头
+# `// source: proto/v1/agent.proto` 与生成物落点都不变。
+plugins:
+  - local: protoc-gen-go
+    out: .tmp-proto-gen
+    opt: paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: .tmp-proto-gen
+    opt: paths=source_relative

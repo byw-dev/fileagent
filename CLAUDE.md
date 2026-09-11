@@ -104,6 +104,13 @@ fileagent/                        # Monorepo 根目录
   `make generate` + `git status --porcelain` 拦截漂移（含新增文件）。
   > 注：sqlc 的依赖要求 **Go 1.26+**（`tools/go.mod` 声明 `go 1.26.0`）。服务代码本身仍是 Go 1.22+，
   > 但 `make generate` 需要 Go 1.26+；`GOTOOLCHAIN=auto`（默认）会按需自动下载对应 toolchain。
+- gRPC 契约：**buf** 生成 `api/v1/*.pb.go`（buf 自带编译器，不需要系统 protoc）。生成器版本由
+  **`tools/` 子模块**钉定（`tools/go.mod` 的 `tool` 指令），统一经 **`make generate`** 运行——
+  **禁止手改 `api/v1/*.pb.go`**；改契约请编辑 `proto/v1/agent.proto` 后 `make generate`。
+  CI（`ci-proto.yml`）会跑 `make generate-proto` + `git status --porcelain` 拦截漂移（含新增文件），
+  并用 **`buf breaking`**（对 master 比对）机器强制「只增字段、不改字段编号、不删字段」。
+  `buf.gen.yaml` 的插件必须是 `local:`（版本来自 `tools/`），**严禁 `remote:`**——远程插件版本随
+  buf 注册中心漂移。见 DECISIONS.md D-032。
 - 测试框架：**testify**（assert + require + mock）
 - 单元测试覆盖率要求：**≥ 80%**（核心业务逻辑 ≥ 90%）
 - 每个导出函数必须有 godoc 注释
@@ -138,7 +145,7 @@ fileagent/                        # Monorepo 根目录
 
 | 文件 | 影响范围 | 修改规则 |
 |------|----------|----------|
-| `proto/v1/agent.proto` | controlplane + agent | 只增字段，不改字段编号；不删除字段 |
+| `proto/v1/agent.proto` | controlplane + agent | 只增字段，不改字段编号；不删除字段。由 `buf breaking`（对 master 比对，`ci-proto.yml`）机器强制 |
 | `deploy/docker-compose.test.yml` 中的端口定义 | 所有集成测试 | 端口固定：PostgreSQL `5432`、Redis `6379`、MinIO `9000/9001`、NATS `4222/8222`；修改前通知所有模块 |
 | `controlplane/migrations/` 迁移文件 | controlplane + 所有依赖 DB 的测试 | 只追加，不修改已有迁移文件 |
 | REST 接口路径 | controlplane + 所有客户端 | 资源类接口统一在 `/api/v1/...`；认证接口统一在 `/api/auth/*`，不得混写 |
@@ -345,7 +352,7 @@ docker compose -f deploy/docker-compose.test.yml down -v
 → 地基 IC-6/7 → 准入 IC-8…10 → 对账 IC-11…13 → 血缘 IC-14。
 **止血阶段已于 2026-09-11 收官**（#93→#94→#96→#97→#98），数据面主路径已有 live 证据。
 **开工前先读 `consistency-ingest.md` 顶部的「🟢 止血阶段已收官——新会话从这里开工」与「分诊结论」两节**——判据已重判，旧口径的「可推/挡」不能直接沿用。
-**WR track（Web UI 重做 WR-2…10）暂停让位**，追踪 `docs/tasks/webui-redesign-impl.md`。未排期：proto→buf。
+**WR track（Web UI 重做 WR-2…10）暂停让位**，追踪 `docs/tasks/webui-redesign-impl.md`。proto→buf 已落地（D-032）。
 
 **已按产品决策推后**（2026-07-04）：**T3-3（Python SDK）/ T4-4（Java SDK）**——暂无消费方；
 契约单一权威/OpenAPI 校验（G-8/G-9）、结构性文档重构（design 去重指针化、CLAUDE.md 减肥）、

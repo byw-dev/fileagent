@@ -192,3 +192,30 @@ Linux CI 是 bash 5，**跑绿也证明不了任何事**。GitHub 的 macOS runn
 
 **优先级**：🟡 中。不是纯健壮性——`deploy/` 是**唯一一处「改坏了单测和 live e2e 都不会红」的地方**，
 而它恰恰决定新环境能不能起来。**排期**：产品已定在 PR #97 + #98 合并之后开工——**两者均已于 2026-09-11 合并（`13eb730` / `91c1628`），条件已满足，可开工**。
+
+---
+
+## proto 布局规范化（包名 / 目录 / 生成落点对齐）
+
+**来源**：PR #102（D-032，protoc → buf）的实测取舍。**不是缺陷，是布局债**——今天没有任何症状。
+
+**现状**：`proto/v1/agent.proto` 里 `package fileagent.v1`，而文件在 `proto/v1/`；生成物落在 `api/v1/`。
+包名与目录不匹配，因此 `buf.yaml` 长期豁免 `PACKAGE_DIRECTORY_MATCH`。buf 的标准布局要求
+`proto/fileagent/v1/agent.proto`。另因源目录（`proto/`）与产物目录（`api/`）不同，
+`make generate-proto` 需要两行 `mv` 把产物从 scratch 目录搬回 `api/v1/`。
+
+**⚠️ 已实测否决的「省事」改法**（别再试一遍）：把 buf 模块根设成 `proto/`、`out: api`
+确实能一步到位、去掉 `mv`，但代价是 **202 行生成物 diff**——
+`// source:` 从 `proto/v1/agent.proto` 变成 `v1/agent.proto`，
+连带满篇 `file_proto_v1_agent_proto_*` → `file_v1_agent_proto_*` 符号重命名。
+那个 `// source:` **不是注释，是描述符的文件名、protobuf 全局注册表的键**，改它是真实语义变更。
+而且**它并不能消掉 lint 豁免**（实测：包名仍是 `fileagent.v1`、目录仍是 `v1`，照样报
+`must be within a directory "fileagent/v1"`）。**用 2 行 shell 换 202 行 diff + 注册表键变更，纯亏。**
+
+**真正的解**：`proto/fileagent/v1/agent.proto` + `go_package` 指向 `api/fileagent/v1` +
+两个模块的 import path 全改。一次跨模块重构。
+
+**优先级**：🔵 **非常低**。今天零症状，收益只有「少两条 lint 豁免 + 少两行 mv」。
+**触发条件**：等 proto 真的要拆多文件时再做——例如 IC-9 的 `files/register` 契约、
+IC-14 的 lineage。那时布局问题才开始真的疼，跟拆文件一起做才划算。
+**在此之前不要单独为它开刀。**

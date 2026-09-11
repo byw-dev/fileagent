@@ -45,7 +45,7 @@
 **⏸️ WR track（Web UI 重做 WR-2…10）暂停让位**（同 2026-07-10 那次的理由）：WR 是给已能用的页面换皮，
 而 IC 修的是「文件根本传不上去、索引可能永久缺失」。WR-1 地基已合并（PR #66/#67）不受影响；
 恢复方法见 [`webui-redesign-impl.md`](webui-redesign-impl.md)。
-**其余候选（未排期）**：proto→buf 复现性 follow-up。
+**其余候选（未排期）**：proto→buf 复现性 follow-up（✅ 已落地，见 DECISIONS.md D-032）。
 
 ---
 
@@ -66,7 +66,7 @@
 
 **其余候选（未排期）**：
 1. **Web UI 重做实现 WR-2…WR-10**（⏸️ 已暂停，恢复条件与方法见 [`webui-redesign-impl.md`](webui-redesign-impl.md)）。
-2. 可选 **proto→buf** 复现性 follow-up。
+2. ~~可选 **proto→buf** 复现性 follow-up~~ ✅ 已落地（DECISIONS.md D-032）。
 
 > **CC-3 已推后**（低价值）：`tmp-uploads` 全代码库未接入（agent 直传目标 bucket，无 staging/ETL），
 > bucket policy 对本系统冗余（MinIO 默认私有，访问全走 STS/presigned IAM）。待有 staging workflow 再做。

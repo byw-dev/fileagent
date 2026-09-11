@@ -1598,3 +1598,76 @@ JetStream 处于闲置状态。
 - **立即切换（放进止血阶段）**：见上「排期与理由」。
 - **双通道并行（webhook + JetStream 同时开）**：两条路径写同一张表，在 `observed_at` 排序键
   （地基阶段 IC-6）落地前会互相覆盖；且加倍了鉴权与运维面。切换应是一次性替换。
+
+---
+
+## D-032：proto 生成链钉定——protoc → buf（tools/ 钉版本 + local 插件）
+
+**决策日期**：2026-09-11
+**影响范围**：`tools/go.mod`、`buf.yaml`、`buf.gen.yaml`、`Makefile`（`generate-proto`）、
+`.github/workflows/ci-proto.yml`、`.gitignore`、`api/v1/*.pb.go`（仅生成器署名行）、文档
+（CLAUDE.md、docs/tasks/active.md）
+**关联**：CLAUDE.md「契约文件」表（`proto/v1/agent.proto`）、`docs/tasks/active.md`
+（原「proto→buf 复现性 follow-up」候选，本条结案）
+
+### 背景：protoc-gen-go 版本是云端环境的隐式残留
+
+`api/v1/agent.pb.go` 文件头写着 `protoc-gen-go v1.36.10 / protoc v7.36.1`——这个版本是早期在
+GitHub Copilot 云端 agent 环境里生成时那个固定环境的隐式残留。仓库里**没有任何东西钉住它**：
+没有 proto 的 make target，`protoc-gen-go` / `protoc-gen-go-grpc` 在本机根本没装。也就是说
+任何人重新生成一次，输出就可能和仓库里的不一致，而且没有任何 CI 检查能发现。
+
+### 决策
+
+proto 生成链全面钉定，机制照抄 sqlc 的现成模式（`tools/` 钉版本 + `make generate-*` + CI drift guard）：
+
+1. **工具钉在 `tools/go.mod`**：`tool` 指令钉 `buf`、`protoc-gen-go`、`protoc-gen-go-grpc`，
+   经 `make generate-proto` 运行，挂入 `make generate`。
+2. **用 buf 取代 protoc**：buf 自带编译器（纯 Go），完全不需要系统 protoc。
+3. **`buf.gen.yaml` 的插件必须 `local:`，严禁 `remote:`**（理由见下 2）。
+4. **CI 单起 `ci-proto.yml`**：drift guard（`make generate-proto` 后 `git status --porcelain`
+   非空即失败）+ `buf lint` + **`buf breaking`（对 master 比对）**。
+
+### 理由
+
+1. **为什么不钉 protoc 而改用 buf**：protoc 是 C++ 二进制，各平台各一个包（brew/apt 各自的版本），
+   无法放进 `tools/go.mod` 这类纯 Go 的钉定机制——正是「跨平台不可钉」的根源。
+   buf 自带编译器、纯 Go，可以像 sqlc 一样进 tools/go.mod 的 tool 指令。
+2. **为什么禁止 remote 插件**：`remote: buf.build/...` 的插件版本来自 buf 远程注册中心，
+   输入不变也会随注册中心漂移——正是本刀要消灭的东西，用了等于白做。`local:` 插件由
+   tools/go.mod 钉定的源码构建，任何平台逐字节一致。
+3. **版本对齐有一个 Go 工具链的现实约束**：Go 的 tool 指令没有独立版本钉定，工具版本走模块图
+   MVS。buf v1.72 与 protoc-gen-go-grpc v1.6.2 都要求 `google.golang.org/protobuf` ≥ v1.36.11，
+   而 protoc-gen-go 报告的版本号来自该模块源码常量（模块 v1.36.11 → 署名 v1.36.11）。
+   因此 tools/go.mod 用 `replace google.golang.org/protobuf => google.golang.org/protobuf v1.36.10`
+   把模块钉回，protoc-gen-go 署名才与现有生成物一致（v1.36.10）。protoc-gen-go-grpc 钉 v1.6.2、
+   buf 钉 v1.72.0，均与生成/运行实测一致。
+4. **顺带获得契约守卫**：CLAUDE.md 给 `proto/v1/agent.proto` 定的规矩「只增字段，不改字段编号，
+   不删除字段」此前完全靠人自觉。`buf breaking`（ci-proto.yml，对 master 比对）把它变成机器强制
+   （已实测：把 `Heartbeat.uptime_seconds` 的编号从 2 改成 7，buf breaking 以
+   「field "2" was deleted」报错退出）。
+5. **lint 豁免记录**（既有事实，不能改 proto）：`PACKAGE_DIRECTORY_MATCH`（文件在 `proto/v1/`，
+   包名 `fileagent.v1`，移文件会改生成物署名与落点）、`RPC_REQUEST_STANDARD_NAME` /
+   `RPC_RESPONSE_STANDARD_NAME`（Connect 流的消息名 `AgentMessage` / `ServerMessage`，改名即改契约）。
+
+### 一次性 diff 的性质
+
+buf 不模拟 protoc 版本，重新生成的 diff **只有生成物头部两行 protoc 署名**
+（`protoc v7.36.1` → `protoc (unknown)`、`protoc v3.21.12` → `protoc (unknown)`），
+语义零变更。protoc-gen-go / protoc-gen-go-grpc 版本行与现有一致（v1.36.10 / v1.6.2），不产生 diff。
+验证：生成前后 diff 仅此两行；controlplane 与 agent 两模块 `go build ./...` + `go test ./...` 全绿。
+
+### 否决了什么
+
+- **钉 protoc 本身**：C++ 二进制，跨平台不可钉（理由 1）。
+- **buf remote 插件**：版本来自注册中心会漂移，破坏复现性（理由 2）。
+- **维持现状**：protoc-gen-go 版本是云端环境残留，重新生成不可复现且无人能发现——现状即缺陷。
+
+### 影响
+
+- 重新生成不再依赖任何本机安装（protoc / protoc-gen-go / protoc-gen-go-grpc 都不需要装）。
+- `ci-proto.yml` 的 drift guard 同时是**跨平台一致性证明**：本地 macOS 生成并提交的产物，
+  CI ubuntu 上 `make generate-proto` 后 `git status --porcelain` 必须为空（逐字节一致才有）。
+- proto 契约的破坏性变更从「口头约定」变为「机器强制」。
+- tools/go.mod 里 grpc / genproto 等依赖因 buf 的依赖被 MVS 抬升（patch 级），sqlc 输出
+  不受影响——`ci-cp.yml` 的 sqlc drift guard 绿为证。
