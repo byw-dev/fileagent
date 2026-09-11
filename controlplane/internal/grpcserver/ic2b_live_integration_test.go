@@ -105,9 +105,9 @@ func TestIC2BLive(t *testing.T) {
 			out, e := exec.Command("sqlite3", filepath.Join(dataDir, "queue.db"),
 				"SELECT count(*) FROM rules;").Output()
 			return e == nil && strings.TrimSpace(string(out)) == fmt.Sprint(want)
-		// 90s: the agent's first approval poll fires only 30s after start
-		// (registration.go polls with a 30s interval), so connect + sync can
-		// legitimately take >30s of wall clock.
+			// 90s: the agent's first approval poll fires only 30s after start
+			// (registration.go polls with a 30s interval), so connect + sync can
+			// legitimately take >30s of wall clock.
 		}, 90*time.Second, 500*time.Millisecond, "agent must have applied %d rules", want)
 	}
 
