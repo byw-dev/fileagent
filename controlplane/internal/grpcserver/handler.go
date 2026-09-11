@@ -128,6 +128,23 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		}
 	}()
 
+	// Push an initial STS session BEFORE the rule sync (IC-BUG-1), and the
+	// rule sync before anything else can act on it.
+	//
+	// The order is load-bearing: with the send goroutine started first
+	// (IC-BUG-31), whatever is enqueued reaches the agent immediately. If the
+	// rule snapshot went first, the agent starts its watchers right away and
+	// IC-5's initial scan submits uploads for existing files — while
+	// pushCredentials is still mid-flight (it contains a live MinIO
+	// AssumeRole round-trip), so those uploads fail with "no upload
+	// credentials available yet", hit the executor's 1-minute backoff, and
+	// the file is delayed by a full retry cycle. That broke
+	// TestUploadMainPathLive on this branch (green on master) — PR #103
+	// review F5. Credentials carry no dependency on the sync (bucketsForAgent
+	// reads the DB directly), so pushing them first is always safe; an agent
+	// with credentials but no rules simply does nothing until rules arrive.
+	s.pushCredentials(ctx, agentID)
+
 	// Sync all rules — active and inactive — and finish with the rule full-set
 	// message (IC-BUG-30 / D-033). A sync failure must end the stream: the
 	// full-set message is the entire delete half of the fix, and an agent that
@@ -140,9 +157,6 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 			return status.Error(codes.Internal, "rule sync incomplete; the agent must reconnect and re-sync")
 		}
 	}
-
-	// Push an initial STS session so the agent can upload immediately (IC-BUG-1).
-	s.pushCredentials(ctx, agentID)
 
 	// Receive loop.
 	//

@@ -13,6 +13,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -620,4 +621,97 @@ func TestServer_Connect_SendConsumerRunsBeforeSync(t *testing.T) {
 	assert.Len(t, rules, total,
 		"every message enqueued during the sync must be delivered — which requires the send consumer to run before the sync")
 	assert.True(t, gotCreds)
+}
+
+// ── F5（IC-2b review 二轮）：凭据必须先于规则到达 ──────────────────────────────
+//
+// ④ 把发送 goroutine 提前后，快照立即送达而 pushCredentials（内含一次 MinIO
+// AssumeRole 往返）随后才发——agent 收到规则即启动 watcher，IC-5 的初始扫描
+// 立刻发现既有文件并尝试上传，此时凭据未到 → 任务失败 → 吃掉 1 分钟退避，
+// TestUploadMainPathLive 因此在 PR #103 上红（master 绿）。修法：凭据先于规则。
+// 本用例钉住消息序：Credentials 必须先于任何 RulesSync 到达。
+
+// singleSnapshotDispatcher mimics SyncRulesOnConnect: exactly one snapshot.
+type singleSnapshotDispatcher struct {
+	registry *AgentRegistry
+}
+
+func (d *singleSnapshotDispatcher) SyncRulesOnConnect(_ context.Context, agentID string) error {
+	d.registry.Send(agentID, &agentv1.ServerMessage{
+		Payload: &agentv1.ServerMessage_RulesSync{
+			RulesSync: &agentv1.RulesSyncCommand{Rules: []*agentv1.CollectionRule{
+				{RuleId: "r1"},
+			}},
+		},
+	})
+	return nil
+}
+
+// The agent cannot act on rules without credentials (IC-5's initial scan
+// uploads the moment a rule arrives), so the credentials push must be
+// enqueued BEFORE the rule snapshot. The channel is FIFO, so the payload
+// order the client observes is the enqueue order.
+func TestServer_Connect_CredentialsDeliveredBeforeRuleSync(t *testing.T) {
+	agentID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	mr, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(mr.Close)
+	redisClient, err := cache.New("redis://"+mr.Addr(), zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = redisClient.Close() })
+
+	jwtSvc := auth.New("test-secret-32-bytes-padded!!!!", redisClient)
+	token, err := jwtSvc.GenerateAccessToken(agentID, "org-1", "agent", agentID, time.Hour)
+	require.NoError(t, err)
+
+	logger, _ := zap.NewDevelopment()
+	registry := NewAgentRegistry()
+	srv := New(logger)
+	srv.WithDeps(registry, newMockCache(), jwtSvc, &mockNATS{}, nil)
+	srv.WithExtraDeps(&singleSnapshotDispatcher{registry: registry}, nil,
+		&mockSTSMgr{creds: &agentv1.CredentialsPayload{AccessKey: "AKID"}},
+		&mockCredDB{
+			bucket: &db.Bucket{Name: "data-sensor"},
+			rules: []*db.CollectionRule{
+				{ID: uuid.New(), AgentID: uuid.MustParse(agentID), Status: db.RuleStatusActive},
+			},
+		})
+	srv.WithStateDB(&mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := srv.GRPCServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	client := agentv1.NewAgentServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token))
+	require.NoError(t, err)
+
+	gotCreds, gotSync := false, false
+	var credFirst bool
+	for !(gotCreds && gotSync) {
+		msg, rErr := stream.Recv()
+		require.NoError(t, rErr)
+		switch msg.GetPayload().(type) {
+		case *agentv1.ServerMessage_Credentials:
+			gotCreds = true
+			credFirst = !gotSync
+		case *agentv1.ServerMessage_RulesSync:
+			gotSync = true
+		}
+	}
+	assert.True(t, credFirst,
+		"credentials must reach the agent before the rule snapshot — a rule arriving first "+
+			"starts the watcher and IC-5's initial scan uploads with no credentials (review F5)")
 }
