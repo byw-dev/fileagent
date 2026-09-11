@@ -585,3 +585,82 @@ func TestSyncRulesOnConnect_OversizedSnapshot_DegradesWithoutDisconnect(t *testi
 	assert.Contains(t, entries[0].Message, "oversized")
 	assert.Contains(t, entries[0].Context, zap.String("agent_id", agentID.String()))
 }
+
+// ── R2（IC-2b review 三轮）：serialisation 条目必须可回收 ──────────────────────
+
+// 断开（retire）后条目被回收：长期运行的 CP 不得随「历史上出现过的 agent 数」
+// 单调增长（慢泄漏）。
+func TestAgentLocks_RetireReclaimsEntry(t *testing.T) {
+	var locks agentLocks
+	id := uuid.NewString()
+	e := locks.acquire(id)
+	locks.release(id, e)
+	locks.retire(id)
+
+	locks.mu.Lock()
+	_, exists := locks.entries[id]
+	locks.mu.Unlock()
+	assert.False(t, exists, "an idle retired entry must be reclaimed")
+}
+
+// 有持有者时 retire 只标记不回收；最后一个持有者离开时才删——
+// 在持锁者仍在使用时删除条目会为同一 agent 留下两个活跃锁，重新打开 F1 竞态。
+func TestAgentLocks_RetireWhileHeld_DeferredToLastUser(t *testing.T) {
+	var locks agentLocks
+	id := uuid.NewString()
+	e := locks.acquire(id)
+	e.mu.Lock()
+	locks.retire(id)
+
+	locks.mu.Lock()
+	_, exists := locks.entries[id]
+	locks.mu.Unlock()
+	assert.True(t, exists, "an in-use entry must not be reclaimed under its holder")
+
+	e.mu.Unlock()
+	locks.release(id, e)
+
+	locks.mu.Lock()
+	_, exists = locks.entries[id]
+	locks.mu.Unlock()
+	assert.False(t, exists, "the last in-flight user must reclaim the retired entry")
+}
+
+// agentLocks.get is a test helper returning the current entry.
+func (l *agentLocks) get(id string) *agentLockEntry {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.entries[id]
+}
+
+// retire 之后新 acquire 创建全新条目：旧持有者残留的 release 不得误删新条目
+// （指针比对语义）。
+func TestAgentLocks_RetireThenNewAcquire_StaleReleaseKeepsFreshEntry(t *testing.T) {
+	var locks agentLocks
+	id := uuid.NewString()
+	old := locks.acquire(id)
+	locks.retire(id) // idle → 已回收
+	fresh := locks.acquire(id)
+	require.NotSame(t, old, fresh)
+	locks.release(id, old) // 旧持有者迟到
+
+	locks.mu.Lock()
+	_, exists := locks.entries[id]
+	locks.mu.Unlock()
+	assert.True(t, exists, "a stale release must not delete the fresh entry")
+	assert.Same(t, fresh, locks.get(id))
+}
+
+// ReleaseAgent（Dispatcher 上的公共入口）接通 retire 路径。
+func TestDispatcher_ReleaseAgent_ReclaimsEntry(t *testing.T) {
+	d, _, _, _ := newTestDispatcher(t)
+	agentID := uuid.NewString()
+	e := d.agentSerialisation(agentID)
+	d.agentLocks.release(agentID, e)
+	d.ReleaseAgent(agentID)
+
+	d.agentLocks.mu.Lock()
+	_, exists := d.agentLocks.entries[agentID]
+	d.agentLocks.mu.Unlock()
+	assert.False(t, exists)
+}

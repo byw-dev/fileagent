@@ -56,20 +56,97 @@ type Dispatcher struct {
 
 	pusher CredentialPusher
 
-	// agentMu serialises a single agent's rule traffic: building + sending the
-	// full snapshot (which spans several DB round-trips) must not interleave
-	// with incremental DispatchRule / DispatchRuleCancel sends, or a rule
-	// created while the snapshot is in flight gets pushed incrementally and
-	// then stopped by the older snapshot's absence (review F1). Per agent —
-	// never global: agents are independent and a global lock would serialise
-	// all dispatch traffic behind one slow sync.
-	agentMu sync.Map // agentID string -> *sync.Mutex
+	// agentLocks serialises a single agent's rule traffic: building + sending
+	// the full snapshot (which spans several DB round-trips) must not
+	// interleave with incremental DispatchRule / DispatchRuleCancel sends, or
+	// a rule created while the snapshot is in flight gets pushed incrementally
+	// and then stopped by the older snapshot's absence (review F1). Per
+	// agent — never global: agents are independent and a global lock would
+	// serialise all dispatch traffic behind one slow sync.
+	//
+	// Entries are reclaimed when the agent's connection is torn down
+	// (ReleaseAgent, called from Connect's defer) — review R2: keyed by
+	// agentID and never removed, the map grows with every agent ever seen,
+	// a slow leak on a long-lived CP.
+	agentLocks agentLocks
 }
 
-// agentLock returns the per-agent dispatch mutex, creating it on first use.
-func (d *Dispatcher) agentLock(agentID string) *sync.Mutex {
-	m, _ := d.agentMu.LoadOrStore(agentID, &sync.Mutex{})
-	return m.(*sync.Mutex)
+// agentLockEntry is one agent's dispatch serialisation lock plus the
+// bookkeeping that lets it be reclaimed safely: a lock may be deleted only
+// once the agent is gone AND no goroutine is using (or about to use) it —
+// deleting under a holder would leave two live entries for one agent and
+// reopen the F1 race across a reconnect.
+type agentLockEntry struct {
+	mu    sync.Mutex
+	users int  // goroutines currently using (or about to use) mu
+	dead  bool // the agent disconnected; eligible for removal once idle
+}
+
+// agentLocks owns the per-agent serialisation entries.
+type agentLocks struct {
+	mu      sync.Mutex
+	entries map[string]*agentLockEntry
+}
+
+// acquire returns the entry for agentID, creating it on first use, and marks
+// it in use so a concurrent retire cannot reclaim it while the caller is
+// still heading for e.mu. A retired entry is replaced, never reused: its
+// in-flight holders still release against their own pointer (a no-op once
+// replaced), and reusing it would weld a reconnecting agent's traffic to a
+// cohort that is being phased out.
+func (l *agentLocks) acquire(agentID string) *agentLockEntry {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.entries == nil {
+		l.entries = make(map[string]*agentLockEntry)
+	}
+	e := l.entries[agentID]
+	if e == nil || e.dead {
+		e = &agentLockEntry{}
+		l.entries[agentID] = e
+	}
+	e.users++
+	return e
+}
+
+// release marks the entry no longer in use and reclaims it if the agent is
+// gone. The pointer comparison matters: a fresh entry may already have been
+// created for a reconnecting agent, and the stale holder must not delete it.
+func (l *agentLocks) release(agentID string, e *agentLockEntry) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e.users--
+	if e.dead && e.users == 0 && l.entries[agentID] == e {
+		delete(l.entries, agentID)
+	}
+}
+
+// retire marks the agent gone; the entry is removed immediately when idle, or
+// by the last in-flight user otherwise (review R2).
+func (l *agentLocks) retire(agentID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if e := l.entries[agentID]; e != nil {
+		e.dead = true
+		if e.users == 0 {
+			delete(l.entries, agentID)
+		}
+	}
+}
+
+// ReleaseAgent reclaims the per-agent dispatch serialisation entry. Called
+// when the agent's connection is torn down (grpcserver Connect's deferred
+// cleanup), so a long-lived CP does not accumulate one mutex per agent ever
+// seen (review R2).
+func (d *Dispatcher) ReleaseAgent(agentID string) {
+	d.agentLocks.retire(agentID)
+}
+
+// agentSerialisation returns the entry to hold around rule-bearing sends for
+// agentID. The caller must pair e.mu.Lock/Unlock with a deferred
+// agentLocks.release.
+func (d *Dispatcher) agentSerialisation(agentID string) *agentLockEntry {
+	return d.agentLocks.acquire(agentID)
 }
 
 // SetCredentialPusher wires the callback used to re-push STS credentials when
@@ -131,15 +208,17 @@ func (d *Dispatcher) DispatchRule(ctx context.Context, rule *db.CollectionRule) 
 	// land strictly before or after the snapshot's build+send window, never
 	// inside it — a push landing inside an older snapshot's window would be
 	// stopped by that snapshot's absence semantics.
-	mu := d.agentLock(agentID)
-	mu.Lock()
+	e := d.agentSerialisation(agentID)
+	e.mu.Lock()
 	if !d.registry.Send(agentID, msg) {
-		mu.Unlock()
+		e.mu.Unlock()
+		d.agentLocks.release(agentID, e)
 		d.logger.Warn("dispatch_rule: failed to send to agent", zap.String("agent_id", agentID))
 		return fmt.Errorf("dispatch_rule: failed to send rule %s to agent %s: channel full or disconnected",
 			rule.ID, agentID)
 	}
-	mu.Unlock()
+	e.mu.Unlock()
+	d.agentLocks.release(agentID, e)
 
 	// IC-BUG-20: credentials are minted for the bucket set of the agent's
 	// active rules at issue time. If this rule points at a bucket no other
@@ -197,12 +276,13 @@ func (d *Dispatcher) DispatchRuleCancel(ctx context.Context, ruleID, agentID str
 	}
 	// Serialize against snapshot sync (review F1): a cancel landing inside the
 	// snapshot's window could be undone by the snapshot re-pushing the rule.
-	mu := d.agentLock(agentID)
-	mu.Lock()
-	defer mu.Unlock()
+	e := d.agentSerialisation(agentID)
+	e.mu.Lock()
 	if !d.registry.Send(agentID, msg) {
 		d.logger.Warn("dispatch_rule_cancel: failed to send", zap.String("agent_id", agentID))
 	}
+	e.mu.Unlock()
+	d.agentLocks.release(agentID, e)
 	return nil
 }
 
@@ -261,19 +341,33 @@ func (d *Dispatcher) SyncRulesOnConnect(ctx context.Context, agentID string) err
 	// arrives, or the snapshot's absence semantics would permanently stop a
 	// rule that still exists. The lock spans the DB round-trips — bounded by
 	// the rule list size, and only for this one agent.
-	mu := d.agentLock(agentID)
-	mu.Lock()
-	defer mu.Unlock()
+	e := d.agentSerialisation(agentID)
+	e.mu.Lock()
+	defer func() {
+		e.mu.Unlock()
+		d.agentLocks.release(agentID, e)
+	}()
 	rules, err := d.db.ListCollectionRulesByAgent(ctx, parsed)
 	if err != nil {
 		return fmt.Errorf("sync_rules: list rules: %w", err)
 	}
 
 	snapshot := make([]*agentv1.CollectionRule, 0, len(rules))
+	// Bucket names are memoised per distinct bucket: rules overwhelmingly
+	// share a handful of buckets, so the N+1 lookups inside the held
+	// serialisation window collapse to distinctBuckets+1 (review R2-2). A
+	// true batched query is a candidate follow-up card; this keeps the lock
+	// hold short without schema or interface changes.
+	names := make(map[uuid.UUID]string, len(rules))
 	for _, rule := range rules {
-		bucketName, err := d.lookupBucketName(ctx, rule.BucketID)
-		if err != nil {
-			return fmt.Errorf("sync_rules: lookup bucket for rule %s: %w", rule.ID, err)
+		bucketName, ok := names[rule.BucketID]
+		if !ok {
+			var err error
+			bucketName, err = d.lookupBucketName(ctx, rule.BucketID)
+			if err != nil {
+				return fmt.Errorf("sync_rules: lookup bucket for rule %s: %w", rule.ID, err)
+			}
+			names[rule.BucketID] = bucketName
 		}
 		snapshot = append(snapshot, ruleToProto(rule, bucketName))
 	}

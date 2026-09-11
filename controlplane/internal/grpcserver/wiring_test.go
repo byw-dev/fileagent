@@ -30,6 +30,9 @@ func (m *mockDispatcher) SyncRulesOnConnect(_ context.Context, agentID string) e
 	return m.err
 }
 
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (m *mockDispatcher) ReleaseAgent(_ string) {}
+
 // ── Mock IndexerClient ────────────────────────────────────────────────────────
 
 type mockIndexer struct {

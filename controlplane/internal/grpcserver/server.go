@@ -38,9 +38,14 @@ type AgentManager interface {
 	PollApproval(ctx context.Context, req *agentv1.PollApprovalRequest) (*agentv1.PollApprovalResponse, error)
 }
 
-// DispatcherClient is the interface used by Connect to sync rules on reconnect.
+// DispatcherClient is the interface used by Connect to sync rules on
+// reconnect. ReleaseAgent is part of the same lifecycle: when the deferred
+// cleanup of Connect runs, the dispatcher reclaims the per-agent rule-sync
+// serialisation entry, so a long-lived process does not accumulate one entry
+// per agent ever seen (IC-2b review R2).
 type DispatcherClient interface {
 	SyncRulesOnConnect(ctx context.Context, agentID string) error
+	ReleaseAgent(agentID string)
 }
 
 // IndexerClient is the interface used by handleUploadResult.
@@ -107,19 +112,19 @@ type Server struct {
 	// the proto does not break compilation.
 	agentv1.UnimplementedAgentServiceServer
 
-	logger        *zap.Logger
-	registry      *AgentRegistry
-	cache         CacheClient
-	jwtSvc        auth.Service
-	nats          NATSPublisher
-	agentMgr      AgentManager
-	dispatcher    DispatcherClient
-	indexer       IndexerClient
-	stsMgr        STSManagerClient
-	credDB        CredentialDB
-	stateDB       AgentStateDB
-	dirResultStore  DirResultDeliverer
-	dryRunStore     DryRunResultDeliverer
+	logger         *zap.Logger
+	registry       *AgentRegistry
+	cache          CacheClient
+	jwtSvc         auth.Service
+	nats           NATSPublisher
+	agentMgr       AgentManager
+	dispatcher     DispatcherClient
+	indexer        IndexerClient
+	stsMgr         STSManagerClient
+	credDB         CredentialDB
+	stateDB        AgentStateDB
+	dirResultStore DirResultDeliverer
+	dryRunStore    DryRunResultDeliverer
 }
 
 // New creates a new gRPC Server with the provided logger. Additional

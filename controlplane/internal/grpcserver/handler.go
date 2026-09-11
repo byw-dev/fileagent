@@ -66,6 +66,13 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		if !s.registry.Unregister(conn) {
 			return
 		}
+		// The agent is gone: reclaim its dispatch serialisation entry so the
+		// dispatcher's map does not grow with every agent ever seen (review
+		// R2). Safe across reconnects — the reclaim only retires the entry;
+		// in-flight holders finish, and a reconnecting agent gets a fresh one.
+		if s.dispatcher != nil {
+			s.dispatcher.ReleaseAgent(agentID)
+		}
 		if s.cache != nil {
 			_ = s.cache.Del(context.Background(), cache.AgentOnlineKey(agentID))
 		}

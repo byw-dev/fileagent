@@ -433,6 +433,9 @@ func (d *bulkSyncDispatcher) SyncRulesOnConnect(_ context.Context, agentID strin
 	return nil
 }
 
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (d *bulkSyncDispatcher) ReleaseAgent(_ string) {}
+
 // 40 active rules must ALL reach the agent, and the credentials push behind
 // them must arrive. 40 > 32 is deliberate — it is exactly the count that
 // structurally dropped 8 rules and the credentials under the old per-message
@@ -556,6 +559,9 @@ func (d *consumerPinningDispatcher) SyncRulesOnConnect(ctx context.Context, agen
 	return nil
 }
 
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (d *consumerPinningDispatcher) ReleaseAgent(_ string) {}
+
 // The send goroutine must be RUNNING before SyncRulesOnConnect is invoked:
 // the dispatcher is only able to deliver past the buffer capacity if a
 // consumer is actively draining. This is a structural guarantee, not a timing
@@ -646,6 +652,9 @@ func (d *singleSnapshotDispatcher) SyncRulesOnConnect(_ context.Context, agentID
 	})
 	return nil
 }
+
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (d *singleSnapshotDispatcher) ReleaseAgent(_ string) {}
 
 // The agent cannot act on rules without credentials (IC-5's initial scan
 // uploads the moment a rule arrives), so the credentials push must be

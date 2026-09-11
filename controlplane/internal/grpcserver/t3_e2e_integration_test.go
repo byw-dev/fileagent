@@ -104,6 +104,9 @@ func (d *integrationTestMockDispatcher) SyncRulesOnConnect(_ context.Context, ag
 	return nil
 }
 
+// ReleaseAgent is part of DispatcherClient; the mock holds no per-agent state.
+func (d *integrationTestMockDispatcher) ReleaseAgent(_ string) {}
+
 type integrationTestMockIndexer struct {
 	mu      sync.Mutex
 	uploads []*agentv1.UploadResult
