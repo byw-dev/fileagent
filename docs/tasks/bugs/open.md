@@ -566,6 +566,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 把默认值改成 ≤20 字符（如 `cpAdmin000000000000`），并在脚本里对长度做前置校验 + 明确报错；同步更新 `init-minio.sh:17` 的注释与部署文档里的示例值。**不存在 `deploy/config/controlplane.env.example`**（`deploy/config/` 整个被 gitignore），仓库里仅 `init-minio.sh:17` 与 `:33` 两处出现该值。**注意这会改变已部署环境的凭据**，需在变更说明里写清 |
 | **验收** | 干净的 MinIO 容器上从头跑一遍 `init-minio.sh` 全程 exit 0；CP 用脚本产出的凭据能成功签发预签名下载 URL 并取回对象 |
 | **归属** | 未排期。与 IC 主线正交（不影响写入准入/一致性），但**挡着任何人复现 live 验收**，宜与 IC-4（同样要动 `init-minio.sh`）合并处理 |
+| **✅ 已修（PR #97，2026-09-11）** | 与 IC-BUG-36 同刀修掉：默认值改为 19 字符，并加了 access(3–20)/secret(8–40) 的**前置**长度校验（在任何集群变更之前退出） |
+| **⚠️ 关闭时必须带上的限定** | **「20 字符上限」只对 service account 成立。** 2026-09-11 实测（同镜像）：`mc admin user add` 收下 21 字符 access key 并能正常 `AssumeRole` + 预签名 GET；`mc admin user svcacct add` 才报 `access key length should be between 3 and 20`。**改用真实 IAM 用户之后，本条的根因描述已不再适用**——脚本保留 3–20 校验是**主动收敛到两种账号形态的公共窗口**（便于互换），不是 MinIO 的要求。若将来有人拿「MinIO 限制 20 字符」当依据做别的决定，那是从这张卡片误读出去的 |
 
 ---
 

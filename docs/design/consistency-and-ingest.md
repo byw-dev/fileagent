@@ -253,6 +253,16 @@ file_entries(..., observed_at, source, grant_id, run_id, ...);
 > 因此 **IC-2a 的第一步（⓪）是把它落成仓库里的真迁移 + 真 upsert + 表驱动测试（含变异开关）**，
 > 此后**本节只表达意图与不变式，SQL 文本以代码为准**（CLAUDE.md：代码是最终真相）。
 > 下面的 SQL 是 PoC 的输入，不是权威。
+>
+> **✅ 已落地（2026-09-11，PR #98）。权威在这三处，改守卫改那里，不要改这一节的 SQL**：
+> - 迁移：`controlplane/migrations/000006_index_observation.up.sql`
+> - 查询：`controlplane/internal/db/queries/ingest.sql`（改完跑 `make generate`）
+> - 回归：`controlplane/internal/db/ingest_integration_test.go` 的 `TestObservationMutationMatrix`
+>   —— 六项基线 + 七种变异开关，**每种变异都会被它声称防的那条用例杀掉**。跑法：
+>   `TEST_DATABASE_URL=postgres://fileagent:fileagent@localhost:5432/fileagent_test?sslmode=disable go test ./controlplane/internal/db/ -tags=integration -run TestObservationMutationMatrix -v`
+>
+> **软删除走的是另一条语句**（`MarkObservedFileDeleted`），它同样带守卫**并推进 `observed_at`/`event_seq`——
+> 只加 WHERE 不推进这两列，会让已删除的行被任一次 create 事件重投复活。改一条就要想另一条。
 
 **排序与因果：三个字段各司其职（2026-09-10 定案，多次修订后定稿）**——最初的错误是让一个字段兼两职。
 

@@ -22,7 +22,7 @@
 - **设计**：[`docs/design/consistency-and-ingest.md`](../design/consistency-and-ingest.md)
 - **决策**：[`DECISIONS.md`](../../DECISIONS.md) **D-030**（不换存储层；STS grant + 注册 outbox + 分片对账）、
   **D-031**（MinIO 事件传输 webhook → NATS JetStream，排期对账阶段 IC-11）
-- **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-38（30…32 来自 2026-09-10 的 M-2 类扫描，33/34 来自同日评审，35 来自 IC-2c 的 live 验收，36 是 IC-2a 开工时挡路的那条，37/38 来自 IC-2a 的 live 验收）。**分诊结论见 [`consistency-ingest.md`](consistency-ingest.md) 「分诊结论」一节**。2026-09-11 随 IC-2a 关闭 **2/8/28/29/33**（另 12/13/31 各关掉一半），随 PR #97 关闭 **35/36**
+- **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-41（30…32 来自 2026-09-10 的 M-2 类扫描，33/34 来自同日评审，35 来自 IC-2c 的 live 验收，36 是 IC-2a 开工时挡路的那条，37/38 来自 IC-2a 的 live 验收，**39…41 来自 PR #97 的 code review**）。**41 条中已关闭 18 条**：随 IC-2a 关闭 **2/8/28/29/33**（另 12/13/31 各关掉一半），随 PR #97 关闭 **35/36**。**未关闭 23 条：9 条挡、11 条可推、3 条拆半**——**判据已于 2026-09-11 重判**（「挡」的含义从「挡着能不能跑通」变成「挡着能不能扛住故障」），详见 [`consistency-ingest.md`](consistency-ingest.md) 「分诊结论」一节，**不要沿用旧口径的可推/挡**
 
 **顺序**：IC-0 文档基线 ✅ → 止血 IC-1 ✅ → **IC-2c** ✅（硬前置，PR #96）→ **IC-2a** ✅（PR #98；前置 PR #97 修 IC-BUG-36/35）→ **下一刀在 IC-2b / IC-3 / IC-4 / IC-5 / IC-SEC-2 之间选（可并行）**
 → 地基 IC-6/7 → 准入 IC-8…10 → 对账 IC-11…13 → 血缘 IC-14。
