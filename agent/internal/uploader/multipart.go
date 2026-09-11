@@ -3,6 +3,7 @@ package uploader
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -33,6 +34,15 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 				zap.String("task_id", task.ID), zap.Error(err))
 			uploadID = ""
 			doneParts = nil
+		} else if skipped := len(doneParts); skipped > 0 {
+			// The acceptance evidence for IC-BUG-5 lives in this line: a resume
+			// must be visible in the log together with how many parts were
+			// skipped, and the upload ID must be the one recorded before the
+			// interruption — not a freshly initiated one.
+			u.logger.Info("uploader: resuming multipart upload from remote state",
+				zap.String("task_id", task.ID),
+				zap.String("upload_id", uploadID),
+				zap.Int("skipped_parts", skipped))
 		}
 	}
 
@@ -43,6 +53,15 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 			return nil, fmt.Errorf("uploader: initiate multipart upload: %w", err)
 		}
 		task.UploadID = uploadID
+		// Persist the initiated upload ID immediately: a crash between this
+		// and the first completed part must still leave a resumable upload ID
+		// behind, not an orphan with no local trace.
+		if u.queue != nil {
+			if err := u.queue.SaveMultipartProgress(ctx, task.ID, task.UploadID, ""); err != nil && !errors.Is(err, queue.ErrTaskNotFound) {
+				u.logger.Warn("uploader: persist multipart initiation",
+					zap.String("task_id", task.ID), zap.Error(err))
+			}
+		}
 	}
 
 	doneSet := make(map[int]struct{}, len(doneParts))
@@ -84,6 +103,15 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 		if u.queue != nil {
 			raw, _ := json.Marshal(completedParts{Parts: doneParts})
 			task.CompletedParts = string(raw)
+			// IC-BUG-5: writing task.CompletedParts alone only mutates memory.
+			// Every completed part is flushed to SQLite here so a retry or a
+			// process restart rescans the real progress instead of empty
+			// values and restarts from part 1.
+			if err := u.queue.SaveMultipartProgress(ctx, task.ID, task.UploadID, task.CompletedParts); err != nil && !errors.Is(err, queue.ErrTaskNotFound) {
+				u.logger.Warn("uploader: persist multipart progress",
+					zap.String("task_id", task.ID),
+					zap.Int("part_number", partNum), zap.Error(err))
+			}
 		}
 	}
 

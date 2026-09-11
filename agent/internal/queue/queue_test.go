@@ -813,3 +813,49 @@ func TestDeleteOldestEvictable_ExcludedIsOnlyCandidate(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, dropped)
 }
+
+func TestSaveMultipartProgress_PersistsBothColumns(t *testing.T) {
+	q := openMemQueue(t)
+
+	require.NoError(t, q.Enqueue(taskAt("mp-1", 1)))
+
+	// Simulate per-part progress: initiate then two completed parts, as the
+	// uploader calls it (IC-BUG-5).
+	require.NoError(t, q.SaveMultipartProgress(context.Background(), "mp-1", "upload-abc", ""))
+	require.NoError(t, q.SaveMultipartProgress(context.Background(), "mp-1", "upload-abc", `{"parts":[{"PartNumber":1,"ETag":"e1"}]}`))
+
+	tasks, err := q.ListByStatus(StatusPending)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, "upload-abc", tasks[0].UploadID)
+	assert.Contains(t, tasks[0].CompletedParts, "PartNumber")
+
+	// The reset path must keep the resume state so the task can continue
+	// rather than restart (IC-3 / IC-BUG-34 synergy).
+	require.NoError(t, q.UpdateStatus("mp-1", StatusRunning))
+	reset, err := q.ResetRunningToPending(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int64(1), reset)
+	tasks, err = q.ListByStatus(StatusPending)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, "upload-abc", tasks[0].UploadID, "reset must preserve upload_id for resume")
+	assert.NotEmpty(t, tasks[0].CompletedParts, "reset must preserve completed_parts for resume")
+}
+
+func TestSaveMultipartProgress_TaskNotFound(t *testing.T) {
+	q := openMemQueue(t)
+
+	err := q.SaveMultipartProgress(context.Background(), "missing", "upload-abc", "")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrTaskNotFound))
+}
+
+func TestSaveMultipartProgress_DatabaseError(t *testing.T) {
+	q := openMemQueue(t)
+
+	require.NoError(t, q.Close())
+	err := q.SaveMultipartProgress(context.Background(), "mp-err", "upload-abc", "")
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, ErrTaskNotFound), "a closed DB is a real failure, not eviction")
+}

@@ -176,6 +176,27 @@ func main() {
 		)
 	}, logger, cfg.Upload.QueueMaxSize)
 
+	// Terminal-state multipart cleanup (IC-3 ②): when the executor gives up on
+	// a task (retry budget exhausted, terminal failure, or eviction), the
+	// in-flight MinIO multipart upload recorded on it must be aborted or its
+	// uploaded parts leak without bound. Best effort — uses the currently held
+	// STS session; without credentials the abort is left to the bucket's
+	// AbortIncompleteMultipartUpload ILM rule.
+	if err := exec.ConfigureAbandon(func(ctx context.Context, task *queue.UploadTask) error {
+		ucfg := creds.Current()
+		if ucfg == nil {
+			return fmt.Errorf("agent: no upload credentials available to abort upload of task %s", task.ID)
+		}
+		u, err := uploader.New(*ucfg, q, logger)
+		if err != nil {
+			return fmt.Errorf("agent: create uploader for abort: %w", err)
+		}
+		return u.AbandonUpload(ctx, task)
+	}); err != nil {
+		logger.Error("configure abandon hook", zap.Error(err))
+		return
+	}
+
 	// ── Scheduler (cron-mode rules) ──────────────────────────────────────────
 	sched := scheduler.New(logger)
 

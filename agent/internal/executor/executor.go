@@ -20,6 +20,14 @@ import (
 // executor calls this for every task dequeued from the SQLite queue.
 type UploadFunc func(ctx context.Context, task *queue.UploadTask) (*uploader.UploadResult, error)
 
+// AbandonFunc releases resources a task still holds when it is given up on —
+// for a multipart task that is the in-flight MinIO upload recorded in
+// task.UploadID, which must be aborted or its parts leak without bound
+// (IC-3 ②; the ILM rule is only the backstop for processes that died before
+// reaching this hook). It returns an error for logging only: abandonment
+// proceeds regardless, so an abort failure must never wedge the executor.
+type AbandonFunc func(ctx context.Context, task *queue.UploadTask) error
+
 // ErrTerminalUpload marks an upload failure whose cause will not go away by
 // retrying — e.g. a second AccessDenied after one credential refresh
 // (IC-BUG-20). Tasks failing with it are failed terminally: no backoff retry,
@@ -50,6 +58,7 @@ type Executor struct {
 	reportTimeout time.Duration
 	reportNotify  chan struct{}
 	retryMax      int
+	abandon       AbandonFunc
 
 	mu      sync.Mutex
 	notify  chan struct{}
@@ -81,6 +90,19 @@ func New(workers int, q *queue.Queue, uploader UploadFunc, logger *zap.Logger, q
 		notify: make(chan struct{}, 1),
 		stopCh: make(chan struct{}),
 	}
+}
+
+// ConfigureAbandon installs the hook that aborts a task's in-flight multipart
+// upload when the task is given up on (retry budget exhausted, terminal
+// failure, or eviction). Passing nil disables the cleanup — the executor then
+// leaves orphans to the bucket's AbortIncompleteMultipartUpload lifecycle
+// rule, so the hook should be configured in production.
+func (e *Executor) ConfigureAbandon(fn AbandonFunc) error {
+	if fn == nil {
+		return fmt.Errorf("executor: invalid abandon configuration")
+	}
+	e.abandon = fn
+	return nil
 }
 
 // Submit enqueues task into the SQLite queue and signals workers. The caller
@@ -159,6 +181,9 @@ func (e *Executor) enforceCapacity(newID string) {
 			zap.String("dropped_task_id", dropped.ID),
 			zap.String("dropped_path", dropped.LocalPath),
 		)
+		// A dropped failed task may carry an in-flight multipart upload that
+		// would never be retried again once the row is gone.
+		e.abandonTaskUpload(context.Background(), dropped)
 	}
 }
 
@@ -250,9 +275,35 @@ func (e *Executor) processTask(ctx context.Context, task *queue.UploadTask) {
 
 }
 
+// abandonTaskUpload aborts the in-flight multipart upload of a task that is
+// being given up on. Best effort: an error (e.g. MinIO unreachable) is logged
+// and the orphan is left to the bucket's AbortIncompleteMultipartUpload ILM
+// rule. Tasks without an upload ID — single-part uploads, or tasks whose
+// multipart upload never initiated — have nothing to release.
+func (e *Executor) abandonTaskUpload(ctx context.Context, task *queue.UploadTask) {
+	if e.abandon == nil || task == nil || task.UploadID == "" {
+		return
+	}
+	if err := e.abandon(ctx, task); err != nil {
+		e.logger.Warn("executor: abort abandoned multipart upload failed, leaving it to the bucket ILM rule",
+			zap.String("task_id", task.ID),
+			zap.String("upload_id", task.UploadID),
+			zap.Error(err))
+		return
+	}
+	e.logger.Info("executor: aborted multipart upload of abandoned task",
+		zap.String("task_id", task.ID),
+		zap.String("upload_id", task.UploadID))
+}
+
 // handleFailure marks a task as failed and re-queues it with exponential
 // backoff unless the retry limit has been reached. Terminal failures
 // (ErrTerminalUpload) skip the retry entirely and report immediately.
+//
+// Abandonment (retry exhausted or terminal failure) also aborts the task's
+// in-flight multipart upload: a task that will never be retried again must not
+// keep uploading parts on MinIO. A task that is merely awaiting backoff keeps
+// its upload ID so the retry resumes rather than restarts.
 func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 	e.logger.Warn("executor: task failed",
 		zap.String("task_id", task.ID),
@@ -269,6 +320,7 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 		)
 		_ = e.queue.MarkFailed(task.ID, err.Error())
 		task.RetryCount++
+		e.abandonTaskUpload(context.Background(), task)
 		e.persistResult(context.Background(), task, nil, err)
 		return
 	}
@@ -282,6 +334,7 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 			zap.String("path", task.LocalPath),
 		)
 		task.RetryCount = newRetry
+		e.abandonTaskUpload(context.Background(), task)
 		e.persistResult(context.Background(), task, nil, err)
 		return
 	}
@@ -307,10 +360,13 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 		// Re-queue by resetting status to pending.
 		if rerr := e.queue.UpdateStatus(task.ID, queue.StatusPending); rerr != nil {
 			// A not-found row was evicted to honour queue_max_size while this
-			// retry was sleeping — an expected outcome, not a failure.
+			// retry was sleeping — an expected outcome, not a failure. The row
+			// is gone for good, so its in-flight multipart upload (if any) is
+			// now an orphan and must be aborted here.
 			if errors.Is(rerr, queue.ErrTaskNotFound) {
 				e.logger.Debug("executor: retry skipped, task was evicted",
 					zap.String("task_id", task.ID))
+				e.abandonTaskUpload(context.Background(), task)
 				return
 			}
 			e.logger.Warn("executor: re-queue failed", zap.String("task_id", task.ID), zap.Error(rerr))

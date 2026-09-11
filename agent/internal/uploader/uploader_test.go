@@ -3,6 +3,7 @@ package uploader
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -24,13 +25,19 @@ type mockStore struct {
 	uploadCalls   int
 	completeCalls int
 	listCalls     int
-	putErr        error
-	initErr       error
-	uploadErr     error
-	completeErr   error
-	uploadID      string
-	parts         []minio.ObjectPart
-	putFn         func(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
+	abortCalls    int
+	// failOnPart, when non-zero, makes PutObjectPart fail on that part number
+	// (1-indexed) and on every later part, simulating a mid-transfer failure.
+	failOnPart   int
+	putErr       error
+	initErr      error
+	uploadErr    error
+	completeErr  error
+	abortErr     error
+	listErr      error
+	uploadID     string
+	parts        []minio.ObjectPart
+	putFn        func(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
 }
 
 func (m *mockStore) PutObject(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
@@ -59,6 +66,9 @@ func (m *mockStore) NewMultipartUpload(_ context.Context, _, _ string, _ minio.P
 
 func (m *mockStore) PutObjectPart(_ context.Context, _, _, _ string, _ int, r io.Reader, _ int64, _ minio.PutObjectPartOptions) (minio.ObjectPart, error) {
 	m.uploadCalls++
+	if m.failOnPart > 0 && m.uploadCalls >= m.failOnPart {
+		return minio.ObjectPart{}, fmt.Errorf("simulated part %d failure", m.uploadCalls)
+	}
 	if m.uploadErr != nil {
 		return minio.ObjectPart{}, m.uploadErr
 	}
@@ -68,6 +78,9 @@ func (m *mockStore) PutObjectPart(_ context.Context, _, _, _ string, _ int, r io
 
 func (m *mockStore) ListObjectParts(_ context.Context, _, _, _ string, _, _ int) (minio.ListObjectPartsResult, error) {
 	m.listCalls++
+	if m.listErr != nil {
+		return minio.ListObjectPartsResult{}, m.listErr
+	}
 	return minio.ListObjectPartsResult{ObjectParts: m.parts}, nil
 }
 
@@ -77,6 +90,14 @@ func (m *mockStore) CompleteMultipartUpload(_ context.Context, _, _, _ string, _
 		return minio.UploadInfo{}, m.completeErr
 	}
 	return minio.UploadInfo{ETag: "etag-multi"}, nil
+}
+
+func (m *mockStore) AbortMultipartUpload(_ context.Context, _, _, _ string) error {
+	m.abortCalls++
+	if m.abortErr != nil {
+		return m.abortErr
+	}
+	return nil
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -192,6 +213,88 @@ func TestUploadFile_Multipart_ResumeFromQueue(t *testing.T) {
 	assert.Equal(t, 0, store.initCalls, "should not start a new multipart upload")
 	assert.Equal(t, 1, store.uploadCalls, "should upload only the remaining part")
 	assert.Equal(t, 1, store.completeCalls)
+	assert.Equal(t, "etag-multi", result.ETag)
+}
+
+// TestUploadFile_Multipart_ProgressPersisted reproduces IC-BUG-5: after a
+// mid-transfer failure, the initiated upload ID and the completed parts must
+// be readable back from the SQLite queue, not only from the in-memory task —
+// otherwise every retry rescans empty values and restarts from part 1.
+func TestUploadFile_Multipart_ProgressPersisted(t *testing.T) {
+	dir := t.TempDir()
+	size := 2 * 1024 * 1024
+	path := filepath.Join(dir, "progress.dat")
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("C"), size), 0o644))
+
+	store := &mockStore{failOnPart: 2}
+	q := newTestQueue(t)
+	task := newTask(t, path, "bucket4", "progress/file.dat")
+	require.NoError(t, q.Enqueue(task))
+
+	u := newWithStore(store, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	_, err := u.UploadFile(context.Background(), task)
+	require.Error(t, err, "part 2 must fail")
+
+	// Simulate a restart: re-read the task from SQLite the way DequeuePending
+	// would, and check the multipart state survived the round trip.
+	rows, err := q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	persisted := rows[0]
+
+	assert.Equal(t, store.uploadID, persisted.UploadID,
+		"upload ID must be persisted, not only held in memory")
+	require.NotEmpty(t, persisted.CompletedParts,
+		"completed part 1 must be persisted when it completes")
+	var cp completedParts
+	require.NoError(t, json.Unmarshal([]byte(persisted.CompletedParts), &cp))
+	require.Len(t, cp.Parts, 1)
+	assert.Equal(t, 1, cp.Parts[0].PartNumber,
+		"the persisted progress must record part 1 as completed")
+}
+
+// TestUploadFile_Multipart_ResumeAfterCrash walks the full IC-BUG-5 scenario:
+// attempt 1 fails mid-transfer (part 2), the process "crashes", the task is
+// rescanned from SQLite (memory gone), and attempt 2 must resume the SAME
+// upload — no new multipart initiation, part 1 not retransmitted.
+func TestUploadFile_Multipart_ResumeAfterCrash(t *testing.T) {
+	dir := t.TempDir()
+	size := 2 * 1024 * 1024
+	path := filepath.Join(dir, "crash.dat")
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("D"), size), 0o644))
+
+	store1 := &mockStore{failOnPart: 2}
+	q := newTestQueue(t)
+	task := newTask(t, path, "bucket5", "crash/file.dat")
+	require.NoError(t, q.Enqueue(task))
+
+	u1 := newWithStore(store1, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	_, err := u1.UploadFile(context.Background(), task)
+	require.Error(t, err)
+
+	// "Restart": scan the task back from SQLite into a fresh in-memory struct.
+	rows, err := q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	restarted := rows[0]
+
+	// Attempt 2 on a fresh uploader. MinIO still reports part 1 of the same
+	// upload as uploaded. When the state survived the round trip, this is the
+	// same upload ID attempt 1 initiated; when it did not (the bug), the empty
+	// value forces a fresh initiation and the test fails below.
+	store2 := &mockStore{
+		uploadID: restarted.UploadID,
+		parts:    []minio.ObjectPart{{PartNumber: 1, ETag: "part-etag-1"}},
+	}
+	u2 := newWithStore(store2, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	result, err := u2.UploadFile(context.Background(), restarted)
+	require.NoError(t, err)
+
+	assert.Equal(t, 0, store2.initCalls,
+		"must resume the persisted upload ID, not initiate a new multipart upload")
+	assert.Equal(t, 1, store2.uploadCalls,
+		"part 1 must not be retransmitted; only part 2 remains")
+	assert.Equal(t, 1, store2.completeCalls)
 	assert.Equal(t, "etag-multi", result.ETag)
 }
 
@@ -373,4 +476,84 @@ UseSSL:    false,
 }, q, zap.NewNop())
 require.NoError(t, err)
 assert.NotNil(t, u)
+}
+
+// ── AbandonUpload (IC-3 ②: terminal-state part cleanup) ──────────────────────
+
+func TestAbandonUpload_AbortsRecordedUpload(t *testing.T) {
+	store := &mockStore{}
+	u := newWithStore(store, Config{}, nil, zap.NewNop())
+	task := newTask(t, "/nonexistent", "bucket6", "key/obj")
+	task.UploadID = "upload-live-1"
+
+	require.NoError(t, u.AbandonUpload(context.Background(), task))
+	assert.Equal(t, 1, store.abortCalls)
+}
+
+func TestAbandonUpload_NoUploadIDIsNoOp(t *testing.T) {
+	store := &mockStore{}
+	u := newWithStore(store, Config{}, nil, zap.NewNop())
+
+	require.NoError(t, u.AbandonUpload(context.Background(), newTask(t, "/p", "b", "k")))
+	require.NoError(t, u.AbandonUpload(context.Background(), nil))
+	assert.Zero(t, store.abortCalls)
+}
+
+func TestAbandonUpload_ToleratesNoSuchUpload(t *testing.T) {
+	// An upload already completed/aborted/expired reports NoSuchUpload — there
+	// is nothing left to clean, so this is success, not an error.
+	store := &mockStore{abortErr: minio.ErrorResponse{Code: "NoSuchUpload"}}
+	u := newWithStore(store, Config{}, nil, zap.NewNop())
+	task := newTask(t, "/p", "b", "k")
+	task.UploadID = "upload-gone"
+
+	require.NoError(t, u.AbandonUpload(context.Background(), task))
+}
+
+func TestAbandonUpload_PropagatesOtherErrors(t *testing.T) {
+	store := &mockStore{abortErr: fmt.Errorf("network down")}
+	u := newWithStore(store, Config{}, nil, zap.NewNop())
+	task := newTask(t, "/p", "b", "k")
+	task.UploadID = "upload-live-2"
+
+	err := u.AbandonUpload(context.Background(), task)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "network down")
+}
+
+// TestUploadFile_Multipart_ResumeVerifyFails starts fresh without aborting:
+// verifyRemoteParts may fail transiently (e.g. network down) and the recorded
+// upload may still be resumable, so a failed verification must NOT abort it —
+// the next attempt reconciles again (IC-3 ② deliberately keeps this path
+// abort-free).
+func TestUploadFile_Multipart_ResumeVerifyFails(t *testing.T) {
+	dir := t.TempDir()
+	size := 2 * 1024 * 1024
+	path := filepath.Join(dir, "verifyfail.dat")
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("E"), size), 0o644))
+
+	store1 := &mockStore{failOnPart: 2}
+	q := newTestQueue(t)
+	task := newTask(t, path, "bucket7", "verifyfail/file.dat")
+	require.NoError(t, q.Enqueue(task))
+
+	u1 := newWithStore(store1, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	_, err := u1.UploadFile(context.Background(), task)
+	require.Error(t, err)
+
+	rows, err := q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	restarted := rows[0]
+	require.NotEmpty(t, restarted.UploadID, "precondition: progress persisted")
+
+	// Second attempt: ListObjectParts fails (transient outage), but the abort
+	// hook must not be consulted here — the upload is abandoned via a fresh
+	// initiation only because verification failed.
+	store2 := &mockStore{listErr: fmt.Errorf("minio unreachable"), uploadID: restarted.UploadID}
+	u2 := newWithStore(store2, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	_, err = u2.UploadFile(context.Background(), restarted)
+	require.NoError(t, err, "verification failure falls back to a fresh upload")
+	assert.Zero(t, store2.abortCalls,
+		"a resumable upload must not be aborted just because the remote check failed")
 }

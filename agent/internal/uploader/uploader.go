@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -71,6 +72,9 @@ type ObjectStore interface {
 	ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumber, maxParts int) (minio.ListObjectPartsResult, error)
 	// CompleteMultipartUpload finalises a multipart upload.
 	CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, parts []minio.CompletePart, opts minio.PutObjectOptions) (minio.UploadInfo, error)
+	// AbortMultipartUpload discards an unfinished multipart upload and all its
+	// uploaded parts.
+	AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) error
 }
 
 // minioAdapter wraps *minio.Core to satisfy the ObjectStore interface.
@@ -97,6 +101,10 @@ func (a *minioAdapter) ListObjectParts(ctx context.Context, bucket, object, uplo
 
 func (a *minioAdapter) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, parts []minio.CompletePart, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
 	return a.c.CompleteMultipartUpload(ctx, bucket, object, uploadID, parts, opts)
+}
+
+func (a *minioAdapter) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) error {
+	return a.c.AbortMultipartUpload(ctx, bucket, object, uploadID)
 }
 
 // Uploader uploads files to MinIO and integrates with the local queue.
@@ -202,6 +210,34 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 	result.SHA256 = sha
 	result.SizeBytes = uploadSize
 	return result, nil
+}
+
+// AbandonUpload aborts the in-flight multipart upload recorded on task, if
+// any. It is called when a task is given up on — retry budget exhausted,
+// terminal failure, or queue eviction — because a multipart upload that will
+// never be completed or resumed leaks its uploaded parts without bound
+// (IC-3 ②). Single-part tasks (and tasks whose upload never initiated) carry
+// no upload ID and are a no-op.
+//
+// Tolerated as success: NoSuchUpload, i.e. the upload was already completed,
+// aborted or expired — in every case there is nothing left to clean up. Any
+// other error is returned so the caller can log it; the bucket's
+// AbortIncompleteMultipartUpload ILM rule remains the backstop for aborts that
+// could not be delivered.
+func (u *Uploader) AbandonUpload(ctx context.Context, task *queue.UploadTask) error {
+	if task == nil || task.UploadID == "" {
+		return nil
+	}
+	err := u.store.AbortMultipartUpload(ctx, task.Bucket, task.StoragePath, task.UploadID)
+	if err == nil {
+		return nil
+	}
+	var resp minio.ErrorResponse
+	if errors.As(err, &resp) && resp.Code == "NoSuchUpload" {
+		return nil
+	}
+	return fmt.Errorf("uploader: abort multipart upload %q of %q: %w",
+		task.UploadID, task.StoragePath, err)
 }
 
 // singlePartUpload uploads a file (or a portion of it) using PutObject.

@@ -471,6 +471,26 @@ func (q *Queue) ResetRunningToPending(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
+// SaveMultipartProgress persists a task's in-flight multipart upload state —
+// the upload ID and the JSON blob of completed parts — so that a crash or a
+// retry can resume the same MinIO multipart upload instead of restarting from
+// part 1 (IC-BUG-5). Call it after the upload is initiated and again every
+// time a part completes. Like UpdateStatus it returns ErrTaskNotFound when the
+// row is gone (evicted), which callers may treat as benign.
+func (q *Queue) SaveMultipartProgress(ctx context.Context, id, uploadID, partsJSON string) error {
+	res, err := q.db.ExecContext(ctx,
+		`UPDATE upload_tasks SET upload_id=?, completed_parts=?, updated_at=? WHERE id=?`,
+		uploadID, partsJSON, time.Now().Unix(), id,
+	)
+	if err != nil {
+		return fmt.Errorf("queue: save multipart progress %q: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("queue: task %q: %w", id, ErrTaskNotFound)
+	}
+	return nil
+}
+
 // UpdateStatus sets the status of a task identified by id.
 func (q *Queue) UpdateStatus(id, status string) error {
 	res, err := q.db.Exec(
