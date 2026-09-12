@@ -469,7 +469,27 @@ func (e *Executor) handleFailure(ctx context.Context, task *queue.UploadTask, er
 			zap.String("path", task.LocalPath),
 			zap.Error(err),
 		)
-		_ = e.queue.MarkFailed(ctx, task.ID, err.Error(), time.Time{})
+		if merr := e.queue.MarkFailedAbandoned(ctx, task, err.Error()); merr != nil {
+			if !errors.Is(merr, queue.ErrTaskNotFound) {
+				// R2: the abandoned state and its abort record are one
+				// transaction; if it could not commit, the task is NOT
+				// durably recorded as abandoned. Abandoning it in memory
+				// anyway would strand the upload (row says never-retry, no
+				// abort record exists). Same ordering rule as the uploader's
+				// first persist (P1-c): make the state trackable BEFORE
+				// acting on it — so leave the row in its current (running)
+				// state, keep the upload alive for the retry to resume or
+				// abort, and surface the failure loudly. Startup recovery
+				// (ResetRunningToPending) makes the row eligible again.
+				e.logger.Error("executor: record terminal abandonment",
+					zap.String("task_id", task.ID),
+					zap.String("upload_id", task.UploadID),
+					zap.Error(merr))
+				return
+			}
+			// Row evicted while we worked: the eviction already wrote the
+			// abort record transactionally with the DELETE.
+		}
 		task.RetryCount++
 		e.abandonTaskUpload(context.Background(), task)
 		e.persistResult(context.Background(), task, nil, err)
@@ -482,7 +502,17 @@ func (e *Executor) handleFailure(ctx context.Context, task *queue.UploadTask, er
 			zap.String("task_id", task.ID),
 			zap.String("path", task.LocalPath),
 		)
-		_ = e.queue.MarkFailed(ctx, task.ID, err.Error(), time.Time{})
+		if merr := e.queue.MarkFailedAbandoned(ctx, task, err.Error()); merr != nil {
+			if !errors.Is(merr, queue.ErrTaskNotFound) {
+				// R2: identical reasoning to the terminal branch — no
+				// durable abandoned state means no abandonment.
+				e.logger.Error("executor: record give-up abandonment",
+					zap.String("task_id", task.ID),
+					zap.String("upload_id", task.UploadID),
+					zap.Error(merr))
+				return
+			}
+		}
 		task.RetryCount = newRetry
 		e.abandonTaskUpload(context.Background(), task)
 		e.persistResult(context.Background(), task, nil, err)
@@ -549,17 +579,32 @@ func (e *Executor) retryDelay(attempt int) time.Duration {
 // recoverFailedTasks re-queues tasks that were awaiting a backoff retry when
 // the previous process exited (IC-3 P1-d). The retry schedule is persisted in
 // next_retry_at (stamped by handleFailure), so recovery reads it instead of
-// trusting memory: tasks already due (or with no schedule — legacy rows)
-// become pending immediately; still-future schedules are armed as in-memory
-// timers that flip the row when due. Failed tasks carrying an in-flight
-// multipart upload keep their upload ID — the re-queued attempt RESUMES it;
-// nothing is aborted here.
+// trusting memory: tasks already due become pending immediately;
+// still-future schedules are armed as in-memory timers that flip the row when
+// due. Failed tasks carrying an in-flight multipart upload keep their upload
+// ID — the re-queued attempt RESUMES it; nothing is aborted here.
 //
-// Abandoned tasks are deliberately NOT resurrected: rows stamped with the
-// never-retry sentinel (give-up / terminal failure) had their upload aborted
-// at abandonment time, and re-running them on every restart would loop
-// forever on a verdict that will not change. The retry-count guard below is
-// belt-and-braces for rows written by older builds without the sentinel.
+// next_retry_at has three shapes, and recovery treats each explicitly:
+//   - negative (NextRetryNever): the task was abandoned (give-up / terminal
+//     failure) — never resurrected. Its upload was either aborted at
+//     abandonment time or is covered by the durable abort record written in
+//     the same transaction as the sentinel (R2); the abort worker drains it.
+//   - positive: the persisted backoff schedule — honour it.
+//   - zero: a LEGACY row written by a build before the schedule was persisted
+//     (the ALTER TABLE default). Such a row is UNDECIDABLE between "awaiting
+//     backoff" and "abandoned on a terminal verdict" — an older build's
+//     terminal give-up can carry a LOW retry count, so the retry-count guard
+//     below cannot tell them apart either. Recovery errs toward abandoned: it
+//     does NOT resurrect the row (re-running an abandoned upload would be
+//     wrong, and an awaiting-backoff task is re-collected naturally by the
+//     scan if the file still matters), and it durably records an abort intent
+//     for the row's in-flight upload so it cannot leak either. No direct
+//     abort happens here: recovery runs on the startup path and must not do
+//     remote I/O — the abort worker drains the record with backoff.
+//
+// The retry-count guard remains as defence for rows whose persisted schedule
+// is positive but whose retry_count has outgrown a retry_max that was lowered
+// between runs.
 func (e *Executor) recoverFailedTasks(ctx context.Context) {
 	failed, err := e.queue.ListByStatus(queue.StatusFailed)
 	if err != nil {
@@ -572,10 +617,26 @@ func (e *Executor) recoverFailedTasks(ctx context.Context) {
 		if t.RetryCount >= e.retryMax || t.NextRetryAt == queue.NextRetryNever {
 			continue
 		}
-		due := now
-		if t.NextRetryAt > 0 {
-			due = time.Unix(t.NextRetryAt, 0)
+		if t.NextRetryAt == 0 {
+			e.logger.Warn("executor: legacy failed row without a persisted retry schedule treated as abandoned",
+				zap.String("task_id", t.ID),
+				zap.String("upload_id", t.UploadID))
+			if e.abandon != nil && t.UploadID != "" {
+				if err := e.queue.EnqueueMultipartAbort(ctx, &queue.AbortOutboxEntry{
+					UploadID:    t.UploadID,
+					TaskID:      t.ID,
+					Bucket:      t.Bucket,
+					StoragePath: t.StoragePath,
+				}); err != nil {
+					e.logger.Error("executor: record durable multipart abort intent failed",
+						zap.String("task_id", t.ID),
+						zap.String("upload_id", t.UploadID),
+						zap.Error(err))
+				}
+			}
+			continue
 		}
+		due := time.Unix(t.NextRetryAt, 0)
 		if !due.After(now) {
 			if err := e.queue.UpdateStatus(t.ID, queue.StatusPending); err != nil {
 				if !errors.Is(err, queue.ErrTaskNotFound) {

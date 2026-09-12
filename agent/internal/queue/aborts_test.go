@@ -108,3 +108,57 @@ func TestMultipartAbortOutbox_DatabaseErrors(t *testing.T) {
 	_, err = q.CountMultipartAborts(ctx)
 	require.Error(t, err)
 }
+
+// MarkFailedAbandoned: the never-retry sentinel and the abort record commit
+// together or not at all (R2).
+func TestMarkFailedAbandoned(t *testing.T) {
+	ctx := context.Background()
+	q := openMemQueue(t)
+
+	task := taskAt("abandon-me", 100)
+	task.UploadID = "upload-abandon-1"
+	task.Bucket = "bkt"
+	task.StoragePath = "obj/key"
+	require.NoError(t, q.Enqueue(task))
+	require.NoError(t, q.UpdateStatus(task.ID, StatusRunning))
+
+	require.NoError(t, q.MarkFailedAbandoned(ctx, task, "terminal: denied"))
+
+	// The row is failed with the never-retry sentinel...
+	rows, err := q.ListByStatus(StatusFailed)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, int64(NextRetryNever), rows[0].NextRetryAt)
+	// ...and the abort record committed with it.
+	entries, err := q.DueMultipartAborts(ctx, time.Now(), 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "upload-abandon-1", entries[0].UploadID)
+	assert.Equal(t, "bkt", entries[0].Bucket)
+	assert.Equal(t, "obj/key", entries[0].StoragePath)
+
+	// A task without an upload ID gets the sentinel but no record.
+	bare := taskAt("bare", 200)
+	require.NoError(t, q.Enqueue(bare))
+	require.NoError(t, q.UpdateStatus(bare.ID, StatusRunning))
+	require.NoError(t, q.MarkFailedAbandoned(ctx, bare, "terminal"))
+	rows, err = q.ListByStatus(StatusFailed)
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	n, err := q.CountMultipartAborts(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "no abort record for a task without an upload id")
+
+	// A missing row returns ErrTaskNotFound and writes nothing.
+	ghost := taskAt("ghost", 300)
+	ghost.UploadID = "upload-ghost"
+	err = q.MarkFailedAbandoned(ctx, ghost, "terminal")
+	require.ErrorIs(t, err, ErrTaskNotFound)
+	n, err = q.CountMultipartAborts(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "no abort record for a row that does not exist")
+
+	// A broken database must surface the error (no silent half-state).
+	require.NoError(t, q.Close())
+	require.Error(t, q.MarkFailedAbandoned(ctx, task, "terminal"))
+}

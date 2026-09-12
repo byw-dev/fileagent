@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"sync/atomic"
@@ -227,6 +229,53 @@ func TestExecutor_RecoveryNeverResurrectsAbandonedTasks(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, failed, 1, "the abandoned task stays failed")
 	e2.Stop()
+}
+
+// R1: a legacy row written before the retry schedule was persisted
+// (next_retry_at = 0, the ALTER TABLE default) is UNDECIDABLE — it can be a
+// task abandoned on a terminal verdict by an older build (low retry count, so
+// the retry-count guard does not catch it) just as well as one awaiting
+// backoff. Recovery must treat it conservatively: NOT resurrect it (re-running
+// an abandoned upload would be wrong), and durably record an abort intent for
+// its in-flight upload so it cannot leak either.
+func TestExecutor_RecoveryTreatsLegacyFailedRowsAsAbandoned(t *testing.T) {
+	q, dsn := newFileQueue(t)
+
+	task := abandonTask(t, q) // running, upload-live-1
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now().Add(time.Minute)))
+	// Rewrite the row into the exact shape an older build left behind:
+	// failed, no persisted schedule, LOW retry count.
+	db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_busy_timeout=5000")
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE upload_tasks SET next_retry_at=0, retry_count=1 WHERE id=?`, task.ID)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// "Restart" with a failing abort hook (MinIO unreachable) so the abort
+	// intent stays visible in the outbox instead of being drained away.
+	e := New(1, q, successUploader, zap.NewNop(), 0)
+	e.abortPoll = 20 * time.Millisecond
+	e.retryDelays = []time.Duration{time.Hour}
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return errors.New("minio unreachable")
+	}))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	e.Start(ctx)
+
+	assert.Never(t, func() bool {
+		failed, err := q.ListByStatus(queue.StatusFailed)
+		return err == nil && len(failed) == 0
+	}, 600*time.Millisecond, 50*time.Millisecond,
+		"a legacy failed row must never leave failed: it may be an abandoned task")
+	failed, err := q.ListByStatus(queue.StatusFailed)
+	require.NoError(t, err)
+	require.Len(t, failed, 1, "the legacy row stays failed (re-collection goes through the scan)")
+	entries, err := q.DueMultipartAborts(context.Background(), time.Now().Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the legacy row's in-flight upload must get a durable abort intent")
+	assert.Equal(t, "upload-live-1", entries[0].UploadID)
+	e.Stop()
 }
 
 func TestExecutor_RetryDelay(t *testing.T) {

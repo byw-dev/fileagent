@@ -118,3 +118,46 @@ func (q *Queue) CountMultipartAborts(ctx context.Context) (int, error) {
 	}
 	return n, nil
 }
+// MarkFailedAbandoned atomically marks a task failed with the never-retry
+// sentinel (given up: terminal failure or retry budget exhausted) AND records
+// the durable abort intent for its in-flight multipart upload in the same
+// transaction (R2). Writing the two separately lets a crash — or a failed
+// record write — strand a failed-with-sentinel row whose upload ID nobody can
+// ever retry again: the row says "never resume", and no abort record exists.
+// Returns ErrTaskNotFound when the row is already gone: the eviction path
+// wrote the abort record transactionally together with the DELETE, so callers
+// may treat that as benign.
+func (q *Queue) MarkFailedAbandoned(ctx context.Context, task *UploadTask, errMsg string) error {
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("queue: begin abandoned-marking transaction for %q: %w", task.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `
+        UPDATE upload_tasks
+        SET status=?, retry_count=retry_count+1, next_retry_at=?, last_error=?, updated_at=?
+        WHERE id=?`,
+		StatusFailed, int64(NextRetryNever), errMsg, time.Now().Unix(), task.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("queue: mark failed abandoned %q: %w", task.ID, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("queue: task %q: %w", task.ID, ErrTaskNotFound)
+	}
+	if task.UploadID != "" {
+		if _, err := tx.ExecContext(ctx, `
+            INSERT INTO multipart_abort_outbox
+                (upload_id, task_id, bucket, storage_path, attempts, next_attempt_at, last_error, created_at)
+            VALUES (?,?,?,?,0,0,NULL,?)
+            ON CONFLICT(upload_id) DO NOTHING`,
+			task.UploadID, task.ID, task.Bucket, task.StoragePath, time.Now().Unix(),
+		); err != nil {
+			return fmt.Errorf("queue: record abort of abandoned task %q: %w", task.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("queue: commit abandoned-marking of %q: %w", task.ID, err)
+	}
+	return nil
+}
