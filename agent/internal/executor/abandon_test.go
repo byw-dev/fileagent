@@ -138,7 +138,10 @@ func TestExecutor_AbortHookErrorIsNonFatal(t *testing.T) {
 	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
 		return errors.New("minio unreachable")
 	}))
-	// Give-up proceeds even when the abort fails; the orphan falls back to ILM.
+	// Give-up proceeds even when the abort fails: the durable abort record
+	// keeps the identity retryable for the abort worker. There is NO ILM
+	// fallback — current MinIO builds do not implement
+	// AbortIncompleteMultipartUpload (IC-3 ③).
 	assert.NotPanics(t, func() { e.handleFailure(context.Background(), task, fmt.Errorf("boom")) })
 }
 

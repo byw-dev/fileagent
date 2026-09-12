@@ -162,3 +162,52 @@ func TestMarkFailedAbandoned(t *testing.T) {
 	require.NoError(t, q.Close())
 	require.Error(t, q.MarkFailedAbandoned(ctx, task, "terminal"))
 }
+
+// MarkCompletedAbandoningUpload: the completed transition and the abort record
+// commit together or not at all (IC-3 R2/B).
+func TestMarkCompletedAbandoningUpload(t *testing.T) {
+	ctx := context.Background()
+	q := openMemQueue(t)
+
+	task := taskAt("dedup-done", 100)
+	task.UploadID = "upload-dedup-1"
+	task.Bucket = "bkt"
+	task.StoragePath = "obj/key"
+	require.NoError(t, q.Enqueue(task))
+	require.NoError(t, q.UpdateStatus(task.ID, StatusRunning))
+
+	require.NoError(t, q.MarkCompletedAbandoningUpload(ctx, task))
+
+	completed, err := q.ListByStatus(StatusCompleted)
+	require.NoError(t, err)
+	require.Len(t, completed, 1)
+	entries, err := q.DueMultipartAborts(ctx, time.Now(), 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "upload-dedup-1", entries[0].UploadID)
+	assert.Equal(t, "bkt", entries[0].Bucket)
+	assert.Equal(t, "obj/key", entries[0].StoragePath)
+
+	// A task without an upload ID completes without a record.
+	bare := taskAt("dedup-bare", 200)
+	require.NoError(t, q.Enqueue(bare))
+	require.NoError(t, q.MarkCompletedAbandoningUpload(ctx, bare))
+	completed, err = q.ListByStatus(StatusCompleted)
+	require.NoError(t, err)
+	assert.Len(t, completed, 2)
+	n, err := q.CountMultipartAborts(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	// A missing row returns ErrTaskNotFound and writes nothing.
+	ghost := taskAt("dedup-ghost", 300)
+	ghost.UploadID = "upload-ghost-2"
+	require.ErrorIs(t, q.MarkCompletedAbandoningUpload(ctx, ghost), ErrTaskNotFound)
+	n, err = q.CountMultipartAborts(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	// A broken database must surface the error.
+	require.NoError(t, q.Close())
+	require.Error(t, q.MarkCompletedAbandoningUpload(ctx, task))
+}

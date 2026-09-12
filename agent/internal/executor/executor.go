@@ -281,14 +281,33 @@ func (e *Executor) processTask(ctx context.Context, task *queue.UploadTask) {
 			zap.String("task_id", task.ID),
 			zap.String("path", task.LocalPath),
 		)
-		// P1-b: `completed` is not only reached via CompleteMultipartUpload.
-		// This task may carry an upload ID from an earlier partial attempt
-		// (it failed; another task for the same file version completed, which
-		// the EnqueueIfNoActive guard does not block against failed rows).
-		// Marking it completed without aborting that upload orphans it for
-		// good — abort first (durably recorded, so a failed abort is retried
-		// by the outbox worker), then complete.
-		e.abandonTaskUpload(ctx, task)
+		// P1-b/R2/B: `completed` is not only reached via
+		// CompleteMultipartUpload. This task may carry an upload ID from an
+		// earlier partial attempt (it failed; another task for the same file
+		// version completed, which the EnqueueIfNoActive guard does not block
+		// against failed rows). The completion transition and the durable
+		// abort intent are ONE transaction — the same order law as the
+		// terminal path: a completed row is permanent, so its abort identity
+		// must be durable in the same commit, not a best-effort write after
+		// it. The direct abort still runs afterwards (fast path); its record
+		// is removed again on success.
+		if task.UploadID != "" {
+			if err := e.queue.MarkCompletedAbandoningUpload(ctx, task); err != nil {
+				if !errors.Is(err, queue.ErrTaskNotFound) {
+					e.logger.Error("executor: record dedup completion with abort",
+						zap.String("task_id", task.ID),
+						zap.String("upload_id", task.UploadID),
+						zap.Error(err))
+					return
+				}
+				// Row evicted while we worked: the eviction already wrote
+				// the abort record transactionally with the DELETE.
+				e.abandonTaskUpload(ctx, task)
+				return
+			}
+			e.abandonTaskUpload(ctx, task)
+			return
+		}
 		_ = e.queue.UpdateStatus(task.ID, queue.StatusCompleted)
 		return
 	}

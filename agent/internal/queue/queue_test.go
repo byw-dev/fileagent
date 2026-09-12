@@ -865,8 +865,8 @@ func TestSaveMultipartProgress_PersistsBothColumns(t *testing.T) {
 
 	// Simulate per-part progress: initiate then two completed parts, as the
 	// uploader calls it (IC-BUG-5).
-	require.NoError(t, q.SaveMultipartProgress(context.Background(), "mp-1", "upload-abc", ""))
-	require.NoError(t, q.SaveMultipartProgress(context.Background(), "mp-1", "upload-abc", `{"parts":[{"PartNumber":1,"ETag":"e1"}]}`))
+	require.NoError(t, q.SaveMultipartProgress(context.Background(), "mp-1", "upload-abc", "", FileVersion{Mtime: 1, Size: 2}))
+	require.NoError(t, q.SaveMultipartProgress(context.Background(), "mp-1", "upload-abc", `{"parts":[{"PartNumber":1,"ETag":"e1"}]}`, FileVersion{Mtime: 1, Size: 2}))
 
 	tasks, err := q.ListByStatus(StatusPending)
 	require.NoError(t, err)
@@ -890,7 +890,7 @@ func TestSaveMultipartProgress_PersistsBothColumns(t *testing.T) {
 func TestSaveMultipartProgress_TaskNotFound(t *testing.T) {
 	q := openMemQueue(t)
 
-	err := q.SaveMultipartProgress(context.Background(), "missing", "upload-abc", "")
+	err := q.SaveMultipartProgress(context.Background(), "missing", "upload-abc", "", FileVersion{})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrTaskNotFound))
 }
@@ -899,7 +899,7 @@ func TestSaveMultipartProgress_DatabaseError(t *testing.T) {
 	q := openMemQueue(t)
 
 	require.NoError(t, q.Close())
-	err := q.SaveMultipartProgress(context.Background(), "mp-err", "upload-abc", "")
+	err := q.SaveMultipartProgress(context.Background(), "mp-err", "upload-abc", "", FileVersion{})
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, ErrTaskNotFound), "a closed DB is a real failure, not eviction")
 }

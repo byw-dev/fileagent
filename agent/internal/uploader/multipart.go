@@ -23,13 +23,48 @@ type completedParts struct {
 func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, size int64) (*UploadResult, error) {
 	partSize := int64(u.cfg.PartSizeMB) * 1024 * 1024
 
+	// The file-version snapshot every persist binds the recorded parts to
+	// (IC-3 R-A): captured once per attempt, written in the same UPDATE as
+	// the upload ID and the parts. A resume whose current file no longer
+	// matches this version must discard the parts — resuming them would
+	// splice old and new content into one object with a wrong SHA.
+	var partsVersion queue.FileVersion
+	if info, err := os.Stat(task.LocalPath); err == nil {
+		partsVersion = queue.FileVersion{Mtime: info.ModTime().Unix(), Size: info.Size()}
+	} else {
+		u.logger.Error("uploader: stat file for multipart version snapshot",
+			zap.String("task_id", task.ID), zap.Error(err))
+	}
+
 	uploadID := task.UploadID
 	var doneParts []minio.CompletePart
 
 	// Attempt to resume a prior upload.
 	if uploadID != "" {
 		doneParts = u.loadCompletedParts(task.CompletedParts)
-		if err := u.verifyRemoteParts(ctx, task, uploadID, &doneParts); err != nil {
+		// R-A: the recorded parts belong to ONE file version — the snapshot
+		// persisted alongside them. If the current file no longer matches
+		// (mtime+size), or no snapshot exists (legacy rows written before the
+		// snapshot existed), the parts are untrustworthy: resuming them would
+		// skip old-version parts and splice NEW content underneath — a
+		// mixed-version object with a wrong SHA (the IC-5 reset deliberately
+		// refreshes file metadata while keeping the upload state, so version
+		// binding is what makes "resumable" and "unchanged" the same
+		// question). Discard the resume state, durably record an abort intent
+		// for the stale upload, and start fresh.
+		snap := queue.FileVersion{Mtime: task.PartsFileMtime, Size: task.PartsFileSize}
+		if snap != partsVersion {
+			u.logger.Warn("uploader: file changed since the recorded parts were uploaded, discarding resume state",
+				zap.String("task_id", task.ID),
+				zap.String("stale_upload_id", uploadID),
+				zap.Int64("parts_mtime", snap.Mtime),
+				zap.Int64("parts_size", snap.Size),
+				zap.Int64("current_mtime", partsVersion.Mtime),
+				zap.Int64("parts_file_size", partsVersion.Size))
+			doneParts = nil
+			u.discardStaleUpload(ctx, task, uploadID)
+			uploadID = ""
+		} else if err := u.verifyRemoteParts(ctx, task, uploadID, &doneParts); err != nil {
 			if !isNoSuchUpload(err) {
 				// P1-a: any OTHER error (timeout, network jitter, 5xx) is
 				// transient — it says nothing about whether the recorded
@@ -88,7 +123,7 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 		// ListObjectParts (verifyRemoteParts). Aborting there would needlessly
 		// discard already-uploaded parts — hence the asymmetry.
 		if u.queue != nil {
-			if err := u.queue.SaveMultipartProgress(ctx, task.ID, task.UploadID, ""); err != nil {
+			if err := u.queue.SaveMultipartProgress(ctx, task.ID, task.UploadID, "", partsVersion); err != nil {
 				u.logger.Error("uploader: persist multipart initiation failed, aborting the fresh upload",
 					zap.String("task_id", task.ID),
 					zap.String("upload_id", uploadID), zap.Error(err))
@@ -160,7 +195,7 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 			// rewritten IN FULL on every part — O(n²) write amplification on
 			// the single SQLite connection, significant only for very large
 			// part counts.
-			if err := u.queue.SaveMultipartProgress(ctx, task.ID, task.UploadID, task.CompletedParts); err != nil && !errors.Is(err, queue.ErrTaskNotFound) {
+			if err := u.queue.SaveMultipartProgress(ctx, task.ID, task.UploadID, task.CompletedParts, partsVersion); err != nil && !errors.Is(err, queue.ErrTaskNotFound) {
 				u.logger.Warn("uploader: persist multipart progress",
 					zap.String("task_id", task.ID),
 					zap.Int("part_number", partNum), zap.Error(err))
@@ -230,3 +265,44 @@ func newSectionReader(path string, offset, size int64) (*sectionReader, error) {
 
 func (s *sectionReader) Read(p []byte) (int, error) { return s.reader.Read(p) }
 func (s *sectionReader) close()                     { _ = s.f.Close() }
+
+// discardStaleUpload drops a recorded multipart upload whose parts belong to a
+// file version that no longer exists (or that was never versioned). It follows
+// the R2 order law: the durable abort intent is recorded FIRST — once the
+// resume state is discarded the record is the only retryable identity left,
+// and there is no ILM backstop on current MinIO builds (IC-3 ③) — then the
+// direct abort runs, and a success removes the record again. A failed abort
+// leaves the record for the executor's abort worker to retry with backoff.
+func (u *Uploader) discardStaleUpload(ctx context.Context, task *queue.UploadTask, uploadID string) {
+	if u.queue != nil {
+		if err := u.queue.EnqueueMultipartAbort(ctx, &queue.AbortOutboxEntry{
+			UploadID:    uploadID,
+			TaskID:      task.ID,
+			Bucket:      task.Bucket,
+			StoragePath: task.StoragePath,
+		}); err != nil {
+			u.logger.Error("uploader: record durable abort intent for stale multipart upload",
+				zap.String("task_id", task.ID),
+				zap.String("upload_id", uploadID),
+				zap.Error(err))
+		}
+	}
+	if err := u.store.AbortMultipartUpload(ctx, task.Bucket, task.StoragePath, uploadID); err != nil && !isNoSuchUpload(err) {
+		u.logger.Warn("uploader: abort of stale multipart upload failed; the durable abort record will be retried",
+			zap.String("task_id", task.ID),
+			zap.String("upload_id", uploadID),
+			zap.Error(err))
+		return
+	}
+	if u.queue != nil {
+		if err := u.queue.DeleteMultipartAbort(ctx, uploadID); err != nil {
+			u.logger.Warn("uploader: remove durable abort record after successful abort",
+				zap.String("task_id", task.ID),
+				zap.String("upload_id", uploadID),
+				zap.Error(err))
+		}
+	}
+	u.logger.Info("uploader: aborted stale multipart upload",
+		zap.String("task_id", task.ID),
+		zap.String("upload_id", uploadID))
+}

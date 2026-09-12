@@ -161,3 +161,47 @@ func (q *Queue) MarkFailedAbandoned(ctx context.Context, task *UploadTask, errMs
 	}
 	return nil
 }
+
+// MarkCompletedAbandoningUpload atomically marks a task completed AND records
+// the durable abort intent for its in-flight multipart upload in the same
+// transaction (IC-3 R2/B). `completed` is not only reached via
+// CompleteMultipartUpload: a task whose earlier partial attempt failed while
+// another task completed the same file version reaches completion through the
+// dedup shortcut, still owning a live upload. Completing it without a durable
+// abort record would make the row permanent while the upload leaks; the
+// transaction keeps the two inseparable. A task without an upload ID gets the
+// completion only. Returns ErrTaskNotFound when the row is already gone
+// (evicted — the eviction wrote the abort record transactionally with the
+// DELETE), which callers may treat as benign.
+func (q *Queue) MarkCompletedAbandoningUpload(ctx context.Context, task *UploadTask) error {
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("queue: begin dedup-completion transaction for %q: %w", task.ID, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE upload_tasks SET status=?, updated_at=? WHERE id=?`,
+		StatusCompleted, time.Now().Unix(), task.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("queue: mark completed %q: %w", task.ID, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("queue: task %q: %w", task.ID, ErrTaskNotFound)
+	}
+	if task.UploadID != "" {
+		if _, err := tx.ExecContext(ctx, `
+            INSERT INTO multipart_abort_outbox
+                (upload_id, task_id, bucket, storage_path, attempts, next_attempt_at, last_error, created_at)
+            VALUES (?,?,?,?,0,0,NULL,?)
+            ON CONFLICT(upload_id) DO NOTHING`,
+			task.UploadID, task.ID, task.Bucket, task.StoragePath, time.Now().Unix(),
+		); err != nil {
+			return fmt.Errorf("queue: record abort of dedup-completed task %q: %w", task.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("queue: commit dedup-completion of %q: %w", task.ID, err)
+	}
+	return nil
+}

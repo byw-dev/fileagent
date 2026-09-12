@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS upload_tasks (
     bucket         TEXT    NOT NULL,
     upload_id      TEXT,
     completed_parts TEXT,
+    parts_file_mtime INTEGER NOT NULL DEFAULT 0,
+    parts_file_size  INTEGER NOT NULL DEFAULT 0,
     file_size      INTEGER NOT NULL DEFAULT 0,
     file_mtime     INTEGER NOT NULL DEFAULT 0,
     sha256         TEXT,
@@ -101,6 +103,8 @@ var schemaMigrations = []string{
 	`ALTER TABLE upload_tasks ADD COLUMN file_offset INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN append_mode TEXT NOT NULL DEFAULT 'overwrite'`,
 	`ALTER TABLE upload_tasks ADD COLUMN next_retry_at INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE upload_tasks ADD COLUMN parts_file_mtime INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE upload_tasks ADD COLUMN parts_file_size INTEGER NOT NULL DEFAULT 0`,
 }
 
 // Status values for upload tasks.
@@ -134,15 +138,28 @@ type UploadTask struct {
 	Bucket         string
 	UploadID       string
 	CompletedParts string
+	// PartsFileMtime / PartsFileSize identify the file version (mtime seconds
+	// + size) that the recorded multipart parts were read from (IC-3 R-A).
+	// A resume whose current file no longer matches must discard the recorded
+	// parts — resuming them would splice old and new content into one object.
+	// Zero/zero means "no snapshot" (legacy rows) and is treated as a
+	// mismatch: unversioned parts are never trusted for a resume.
+	PartsFileMtime int64
+	PartsFileSize  int64
 	FileSize       int64
 	FileMtime      int64
 	SHA256         string
 Status         string
 	RetryCount     int
 	// NextRetryAt is the unix time (seconds) when a failed task becomes
-	// eligible for re-queueing (IC-3 P1-d). Zero means "no schedule recorded"
-	// (legacy rows, or a task never failed) and is treated as due; a negative
-	// value (NextRetryNever) means the task was abandoned — never re-queue it.
+	// eligible for re-queueing (IC-3 P1-d). A positive value is the persisted
+	// backoff schedule, honoured by startup recovery. A negative value
+	// (NextRetryNever) marks the task abandoned — never re-queued. Zero means
+	// "no schedule recorded" (rows written before the schedule was persisted):
+	// such a row is UNDECIDABLE between "awaiting backoff" and "abandoned on a
+	// terminal verdict" and is treated conservatively as ABANDONED — startup
+	// recovery does not resurrect it, but records an abort intent for its
+	// in-flight upload so it cannot leak either.
 	NextRetryAt  int64
 	LastError    string
 	CreatedAt      int64
@@ -360,7 +377,8 @@ func (q *Queue) DeleteOldestEvictable(excludeID string) (*UploadTask, error) {
 		rows, err := tx.Query(`
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
-               retry_count, next_retry_at, last_error, created_at, updated_at,
+               retry_count, next_retry_at, parts_file_mtime, parts_file_size,
+               last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
         WHERE status IN (?, ?) AND id != ?
@@ -426,7 +444,8 @@ func (q *Queue) DequeuePending(limit int) ([]*UploadTask, error) {
 	rows, err := q.db.Query(`
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
-               retry_count, next_retry_at, last_error, created_at, updated_at,
+               retry_count, next_retry_at, parts_file_mtime, parts_file_size,
+               last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
         WHERE status = ?
@@ -483,7 +502,8 @@ func (q *Queue) ResetRunningToPending(ctx context.Context) (int64, error) {
 	rows, err := tx.QueryContext(ctx, `
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
-               retry_count, next_retry_at, last_error, created_at, updated_at,
+               retry_count, next_retry_at, parts_file_mtime, parts_file_size,
+               last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
         WHERE status = ?
@@ -538,16 +558,30 @@ func (q *Queue) ResetRunningToPending(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
+// FileVersion identifies the content of the local file that a multipart
+// upload's recorded parts were read from: mtime (unix seconds) + size. Two
+// versions equal only when both match — the same test IsProcessed applies to
+// whole files (IC-BUG-10). Files rewritten within the same second at the same
+// size are indistinguishable; that residual blind spot is accepted and shared
+// with every other mtime+size identity in this codebase.
+type FileVersion struct {
+	Mtime int64
+	Size  int64
+}
+
 // SaveMultipartProgress persists a task's in-flight multipart upload state —
-// the upload ID and the JSON blob of completed parts — so that a crash or a
-// retry can resume the same MinIO multipart upload instead of restarting from
-// part 1 (IC-BUG-5). Call it after the upload is initiated and again every
-// time a part completes. Like UpdateStatus it returns ErrTaskNotFound when the
-// row is gone (evicted), which callers may treat as benign.
-func (q *Queue) SaveMultipartProgress(ctx context.Context, id, uploadID, partsJSON string) error {
+// the upload ID, the JSON blob of completed parts, and the file version those
+// parts were read from — so that a crash or a retry can resume the same MinIO
+// multipart upload instead of restarting from part 1 (IC-BUG-5), while a file
+// that changed underneath is detected and the stale parts discarded (IC-3
+// R-A). All three are one UPDATE: a torn state (upload ID without its version)
+// must not exist. Call it after the upload is initiated and again every time a
+// part completes. Like UpdateStatus it returns ErrTaskNotFound when the row is
+// gone (evicted), which callers may treat as benign.
+func (q *Queue) SaveMultipartProgress(ctx context.Context, id, uploadID, partsJSON string, fv FileVersion) error {
 	res, err := q.db.ExecContext(ctx,
-		`UPDATE upload_tasks SET upload_id=?, completed_parts=?, updated_at=? WHERE id=?`,
-		uploadID, partsJSON, time.Now().Unix(), id,
+		`UPDATE upload_tasks SET upload_id=?, completed_parts=?, parts_file_mtime=?, parts_file_size=?, updated_at=? WHERE id=?`,
+		uploadID, partsJSON, fv.Mtime, fv.Size, time.Now().Unix(), id,
 	)
 	if err != nil {
 		return fmt.Errorf("queue: save multipart progress %q: %w", id, err)
@@ -605,7 +639,8 @@ func (q *Queue) ListByStatus(status string) ([]*UploadTask, error) {
 	rows, err := q.db.Query(`
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
-               retry_count, next_retry_at, last_error, created_at, updated_at,
+               retry_count, next_retry_at, parts_file_mtime, parts_file_size,
+               last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
         WHERE status = ?
@@ -731,7 +766,8 @@ func scanTasks(rows *sql.Rows) ([]*UploadTask, error) {
 		if err := rows.Scan(
 			&t.ID, &t.RuleID, &t.LocalPath, &t.StoragePath, &t.Bucket,
 			&t.UploadID, &t.CompletedParts, &t.FileSize, &t.FileMtime,
-			&t.SHA256, &t.Status, &t.RetryCount, &t.NextRetryAt, &t.LastError,
+			&t.SHA256, &t.Status, &t.RetryCount, &t.NextRetryAt,
+			&t.PartsFileMtime, &t.PartsFileSize, &t.LastError,
 			&t.CreatedAt, &t.UpdatedAt,
 			&t.FileOffset, &t.AppendMode,
 		); err != nil {

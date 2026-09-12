@@ -643,3 +643,75 @@ func TestExecutor_TerminalFailureLeavesAbortRecord(t *testing.T) {
 	require.Len(t, entries, 1, "terminal failure must leave a durable abort record")
 	assert.Equal(t, "upload-live-1", entries[0].UploadID)
 }
+
+// B: the dedup-completed transition and its abort record must follow the same
+// order law as the terminal path (R2): the durable abort intent must be part
+// of the completion transition itself, not a best-effort write after it. With
+// the old split (abort hook first, UpdateStatus completed after) a crash in
+// between could leave a permanently-completed row whose upload identity was
+// never durably recorded — or an intent without its terminal state.
+func TestExecutor_DedupCompleteAndAbortRecordAreAtomic(t *testing.T) {
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	var aborted atomic.Int32
+
+	// Task A failed mid-multipart and awaits its backoff retry (failed, with
+	// a live upload ID); task B already completed the same file version, so
+	// A's retry hits the dedup shortcut.
+	task := abandonTask(t, q)
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now().Add(time.Minute)))
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
+		FileSize: task.FileSize, FileMtime: task.FileMtime, UploadedAt: time.Now().Unix(),
+	}))
+
+	// Only the outbox INSERT fails: the completion transition must fail with
+	// it, leaving the task recoverable instead of completed-without-record.
+	failStatement(t, dsn, "no_abort_record", "INSERT", "multipart_abort_outbox")
+	e := New(1, q, successUploader, zap.New(core), 0)
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		aborted.Add(1)
+		return nil
+	}))
+
+	e.processTask(context.Background(), task)
+
+	assert.Zero(t, aborted.Load(),
+		"the upload must not be abandoned while its abort intent could not be made durable")
+	failed, err := q.ListByStatus(queue.StatusFailed)
+	require.NoError(t, err)
+	assert.Len(t, failed, 1, "the task stays recoverable; the retry redoes the dedup completion")
+	completed, err := q.ListByStatus(queue.StatusCompleted)
+	require.NoError(t, err)
+	assert.Empty(t, completed)
+	assert.NotZero(t, logs.FilterMessage("executor: record dedup completion with abort").Len(),
+		"the failed atomic completion must surface loudly")
+}
+
+// The same invariant, happy path with a failing abort (MinIO unreachable):
+// dedup-completion must leave BOTH the completed status and a durable abort
+// record behind.
+func TestExecutor_DedupCompleteLeavesAbortRecord(t *testing.T) {
+	ctx := context.Background()
+	q := newTestQueue(t)
+	e := New(1, q, successUploader, zap.NewNop(), 0)
+	e.abortPoll = time.Hour
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return errors.New("minio unreachable")
+	}))
+
+	task := abandonTask(t, q)
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
+		FileSize: task.FileSize, FileMtime: task.FileMtime, UploadedAt: time.Now().Unix(),
+	}))
+	e.processTask(ctx, task)
+
+	entries, err := q.DueMultipartAborts(ctx, time.Now(), 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "dedup-completion must leave a durable abort record")
+	assert.Equal(t, "upload-live-1", entries[0].UploadID)
+	completed, err := q.ListByStatus(queue.StatusCompleted)
+	require.NoError(t, err)
+	assert.Len(t, completed, 1)
+}
