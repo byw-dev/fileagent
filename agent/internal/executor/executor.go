@@ -23,9 +23,11 @@ type UploadFunc func(ctx context.Context, task *queue.UploadTask) (*uploader.Upl
 // AbandonFunc releases resources a task still holds when it is given up on —
 // for a multipart task that is the in-flight MinIO upload recorded in
 // task.UploadID, which must be aborted or its parts leak without bound
-// (IC-3 ②; the ILM rule is only the backstop for processes that died before
-// reaching this hook). It returns an error for logging only: abandonment
-// proceeds regardless, so an abort failure must never wedge the executor.
+// (IC-3 ②). It returns an error for logging only: abandonment proceeds
+// regardless. A failed abort is NOT silently delegated to any ILM rule — the
+// current MinIO builds do not implement AbortIncompleteMultipartUpload (IC-3
+// ③) — but is retried from the durable abort outbox (queue.MultipartAbort)
+// with backoff, so the failure must never wedge the executor.
 type AbandonFunc func(ctx context.Context, task *queue.UploadTask) error
 
 // ErrTerminalUpload marks an upload failure whose cause will not go away by
@@ -35,7 +37,8 @@ type AbandonFunc func(ctx context.Context, task *queue.UploadTask) error
 var ErrTerminalUpload = errors.New("terminal upload failure")
 
 // retryDelays defines the wait duration before each retry attempt (1-indexed).
-// Indices beyond the slice length use the last value.
+// Indices beyond the slice length use the last value. The same ladder backs
+// off the durable abort worker's retries.
 var defaultRetryDelays = []time.Duration{
 	1 * time.Minute,
 	5 * time.Minute,
@@ -45,6 +48,14 @@ var defaultRetryDelays = []time.Duration{
 
 // maxRetries is the maximum number of retry attempts before permanently failing.
 const maxRetries = 10
+
+// Defaults for the durable abort outbox worker: how long a single Abort call
+// may run before it is treated as failed (and retried), and how often the
+// worker wakes to drain due records.
+const (
+	defaultAbortTimeout = 30 * time.Second
+	defaultAbortPoll    = 30 * time.Second
+)
 
 // Executor manages a pool of upload workers consuming from the queue.
 type Executor struct {
@@ -59,6 +70,8 @@ type Executor struct {
 	reportNotify  chan struct{}
 	retryMax      int
 	abandon       AbandonFunc
+	abortTimeout  time.Duration
+	abortPoll     time.Duration
 
 	mu      sync.Mutex
 	notify  chan struct{}
@@ -86,17 +99,23 @@ func New(workers int, q *queue.Queue, uploader UploadFunc, logger *zap.Logger, q
 		logger:       logger,
 		retryDelays:  defaultRetryDelays,
 		queueMaxSize: queueMaxSize,
-		retryMax:     maxRetries, reportNotify: make(chan struct{}, 1),
-		notify: make(chan struct{}, 1),
-		stopCh: make(chan struct{}),
+		retryMax:     maxRetries,
+		abortTimeout: defaultAbortTimeout,
+		abortPoll:    defaultAbortPoll,
+		reportNotify: make(chan struct{}, 1),
+		notify:       make(chan struct{}, 1),
+		stopCh:       make(chan struct{}),
 	}
 }
 
 // ConfigureAbandon installs the hook that aborts a task's in-flight multipart
-// upload when the task is given up on (retry budget exhausted, terminal
-// failure, or eviction). Passing nil disables the cleanup — the executor then
-// leaves orphans to the bucket's AbortIncompleteMultipartUpload lifecycle
-// rule, so the hook should be configured in production.
+// upload when the task is given up on (dedup-completion, retry budget
+// exhausted, terminal failure, or eviction). Passing nil disables the cleanup:
+// pending abort records then stay in the durable outbox (identity preserved,
+// retried once a hook is configured) — but with no hook, live abandonments
+// during this process are never attempted, so the hook should always be
+// configured in production. Note there is no reliable ILM backstop: current
+// MinIO builds do not implement AbortIncompleteMultipartUpload (IC-3 ③).
 func (e *Executor) ConfigureAbandon(fn AbandonFunc) error {
 	if fn == nil {
 		return fmt.Errorf("executor: invalid abandon configuration")
@@ -197,6 +216,11 @@ func (e *Executor) Start(ctx context.Context) {
 		e.wg.Add(1)
 		go e.runReporter(ctx)
 	}
+	// The durable abort worker runs from startup so abort records written by
+	// a previous process (before it exited) are drained too.
+	e.wg.Add(1)
+	go e.runAbortWorker(ctx)
+	e.recoverFailedTasks(ctx)
 	for i := 0; i < e.workers; i++ {
 		e.wg.Add(1)
 		go e.runWorker(ctx)
@@ -257,18 +281,26 @@ func (e *Executor) processTask(ctx context.Context, task *queue.UploadTask) {
 			zap.String("task_id", task.ID),
 			zap.String("path", task.LocalPath),
 		)
+		// P1-b: `completed` is not only reached via CompleteMultipartUpload.
+		// This task may carry an upload ID from an earlier partial attempt
+		// (it failed; another task for the same file version completed, which
+		// the EnqueueIfNoActive guard does not block against failed rows).
+		// Marking it completed without aborting that upload orphans it for
+		// good — abort first (durably recorded, so a failed abort is retried
+		// by the outbox worker), then complete.
+		e.abandonTaskUpload(ctx, task)
 		_ = e.queue.UpdateStatus(task.ID, queue.StatusCompleted)
 		return
 	}
 
 	result, err := e.uploader(ctx, task)
 	if err != nil {
-		e.handleFailure(task, err)
+		e.handleFailure(ctx, task, err)
 		return
 	}
 
 	if result == nil {
-		e.handleFailure(task, fmt.Errorf("uploader returned nil result"))
+		e.handleFailure(ctx, task, fmt.Errorf("uploader returned nil result"))
 		return
 	}
 	e.persistResult(ctx, task, result, nil)
@@ -276,24 +308,136 @@ func (e *Executor) processTask(ctx context.Context, task *queue.UploadTask) {
 }
 
 // abandonTaskUpload aborts the in-flight multipart upload of a task that is
-// being given up on. Best effort: an error (e.g. MinIO unreachable) is logged
-// and the orphan is left to the bucket's AbortIncompleteMultipartUpload ILM
-// rule. Tasks without an upload ID — single-part uploads, or tasks whose
-// multipart upload never initiated — have nothing to release.
+// being given up on (dedup-completion, retry budget exhausted, terminal
+// failure, or eviction while the hook is set). The abort identity is first
+// recorded durably in the queue's multipart_abort_outbox (IC-3 ②/P2): once the
+// task row is gone or final, this record is the only retryable local identity
+// left — there is no ILM backstop on current MinIO builds (IC-3 ③). The direct
+// abort then runs with a timeout; on failure the outbox worker retries it with
+// backoff, and on success the record is removed again. Tasks without an
+// upload ID — single-part uploads, or tasks whose multipart upload never
+// initiated — have nothing to release.
 func (e *Executor) abandonTaskUpload(ctx context.Context, task *queue.UploadTask) {
 	if e.abandon == nil || task == nil || task.UploadID == "" {
 		return
 	}
-	if err := e.abandon(ctx, task); err != nil {
-		e.logger.Warn("executor: abort abandoned multipart upload failed, leaving it to the bucket ILM rule",
+	if e.queue != nil {
+		if err := e.queue.EnqueueMultipartAbort(ctx, &queue.AbortOutboxEntry{
+			UploadID:    task.UploadID,
+			TaskID:      task.ID,
+			Bucket:      task.Bucket,
+			StoragePath: task.StoragePath,
+		}); err != nil {
+			// Without this record a subsequent abort failure would leave an
+			// orphan nobody can retry — surface it loudly.
+			e.logger.Error("executor: record durable multipart abort intent failed",
+				zap.String("task_id", task.ID),
+				zap.String("upload_id", task.UploadID),
+				zap.Error(err))
+		}
+	}
+
+	actx, cancel := context.WithTimeout(ctx, e.abortTimeout)
+	defer cancel()
+	if err := e.abandon(actx, task); err != nil {
+		e.logger.Warn("executor: abort of abandoned multipart upload failed; the durable abort record will be retried",
 			zap.String("task_id", task.ID),
 			zap.String("upload_id", task.UploadID),
 			zap.Error(err))
 		return
 	}
+	if e.queue != nil {
+		if err := e.queue.DeleteMultipartAbort(ctx, task.UploadID); err != nil {
+			e.logger.Warn("executor: remove durable abort record after successful abort",
+				zap.String("task_id", task.ID),
+				zap.String("upload_id", task.UploadID),
+				zap.Error(err))
+		}
+	}
 	e.logger.Info("executor: aborted multipart upload of abandoned task",
 		zap.String("task_id", task.ID),
 		zap.String("upload_id", task.UploadID))
+}
+
+// runAbortWorker drains the durable multipart-abort outbox until shutdown. It
+// exists because a best-effort abort is not enough: MinIO may be unreachable
+// at abandonment time, and no ILM rule backstop exists on current MinIO builds
+// (IC-3 ③) — the durable record plus this retrying worker is the last line of
+// defence against unbounded part leaks.
+func (e *Executor) runAbortWorker(ctx context.Context) {
+	defer e.wg.Done()
+	ticker := time.NewTicker(e.abortPoll)
+	defer ticker.Stop()
+	for {
+		e.drainAbortOutbox(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-e.stopCh:
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// drainAbortOutbox attempts every due abort record, each under the abort
+// timeout. Success (or a confirmed NoSuchUpload, tolerated by the abandon
+// implementation) deletes the record; failure schedules the next attempt with
+// the shared backoff ladder.
+func (e *Executor) drainAbortOutbox(ctx context.Context) {
+	if e.abandon == nil {
+		// No hook configured: keep the records (identity stays retryable),
+		// warn so the missing ConfigureAbandon is visible in logs.
+		e.logger.Warn("executor: multipart abort records pending but no abandon hook configured")
+		return
+	}
+	entries, err := e.queue.DueMultipartAborts(ctx, time.Now(), 100)
+	if err != nil {
+		e.logger.Warn("executor: list due multipart aborts", zap.Error(err))
+		return
+	}
+	for _, entry := range entries {
+		task := &queue.UploadTask{
+			ID:          entry.TaskID,
+			Bucket:      entry.Bucket,
+			StoragePath: entry.StoragePath,
+			UploadID:    entry.UploadID,
+		}
+		actx, cancel := context.WithTimeout(ctx, e.abortTimeout)
+		err := e.abandon(actx, task)
+		cancel()
+		if err == nil {
+			if derr := e.queue.DeleteMultipartAbort(ctx, entry.UploadID); derr != nil {
+				e.logger.Warn("executor: remove durable abort record after successful abort",
+					zap.String("upload_id", entry.UploadID), zap.Error(derr))
+			}
+			e.logger.Info("executor: aborted multipart upload from the durable abort record",
+				zap.String("task_id", entry.TaskID),
+				zap.String("upload_id", entry.UploadID),
+				zap.Int("attempts", entry.Attempts))
+			continue
+		}
+		next := time.Now().Add(e.abortBackoffDelay(entry.Attempts))
+		if rerr := e.queue.RecordMultipartAbortAttempt(ctx, entry.UploadID, next, err.Error()); rerr != nil && !errors.Is(rerr, queue.ErrTaskNotFound) {
+			e.logger.Warn("executor: record abort retry timer", zap.String("upload_id", entry.UploadID), zap.Error(rerr))
+		}
+		e.logger.Warn("executor: durable multipart abort failed, scheduled for retry",
+			zap.String("task_id", entry.TaskID),
+			zap.String("upload_id", entry.UploadID),
+			zap.Time("next_attempt", next),
+			zap.Error(err))
+	}
+}
+
+// abortBackoffDelay returns the wait before the next abort retry. attempts is
+// the number of failed attempts so far (0 → first retry uses the first delay).
+// It shares the executor's retry ladder (and thus its test overrides).
+func (e *Executor) abortBackoffDelay(attempts int) time.Duration {
+	idx := attempts
+	if idx >= len(e.retryDelays) {
+		idx = len(e.retryDelays) - 1
+	}
+	return e.retryDelays[idx]
 }
 
 // handleFailure marks a task as failed and re-queues it with exponential
@@ -304,7 +448,14 @@ func (e *Executor) abandonTaskUpload(ctx context.Context, task *queue.UploadTask
 // in-flight multipart upload: a task that will never be retried again must not
 // keep uploading parts on MinIO. A task that is merely awaiting backoff keeps
 // its upload ID so the retry resumes rather than restarts.
-func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
+//
+// The backoff schedule is PERSISTED (IC-3 P1-d): MarkFailed stamps
+// next_retry_at, so a process that exits during the backoff window recovers
+// the task at startup (recoverFailedTasks) instead of losing it — the old
+// in-memory-only retry goroutine left failed rows dead across restarts, their
+// uploads neither resumed nor aborted. Abandoned tasks (give-up, terminal)
+// are stamped with the never-retry sentinel so no restart resurrects them.
+func (e *Executor) handleFailure(ctx context.Context, task *queue.UploadTask, err error) {
 	e.logger.Warn("executor: task failed",
 		zap.String("task_id", task.ID),
 		zap.String("path", task.LocalPath),
@@ -318,14 +469,12 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 			zap.String("path", task.LocalPath),
 			zap.Error(err),
 		)
-		_ = e.queue.MarkFailed(task.ID, err.Error())
+		_ = e.queue.MarkFailed(ctx, task.ID, err.Error(), time.Time{})
 		task.RetryCount++
 		e.abandonTaskUpload(context.Background(), task)
 		e.persistResult(context.Background(), task, nil, err)
 		return
 	}
-
-	_ = e.queue.MarkFailed(task.ID, err.Error())
 
 	newRetry := task.RetryCount + 1
 	if newRetry >= e.retryMax {
@@ -333,17 +482,26 @@ func (e *Executor) handleFailure(task *queue.UploadTask, err error) {
 			zap.String("task_id", task.ID),
 			zap.String("path", task.LocalPath),
 		)
+		_ = e.queue.MarkFailed(ctx, task.ID, err.Error(), time.Time{})
 		task.RetryCount = newRetry
 		e.abandonTaskUpload(context.Background(), task)
 		e.persistResult(context.Background(), task, nil, err)
 		return
 	}
 
+	// Stamp the persisted retry schedule before arming the in-memory timer:
+	// the timer is an optimisation, the DB row is the truth (IC-3 P1-d).
 	delay := e.retryDelay(newRetry)
+	nextRetryAt := time.Now().Add(delay)
+	if merr := e.queue.MarkFailed(ctx, task.ID, err.Error(), nextRetryAt); merr != nil {
+		e.logger.Warn("executor: stamp persisted retry schedule",
+			zap.String("task_id", task.ID), zap.Error(merr))
+	}
 	e.logger.Info("executor: scheduling retry",
 		zap.String("task_id", task.ID),
 		zap.Int("attempt", newRetry),
 		zap.Duration("delay", delay),
+		zap.Time("next_retry_at", nextRetryAt),
 	)
 
 	// Add to the WaitGroup before starting the goroutine: calling Add inside the
@@ -386,4 +544,88 @@ func (e *Executor) retryDelay(attempt int) time.Duration {
 		idx = len(e.retryDelays) - 1
 	}
 	return e.retryDelays[idx]
+}
+
+// recoverFailedTasks re-queues tasks that were awaiting a backoff retry when
+// the previous process exited (IC-3 P1-d). The retry schedule is persisted in
+// next_retry_at (stamped by handleFailure), so recovery reads it instead of
+// trusting memory: tasks already due (or with no schedule — legacy rows)
+// become pending immediately; still-future schedules are armed as in-memory
+// timers that flip the row when due. Failed tasks carrying an in-flight
+// multipart upload keep their upload ID — the re-queued attempt RESUMES it;
+// nothing is aborted here.
+//
+// Abandoned tasks are deliberately NOT resurrected: rows stamped with the
+// never-retry sentinel (give-up / terminal failure) had their upload aborted
+// at abandonment time, and re-running them on every restart would loop
+// forever on a verdict that will not change. The retry-count guard below is
+// belt-and-braces for rows written by older builds without the sentinel.
+func (e *Executor) recoverFailedTasks(ctx context.Context) {
+	failed, err := e.queue.ListByStatus(queue.StatusFailed)
+	if err != nil {
+		e.logger.Error("executor: recover failed tasks", zap.Error(err))
+		return
+	}
+	now := time.Now()
+	recovered := 0
+	for _, t := range failed {
+		if t.RetryCount >= e.retryMax || t.NextRetryAt == queue.NextRetryNever {
+			continue
+		}
+		due := now
+		if t.NextRetryAt > 0 {
+			due = time.Unix(t.NextRetryAt, 0)
+		}
+		if !due.After(now) {
+			if err := e.queue.UpdateStatus(t.ID, queue.StatusPending); err != nil {
+				if !errors.Is(err, queue.ErrTaskNotFound) {
+					e.logger.Warn("executor: recover failed task",
+						zap.String("task_id", t.ID), zap.Error(err))
+				}
+				continue
+			}
+			recovered++
+			e.signalWorkers()
+			continue
+		}
+		e.scheduleFailedRequeue(t, due)
+	}
+	if recovered > 0 {
+		e.logger.Info("executor: recovered failed tasks from a previous process",
+			zap.Int("task_count", recovered))
+	}
+}
+
+// scheduleFailedRequeue flips a failed task to pending once its persisted
+// next_retry_at passes. The timer survives only this process (like the old
+// retry goroutine) — but the schedule itself is durable, so if the process
+// exits again the next startup recovers from the row.
+func (e *Executor) scheduleFailedRequeue(t *queue.UploadTask, due time.Time) {
+	e.retryWg.Add(1)
+	go func() {
+		defer e.retryWg.Done()
+		timer := time.NewTimer(time.Until(due))
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-e.stopCh:
+			return
+		}
+		if err := e.queue.UpdateStatus(t.ID, queue.StatusPending); err != nil {
+			if !errors.Is(err, queue.ErrTaskNotFound) {
+				e.logger.Warn("executor: re-queue recovered task",
+					zap.String("task_id", t.ID), zap.Error(err))
+			}
+			return
+		}
+		e.signalWorkers()
+	}()
+}
+
+// signalWorkers wakes one worker non-blockingly.
+func (e *Executor) signalWorkers() {
+	select {
+	case e.notify <- struct{}{}:
+	default:
+	}
 }

@@ -212,6 +212,14 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 	return result, nil
 }
 
+// isNoSuchUpload reports whether err is (or wraps) a MinIO NoSuchUpload
+// response: the referenced multipart upload is confirmed gone (already
+// completed, aborted or expired), so there is nothing left to clean up.
+func isNoSuchUpload(err error) bool {
+	var resp minio.ErrorResponse
+	return errors.As(err, &resp) && resp.Code == "NoSuchUpload"
+}
+
 // AbandonUpload aborts the in-flight multipart upload recorded on task, if
 // any. It is called when a task is given up on — retry budget exhausted,
 // terminal failure, or queue eviction — because a multipart upload that will
@@ -221,9 +229,11 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 //
 // Tolerated as success: NoSuchUpload, i.e. the upload was already completed,
 // aborted or expired — in every case there is nothing left to clean up. Any
-// other error is returned so the caller can log it; the bucket's
-// AbortIncompleteMultipartUpload ILM rule remains the backstop for aborts that
-// could not be delivered.
+// other error is returned so the caller can log and RETRY it: note that on the
+// current MinIO builds the bucket's AbortIncompleteMultipartUpload ILM rule is
+// NOT a reliable backstop (IC-3 ③: the action is rejected outright, or silently
+// stripped alongside Expiration), so a failed abort must keep a retryable local
+// identity — the executor's durable abort record (IC-3 P2) provides it.
 func (u *Uploader) AbandonUpload(ctx context.Context, task *queue.UploadTask) error {
 	if task == nil || task.UploadID == "" {
 		return nil
@@ -232,8 +242,7 @@ func (u *Uploader) AbandonUpload(ctx context.Context, task *queue.UploadTask) er
 	if err == nil {
 		return nil
 	}
-	var resp minio.ErrorResponse
-	if errors.As(err, &resp) && resp.Code == "NoSuchUpload" {
+	if isNoSuchUpload(err) {
 		return nil
 	}
 	return fmt.Errorf("uploader: abort multipart upload %q of %q: %w",

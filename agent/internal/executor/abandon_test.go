@@ -54,7 +54,7 @@ func TestExecutor_AbortsOnGiveUp(t *testing.T) {
 
 	e := New(1, q, failUploader, zap.NewNop(), 0)
 	require.NoError(t, e.ConfigureAbandon(rec.abandon))
-	e.handleFailure(task, fmt.Errorf("boom"))
+	e.handleFailure(context.Background(), task, fmt.Errorf("boom"))
 	task.RetryCount = maxRetries // handleFailure mutated its copy
 
 	require.Equal(t, int32(1), rec.calls.Load(),
@@ -69,7 +69,7 @@ func TestExecutor_AbortsOnTerminalFailure(t *testing.T) {
 	task := abandonTask(t, q)
 	e := New(1, q, failUploader, zap.NewNop(), 0)
 	require.NoError(t, e.ConfigureAbandon(rec.abandon))
-	e.handleFailure(task, fmt.Errorf("%w: still AccessDenied", ErrTerminalUpload))
+	e.handleFailure(context.Background(), task, fmt.Errorf("%w: still AccessDenied", ErrTerminalUpload))
 
 	require.Equal(t, int32(1), rec.calls.Load(),
 		"terminal upload failure must abort the in-flight multipart upload")
@@ -85,7 +85,7 @@ func TestExecutor_NoAbortWhileRetryScheduled(t *testing.T) {
 	e := New(1, q, failUploader, zap.NewNop(), 0)
 	e.retryDelays = []time.Duration{time.Hour} // keep the retry pending
 	require.NoError(t, e.ConfigureAbandon(rec.abandon))
-	e.handleFailure(task, fmt.Errorf("boom"))
+	e.handleFailure(context.Background(), task, fmt.Errorf("boom"))
 
 	time.Sleep(100 * time.Millisecond)
 	assert.Zero(t, rec.calls.Load(),
@@ -113,7 +113,7 @@ func TestExecutor_AbortsOnEviction(t *testing.T) {
 	// A failed task awaiting backoff carries a live upload ID; capacity
 	// eviction dropping it orphans that upload unless it is aborted.
 	task := abandonTask(t, q)
-	require.NoError(t, q.MarkFailed(task.ID, "boom"))
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Time{}))
 
 	e := New(1, q, successUploader, zap.NewNop(), 0)
 	e.queueMaxSize = 1
@@ -139,10 +139,45 @@ func TestExecutor_AbortHookErrorIsNonFatal(t *testing.T) {
 		return errors.New("minio unreachable")
 	}))
 	// Give-up proceeds even when the abort fails; the orphan falls back to ILM.
-	assert.NotPanics(t, func() { e.handleFailure(task, fmt.Errorf("boom")) })
+	assert.NotPanics(t, func() { e.handleFailure(context.Background(), task, fmt.Errorf("boom")) })
 }
 
 func TestExecutor_ConfigureAbandonRejectsNil(t *testing.T) {
 	e := New(1, newTestQueue(t), successUploader, zap.NewNop(), 0)
 	require.Error(t, e.ConfigureAbandon(nil))
+}
+
+// TestExecutor_DedupCompleteAbortsOrphanedUpload pins the P1-b fix: `completed`
+// is NOT only reached via CompleteMultipartUpload. Task A uploads part of a
+// multipart and fails; task B (the dedup guard does not block against failed
+// rows) completes the same file version; A retries, hits the dedup check and is
+// marked completed — while its upload ID still owns an in-flight MinIO upload
+// that must be aborted, or it leaks without bound.
+func TestExecutor_DedupCompleteAbortsOrphanedUpload(t *testing.T) {
+	q := newTestQueue(t)
+	rec := &abandonRecorder{}
+
+	// Task A: partial multipart upload, then failed — the upload ID stays on
+	// the row exactly as multipart.go persisted it.
+	task := abandonTask(t, q)
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Time{}))
+
+	// Task B completed the same file version: dedup state exists, so A's
+	// processTask now takes the dedup shortcut to completed.
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID:         "pf-" + task.ID,
+		RuleID:     task.RuleID,
+		LocalPath:  task.LocalPath,
+		FileSize:   task.FileSize,
+		FileMtime:  task.FileMtime,
+		UploadedAt: time.Now().Unix(),
+	}))
+
+	e := New(1, q, successUploader, zap.NewNop(), 0)
+	require.NoError(t, e.ConfigureAbandon(rec.abandon))
+	e.processTask(context.Background(), task)
+
+	require.Equal(t, int32(1), rec.calls.Load(),
+		"marking a dedup-duplicate completed must abort its still-live multipart upload")
+	assert.Equal(t, "upload-live-1", rec.lastUploadID.Load())
 }

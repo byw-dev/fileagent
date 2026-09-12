@@ -298,6 +298,87 @@ func TestUploadFile_Multipart_ResumeAfterCrash(t *testing.T) {
 	assert.Equal(t, "etag-multi", result.ETag)
 }
 
+// TestUploadFile_Multipart_FirstPersistFailsAborts pins the P1-c fix: when the
+// FIRST SaveMultipartProgress after NewMultipartUpload fails (here: the task
+// row is gone, ErrTaskNotFound), the just-created upload must be ABORTED and
+// the attempt must fail. The old behaviour only logged and kept uploading — a
+// crash from that point left an upload whose ID existed nowhere, permanently
+// untracked: exactly the leak this PR claims to close.
+func TestUploadFile_Multipart_FirstPersistFailsAborts(t *testing.T) {
+	dir := t.TempDir()
+	size := 2 * 1024 * 1024
+	path := filepath.Join(dir, "persistfail.dat")
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("G"), size), 0o644))
+
+	store := &mockStore{}
+	q := newTestQueue(t)
+	// The task carries an ID that was never enqueued: SaveMultipartProgress
+	// deterministically returns ErrTaskNotFound on the first persist.
+	task := newTask(t, path, "bucket9", "persistfail/file.dat")
+	task.ID = "task-never-enqueued"
+
+	u := newWithStore(store, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	_, err := u.UploadFile(context.Background(), task)
+	require.Error(t, err, "a failed first persist must fail the attempt, not continue uploading")
+	assert.Equal(t, 1, store.initCalls)
+	assert.Equal(t, 1, store.abortCalls,
+		"the freshly initiated upload must be aborted when its first persist fails")
+	assert.Zero(t, store.uploadCalls, "no part may be uploaded after a failed first persist")
+	assert.Zero(t, store.completeCalls)
+}
+
+// The non-NotFound variant: a broken queue (closed DB) fails the first persist
+// the same way — abort and fail, not log-and-continue.
+func TestUploadFile_Multipart_FirstPersistDatabaseErrorAborts(t *testing.T) {
+	dir := t.TempDir()
+	size := 2 * 1024 * 1024
+	path := filepath.Join(dir, "persistdbfail.dat")
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("G"), size), 0o644))
+
+	store := &mockStore{}
+	q := newTestQueue(t)
+	task := newTask(t, path, "bucket9", "persistdbfail/file.dat")
+	require.NoError(t, q.Enqueue(task))
+	require.NoError(t, q.Close())
+
+	u := newWithStore(store, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	_, err := u.UploadFile(context.Background(), task)
+	require.Error(t, err, "a failed first persist must fail the attempt, not continue uploading")
+	assert.Equal(t, 1, store.abortCalls,
+		"the freshly initiated upload must be aborted when its first persist fails")
+	assert.Zero(t, store.uploadCalls)
+}
+
+// TestUploadFile_Multipart_ProgressPersistFailureTolerated pins the deliberate
+// policy asymmetry: once the upload ID is durably persisted, a per-part
+// progress write failure must NOT abort the transfer — the ID is already on
+// disk, and the next attempt reconciles the true remote state via
+// ListObjectParts. (The first persist is the one that must be fatal — see
+// TestUploadFile_Multipart_FirstPersistFailsAborts.)
+func TestUploadFile_Multipart_ProgressPersistFailureTolerated(t *testing.T) {
+	dir := t.TempDir()
+	size := 2 * 1024 * 1024
+	path := filepath.Join(dir, "partpersist.dat")
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("H"), size), 0o644))
+
+	store := &mockStore{failOnPart: 2}
+	q := newTestQueue(t)
+	task := newTask(t, path, "bucket9", "partpersist/file.dat")
+	require.NoError(t, q.Enqueue(task))
+
+	u := newWithStore(store, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	_, err := u.UploadFile(context.Background(), task)
+	require.Error(t, err, "part 2 must fail (precondition)")
+
+	// Part 1 was uploaded and its progress persisted; the upload ID is durable.
+	rows, err := q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.NotEmpty(t, rows[0].UploadID, "part-1 progress (incl. upload ID) must be persisted")
+	assert.Zero(t, store.abortCalls,
+		"mid-transfer persist failures must not abort a durable, resumable upload")
+}
+
 func TestUploadFile_FileMissing(t *testing.T) {
 	store := &mockStore{}
 	q := newTestQueue(t)
@@ -521,11 +602,12 @@ func TestAbandonUpload_PropagatesOtherErrors(t *testing.T) {
 	assert.Contains(t, err.Error(), "network down")
 }
 
-// TestUploadFile_Multipart_ResumeVerifyFails starts fresh without aborting:
-// verifyRemoteParts may fail transiently (e.g. network down) and the recorded
-// upload may still be resumable, so a failed verification must NOT abort it —
-// the next attempt reconciles again (IC-3 ② deliberately keeps this path
-// abort-free).
+// TestUploadFile_Multipart_ResumeVerifyFails pins the P1-a fix: a transient
+// verifyRemoteParts failure (e.g. a network blip on ListObjectParts) must fail
+// the attempt while KEEPING the recorded upload ID. The old behaviour started a
+// fresh multipart and overwrote the SQLite upload ID on ANY list error — the
+// old upload was neither aborted nor referenced any more, so a single network
+// jitter manufactured one permanent orphan per occurrence.
 func TestUploadFile_Multipart_ResumeVerifyFails(t *testing.T) {
 	dir := t.TempDir()
 	size := 2 * 1024 * 1024
@@ -546,14 +628,61 @@ func TestUploadFile_Multipart_ResumeVerifyFails(t *testing.T) {
 	require.Len(t, rows, 1)
 	restarted := rows[0]
 	require.NotEmpty(t, restarted.UploadID, "precondition: progress persisted")
+	oldUploadID := restarted.UploadID
 
-	// Second attempt: ListObjectParts fails (transient outage), but the abort
-	// hook must not be consulted here — the upload is abandoned via a fresh
-	// initiation only because verification failed.
+	// Second attempt: ListObjectParts fails transiently (minio unreachable).
+	// The attempt must fail — not silently start a fresh upload that would
+	// orphan the recorded one.
 	store2 := &mockStore{listErr: fmt.Errorf("minio unreachable"), uploadID: restarted.UploadID}
 	u2 := newWithStore(store2, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
 	_, err = u2.UploadFile(context.Background(), restarted)
-	require.NoError(t, err, "verification failure falls back to a fresh upload")
+	require.Error(t, err, "a transient reconciliation failure must fail the attempt, not start fresh")
+	assert.Zero(t, store2.initCalls,
+		"must not initiate a new multipart upload while the recorded one may still be resumable")
 	assert.Zero(t, store2.abortCalls,
 		"a resumable upload must not be aborted just because the remote check failed")
+	assert.Zero(t, store2.uploadCalls, "no parts may be uploaded on a failed verification")
+
+	// The SQLite row must still carry the OLD upload id: the only reference to
+	// the in-flight remote upload survives for the retry to resume.
+	rows, err = q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, oldUploadID, rows[0].UploadID,
+		"the recorded upload id must survive a transient verification failure")
+}
+
+// TestUploadFile_Multipart_ResumeNoSuchUploadStartsFresh is the other half of
+// P1-a: only a CONFIRMED NoSuchUpload (the upload was completed, aborted or
+// expired) may clear the recorded state and start a fresh multipart — and the
+// fresh initiation then overwrites the stale upload id in SQLite.
+func TestUploadFile_Multipart_ResumeNoSuchUploadStartsFresh(t *testing.T) {
+	dir := t.TempDir()
+	size := 2 * 1024 * 1024
+	path := filepath.Join(dir, "nosuchupload.dat")
+	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("F"), size), 0o644))
+
+	q := newTestQueue(t)
+	task := newTask(t, path, "bucket8", "nosuchupload/file.dat")
+	task.UploadID = "gone-upload-id"
+	task.CompletedParts = `{"parts":[{"part_number":1,"etag":"part-etag-1"}]}`
+	require.NoError(t, q.Enqueue(task))
+
+	store := &mockStore{listErr: minio.ErrorResponse{Code: "NoSuchUpload"}}
+	u := newWithStore(store, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	_, err := u.UploadFile(context.Background(), task)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, store.initCalls,
+		"a confirmed NoSuchUpload must start a fresh multipart upload")
+	assert.Equal(t, 1, store.completeCalls)
+	assert.Equal(t, 0, store.abortCalls, "there is nothing left to abort")
+
+	rows, err := q.ListByStatus(queue.StatusPending)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, store.uploadID, rows[0].UploadID,
+		"the fresh upload id must replace the stale one in SQLite")
+	assert.NotEqual(t, "gone-upload-id", rows[0].UploadID,
+		"the stale upload id must not survive the fresh initiation")
 }

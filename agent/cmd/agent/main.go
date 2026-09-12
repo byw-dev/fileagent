@@ -176,12 +176,14 @@ func main() {
 		)
 	}, logger, cfg.Upload.QueueMaxSize)
 
-	// Terminal-state multipart cleanup (IC-3 ②): when the executor gives up on
-	// a task (retry budget exhausted, terminal failure, or eviction), the
-	// in-flight MinIO multipart upload recorded on it must be aborted or its
-	// uploaded parts leak without bound. Best effort — uses the currently held
-	// STS session; without credentials the abort is left to the bucket's
-	// AbortIncompleteMultipartUpload ILM rule.
+// Terminal-state multipart cleanup (IC-3 ②): when the executor gives up on
+// a task (dedup-completion, retry budget exhausted, terminal failure, or
+// eviction), the in-flight MinIO multipart upload recorded on it must be
+// aborted or its uploaded parts leak without bound. Best effort — uses the
+// currently held STS session. Note: the bucket's AbortIncompleteMultipartUpload
+// ILM rule is NOT a reliable backstop on current MinIO builds (IC-3 ③: the
+// action is rejected, or silently stripped next to an Expiration rule) — a
+// failed abort is retried from the executor's durable abort outbox instead.
 	if err := exec.ConfigureAbandon(func(ctx context.Context, task *queue.UploadTask) error {
 		ucfg := creds.Current()
 		if ucfg == nil {

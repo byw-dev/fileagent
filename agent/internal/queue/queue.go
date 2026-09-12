@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS upload_tasks (
     sha256         TEXT,
     status         TEXT    NOT NULL DEFAULT 'pending',
     retry_count    INTEGER NOT NULL DEFAULT 0,
+    next_retry_at  INTEGER NOT NULL DEFAULT 0,
     last_error     TEXT,
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL,
@@ -53,6 +54,23 @@ CREATE TABLE IF NOT EXISTS processed_files (
     sha256      TEXT,
     uploaded_at INTEGER NOT NULL,
     UNIQUE (rule_id, local_path)
+);
+
+-- Durable record of a MinIO multipart upload that must be aborted (IC-3 ②/P2).
+-- Written BEFORE the owning task row is deleted or marked final so the abort
+-- always keeps a retryable local identity; drained by the executor's abort
+-- worker with backoff. There is no reliable AbortIncompleteMultipartUpload ILM
+-- backstop on current MinIO builds (IC-3 ③), so this table is the safety net
+-- for aborts that fail.
+CREATE TABLE IF NOT EXISTS multipart_abort_outbox (
+    upload_id       TEXT PRIMARY KEY,
+    task_id         TEXT NOT NULL,
+    bucket          TEXT NOT NULL,
+    storage_path    TEXT NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS rules (
@@ -82,6 +100,7 @@ CREATE INDEX IF NOT EXISTS idx_processed_files_rule
 var schemaMigrations = []string{
 	`ALTER TABLE upload_tasks ADD COLUMN file_offset INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN append_mode TEXT NOT NULL DEFAULT 'overwrite'`,
+	`ALTER TABLE upload_tasks ADD COLUMN next_retry_at INTEGER NOT NULL DEFAULT 0`,
 }
 
 // Status values for upload tasks.
@@ -92,6 +111,13 @@ const (
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
 )
+
+// NextRetryNever marks a failed task as abandoned — no further retry is
+// scheduled for it, across restarts included. It is stamped when a task is
+// given up on (retry budget exhausted, terminal failure): its in-flight
+// multipart upload was aborted at that moment, and resurrecting it on every
+// process restart would loop forever on a verdict that will not change.
+const NextRetryNever = -1
 
 // ErrTaskNotFound is returned by mutating operations (UpdateStatus, MarkFailed)
 // when no task matches the given id — typically because the row was already
@@ -111,9 +137,14 @@ type UploadTask struct {
 	FileSize       int64
 	FileMtime      int64
 	SHA256         string
-	Status         string
+Status         string
 	RetryCount     int
-	LastError      string
+	// NextRetryAt is the unix time (seconds) when a failed task becomes
+	// eligible for re-queueing (IC-3 P1-d). Zero means "no schedule recorded"
+	// (legacy rows, or a task never failed) and is treated as due; a negative
+	// value (NextRetryNever) means the task was abandoned — never re-queue it.
+	NextRetryAt  int64
+	LastError    string
 	CreatedAt      int64
 	UpdatedAt      int64
 	// FileOffset is the byte offset from which to begin uploading in tail mode.
@@ -312,43 +343,79 @@ func (q *Queue) CountActive() (int, error) {
 // prevents deleting an in-flight task and orphaning its upload. Retries are
 // bounded; if the queue is churning too hard to settle on a victim it returns
 // (nil, nil), which the caller treats as "nothing evictable".
+//
+// Evicting a task whose multipart upload is still in flight (upload_id set)
+// writes a durable abort record in the SAME transaction as the delete, BEFORE
+// the row is removed (IC-3 ②/P2): once the row is gone no retry would ever
+// find the upload identity again, and the best-effort abort at the call site
+// can fail (MinIO unreachable). The abort record is what makes the eviction's
+// cleanup retryable — there is no ILM backstop on current MinIO builds.
 func (q *Queue) DeleteOldestEvictable(excludeID string) (*UploadTask, error) {
 	const maxAttempts = 8
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		rows, err := q.db.Query(`
+		tx, err := q.db.Begin()
+		if err != nil {
+			return nil, fmt.Errorf("queue: begin eviction transaction: %w", err)
+		}
+		rows, err := tx.Query(`
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
-               retry_count, last_error, created_at, updated_at,
+               retry_count, next_retry_at, last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
         WHERE status IN (?, ?) AND id != ?
         ORDER BY created_at ASC
         LIMIT 1`, StatusPending, StatusFailed, excludeID)
 		if err != nil {
+			_ = tx.Rollback()
 			return nil, fmt.Errorf("queue: select oldest evictable: %w", err)
 		}
 		tasks, err := scanTasks(rows)
-		_ = rows.Close() // release the single connection before the DELETE below
+		_ = rows.Close() // release the connection before the DELETE below
 		if err != nil {
+			_ = tx.Rollback()
 			return nil, err
 		}
 		if len(tasks) == 0 {
+			_ = tx.Rollback()
 			return nil, nil
 		}
 		t := tasks[0]
+		// Durable abort record FIRST, inside the same transaction as the
+		// delete: if the DELETE commits, the record commits with it. An
+		// aborted-but-unreachable MinIO then still leaves a retryable
+		// identity behind instead of a permanently untracked orphan.
+		if t.UploadID != "" {
+			if _, err := tx.Exec(`
+                INSERT INTO multipart_abort_outbox
+                    (upload_id, task_id, bucket, storage_path, attempts, next_attempt_at, last_error, created_at)
+                VALUES (?,?,?,?,0,0,NULL,?)
+                ON CONFLICT(upload_id) DO NOTHING`,
+				t.UploadID, t.ID, t.Bucket, t.StoragePath, time.Now().Unix(),
+			); err != nil {
+				_ = tx.Rollback()
+				return nil, fmt.Errorf("queue: record abort of evicted task %q: %w", t.ID, err)
+			}
+		}
 		// Guard the DELETE with the status filter: if the row transitioned to
 		// "running" since the SELECT, this removes nothing and we retry.
-		res, err := q.db.Exec(
+		res, err := tx.Exec(
 			`DELETE FROM upload_tasks WHERE id=? AND status IN (?, ?)`,
 			t.ID, StatusPending, StatusFailed,
 		)
 		if err != nil {
+			_ = tx.Rollback()
 			return nil, fmt.Errorf("queue: delete oldest evictable %q: %w", t.ID, err)
 		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			return t, nil
+		if n, _ := res.RowsAffected(); n == 0 {
+			// Row changed state under us; try the next-oldest evictable task.
+			_ = tx.Rollback()
+			continue
 		}
-		// Row changed state under us; try the next-oldest evictable task.
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("queue: commit eviction of %q: %w", t.ID, err)
+		}
+		return t, nil
 	}
 	return nil, nil
 }
@@ -359,7 +426,7 @@ func (q *Queue) DequeuePending(limit int) ([]*UploadTask, error) {
 	rows, err := q.db.Query(`
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
-               retry_count, last_error, created_at, updated_at,
+               retry_count, next_retry_at, last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
         WHERE status = ?
@@ -416,7 +483,7 @@ func (q *Queue) ResetRunningToPending(ctx context.Context) (int64, error) {
 	rows, err := tx.QueryContext(ctx, `
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
-               retry_count, last_error, created_at, updated_at,
+               retry_count, next_retry_at, last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
         WHERE status = ?
@@ -506,15 +573,23 @@ func (q *Queue) UpdateStatus(id, status string) error {
 	return nil
 }
 
-// MarkFailed increments retry_count, records the last error message, and sets
-// the task status to "failed". Call UpdateStatus with StatusPending to re-queue
-// the task for a subsequent retry attempt.
-func (q *Queue) MarkFailed(id, errMsg string) error {
-	res, err := q.db.Exec(`
+// MarkFailed increments retry_count, records the last error message, sets the
+// task status to "failed", and stamps next_retry_at — the persisted retry
+// schedule (IC-3 P1-d), so a process that exits during the backoff window can
+// recover the task at startup instead of losing it forever. A zero nextRetryAt
+// stamps NextRetryNever: the caller gave up on the task (retry budget
+// exhausted or terminal failure), so no restart may resurrect it. Call
+// UpdateStatus with StatusPending to re-queue the task for the next attempt.
+func (q *Queue) MarkFailed(ctx context.Context, id, errMsg string, nextRetryAt time.Time) error {
+	stamp := int64(NextRetryNever)
+	if !nextRetryAt.IsZero() {
+		stamp = nextRetryAt.Unix()
+	}
+	res, err := q.db.ExecContext(ctx, `
         UPDATE upload_tasks
-        SET status=?, retry_count=retry_count+1, last_error=?, updated_at=?
+        SET status=?, retry_count=retry_count+1, next_retry_at=?, last_error=?, updated_at=?
         WHERE id=?`,
-		StatusFailed, errMsg, time.Now().Unix(), id,
+		StatusFailed, stamp, errMsg, time.Now().Unix(), id,
 	)
 	if err != nil {
 		return fmt.Errorf("queue: mark failed %q: %w", id, err)
@@ -530,7 +605,7 @@ func (q *Queue) ListByStatus(status string) ([]*UploadTask, error) {
 	rows, err := q.db.Query(`
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
-               retry_count, last_error, created_at, updated_at,
+               retry_count, next_retry_at, last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
         WHERE status = ?
@@ -656,7 +731,7 @@ func scanTasks(rows *sql.Rows) ([]*UploadTask, error) {
 		if err := rows.Scan(
 			&t.ID, &t.RuleID, &t.LocalPath, &t.StoragePath, &t.Bucket,
 			&t.UploadID, &t.CompletedParts, &t.FileSize, &t.FileMtime,
-			&t.SHA256, &t.Status, &t.RetryCount, &t.LastError,
+			&t.SHA256, &t.Status, &t.RetryCount, &t.NextRetryAt, &t.LastError,
 			&t.CreatedAt, &t.UpdatedAt,
 			&t.FileOffset, &t.AppendMode,
 		); err != nil {

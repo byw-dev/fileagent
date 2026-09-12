@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync/atomic"
@@ -183,7 +184,7 @@ func TestExecutor_RetryCancelledByStop(t *testing.T) {
 	running, err := q.DequeuePending(1)
 	require.NoError(t, err)
 	require.Len(t, running, 1)
-	e.handleFailure(running[0], fmt.Errorf("boom"))
+	e.handleFailure(context.Background(), running[0], fmt.Errorf("boom"))
 
 	stopDone := make(chan struct{})
 	go func() { e.Stop(); close(stopDone) }()
@@ -214,7 +215,7 @@ func TestExecutor_RequeueFailureAfterCloseWarns(t *testing.T) {
 	running, err := q.DequeuePending(1)
 	require.NoError(t, err)
 	require.Len(t, running, 1)
-	e.handleFailure(running[0], fmt.Errorf("boom"))
+	e.handleFailure(context.Background(), running[0], fmt.Errorf("boom"))
 
 	require.NoError(t, q.Close()) // DB goes away before the retry wakes
 
@@ -438,4 +439,140 @@ func TestExecutor_TerminalUploadError_NoRetry(t *testing.T) {
 		reports, err := q.ListByStatus(queue.StatusReported)
 		return err == nil && len(reports) == 1
 	}, 2*time.Second, 20*time.Millisecond, "terminal failure must produce a success=false report")
+}
+
+// A failure to record the durable abort intent must be surfaced loudly: that
+// record is the only retryable identity left once the task row is gone or
+// final, and silently losing it would manufacture the orphan the whole IC-3
+// mechanism exists to prevent. The direct abort attempt must still run.
+func TestExecutor_AbortRecordWriteFailureWarns(t *testing.T) {
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	e := New(1, q, successUploader, zap.New(core), 0)
+
+	task := abandonTask(t, q)
+	task.RetryCount = maxRetries - 1
+
+	// Only the outbox INSERT fails; the abort itself and everything else
+	// still work.
+	failStatement(t, dsn, "no_abort_record", "INSERT", "multipart_abort_outbox")
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return nil
+	}))
+
+	e.handleFailure(context.Background(), task, fmt.Errorf("boom"))
+
+	assert.NotZero(t, logs.FilterMessage("executor: record durable multipart abort intent failed").Len())
+	assert.NotZero(t, logs.FilterMessage("executor: aborted multipart upload of abandoned task").Len(),
+		"the direct abort still proceeds after a failed record write")
+}
+
+// A broken database must not stop the abort worker: the listing failure is
+// warned and retried on the next tick, never fatal. (The same Start also
+// exercises recoverFailedTasks' own error branch.)
+func TestExecutor_AbortWorkerSurvivesDatabaseError(t *testing.T) {
+	q := newTestQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	e := New(1, q, successUploader, zap.New(core), 0)
+	e.abortPoll = 20 * time.Millisecond
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return nil
+	}))
+
+	require.NoError(t, q.Close())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	e.Start(ctx)
+	e.Stop()
+
+	assert.NotZero(t, logs.FilterMessage("executor: list due multipart aborts").Len())
+	assert.NotZero(t, logs.FilterMessage("executor: recover failed tasks").Len(),
+		"recoverFailedTasks must surface its listing failure")
+}
+
+// When the failed abort attempt cannot be recorded as failed (timer UPDATE
+// broken), the record keeps its old schedule — surfaced as a warning, never
+// silently dropped.
+func TestExecutor_AbortRetryTimerFailureWarns(t *testing.T) {
+	ctx := context.Background()
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	e := New(1, q, successUploader, zap.New(core), 0)
+	e.abortPoll = 20 * time.Millisecond
+
+	require.NoError(t, q.EnqueueMultipartAbort(ctx, &queue.AbortOutboxEntry{
+		UploadID: "upload-timer-1", TaskID: "task-1", Bucket: "b", StoragePath: "k",
+	}))
+	// Installed after the record exists, so the listing SELECT still sees it
+	// and only the attempt-recording UPDATE fails.
+	failStatement(t, dsn, "no_abort_timer", "UPDATE", "multipart_abort_outbox")
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return errors.New("minio unreachable")
+	}))
+
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	e.Start(sctx)
+
+	require.Eventually(t, func() bool {
+		return logs.FilterMessage("executor: record abort retry timer").Len() >= 1
+	}, 3*time.Second, 20*time.Millisecond)
+	e.Stop()
+}
+
+// A successful abort whose record removal fails leaves the record behind —
+// the next drain aborts again (harmless NoSuchUpload) — but the failure must
+// be visible.
+func TestExecutor_AbortRecordDeleteFailureWarns(t *testing.T) {
+	ctx := context.Background()
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	var calls atomic.Int32
+	e := New(1, q, successUploader, zap.New(core), 0)
+	e.abortPoll = 20 * time.Millisecond
+	e.abortTimeout = time.Second
+
+	require.NoError(t, q.EnqueueMultipartAbort(ctx, &queue.AbortOutboxEntry{
+		UploadID: "upload-del-1", TaskID: "task-1", Bucket: "b", StoragePath: "k",
+	}))
+	failStatement(t, dsn, "no_abort_delete", "DELETE", "multipart_abort_outbox")
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		calls.Add(1)
+		return nil
+	}))
+
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	e.Start(sctx)
+
+	require.Eventually(t, func() bool { return calls.Load() >= 1 }, 3*time.Second, 20*time.Millisecond)
+	assert.NotZero(t, logs.FilterMessage("executor: remove durable abort record after successful abort").Len())
+	e.Stop()
+}
+
+// If a recovered task's row is evicted between listing it and its scheduled
+// flip, the flip hits ErrTaskNotFound — an expected outcome that must stay
+// benign (no warning), exactly like the in-memory retry's eviction case.
+func TestExecutor_RecoveredRequeueOfEvictedTaskLogsNoWarning(t *testing.T) {
+	q := newTestQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	e := New(1, q, successUploader, zap.New(core), 0)
+	e.abortPoll = time.Hour
+
+	task := abandonTask(t, q)
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now().Add(300*time.Millisecond)))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	e.Start(ctx)
+
+	// Evict the failed row while recovery's timer is pending.
+	dropped, err := q.DeleteOldestEvictable("")
+	require.NoError(t, err)
+	require.NotNil(t, dropped)
+
+	time.Sleep(500 * time.Millisecond)
+	assert.Zero(t, logs.FilterMessage("executor: re-queue recovered task").Len(),
+		"an evicted row must not surface as a failed recovery")
+	e.Stop()
 }

@@ -30,8 +30,25 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 	if uploadID != "" {
 		doneParts = u.loadCompletedParts(task.CompletedParts)
 		if err := u.verifyRemoteParts(ctx, task, uploadID, &doneParts); err != nil {
-			u.logger.Warn("uploader: cannot verify remote parts, starting fresh",
-				zap.String("task_id", task.ID), zap.Error(err))
+			if !isNoSuchUpload(err) {
+				// P1-a: any OTHER error (timeout, network jitter, 5xx) is
+				// transient — it says nothing about whether the recorded
+				// upload still exists. Starting a fresh multipart here and
+				// overwriting the SQLite upload ID would orphan the old
+				// upload (never aborted, no reference left) — one orphan per
+				// network blip. Fail the attempt instead: the executor's
+				// backoff retries, and the next attempt reconciles again.
+				return nil, fmt.Errorf("uploader: verify remote parts of upload %q: %w", uploadID, err)
+			}
+			// NoSuchUpload is the only error that CONFIRMS the recorded
+			// upload is gone (completed, aborted or expired) — only then is
+			// dropping the recorded state and initiating fresh safe. The
+			// fresh initiation below persists the new upload ID over the
+			// stale one.
+			u.logger.Info("uploader: recorded multipart upload no longer exists, starting fresh",
+				zap.String("task_id", task.ID),
+				zap.String("stale_upload_id", uploadID),
+				zap.Error(err))
 			uploadID = ""
 			doneParts = nil
 		} else if skipped := len(doneParts); skipped > 0 {
@@ -56,10 +73,35 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 		// Persist the initiated upload ID immediately: a crash between this
 		// and the first completed part must still leave a resumable upload ID
 		// behind, not an orphan with no local trace.
+		//
+		// Policy (P1-c): the FIRST persist is deliberately fatal on failure,
+		// unlike the per-part writes below. Until this write succeeds the
+		// upload ID exists NOWHERE else — a crash right now would leave an
+		// untracked orphan (exactly the leak IC-BUG-5 closes), and a row that
+		// vanished (ErrTaskNotFound, evicted) means the task will never
+		// resume. So on failure the fresh upload is aborted here and the
+		// attempt fails; a retry re-initiates cleanly.
+		//
+		// After this persist succeeds the ID is durable: a per-part progress
+		// failure only loses ETag bookkeeping for that one part, and the next
+		// attempt reconciles the authoritative remote state via
+		// ListObjectParts (verifyRemoteParts). Aborting there would needlessly
+		// discard already-uploaded parts — hence the asymmetry.
 		if u.queue != nil {
-			if err := u.queue.SaveMultipartProgress(ctx, task.ID, task.UploadID, ""); err != nil && !errors.Is(err, queue.ErrTaskNotFound) {
-				u.logger.Warn("uploader: persist multipart initiation",
-					zap.String("task_id", task.ID), zap.Error(err))
+			if err := u.queue.SaveMultipartProgress(ctx, task.ID, task.UploadID, ""); err != nil {
+				u.logger.Error("uploader: persist multipart initiation failed, aborting the fresh upload",
+					zap.String("task_id", task.ID),
+					zap.String("upload_id", uploadID), zap.Error(err))
+				// The upload was created seconds ago; a straight abort is the
+				// right call (NoSuchUpload tolerance is unnecessary here, and
+				// clearing task.UploadID first would no-op AbandonUpload).
+				if abortErr := u.store.AbortMultipartUpload(ctx, task.Bucket, task.StoragePath, uploadID); abortErr != nil {
+					u.logger.Error("uploader: abort of the fresh upload after persist failure also failed",
+						zap.String("task_id", task.ID),
+						zap.String("upload_id", uploadID), zap.Error(abortErr))
+				}
+				task.UploadID = ""
+				return nil, fmt.Errorf("uploader: persist multipart initiation of upload %q: %w", uploadID, err)
 			}
 		}
 	}
@@ -107,6 +149,17 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 			// Every completed part is flushed to SQLite here so a retry or a
 			// process restart rescans the real progress instead of empty
 			// values and restarts from part 1.
+			//
+			// Deliberately best-effort (P1-c policy asymmetry, see the first
+			// persist above): the upload ID is already durable after the
+			// initiation persist, so a failure here only loses this part's
+			// ETag bookkeeping — the next attempt reconciles the authoritative
+			// remote state via ListObjectParts and re-uploads only what MinIO
+			// does not have. Known characteristic (documented, deliberate, not
+			// scheduled for a fix): the growing completed_parts JSON blob is
+			// rewritten IN FULL on every part — O(n²) write amplification on
+			// the single SQLite connection, significant only for very large
+			// part counts.
 			if err := u.queue.SaveMultipartProgress(ctx, task.ID, task.UploadID, task.CompletedParts); err != nil && !errors.Is(err, queue.ErrTaskNotFound) {
 				u.logger.Warn("uploader: persist multipart progress",
 					zap.String("task_id", task.ID),
