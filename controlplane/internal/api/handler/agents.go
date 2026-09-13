@@ -747,12 +747,24 @@ func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 // fields that decide the object key (review C2): path_pattern and
 // dest_path_template. This mirrors the agent's reservedTimeMisuse gate, which
 // checks both — checking only dest_path_template here would let the admin
-// create a rule the CP passes but the agent refuses at upload time. The
-// deprecated {time} notice is a hint, not a rejection: existing rules created
-// through the Web UI's old default template must not break. The misuse notice
-// (ValidateReservedTimeUse: bare or non-time-typed reserved word) matches the
-// agent's hard refusal — such rules fail every upload (or silently repurpose
-// the reserved word as an arbitrary string), so the hint names the fix.
+// create a rule the CP passes but the agent refuses at upload time.
+//
+// Deprecated {time}: a hint, not a rejection — existing rules created through
+// the Web UI's old default template must not break. The wording is
+// field-appropriate (review D2): path_pattern parses, dest_path_template only
+// composes — one template for both fields got this wrong.
+//
+// Misuse (ValidateReservedTimeUse: bare or non-time-typed reserved word)
+// matches the agent's hard refusal.
+//
+// Full syntax & timezone validity (review D1): the webui validator only
+// checks kind/basic syntax and cannot be authoritative about IANA zones —
+// measured cross-language gap ({tz=Nope/Bad}, trailing space, repeated |tz=
+// all pass the UI but fail trollsift.New). The CP runs the same New() the
+// agent runs (glob patterns are skipped: they are not trollsift) and reports
+// the error in warnings at save time, so it surfaces here rather than at
+// upload. Refusing the request outright would need a new decision — D-030 §8
+// keeps templates shape-unconstrained.
 func ruleTemplateWarnings(pathPattern, destPathTemplate string) []string {
 	var warnings []string
 	for _, f := range []struct{ field, value string }{
@@ -760,16 +772,33 @@ func ruleTemplateWarnings(pathPattern, destPathTemplate string) []string {
 		{"dest_path_template", destPathTemplate},
 	} {
 		if trollsift.UsesDeprecatedTimeField(f.value) {
-			warnings = append(warnings, f.field+" uses the deprecated reserved word {time}; "+
-				"it still renders (the file's submit-for-upload instant, unless "+f.field+" parses a field with that name — parse results always win), "+
-				"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)")
+			warnings = append(warnings, deprecatedNotice(f.field))
 		}
 		if reason := trollsift.ValidateReservedTimeUse(f.value); reason != "" {
 			warnings = append(warnings, f.field+": "+reason+
 				" — the agent refuses to compose such uploads (task failure, no guessed key)")
 		}
+		if f.field == "path_pattern" && !trollsift.IsTrollsiftPattern(f.value) {
+			continue
+		}
+		if _, err := trollsift.New(f.value); err != nil {
+			warnings = append(warnings, f.field+" is not a valid trollsift pattern; the agent will not compose it: "+err.Error())
+		}
 	}
 	return warnings
+}
+
+// deprecatedNotice wording per field (review D2): the parse-first exception
+// lives on the path_pattern side, so the dest hint references path_pattern.
+func deprecatedNotice(field string) string {
+	if field == "path_pattern" {
+		return "path_pattern uses the deprecated reserved word {time}; " +
+			"it still parses as a time field (parse results always win), " +
+			"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)"
+	}
+	return "dest_path_template uses the deprecated reserved word {time}; " +
+		"it still renders (the file's submit-for-upload instant, unless path_pattern parses a field with that name — parse results always win), " +
+		"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)"
 }
 
 // respondRule writes a rule response, attaching contract warnings for the

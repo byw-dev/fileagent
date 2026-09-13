@@ -165,6 +165,18 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 | `d`、`Nd`、`0Nd`（如 `05d`） | int | `/^d$/`、`/^\d+d$/`、`/^0\d+d$/` | ❌ 拒绝 |
 | 其余（`yyyy`、`MM/dd`、`HH:mm|tz=...` …） | time（LDML） | 其余 | ✅ 唯一合法形态 |
 
+> ⚠️ **等价声明范围（review D1 收窄）**：TS 镜像只覆盖 **kind 判定与基础语法**
+> （括号平衡、变量名非空、`tz=` 非空）。**时区有效性由 Go 侧权威校验**
+> （`time.LoadLocation`，trollsift `New()`）——TS **不做**时区校验：浏览器没有
+> 权威 IANA 数据源，`Intl.supportedValuesOf('timeZone')` 可用性依环境且集合与
+> Go tzdata 不重合；「尾空格」「重复 `|tz=`」则需逐字镜像 Go 的切分逻辑。
+> 实测跨端不等价：`{time:yyyy|tz=Nope/Bad}`、`{time:yyyy|tz=Asia/Shanghai }`、
+> `{time:yyyy|tz=UTC|tz=UTC}` 全部通过 TS、全部被 Go `New()` 拒绝。
+> 因此 **CP 在创建/更新时用 Go `New()` 对 `path_pattern`（仅 trollsift 形态）与
+> `dest_path_template` 做完整校验**（与 agent 同库同判定），失败进 `warnings`
+> （不 422，D-030 第八条）——错误在保存响应可见，而非等到上传时。
+> `ValidateReservedTimeUse` 只管 kind，**不做**时区校验（分工如此，勿混）。
+
 ### 优先级：解析结果 vs 注入值（IC-BUG-50 / D-034，review P1-A/P2-D 修正）
 
 **解析结果优先，注入不覆盖**——对**全部**系统变量与保留字统一成立

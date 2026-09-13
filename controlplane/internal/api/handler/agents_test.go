@@ -686,6 +686,79 @@ func TestAgentsHandler_CreateRule_DeprecatedTimeInPattern_Warns(t *testing.T) {
 	assert.Contains(t, joined, "path_pattern uses the deprecated reserved word")
 }
 
+// Review D1: timezone validity is Go-authoritative (time.LoadLocation inside
+// trollsift.New) — the webui only checks kind/basic syntax and lets these
+// through, so the CP must catch them at save time or the admin only finds out
+// at upload. Measured New() errors: unknown zone, trailing space, repeated tz.
+func TestAgentsHandler_CreateRule_InvalidTimezone_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	for _, tpl := range []string{
+		"{time:yyyy|tz=Nope/Bad}/{filename}",
+		"{time:yyyy|tz=Asia/Shanghai }/{filename}",
+		"{time:yyyy|tz=UTC|tz=UTC}/{filename}",
+	} {
+		body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"` + tpl + `"}`
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		testAgentsRouter(h).ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code, tpl)
+		var resp map[string]interface{}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		warnings, ok := resp["warnings"].([]interface{})
+		require.True(t, ok, "invalid timezone in %s must produce a warnings array", tpl)
+		assert.Contains(t, fmt.Sprint(warnings), "invalid timezone", tpl)
+	}
+	// A valid timezone must not warn (note: {time:...} would legitimately warn as
+// the deprecated alias — use the declared {submit_time} name).
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"{submit_time:yyyy|tz=Asia/Shanghai}/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Nil(t, resp["warnings"], "valid timezone must not warn")
+}
+
+// The same Go-authoritative check covers path_pattern (trollsift patterns
+// only — glob patterns must not be fed to New).
+func TestAgentsHandler_CreateRule_InvalidTimezoneInPattern_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"of/{time:yyyy|tz=Nope/Bad}/{filename}","dest_path_template":"data/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "invalid timezone in path_pattern must produce a warnings array")
+	joined := fmt.Sprint(warnings)
+	assert.Contains(t, joined, "path_pattern is not a valid trollsift pattern")
+	assert.Contains(t, joined, "invalid timezone")
+}
+
+// Review D2: the two fields' deprecation hints must use field-appropriate
+// verbs — dest_path_template does not parse, it only composes.
+func TestAgentsHandler_CreateRule_DeprecatedTime_DestHintDoesNotSayParses(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"{time:yyyy/MM/dd}/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok)
+	assert.NotContains(t, fmt.Sprint(warnings), "dest_path_template parses")
+	assert.NotContains(t, fmt.Sprint(warnings), "dest_path_template still parses")
+}
+
 func TestAgentsHandler_UpdateRule_FullUpdate_DeprecatedTimeTemplate_Warns(t *testing.T) {
 	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
 	body := `{"name":"edited","bucket_id":"` + uuid.New().String() +

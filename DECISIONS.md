@@ -1922,21 +1922,54 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
    任意字符串，V-3 对「`submit_time` = 该文件被提交上传的时刻」的承诺在该规则上
    直接为假，且镜像规则会把错误值传播到另一个别名。
 
-   **存量代价（三轮 review C3 修正——初版漏报了能合成的组合，此处为完整清单）**：
+   **存量代价（四轮 review C3/D3 修正——穷尽全部组合并区分两类性质）**：
+
+   **原先能跑 → 现在失败（真实行为变更，共两行）**：
+
+   | 组合 | 禁令前 | 禁令后 | 实测证据 |
+   |------|--------|--------|----------|
+   | pattern 把保留字解析成 **string/int**（如 `{submit_time:s}`），dest **裸/typed 引用**（`{submit_time}`、`{submit_time:s}`） | **能合成** | **拒绝**（任务失败） | `HELLO/a.csv` |
+   | pattern 把保留字解析成 **string/int**，dest **不引用**（保留字摆设） | 能跑 | **拒绝** | — |
+
+   **失败 → 失败（仅错误更可读，含改法；非行为变更，共三行）**：
 
    | 组合 | 禁令前 | 禁令后 |
    |------|--------|--------|
-   | pattern 把保留字解析成 **string/int**（如 `{submit_time:s}`），dest **裸/typed 引用**（`{submit_time}`、`{submit_time:s}`） | **能合成**（实测 `HELLO/a.csv`——保留字被挪用为任意字符串） | **拒绝**（任务失败） |
-   | pattern 把保留字解析成 string/int，dest **不引用**（保留字摆设） | 能跑 | **拒绝** |
-   | dest 裸/typed 引用 + 解析不出该字段 | 已失败（`expects a string value` 类型不符） | 拒绝（失败→失败，仅错误更可读、含改法） |
-   | pattern/dest 保留字**时间类型**（`{time:yyyy/MM}` 数据日期归档） | 能跑 | 能跑（不变，合法形态） |
+   | pattern 把保留字解析成 **时间类型**（`{time:yyyy}`），dest **裸/typed 引用** | 失败（Time 值 + string 类型字段：`expects a string value`） | 拒绝（同失败，错误含 LDML 改法） |
+   | pattern 把保留字解析成 **非时间类型**，dest **时间类型引用**（`{time:yyyy}`） | 失败（string 值 + 时间类型字段：`expects a time value`） | 拒绝（同失败，错误含改法） |
+   | dest 裸/typed 引用，**无解析** | 失败（同上类型不符） | 拒绝（同失败，错误含改法） |
 
-   即「原先能跑、现在失败」的有**前两行**两类，不止当初写的「dest 不引用」一行。
    这两类规则的 path_pattern 本身就把保留字用成了普通字段，属配置语义错位；
    fail-fast（Warn 可读、指明在 path_pattern 里改字段名）优于继续静默跑。
+   保留字**时间类型**形态（pattern/dest `{time:yyyy/MM}` 数据日期归档）不受影响。
+   （pattern 语法错误——`New()` 失败——不在此列：agent 对它本就静默当无字段
+   pattern，行为未变；本刀起 CP 在创建/更新时以 warnings 提示，见补记 3 第 1 条。）
 2. **预览镜像写进契约（B2）**。前端 `renderPathPreview` 已实现 dynamicFields
    优先但未实现别名镜像——预览与真实合成不一致，正是 P2-C 要消灭的问题换了入口。
    修正：前端实现与 `InjectSubmitTime` 同款镜像规则（单侧解析→镜像给缺失别名；
    双侧→各用各的；都没解析→当前时间），交叉预览测试钉住。**教训落进 V-3**：
    Go 与 `pathTemplate.ts` 的手工双维护是已记录的脆弱点，本次再次咬人——
    别名镜像与裸形式禁令必须写成**三端共享约定**（契约正文），不能只活在 Go 注释里。
+
+**补记 3（2026-09-13，PR #106 三/四轮 review：时区权威校验收窄到 Go 端、dest 提示动词、代价矩阵穷尽）**：
+
+1. **时区有效性不做 TS 镜像，权威校验收归 Go 端（四轮 D1，选 b）**。
+   实测跨端不等价：`{time:yyyy|tz=Nope/Bad}`、`{time:yyyy|tz=Asia/Shanghai }`
+   （尾空格）、`{time:yyyy|tz=UTC|tz=UTC}`（重复 tz）在 Go `New()` 全部报
+   `invalid timezone`，而 TS 只查 `tz=` 非空、三者放行——管理员 UI 保存成功、
+   上传时才失败。**不选 (a) TS 补时区校验**：浏览器没有权威 IANA 数据源
+   （`Intl.supportedValuesOf('timeZone')` 可用性依环境、集合与 Go tzdata 不重合），
+   「重复 tz」「尾空格」需要逐字镜像 `strings.Index(spec, "|tz=")` 切分逻辑——
+   正是本契约已三次咬人的「双实现必然漂移」模式。**选 (b)**：TS 声明收窄为
+   kind + 基础语法；**CP 创建/更新时用 Go `New()` 对两字段做完整校验**（与 agent
+   同库同判定），失败进 `warnings`（不 422——模板形状约束已由 D-030 第八条否决，
+   需要拒绝须另立决策）——「UI 放行、保存成功」时错误即在保存响应可见，
+   不再等到上传。`ValidateReservedTimeUse` 保持只管 kind（正确，未改）。
+2. **dest 提示动词修正（四轮 D2）**：C2 的字段插值让 dest 的 deprecated 提示
+   也带上 "parses"——`dest_path_template` 只合成、不解析，文案误导。
+   两字段文案分别成立：path_pattern 用「解析出同名字段」，dest 用「渲染为提交
+   时刻，除非 path_pattern 解析出同名字段」（解析优先是全局规则，条件在 pattern 侧）。
+3. **存量代价矩阵穷尽（四轮 D3）**：三轮修正的四行矩阵仍漏两组
+   「失败→失败」组合（pattern=time 解析 + dest 裸/typed 引用；
+   pattern=非时间解析 + dest=time 引用），已补入并**显式区分**「原先能跑→现在失败」
+   （真实行为变更，2 行）与「失败→失败」（仅错误更可读，4 行），不再混排。
