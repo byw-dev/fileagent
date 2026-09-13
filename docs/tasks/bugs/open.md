@@ -10,13 +10,15 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
+> **计数（2026-09-13，PR #106 合并后）**：共 **51** 条 = **已关闭 31** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 19**（**4 条挡** 6/7/9/40 + **14 条可推** + **1 条拆半** 46）。**口径**：拆半计入「未关闭」（与 `active.md` 一致），因为它的功能缺口仍在——IC-3 只止住了出血。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**。
+
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
 > 与 `system-design.md` §4.5 描述的主路径完全相反。
 
 ### 缺陷模式（2026-09-10 归纳）
 
-41 条里**有 30 条归得进三类成因**（M-1/M-2/M-3）。M-1 与 M-2 的类扫描均已完成（结论见下方两小节），
+41 条里**有 30 条归得进三类成因**（M-1/M-2/M-3）。**⚠️ 这段归纳的时点是 2026-09-10、样本是当时的 41 条**——此后新增的 42…51 尚未归类，M-3 也仍未扫；**下一轮归纳需连同新增 10 条一起重做**，并正式收编「参数收了不用」（已有 IC-BUG-5/11/38 三个实例）。M-1 与 M-2 的类扫描均已完成（结论见下方两小节），
 M-3 待扫。**剩下 11 条不属于任何一类**——IC-BUG-39/40 是**「配置/契约在两处各写一份，没有任何机制让它们对齐」**
 （脚本硬编码的 session policy vs `storage/policy.go`；CP 的 MinIO 凭据配置 vs MinIO 里的实际账号），
 这一类值得盯，因为它的症状永远出现在离根因很远的地方；IC-BUG-33/34 是「持久化状态缺少终态处理」；IC-BUG-5/11/**38** 是
@@ -137,7 +139,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-36 | CP 凭据被 `init-minio.sh` 建成 **service account**，而 MinIO 的 service account 不能调 AssumeRole → 全新环境 STS 必然 `Access Denied` ✅ 已修（PR #97） | 🔴 P0 | deploy |
 | IC-BUG-37 | watcher 的 fsnotify 分支没有初始扫描，规则指向的**既有文件永不被采集**；而 polling 回退分支却会扫——同一条规则的行为取决于 fsnotify 是否可用 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
 | IC-BUG-38 | agent 的 `log.output` / `log.max_size_mb` / `log.max_backups` 解析了、校验了、写进文档了，就是没人读——日志只落 stdout，无文件、无轮转 | 🟡 P2 | agent |
-| IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 ✅ 随 IC-3 修复（新增 `policy_script_test.go` 交叉校验） ✅ 随 IC-3 修复 | 🟡 P2 | deploy + controlplane |
+| IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 ✅ 随 IC-3 修复（新增 `policy_script_test.go` 交叉校验）| 🟡 P2 | deploy + controlplane |
 | IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 | 🟠 P1 | controlplane |
 | IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 | 🟡 P2 | deploy |
 | IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT | 🟡 P2 | agent |
@@ -148,7 +150,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-47 | 实时 fsnotify 事件路径仍用非阻塞 `emit`（满即丢弃），大量小文件并发写入时被丢弃的文件**永不被采集**——IC-5 的 F1 只修了初始扫描那一半 ✅ 随 IC-3 修复（4 处实时发送点全改 `emitBlocking`） | 🟠 P1 | agent |
 | IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 | 🟡 P2 | agent |
 | IC-BUG-49 | ~~`dest_path_template` 带不带 `{time}` 隐式决定「追加后产生新版本对象 vs 覆盖同一对象」，产品语义从未定义~~ **❌ 已撤销（2026-09-13，前提被实测证伪）**，其中成立的产品问题拆出为 [backlog](../backlog.md)「同一文件重复采集的覆盖语义」条目 | 🟡 P2 | 产品 + agent |
-| IC-BUG-50 | `time` 是**未声明的保留字**（三端契约只有 agent 知道）、**优先级与同体系系统变量相反**（无条件覆盖解析结果）、且**名字误导**（实为「文件被提交上传的时刻」）✅ 随 D-034 修复（改名 `{submit_time}` + 解析结果优先 + 旧名 deprecated 兼容） | 🟡 P2 | agent + controlplane + webui |
+| IC-BUG-50 | `time` 是**未声明的保留字**（三端契约只有 agent 知道）、**优先级与同体系系统变量相反**（无条件覆盖解析结果）、且**名字误导**（实为「文件被提交上传的时刻」）✅ 随 D-034 修复（PR #106：改名 `{submit_time}` + 解析结果优先 + 旧名 deprecated 兼容） | 🟡 P2 | agent + controlplane + webui |
+| IC-BUG-51 | 上报的 `sha256` / `size_bytes` / 实际上传字节**来自三次独立的文件读**，三者可以描述文件的不同版本；且 `PutObject` 返回的 ETag 虽已拿到却无人用来复核 | 🟡 P2 | agent |
 
 ---
 
@@ -773,5 +776,17 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 - 决策记录：[`DECISIONS.md`](../../../DECISIONS.md) **D-030**（写入准入与一致性模型）
 - 设计文档：[`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)
+## IC-BUG-51 — sha256 / size / 上传字节来自三次独立读，可描述不同版本 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `UploadFile` 对同一个文件做了**三次互不相干的读**，每次都重新打开/重新 stat：① `os.Stat`（`uploader.go:168`）得出 `fileSize`/`uploadSize`，并在 `:206` 快照出 `current` 版本；② `fileSHA256(task.LocalPath)`（`:190`）**另开一次文件**，从头哈希全文；③ `singlePartUpload` 的 `os.Open`+`PutObject`（`:285,:297`）**再开一次**，把字节流交给 MinIO。三次之间没有任何锁、租约或版本复核，文件在此期间被改写时，`result.SHA256 = sha`（来自②）、`result.SizeBytes = uploadSize`（来自①）与对象里真正的字节（来自③）**会分别属于不同版本** |
+| **精确位置** | `agent/internal/uploader/uploader.go:168`（stat）、`:190`（`fileSHA256`）、`:206`（版本快照）、`:237-238`（`result.SHA256` / `result.SizeBytes` 赋值）、`:285-297`（第三次读 + PutObject）；multipart 路径共用②的 `sha`，同样成立 |
+| **后果** | CP 的 `file_entries.sha256` / `size_bytes` 可能**与 MinIO 里的对象不符，而两端都认为上传成功**。这不是「某次上传失败」，而是**索引与对象静默失配**——正是本 track 要消灭的那一类。另：`PutObject` 返回的 `info.ETag` 已经被取到并填进 `UploadResult.ETag`，它**精确描述了实际上传的字节**，却没有任何地方拿它与本地重算值比对——手边就有的校验信号被浪费了。声明给 MinIO 的 `size` 也来自①：文件在②③之间增长则只有前 `size` 字节入对象（尾部静默截断），缩短则 PutObject 读不满 |
+| **与 `close_wait` 的关系** | `close_wait` 只是 **500ms 空闲去抖**（代码注释自承 "approximates"），**不保证写入方已关闭文件**，所以「上传期间文件仍在变」不是臆想的边界，而是 tail / 日志类写入方的常态。IC-BUG-45/48 是同一块地的邻居：45 是偏移推进时机，48 是身份靠推断，**51 是同一次上传内部的自相矛盾** |
+| **修复** | 让**哈希与上传共享同一次读**：`io.TeeReader(f, sha256.New())` 包住交给 `PutObject` 的 reader，上传完成后取 hash——此时 `sha256` 按定义精确描述「实际送上去的字节」，不可能失配；`size_bytes` 同样改为取自该次读的计数（`io.Counter` 或 PutObject 返回的 `info.Size`）而非①的 stat。multipart 路径同理，逐片 Tee 后汇总。**可选加固**：上传后用 `info.ETag` 与本地重算的 MD5（单片）或分片 ETag 列表（多片）复核，把「手边的校验信号」真正用起来（与 IC-BUG-48 的 ETag 验证同一套基建，宜同刀） |
+| **验收** | 构造「上传进行中文件被追加/截断」的用例（慢 reader 或在 PutObject 期间写源文件）：上报的 `sha256` 必须等于对象实际内容的 sha256（用 `mc cat \| shasum` 核），`size_bytes` 必须等于对象的 `size`；变异——退回两次独立读，该用例必须变红 |
+| **归属** | 未排期。**是 IC-11…13（分片对账）的硬前置**：对账的全部前提就是「DB 记的 sha256/size 可信」，本条不修则对账会把好对象判成不一致、也会把坏对象判成一致。宜与 **IC-BUG-48**（ETag 验证）同刀，两者共用同一套校验基建 |
+
 - 已关闭 Bug：[`closed.md`](closed.md)
 - 当前活跃任务：[`../active.md`](../active.md)

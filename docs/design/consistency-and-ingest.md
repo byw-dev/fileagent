@@ -163,11 +163,11 @@ grant 时间来自 CP 时钟，而 `last_modified` 来自 MinIO 时钟或事件�
 这条取舍消掉了一整类故障，且大幅简化 IC-1：
 
 **最直接的一条**：按字面的「模板**静态**前缀」计算，webui 新建规则的默认模板
-`/{agent_name}/{time:yyyy/MM/dd}/{filename}`（`webui/src/pages/Agents/RuleForm.tsx:104`）的静态前缀
+`/{agent_name}/{submit_time:yyyy/MM/dd}/{filename}`（`webui/src/pages/Agents/RuleForm.tsx:106`；D-034 前该保留字叫 `{time}`）的静态前缀
 是**空串**——收窄当场退化成整桶。也就是说「按静态前缀收窄」对经 UI 创建的规则根本不产生收窄效果，
 只是把整桶写成了一个更复杂的表达式。
 
-若改用「签发时求值」的变体（把 `{agent_name}` / `{time:…}` 代入后再取前缀），前缀确实变窄了，
+若改用「签发时求值」的变体（把 `{agent_name}` / `{submit_time:…}` 代入后再取前缀），前缀确实变窄了，
 但会引入下面这些故障——整桶 policy 一并消掉：
 
 | 「签发时求值」变体会带来的问题 | 整桶 policy |
