@@ -647,6 +647,45 @@ func TestAgentsHandler_CreateRule_NonDeprecatedTemplates_NoWarning(t *testing.T)
 	}
 }
 
+// Review C2: the warnings must cover path_pattern too — the agent's gate
+// refuses a pattern that declares a reserved word as a non-time field, so a
+// rule the CP lets through would only fail at upload time. The warning names
+// the field (parallel to the agent's refusePathField wording).
+func TestAgentsHandler_CreateRule_PatternReservedTypedNonTime_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"of/{time:s}/{filename}","dest_path_template":"data/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "pattern misuse must produce a warnings array")
+	joined := fmt.Sprint(warnings)
+	assert.Contains(t, joined, "path_pattern")
+	assert.Contains(t, joined, "LDML")
+}
+
+// The deprecated alias in path_pattern also warns (it renders fine, but the
+// rule should migrate to the declared name).
+func TestAgentsHandler_CreateRule_DeprecatedTimeInPattern_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"of/{time:yyyy}/{filename}","dest_path_template":"data/{time:yyyy}/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "deprecated {time} in path_pattern must warn")
+	joined := fmt.Sprint(warnings)
+	assert.Contains(t, joined, "path_pattern uses the deprecated reserved word")
+}
+
 func TestAgentsHandler_UpdateRule_FullUpdate_DeprecatedTimeTemplate_Warns(t *testing.T) {
 	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
 	body := `{"name":"edited","bucket_id":"` + uuid.New().String() +

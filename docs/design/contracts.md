@@ -150,8 +150,20 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
   时间类型解析（`{time:yyyy/MM}`，数据日期归档）**合法**。
 - **webui（创建时拦截）**：`validatePathTemplate` 拒绝裸引用并给出带格式示例；
   变量清单以 LDML 形式展示。
-- **CP（创建/更新时提示）**：`warnings` 返回可读的 misuse 提示（不 422——REST 对
-  模板无形状约束，D-030 第八条）。
+- **CP（创建/更新时提示）**：`warnings` 对 `path_pattern` 与 `dest_path_template`
+  **两个字段都**返回可读提示（不 422——REST 对模板无形状约束，D-030 第八条）；
+  文案以字段名开头，与 agent 的 `refusePathField` 平行。
+
+**kind 判定逐条对照表**（`pkg/trollsift/field.go` `parseFieldSpec` ↔
+`webui/src/utils/pathTemplate.ts` `reservedTimeKindError`，review C1——
+两处手工维护，改任一侧必须逐行核对另一侧）：
+
+| spec（`:` 之后的格式段，`|tz=...` 先剥离） | Go kind | TS 判定 | 保留字可用？ |
+|------|---------|---------|------|
+| 无（裸 `{time}`） | string（空 spec） | `/^$/` → str | ❌ 拒绝 |
+| `s`、`Ns`（如 `3s`） | string | `/^s$/`、`/^\d+s$/` | ❌ 拒绝 |
+| `d`、`Nd`、`0Nd`（如 `05d`） | int | `/^d$/`、`/^\d+d$/`、`/^0\d+d$/` | ❌ 拒绝 |
+| 其余（`yyyy`、`MM/dd`、`HH:mm|tz=...` …） | time（LDML） | 其余 | ✅ 唯一合法形态 |
 
 ### 优先级：解析结果 vs 注入值（IC-BUG-50 / D-034，review P1-A/P2-D 修正）
 

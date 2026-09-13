@@ -1920,11 +1920,20 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
    时间类型 `{submit_time:yyyy/MM}` 仍合法——那是文档支持的数据日期归档）。
    理由：保留字的意义是名字唯一绑定语义；让 path_pattern 拿 `submit_time` 捕获
    任意字符串，V-3 对「`submit_time` = 该文件被提交上传的时刻」的承诺在该规则上
-   直接为假，且镜像规则会把错误值传播到另一个别名。**代价（存量规则从能跑变失败）**：
-   仅命中「path_pattern 把保留字声明为非时间字段」的规则——其中 dest 引用该字段
-   带格式的**早已失败**（类型不匹配 `expects a time value`）；dest 不引用的
-   （保留字纯属摆设）从能跑变任务失败，Warn 可读、指明改法（在 path_pattern 里
-   改字段名）。评估：这类规则本身就是配置错误，fail-fast 优于静默跑。
+   直接为假，且镜像规则会把错误值传播到另一个别名。
+
+   **存量代价（三轮 review C3 修正——初版漏报了能合成的组合，此处为完整清单）**：
+
+   | 组合 | 禁令前 | 禁令后 |
+   |------|--------|--------|
+   | pattern 把保留字解析成 **string/int**（如 `{submit_time:s}`），dest **裸/typed 引用**（`{submit_time}`、`{submit_time:s}`） | **能合成**（实测 `HELLO/a.csv`——保留字被挪用为任意字符串） | **拒绝**（任务失败） |
+   | pattern 把保留字解析成 string/int，dest **不引用**（保留字摆设） | 能跑 | **拒绝** |
+   | dest 裸/typed 引用 + 解析不出该字段 | 已失败（`expects a string value` 类型不符） | 拒绝（失败→失败，仅错误更可读、含改法） |
+   | pattern/dest 保留字**时间类型**（`{time:yyyy/MM}` 数据日期归档） | 能跑 | 能跑（不变，合法形态） |
+
+   即「原先能跑、现在失败」的有**前两行**两类，不止当初写的「dest 不引用」一行。
+   这两类规则的 path_pattern 本身就把保留字用成了普通字段，属配置语义错位；
+   fail-fast（Warn 可读、指明在 path_pattern 里改字段名）优于继续静默跑。
 2. **预览镜像写进契约（B2）**。前端 `renderPathPreview` 已实现 dynamicFields
    优先但未实现别名镜像——预览与真实合成不一致，正是 P2-C 要消灭的问题换了入口。
    修正：前端实现与 `InjectSubmitTime` 同款镜像规则（单侧解析→镜像给缺失别名；

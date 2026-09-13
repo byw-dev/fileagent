@@ -743,39 +743,48 @@ func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 	return resp
 }
 
-// deprecatedTemplateWarnings returns the readable deprecation notices for a
-// dest_path_template that misuses the reserved time words (IC-BUG-50 / D-034
-// + review P1-B/B1). The agent keeps rendering the deprecated {time} alias
-// with parse-first priority, so that one is a hint, not a rejection: existing
-// rules created through the Web UI's old default template must not break.
-// The misuse notice (ValidateReservedTimeUse: bare or non-time-typed reserved
-// word) matches the agent's hard refusal — such templates fail every upload
-// (or silently repurpose the reserved word as an arbitrary string), so the
-// hint names the fix at creation time instead.
-func deprecatedTemplateWarnings(template string) []string {
+// ruleTemplateWarnings returns the readable contract notices for BOTH rule
+// fields that decide the object key (review C2): path_pattern and
+// dest_path_template. This mirrors the agent's reservedTimeMisuse gate, which
+// checks both — checking only dest_path_template here would let the admin
+// create a rule the CP passes but the agent refuses at upload time. The
+// deprecated {time} notice is a hint, not a rejection: existing rules created
+// through the Web UI's old default template must not break. The misuse notice
+// (ValidateReservedTimeUse: bare or non-time-typed reserved word) matches the
+// agent's hard refusal — such rules fail every upload (or silently repurpose
+// the reserved word as an arbitrary string), so the hint names the fix.
+func ruleTemplateWarnings(pathPattern, destPathTemplate string) []string {
 	var warnings []string
-	if trollsift.UsesDeprecatedTimeField(template) {
-		warnings = append(warnings, "dest_path_template uses the deprecated reserved word {time}; "+
-			"it still renders (the file's submit-for-upload instant, unless path_pattern parses a field with that name — parse results always win), "+
-			"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)")
-	}
-	if reason := trollsift.ValidateReservedTimeUse(template); reason != "" {
-		warnings = append(warnings, "dest_path_template: "+reason+
-			" — the agent refuses to compose such uploads (task failure, no guessed key)")
+	for _, f := range []struct{ field, value string }{
+		{"path_pattern", pathPattern},
+		{"dest_path_template", destPathTemplate},
+	} {
+		if trollsift.UsesDeprecatedTimeField(f.value) {
+			warnings = append(warnings, f.field+" uses the deprecated reserved word {time}; "+
+				"it still renders (the file's submit-for-upload instant, unless "+f.field+" parses a field with that name — parse results always win), "+
+				"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)")
+		}
+		if reason := trollsift.ValidateReservedTimeUse(f.value); reason != "" {
+			warnings = append(warnings, f.field+": "+reason+
+				" — the agent refuses to compose such uploads (task failure, no guessed key)")
+		}
 	}
 	return warnings
 }
 
-// respondRule writes a rule response, attaching deprecation warnings for the
-// deprecated {time} reserved word and logging a Warn so the hint survives even
-// for API clients that ignore the warnings field.
+// respondRule writes a rule response, attaching contract warnings for the
+// deprecated {time} reserved word and reserved-word misuse in BOTH
+// path_pattern and dest_path_template (review C2), plus a Warn log so the
+// hint survives even for API clients that ignore the warnings field.
 func (h *AgentsHandler) respondRule(c *gin.Context, code int, rule *db.CollectionRule) {
 	resp := toRuleResponse(rule)
-	if warns := deprecatedTemplateWarnings(rule.DestPathTemplate); warns != nil {
+	if warns := ruleTemplateWarnings(rule.PathPattern, rule.DestPathTemplate); warns != nil {
 		resp.Warnings = warns
-		h.logger.Warn("dest_path_template uses the deprecated {time} reserved word (IC-BUG-50 / D-034); migrate to {submit_time}",
+		h.logger.Warn("rule template/pattern contract warnings (IC-BUG-50 / D-034); migrate to {submit_time}",
 			zap.String("rule_id", rule.ID.String()),
-			zap.String("dest_path_template", rule.DestPathTemplate))
+			zap.String("path_pattern", rule.PathPattern),
+			zap.String("dest_path_template", rule.DestPathTemplate),
+			zap.Strings("warnings", warns))
 	}
 	c.JSON(code, resp)
 }

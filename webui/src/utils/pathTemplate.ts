@@ -170,14 +170,48 @@ export function validatePathTemplate(template: string): string | null {
     if (!inner) return '模板变量名不能为空'
     const tzMatch = inner.match(/\|tz=(.*)$/)
     if (tzMatch && !tzMatch[1]) return '时区（tz=）值不能为空'
-    // Review P1-B: bare reserved time fields ({submit_time} / {time} without
-    // an LDML format) cannot compose — every upload would fail with a type
-    // mismatch. Reject here so the admin never creates such a template.
-    if (inner === 'submit_time' || inner === 'time') {
-      return '保留时间字段必须带 LDML 格式，例如 {submit_time:yyyy/MM/dd}（裸 {submit_time} / {time} 无法合成）'
-    }
+    // Reserved time words (review C1): mirror the Go kind gate exactly
+    // (pkg/trollsift parseFieldSpec) — the reserved word must be used as a
+    // TIME field with an LDML format. Bare ({submit_time}) and typed
+    // non-time ({submit_time:s}, {time:3d}) uses are rejected here AND by the
+    // agent's reservedTimeMisuse gate; letting the UI create them would mean
+    // the failure only surfaces at upload time.
+    const reservedError = reservedTimeKindError(inner)
+    if (reservedError) return reservedError
   }
 
+  return null
+}
+
+/**
+ * Mirror of the Go kind detection for the reserved time words
+ * (pkg/trollsift/field.go parseFieldSpec, review C1 — kept line-by-line
+ * comparable): strip |tz=..., then spec is
+ *   d / Nd / 0Nd  → int      (rejected for reserved words)
+ *   "" / s / Ns   → string   (rejected; "" is the bare form)
+ *   anything else → time     (the only accepted kind)
+ * Returns an error message for a reserved word used as a non-time field,
+ * or null when the field is fine (not a reserved word, or time-typed).
+ */
+function reservedTimeKindError(inner: string): string | null {
+  const colonIdx = inner.indexOf(':')
+  const name = colonIdx === -1 ? inner : inner.slice(0, colonIdx)
+  if (name !== 'submit_time' && name !== 'time') return null
+
+  if (colonIdx === -1) {
+    return `保留时间字段必须带 LDML 时间格式，例如 {${name}:yyyy/MM/dd}（裸 {${name}} 无法合成，会被 agent 拒绝）`
+  }
+
+  let spec = inner.slice(colonIdx + 1)
+  const pipeIdx = spec.indexOf('|tz=')
+  if (pipeIdx !== -1) spec = spec.slice(0, pipeIdx)
+
+  const isInt = /^d$/.test(spec) || /^0\d+d$/.test(spec) || /^\d+d$/.test(spec)
+  const isStr = spec === '' || spec === 's' || /^\d+s$/.test(spec)
+  if (isInt || isStr) {
+    const shown = spec === '' ? name : `${name}:${spec}`
+    return `保留时间字段必须带 LDML 时间格式，例如 {${name}:yyyy/MM/dd}；非时间类型（{${shown}}）会被 agent 拒绝（IC-BUG-50）`
+  }
   return null
 }
 

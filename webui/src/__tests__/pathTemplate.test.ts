@@ -58,6 +58,25 @@ describe('renderPathPreview: submit_time (IC-BUG-50 / D-034)', () => {
     expect(validatePathTemplate('{time_zone}/{filename}')).toBeNull()
   })
 
+  // Review C1: the validator must mirror the Go kind gate, not just the bare
+  // form — a typed NON-time reference ({submit_time:s}, {time:3d}) composes
+  // when the value was parsed as a string and is refused by the agent.
+  it('validatePathTemplate rejects typed non-time reserved words (kind gate parity)', () => {
+    expect(validatePathTemplate('{submit_time:s}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{time:s}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{submit_time:3s}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{time:3d}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{time:d}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{time:05d}/{filename}')).toContain('LDML') // zero-pad int variant
+    // The supported forms stay valid.
+    expect(validatePathTemplate('{submit_time:yyyy/MM/dd}/{filename}')).toBeNull()
+    expect(validatePathTemplate('{time:yyyy|tz=Asia/Shanghai}/{filename}')).toBeNull()
+    expect(validatePathTemplate('{time:HH:mm:ss|tz=Asia/Shanghai}/{filename}')).toBeNull()
+    // time_zone with the same specs is an ordinary field: untouched.
+    expect(validatePathTemplate('{time_zone:s}/{filename}')).toBeNull()
+    expect(validatePathTemplate('{time_zone:3d}/{filename}')).toBeNull()
+  })
+
   it('does not treat {time_zone} as a time field', () => {
     // time_zone without LDML is not a reserved word: it stays unchanged
     // (compose-time field from path_pattern), exactly like unknown variables.
