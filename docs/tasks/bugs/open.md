@@ -99,10 +99,10 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 | ID | 标题 | 严重程度 | 涉及模块 |
 |----|------|---------|---------|
-| IC-BUG-1 | Agent 永远拿不到 STS 凭据，所有上传直接失败 | 🔴 P0 | controlplane + agent |
+| IC-BUG-1 | Agent 永远拿不到 STS 凭据，所有上传直接失败  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane + agent |
 | IC-BUG-2 | Agent 从不上报 `UploadResult`，索引主路径是死代码 ✅ 随 IC-2a 修复 | 🔴 P0 | agent |
-| IC-BUG-3 | STS session policy 前缀与实际对象键不匹配 | 🔴 P0 | controlplane |
-| IC-BUG-4 | STS session policy 缺 multipart 权限、多授 DeleteObject | 🔴 P0 | controlplane |
+| IC-BUG-3 | STS session policy 前缀与实际对象键不匹配  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
+| IC-BUG-4 | STS session policy 缺 multipart 权限、多授 DeleteObject  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
 | IC-BUG-5 | 断点续传状态从未落盘，重试永远从头重传 + 孤儿分片累积 ✅ 随 IC-3 修复 | 🟠 P1 | agent |
 | IC-BUG-6 | minio-event 索引失败仍返回 200，MinIO 丢弃事件 | 🟠 P1 | controlplane |
 | IC-BUG-7 | 通过 API 新建的 bucket 不注册事件通知，文件永不入索引 | 🟠 P1 | controlplane + deploy |
@@ -114,16 +114,16 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-13 | `content_type` 两条索引路径都不赋值，且会被 upsert 清空 | 🟡 P2 | controlplane |
 | IC-BUG-14 | Dashboard `COUNT(*)` / `SUM` 全表扫描（规模隐患） | 🟡 P2 | controlplane |
 | IC-BUG-15 | 预签名下载 URL TTL 硬编码 15 分钟，大文件不够用 | 🟡 P2 | controlplane |
-| IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效 | 🟠 P1 | agent + controlplane |
-| IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 | 🔴 P0 | agent |
-| IC-BUG-18 | Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 | 🔴 P0 | agent |
+| IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效  ✅ 随 IC-1 修复 | 🟠 P1 | agent + controlplane |
+| IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效  ✅ 随 IC-1 修复 | 🔴 P0 | agent |
+| IC-BUG-18 | Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上  ✅ 随 IC-1 修复 | 🔴 P0 | agent |
 | IC-BUG-19 | minio-event 索引 URL 编码后的对象键（`%2F`），与真实键不符 ✅ 随 IC-2c 修复 | 🟠 P1 | controlplane |
 | IC-BUG-20 | bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 ✅ 随 IC-2b 修复 | 🟠 P1 | controlplane + agent |
 | IC-BUG-21 | 模板解析失败时猜一个对象键写进去，污染对账分片 ✅ 随 IC-2b 修复 | 🟡 P2 | agent |
-| IC-BUG-22 | `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token | 🔴 P0 | controlplane |
-| IC-BUG-23 | 吊销不生效：被吊销 agent 的 token 仍可用，且重连会把状态刷回 online | 🔴 P0 | controlplane |
-| IC-BUG-24 | `handleDryRunResult` 无归属校验，可对他人 rule 投递伪造试运行结果 | 🟡 P2 | controlplane |
-| IC-BUG-25 | 吊销切不断已建立的流：被吊销 agent 仍可心跳/上报，UI 显示在线且踢不掉 | 🟠 P1 | controlplane |
+| IC-BUG-22 | `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
+| IC-BUG-23 | 吊销不生效：被吊销 agent 的 token 仍可用，且重连会把状态刷回 online  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
+| IC-BUG-24 | `handleDryRunResult` 无归属校验，可对他人 rule 投递伪造试运行结果  ✅ 随 IC-SEC-1 修复 | 🟡 P2 | controlplane |
+| IC-BUG-25 | 吊销切不断已建立的流：被吊销 agent 仍可心跳/上报，UI 显示在线且踢不掉  ✅ 随 IC-SEC-1 修复 | 🟠 P1 | controlplane |
 | IC-BUG-26 | `DeleteCollectionRule` 无归属约束，可删掉别的 agent 的规则 | 🟠 P1 | controlplane |
 | IC-BUG-27 | `handleDirectoryListing` 拿到 agentID 却只用于打日志，不校验归属 | 🟡 P2 | controlplane |
 | IC-BUG-28 | `registry.Register` 覆盖 map，重连时陈旧流的 defer 会关掉新连接的 SendCh ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
@@ -137,15 +137,15 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-36 | CP 凭据被 `init-minio.sh` 建成 **service account**，而 MinIO 的 service account 不能调 AssumeRole → 全新环境 STS 必然 `Access Denied` ✅ 已修（PR #97） | 🔴 P0 | deploy |
 | IC-BUG-37 | watcher 的 fsnotify 分支没有初始扫描，规则指向的**既有文件永不被采集**；而 polling 回退分支却会扫——同一条规则的行为取决于 fsnotify 是否可用 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
 | IC-BUG-38 | agent 的 `log.output` / `log.max_size_mb` / `log.max_backups` 解析了、校验了、写进文档了，就是没人读——日志只落 stdout，无文件、无轮转 | 🟡 P2 | agent |
-| IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 ✅ 随 IC-3 修复 | 🟡 P2 | deploy + controlplane |
+| IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 ✅ 随 IC-3 修复（新增 `policy_script_test.go` 交叉校验） ✅ 随 IC-3 修复 | 🟡 P2 | deploy + controlplane |
 | IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 | 🟠 P1 | controlplane |
 | IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 | 🟡 P2 | deploy |
 | IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT | 🟡 P2 | agent |
 | IC-BUG-43 | close_wait 初始扫描跳过「仍在写」的文件，但 fsnotify 分支只扫一次、也没有后续事件兜底——写完即停的文件会被永久跳过 | 🟡 P2 | agent |
 | IC-BUG-44 | 阻塞发送期间内核 watch 队列可能溢出——两个生产平台都会把溢出报上 `fw.Errors`（Linux `IN_Q_OVERFLOW` / Windows `ErrEventOverflow`），但代码只打一条 Warn 就扔了，缺一次安全网重扫闭环 | 🟠 P1 | agent |
 | IC-BUG-45 | tail 偏移在**事件发出时**推进而非**上传确认后**，一次彻底失败的 tail 上传会静默丢掉一段字节区间且无任何信号 | 🟡 P2 | agent |
-| IC-BUG-46 | **`append_mode=tail` 静默丢数据**：`singlePartUpload` 在 `offset>0` 时把**只含增量**的内容 `PutObject` 到同一键，对象被整体替换，此前已采集的内容从对象中消失 | 🔴 P0 | agent |
-| IC-BUG-47 | 实时 fsnotify 事件路径仍用非阻塞 `emit`（满即丢弃），大量小文件并发写入时被丢弃的文件**永不被采集**——IC-5 的 F1 只修了初始扫描那一半 | 🟠 P1 | agent |
+| IC-BUG-46 | **`append_mode=tail` 静默丢数据**：`singlePartUpload` 在 `offset>0` 时把**只含增量**的内容 `PutObject` 到同一键，对象被整体替换，此前已采集的内容从对象中消失 ◐ **拆半**：挡掉半边 ✅ 随 IC-3（CP 422 + agent 闸门 + UI 禁用）；**正确实现归 IC-15** | 🔴 P0 | agent |
+| IC-BUG-47 | 实时 fsnotify 事件路径仍用非阻塞 `emit`（满即丢弃），大量小文件并发写入时被丢弃的文件**永不被采集**——IC-5 的 F1 只修了初始扫描那一半 ✅ 随 IC-3 修复（4 处实时发送点全改 `emitBlocking`） | 🟠 P1 | agent |
 | IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 | 🟡 P2 | agent |
 | IC-BUG-49 | `dest_path_template` 带不带 `{time}` 隐式决定「追加后产生新版本对象 vs 覆盖同一对象」，**产品语义从未定义** | 🟡 P2 | 产品 + agent |
 
@@ -627,7 +627,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **归属** | 未排期。属「参数收了不用」类（与 IC-BUG-5/11 同类，本条是第三个实例——见上方「缺陷模式」一节） |
 
 
-## IC-BUG-39 — 脚本硬编码的 session policy 与 `storage/policy.go` 无联动 🟡 P2
+## IC-BUG-39 — 脚本硬编码的 session policy 与 `storage/policy.go` 无联动 🟡 P2 ✅ 已修（IC-3，PR #105）
 
 | 字段 | 内容 |
 |------|------|
@@ -709,7 +709,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | tail 规则下让一次上传彻底失败，随后文件继续增长——下一次上传必须覆盖失败的那段字节，不得出现空洞 |
 | **归属** | 未排期。与 **IC-BUG-42** 同源（都是「任务失败后的状态推进」），宜同刀 |
 
-## IC-BUG-46 — `append_mode=tail` 静默丢数据 🔴 P0
+## IC-BUG-46 — `append_mode=tail` 静默丢数据 🔴 P0 ◐ 拆半（挡掉 ✅ IC-3 / 正确实现 → IC-15）
 
 | 字段 | 内容 |
 |------|------|
@@ -722,7 +722,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 创建 `append_mode=tail` 的规则返回 422；已存在的 tail 规则触发上传时任务显式失败并留下可检索的告警，MinIO 侧**不产生**任何被替换的对象 |
 | **归属** | **挡掉随 IC-3；正确实现见 IC-15** |
 
-## IC-BUG-47 — 实时 fsnotify 路径仍会静默丢弃事件 🟠 P1
+## IC-BUG-47 — 实时 fsnotify 路径仍会静默丢弃事件 🟠 P1 ✅ 已修（IC-3，PR #105）
 
 | 字段 | 内容 |
 |------|------|
