@@ -1983,3 +1983,36 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
    正常 watch/cron 路径 `matchGlob` 先行 `New()`，失败即 Warn 跳过、dry-run
    显式报错，「静默」仅在 buildStoragePath 内部成立而那里根本走不到。该行
    与保留字无关、禁令前后行为一致，已移出矩阵并如实注明。
+
+**补记 4（2026-09-13，PR #106 五/六轮 review：warnings 的最后一米 + 测试基建保真）**：
+
+1. **CP 的 warnings 此前到不了任何人眼前（五轮 E1）**。三/四轮把时区权威校验收归 CP 并
+   以 `warnings` 返回，但 webui 的 `CollectionRule` 类型里**根本没有 `warnings` 字段**，
+   响应体到了前端即被丢弃——「保存成功时错误即可见」这个设计承诺在实现上为空。
+   同时 `updateRuleStatus`（status-only PUT）**绕过了 `respondRule`**，激活一条模板
+   有问题的规则静默返回无提示。修正：类型补 `warnings?: string[]`；
+   `updateRuleStatus` 改走 `respondRule` 与创建/全量更新同一出口；
+   UI 选**表单顶部可关闭警告区块**而非 toast，且**有 warnings 时保存成功但不自动跳转**
+   ——提示是多行散文（弃用依据、具体非法时区名、LDML 修法示例），toast 一闪而过读不完，
+   而常规跳转目标（规则列表）不返回 warnings，跳过去就永远看不到。
+2. **「共用一处渲染分支」不等于被覆盖（六轮）**。warnings 的**判定**在 create/update
+   两分支各写了一份，测试只钉住 update 那份：实测把 create 分支的整段处理删掉，
+   全部用例仍绿——create 路径当时没有任何保护。修正不是补一个 create 测试，而是
+   **合并为单一出口**，使 create/update 字面共用同一行代码，覆盖论证由「声称」变为「成立」。
+3. **mock 比真实 DB 宽松是一类缺陷，不是一个缺陷（六轮）**。`mockAgentsDB` 的
+   `CreateCollectionRule` 丢掉 `cron_expr`/`run_once_on_start`/`append_mode`，
+   `UpdateCollectionRuleStatus` 只挑回 `path_pattern`/`dest_path_template`——这类失真
+   让「响应体缺字段」的缺陷静默通过且测试永远绿。改为**原样回显全部入参 / 整行拷贝
+   存储行后只覆盖本语句真正改动的字段**，消掉这一类而非再补一个字段。
+
+### 落地记录
+
+**PR #106**（squash `e444d27`，2026-09-13 合并）。六轮 review，发现的严重度单调下降：
+① 数据落错位置（注入优先级）→ ② 禁令只禁一半 → ③ 三端口径矛盾 → ④ 文本与边界 →
+⑤ 可见性（CP 的 warnings 到不了 UI）→ ⑥ 测试债（实现已正确）。第六轮首次出现
+「实现本身没有错误」，据此判定收敛并合并。**11 条守卫经变异确认**；
+跨端 13 个 kind 形态 Go↔TS **13/13 一致**；CI 3/3 全绿。
+
+> **这一刀最值得留给后人的一条**：`{time}` 这个保留字在代码里活了很久，
+> 三端契约只有 agent 一端知道它存在——**它不是被测试发现的，是在讨论 tail 设计时
+> 顺手读 `pkg/trollsift/parser_test.go` 撞见的**。隐性契约不会让任何用例变红。

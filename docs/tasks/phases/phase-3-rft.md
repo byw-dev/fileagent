@@ -1,9 +1,29 @@
 # phase-3-rft.md — 采集规则重构（Rule Field & Template）任务规格
 
-> **状态**：⬜ 待执行  
+> **状态**：📦 **历史规格（主体已落地，勿照此执行）**——主要交付物已存在
+> （`webui/src/utils/pathTemplate.ts` 的 `validatePathTemplate`/`renderPathPreview`、`pkg/trollsift`），
+> 但**并非逐条落地**：例如本文 §「`config.toml` 新增」要求的 `[collection].dry_run_limit`
+> **至今未实现**（agent 硬编码 `defaultDryRunLimit = 10`，CP 收了该参数却从不下发
+> ——已立 **IC-BUG-52**）。**部分细节另已被后续决策取代**（见下方警告）。
+> 保留全文作为当时的规格原文，**不作为执行目标**；若要清理遗留项，请以代码为准逐条核对。  
 > **父阶段**：Phase 3 集成联调  
-> **优先级**：在 T3-2 完成后立即执行，阻塞 T3-3  
+> **优先级**：~~在 T3-2 完成后立即执行，阻塞 T3-3~~（已失效，见上方状态）  
 > **设计参考**：`DECISIONS.md` D-009（字段统一命名）、D-010（trollsift 引入）、`docs/design/system-design.md` §§4.1, 4.5, 5.5, 5.6, 5.8
+
+> ⚠️ **保留字已改名（2026-09-13，D-034 / PR #106）**：本文全篇约 15 处 `{time:…}` 示例现为
+> **已废弃的别名**，正式名是 **`{submit_time:…}`**（旧名仍可渲染，语义等价）。另外，保留字的
+> **裸形式**（`{submit_time}` / `{time}`，不带 LDML 格式）与**非时间类型引用**（如 `{time:s}`、
+> `{time:3d}`）**已被三端一致拒绝**。⚠️ **注意区分**：本文示例里带 LDML 的 `{time:yyyy/MM/dd}` **仍可正常渲染**
+> （deprecated 别名，语义等价于 `{submit_time:yyyy/MM/dd}`），**不会失败**。因此本文那段
+> 「`{字段名:LDML格式}`」的说明对普通字段名仍成立，只是对保留字**少了「必须带格式、
+> 且必须是时间类型」这条约束**。⚠️ **保留字禁令不是「失败写法」的全集**：除裸形式与
+> 非时间类型引用外，**任何让 `trollsift.New()` 报错的写法同样失败**——实测
+> `{time:yyyy|tz=Nope/Bad}` 报 `invalid timezone`；但**并非所有 LDML 错误都在此阶段暴露**
+> （实测 `{time:qqqq}` 通过 `New()`，要到合成时才出问题）。要判断某个写法是否合法，
+> **以 `pkg/trollsift` 的实际行为为准，不要依赖本文或任何清单的枚举**。
+> **路径模板保留字的权威清单在
+> [`docs/design/contracts.md`](../../design/contracts.md) V-3**（另见 `DECISIONS.md` D-034）。
+> 本文未逐处回填——改写历史规格原文等于篡改当时的规格。
 
 ---
 
