@@ -463,12 +463,16 @@ func TestExecutor_AbortRecordWriteFailureWarns(t *testing.T) {
 
 	e.handleFailure(context.Background(), task, fmt.Errorf("boom"))
 
-	assert.NotZero(t, logs.FilterMessage("executor: record give-up abandonment").Len(),
+	assert.NotZero(t, logs.FilterMessage("executor: record give-up abandonment failed, keeping the task retryable").Len(),
 		"the failed atomic give-up must surface loudly")
-	running, err := q.ListByStatus(queue.StatusRunning)
+	// B: the fallback lands the row back in `failed` WITH a persisted
+	// schedule — schedulable by this process, not stalled as running.
+	failed, err := q.ListByStatus(queue.StatusFailed)
 	require.NoError(t, err)
-	require.Len(t, running, 1, "the task stays recoverable (running → pending at next start)")
-	assert.Equal(t, "upload-live-1", running[0].UploadID)
+	require.Len(t, failed, 1, "the task stays recoverable via the backoff path")
+	assert.NotZero(t, failed[0].NextRetryAt, "the fallback must carry a persisted retry schedule")
+	assert.Equal(t, "upload-live-1", failed[0].UploadID,
+		"the upload identity survives for the retry to resume or abort it")
 	n, err := q.CountMultipartAborts(context.Background())
 	require.NoError(t, err)
 	assert.Zero(t, n, "no half-written abort record may exist without the sentinel")
@@ -611,15 +615,16 @@ func TestExecutor_AbandonStateAndAbortRecordAreAtomic(t *testing.T) {
 
 	assert.Zero(t, aborted.Load(),
 		"a task whose abort intent could not be made durable must not be abandoned")
+	// B: the fallback puts the row back into `failed` with a persisted
+	// schedule — schedulable by the CURRENT process (production flow:
+	// failed → pending → running → failed, never a stalled running row).
 	failed, err := q.ListByStatus(queue.StatusFailed)
 	require.NoError(t, err)
-	assert.Empty(t, failed, "the row must not be marked abandoned without its abort record")
-	running, err := q.ListByStatus(queue.StatusRunning)
-	require.NoError(t, err)
-	require.Len(t, running, 1, "the task stays recoverable (running → reset to pending at next start)")
-	assert.Equal(t, "upload-live-1", running[0].UploadID,
+	require.Len(t, failed, 1, "the task stays recoverable via the backoff path")
+	assert.NotZero(t, failed[0].NextRetryAt)
+	assert.Equal(t, "upload-live-1", failed[0].UploadID,
 		"the upload identity must survive for the retry to resume or abort it")
-	assert.NotZero(t, logs.FilterMessage("executor: record terminal abandonment").Len(),
+	assert.NotZero(t, logs.FilterMessage("executor: record terminal abandonment failed, keeping the task retryable").Len(),
 		"the failed atomic marking must surface loudly")
 }
 
@@ -678,13 +683,15 @@ func TestExecutor_DedupCompleteAndAbortRecordAreAtomic(t *testing.T) {
 
 	assert.Zero(t, aborted.Load(),
 		"the upload must not be abandoned while its abort intent could not be made durable")
+	// B: the fallback lands the row back in `failed` with a schedule.
 	failed, err := q.ListByStatus(queue.StatusFailed)
 	require.NoError(t, err)
 	assert.Len(t, failed, 1, "the task stays recoverable; the retry redoes the dedup completion")
+	assert.NotZero(t, failed[0].NextRetryAt)
 	completed, err := q.ListByStatus(queue.StatusCompleted)
 	require.NoError(t, err)
 	assert.Empty(t, completed)
-	assert.NotZero(t, logs.FilterMessage("executor: record dedup completion with abort").Len(),
+	assert.NotZero(t, logs.FilterMessage("executor: record dedup completion with abort failed, keeping the task retryable").Len(),
 		"the failed atomic completion must surface loudly")
 }
 
@@ -714,4 +721,62 @@ func TestExecutor_DedupCompleteLeavesAbortRecord(t *testing.T) {
 	completed, err := q.ListByStatus(queue.StatusCompleted)
 	require.NoError(t, err)
 	assert.Len(t, completed, 1)
+}
+
+// B: the fallback after a failed atomic abandonment must keep the task
+// schedulable by THIS process. In production the row is RUNNING when the
+// marking fails (the retry flowed failed → pending → running), so a fallback
+// that merely returns would stall the row until the next restart's
+// ResetRunningToPending. The test reproduces the production state flow and
+// requires the task to be completed by the SAME process once the injection
+// is removed.
+func TestExecutor_DedupCompletionFallbackRequeuesInProcess(t *testing.T) {
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+
+	task := abandonTask(t, q) // running
+	// Production flow: the task failed on attempt 1 (failed + schedule), the
+	// retry requeued it (pending → running), and the dedup shortcut hits.
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now()))
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
+		FileSize: task.FileSize, FileMtime: task.FileMtime, UploadedAt: time.Now().Unix(),
+	}))
+
+	failStatement(t, dsn, "no_abort_record", "INSERT", "multipart_abort_outbox")
+	e := New(1, q, successUploader, zap.New(core), 0)
+	e.retryDelays = []time.Duration{50 * time.Millisecond}
+	e.abortPoll = time.Hour
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return nil
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	e.Start(ctx)
+
+	// The injected marking failure must be visible and the task must cycle
+	// back through the queue (not stall as a running row).
+	require.Eventually(t, func() bool {
+		return logs.FilterMessage("executor: record dedup completion with abort failed, keeping the task retryable").Len() >= 1
+	}, 5*time.Second, 20*time.Millisecond, "the failed atomic marking must surface")
+	failed, err := q.ListByStatus(queue.StatusFailed)
+	require.NoError(t, err)
+	require.Len(t, failed, 1,
+		"the row must land back in failed with a retry schedule, schedulable by this process")
+	assert.NotZero(t, failed[0].NextRetryAt, "the fallback must arm a persisted retry schedule")
+
+	// Injection removed: the same process must redo the completion and finish.
+	db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_busy_timeout=5000")
+	require.NoError(t, err)
+	_, err = db.Exec(`DROP TRIGGER no_abort_record`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	require.Eventually(t, func() bool {
+		completed, err := q.ListByStatus(queue.StatusCompleted)
+		return err == nil && len(completed) == 1
+	}, 5*time.Second, 20*time.Millisecond,
+		"the task must be completed by the CURRENT process, not only after a restart")
+	e.Stop()
 }

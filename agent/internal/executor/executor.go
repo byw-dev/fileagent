@@ -294,10 +294,19 @@ func (e *Executor) processTask(ctx context.Context, task *queue.UploadTask) {
 		if task.UploadID != "" {
 			if err := e.queue.MarkCompletedAbandoningUpload(ctx, task); err != nil {
 				if !errors.Is(err, queue.ErrTaskNotFound) {
-					e.logger.Error("executor: record dedup completion with abort",
+					// R2/B: the completion transition and its abort intent
+					// are one transaction; if it could not commit, the task
+					// is NOT completed and NOT abandoned. Fall back to the
+					// normal retryable-failure path so the row lands back in
+					// `failed` with a persisted schedule — schedulable by
+					// THIS process (a bare return would stall it as running
+					// until the next restart). The retry hits the dedup
+					// shortcut again and re-attempts the atomic completion.
+					e.logger.Error("executor: record dedup completion with abort failed, keeping the task retryable",
 						zap.String("task_id", task.ID),
 						zap.String("upload_id", task.UploadID),
 						zap.Error(err))
+					e.handleFailure(ctx, task, fmt.Errorf("dedup completion could not be recorded: %w", err))
 					return
 				}
 				// Row evicted while we worked: the eviction already wrote
@@ -461,7 +470,9 @@ func (e *Executor) abortBackoffDelay(attempts int) time.Duration {
 
 // handleFailure marks a task as failed and re-queues it with exponential
 // backoff unless the retry limit has been reached. Terminal failures
-// (ErrTerminalUpload) skip the retry entirely and report immediately.
+// (ErrTerminalUpload) skip the retry entirely and report immediately —
+// UNLESS their abandonment could not be durably recorded (see below), in
+// which case the task falls back to the backoff path and stays retryable.
 //
 // Abandonment (retry exhausted or terminal failure) also aborts the task's
 // in-flight multipart upload: a task that will never be retried again must not
@@ -474,6 +485,17 @@ func (e *Executor) abortBackoffDelay(attempts int) time.Duration {
 // in-memory-only retry goroutine left failed rows dead across restarts, their
 // uploads neither resumed nor aborted. Abandoned tasks (give-up, terminal)
 // are stamped with the never-retry sentinel so no restart resurrects them.
+//
+// The abandonment marking (never-retry sentinel + abort record) is one
+// transaction (R2). When that marking FAILS (and the row was not evicted),
+// the verdict is NOT durable — so the task is deliberately kept RETRYABLE:
+// all three abandonment branches (terminal, give-up, dedup-completion) fall
+// through to the backoff path, landing the row back in `failed` with a
+// persisted schedule that THIS process re-schedules (B). A bare return would
+// strand the row in `running`, which nothing but the next startup's
+// ResetRunningToPending would ever touch. On the retry the verdict is
+// re-derived and the atomic marking re-attempted; one extra attempt while the
+// local DB is broken is cheaper than a stalled row or a stranded upload.
 func (e *Executor) handleFailure(ctx context.Context, task *queue.UploadTask, err error) {
 	e.logger.Warn("executor: task failed",
 		zap.String("task_id", task.ID),
@@ -490,29 +512,39 @@ func (e *Executor) handleFailure(ctx context.Context, task *queue.UploadTask, er
 		)
 		if merr := e.queue.MarkFailedAbandoned(ctx, task, err.Error()); merr != nil {
 			if !errors.Is(merr, queue.ErrTaskNotFound) {
-				// R2: the abandoned state and its abort record are one
+				// R2/B: the abandoned state and its abort record are one
 				// transaction; if it could not commit, the task is NOT
 				// durably recorded as abandoned. Abandoning it in memory
 				// anyway would strand the upload (row says never-retry, no
 				// abort record exists). Same ordering rule as the uploader's
 				// first persist (P1-c): make the state trackable BEFORE
-				// acting on it — so leave the row in its current (running)
-				// state, keep the upload alive for the retry to resume or
-				// abort, and surface the failure loudly. Startup recovery
-				// (ResetRunningToPending) makes the row eligible again.
-				e.logger.Error("executor: record terminal abandonment",
+				// acting on it — so fall through to the BACKOFF path below:
+				// the row lands back in `failed` with a persisted schedule,
+				// schedulable again by THIS process (B: a bare return would
+				// leave it running, which nothing but the next restart's
+				// ResetRunningToPending would ever touch). The retry re-runs
+				// the upload, re-derives the verdict, and re-attempts the
+				// atomic marking — one extra attempt on a broken local DB is
+				// cheaper than a stalled row or a stranded upload.
+				e.logger.Error("executor: record terminal abandonment failed, keeping the task retryable",
 					zap.String("task_id", task.ID),
 					zap.String("upload_id", task.UploadID),
 					zap.Error(merr))
+				err = fmt.Errorf("%w (terminal abandonment not durably recorded: %v)", err, merr)
+			} else {
+				// Row evicted while we worked: the eviction already wrote the
+				// abort record transactionally with the DELETE.
+				task.RetryCount++
+				e.abandonTaskUpload(context.Background(), task)
+				e.persistResult(context.Background(), task, nil, err)
 				return
 			}
-			// Row evicted while we worked: the eviction already wrote the
-			// abort record transactionally with the DELETE.
+		} else {
+			task.RetryCount++
+			e.abandonTaskUpload(context.Background(), task)
+			e.persistResult(context.Background(), task, nil, err)
+			return
 		}
-		task.RetryCount++
-		e.abandonTaskUpload(context.Background(), task)
-		e.persistResult(context.Background(), task, nil, err)
-		return
 	}
 
 	newRetry := task.RetryCount + 1
@@ -523,19 +555,28 @@ func (e *Executor) handleFailure(ctx context.Context, task *queue.UploadTask, er
 		)
 		if merr := e.queue.MarkFailedAbandoned(ctx, task, err.Error()); merr != nil {
 			if !errors.Is(merr, queue.ErrTaskNotFound) {
-				// R2: identical reasoning to the terminal branch — no
-				// durable abandoned state means no abandonment.
-				e.logger.Error("executor: record give-up abandonment",
+				// R2/B: identical reasoning to the terminal branch — no
+				// durable abandoned state means no abandonment; fall through
+				// to the backoff path so THIS process keeps the row
+				// schedulable instead of stalling it as running. The retry
+				// re-derives the give-up verdict once the marking can commit.
+				e.logger.Error("executor: record give-up abandonment failed, keeping the task retryable",
 					zap.String("task_id", task.ID),
 					zap.String("upload_id", task.UploadID),
 					zap.Error(merr))
+				err = fmt.Errorf("%w (give-up abandonment not durably recorded: %v)", err, merr)
+			} else {
+				task.RetryCount = newRetry
+				e.abandonTaskUpload(context.Background(), task)
+				e.persistResult(context.Background(), task, nil, err)
 				return
 			}
+		} else {
+			task.RetryCount = newRetry
+			e.abandonTaskUpload(context.Background(), task)
+			e.persistResult(context.Background(), task, nil, err)
+			return
 		}
-		task.RetryCount = newRetry
-		e.abandonTaskUpload(context.Background(), task)
-		e.persistResult(context.Background(), task, nil, err)
-		return
 	}
 
 	// Stamp the persisted retry schedule before arming the in-memory timer:

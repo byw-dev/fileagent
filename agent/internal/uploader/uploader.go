@@ -199,10 +199,36 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 
 	var result *UploadResult
 	threshold := int64(u.cfg.ThresholdMB) * 1024 * 1024
-	if uploadSize <= threshold {
-		result, err = u.singlePartUpload(ctx, task, offset, uploadSize)
+	// The file version this attempt would read (the top stat succeeded, or we
+	// would have returned above — "stat failed" can never reach the gate).
+	current := queue.FileVersion{Mtime: info.ModTime().Unix(), Size: info.Size()}
+	isMultipart := uploadSize > threshold
+
+	// Fail-closed resume gate (IC-3 R-A/A1/A2): the recorded parts may be
+	// skipped ONLY when canResumeParts holds for EVERY condition. Anything
+	// else — no snapshot, failed stat, changed version, shrunken single-part
+	// file — means the recorded multipart upload is discarded first (abort
+	// intent + abort) or the attempt fails (discard refused, A3), and the
+	// current content is uploaded from scratch. This gate lives at the ONE
+	// place every upload path flows through, so no path can bypass it.
+	if task.UploadID != "" {
+		if ok, reason := canResumeParts(task, current, true, isMultipart); !ok {
+			u.logger.Warn("uploader: recorded multipart upload cannot be resumed, discarding it",
+				zap.String("task_id", task.ID),
+				zap.String("upload_id", task.UploadID),
+				zap.String("reason", reason))
+			if derr := u.discardStaleUpload(ctx, task, task.UploadID); derr != nil {
+				return nil, fmt.Errorf("uploader: discard stale multipart upload %q: %w", task.UploadID, derr)
+			}
+			task.UploadID = ""
+			task.CompletedParts = ""
+		}
+	}
+
+	if isMultipart {
+		result, err = u.multipartUpload(ctx, task, current, fileSize)
 	} else {
-		result, err = u.multipartUpload(ctx, task, fileSize)
+		result, err = u.singlePartUpload(ctx, task, offset, uploadSize)
 	}
 	if err != nil {
 		return nil, err
