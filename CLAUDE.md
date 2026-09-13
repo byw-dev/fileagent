@@ -349,7 +349,7 @@ docker compose -f deploy/docker-compose.test.yml down -v
 顺序：IC-0 文档基线 → 止血 IC-1 ✅ → **IC-2c** ✅（webhook 键解码，PR #96）→ **IC-2a** ✅（上报主路径，原子刀，PR #98；
 开工前先修掉挡路的 IC-BUG-36/35——CP 凭据被建成 root 的 service account，而 MinIO 不允许 service account 调 `AssumeRole`，
 **全新环境从来签不出 STS**，PR #97）→ **IC-5** ✅（采集正确性，PR #100）→ **IC-2b** ✅（下发链路鲁棒性，PR #103）→
-**IC-3** ✅（续传落盘 + 孤儿分片清理，PR #105，六轮 review）→ **下一刀在 IC-4 / IC-SEC-2 之间选（可并行）**
+**IC-3** ✅（续传落盘 + 孤儿分片清理，PR #105，六轮 review）→ **下一刀在 IC-4 / IC-SEC-2 / IC-15 / IC-BUG-44 之间选（可并行）**
 → 地基 IC-6/7 → 准入 IC-8…10 → 对账 IC-11…13 → 血缘 IC-14 → **tail 重做 IC-15**。
 **⚠️ `append_mode=tail` 当前会静默丢数据**（IC-BUG-46 🔴 P0：`singlePartUpload` 把只含增量的内容整体替换对象）——
 **IC-3 先 fail-closed 挡掉**（规则创建 422 + 上传路径显式失败），**正确实现（滚动分块 + 服务端合并）见 IC-15**。
