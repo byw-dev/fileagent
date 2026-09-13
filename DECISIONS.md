@@ -1942,8 +1942,13 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
    这两类规则的 path_pattern 本身就把保留字用成了普通字段，属配置语义错位；
    fail-fast（Warn 可读、指明在 path_pattern 里改字段名）优于继续静默跑。
    保留字**时间类型**形态（pattern/dest `{time:yyyy/MM}` 数据日期归档）不受影响。
-   （pattern 语法错误——`New()` 失败——不在此列：agent 对它本就静默当无字段
-   pattern，行为未变；本刀起 CP 在创建/更新时以 warnings 提示，见补记 3 第 1 条。）
+
+   （**pattern 语法错误**（`New()` 失败）不在矩阵内——它与保留字无关，且 agent
+   对它的处理路径不经过 buildStoragePath：正常 watch/cron 路径由 `matchGlob`
+   先行 `New()`，失败即 **Warn 跳过该文件**（`agent: match path failed`），
+   dry-run 显式返回错误；「静默当无字段 pattern」仅在 buildStoragePath 内部成立、
+   而那里只在文件已匹配后才被调用。禁令前后行为一致（Warn 跳过/显式错误），
+   非本刀行为变更；本刀起 CP 在创建/更新时以 warnings 提示，见补记 3 第 1 条。）
 2. **预览镜像写进契约（B2）**。前端 `renderPathPreview` 已实现 dynamicFields
    优先但未实现别名镜像——预览与真实合成不一致，正是 P2-C 要消灭的问题换了入口。
    修正：前端实现与 `InjectSubmitTime` 同款镜像规则（单侧解析→镜像给缺失别名；
@@ -1969,7 +1974,12 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
    也带上 "parses"——`dest_path_template` 只合成、不解析，文案误导。
    两字段文案分别成立：path_pattern 用「解析出同名字段」，dest 用「渲染为提交
    时刻，除非 path_pattern 解析出同名字段」（解析优先是全局规则，条件在 pattern 侧）。
-3. **存量代价矩阵穷尽（四轮 D3）**：三轮修正的四行矩阵仍漏两组
+3. **存量代价矩阵穷尽（四轮 D3 / 五轮 E2 修正）**：三轮修正的四行矩阵仍漏两组
    「失败→失败」组合（pattern=time 解析 + dest 裸/typed 引用；
    pattern=非时间解析 + dest=time 引用），已补入并**显式区分**「原先能跑→现在失败」
-   （真实行为变更，2 行）与「失败→失败」（仅错误更可读，4 行），不再混排。
+   （真实行为变更，**2 行**）与「失败→失败」（仅错误更可读，**3 行**）——
+   五轮修正：正文矩阵初版误写「共四行」且把「pattern 语法错误」行混入并以
+   错误理由（「静默当无字段 pattern」）佐证「行为未变」；实测该理由不成立——
+   正常 watch/cron 路径 `matchGlob` 先行 `New()`，失败即 Warn 跳过、dry-run
+   显式报错，「静默」仅在 buildStoragePath 内部成立而那里根本走不到。该行
+   与保留字无关、禁令前后行为一致，已移出矩阵并如实注明。

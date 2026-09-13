@@ -1090,7 +1090,10 @@ func (h *AgentsHandler) updateRuleStatus(c *gin.Context, rid uuid.UUID, statusSt
 	}
 
 	h.redispatchRule(c.Request.Context(), rule, status)
-	c.JSON(http.StatusOK, toRuleResponse(rule))
+	// respondRule (not a bare c.JSON) so the status-only path — enabling a
+	// rule whose template misuses a reserved word or uses the deprecated
+	// {time} alias — also surfaces the contract warnings (review E1).
+	h.respondRule(c, http.StatusOK, rule)
 }
 
 // updateRuleFull applies a full-field edit of a collection rule. The update is

@@ -123,6 +123,15 @@ export interface CollectionRule {
   enabled: boolean
   metadata?: RuleMetadata
   created_at: string
+  /**
+   * Non-fatal contract notices from the CP (IC-BUG-50 / review E1): a
+   * dest_path_template using the deprecated {time} reserved word, misusing a
+   * reserved time word, or carrying an invalid timezone. The rule is still
+   * saved — the agent keeps rendering deprecated aliases — but the admin must
+   * see the hint at save time, not discover it at upload. The webui renders
+   * them in the rule form (SaveWarningsAlert).
+   */
+  warnings?: string[]
 }
 
 /** Create/update payload for a collection rule */

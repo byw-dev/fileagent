@@ -93,14 +93,21 @@ func (m *mockAgentsDB) UpdateCollectionRuleStatus(_ context.Context, id uuid.UUI
 	if m.updateErr != nil {
 		return nil, m.updateErr
 	}
-	return &db.CollectionRule{
+	// The real DB returns the full stored row; round-trip the template fields
+	// so status-only responses carry the same contract warnings (review E1).
+	r := &db.CollectionRule{
 		ID:        id,
 		AgentID:   uuid.New(),
 		Status:    status,
 		Metadata:  json.RawMessage(`{}`),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
-	}, nil
+	}
+	if m.rule != nil {
+		r.PathPattern = m.rule.PathPattern
+		r.DestPathTemplate = m.rule.DestPathTemplate
+	}
+	return r, nil
 }
 func (m *mockAgentsDB) UpdateCollectionRule(_ context.Context, arg db.UpdateCollectionRuleParams) (*db.CollectionRule, error) {
 	if m.fullUpdateErr != nil {
@@ -757,6 +764,27 @@ func TestAgentsHandler_CreateRule_DeprecatedTime_DestHintDoesNotSayParses(t *tes
 	require.True(t, ok)
 	assert.NotContains(t, fmt.Sprint(warnings), "dest_path_template parses")
 	assert.NotContains(t, fmt.Sprint(warnings), "dest_path_template still parses")
+}
+
+// Review E1: the status-only PUT (enable/disable toggle) must carry the same
+// contract warnings — activating a rule whose template is deprecated or
+// misuses a reserved word must not silently succeed with no signal.
+func TestAgentsHandler_UpdateRule_StatusOnly_ReturnsTemplateWarnings(t *testing.T) {
+	rule := &db.CollectionRule{
+		ID:               uuid.New(),
+		AgentID:          uuid.New(),
+		Status:           db.RuleStatusInactive,
+		DestPathTemplate: "{time:yyyy}/{filename}",
+		CreatedAt:        time.Now(),
+	}
+	h := handler.NewAgentsHandler(&mockAgentsDB{rule: rule}, nil, &mockDispatcher{}, nil, newTestLogger())
+	w := putRule(t, h, `{"status":"active"}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "status-only activation of a rule with deprecated {time} must warn")
+	assert.Contains(t, fmt.Sprint(warnings), "dest_path_template uses the deprecated reserved word")
 }
 
 func TestAgentsHandler_UpdateRule_FullUpdate_DeprecatedTimeTemplate_Warns(t *testing.T) {
