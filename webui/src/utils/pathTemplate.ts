@@ -1,12 +1,16 @@
 /**
  * System template variables that are always available for upload path configuration.
  * These are injected by the Agent via InjectContext and buildStoragePath.
+ * IC-BUG-50 / D-034: {submit_time} is the declared reserved word for the
+ * file's submit-for-upload instant (UTC); {time} is its deprecated alias.
  */
 export const SYSTEM_TEMPLATE_VARIABLES: ReadonlyArray<{ key: string; desc: string }> = [
-  { key: '{agent_name}', desc: 'Agent 名称，例如 prod-sensor-01' },
-  { key: '{agent_id}',   desc: 'Agent UUID，例如 a1b2c3...' },
-  { key: '{filename}',   desc: '原始文件名（含扩展名），例如 data.csv' },
-  { key: '{ext}',        desc: '文件扩展名（不含点），例如 csv' },
+  { key: '{agent_name}',  desc: 'Agent 名称，例如 prod-sensor-01' },
+  { key: '{agent_id}',    desc: 'Agent UUID，例如 a1b2c3...' },
+  { key: '{filename}',    desc: '原始文件名（含扩展名），例如 data.csv' },
+  { key: '{ext}',         desc: '文件扩展名（不含点），例如 csv' },
+  { key: '{submit_time}', desc: '该文件被提交上传的时刻（UTC），例如 2026-09-13T08:00:00Z' },
+  { key: '{time}',        desc: '已废弃（deprecated）：{submit_time} 的旧名，仍可渲染，请改用 {submit_time}' },
 ]
 
 /**
@@ -50,13 +54,14 @@ function formatLDML(ldml: string, now: Date): string {
  *
  * Substitution priority (highest first):
  *  1. `{fieldname:LDML}` or `{fieldname:LDML|tz=...}` — formatted with UTC current time.
- *  2. System variables (`{agent_name}`, `{agent_id}`, `{filename}`, `{ext}`) — fixed examples.
+ *  2. System variables (`{agent_name}`, `{agent_id}`, `{filename}`, `{ext}`,
+ *     `{submit_time}` — bare form only; `{time}` is the deprecated alias). — fixed examples.
  *  3. Fields present in `dynamicFields` — shown as `«fieldname»` (runtime placeholder).
  *  4. All other variables — left unchanged (valid syntax, resolved at runtime).
  *
  * A leading "/" is stripped first, matching how the Agent builds the object key.
  *
- * @param template - Path template string, e.g. `/{agent_name}/{time:yyyy/MM/dd}/{filename}`.
+ * @param template - Path template string, e.g. `/{agent_name}/{submit_time:yyyy/MM/dd}/{filename}`.
  * @param dynamicFields - Field names extracted from path_pattern (shown as «name» placeholders).
  * @returns Preview string with example substitutions applied, without a leading "/".
  */
@@ -71,10 +76,12 @@ export function renderPathPreview(template: string, dynamicFields?: string[]): s
   const now = new Date()
 
   const systemSubs: Record<string, string> = {
-    '{agent_name}': 'my-agent',
-    '{agent_id}':   'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
-    '{filename}':   'data.csv',
-    '{ext}':        'csv',
+    '{agent_name}':  'my-agent',
+    '{agent_id}':    'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+    '{filename}':    'data.csv',
+    '{ext}':         'csv',
+    '{submit_time}': '2026-09-13T08:00:00Z',
+    '{time}':        '2026-09-13T08:00:00Z (deprecated)',
   }
 
   const dynamicSet = new Set(dynamicFields ?? [])

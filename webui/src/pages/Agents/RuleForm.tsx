@@ -101,7 +101,9 @@ const DEFAULT_VALUES: RuleFormValues = {
   recursive: false,
   append_mode: 'overwrite',
   enabled: true,
-  dest_path_template: '/{agent_name}/{time:yyyy/MM/dd}/{filename}',
+  // IC-BUG-50 / D-034: the default template uses the declared {submit_time}
+  // reserved word (the file's submit-for-upload instant), not the deprecated {time}.
+  dest_path_template: '/{agent_name}/{submit_time:yyyy/MM/dd}/{filename}',
   file_type: '',
   static_tags: [],
   path_tag_map: [],
@@ -513,7 +515,7 @@ function AgentRuleFormPage() {
                 <div>
                   <Text code>{'{字段名:LDML格式}'}</Text>
                   <Text type="secondary" style={{ marginLeft: 4, fontSize: 12 }}>
-                    时间字段，例如 {'{'}{`time:yyyy/MM/dd`}{'}'} 、{'{'}{`ts:HH:mm:ss|tz=Asia/Shanghai`}{'}'}
+                    时间字段，例如 {'{'}{`submit_time:yyyy/MM/dd`}{'}'} 、{'{'}{`ts:HH:mm:ss|tz=Asia/Shanghai`}{'}'}
                   </Text>
                 </div>
               </div>

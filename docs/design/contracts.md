@@ -127,10 +127,29 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 | `{agent_id}`   | Agent UUID |
 | `{filename}`   | 原始文件名（含扩展名） |
 | `{ext}`        | 扩展名（不含点） |
+| `{submit_time}` | **该文件被提交上传的时刻**（`submitFile` 时刻，UTC）。⚠️ 不是「当前时刻」的通用时间变量——同一文件重复采集时它是稳定的（IC-BUG-50 / D-034） |
+| `{time}`       | ⚠️ **已废弃（deprecated）**：`{submit_time}` 的旧名，**仍可渲染**（语义完全等价），无移除时间表；新建规则一律用 `{submit_time}`。经 UI 旧默认模板创建的存量规则仍带此名 |
 
-- 权威注入点：`pkg/trollsift/context.go`（`InjectContext`：`agent_name` / `agent_id`；
-  `filename` / `ext` 由 agent 上传路径构建时注入）
+- 权威注入点共**两处**（此前只写了第一处）：
+  1. `pkg/trollsift/context.go`（`InjectContext`：`agent_name` / `agent_id`）
+  2. `pkg/trollsift/uploadfields.go`（`InjectSubmitTime`：`submit_time` + 废弃别名 `time`；
+     `filename` / `ext` 由 agent 上传路径构建时注入——`buildStoragePath` 与
+     `handleDryRun` 共用 `injectUploadFields`）
 - webui 镜像清单：`webui/src/utils/pathTemplate.ts:5`（`SYSTEM_TEMPLATE_VARIABLES`）
+
+### 优先级：解析结果 vs 注入值（IC-BUG-50 / D-034）
+
+**解析结果优先，注入不覆盖**——对全部系统变量与保留字统一成立：
+`path_pattern` 从文件相对路径解析出**同名字段**时，一律用解析值；字段缺失才注入。
+权威实现在两处注入点本身（`InjectContext` 的 exists 检查、`InjectSubmitTime` 的
+inject-if-absent；`TestInjectContext_NoOverwrite`、
+`TestBuildStoragePath_SubmitTimeParsedFieldWins` 钉住）。因此：
+
+- 管理员把解析字段命名为 `submit_time`（或旧名 `time`）即可**按数据日期归档**，
+  不会被上传时刻静默覆盖（IC-BUG-50 修复前 `{time}` 是无条件覆盖，恰与此相反）。
+- 「想要上传时刻」的用法不受影响：解析字段不同名时（大多数规则）注入值生效。
+- 字段名共享前缀（如解析字段 `time_zone`）不会被保留字注入误伤——注入是
+  inject-if-absent，**不做模板子串前缀匹配**。
 
 ### 时间字段（LDML 语法）
 
@@ -139,13 +158,18 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 | 符号 | 含义 | 符号 | 含义 |
 |------|------|------|------|
 | `yyyy` | 四位年 | `HH` | 时（24h） |
-| `yy`   | 两位年 | `mm` | 分 |
-| `MM`   | 月     | `ss` | 秒 |
+| `yy`   | 两位年 | `mm` | **分** |
+| `MM`   | **月** | `ss` | 秒 |
 | `dd`   | 日     |      |    |
+
+> ⚠️ **大小写敏感**：`mm` = 分钟、`MM` = 月，写错**在建规则时不会被拦下**
+> （webui/REST 对模板无形状约束，D-030 第八条），**要到上传时才失败**
+> （实测报 `month out of range` 一类解析错误，按 IC-BUG-21 任务失败并告警）。
 
 - 权威解析：`pkg/trollsift/parser.go` / `pkg/trollsift/regex.go`
 - webui 预览渲染镜像：`webui/src/utils/pathTemplate.ts`（`formatLDML`）
-- 决策背景：`DECISIONS.md` **D-010**（引入 `pkg/trollsift` 统一路径模板）
+- 决策背景：`DECISIONS.md` **D-010**（引入 `pkg/trollsift` 统一路径模板）、
+  **D-034**（`{time}` → `{submit_time}` 改名与优先级对齐）
 
 ### 前导 `/` 的归一化（三端共享约定）
 
@@ -164,8 +188,10 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 | webui（模板预览） | `webui/src/utils/pathTemplate.ts` `normalizeTemplate` | ✅ IC-1 修复（此前不剥，预览显示 `/my-agent/…` 而真实键是 `my-agent/…`） |
 | agent（dry-run 试运行） | `agent/cmd/agent/main.go` `handleDryRun` | ✅ IC-1 修复（此前用原始模板，且它与 webui 预览显示在**同一个表单**里，两个字段对同一模板给出不同答案） |
 
-webui 新建规则的默认模板就带前导 `/`（`webui/src/pages/Agents/RuleForm.tsx:104` =
-`/{agent_name}/{time:yyyy/MM/dd}/{filename}`），**经 UI 创建的规则全部命中**——这就是
+webui 新建规则的默认模板就带前导 `/`（`webui/src/pages/Agents/RuleForm.tsx:104`，
+D-034 起为 `/{agent_name}/{submit_time:yyyy/MM/dd}/{filename}`；D-034 前是
+`/{agent_name}/{time:yyyy/MM/dd}/{filename}`——**经 UI 创建的存量规则仍带旧名**，
+agent 侧继续按 deprecated 别名渲染，见上方系统变量表），**经 UI 创建的规则全部命中**——这就是
 `docs/tasks/bugs/open.md` **IC-BUG-16** 长期静默的原因。
 
 修复方向是**让 CP 与 webui 剥模板**，不是让 agent 停止剥路径：后者会改写所有既有对象键、需全量重铺。

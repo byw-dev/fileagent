@@ -1814,3 +1814,66 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
    `ErrRulesSyncDegraded`；gRPC Connect 据此**保持连接**（断流必然循环）并在缓存打
    `AgentSyncDegradedKey`（24h TTL，成功同步清除），agents API 的
    `agentResponse.rule_sync_degraded` 直接可读——不再只有一条 ERROR 日志。
+
+---
+
+## D-034：路径模板保留字 `time` 改名 `submit_time`，注入优先级与系统变量对齐（IC-BUG-50）
+
+**决策日期**：2026-09-13
+**影响范围**：`pkg/trollsift`（新增 `InjectSubmitTime` / `UsesDeprecatedTimeField`）、
+`agent/cmd/agent/main.go`（`buildStoragePath` / `handleDryRun`）、
+`controlplane/internal/api/handler/agents.go`（创建/更新的 deprecation 提示）、
+`webui/src/utils/pathTemplate.ts`、`webui/src/pages/Agents/RuleForm.tsx`（默认模板）、
+`docs/design/contracts.md` V-3（契约对齐）
+**关联**：IC-BUG-50（docs/tasks/bugs/open.md）、D-010（引入 trollsift）、V-3（路径模板契约）
+
+### 背景与三条根因（IC-BUG-50）
+
+1. **`time` 是未声明的保留字**。`buildStoragePath` 里硬编码注入 `fields["time"]`，
+   但 `contracts.md` V-3 的系统变量表与 webui 的 `SYSTEM_TEMPLATE_VARIABLES` 都没有它
+   ——三端契约只有两端知道它存在。
+2. **优先级与同体系变量相反**。`InjectContext` 对 `agent_name`/`agent_id` 是
+   **解析结果优先、不覆盖**（`TestInjectContext_NoOverwrite` 钉住），而 `time`
+   是 `strings.Contains(DestPathTemplate, "{time")` 命中即**无条件覆盖**解析结果。
+   管理员把解析字段命名为 `time`（很自然）想按**数据日期**归档时，会静默拿到
+   **采集时刻**——归档到错误日期且无任何提示（D-030 整桶 policy 下连 403 都没有）。
+3. **名字误导**。它不是「当前时刻」语义，而是「**该文件被提交上传的那一刻**」
+   （`submitFile` 时刻的 `time.Now().UTC()`）；叫 `time` 让人以为是通用时间变量。
+
+且 `strings.Contains(template, "{time")` 是字面前缀匹配，对 `{time_zone}`
+这类前缀相同的字段名会误触发注入（`submit_time` 系列同样存在，改名后一并消除）。
+
+### 决策
+
+1. **改名**：保留字 `{time}` → **`{submit_time}`**。语义 = **该文件被提交上传的
+   时刻**（`submitFile` 时刻，UTC），与 `agent_name`/`filename` 同为小写下划线名词，
+   且与代码自身词汇（`submitFile`）一致。否决 `upload_time`（歧义为 PUT 完成时刻）、
+   `now`（查询时刻歧义，任务明令禁用）。
+2. **优先级对齐**：与 `agent_name`/`agent_id` 一致改为**解析结果优先**——
+   `path_pattern` 解析出同名字段就用解析值，**没有才注入**上传时刻。
+   同一体系里不允许两套相反的优先级规则；「想要上传时刻」的用法在解析字段
+   不同名时照样成立。权威注入点收敛为 `pkg/trollsift.InjectSubmitTime`
+   （`buildStoragePath` 与 `handleDryRun` 共用），不再做模板字符串前缀匹配
+   ——无条件注入-if-absent 对 Compose 无副作用（未引用的字段不参与合成），
+   从结构上消灭 `{time_zone}` 前缀误伤。
+3. **存量兼容**：**同时接受旧名 `{time}` 与 `{submit_time}`**，渲染语义完全等价
+   （同样解析结果优先）。**不选一次性数据迁移**：模板存在 `rules.dest_path_template`
+   里，迁移要扫全表改写文本且 REST 建的规则无形状约束、无法保证替换不破坏 LDML
+   段；而 agent 侧接受旧名的成本是两行 inject-if-absent，风险更低。旧名标记为
+   **deprecated（未移除，无移除时间表）**：CP 在创建/更新规则时对含旧名的模板
+   返回可读的 `warnings` 提示并记 Warn 日志。
+4. **行为变更声明（对存量规则）**：仅当一条规则**同时**满足「`path_pattern`
+   解析出名为 `time` 的字段」且「`dest_path_template` 引用 `{time}`」时，
+   渲染结果从「上传时刻」变为「解析值」——这正是缺陷本身，属修复而非破坏；
+   其余存量规则（模板含 `{time}` 但无同名字段）渲染结果逐字节不变。
+   UI 默认模板改用 `{submit_time:yyyy/MM/dd}`，新建规则不再产生旧名。
+
+### 落地约束
+
+- `pkg/trollsift` 为权威（`InjectSubmitTime` / `UsesDeprecatedTimeField`），
+  webui `pathTemplate.ts` 镜像同步（V-3 既有约定）。
+- `contracts.md` V-3 同步：系统变量表补 `submit_time` + 旧名 deprecation 状态、
+  新增优先级说明（`InjectContext` 与 `buildStoragePath` 两个注入点）、
+  时间符号表补 `mm`=分 / `MM`=月及「大小写写错在上传时才失败（`month out of range`）」。
+- 测试钉住：解析优先（含旧名等价、`time_zone` 不被误伤）、新名注入兜底、
+  CP 侧 deprecation 提示。

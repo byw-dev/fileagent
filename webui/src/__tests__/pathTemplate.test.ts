@@ -7,13 +7,44 @@ import {
 } from '../utils/pathTemplate'
 
 describe('SYSTEM_TEMPLATE_VARIABLES', () => {
-  it('should export 4 system variables', () => {
-    expect(SYSTEM_TEMPLATE_VARIABLES).toHaveLength(4)
+  it('should export the system variables (IC-BUG-50: incl. submit_time)', () => {
+    expect(SYSTEM_TEMPLATE_VARIABLES).toHaveLength(6)
     const keys = SYSTEM_TEMPLATE_VARIABLES.map((v) => v.key)
     expect(keys).toContain('{agent_name}')
     expect(keys).toContain('{agent_id}')
     expect(keys).toContain('{filename}')
     expect(keys).toContain('{ext}')
+  })
+
+  // IC-BUG-50: submit_time is the declared reserved word for the moment the
+  // file was submitted for upload; the deprecated {time} alias is listed so
+  // legacy rules are discoverable in the UI hints.
+  it('declares submit_time and the deprecated time alias', () => {
+    const keys = SYSTEM_TEMPLATE_VARIABLES.map((v) => v.key)
+    expect(keys).toContain('{submit_time}')
+    expect(keys).toContain('{time}')
+    const submitTime = SYSTEM_TEMPLATE_VARIABLES.find((v) => v.key === '{submit_time}')
+    expect(submitTime?.desc).toContain('上传')
+    const legacyTime = SYSTEM_TEMPLATE_VARIABLES.find((v) => v.key === '{time}')
+    expect(legacyTime?.desc).toContain('deprecated')
+  })
+})
+
+describe('renderPathPreview: submit_time (IC-BUG-50 / D-034)', () => {
+  it('renders the new default template with LDML', () => {
+    const preview = renderPathPreview('/{agent_name}/{submit_time:yyyy/MM/dd}/{filename}')
+    expect(preview).toMatch(/^my-agent\/\d{4}\/\d{2}\/\d{2}\/data\.csv$/)
+  })
+
+  it('substitutes a UTC example for the bare reserved word', () => {
+    expect(renderPathPreview('{submit_time}')).toBe('2026-09-13T08:00:00Z')
+    expect(renderPathPreview('{time}')).toBe('2026-09-13T08:00:00Z (deprecated)')
+  })
+
+  it('does not treat {time_zone} as a time field', () => {
+    // time_zone without LDML is not a reserved word: it stays unchanged
+    // (compose-time field from path_pattern), exactly like unknown variables.
+    expect(renderPathPreview('{time_zone}', ['time_zone'])).toBe('\u00ABtime_zone\u00BB')
   })
 })
 

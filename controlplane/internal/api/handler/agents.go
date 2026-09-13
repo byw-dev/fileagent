@@ -17,6 +17,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
+	"github.com/byw-dev/fileagent/pkg/trollsift"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -713,6 +714,10 @@ type collectionRuleResponse struct {
 	// edit — without it an update would overwrite the stored metadata with {}.
 	Metadata  json.RawMessage `json:"metadata,omitempty"`
 	CreatedAt string          `json:"created_at"`
+	// Warnings carries non-fatal contract notices (IC-BUG-50 / D-034): a
+	// dest_path_template using the deprecated {time} reserved word still
+	// renders, but creation/update tells the admin to migrate to {submit_time}.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
@@ -736,6 +741,34 @@ func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 		resp.CronExpr = r.CronExpr.String
 	}
 	return resp
+}
+
+// deprecatedTemplateWarnings returns the readable deprecation notice for a
+// dest_path_template that still uses the deprecated {time} reserved word
+// (IC-BUG-50 / D-034). The agent keeps rendering the alias with parse-first
+// priority, so this is a hint, not a rejection: existing rules created through
+// the Web UI's old default template must not break.
+func deprecatedTemplateWarnings(template string) []string {
+	if !trollsift.UsesDeprecatedTimeField(template) {
+		return nil
+	}
+	return []string{"dest_path_template uses the deprecated reserved word {time}; " +
+		"it still renders (the file's submit-for-upload instant, unless path_pattern parses a field with that name — parse results always win), " +
+		"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)"}
+}
+
+// respondRule writes a rule response, attaching deprecation warnings for the
+// deprecated {time} reserved word and logging a Warn so the hint survives even
+// for API clients that ignore the warnings field.
+func (h *AgentsHandler) respondRule(c *gin.Context, code int, rule *db.CollectionRule) {
+	resp := toRuleResponse(rule)
+	if warns := deprecatedTemplateWarnings(rule.DestPathTemplate); warns != nil {
+		resp.Warnings = warns
+		h.logger.Warn("dest_path_template uses the deprecated {time} reserved word (IC-BUG-50 / D-034); migrate to {submit_time}",
+			zap.String("rule_id", rule.ID.String()),
+			zap.String("dest_path_template", rule.DestPathTemplate))
+	}
+	c.JSON(code, resp)
 }
 
 // rejectTailAppendMode enforces the IC-BUG-46 fail-closed block on
@@ -927,7 +960,7 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 			h.logger.Warn("dispatch rule after create", zap.Error(err))
 		}
 	}
-	c.JSON(http.StatusCreated, toRuleResponse(rule))
+	h.respondRule(c, http.StatusCreated, rule)
 }
 
 // updateRuleRequest is the body expected by PUT /api/v1/agents/:id/rules/:rid.
@@ -1111,7 +1144,7 @@ func (h *AgentsHandler) updateRuleFull(c *gin.Context, rid uuid.UUID, req update
 	// Re-dispatch so an active rule's content change hot-reloads on the Agent
 	// (offline agents pick it up via SyncRulesOnConnect on reconnect).
 	h.redispatchRule(c.Request.Context(), rule, status)
-	c.JSON(http.StatusOK, toRuleResponse(rule))
+	h.respondRule(c, http.StatusOK, rule)
 }
 
 // redispatchRule pushes the rule to its Agent when active, or cancels it when

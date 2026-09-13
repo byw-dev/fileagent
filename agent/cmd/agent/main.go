@@ -937,11 +937,7 @@ func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx 
 	}
 
 	fields = trollsift.InjectContext(agentCtx, fields)
-	fields["filename"] = trollsift.S(filepath.Base(localPath))
-	fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(localPath), "."))
-	if strings.Contains(rule.DestPathTemplate, "{time") {
-		fields["time"] = trollsift.T(now)
-	}
+	fields = injectUploadFields(fields, localPath, now)
 
 	fail := func(cause string, causeErr error) (string, error) {
 		err := fmt.Errorf("dest_path_template for rule %s cannot be resolved (%s): template %q: %w",
@@ -971,6 +967,20 @@ func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx 
 		return fail("resolved to an empty key", fmt.Errorf("composed key is empty"))
 	}
 	return trollsift.NormalizeObjectKey(storagePath), nil
+}
+
+// injectUploadFields adds the non-parsed upload variables shared by
+// buildStoragePath and handleDryRun, so a dry-run preview shows exactly the
+// key the upload would produce. filename/ext always overwrite (they describe
+// this local file); submit_time — and its deprecated alias {time}
+// (IC-BUG-50 / D-034) — is parse-first (D-034): InjectSubmitTime never
+// overwrites a field parsed out of path_pattern. The injection is
+// unconditional-if-absent instead of a template substring check, so field
+// names sharing the reserved word's prefix ({time_zone}) cannot misfire.
+func injectUploadFields(fields map[string]trollsift.Value, localPath string, now time.Time) map[string]trollsift.Value {
+	fields["filename"] = trollsift.S(filepath.Base(localPath))
+	fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(localPath), "."))
+	return trollsift.InjectSubmitTime(fields, now)
 }
 
 // applyRulesSnapshot replaces the agent's whole rule set with the synced
@@ -1093,8 +1103,7 @@ func handleDryRun(rule scheduler.CollectionRule, client *grpcclient.Client, agen
 			}
 		}
 		fields = trollsift.InjectContext(agentCtx, fields)
-		fields["filename"] = trollsift.S(filepath.Base(path))
-		fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(path), "."))
+		fields = injectUploadFields(fields, path, time.Now().UTC())
 
 		// Normalise exactly as buildStoragePath does: the dry-run preview sits
 		// next to the Web UI's own preview in the same form, so showing a

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -606,6 +607,57 @@ func TestAgentsHandler_CreateRule_InvalidBucketID(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// IC-BUG-50 / D-034: creating a rule whose dest_path_template uses the
+// deprecated {time} reserved word must still succeed (the agent accepts the
+// alias), but the response must carry a readable deprecation hint pointing at
+// {submit_time}.
+func TestAgentsHandler_CreateRule_DeprecatedTimeTemplate_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"{time:yyyy/MM/dd}/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "deprecated {time} template must produce a warnings array")
+	joined := fmt.Sprint(warnings)
+	assert.Contains(t, joined, "deprecated")
+	assert.Contains(t, joined, "submit_time")
+}
+
+// The new reserved word must not trigger the deprecation warning, nor must a
+// field name that merely shares the {time prefix ({time_zone}).
+func TestAgentsHandler_CreateRule_NonDeprecatedTemplates_NoWarning(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	for _, tpl := range []string{"{submit_time:yyyy/MM/dd}/{filename}", "{time_zone}/{filename}"} {
+		body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"` + tpl + `"}`
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		testAgentsRouter(h).ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code, tpl)
+		var resp map[string]interface{}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Nil(t, resp["warnings"], "template %s must not warn", tpl)
+	}
+}
+
+func TestAgentsHandler_UpdateRule_FullUpdate_DeprecatedTimeTemplate_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"name":"edited","bucket_id":"` + uuid.New().String() +
+		`","mode":"watch","base_path":"/data","path_pattern":"*","dest_path_template":"{time:yyyy}/{filename}","enabled":true}`
+	w := putRule(t, h, body)
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "deprecated {time} template must produce a warnings array")
+	assert.Contains(t, fmt.Sprint(warnings), "submit_time")
 }
 
 // ── UpdateRule ────────────────────────────────────────────────────────────────

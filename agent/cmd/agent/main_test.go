@@ -195,6 +195,81 @@ func TestBuildStoragePath_EmptyResolvedKey_FailsTask(t *testing.T) {
 	assert.Empty(t, got)
 }
 
+// ── buildStoragePath: submit_time reserved word (IC-BUG-50 / D-034) ───────────
+
+// submit_time is the declared reserved word for the instant the file was
+// submitted for upload: when path_pattern parses nothing by that name, the
+// upload instant (submitFile moment, passed as `now`) fills it.
+func TestBuildStoragePath_SubmitTimeInjectedFromUploadInstant(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		DestPathTemplate: "{submit_time:yyyy/MM/dd}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err, "submit_time must resolve like the old reserved word did")
+	assert.Equal(t, "2026/09/13/out.bin", got)
+}
+
+// D-034 parse-first priority: a time field parsed out of path_pattern must win
+// over the injected upload instant. The old reserved word overwrote the parse
+// result unconditionally, silently archiving by collection time when the admin
+// meant the data date.
+func TestBuildStoragePath_SubmitTimeParsedFieldWins(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		PathPattern:      "logs/{submit_time:yyyy/MM}/{filename}",
+		DestPathTemplate: "{submit_time:yyyy}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/logs/2019/03/out.bin",
+		trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "2019/out.bin", got, "parsed data date must win over the upload instant")
+}
+
+// The deprecated {time} alias (IC-BUG-50 / D-034) keeps rendering legacy rules
+// created through the Web UI's old default template.
+func TestBuildStoragePath_LegacyTimeAliasStillWorks(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		DestPathTemplate: "{time:yyyy/MM/dd}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err, "legacy {time} templates must keep resolving")
+	assert.Equal(t, "2026/09/13/out.bin", got)
+}
+
+// The deprecated alias obeys the same parse-first priority as submit_time.
+func TestBuildStoragePath_LegacyTimeParsedFieldWins(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		PathPattern:      "logs/{time:yyyy/MM}/{filename}",
+		DestPathTemplate: "{time:yyyy}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/logs/2019/03/out.bin",
+		trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "2019/out.bin", got, "parsed data date must win over the upload instant")
+}
+
+// A parsed field that merely shares the reserved word's prefix (time_zone) is
+// never touched by the injection — no substring-prefix misfire (IC-BUG-50).
+func TestBuildStoragePath_TimeZoneFieldNotClobbered(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		PathPattern:      "logs/{time_zone}/{filename}",
+		DestPathTemplate: "{time_zone}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/logs/UTC+8/out.bin",
+		trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "UTC+8/out.bin", got)
+}
+
 // ── submitFile ────────────────────────────────────────────────────────────────
 
 func openTestQueue(t *testing.T) *queue.Queue {

@@ -147,7 +147,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-46 | **`append_mode=tail` 静默丢数据**：`singlePartUpload` 在 `offset>0` 时把**只含增量**的内容 `PutObject` 到同一键，对象被整体替换，此前已采集的内容从对象中消失 ◐ **拆半**：挡掉半边 ✅ 随 IC-3（CP 422 + agent 闸门 + UI 禁用）；**正确实现归 IC-15** | 🔴 P0 | agent |
 | IC-BUG-47 | 实时 fsnotify 事件路径仍用非阻塞 `emit`（满即丢弃），大量小文件并发写入时被丢弃的文件**永不被采集**——IC-5 的 F1 只修了初始扫描那一半 ✅ 随 IC-3 修复（4 处实时发送点全改 `emitBlocking`） | 🟠 P1 | agent |
 | IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 | 🟡 P2 | agent |
-| IC-BUG-49 | `dest_path_template` 带不带 `{time}` 隐式决定「追加后产生新版本对象 vs 覆盖同一对象」，**产品语义从未定义** | 🟡 P2 | 产品 + agent |
+| IC-BUG-49 | ~~`dest_path_template` 带不带 `{time}` 隐式决定「追加后产生新版本对象 vs 覆盖同一对象」，产品语义从未定义~~ **❌ 已撤销（2026-09-13，前提被实测证伪）**，其中成立的产品问题拆出为 [backlog](../backlog.md)「同一文件重复采集的覆盖语义」条目 | 🟡 P2 | 产品 + agent |
+| IC-BUG-50 | `time` 是**未声明的保留字**（三端契约只有 agent 知道）、**优先级与同体系系统变量相反**（无条件覆盖解析结果）、且**名字误导**（实为「文件被提交上传的时刻」）✅ 随 D-034 修复（改名 `{submit_time}` + 解析结果优先 + 旧名 deprecated 兼容） | 🟡 P2 | agent + controlplane + webui |
 
 ---
 
@@ -745,14 +746,26 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 同秒同尺寸改写后必须重采；保留 mtime 的原地重建（内容不同）必须重采；内容确实相同的重建仍可跳过（账本语义正确，无新内容可传） |
 | **归属** | **宜与 IC-15 同刀**——IC-15 本来就要定内容身份判据，一次解决续传版本判定 + 本条两个盲区 |
 
-## IC-BUG-49 — 追加写入后「新版本对象 vs 覆盖」语义未定义 🟡 P2
+## IC-BUG-49 — 追加写入后「新版本对象 vs 覆盖」语义未定义 🟡 P2 ❌ 已撤销（2026-09-13）
+
+> **撤销说明**：协调者误判，**已实测证伪**，编号按仓库惯例保留不改不删。
 
 | 字段 | 内容 |
 |------|------|
-| **根因** | 一个已 `completed` 的文件被追加写入后，IC-5 ① 的四元组判重会正确地重新采集它。但**最终落到哪个对象键，由 `dest_path_template` 是否包含 `{time}` 隐式决定**，而这个产品语义从未被明确定义 |
-| **后果** | 模板带 `{time}` → 每次新键 → 索引里**多行**，同一文件的多个历史版本并存；不带 `{time}` → 同键 → 对象被**整体覆盖**、索引行更新。两种都「能工作」，但运维无法预期，也没有文档说明哪种是推荐形态 |
-| **修复** | **需要产品拍板**：追加写入应产生新版本对象，还是覆盖同一对象？定下之后在 `system-design.md` §4.4.3 写明，并在规则创建时对不匹配的模板给出提示 |
-| **归属** | 未排期，**需产品决策**。与 IC-15 的「采集中的索引状态」一并考虑更划算 |
+| **原命题（错误）** | 「`dest_path_template` 带不带 `{time}` 隐式决定追加后产生新版本对象 vs 覆盖同一对象」——即认为模板里是否有 `{time}` 会让同一文件的两次采集落到不同对象键 |
+| **证伪依据（2026-09-13 实测）** | `{time}`（现 `{submit_time}`）的值是**该文件被提交上传那一刻**（`submitFile` 时刻），不是「每次上传的当下」。对**同一个文件**（mtime/size 未变）重复采集时，提交时刻只在**首次提交**变化——解析出的时间字段（来自 `path_pattern` 的数据日期）对同一文件更是**固定值**。因此目标对象键是**稳定的**：同一文件再次采集要么复用同一键（覆盖同一对象），要么进入追加/续传逻辑，**不存在「带 `{time}` 就每次新键」的机制** |
+| **仍然成立的那半（拆出，待产品拍板）** | 「同一文件再次采集会**覆盖之前那份对象**（键稳定时 PUT 同键），这是否符合产品预期」是一个**与模板无关**的产品问题——已单独记为 [`backlog.md`](../backlog.md) 的「同一文件重复采集的覆盖语义」条目，不再挂在本缺陷下 |
+| **处置** | 撤销本条；缺陷编号保留于历史。`{time}` 保留字本身的真实缺陷另立 **IC-BUG-50**（下方），随 D-034 修复 |
+
+## IC-BUG-50 — 隐藏保留字 `time`：未声明、优先级相反、名字误导 🟡 P2 ✅ 已修（D-034）
+
+| 字段 | 内容 |
+|------|------|
+| **根因（三条）** | ① **未声明的保留字**：`buildStoragePath` 硬编码 `strings.Contains(template, "{time")` 命中即注入 `fields["time"]`，但 `contracts.md` V-3 系统变量表与 webui `SYSTEM_TEMPLATE_VARIABLES` 都没有它——三端契约只有 agent 一端知道它存在；② **优先级与同体系变量相反**：`InjectContext` 对 `agent_name`/`agent_id` 是**解析结果优先、不覆盖**（`TestInjectContext_NoOverwrite` 钉住），而 `time` 是**无条件覆盖**——管理员把解析字段命名为 `time` 想按**数据日期**归档时，静默拿到**采集时刻**，归档到错误日期且无任何提示（D-030 整桶 policy 下连 403 都没有）；③ **名字误导**：它不是「当前时刻」，而是「该文件被提交上传的那一刻」，叫 `time` 让人以为是通用时间变量 |
+| **影响面** | webui 新建规则的**默认模板**是 `/{agent_name}/{time:yyyy/MM/dd}/{filename}`（`RuleForm.tsx:104`），**经 UI 创建的规则全部带 `{time}`**；且 `strings.Contains("{time")` 是字面前缀匹配，对 `{time_zone}` 这类前缀相同的字段名会误触发注入 |
+| **修复（D-034）** | 改名 **`{submit_time}`**（语义 = 文件被提交上传的时刻，UTC，与 `agent_name`/`filename` 命名一致）；优先级改为**解析结果优先**（与 `agent_name`/`agent_id` 同规则，权威注入点收敛为 `pkg/trollsift.InjectSubmitTime`，inject-if-absent 不再做模板子串匹配，`{time_zone}` 前缀误伤从结构上消除）；**旧名 `{time}` 保留为 deprecated 别名**、渲染语义完全等价（存量 UI 规则不破坏），CP 创建/更新时返回 `warnings` 可读提示；webui 默认模板与 `SYSTEM_TEMPLATE_VARIABLES`、`contracts.md` V-3 三端同步 |
+| **验收** | `TestBuildStoragePath_SubmitTimeInjectedFromUploadInstant` / `SubmitTimeParsedFieldWins` / `LegacyTimeAliasStillWorks` / `LegacyTimeParsedFieldWins` / `TimeZoneFieldNotClobbered`（agent）；`InjectSubmitTime` 三例（pkg/trollsift）；CP 创建/更新 deprecation 提示三例；webui `pathTemplate.test.ts` submit_time 三例 |
+| **归属** | ✅ 随本刀修复（分支 `fix/ic-bug-50-rename-time-reserved-word`，决策 D-034） |
 
 ---
 
