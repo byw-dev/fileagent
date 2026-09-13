@@ -3,14 +3,17 @@
  * These are injected by the Agent via InjectContext and buildStoragePath.
  * IC-BUG-50 / D-034: {submit_time} is the declared reserved word for the
  * file's submit-for-upload instant (UTC); {time} is its deprecated alias.
+ * Review P1-B: the list shows the LDML form on purpose — a bare reserved time
+ * field ({submit_time} / {time} without a format) can never compose (Go types
+ * format-less fields as string), so the UI must not advertise it.
  */
 export const SYSTEM_TEMPLATE_VARIABLES: ReadonlyArray<{ key: string; desc: string }> = [
-  { key: '{agent_name}',  desc: 'Agent 名称，例如 prod-sensor-01' },
-  { key: '{agent_id}',    desc: 'Agent UUID，例如 a1b2c3...' },
-  { key: '{filename}',    desc: '原始文件名（含扩展名），例如 data.csv' },
-  { key: '{ext}',         desc: '文件扩展名（不含点），例如 csv' },
-  { key: '{submit_time}', desc: '该文件被提交上传的时刻（UTC），例如 2026-09-13T08:00:00Z' },
-  { key: '{time}',        desc: '已废弃（deprecated）：{submit_time} 的旧名，仍可渲染，请改用 {submit_time}' },
+  { key: '{agent_name}',            desc: 'Agent 名称，例如 prod-sensor-01' },
+  { key: '{agent_id}',              desc: 'Agent UUID，例如 a1b2c3...' },
+  { key: '{filename}',              desc: '原始文件名（含扩展名），例如 data.csv' },
+  { key: '{ext}',                   desc: '文件扩展名（不含点），例如 csv' },
+  { key: '{submit_time:yyyy/MM/dd}', desc: '该文件被提交上传的时刻（UTC），例如 2026/09/13；必须带 LDML 时间格式' },
+  { key: '{time:yyyy/MM/dd}',       desc: '已废弃（deprecated）：{submit_time} 的旧名，仍可渲染，请改用 {submit_time:yyyy/MM/dd}' },
 ]
 
 /**
@@ -53,10 +56,15 @@ function formatLDML(ldml: string, now: Date): string {
  * Render a preview of a path template by substituting variables with example values.
  *
  * Substitution priority (highest first):
- *  1. `{fieldname:LDML}` or `{fieldname:LDML|tz=...}` — formatted with UTC current time.
- *  2. System variables (`{agent_name}`, `{agent_id}`, `{filename}`, `{ext}`,
- *     `{submit_time}` — bare form only; `{time}` is the deprecated alias). — fixed examples.
- *  3. Fields present in `dynamicFields` — shown as `«fieldname»` (runtime placeholder).
+ *  1. Fields present in `dynamicFields` — shown as `«fieldname»` (runtime
+ *     placeholder). Checked FIRST, also for `{name:LDML}` fields: with
+ *     parse-first priority (D-034 / review P2-C) the upload would use the
+ *     parsed value, so the preview must not show the current time.
+ *  2. `{fieldname:LDML}` or `{fieldname:LDML|tz=...}` — formatted with UTC current time.
+ *  3. System variables (`{agent_name}`, `{agent_id}`, `{filename}`, `{ext}`) — fixed examples.
+ *     Reserved time words ({submit_time}, deprecated {time}) are NOT listed
+ *     here: their bare form is forbidden (cannot compose — review P1-B) and
+ *     their LDML form is handled by rule 2.
  *  4. All other variables — left unchanged (valid syntax, resolved at runtime).
  *
  * A leading "/" is stripped first, matching how the Agent builds the object key.
@@ -75,19 +83,24 @@ export function renderPathPreview(template: string, dynamicFields?: string[]): s
 
   const now = new Date()
 
-  const systemSubs: Record<string, string> = {
-    '{agent_name}':  'my-agent',
-    '{agent_id}':    'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
-    '{filename}':    'data.csv',
-    '{ext}':         'csv',
-    '{submit_time}': '2026-09-13T08:00:00Z',
-    '{time}':        '2026-09-13T08:00:00Z (deprecated)',
+const systemSubs: Record<string, string> = {
+    '{agent_name}': 'my-agent',
+    '{agent_id}':   'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+    '{filename}':   'data.csv',
+    '{ext}':        'csv',
   }
 
   const dynamicSet = new Set(dynamicFields ?? [])
 
   return template.replace(/\{([^}]+)\}/g, (match, inner: string) => {
     const colonIdx = inner.indexOf(':')
+    const fieldName = colonIdx !== -1 ? inner.slice(0, colonIdx) : inner
+    // Review P2-C: a field path_pattern parses (dynamicSet) must win over the
+    // current-time rendering — with parse-first priority (D-034) the upload
+    // would use the parsed value, so showing the current time here would lie.
+    if (dynamicSet.has(fieldName)) {
+      return `\u00AB${fieldName}\u00BB`
+    }
     if (colonIdx !== -1) {
       // Time field: {fieldname:LDML} or {fieldname:LDML|tz=...}
       let ldmlPart = inner.slice(colonIdx + 1)
@@ -99,9 +112,6 @@ export function renderPathPreview(template: string, dynamicFields?: string[]): s
     }
     if (Object.hasOwn(systemSubs, match)) {
       return systemSubs[match]
-    }
-    if (dynamicSet.has(inner)) {
-      return `\u00AB${inner}\u00BB`
     }
     return match
   })
@@ -143,6 +153,12 @@ export function validatePathTemplate(template: string): string | null {
     if (!inner) return '模板变量名不能为空'
     const tzMatch = inner.match(/\|tz=(.*)$/)
     if (tzMatch && !tzMatch[1]) return '时区（tz=）值不能为空'
+    // Review P1-B: bare reserved time fields ({submit_time} / {time} without
+    // an LDML format) cannot compose — every upload would fail with a type
+    // mismatch. Reject here so the admin never creates such a template.
+    if (inner === 'submit_time' || inner === 'time') {
+      return '保留时间字段必须带 LDML 格式，例如 {submit_time:yyyy/MM/dd}（裸 {submit_time} / {time} 无法合成）'
+    }
   }
 
   return null

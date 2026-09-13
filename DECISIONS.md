@@ -1877,3 +1877,32 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
   时间符号表补 `mm`=分 / `MM`=月及「大小写写错在上传时才失败（`month out of range`）」。
 - 测试钉住：解析优先（含旧名等价、`time_zone` 不被误伤）、新名注入兜底、
   CP 侧 deprecation 提示。
+
+**补记 1（2026-09-13，PR #106 review：别名镜像、裸形式禁令、filename/ext 统一优先级）**：
+
+首版实现被 review 实测抓出三处语义漏洞，修正如下：
+
+1. **别名必须是互为镜像，不是两个独立字段**。首版 `InjectSubmitTime` 对
+   `submit_time` 与 `time` 各判各的 inject-if-absent——存量规则解析出 `time`
+   （数据日期）、管理员照 deprecation 提示把 dest 的 `{time}` 改成 `{submit_time}`
+   后，`submit_time` 从未被解析 → 注入提交时刻 → **照迁移建议做反而落错位置**。
+   修正：单侧已解析时**镜像给缺失的别名**（解析出 `time` 则 `submit_time` 取同值，
+   反之亦然）；**双侧都被解析时各用各的、不互相覆盖**——Compose 只读模板引用的
+   字段，两个独立的解析结果强制镜像反而会制造意外值；此规则写进 `InjectSubmitTime`
+   注释与 V-3，并以交叉别名矩阵测试（4 种输入 × 2 种 dest 引用）逐格钉住。
+2. **裸形式禁令（选 b）**：`{submit_time}` / `{time}` **不带 LDML 格式**时，Go 侧把
+   无格式字段判为 string 类型（`field.go`），注入的 Time 值必然 compose 失败
+   （实测 `expects a string value`）——而首版 UI 清单与契约恰以裸形式宣传，管理员
+   照抄即得一个必失败模板。**不选默认序列化（(a)）**：对象键里没有无歧义的默认时间
+   格式（RFC3339 带 `:` 冒号），任何默认值都是任意拍板，且会连带改变 parse 侧语义。
+   修正：**禁止裸形式**——webui `validatePathTemplate` 拦截并给出带格式示例、
+   UI 变量清单改以带格式形式展示（`{submit_time:yyyy/MM/dd}`）、契约写明禁令、
+   CP warnings 对裸形式给出可读提示。**弃用提示只进给人看的提示区，不进对象键**
+   （首版把 `(deprecated)` 拼进了预览键，已移除）。
+3. **filename/ext 统一解析优先**。契约原文宣称「全部系统变量解析优先」，但
+   `injectUploadFields` 对 `filename`/`ext` 仍无条件覆盖（实测：解析出 `ext=csv`
+   的 `/data/csv/report.bin` 合成 `bin/report.bin`）——契约声称与实现不符
+   （本 track 第 11 次）。**选统一 absent-only 而非收窄措辞**：同一体系一套优先级
+   规则可让契约逐字成立、不再需要例外清单；行为变更面极小（仅当 path_pattern
+   显式命名 `filename`/`ext` 且捕获值 ≠ 本地 basename/ext 时，键以解析值为准——
+   那正是管理员的显式意图）。

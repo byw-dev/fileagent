@@ -127,29 +127,48 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 | `{agent_id}`   | Agent UUID |
 | `{filename}`   | 原始文件名（含扩展名） |
 | `{ext}`        | 扩展名（不含点） |
-| `{submit_time}` | **该文件被提交上传的时刻**（`submitFile` 时刻，UTC）。⚠️ 不是「当前时刻」的通用时间变量——同一文件重复采集时它是稳定的（IC-BUG-50 / D-034） |
-| `{time}`       | ⚠️ **已废弃（deprecated）**：`{submit_time}` 的旧名，**仍可渲染**（语义完全等价），无移除时间表；新建规则一律用 `{submit_time}`。经 UI 旧默认模板创建的存量规则仍带此名 |
+| `{submit_time}` | **该文件被提交上传的时刻**（`submitFile` 时刻，UTC）。⚠️ 不是「当前时刻」的通用时间变量——同一文件重复采集时它是稳定的（IC-BUG-50 / D-034）。**引用必须带 LDML 格式**（如 `{submit_time:yyyy/MM/dd}`）：**裸形式 `{submit_time}` 无法合成**（无格式字段被判为 string 类型，与注入的时间值类型不符，实测报 `expects a string value`），webui 校验拦截、CP 创建/更新 warnings 提示 |
+| `{time}`       | ⚠️ **已废弃（deprecated）**：`{submit_time}` 的旧名，**仍可渲染**（语义完全等价），无移除时间表；新建规则一律用 `{submit_time}`。经 UI 旧默认模板创建的存量规则仍带此名。**同样是别名而非独立变量**：见下方优先级节的镜像规则 |
 
 - 权威注入点共**两处**（此前只写了第一处）：
   1. `pkg/trollsift/context.go`（`InjectContext`：`agent_name` / `agent_id`）
-  2. `pkg/trollsift/uploadfields.go`（`InjectSubmitTime`：`submit_time` + 废弃别名 `time`；
-     `filename` / `ext` 由 agent 上传路径构建时注入——`buildStoragePath` 与
-     `handleDryRun` 共用 `injectUploadFields`）
-- webui 镜像清单：`webui/src/utils/pathTemplate.ts:5`（`SYSTEM_TEMPLATE_VARIABLES`）
+  2. `pkg/trollsift/uploadfields.go`（`InjectSubmitTime`：`submit_time` + 废弃别名
+     `time`，**互为镜像**；`pkg/trollsift/uploadfields.go` 的
+     `InjectSubmitTime` 由 agent `injectUploadFields` 调用——`filename` / `ext` /
+     `submit_time` 全部 parse-first（`buildStoragePath` 与 `handleDryRun` 共用））
+- webui 镜像清单：`webui/src/utils/pathTemplate.ts:5`（`SYSTEM_TEMPLATE_VARIABLES`；
+  清单以 **LDML 形式**展示 `{submit_time:yyyy/MM/dd}`——裸形式被禁，见上）
 
-### 优先级：解析结果 vs 注入值（IC-BUG-50 / D-034）
+### 优先级：解析结果 vs 注入值（IC-BUG-50 / D-034，review P1-A/P2-D 修正）
 
-**解析结果优先，注入不覆盖**——对全部系统变量与保留字统一成立：
-`path_pattern` 从文件相对路径解析出**同名字段**时，一律用解析值；字段缺失才注入。
-权威实现在两处注入点本身（`InjectContext` 的 exists 检查、`InjectSubmitTime` 的
-inject-if-absent；`TestInjectContext_NoOverwrite`、
-`TestBuildStoragePath_SubmitTimeParsedFieldWins` 钉住）。因此：
+**解析结果优先，注入不覆盖**——对**全部**系统变量与保留字统一成立
+（**含 `filename` / `ext`**）：`path_pattern` 从文件相对路径解析出**同名字段**时，
+一律用解析值；字段缺失才注入。权威实现在两处注入点本身（`InjectContext` 的
+exists 检查、`injectUploadFields` + `InjectSubmitTime` 的 inject-if-absent；
+`TestInjectContext_NoOverwrite`、`TestBuildStoragePath_SubmitTimeParsedFieldWins`、
+`TestBuildStoragePath_ParsedFilenameAndExtWin` 钉住）。因此：
 
-- 管理员把解析字段命名为 `submit_time`（或旧名 `time`）即可**按数据日期归档**，
-  不会被上传时刻静默覆盖（IC-BUG-50 修复前 `{time}` 是无条件覆盖，恰与此相反）。
-- 「想要上传时刻」的用法不受影响：解析字段不同名时（大多数规则）注入值生效。
+- 管理员把解析字段命名为 `submit_time`（或旧名 `time`、`filename`、`ext`）即可
+  **按解析值归档**，不会被注入值静默覆盖（IC-BUG-50 修复前 `{time}` 是无条件覆盖，
+  恰与此相反；PR #106 review P2-D 修复前 `filename`/`ext` 也在覆盖）。
+- 「想要注入值」的用法不受影响：解析字段不同名时（大多数规则）注入值生效。
 - 字段名共享前缀（如解析字段 `time_zone`）不会被保留字注入误伤——注入是
   inject-if-absent，**不做模板子串前缀匹配**。
+
+**`time` ↔ `submit_time` 互为别名（不是两个独立变量，review P1-A）**：
+
+- 只解析了其中一个时，**解析值镜像给缺失的别名**——把存量规则的 `{time}` 按提示
+  迁移成 `{submit_time}` 不会改变合成结果（数据日期仍是数据日期）。
+- **两个都解析了：各用各的**——模板只合成自己引用的字段，两个独立解析结果
+  强制镜像反而会捏造出谁都没要的值。
+- 都没解析：两者都注入提交时刻（`submitFile` 时刻，同一值）。
+- 钉住：`TestInjectSubmitTime_AliasMatrix`（4 输入 × 逐格断言）、
+  `TestBuildStoragePath_MigratedLegacyTime_KeepsDataDate`。
+
+**webui 预览同规则（review P2-C）**：`renderPathPreview` 对 `dynamicFields`
+（即 `path_pattern` 解析出的字段）**优先显示 `«name»` 占位**，包括带 LDML 的
+`{name:LDML}` 引用——解析优先意味着上传不会用当前时间，预览也不得显示当前时间；
+仅当字段不在 `dynamicFields` 里时才按当前时间渲染 LDML。
 
 ### 时间字段（LDML 语法）
 

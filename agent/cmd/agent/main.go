@@ -971,15 +971,19 @@ func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx 
 
 // injectUploadFields adds the non-parsed upload variables shared by
 // buildStoragePath and handleDryRun, so a dry-run preview shows exactly the
-// key the upload would produce. filename/ext always overwrite (they describe
-// this local file); submit_time — and its deprecated alias {time}
-// (IC-BUG-50 / D-034) — is parse-first (D-034): InjectSubmitTime never
-// overwrites a field parsed out of path_pattern. The injection is
-// unconditional-if-absent instead of a template substring check, so field
+// key the upload would produce. All fields are parse-first (D-034): a value
+// parsed out of path_pattern wins, the local file's basename/ext and the
+// submit instant (plus its deprecated alias {time}, via InjectSubmitTime —
+// IC-BUG-50) only fill in when nothing was parsed by that name. The injection
+// is unconditional-if-absent instead of a template substring check, so field
 // names sharing the reserved word's prefix ({time_zone}) cannot misfire.
 func injectUploadFields(fields map[string]trollsift.Value, localPath string, now time.Time) map[string]trollsift.Value {
-	fields["filename"] = trollsift.S(filepath.Base(localPath))
-	fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(localPath), "."))
+	if _, ok := fields["filename"]; !ok {
+		fields["filename"] = trollsift.S(filepath.Base(localPath))
+	}
+	if _, ok := fields["ext"]; !ok {
+		fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(localPath), "."))
+	}
 	return trollsift.InjectSubmitTime(fields, now)
 }
 

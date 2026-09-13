@@ -660,6 +660,27 @@ func TestAgentsHandler_UpdateRule_FullUpdate_DeprecatedTimeTemplate_Warns(t *tes
 	assert.Contains(t, fmt.Sprint(warnings), "submit_time")
 }
 
+// Review P1-B: a bare reserved time field ({submit_time} or {time} without
+// LDML) can never compose — every upload would fail. Creation still succeeds
+// (D-030 §8: no template shape constraints), but the response must carry a
+// readable warning pointing at the LDML form.
+func TestAgentsHandler_CreateRule_BareReservedTimeTemplate_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	for _, tpl := range []string{"{submit_time}/{filename}", "{time}/{filename}"} {
+		body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"` + tpl + `"}`
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		testAgentsRouter(h).ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code, tpl)
+		var resp map[string]interface{}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		warnings, ok := resp["warnings"].([]interface{})
+		require.True(t, ok, "bare reserved time template %s must produce a warnings array", tpl)
+		assert.Contains(t, fmt.Sprint(warnings), "LDML", tpl)
+	}
+}
+
 // ── UpdateRule ────────────────────────────────────────────────────────────────
 
 func TestAgentsHandler_UpdateRule_Activate(t *testing.T) {

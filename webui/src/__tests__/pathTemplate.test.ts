@@ -18,14 +18,19 @@ describe('SYSTEM_TEMPLATE_VARIABLES', () => {
 
   // IC-BUG-50: submit_time is the declared reserved word for the moment the
   // file was submitted for upload; the deprecated {time} alias is listed so
-  // legacy rules are discoverable in the UI hints.
-  it('declares submit_time and the deprecated time alias', () => {
+  // legacy rules are discoverable in the UI hints. Review P1-B: the list shows
+  // the LDML form — a bare reserved time field ({submit_time}/{time} without a
+  // format) can never compose, so the UI must not advertise it.
+  it('declares submit_time and the deprecated time alias in LDML form', () => {
     const keys = SYSTEM_TEMPLATE_VARIABLES.map((v) => v.key)
-    expect(keys).toContain('{submit_time}')
-    expect(keys).toContain('{time}')
-    const submitTime = SYSTEM_TEMPLATE_VARIABLES.find((v) => v.key === '{submit_time}')
+    expect(keys).toContain('{submit_time:yyyy/MM/dd}')
+    expect(keys).toContain('{time:yyyy/MM/dd}')
+    // The bare form must not be advertised anywhere in the list.
+    expect(keys).not.toContain('{submit_time}')
+    expect(keys).not.toContain('{time}')
+    const submitTime = SYSTEM_TEMPLATE_VARIABLES.find((v) => v.key.startsWith('{submit_time'))
     expect(submitTime?.desc).toContain('上传')
-    const legacyTime = SYSTEM_TEMPLATE_VARIABLES.find((v) => v.key === '{time}')
+    const legacyTime = SYSTEM_TEMPLATE_VARIABLES.find((v) => v.key.startsWith('{time'))
     expect(legacyTime?.desc).toContain('deprecated')
   })
 })
@@ -36,15 +41,46 @@ describe('renderPathPreview: submit_time (IC-BUG-50 / D-034)', () => {
     expect(preview).toMatch(/^my-agent\/\d{4}\/\d{2}\/\d{2}\/data\.csv$/)
   })
 
-  it('substitutes a UTC example for the bare reserved word', () => {
-    expect(renderPathPreview('{submit_time}')).toBe('2026-09-13T08:00:00Z')
-    expect(renderPathPreview('{time}')).toBe('2026-09-13T08:00:00Z (deprecated)')
+  // Review P1-B: the bare form is forbidden — it cannot compose at upload
+  // time, and the deprecation hint must never leak into the previewed key.
+  it('leaves the bare reserved word unchanged (no fake value, no hint text in the key)', () => {
+    expect(renderPathPreview('{submit_time}')).toBe('{submit_time}')
+    expect(renderPathPreview('{time}')).toBe('{time}')
+    expect(renderPathPreview('{time}')).not.toContain('deprecated')
+  })
+
+  // Review P1-B: the validator rejects the bare form with a readable message.
+  it('validatePathTemplate rejects the bare reserved time words', () => {
+    expect(validatePathTemplate('{submit_time}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{time}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{submit_time:yyyy/MM/dd}/{filename}')).toBeNull()
+    // time_zone is an ordinary field name, not the reserved word.
+    expect(validatePathTemplate('{time_zone}/{filename}')).toBeNull()
   })
 
   it('does not treat {time_zone} as a time field', () => {
     // time_zone without LDML is not a reserved word: it stays unchanged
     // (compose-time field from path_pattern), exactly like unknown variables.
     expect(renderPathPreview('{time_zone}', ['time_zone'])).toBe('\u00ABtime_zone\u00BB')
+  })
+})
+
+describe('renderPathPreview: parsed fields win over the current-time rendering (review P2-C)', () => {
+  it('shows «name» for a dynamic field referenced with LDML — new name', () => {
+    // path_pattern parses submit_time (e.g. the data date): the local preview
+    // must not show the current time, which is what the upload would NOT use.
+    expect(renderPathPreview('{submit_time:yyyy/MM}/{filename}', ['submit_time']))
+      .toBe('\u00ABsubmit_time\u00BB/data.csv')
+  })
+
+  it('shows «name» for a dynamic field referenced with LDML — legacy name', () => {
+    expect(renderPathPreview('{time:yyyy/MM}/{filename}', ['time']))
+      .toBe('\u00ABtime\u00BB/data.csv')
+  })
+
+  it('still renders the current time for LDML fields that path_pattern does NOT parse', () => {
+    expect(renderPathPreview('{submit_time:yyyy/MM}/{filename}'))
+      .toMatch(/^\d{4}\/\d{2}\/data\.csv$/)
   })
 })
 

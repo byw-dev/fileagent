@@ -18,21 +18,35 @@ const (
 
 // InjectSubmitTime injects the reserved upload-time variables into fields.
 //
-// Priority is parse-first (D-034): a field parsed out of path_pattern is never
-// overwritten — the same rule InjectContext applies to agent_name/agent_id.
-// The injection is unconditional-if-absent rather than gated on a template
-// substring check: unreferenced fields do not participate in Compose, so this
-// cannot misfire on field names that merely share a prefix ({time_zone}).
+// time and submit_time are aliases of one another (D-034, review P1-A):
+// when exactly one of them was parsed out of path_pattern, the parsed value is
+// MIRRORED to the missing alias — otherwise migrating a template from {time}
+// to {submit_time} (what the deprecation hint advises) would silently change
+// the object key from the data date to the upload instant. When both were
+// parsed, each keeps its own value: Compose reads only the fields the template
+// references, and force-mirroring two independent parse results would
+// fabricate a value neither asked for. When neither was parsed, both get the
+// submit instant. The injection is unconditional-if-absent rather than gated
+// on a template substring check: unreferenced fields do not participate in
+// Compose, so this cannot misfire on field names that merely share a prefix
+// ({time_zone}).
 func InjectSubmitTime(fields map[string]Value, at time.Time) map[string]Value {
 	if fields == nil {
 		fields = make(map[string]Value)
 	}
-	if _, exists := fields[SubmitTimeField]; !exists {
+	parsedSubmit, hasSubmit := fields[SubmitTimeField]
+	parsedLegacy, hasLegacy := fields[DeprecatedTimeField]
+	switch {
+	case hasSubmit && hasLegacy:
+		// Both parsed: keep each as-is (see doc comment).
+	case hasSubmit:
+		fields[DeprecatedTimeField] = parsedSubmit
+	case hasLegacy:
+		fields[SubmitTimeField] = parsedLegacy
+	default:
 		fields[SubmitTimeField] = T(at)
-	}
-	// Deprecated alias (D-034): legacy {time} templates keep rendering with
-	// identical parse-first semantics. Not removed; no removal date.
-	if _, exists := fields[DeprecatedTimeField]; !exists {
+		// Deprecated alias (D-034): legacy {time} templates keep rendering with
+		// identical semantics. Not removed; no removal date.
 		fields[DeprecatedTimeField] = T(at)
 	}
 	return fields
@@ -47,4 +61,17 @@ var deprecatedTimeRe = regexp.MustCompile(`\{time[:}]`)
 // readable deprecation hint (D-034).
 func UsesDeprecatedTimeField(template string) bool {
 	return deprecatedTimeRe.MatchString(template)
+}
+
+// bareReservedTimeRe matches the reserved time words in their BARE form —
+// {submit_time} or {time} without an LDML format (review P1-B).
+var bareReservedTimeRe = regexp.MustCompile(`\{submit_time\}|\{time\}`)
+
+// UsesBareReservedTimeField reports whether a dest_path_template references a
+// reserved time word bare (no LDML). Such templates cannot compose: Go types a
+// format-less field as string while the injected value is a time, so every
+// upload would fail with "expects a string value". CP creation/update warns
+// on it; the webui validator rejects it outright.
+func UsesBareReservedTimeField(template string) bool {
+	return bareReservedTimeRe.MatchString(template)
 }

@@ -743,18 +743,25 @@ func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 	return resp
 }
 
-// deprecatedTemplateWarnings returns the readable deprecation notice for a
-// dest_path_template that still uses the deprecated {time} reserved word
-// (IC-BUG-50 / D-034). The agent keeps rendering the alias with parse-first
-// priority, so this is a hint, not a rejection: existing rules created through
-// the Web UI's old default template must not break.
+// deprecatedTemplateWarnings returns the readable deprecation notices for a
+// dest_path_template that misuses the reserved time words (IC-BUG-50 / D-034
+// + review P1-B). The agent keeps rendering the deprecated {time} alias with
+// parse-first priority, so that one is a hint, not a rejection: existing rules
+// created through the Web UI's old default template must not break. A bare
+// reserved time field ({submit_time} / {time} without LDML) can never compose
+// — every upload of such a rule would fail — so that hint names the fix.
 func deprecatedTemplateWarnings(template string) []string {
-	if !trollsift.UsesDeprecatedTimeField(template) {
-		return nil
+	var warnings []string
+	if trollsift.UsesDeprecatedTimeField(template) {
+		warnings = append(warnings, "dest_path_template uses the deprecated reserved word {time}; "+
+			"it still renders (the file's submit-for-upload instant, unless path_pattern parses a field with that name — parse results always win), "+
+			"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)")
 	}
-	return []string{"dest_path_template uses the deprecated reserved word {time}; " +
-		"it still renders (the file's submit-for-upload instant, unless path_pattern parses a field with that name — parse results always win), " +
-		"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)"}
+	if trollsift.UsesBareReservedTimeField(template) {
+		warnings = append(warnings, "dest_path_template references a reserved time word bare ({submit_time} or {time} without a format); "+
+			"bare reserved time fields cannot compose and every upload will fail — add an LDML format, e.g. {submit_time:yyyy/MM/dd} (see docs/design/contracts.md V-3)")
+	}
+	return warnings
 }
 
 // respondRule writes a rule response, attaching deprecation warnings for the

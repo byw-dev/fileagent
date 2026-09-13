@@ -270,6 +270,87 @@ func TestBuildStoragePath_TimeZoneFieldNotClobbered(t *testing.T) {
 	assert.Equal(t, "UTC+8/out.bin", got)
 }
 
+// ── buildStoragePath: cross-alias matrix (review P1-A / D-034) ────────────────
+
+// The migration-critical cell of the alias matrix: a legacy rule that parses
+// `time` from path_pattern and is migrated (per the deprecation hint) to
+// {submit_time} must keep composing the DATA DATE, not the upload instant.
+func TestBuildStoragePath_MigratedLegacyTime_KeepsDataDate(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		PathPattern:      "logs/{time:yyyy/MM}/{filename}",
+		DestPathTemplate: "{submit_time:yyyy}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/logs/2019/03/out.bin",
+		trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "2019/out.bin", got,
+		"migrating {time} to {submit_time} must not change the composed key")
+}
+
+// Reverse direction of the matrix: parse submit_time, reference legacy {time}.
+func TestBuildStoragePath_ParsedSubmitTimeReferencedAsLegacyTime(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		PathPattern:      "logs/{submit_time:yyyy/MM}/{filename}",
+		DestPathTemplate: "{time:yyyy}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/logs/2019/03/out.bin",
+		trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "2019/out.bin", got)
+}
+
+// Both reserved words parsed independently: the template composes each field's
+// own parsed value, no cross-mirroring (matrix cell "both parsed"). The
+// template must reference them with LDML — bare {time}/{submit_time} is
+// forbidden (review P1-B: bare reserved time fields cannot compose).
+func TestBuildStoragePath_BothParsed_EachKeepsOwnValue(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		PathPattern:      "logs/{time:yyyy}/{submit_time:yyyy}/{filename}",
+		DestPathTemplate: "{time:yyyy}-{submit_time:yyyy}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/logs/2010/2019/out.bin",
+		trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "2010-2019/out.bin", got)
+}
+
+// Review P2-D: filename/ext obey the same parse-first rule as every other
+// system variable — a value parsed out of path_pattern wins over the local
+// file's basename/ext.
+func TestBuildStoragePath_ParsedFilenameAndExtWin(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		PathPattern:      "archives/{ext}/{filename}",
+		DestPathTemplate: "{ext}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/archives/csv/report.bin",
+		trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "csv/report.bin", got,
+		"parsed ext must win over the local file extension (parse-first, D-034)")
+}
+
+// The local basename/ext still fill in when path_pattern captures nothing by
+// that name — the common case must keep composing exactly as before.
+func TestBuildStoragePath_FilenameExtInjectedWhenNotParsed(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		PathPattern:      "*.log",
+		DestPathTemplate: "logs/{ext}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "logs/bin/out.bin", got)
+}
+
 // ── submitFile ────────────────────────────────────────────────────────────────
 
 func openTestQueue(t *testing.T) *queue.Queue {
