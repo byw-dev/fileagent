@@ -1906,3 +1906,28 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
    规则可让契约逐字成立、不再需要例外清单；行为变更面极小（仅当 path_pattern
    显式命名 `filename`/`ext` 且捕获值 ≠ 本地 basename/ext 时，键以解析值为准——
    那正是管理员的显式意图）。
+
+**补记 2（2026-09-13，PR #106 二轮 review B1/B2：裸保留字 agent 侧无条件拒绝、预览镜像入契约）**：
+
+1. **裸保留时间字段无条件拒绝（B1）**。补记 1 的裸形式禁令只覆盖了
+   「裸字段 + 注入的 Time 值」——实测 `path_pattern: 'of/{submit_time:s}/…'`
+   解析出 string 值后，裸模板 `{submit_time}/…` **照样合成成功**：三端口径矛盾
+   （webui 拦、CP 警、agent 跑通），且保留字被挪用为任意字符串。修正：
+   **agent 侧无条件拒绝**——新增 `pkg/trollsift.ValidateReservedTimeUse`，
+   在 `buildStoragePath` 与 `handleDryRun` 共用的 gate 处统一校验（IC-BUG-21
+   语义：任务失败、可读错误、绝不猜键）。
+   **判断：parse 侧一并拒绝**（保留字声明为非时间字段也拒，如 `{submit_time:s}`；
+   时间类型 `{submit_time:yyyy/MM}` 仍合法——那是文档支持的数据日期归档）。
+   理由：保留字的意义是名字唯一绑定语义；让 path_pattern 拿 `submit_time` 捕获
+   任意字符串，V-3 对「`submit_time` = 该文件被提交上传的时刻」的承诺在该规则上
+   直接为假，且镜像规则会把错误值传播到另一个别名。**代价（存量规则从能跑变失败）**：
+   仅命中「path_pattern 把保留字声明为非时间字段」的规则——其中 dest 引用该字段
+   带格式的**早已失败**（类型不匹配 `expects a time value`）；dest 不引用的
+   （保留字纯属摆设）从能跑变任务失败，Warn 可读、指明改法（在 path_pattern 里
+   改字段名）。评估：这类规则本身就是配置错误，fail-fast 优于静默跑。
+2. **预览镜像写进契约（B2）**。前端 `renderPathPreview` 已实现 dynamicFields
+   优先但未实现别名镜像——预览与真实合成不一致，正是 P2-C 要消灭的问题换了入口。
+   修正：前端实现与 `InjectSubmitTime` 同款镜像规则（单侧解析→镜像给缺失别名；
+   双侧→各用各的；都没解析→当前时间），交叉预览测试钉住。**教训落进 V-3**：
+   Go 与 `pathTemplate.ts` 的手工双维护是已记录的脆弱点，本次再次咬人——
+   别名镜像与裸形式禁令必须写成**三端共享约定**（契约正文），不能只活在 Go 注释里。

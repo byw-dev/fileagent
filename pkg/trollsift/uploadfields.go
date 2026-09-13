@@ -75,3 +75,38 @@ var bareReservedTimeRe = regexp.MustCompile(`\{submit_time\}|\{time\}`)
 func UsesBareReservedTimeField(template string) bool {
 	return bareReservedTimeRe.MatchString(template)
 }
+
+// ValidateReservedTimeUse rejects the reserved time words when they are used
+// as anything OTHER than a time field with an LDML format (review B1). The
+// check is bidirectional: dest_path_template must not reference the reserved
+// word bare or typed as string/int ({submit_time}, {submit_time:s},
+// {time:3d}…), and path_pattern must not declare it as a non-time field
+// ({submit_time:s} parsing an arbitrary substring silently repurposes the
+// reserved word as an ordinary path segment). Bare reserved fields cannot
+// compose at all; non-time typed references either fail on the injected value
+// or, worse, compose with a parsed string and break the contract's promise
+// that submit_time is the file's submit-for-upload instant.
+//
+// Returns "" when the pattern is acceptable; otherwise a readable reason for
+// the agent's IC-BUG-21 refusal and the CP's deprecation warnings. Syntax
+// errors return "" — they are reported by New at the caller's own site.
+func ValidateReservedTimeUse(pattern string) string {
+	p, err := New(pattern)
+	if err != nil {
+		return ""
+	}
+	for _, seg := range p.segments {
+		if !seg.isField {
+			continue
+		}
+		fs := seg.field
+		if fs.name != SubmitTimeField && fs.name != DeprecatedTimeField {
+			continue
+		}
+		if fs.kind != kindTime {
+			return "reserved time word \"" + fs.name + "\" must be used as a time field with an LDML format, e.g. {" +
+				fs.name + ":yyyy/MM/dd}; bare (" + "{" + fs.name + "}) and non-time typed (" + "{" + fs.name + ":s}) uses are rejected (IC-BUG-50 / D-034)"
+		}
+	}
+	return ""
+}

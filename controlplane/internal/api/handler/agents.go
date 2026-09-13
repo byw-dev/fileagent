@@ -745,11 +745,13 @@ func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 
 // deprecatedTemplateWarnings returns the readable deprecation notices for a
 // dest_path_template that misuses the reserved time words (IC-BUG-50 / D-034
-// + review P1-B). The agent keeps rendering the deprecated {time} alias with
-// parse-first priority, so that one is a hint, not a rejection: existing rules
-// created through the Web UI's old default template must not break. A bare
-// reserved time field ({submit_time} / {time} without LDML) can never compose
-// — every upload of such a rule would fail — so that hint names the fix.
+// + review P1-B/B1). The agent keeps rendering the deprecated {time} alias
+// with parse-first priority, so that one is a hint, not a rejection: existing
+// rules created through the Web UI's old default template must not break.
+// The misuse notice (ValidateReservedTimeUse: bare or non-time-typed reserved
+// word) matches the agent's hard refusal — such templates fail every upload
+// (or silently repurpose the reserved word as an arbitrary string), so the
+// hint names the fix at creation time instead.
 func deprecatedTemplateWarnings(template string) []string {
 	var warnings []string
 	if trollsift.UsesDeprecatedTimeField(template) {
@@ -757,9 +759,9 @@ func deprecatedTemplateWarnings(template string) []string {
 			"it still renders (the file's submit-for-upload instant, unless path_pattern parses a field with that name — parse results always win), "+
 			"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)")
 	}
-	if trollsift.UsesBareReservedTimeField(template) {
-		warnings = append(warnings, "dest_path_template references a reserved time word bare ({submit_time} or {time} without a format); "+
-			"bare reserved time fields cannot compose and every upload will fail — add an LDML format, e.g. {submit_time:yyyy/MM/dd} (see docs/design/contracts.md V-3)")
+	if reason := trollsift.ValidateReservedTimeUse(template); reason != "" {
+		warnings = append(warnings, "dest_path_template: "+reason+
+			" — the agent refuses to compose such uploads (task failure, no guessed key)")
 	}
 	return warnings
 }

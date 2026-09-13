@@ -92,9 +92,26 @@ const systemSubs: Record<string, string> = {
 
   const dynamicSet = new Set(dynamicFields ?? [])
 
+  // Cross-alias mirror (review P1-A/B2, D-034): must match
+  // trollsift.InjectSubmitTime on the Go side. When exactly ONE reserved word
+  // was parsed out of path_pattern, the missing alias composes with the SAME
+  // parsed value, so the preview shows the SOURCE field's name for both
+  // spellings; when both were parsed, each keeps its own value; when neither
+  // was parsed, the LDML branch renders the current time (the injected value).
+  const hasLegacy = dynamicSet.has('time')
+  const hasSubmit = dynamicSet.has('submit_time')
+  const legacyLabel = hasLegacy ? 'time' : hasSubmit ? 'submit_time' : null
+  const submitLabel = hasSubmit ? 'submit_time' : hasLegacy ? 'time' : null
+
   return template.replace(/\{([^}]+)\}/g, (match, inner: string) => {
     const colonIdx = inner.indexOf(':')
     const fieldName = colonIdx !== -1 ? inner.slice(0, colonIdx) : inner
+    if (fieldName === 'submit_time' && submitLabel) {
+      return `\u00AB${submitLabel}\u00BB`
+    }
+    if (fieldName === 'time' && legacyLabel) {
+      return `\u00AB${legacyLabel}\u00BB`
+    }
     // Review P2-C: a field path_pattern parses (dynamicSet) must win over the
     // current-time rendering — with parse-first priority (D-034) the upload
     // would use the parsed value, so showing the current time here would lie.

@@ -351,6 +351,137 @@ func TestBuildStoragePath_FilenameExtInjectedWhenNotParsed(t *testing.T) {
 	assert.Equal(t, "logs/bin/out.bin", got)
 }
 
+// ── buildStoragePath: bare reserved time words are refused unconditionally
+//    (review B1 / D-034 补记 2) ────────────────────────────────────────────────
+
+// The exact reviewer scenario: path_pattern parses the reserved word as a
+// STRING field, the bare dest template composed "HELLO/a.csv" before the ban.
+// Now the reserved word must fail the task with a readable error — never
+// compose into an object key, and never fall back to a guessed key.
+func TestBuildStoragePath_BareReservedParsedAsString_Refused(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		RuleID:           "r-bare-parsed",
+		BasePath:         "/data",
+		PathPattern:      "of/{submit_time:s}/{filename}",
+		DestPathTemplate: "{submit_time}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/of/HELLO/a.csv",
+		trollsift.AgentContext{}, now, testLogger())
+	require.Error(t, err, "bare reserved word with a parsed string value must be refused")
+	assert.Empty(t, got, "no object key may be produced")
+	assert.Contains(t, err.Error(), "submit_time")
+	assert.Contains(t, err.Error(), "LDML")
+}
+
+// Bare reserved word with no parse at all (previously a type-mismatch error
+// that never named the fix): now the same readable gate error applies.
+func TestBuildStoragePath_BareReservedDestInjected_Refused(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		DestPathTemplate: "{submit_time}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, now, testLogger())
+	require.Error(t, err)
+	assert.Empty(t, got)
+	assert.Contains(t, err.Error(), "submit_time")
+	assert.Contains(t, err.Error(), "LDML")
+}
+
+// The legacy alias is refused bare as well.
+func TestBuildStoragePath_LegacyBareDest_Refused(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		DestPathTemplate: "{time}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/out.bin", trollsift.AgentContext{}, now, testLogger())
+	require.Error(t, err)
+	assert.Empty(t, got)
+	assert.Contains(t, err.Error(), "LDML")
+}
+
+// Parse side: the reserved word declared as a NON-time field in path_pattern
+// is refused even when the dest template never references it — a reserved
+// word parsed as an arbitrary string would silently break the contract's
+// promise (submit_time = the submit-for-upload instant) and the mirror rule
+// would propagate the wrong value to the other alias.
+func TestBuildStoragePath_PatternReservedTypedAsString_Refused(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		RuleID:           "r-pattern-misuse",
+		BasePath:         "/data",
+		PathPattern:      "of/{time:s}/{filename}",
+		DestPathTemplate: "data/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/of/HELLO/a.csv",
+		trollsift.AgentContext{}, now, testLogger())
+	require.Error(t, err, "path_pattern must not declare the reserved word as a non-time field")
+	assert.Empty(t, got)
+	assert.Contains(t, err.Error(), "time")
+	assert.Contains(t, err.Error(), "LDML")
+	assert.Contains(t, err.Error(), "r-pattern-misuse")
+}
+
+// A reserved word typed as a fixed-width string in the DEST template is
+// refused too ({submit_time:s} composes with a parsed string otherwise).
+func TestBuildStoragePath_DestReservedTypedAsString_Refused(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		PathPattern:      "of/{submit_time:s}/{filename}",
+		DestPathTemplate: "{submit_time:s}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/of/HELLO/a.csv",
+		trollsift.AgentContext{}, now, testLogger())
+	require.Error(t, err)
+	assert.Empty(t, got)
+	assert.Contains(t, err.Error(), "LDML")
+}
+
+// Time-typed use of the reserved word in path_pattern remains legal — the
+// documented data-date archiving form.
+func TestBuildStoragePath_PatternReservedTimeTyped_OK(t *testing.T) {
+	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
+	rule := scheduler.CollectionRule{
+		BasePath:         "/data",
+		PathPattern:      "of/{time:yyyy}/{filename}",
+		DestPathTemplate: "{time:yyyy}/{filename}",
+	}
+	got, err := buildStoragePath(rule, "/data/of/2019/a.csv",
+		trollsift.AgentContext{}, now, testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "2019/a.csv", got)
+}
+
+// reservedTimeMisuse gates BOTH compose paths: assert the helper itself so
+// handleDryRun's call site (no end-to-end dry-run test exists) is covered
+// structurally — it calls this same function.
+func TestReservedTimeMisuse(t *testing.T) {
+	cases := []struct {
+		name        string
+		rule        scheduler.CollectionRule
+		wantSubject string
+	}{
+		{"bare dest", scheduler.CollectionRule{DestPathTemplate: "{time}/{filename}"}, "dest_path_template"},
+		{"typed dest", scheduler.CollectionRule{DestPathTemplate: "{submit_time:s}/{filename}"}, "dest_path_template"},
+		{"typed pattern", scheduler.CollectionRule{PathPattern: "of/{submit_time:s}/{filename:s}"}, "path_pattern"},
+		{"clean", scheduler.CollectionRule{PathPattern: "logs/{time:yyyy}/{filename}", DestPathTemplate: "{time:yyyy}/{filename}"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			subject, reason := reservedTimeMisuse(tc.rule)
+			if tc.wantSubject == "" {
+				assert.Empty(t, reason)
+				return
+			}
+			assert.Equal(t, tc.wantSubject, subject)
+			assert.NotEmpty(t, reason)
+		})
+	}
+}
+
 // ── submitFile ────────────────────────────────────────────────────────────────
 
 func openTestQueue(t *testing.T) *queue.Queue {

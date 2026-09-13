@@ -82,6 +82,25 @@ describe('renderPathPreview: parsed fields win over the current-time rendering (
     expect(renderPathPreview('{submit_time:yyyy/MM}/{filename}'))
       .toMatch(/^\d{4}\/\d{2}\/data\.csv$/)
   })
+
+  // Review B2: the preview must mirror the cross-alias semantics of
+  // trollsift.InjectSubmitTime — when exactly ONE reserved word was parsed,
+  // the missing alias composes with the SAME parsed value, so the preview
+  // shows the SOURCE field's «name» for both spellings.
+  it('mirrors parsed legacy time to the submit_time spelling', () => {
+    expect(renderPathPreview('{submit_time:yyyy}/{filename}', ['time']))
+      .toBe('\u00ABtime\u00BB/data.csv')
+  })
+
+  it('mirrors parsed submit_time to the legacy time spelling', () => {
+    expect(renderPathPreview('{time:yyyy}/{filename}', ['submit_time']))
+      .toBe('\u00ABsubmit_time\u00BB/data.csv')
+  })
+
+  it('keeps each spelling on its own parsed value when both were parsed', () => {
+    expect(renderPathPreview('{time:yyyy}/{submit_time:yyyy}/{filename}', ['time', 'submit_time']))
+      .toBe('\u00ABtime\u00BB/\u00ABsubmit_time\u00BB/data.csv')
+  })
 })
 
 describe('renderPathPreview', () => {

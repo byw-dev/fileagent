@@ -127,17 +127,31 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 | `{agent_id}`   | Agent UUID |
 | `{filename}`   | 原始文件名（含扩展名） |
 | `{ext}`        | 扩展名（不含点） |
-| `{submit_time}` | **该文件被提交上传的时刻**（`submitFile` 时刻，UTC）。⚠️ 不是「当前时刻」的通用时间变量——同一文件重复采集时它是稳定的（IC-BUG-50 / D-034）。**引用必须带 LDML 格式**（如 `{submit_time:yyyy/MM/dd}`）：**裸形式 `{submit_time}` 无法合成**（无格式字段被判为 string 类型，与注入的时间值类型不符，实测报 `expects a string value`），webui 校验拦截、CP 创建/更新 warnings 提示 |
+| `{submit_time}` | **该文件被提交上传的时刻**（`submitFile` 时刻，UTC）。⚠️ 不是「当前时刻」的通用时间变量——同一文件重复采集时它是稳定的（IC-BUG-50 / D-034）。**引用必须带 LDML 格式**（如 `{submit_time:yyyy/MM/dd}`）：**裸形式或非时间类型引用（`{submit_time}`、`{submit_time:s}`、`{time:3d}`）被三端一致拒绝**（见下方「保留字禁令」；实测：裸形式合成时类型不符报 `expects a string value`；解析出字符串时甚至能合成出错误键） |
 | `{time}`       | ⚠️ **已废弃（deprecated）**：`{submit_time}` 的旧名，**仍可渲染**（语义完全等价），无移除时间表；新建规则一律用 `{submit_time}`。经 UI 旧默认模板创建的存量规则仍带此名。**同样是别名而非独立变量**：见下方优先级节的镜像规则 |
 
 - 权威注入点共**两处**（此前只写了第一处）：
   1. `pkg/trollsift/context.go`（`InjectContext`：`agent_name` / `agent_id`）
   2. `pkg/trollsift/uploadfields.go`（`InjectSubmitTime`：`submit_time` + 废弃别名
-     `time`，**互为镜像**；`pkg/trollsift/uploadfields.go` 的
-     `InjectSubmitTime` 由 agent `injectUploadFields` 调用——`filename` / `ext` /
+     `time`，**互为镜像**；由 agent `injectUploadFields` 调用——`filename` / `ext` /
      `submit_time` 全部 parse-first（`buildStoragePath` 与 `handleDryRun` 共用））
 - webui 镜像清单：`webui/src/utils/pathTemplate.ts:5`（`SYSTEM_TEMPLATE_VARIABLES`；
-  清单以 **LDML 形式**展示 `{submit_time:yyyy/MM/dd}`——裸形式被禁，见上）
+  清单以 **LDML 形式**展示 `{submit_time:yyyy/MM/dd}`——裸形式被禁，见下）
+
+### 保留字禁令（三端共享约定，review B1）
+
+保留字 `submit_time` / `time` **只能以时间字段 + LDML 格式使用**（`{time:yyyy/MM/dd}`），
+`pkg/trollsift.ValidateReservedTimeUse` 是权威检测，**双向三端一致**：
+
+- **agent（硬拒绝，`buildStoragePath` 与 `handleDryRun` 共用 `reservedTimeMisuse`
+  gate）**：`path_pattern` 把保留字声明为**非时间字段**（`{submit_time:s}` 捕获任意
+  字符串——保留字被挪用，镜像规则还会把错误值传播到别名），或 `dest_path_template`
+  **裸 / 非时间类型引用**保留字，一律任务失败（IC-BUG-21 语义：可读错误、**绝不猜键**）。
+  时间类型解析（`{time:yyyy/MM}`，数据日期归档）**合法**。
+- **webui（创建时拦截）**：`validatePathTemplate` 拒绝裸引用并给出带格式示例；
+  变量清单以 LDML 形式展示。
+- **CP（创建/更新时提示）**：`warnings` 返回可读的 misuse 提示（不 422——REST 对
+  模板无形状约束，D-030 第八条）。
 
 ### 优先级：解析结果 vs 注入值（IC-BUG-50 / D-034，review P1-A/P2-D 修正）
 
@@ -165,10 +179,17 @@ exists 检查、`injectUploadFields` + `InjectSubmitTime` 的 inject-if-absent�
 - 钉住：`TestInjectSubmitTime_AliasMatrix`（4 输入 × 逐格断言）、
   `TestBuildStoragePath_MigratedLegacyTime_KeepsDataDate`。
 
-**webui 预览同规则（review P2-C）**：`renderPathPreview` 对 `dynamicFields`
+> ⚠️ **别名镜像与裸形式禁令是三端共享约定，不是 Go 侧的实现细节**——
+> webui 预览（`renderPathPreview`）必须实现同一条镜像规则（单侧解析→预览显示
+> **来源字段**的 `«name»`；双侧→各显示各的），否则预览与真实合成不一致。
+> Go 与 `pathTemplate.ts` 的手工双维护是已记录的脆弱点（见下方漂移风险点），
+> PR #106 二轮 review 的 B2 正是它咬人：预览层漏了镜像。改任一侧必须逐条对照另一侧。
+
+**webui 预览同规则（review P2-C/B2）**：`renderPathPreview` 对 `dynamicFields`
 （即 `path_pattern` 解析出的字段）**优先显示 `«name»` 占位**，包括带 LDML 的
 `{name:LDML}` 引用——解析优先意味着上传不会用当前时间，预览也不得显示当前时间；
-仅当字段不在 `dynamicFields` 里时才按当前时间渲染 LDML。
+仅当字段不在 `dynamicFields` 里时才按当前时间渲染 LDML。保留字的镜像语义同样
+必须被预览实现，见上方警告块。
 
 ### 时间字段（LDML 语法）
 

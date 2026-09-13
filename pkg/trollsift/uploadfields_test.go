@@ -124,7 +124,7 @@ func TestUsesBareReservedTimeField(t *testing.T) {
 }
 
 // The bare form really does fail to compose with the injected time value —
-// pinning the failure that motivates the bare-form ban.
+// pinning the failure that motivated the bare-form ban.
 func TestBareReservedTimeField_CannotCompose(t *testing.T) {
 	now := time.Date(2026, 9, 13, 8, 0, 0, 0, time.UTC)
 	fields := InjectSubmitTime(map[string]Value{}, now)
@@ -132,4 +132,29 @@ func TestBareReservedTimeField_CannotCompose(t *testing.T) {
 	require.NoError(t, err)
 	_, err = p.Compose(fields, false)
 	assert.Error(t, err, "bare {submit_time} must not silently compose")
+}
+
+// Review B1: the bare-form ban only covered bare field + injected Time value.
+// A path_pattern that parses the reserved word as a STRING field still let a
+// bare template compose ("HELLO/a.csv") — the reserved word was silently
+// repurposed as an arbitrary path segment. ValidateReservedTimeUse rejects a
+// reserved time word used as a NON-time field in either direction:
+// dest_path_template (compose side) and path_pattern (parse side).
+func TestValidateReservedTimeUse(t *testing.T) {
+	assert.Contains(t, ValidateReservedTimeUse("{submit_time}/{filename}"), "submit_time")
+	assert.Contains(t, ValidateReservedTimeUse("/{time}/{filename}"), "time")
+	assert.Contains(t, ValidateReservedTimeUse("{submit_time:s}/{filename}"), "submit_time")
+	assert.Contains(t, ValidateReservedTimeUse("{time:3s}"), "time")
+	assert.Contains(t, ValidateReservedTimeUse("of/{submit_time:5d}/x"), "submit_time")
+
+	// Time-typed use with LDML is the documented, supported form.
+	assert.Empty(t, ValidateReservedTimeUse("{submit_time:yyyy/MM/dd}/{filename}"))
+	assert.Empty(t, ValidateReservedTimeUse("{time:yyyy/MM|tz=Asia/Shanghai}/{filename}"))
+	// Unrelated fields are never flagged.
+	assert.Empty(t, ValidateReservedTimeUse("{time_zone}/{filename}"))
+	assert.Empty(t, ValidateReservedTimeUse("{submit_time_of_day}/{filename}"))
+	assert.Empty(t, ValidateReservedTimeUse("static/{filename}"))
+	assert.Empty(t, ValidateReservedTimeUse(""))
+	// Syntax errors are reported elsewhere (New); not this gate's problem.
+	assert.Empty(t, ValidateReservedTimeUse("{unclosed/{filename}"))
 }
