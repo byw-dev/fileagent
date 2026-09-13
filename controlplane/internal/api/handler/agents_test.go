@@ -84,6 +84,9 @@ func (m *mockAgentsDB) CreateCollectionRule(_ context.Context, arg db.CreateColl
 		PathPattern:      arg.PathPattern,
 		DestPathTemplate: arg.DestPathTemplate,
 		Recursive:        arg.Recursive,
+		CronExpr:         arg.CronExpr,
+		RunOnceOnStart:   arg.RunOnceOnStart,
+		AppendMode:       arg.AppendMode,
 		Metadata:         arg.Metadata,
 		CreatedAt:        time.Now(),
 		UpdatedAt:        time.Now(),
@@ -93,19 +96,25 @@ func (m *mockAgentsDB) UpdateCollectionRuleStatus(_ context.Context, id uuid.UUI
 	if m.updateErr != nil {
 		return nil, m.updateErr
 	}
-	// The real DB returns the full stored row; round-trip the template fields
-	// so status-only responses carry the same contract warnings (review E1).
+	// The real DB returns the FULL stored row. Cherry-picking fields here makes
+	// the mock looser than production and silently hides response-shape bugs
+	// (review round 6), so copy the whole stored rule and override only what
+	// this statement actually changes.
 	r := &db.CollectionRule{
 		ID:        id,
 		AgentID:   uuid.New(),
-		Status:    status,
 		Metadata:  json.RawMessage(`{}`),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
 	if m.rule != nil {
-		r.PathPattern = m.rule.PathPattern
-		r.DestPathTemplate = m.rule.DestPathTemplate
+		cp := *m.rule
+		r = &cp
+	}
+	r.ID = id
+	r.Status = status
+	if len(r.Metadata) == 0 {
+		r.Metadata = json.RawMessage(`{}`)
 	}
 	return r, nil
 }

@@ -291,23 +291,20 @@ function AgentRuleFormPage() {
         // than the backend defaulting a missing value to {}.
         metadata: toRuleMetadata(values),
       }
-      if (isEdit && rid) {
-        const resp = await updateRule(agentId, rid, payload)
-        message.success('规则更新成功')
-        // IC-BUG-50 / review E1: surface the CP contract warnings instead of
-        // discarding them. The save itself succeeded; the hint stays on the
-        // form (closable) rather than vanishing into a toast or a redirect.
-        if (resp.warnings?.length) {
-          setSaveWarnings(resp.warnings)
-          return true
-        }
-      } else {
-        const resp = await createRule(agentId, payload)
-        message.success('规则创建成功')
-        if (resp.warnings?.length) {
-          setSaveWarnings(resp.warnings)
-          return true
-        }
+      // Both branches return the same envelope, so the warnings handling below
+      // is deliberately written ONCE: duplicating it per branch left the create
+      // copy unpinned by any test (review round 6).
+      const resp =
+        isEdit && rid
+          ? await updateRule(agentId, rid, payload)
+          : await createRule(agentId, payload)
+      message.success(isEdit && rid ? '规则更新成功' : '规则创建成功')
+      // IC-BUG-50 / review E1: surface the CP contract warnings instead of
+      // discarding them. The save itself succeeded; the hint stays on the form
+      // (closable) rather than vanishing into a toast or a redirect.
+      if (resp.warnings?.length) {
+        setSaveWarnings(resp.warnings)
+        return true
       }
       navigate(`/agents/${agentId}`, { state: { tab: 'rules' } })
       return true
