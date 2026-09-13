@@ -445,7 +445,13 @@ function AgentRuleFormPage() {
             initialValue={initial.append_mode}
             options={[
               { label: 'overwrite（全量）', value: 'overwrite' },
-              { label: 'tail（追加尾部）', value: 'tail' },
+              {
+                // IC-BUG-46 fail-closed：tail 当前实现会静默丢数据（增量 PutObject 整体替换对象），
+                // 提交必然被 CP 422 拒绝。保留选项并说明原因，而非悄悄消失；正确实现见 IC-15。
+                label: 'tail（追加尾部）— 已停用：当前实现会静默丢数据（IC-BUG-46），正确实现见 IC-15',
+                value: 'tail',
+                disabled: true,
+              },
               { label: 'close_wait（写完后上传）', value: 'close_wait' },
             ]}
           />

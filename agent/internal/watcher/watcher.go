@@ -1,6 +1,7 @@
 // Package watcher monitors file system directories and emits FileEvents for
 // new or modified files. It uses fsnotify for real-time notifications and
-// falls back to periodic polling when inotify is unavailable.
+// falls back to periodic polling when fsnotify is unavailable (watch
+// creation or watch-path registration fails).
 package watcher
 
 import (
@@ -214,6 +215,8 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 			if !ok {
 				return nil
 			}
+			// Same IC-BUG-44 story as runFsnotify: overflow errors are only
+			// Warn-logged here; the safety-net rescan is that knife's job.
 			w.logger.Warn("watcher: fsnotify error", zap.Error(err))
 		}
 	}
@@ -231,10 +234,13 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 //
 // Known trade-off (IC-BUG-44, deliberately out of scope here): while the
 // send blocks, fw.Events is not drained, so fsnotify's backend stops reading
-// the kernel watch queue; a sustained burst can overflow it. On Linux
-// inotify this surfaces as a visible error (IN_Q_OVERFLOW) on fw.Errors —
-// logged below — and a periodic safety-net poll scan would recover the
-// files; on the macOS/Windows backends the loss at that layer may be silent.
+// the kernel watch queue; a sustained burst can overflow it. Overflow is
+// visible on both production platforms: Linux (inotify) reports it as
+// IN_Q_OVERFLOW on fw.Errors, and Windows (production, ReadDirectoryChangesW
+// backend in fsnotify v1.8.0) surfaces a buffer overflow as fsnotify
+// .ErrEventOverflow on fw.Errors. In both cases a safety-net poll scan
+// triggered on such an error would recover the missed files — IC-BUG-44's
+// knife. Only macOS kqueue (dev machines, not production) may drop silently.
 // Both follow-ups belong to IC-BUG-44's knife, not this one.
 func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher) error {
 	for {
@@ -259,6 +265,10 @@ func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *
 			if !ok {
 				return nil
 			}
+			// IC-BUG-44: on Linux this can be IN_Q_OVERFLOW and on Windows
+			// fsnotify.ErrEventOverflow — both mean queued events were lost
+			// to a kernel-buffer overflow. Today only a Warn; the safety-net
+			// rescan on such errors is IC-BUG-44's knife.
 			w.logger.Warn("watcher: fsnotify error", zap.Error(err))
 		}
 	}

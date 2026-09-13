@@ -142,7 +142,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 | 🟡 P2 | deploy |
 | IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT | 🟡 P2 | agent |
 | IC-BUG-43 | close_wait 初始扫描跳过「仍在写」的文件，但 fsnotify 分支只扫一次、也没有后续事件兜底——写完即停的文件会被永久跳过 | 🟡 P2 | agent |
-| IC-BUG-44 | 阻塞式初始扫描在事件循环启动**之前**跑，大目录下 inotify 内核队列可能溢出（`IN_Q_OVERFLOW`），期间新建的文件静默丢失 | 🟡 P2 | agent |
+| IC-BUG-44 | 阻塞发送期间内核 watch 队列可能溢出——两个生产平台都会把溢出报上 `fw.Errors`（Linux `IN_Q_OVERFLOW` / Windows `ErrEventOverflow`），但代码只打一条 Warn 就扔了，缺一次安全网重扫闭环 | 🟠 P1 | agent |
 | IC-BUG-45 | tail 偏移在**事件发出时**推进而非**上传确认后**，一次彻底失败的 tail 上传会静默丢掉一段字节区间且无任何信号 | 🟡 P2 | agent |
 | IC-BUG-46 | **`append_mode=tail` 静默丢数据**：`singlePartUpload` 在 `offset>0` 时把**只含增量**的内容 `PutObject` 到同一键，对象被整体替换，此前已采集的内容从对象中消失 | 🔴 P0 | agent |
 | IC-BUG-47 | 实时 fsnotify 事件路径仍用非阻塞 `emit`（满即丢弃），大量小文件并发写入时被丢弃的文件**永不被采集**——IC-5 的 F1 只修了初始扫描那一半 | 🟠 P1 | agent |
@@ -685,17 +685,18 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 写完并关闭一个文件后立即启动 agent（落在去抖窗口内），该文件最终必须被采集；且仍不得上传处于写入中的文件（不能把 F2 修复退回去）|
 | **归属** | 未排期。归 agent 采集路径，宜与 IC-BUG-44 同刀（都是初始扫描的时序边界）|
 
-## IC-BUG-44 — 阻塞式初始扫描先于事件循环，inotify 队列可能溢出 🟡 P2
+## IC-BUG-44 — 阻塞发送期间内核 watch 队列溢出：溢出信号已送到手边，代码只 Warn 不补救 🟠 P1
 
 | 字段 | 内容 |
 |------|------|
-| **根因** | IC-5（PR #100）的 review F1 修复把初始扫描改成**阻塞发送**（背压取代丢弃），但扫描仍在**进入事件循环之前**执行。`fsnotify` 的 `Events` channel 无缓冲，在 `runFsnotify` / `runCloseWait` 启动前没有任何消费者 |
-| **精确位置** | `agent/internal/watcher/watcher.go` `Start` 中 `pollScan` 的调用位置（在 `runFsnotify` / `runCloseWait` 之前）|
-| **后果** | 5 万个既有文件 + 消费端受限于 SQLite 写入时，扫描会把 `Start` 阻塞数分钟；这期间新建的文件冲爆内核队列（`max_queued_events` 默认 16384）→ `IN_Q_OVERFLOW` → **这些 create 事件被静默丢弃，且没有任何后续扫描会找回它们** |
-| **注意** | 这是 F1 修复的**代价而非退步**：改成阻塞之前，同样的积压是直接被 `emit` 丢掉的（那更糟且无声）。本条是把风险从「必然丢」降到「极端规模下可能丢」之后剩下的尾巴 |
-| **修复** | 把初始扫描放进独立 goroutine，在事件循环**已经在消费**之后再跑；扫描与实时事件并发写同一个 channel 是安全的（`seen` map 的并发访问需加锁或改为扫描独占）|
-| **验收** | 大目录（万级）下启动 agent，同时持续创建新文件，既有文件与新建文件**都不丢** |
-| **归属** | 未排期。宜与 IC-BUG-43 同刀 |
+| **根因** | IC-BUG-47（IC-3 修复）把实时事件改成阻塞发送后，**发送阻塞期间 `fw.Events` 无人消费**，fsnotify 后端停止读取内核 watch 队列；持续突发可把队列冲爆（Linux `max_queued_events` 默认 16384）。**关键平台事实（codex 第六轮复核查证 fsnotify v1.8.0）**：溢出在**两个生产平台都是可见的**——Linux（生产）inotify 报 `IN_Q_OVERFLOW`、Windows（生产）ReadDirectoryChangesW 后端报 `fsnotify.ErrEventOverflow`，两者都会出现在 `fw.Errors` 上。**但当前 `fw.Errors` 分支只有一条 `w.logger.Warn`，没有任何恢复动作**——信号已经送到手边，代码接住了又扔掉 |
+| **精确位置** | `agent/internal/watcher/watcher.go` 两处 `fw.Errors` 分支（`runCloseWait` 与 `runFsnotify`，约 :214-218 / :263-268），均只 `logger.Warn("watcher: fsnotify error", …)` |
+| **后果** | 溢出期间排队的 create/write 事件丢失，对应文件不被采集。**性质与初判不同**：这不是「难以察觉的静默丢数据」——溢出信号两个生产平台都会明确报告，只差一步补救动作即可闭环。**因此从 P2 上调为 P1**：从「隐蔽隐患」变成「差一步闭环的缺口」，修复成本低、收益直接 |
+| **平台角色（重要，勿再搞反）** | Linux（**生产**）`IN_Q_OVERFLOW` **可见**；Windows（**生产**）`ErrEventOverflow` **可见**（fsnotify v1.8.0 查证）；macOS kqueue（**仅开发机**）不保证溢出可见，可能静默——**它只影响开发机上能不能复现这个分支，不影响生产的数据安全边界**。⚠️ 这是本 track 第 10 次「注释声称的性质不成立」，此前 watcher.go 注释曾声称 Windows 该层丢失可能静默，系错误 |
+| **修复** | **不需要发明任何检测手段**：在 `fw.Errors` 分支收到溢出错误（`IN_Q_OVERFLOW` / `fsnotify.ErrEventOverflow`）时触发一次**安全网重扫**（复用现有 `pollScan`），把溢出期间漏掉的文件找回来。可选地同时保留 Warn 日志并带上溢出标记。不动 emitBlocking 的背压语义——那是 IC-BUG-47 已验证的正确行为 |
+| **验收** | CI（ubuntu + windows）下制造队列溢出（小队列限制 + 持续突发），断言溢出后触发重扫、溢出窗口内创建的文件最终被采集 |
+| **⚠️ 流程事实（与直觉相反，值得后人知道）** | 对 fsnotify 这一类机制，**CI（ubuntu + windows）才是权威验证环境，本机 macOS 不是**——macOS kqueue 不报溢出，本地跑再多次也走不到 `fw.Errors` 的溢出分支，0 失败只代表「没测到」，不代表「没问题」。IC-BUG-44 的验收**必须在 CI 上看，不要被本机绿灯误导** |
+| **归属** | 未排期（IC-3 收尾明确不做本刀——安全网重扫是它自己那一刀）。宜与 IC-BUG-43 同刀（都是初始扫描的时序边界） |
 
 ## IC-BUG-45 — tail 偏移在发出事件时推进，而非上传确认后 🟡 P2
 
@@ -727,7 +728,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 |------|------|
 | **根因** | IC-5 的 review F1 把**初始扫描**改成了阻塞发送（`emitBlocking`，背压取代丢弃），但**实时 fsnotify 事件循环仍在用非阻塞的 `emit`**——满即丢弃 |
 | **精确位置** | `agent/internal/watcher/watcher.go`：`emit` 的调用点在 `runFsnotify` / `runCloseWait`（约 :154 / :176 / :221 / :226）；`emitBlocking` 只用在 `pollScan`（约 :303）。消费端 channel 缓冲 64（`agent/cmd/agent/main.go` 约 :791） |
-| **后果** | 大量小文件并发写入 → 64 缓冲打满 → 事件被丢弃（仅一条 Warn）→ **那些文件永不被采集**，因为它们的 mtime/size 不会再变、也不会再有事件触发。叠加 **IC-BUG-44** 的 inotify 内核队列溢出，丢失面更大 |
+| **后果** | 大量小文件并发写入 → 64 缓冲打满 → 事件被丢弃（仅一条 Warn）→ **那些文件永不被采集**，因为它们的 mtime/size 不会再变、也不会再有事件触发。其背压语义会让 fsnotify 停读内核 watch 队列，溢出风险见 **IC-BUG-44**（P1：溢出可见、缺安全网重扫） |
 | **与 F1 的关系** | **同一个缺陷的另一半**。F1 修复时双方都以为覆盖了整条路径，实际只修了初始扫描 |
 | **修复** | 实时事件路径同样改用 `emitBlocking`（4 处调用点），与 F1 同一模式 |
 | **验收** | 并发写入远超 channel 缓冲的小文件（如 500 个），断言**全部**被采集，一个不丢；变异（改回 `emit`）必须稳定红 |
