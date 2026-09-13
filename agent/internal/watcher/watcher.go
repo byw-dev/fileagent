@@ -227,10 +227,15 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 // dropped create/write event means that file is never collected, because its
 // mtime/size do not change again and no further event fires. Backpressure is
 // the correct semantics here, as it already is for pollScan (PR #100 F1) and
-// runCloseWait. Known trade-off (IC-BUG-44, kept out of scope): while the
-// send blocks, fw.Events is not drained, so a sustained burst can overflow
-// the kernel's inotify/kqueue queue — fsnotify surfaces that as an error
-// (logged below), which is visible, unlike the old silent per-event drop.
+// runCloseWait.
+//
+// Known trade-off (IC-BUG-44, deliberately out of scope here): while the
+// send blocks, fw.Events is not drained, so fsnotify's backend stops reading
+// the kernel watch queue; a sustained burst can overflow it. On Linux
+// inotify this surfaces as a visible error (IN_Q_OVERFLOW) on fw.Errors —
+// logged below — and a periodic safety-net poll scan would recover the
+// files; on the macOS/Windows backends the loss at that layer may be silent.
+// Both follow-ups belong to IC-BUG-44's knife, not this one.
 func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher) error {
 	for {
 		select {
@@ -391,10 +396,9 @@ func (w *Watcher) buildEvent(path, op string) (FileEvent, error) {
 // semantics for ALL event paths — the initial scan (PR #100 F1), the
 // close_wait debounce flush, and the real-time fsnotify loop (IC-BUG-47) —
 // because a dropped event means the file is never collected: the consumer
-// keeps draining, so blocking only delays delivery, it never loses it. Note
-// the IC-BUG-44 interaction recorded on runFsnotify: blocking holds the
-// fsnotify event loop, so a sustained burst can overflow the kernel watch
-// queue (surfaced as a visible fsnotify error, not a silent drop).
+// keeps draining, so blocking only delays delivery, it never loses it (this
+// holds at the watcher level; the OS layer below fsnotify has its own loss
+// modes — see the IC-BUG-44 note on runFsnotify).
 func (w *Watcher) emitBlocking(ctx context.Context, events chan<- FileEvent, fe FileEvent) bool {
 	select {
 	case <-ctx.Done():
