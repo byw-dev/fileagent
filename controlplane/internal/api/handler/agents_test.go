@@ -656,7 +656,7 @@ func fullRuleBody(t *testing.T) string {
 	return `{"name":"edited","bucket_id":"` + uuid.New().String() +
 		`","mode":"scheduled","base_path":"/data2","path_pattern":"*.csv",` +
 		`"dest_path_template":"out/{filename}","recursive":true,"cron_expr":"0 * * * *",` +
-		`"run_once_on_start":true,"append_mode":"tail","enabled":true}`
+		`"run_once_on_start":true,"append_mode":"overwrite","enabled":true}`
 }
 
 func TestAgentsHandler_UpdateRule_FullUpdate_Success(t *testing.T) {
@@ -668,7 +668,7 @@ func TestAgentsHandler_UpdateRule_FullUpdate_Success(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
 	assert.Equal(t, "edited", body["name"])
 	assert.Equal(t, "scheduled", body["mode"])
-	assert.Equal(t, "tail", body["append_mode"])
+	assert.Equal(t, "overwrite", body["append_mode"])
 	// An active result must hot-reload via DispatchRule, not cancel.
 	assert.Equal(t, 1, dispatcher.dispatched)
 	assert.Equal(t, 0, dispatcher.cancelled)
@@ -728,11 +728,46 @@ func TestAgentsHandler_UpdateRule_FullUpdate_InvalidMode(t *testing.T) {
 	assert.Equal(t, http.StatusUnprocessableEntity, w.Code)
 }
 
+func TestAgentsHandler_CreateRule_TailMode_422(t *testing.T) {
+	// IC-BUG-46 fail-closed: append_mode=tail currently replaces the whole
+	// object with the appended increment (silent data loss), so rule creation
+	// must reject it with a readable 422 until IC-15 lands.
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"logs/","append_mode":"tail"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errObj := resp["error"].(map[string]interface{})
+	assert.Equal(t, "VALIDATION_ERROR", errObj["code"])
+	msg, _ := errObj["message"].(string)
+	assert.Contains(t, msg, "tail", "the rejection must explain why tail is refused")
+}
+
 func TestAgentsHandler_UpdateRule_FullUpdate_InvalidBucketID(t *testing.T) {
 	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
 	body := `{"name":"edited","bucket_id":"not-a-uuid","mode":"watch","base_path":"/d","path_pattern":"*","dest_path_template":"x/"}`
 	w := putRule(t, h, body)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestAgentsHandler_UpdateRule_FullUpdate_TailMode_422(t *testing.T) {
+	// IC-BUG-46 fail-closed: a full-field update switching the rule to
+	// append_mode=tail must be rejected with the same readable 422 as creation.
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, nil, newTestLogger())
+	body := `{"name":"edited","bucket_id":"` + uuid.New().String() +
+		`","mode":"watch","base_path":"/d","path_pattern":"*","dest_path_template":"x/","append_mode":"tail"}`
+	w := putRule(t, h, body)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	errObj := resp["error"].(map[string]interface{})
+	assert.Equal(t, "VALIDATION_ERROR", errObj["code"])
+	msg, _ := errObj["message"].(string)
+	assert.Contains(t, msg, "tail", "the rejection must explain why tail is refused")
 }
 
 func TestAgentsHandler_UpdateRule_FullUpdate_NotFound(t *testing.T) {

@@ -158,10 +158,12 @@ func normalise(cfg *Config) {
 // single-part and multipart strategies based on file size, and honours any
 // partially-uploaded state stored in the queue.
 //
-// When task.AppendMode is "tail" and task.FileOffset > 0, only the bytes
-// starting from FileOffset are uploaded (i.e., the tail appended since the
-// last upload). The object key is the same (task.StoragePath), so the
-// caller must ensure unique keys per chunk if full history is required.
+// ⚠️ IC-BUG-46: tasks with AppendMode "tail" are refused by the executor
+// BEFORE UploadFile is reached, so the tail-specific path below (offset > 0 →
+// Seek + PutObject to the same key) is currently unreachable. It must NOT be
+// re-enabled: PutObject replaces the whole object, so an incremental tail
+// upload would silently destroy the previously collected content. The correct
+// implementation (rolling chunks + server-side merge) is IC-15.
 func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*UploadResult, error) {
 	info, err := os.Stat(task.LocalPath)
 	if err != nil {

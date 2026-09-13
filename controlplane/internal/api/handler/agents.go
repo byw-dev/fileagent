@@ -738,6 +738,27 @@ func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 	return resp
 }
 
+// rejectTailAppendMode enforces the IC-BUG-46 fail-closed block on
+// append_mode=tail. The refusal is NOT because "there are no consumers today"
+// (that is a point-in-time snapshot, not a property of the mode): tail is a
+// mode already offered by system-design.md §4.4.3, the rule schema and the
+// proto — and with the current upload path an incremental tail upload
+// REPLACES the whole object with just the appended bytes, silently destroying
+// previously collected data. A mode that silently loses data must be stopped
+// first; a visible failure beats a silently wrong result. The correct
+// implementation (rolling chunks + server-side merge) is IC-15; until it
+// lands, creation/update of tail rules is refused with a readable 422 shaped
+// like the existing VALIDATION_ERROR responses. Returns true when the request
+// was rejected (the caller must return immediately).
+func rejectTailAppendMode(c *gin.Context, appendMode string) bool {
+	if strings.EqualFold(strings.TrimSpace(appendMode), "tail") {
+		middleware.RespondError(c, http.StatusUnprocessableEntity, "VALIDATION_ERROR",
+			"append_mode=tail is disabled: an incremental tail upload currently replaces the whole object with only the appended bytes, silently losing previously collected data (IC-BUG-46); it stays refused until the correct implementation lands (IC-15: rolling chunks + server-side merge)", nil)
+		return true
+	}
+	return false
+}
+
 // ListRules handles GET /api/v1/agents/:id/rules.
 func (h *AgentsHandler) ListRules(c *gin.Context) {
 	if h.db == nil {
@@ -860,6 +881,9 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 	appendMode := req.AppendMode
 	if appendMode == "" {
 		appendMode = "overwrite"
+	}
+	if rejectTailAppendMode(c, appendMode) {
+		return
 	}
 	mode := strings.ToLower(req.Mode)
 	status := db.RuleStatusActive
@@ -1044,6 +1068,9 @@ func (h *AgentsHandler) updateRuleFull(c *gin.Context, rid uuid.UUID, req update
 	appendMode := req.AppendMode
 	if appendMode == "" {
 		appendMode = "overwrite"
+	}
+	if rejectTailAppendMode(c, appendMode) {
+		return
 	}
 	metadata := req.Metadata
 	if len(metadata) == 0 {

@@ -171,6 +171,15 @@ Status         string
 	AppendMode string
 }
 
+// Append-mode values as persisted in upload_tasks.append_mode (schema default
+// "overwrite"). "tail" is currently fail-closed blocked upstream of storage
+// (IC-BUG-46); the constant stays because pre-existing rows can still carry it.
+const (
+	AppendModeOverwrite = "overwrite"
+	AppendModeTail      = "tail"
+	AppendModeCloseWait = "close_wait"
+)
+
 // ProcessedFile represents a row in the processed_files table.
 type ProcessedFile struct {
 	ID         string

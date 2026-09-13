@@ -321,6 +321,33 @@ func (e *Executor) processTask(ctx context.Context, task *queue.UploadTask) {
 		return
 	}
 
+	// IC-BUG-46 fail-closed gate. append_mode=tail is refused BEFORE the
+	// uploader runs, so no object is ever produced. The reason is NOT that
+	// "there are no consumers today" (a point-in-time snapshot, not a
+	// property): tail is a mode already offered by system-design.md §4.4.3 /
+	// the rule schema / the proto, and with the current upload path an
+	// incremental tail upload REPLACES the whole object with only the
+	// appended bytes — previously collected data silently disappears. A mode
+	// that can silently lose data must be stopped first: a visible failure
+	// beats a silently wrong result. The correct implementation is IC-15
+	// (rolling chunks + server-side merge); until it lands, every tail task
+	// fails terminally — retrying cannot help while the mode is unsupported,
+	// and handleFailure's terminal branch upholds the abort order law: the
+	// durable abort intent (outbox write inside MarkFailedAbandoned) commits
+	// BEFORE the direct abort runs. The gate sits at the single choke point
+	// ahead of the uploader (the executor is the uploader's only caller), so
+	// no upload path reaches storage with a tail task.
+	if task.AppendMode == queue.AppendModeTail {
+		err := fmt.Errorf("%w: append_mode=tail is disabled (IC-BUG-46): an incremental tail upload would replace the whole object with only the appended bytes, silently losing previously collected data; the correct implementation is IC-15", ErrTerminalUpload)
+		e.logger.Error("executor: refusing tail-mode upload",
+			zap.String("task_id", task.ID),
+			zap.String("path", task.LocalPath),
+			zap.String("upload_id", task.UploadID),
+			zap.Error(err))
+		e.handleFailure(ctx, task, err)
+		return
+	}
+
 	result, err := e.uploader(ctx, task)
 	if err != nil {
 		e.handleFailure(ctx, task, err)

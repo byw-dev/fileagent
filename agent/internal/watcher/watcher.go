@@ -11,6 +11,8 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
+
+	"github.com/byw-dev/fileagent/agent/internal/queue"
 )
 
 var newFSWatcher = fsnotify.NewWatcher
@@ -43,16 +45,24 @@ type Watcher struct {
 	tailOffsets map[string]int64
 }
 
-// AppendModeOverwrite means upload the full file on each change (default mode).
-const AppendModeOverwrite = "overwrite"
-
-// AppendModeTail tracks the byte offset of each file and uploads only the
-// bytes added since the last successful upload.
-const AppendModeTail = "tail"
-
-// AppendModeCloseWait debounces Write/Create events by waiting a short idle
-// period before emitting, approximating "file was closed after writing".
-const AppendModeCloseWait = "close_wait"
+// Append-mode constants. The canonical values live in the queue package (they
+// are persisted in upload_tasks.append_mode); these aliases keep the watcher's
+// public API stable.
+const (
+	// AppendModeOverwrite means upload the full file on each change (default mode).
+	AppendModeOverwrite = queue.AppendModeOverwrite
+	// AppendModeTail tracks the byte offset of each file and uploads only the
+	// bytes added since the last successful upload.
+	//
+	// ⚠️ IC-BUG-46: tail is fail-closed blocked — the incremental tail upload
+	// path would replace the whole object with only the appended bytes,
+	// silently losing previously collected data. The executor refuses tail
+	// tasks before any upload runs; the correct implementation is IC-15.
+	AppendModeTail = queue.AppendModeTail
+	// AppendModeCloseWait debounces Write/Create events by waiting a short idle
+	// period before emitting, approximating "file was closed after writing".
+	AppendModeCloseWait = queue.AppendModeCloseWait
+)
 
 // closeWaitDebounce is the idle period used in close_wait mode.
 const closeWaitDebounce = 500 * time.Millisecond
@@ -151,7 +161,10 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 		if err != nil {
 			return
 		}
-		w.emit(ctx, events, fe)
+		// IC-BUG-47: blocking send — a dropped event here means the file is
+		// never collected (mtime/size never change again). Backpressure
+		// delays the debounce-flush goroutine instead.
+		w.emitBlocking(ctx, events, fe)
 	}
 
 	for {
@@ -173,7 +186,8 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 						p.timer.Stop()
 						delete(pending, ev.Name)
 					}
-					w.emit(ctx, events, FileEvent{Path: ev.Name, Op: "remove"})
+					// IC-BUG-47: blocking send — never drop.
+					w.emitBlocking(ctx, events, FileEvent{Path: ev.Name, Op: "remove"})
 				}
 				continue
 			}
@@ -207,6 +221,16 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 
 // runFsnotify drives the fsnotify event loop, translating raw events into
 // FileEvents and emitting them on the events channel.
+//
+// IC-BUG-47: both send sites below use emitBlocking. The earlier non-blocking
+// emit dropped events whenever the consumer channel (buffer 64) was full — a
+// dropped create/write event means that file is never collected, because its
+// mtime/size do not change again and no further event fires. Backpressure is
+// the correct semantics here, as it already is for pollScan (PR #100 F1) and
+// runCloseWait. Known trade-off (IC-BUG-44, kept out of scope): while the
+// send blocks, fw.Events is not drained, so a sustained burst can overflow
+// the kernel's inotify/kqueue queue — fsnotify surfaces that as an error
+// (logged below), which is visible, unlike the old silent per-event drop.
 func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher) error {
 	for {
 		select {
@@ -218,12 +242,12 @@ func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *
 			}
 			if ev.Has(fsnotify.Create) || ev.Has(fsnotify.Write) {
 				if fe, err := w.buildEvent(ev.Name, opString(ev)); err == nil {
-					w.emit(ctx, events, fe)
+					w.emitBlocking(ctx, events, fe)
 				}
 			}
 			if ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename) {
 				if w.matchGlob(ev.Name) {
-					w.emit(ctx, events, FileEvent{Path: ev.Name, Op: "remove"})
+					w.emitBlocking(ctx, events, FileEvent{Path: ev.Name, Op: "remove"})
 				}
 			}
 		case err, ok := <-fw.Errors:
@@ -364,26 +388,19 @@ func (w *Watcher) buildEvent(path, op string) (FileEvent, error) {
 // emitBlocking sends fe to the events channel, blocking until the consumer
 // takes it or ctx is cancelled. It returns false only when the context was
 // cancelled before the event could be delivered. Backpressure is the correct
-// semantics for scan paths: the producer is a bounded one-shot walk and the
-// consumer keeps draining, so blocking here prevents silent data loss (PR #100
-// review F1). Unlike emit, no event is ever dropped.
+// semantics for ALL event paths — the initial scan (PR #100 F1), the
+// close_wait debounce flush, and the real-time fsnotify loop (IC-BUG-47) —
+// because a dropped event means the file is never collected: the consumer
+// keeps draining, so blocking only delays delivery, it never loses it. Note
+// the IC-BUG-44 interaction recorded on runFsnotify: blocking holds the
+// fsnotify event loop, so a sustained burst can overflow the kernel watch
+// queue (surfaced as a visible fsnotify error, not a silent drop).
 func (w *Watcher) emitBlocking(ctx context.Context, events chan<- FileEvent, fe FileEvent) bool {
 	select {
 	case <-ctx.Done():
 		return false
 	case events <- fe:
 		return true
-	}
-}
-
-// emit sends fe to the events channel in a non-blocking manner. If the channel
-// is full, the event is dropped and a warning is logged.
-func (w *Watcher) emit(ctx context.Context, events chan<- FileEvent, fe FileEvent) {
-	select {
-	case <-ctx.Done():
-	case events <- fe:
-	default:
-		w.logger.Warn("watcher: event channel full, dropping event", zap.String("path", fe.Path))
 	}
 }
 
