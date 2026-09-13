@@ -11,21 +11,21 @@
 **权威追踪**：[`metadata-phase1.md`](metadata-phase1.md)（含收官 banner）。落地：`DECISIONS.md` D-025 各「落地记录」；
 架构回填：`system-design.md` §3.3.8/§5.8。**推后**：规则改动回溯（低价值）；Phase 2（数据集/血缘）按信号触发。
 
-## ▶️ 当前 track（2026-09-08 拍板）：写入准入与索引一致性（IC-0…IC-14）
+## ▶️ 当前 track（2026-09-08 拍板）：写入准入与索引一致性（IC-0…IC-15）
 
 对写入链路做全面审计后发现 **Agent 数据面从未端到端跑通过**：Agent 拿不到 STS 凭据（IC-BUG-1）、
 从不上报 `UploadResult`（IC-BUG-2）、STS policy 前缀与实际对象键不匹配（IC-BUG-3）且缺 multipart 权限（IC-BUG-4）。
 当前 `file_entries` 的唯一写入者是本应「只做对账兜底」的 minio-event webhook，与 `system-design.md` §4.5
 描述的主路径完全相反。同时确认**不存在任何 MinIO↔PostgreSQL 对账机制**。
 
-- **追踪**：[`consistency-ingest.md`](consistency-ingest.md)（IC-0…IC-14，含命名约定与执行纪律）
+- **追踪**：[`consistency-ingest.md`](consistency-ingest.md)（IC-0…IC-15，含命名约定与执行纪律）
 - **设计**：[`docs/design/consistency-and-ingest.md`](../design/consistency-and-ingest.md)
 - **决策**：[`DECISIONS.md`](../../DECISIONS.md) **D-030**（不换存储层；STS grant + 注册 outbox + 分片对账）、
   **D-031**（MinIO 事件传输 webhook → NATS JetStream，排期对账阶段 IC-11）
-- **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-49（30…32 来自 2026-09-10 的 M-2 类扫描，33/34 来自同日评审，35 来自 IC-2c 的 live 验收，36 是 IC-2a 开工时挡路的那条，37/38 来自 IC-2a 的 live 验收，**39…41 来自 PR #97 的 code review**）。**49 条中已关闭 30 条**：随 IC-2a 关闭 **2/8/28/29/33**（另 13/31 各关掉一半），随 PR #97 关闭 **35/36**，随 **IC-5（PR #100）关闭 10/11/34/37 并补齐 12 的超时半边**（12 不再是拆半），随 **IC-2b（PR #103）关闭 20/21/30**，随 **IC-3（PR #105）关闭 5/39**（IC-3 的 ILM 兜底受上游 MinIO 限制，见卡片）。**未关闭 16 条：4 条挡（6/7/9/40）、11 条可推、1 条拆半**（6/7 是「挡（收窄）」，仍算挡；42…45 是 PR #100 两轮 review 新立，均判可推）——**判据已于 2026-09-11 重判**（「挡」的含义从「挡着能不能跑通」变成「挡着能不能扛住故障」），详见 [`consistency-ingest.md`](consistency-ingest.md) 「分诊结论」一节，**不要沿用旧口径的可推/挡**
+- **缺陷清单**：[`bugs/open.md`](bugs/open.md) IC-BUG-1…IC-BUG-49（30…32 来自 2026-09-10 的 M-2 类扫描，33/34 来自同日评审，35 来自 IC-2c 的 live 验收，36 是 IC-2a 开工时挡路的那条，37/38 来自 IC-2a 的 live 验收，**39…41 来自 PR #97 的 code review**）。**49 条中已关闭 30 条**：随 IC-2a 关闭 **2/8/28/29/33**（另 13/31 各关掉一半），随 PR #97 关闭 **35/36**，随 **IC-5（PR #100）关闭 10/11/34/37 并补齐 12 的超时半边**（12 不再是拆半），随 **IC-2b（PR #103）关闭 20/21/30**，随 **IC-3（PR #105）关闭 5/39**（IC-3 的 ILM 兜底受上游 MinIO 限制，见卡片）。**未关闭 19 条：4 条挡（6/7/9/40）、13 条可推、2 条拆半**（6/7 是「挡（收窄）」，仍算挡；42…45 是 PR #100 两轮 review 新立、均判可推；**46…49 是 IC-3 六轮 review 与 tail 设计讨论新立**——46 为拆半：出血半边已随 IC-3 挡掉、正确实现归 IC-15，**tail 当前不可用**；47 已随 IC-3 关闭；48 归 IC-15；49 需产品拍板）」，仍算挡；42…45 是 PR #100 两轮 review 新立，均判可推）——**判据已于 2026-09-11 重判**（「挡」的含义从「挡着能不能跑通」变成「挡着能不能扛住故障」），详见 [`consistency-ingest.md`](consistency-ingest.md) 「分诊结论」一节，**不要沿用旧口径的可推/挡**
 
-**顺序**：IC-0 文档基线 ✅ → 止血 IC-1 ✅ → **IC-2c** ✅（硬前置，PR #96）→ **IC-2a** ✅（PR #98；前置 PR #97 修 IC-BUG-36/35）→ **IC-2b** ✅（IC-BUG-20/21/30/31 结构半边，live 三条验收全过；③ 为快照形态，D-033）→ **下一刀在 IC-3 / IC-4 / IC-5 / IC-SEC-2 之间选（可并行）**
-→ 地基 IC-6/7 → 准入 IC-8…10 → 对账 IC-11…13 → 血缘 IC-14。
+**顺序**：IC-0 文档基线 ✅ → 止血 IC-1 ✅ → **IC-2c** ✅（硬前置，PR #96）→ **IC-2a** ✅（PR #98；前置 PR #97 修 IC-BUG-36/35）→ **IC-2b** ✅（IC-BUG-20/21/30/31 结构半边，live 三条验收全过；③ 为快照形态，D-033）→ **IC-5** ✅（采集正确性，PR #100）→ **IC-3** ✅（续传落盘 + 孤儿分片清理，PR #105，六轮 review；**tail 已 fail-closed 挡掉**，IC-BUG-46 的正确实现见 IC-15）→ **下一刀在 IC-4 / IC-SEC-2 / IC-15 / IC-BUG-44 之间选**
+→ 地基 IC-6/7 → 准入 IC-8…10 → 对账 IC-11…13 → 血缘 IC-14 → **tail 重做 IC-15**。
 
 > ⚠️ 两条硬约束：**IC-1 必须第一个做**（在它之前 Agent 一个文件都传不上去，任何 live 验收都无法执行）；
 > **IC-2c 是 IC-2a 的硬前置**（webhook 对象键 `url.QueryUnescape`，IC-BUG-19）——反序会给每个对象造两行。
