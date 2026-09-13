@@ -906,6 +906,52 @@ func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, ru
 // will mute — a per-file warning storm is how IC-BUG-21 degraded into noise.
 var templateRefusals sync.Map
 
+// refusePathField fails the task with the IC-BUG-21 semantics: a readable
+// error, no guessed key, and a Warn deduplicated per rule over the process
+// lifetime. It covers both rule fields that decide the object key —
+// dest_path_template (unchanged wording from IC-BUG-21) and, since the
+// reserved-time gate (review B1), path_pattern misuse of the reserved words.
+func refusePathField(subject, ruleID, text, cause string, causeErr error, logger *zap.Logger) (string, error) {
+	var err error
+	if subject == "dest_path_template" {
+		err = fmt.Errorf("dest_path_template for rule %s cannot be resolved (%s): template %q: %w",
+			ruleID, cause, text, causeErr)
+	} else {
+		err = fmt.Errorf("%s for rule %s cannot be used (%s): pattern %q: %w",
+			subject, ruleID, cause, text, causeErr)
+	}
+	if _, dup := templateRefusals.LoadOrStore(ruleID, true); dup {
+		logger.Debug("agent: "+subject+" still unusable for this rule (first occurrence already logged)",
+			zap.String("rule_id", ruleID))
+		return "", err
+	}
+	logger.Warn("agent: "+subject+" unusable, refusing to guess an object key — task will not be enqueued "+
+		"(fix the rule; existing files are re-collected on the next cron walk or write event)",
+		zap.String("rule_id", ruleID),
+		zap.String("subject", subject),
+		zap.String("text", text),
+		zap.String("cause", cause),
+		zap.Error(causeErr))
+	return "", err
+}
+
+// reservedTimeMisuse returns the first misuse of the reserved time words
+// across BOTH pattern directions (review B1 / D-034 补记 2): path_pattern
+// declaring the reserved word as a non-time field, or dest_path_template
+// referencing it bare or typed as non-time. Both buildStoragePath and
+// handleDryRun gate on it so every compose path — upload and dry-run preview
+// alike — fails the same way; webui rejects it at validation time and the CP
+// warns at create/update, so the agent must not be the lenient outlier.
+func reservedTimeMisuse(rule scheduler.CollectionRule) (subject, reason string) {
+	if reason := trollsift.ValidateReservedTimeUse(rule.PathPattern); reason != "" {
+		return "path_pattern", reason
+	}
+	if reason := trollsift.ValidateReservedTimeUse(trollsift.NormalizeTemplate(rule.DestPathTemplate)); reason != "" {
+		return "dest_path_template", reason
+	}
+	return "", ""
+}
+
 // buildStoragePath resolves the upload path template and returns the object
 // key to use in MinIO, or an error when the template cannot be resolved.
 //
@@ -919,6 +965,19 @@ var templateRefusals sync.Map
 // and the IC-6 reconciliation shard tree. A silent fallback was exactly how
 // IC-BUG-17 flattened every upload into the bucket root.
 func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx trollsift.AgentContext, now time.Time, logger *zap.Logger) (string, error) {
+	// Reserved-time gate (review B1): a reserved word used bare or as a
+	// non-time field must fail BEFORE any compose — regardless of where the
+	// value comes from (injected time or a parsed string). IC-BUG-21
+	// semantics: readable error, no guessed key.
+	if subject, reason := reservedTimeMisuse(rule); reason != "" {
+		text := rule.PathPattern
+		if subject == "dest_path_template" {
+			text = rule.DestPathTemplate
+		}
+		return refusePathField(subject, rule.RuleID, text, "reserved time word used outside its declared meaning",
+			errors.New(reason), logger)
+	}
+
 	relPath, err := filepath.Rel(rule.BasePath, localPath)
 	if err != nil {
 		relPath = filepath.Base(localPath)
@@ -937,26 +996,10 @@ func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx 
 	}
 
 	fields = trollsift.InjectContext(agentCtx, fields)
-	fields["filename"] = trollsift.S(filepath.Base(localPath))
-	fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(localPath), "."))
-	if strings.Contains(rule.DestPathTemplate, "{time") {
-		fields["time"] = trollsift.T(now)
-	}
+	fields = injectUploadFields(fields, localPath, now)
 
 	fail := func(cause string, causeErr error) (string, error) {
-		err := fmt.Errorf("dest_path_template for rule %s cannot be resolved (%s): template %q: %w",
-			rule.RuleID, cause, rule.DestPathTemplate, causeErr)
-		if _, dup := templateRefusals.LoadOrStore(rule.RuleID, true); dup {
-			logger.Debug("agent: dest_path_template still unresolvable for this rule (first occurrence already logged)",
-				zap.String("rule_id", rule.RuleID))
-			return "", err
-		}
-		logger.Warn("agent: dest_path_template unresolvable, refusing to guess an object key — task will not be enqueued "+
-			"(fix the rule's dest_path_template; existing files are re-collected on the next cron walk or write event)",
-			zap.String("rule_id", rule.RuleID),
-			zap.String("template", rule.DestPathTemplate),
-			zap.Error(causeErr))
-		return "", err
+		return refusePathField("dest_path_template", rule.RuleID, rule.DestPathTemplate, cause, causeErr, logger)
 	}
 
 	destParser, err := trollsift.New(trollsift.NormalizeTemplate(rule.DestPathTemplate))
@@ -971,6 +1014,24 @@ func buildStoragePath(rule scheduler.CollectionRule, localPath string, agentCtx 
 		return fail("resolved to an empty key", fmt.Errorf("composed key is empty"))
 	}
 	return trollsift.NormalizeObjectKey(storagePath), nil
+}
+
+// injectUploadFields adds the non-parsed upload variables shared by
+// buildStoragePath and handleDryRun, so a dry-run preview shows exactly the
+// key the upload would produce. All fields are parse-first (D-034): a value
+// parsed out of path_pattern wins, the local file's basename/ext and the
+// submit instant (plus its deprecated alias {time}, via InjectSubmitTime —
+// IC-BUG-50) only fill in when nothing was parsed by that name. The injection
+// is unconditional-if-absent instead of a template substring check, so field
+// names sharing the reserved word's prefix ({time_zone}) cannot misfire.
+func injectUploadFields(fields map[string]trollsift.Value, localPath string, now time.Time) map[string]trollsift.Value {
+	if _, ok := fields["filename"]; !ok {
+		fields["filename"] = trollsift.S(filepath.Base(localPath))
+	}
+	if _, ok := fields["ext"]; !ok {
+		fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(localPath), "."))
+	}
+	return trollsift.InjectSubmitTime(fields, now)
 }
 
 // applyRulesSnapshot replaces the agent's whole rule set with the synced
@@ -1040,6 +1101,15 @@ const defaultDryRunLimit = 10
 func handleDryRun(rule scheduler.CollectionRule, client *grpcclient.Client, agentCtx trollsift.AgentContext, logger *zap.Logger) {
 	result := &agentv1.DryRunResult{RuleId: rule.RuleID}
 
+	// Reserved-time gate (review B1): the dry-run preview must fail exactly
+	// the way the upload would — same reservedTimeMisuse check as
+	// buildStoragePath, reported rule-level so every file row shows the cause.
+	if subject, reason := reservedTimeMisuse(rule); reason != "" {
+		result.Error = subject + ": " + reason
+		sendDryRunResult(client, result, logger)
+		return
+	}
+
 	var pathParser *trollsift.Parser
 	if trollsift.IsTrollsiftPattern(rule.PathPattern) {
 		p, err := trollsift.New(rule.PathPattern)
@@ -1093,8 +1163,7 @@ func handleDryRun(rule scheduler.CollectionRule, client *grpcclient.Client, agen
 			}
 		}
 		fields = trollsift.InjectContext(agentCtx, fields)
-		fields["filename"] = trollsift.S(filepath.Base(path))
-		fields["ext"] = trollsift.S(strings.TrimPrefix(filepath.Ext(path), "."))
+		fields = injectUploadFields(fields, path, time.Now().UTC())
 
 		// Normalise exactly as buildStoragePath does: the dry-run preview sits
 		// next to the Web UI's own preview in the same form, so showing a

@@ -1814,3 +1814,172 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
    `ErrRulesSyncDegraded`；gRPC Connect 据此**保持连接**（断流必然循环）并在缓存打
    `AgentSyncDegradedKey`（24h TTL，成功同步清除），agents API 的
    `agentResponse.rule_sync_degraded` 直接可读——不再只有一条 ERROR 日志。
+
+---
+
+## D-034：路径模板保留字 `time` 改名 `submit_time`，注入优先级与系统变量对齐（IC-BUG-50）
+
+**决策日期**：2026-09-13
+**影响范围**：`pkg/trollsift`（新增 `InjectSubmitTime` / `UsesDeprecatedTimeField`）、
+`agent/cmd/agent/main.go`（`buildStoragePath` / `handleDryRun`）、
+`controlplane/internal/api/handler/agents.go`（创建/更新的 deprecation 提示）、
+`webui/src/utils/pathTemplate.ts`、`webui/src/pages/Agents/RuleForm.tsx`（默认模板）、
+`docs/design/contracts.md` V-3（契约对齐）
+**关联**：IC-BUG-50（docs/tasks/bugs/open.md）、D-010（引入 trollsift）、V-3（路径模板契约）
+
+### 背景与三条根因（IC-BUG-50）
+
+1. **`time` 是未声明的保留字**。`buildStoragePath` 里硬编码注入 `fields["time"]`，
+   但 `contracts.md` V-3 的系统变量表与 webui 的 `SYSTEM_TEMPLATE_VARIABLES` 都没有它
+   ——三端契约只有两端知道它存在。
+2. **优先级与同体系变量相反**。`InjectContext` 对 `agent_name`/`agent_id` 是
+   **解析结果优先、不覆盖**（`TestInjectContext_NoOverwrite` 钉住），而 `time`
+   是 `strings.Contains(DestPathTemplate, "{time")` 命中即**无条件覆盖**解析结果。
+   管理员把解析字段命名为 `time`（很自然）想按**数据日期**归档时，会静默拿到
+   **采集时刻**——归档到错误日期且无任何提示（D-030 整桶 policy 下连 403 都没有）。
+3. **名字误导**。它不是「当前时刻」语义，而是「**该文件被提交上传的那一刻**」
+   （`submitFile` 时刻的 `time.Now().UTC()`）；叫 `time` 让人以为是通用时间变量。
+
+且 `strings.Contains(template, "{time")` 是字面前缀匹配，对 `{time_zone}`
+这类前缀相同的字段名会误触发注入（`submit_time` 系列同样存在，改名后一并消除）。
+
+### 决策
+
+1. **改名**：保留字 `{time}` → **`{submit_time}`**。语义 = **该文件被提交上传的
+   时刻**（`submitFile` 时刻，UTC），与 `agent_name`/`filename` 同为小写下划线名词，
+   且与代码自身词汇（`submitFile`）一致。否决 `upload_time`（歧义为 PUT 完成时刻）、
+   `now`（查询时刻歧义，任务明令禁用）。
+2. **优先级对齐**：与 `agent_name`/`agent_id` 一致改为**解析结果优先**——
+   `path_pattern` 解析出同名字段就用解析值，**没有才注入**上传时刻。
+   同一体系里不允许两套相反的优先级规则；「想要上传时刻」的用法在解析字段
+   不同名时照样成立。权威注入点收敛为 `pkg/trollsift.InjectSubmitTime`
+   （`buildStoragePath` 与 `handleDryRun` 共用），不再做模板字符串前缀匹配
+   ——无条件注入-if-absent 对 Compose 无副作用（未引用的字段不参与合成），
+   从结构上消灭 `{time_zone}` 前缀误伤。
+3. **存量兼容**：**同时接受旧名 `{time}` 与 `{submit_time}`**，渲染语义完全等价
+   （同样解析结果优先）。**不选一次性数据迁移**：模板存在 `rules.dest_path_template`
+   里，迁移要扫全表改写文本且 REST 建的规则无形状约束、无法保证替换不破坏 LDML
+   段；而 agent 侧接受旧名的成本是两行 inject-if-absent，风险更低。旧名标记为
+   **deprecated（未移除，无移除时间表）**：CP 在创建/更新规则时对含旧名的模板
+   返回可读的 `warnings` 提示并记 Warn 日志。
+4. **行为变更声明（对存量规则）**：仅当一条规则**同时**满足「`path_pattern`
+   解析出名为 `time` 的字段」且「`dest_path_template` 引用 `{time}`」时，
+   渲染结果从「上传时刻」变为「解析值」——这正是缺陷本身，属修复而非破坏；
+   其余存量规则（模板含 `{time}` 但无同名字段）渲染结果逐字节不变。
+   UI 默认模板改用 `{submit_time:yyyy/MM/dd}`，新建规则不再产生旧名。
+
+### 落地约束
+
+- `pkg/trollsift` 为权威（`InjectSubmitTime` / `UsesDeprecatedTimeField`），
+  webui `pathTemplate.ts` 镜像同步（V-3 既有约定）。
+- `contracts.md` V-3 同步：系统变量表补 `submit_time` + 旧名 deprecation 状态、
+  新增优先级说明（`InjectContext` 与 `buildStoragePath` 两个注入点）、
+  时间符号表补 `mm`=分 / `MM`=月及「大小写写错在上传时才失败（`month out of range`）」。
+- 测试钉住：解析优先（含旧名等价、`time_zone` 不被误伤）、新名注入兜底、
+  CP 侧 deprecation 提示。
+
+**补记 1（2026-09-13，PR #106 review：别名镜像、裸形式禁令、filename/ext 统一优先级）**：
+
+首版实现被 review 实测抓出三处语义漏洞，修正如下：
+
+1. **别名必须是互为镜像，不是两个独立字段**。首版 `InjectSubmitTime` 对
+   `submit_time` 与 `time` 各判各的 inject-if-absent——存量规则解析出 `time`
+   （数据日期）、管理员照 deprecation 提示把 dest 的 `{time}` 改成 `{submit_time}`
+   后，`submit_time` 从未被解析 → 注入提交时刻 → **照迁移建议做反而落错位置**。
+   修正：单侧已解析时**镜像给缺失的别名**（解析出 `time` 则 `submit_time` 取同值，
+   反之亦然）；**双侧都被解析时各用各的、不互相覆盖**——Compose 只读模板引用的
+   字段，两个独立的解析结果强制镜像反而会制造意外值；此规则写进 `InjectSubmitTime`
+   注释与 V-3，并以交叉别名矩阵测试（4 种输入 × 2 种 dest 引用）逐格钉住。
+2. **裸形式禁令（选 b）**：`{submit_time}` / `{time}` **不带 LDML 格式**时，Go 侧把
+   无格式字段判为 string 类型（`field.go`），注入的 Time 值必然 compose 失败
+   （实测 `expects a string value`）——而首版 UI 清单与契约恰以裸形式宣传，管理员
+   照抄即得一个必失败模板。**不选默认序列化（(a)）**：对象键里没有无歧义的默认时间
+   格式（RFC3339 带 `:` 冒号），任何默认值都是任意拍板，且会连带改变 parse 侧语义。
+   修正：**禁止裸形式**——webui `validatePathTemplate` 拦截并给出带格式示例、
+   UI 变量清单改以带格式形式展示（`{submit_time:yyyy/MM/dd}`）、契约写明禁令、
+   CP warnings 对裸形式给出可读提示。**弃用提示只进给人看的提示区，不进对象键**
+   （首版把 `(deprecated)` 拼进了预览键，已移除）。
+3. **filename/ext 统一解析优先**。契约原文宣称「全部系统变量解析优先」，但
+   `injectUploadFields` 对 `filename`/`ext` 仍无条件覆盖（实测：解析出 `ext=csv`
+   的 `/data/csv/report.bin` 合成 `bin/report.bin`）——契约声称与实现不符
+   （本 track 第 11 次）。**选统一 absent-only 而非收窄措辞**：同一体系一套优先级
+   规则可让契约逐字成立、不再需要例外清单；行为变更面极小（仅当 path_pattern
+   显式命名 `filename`/`ext` 且捕获值 ≠ 本地 basename/ext 时，键以解析值为准——
+   那正是管理员的显式意图）。
+
+**补记 2（2026-09-13，PR #106 二轮 review B1/B2：裸保留字 agent 侧无条件拒绝、预览镜像入契约）**：
+
+1. **裸保留时间字段无条件拒绝（B1）**。补记 1 的裸形式禁令只覆盖了
+   「裸字段 + 注入的 Time 值」——实测 `path_pattern: 'of/{submit_time:s}/…'`
+   解析出 string 值后，裸模板 `{submit_time}/…` **照样合成成功**：三端口径矛盾
+   （webui 拦、CP 警、agent 跑通），且保留字被挪用为任意字符串。修正：
+   **agent 侧无条件拒绝**——新增 `pkg/trollsift.ValidateReservedTimeUse`，
+   在 `buildStoragePath` 与 `handleDryRun` 共用的 gate 处统一校验（IC-BUG-21
+   语义：任务失败、可读错误、绝不猜键）。
+   **判断：parse 侧一并拒绝**（保留字声明为非时间字段也拒，如 `{submit_time:s}`；
+   时间类型 `{submit_time:yyyy/MM}` 仍合法——那是文档支持的数据日期归档）。
+   理由：保留字的意义是名字唯一绑定语义；让 path_pattern 拿 `submit_time` 捕获
+   任意字符串，V-3 对「`submit_time` = 该文件被提交上传的时刻」的承诺在该规则上
+   直接为假，且镜像规则会把错误值传播到另一个别名。
+
+   **存量代价（四轮 review C3/D3 修正——穷尽全部组合并区分两类性质）**：
+
+   **原先能跑 → 现在失败（真实行为变更，共两行）**：
+
+   | 组合 | 禁令前 | 禁令后 | 实测证据 |
+   |------|--------|--------|----------|
+   | pattern 把保留字解析成 **string/int**（如 `{submit_time:s}`），dest **裸/typed 引用**（`{submit_time}`、`{submit_time:s}`） | **能合成** | **拒绝**（任务失败） | `HELLO/a.csv` |
+   | pattern 把保留字解析成 **string/int**，dest **不引用**（保留字摆设） | 能跑 | **拒绝** | — |
+
+   **失败 → 失败（仅错误更可读，含改法；非行为变更，共三行）**：
+
+   | 组合 | 禁令前 | 禁令后 |
+   |------|--------|--------|
+   | pattern 把保留字解析成 **时间类型**（`{time:yyyy}`），dest **裸/typed 引用** | 失败（Time 值 + string 类型字段：`expects a string value`） | 拒绝（同失败，错误含 LDML 改法） |
+   | pattern 把保留字解析成 **非时间类型**，dest **时间类型引用**（`{time:yyyy}`） | 失败（string 值 + 时间类型字段：`expects a time value`） | 拒绝（同失败，错误含改法） |
+   | dest 裸/typed 引用，**无解析** | 失败（同上类型不符） | 拒绝（同失败，错误含改法） |
+
+   这两类规则的 path_pattern 本身就把保留字用成了普通字段，属配置语义错位；
+   fail-fast（Warn 可读、指明在 path_pattern 里改字段名）优于继续静默跑。
+   保留字**时间类型**形态（pattern/dest `{time:yyyy/MM}` 数据日期归档）不受影响。
+
+   （**pattern 语法错误**（`New()` 失败）不在矩阵内——它与保留字无关，且 agent
+   对它的处理路径不经过 buildStoragePath：正常 watch/cron 路径由 `matchGlob`
+   先行 `New()`，失败即 **Warn 跳过该文件**（`agent: match path failed`），
+   dry-run 显式返回错误；「静默当无字段 pattern」仅在 buildStoragePath 内部成立、
+   而那里只在文件已匹配后才被调用。禁令前后行为一致（Warn 跳过/显式错误），
+   非本刀行为变更；本刀起 CP 在创建/更新时以 warnings 提示，见补记 3 第 1 条。）
+2. **预览镜像写进契约（B2）**。前端 `renderPathPreview` 已实现 dynamicFields
+   优先但未实现别名镜像——预览与真实合成不一致，正是 P2-C 要消灭的问题换了入口。
+   修正：前端实现与 `InjectSubmitTime` 同款镜像规则（单侧解析→镜像给缺失别名；
+   双侧→各用各的；都没解析→当前时间），交叉预览测试钉住。**教训落进 V-3**：
+   Go 与 `pathTemplate.ts` 的手工双维护是已记录的脆弱点，本次再次咬人——
+   别名镜像与裸形式禁令必须写成**三端共享约定**（契约正文），不能只活在 Go 注释里。
+
+**补记 3（2026-09-13，PR #106 三/四轮 review：时区权威校验收窄到 Go 端、dest 提示动词、代价矩阵穷尽）**：
+
+1. **时区有效性不做 TS 镜像，权威校验收归 Go 端（四轮 D1，选 b）**。
+   实测跨端不等价：`{time:yyyy|tz=Nope/Bad}`、`{time:yyyy|tz=Asia/Shanghai }`
+   （尾空格）、`{time:yyyy|tz=UTC|tz=UTC}`（重复 tz）在 Go `New()` 全部报
+   `invalid timezone`，而 TS 只查 `tz=` 非空、三者放行——管理员 UI 保存成功、
+   上传时才失败。**不选 (a) TS 补时区校验**：浏览器没有权威 IANA 数据源
+   （`Intl.supportedValuesOf('timeZone')` 可用性依环境、集合与 Go tzdata 不重合），
+   「重复 tz」「尾空格」需要逐字镜像 `strings.Index(spec, "|tz=")` 切分逻辑——
+   正是本契约已三次咬人的「双实现必然漂移」模式。**选 (b)**：TS 声明收窄为
+   kind + 基础语法；**CP 创建/更新时用 Go `New()` 对两字段做完整校验**（与 agent
+   同库同判定），失败进 `warnings`（不 422——模板形状约束已由 D-030 第八条否决，
+   需要拒绝须另立决策）——「UI 放行、保存成功」时错误即在保存响应可见，
+   不再等到上传。`ValidateReservedTimeUse` 保持只管 kind（正确，未改）。
+2. **dest 提示动词修正（四轮 D2）**：C2 的字段插值让 dest 的 deprecated 提示
+   也带上 "parses"——`dest_path_template` 只合成、不解析，文案误导。
+   两字段文案分别成立：path_pattern 用「解析出同名字段」，dest 用「渲染为提交
+   时刻，除非 path_pattern 解析出同名字段」（解析优先是全局规则，条件在 pattern 侧）。
+3. **存量代价矩阵穷尽（四轮 D3 / 五轮 E2 修正）**：三轮修正的四行矩阵仍漏两组
+   「失败→失败」组合（pattern=time 解析 + dest 裸/typed 引用；
+   pattern=非时间解析 + dest=time 引用），已补入并**显式区分**「原先能跑→现在失败」
+   （真实行为变更，**2 行**）与「失败→失败」（仅错误更可读，**3 行**）——
+   五轮修正：正文矩阵初版误写「共四行」且把「pattern 语法错误」行混入并以
+   错误理由（「静默当无字段 pattern」）佐证「行为未变」；实测该理由不成立——
+   正常 watch/cron 路径 `matchGlob` 先行 `New()`，失败即 Warn 跳过、dry-run
+   显式报错，「静默」仅在 buildStoragePath 内部成立而那里根本走不到。该行
+   与保留字无关、禁令前后行为一致，已移出矩阵并如实注明。

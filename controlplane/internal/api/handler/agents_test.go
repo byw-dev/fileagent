@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -83,6 +84,9 @@ func (m *mockAgentsDB) CreateCollectionRule(_ context.Context, arg db.CreateColl
 		PathPattern:      arg.PathPattern,
 		DestPathTemplate: arg.DestPathTemplate,
 		Recursive:        arg.Recursive,
+		CronExpr:         arg.CronExpr,
+		RunOnceOnStart:   arg.RunOnceOnStart,
+		AppendMode:       arg.AppendMode,
 		Metadata:         arg.Metadata,
 		CreatedAt:        time.Now(),
 		UpdatedAt:        time.Now(),
@@ -92,14 +96,27 @@ func (m *mockAgentsDB) UpdateCollectionRuleStatus(_ context.Context, id uuid.UUI
 	if m.updateErr != nil {
 		return nil, m.updateErr
 	}
-	return &db.CollectionRule{
+	// The real DB returns the FULL stored row. Cherry-picking fields here makes
+	// the mock looser than production and silently hides response-shape bugs
+	// (review round 6), so copy the whole stored rule and override only what
+	// this statement actually changes.
+	r := &db.CollectionRule{
 		ID:        id,
 		AgentID:   uuid.New(),
-		Status:    status,
 		Metadata:  json.RawMessage(`{}`),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
-	}, nil
+	}
+	if m.rule != nil {
+		cp := *m.rule
+		r = &cp
+	}
+	r.ID = id
+	r.Status = status
+	if len(r.Metadata) == 0 {
+		r.Metadata = json.RawMessage(`{}`)
+	}
+	return r, nil
 }
 func (m *mockAgentsDB) UpdateCollectionRule(_ context.Context, arg db.UpdateCollectionRuleParams) (*db.CollectionRule, error) {
 	if m.fullUpdateErr != nil {
@@ -606,6 +623,211 @@ func TestAgentsHandler_CreateRule_InvalidBucketID(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// IC-BUG-50 / D-034: creating a rule whose dest_path_template uses the
+// deprecated {time} reserved word must still succeed (the agent accepts the
+// alias), but the response must carry a readable deprecation hint pointing at
+// {submit_time}.
+func TestAgentsHandler_CreateRule_DeprecatedTimeTemplate_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"{time:yyyy/MM/dd}/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "deprecated {time} template must produce a warnings array")
+	joined := fmt.Sprint(warnings)
+	assert.Contains(t, joined, "deprecated")
+	assert.Contains(t, joined, "submit_time")
+}
+
+// The new reserved word must not trigger the deprecation warning, nor must a
+// field name that merely shares the {time prefix ({time_zone}).
+func TestAgentsHandler_CreateRule_NonDeprecatedTemplates_NoWarning(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	for _, tpl := range []string{"{submit_time:yyyy/MM/dd}/{filename}", "{time_zone}/{filename}"} {
+		body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"` + tpl + `"}`
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		testAgentsRouter(h).ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code, tpl)
+		var resp map[string]interface{}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		assert.Nil(t, resp["warnings"], "template %s must not warn", tpl)
+	}
+}
+
+// Review C2: the warnings must cover path_pattern too — the agent's gate
+// refuses a pattern that declares a reserved word as a non-time field, so a
+// rule the CP lets through would only fail at upload time. The warning names
+// the field (parallel to the agent's refusePathField wording).
+func TestAgentsHandler_CreateRule_PatternReservedTypedNonTime_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"of/{time:s}/{filename}","dest_path_template":"data/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "pattern misuse must produce a warnings array")
+	joined := fmt.Sprint(warnings)
+	assert.Contains(t, joined, "path_pattern")
+	assert.Contains(t, joined, "LDML")
+}
+
+// The deprecated alias in path_pattern also warns (it renders fine, but the
+// rule should migrate to the declared name).
+func TestAgentsHandler_CreateRule_DeprecatedTimeInPattern_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"of/{time:yyyy}/{filename}","dest_path_template":"data/{time:yyyy}/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "deprecated {time} in path_pattern must warn")
+	joined := fmt.Sprint(warnings)
+	assert.Contains(t, joined, "path_pattern uses the deprecated reserved word")
+}
+
+// Review D1: timezone validity is Go-authoritative (time.LoadLocation inside
+// trollsift.New) — the webui only checks kind/basic syntax and lets these
+// through, so the CP must catch them at save time or the admin only finds out
+// at upload. Measured New() errors: unknown zone, trailing space, repeated tz.
+func TestAgentsHandler_CreateRule_InvalidTimezone_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	for _, tpl := range []string{
+		"{time:yyyy|tz=Nope/Bad}/{filename}",
+		"{time:yyyy|tz=Asia/Shanghai }/{filename}",
+		"{time:yyyy|tz=UTC|tz=UTC}/{filename}",
+	} {
+		body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"` + tpl + `"}`
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		testAgentsRouter(h).ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code, tpl)
+		var resp map[string]interface{}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		warnings, ok := resp["warnings"].([]interface{})
+		require.True(t, ok, "invalid timezone in %s must produce a warnings array", tpl)
+		assert.Contains(t, fmt.Sprint(warnings), "invalid timezone", tpl)
+	}
+	// A valid timezone must not warn (note: {time:...} would legitimately warn as
+// the deprecated alias — use the declared {submit_time} name).
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"{submit_time:yyyy|tz=Asia/Shanghai}/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Nil(t, resp["warnings"], "valid timezone must not warn")
+}
+
+// The same Go-authoritative check covers path_pattern (trollsift patterns
+// only — glob patterns must not be fed to New).
+func TestAgentsHandler_CreateRule_InvalidTimezoneInPattern_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"of/{time:yyyy|tz=Nope/Bad}/{filename}","dest_path_template":"data/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "invalid timezone in path_pattern must produce a warnings array")
+	joined := fmt.Sprint(warnings)
+	assert.Contains(t, joined, "path_pattern is not a valid trollsift pattern")
+	assert.Contains(t, joined, "invalid timezone")
+}
+
+// Review D2: the two fields' deprecation hints must use field-appropriate
+// verbs — dest_path_template does not parse, it only composes.
+func TestAgentsHandler_CreateRule_DeprecatedTime_DestHintDoesNotSayParses(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"{time:yyyy/MM/dd}/{filename}"}`
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok)
+	assert.NotContains(t, fmt.Sprint(warnings), "dest_path_template parses")
+	assert.NotContains(t, fmt.Sprint(warnings), "dest_path_template still parses")
+}
+
+// Review E1: the status-only PUT (enable/disable toggle) must carry the same
+// contract warnings — activating a rule whose template is deprecated or
+// misuses a reserved word must not silently succeed with no signal.
+func TestAgentsHandler_UpdateRule_StatusOnly_ReturnsTemplateWarnings(t *testing.T) {
+	rule := &db.CollectionRule{
+		ID:               uuid.New(),
+		AgentID:          uuid.New(),
+		Status:           db.RuleStatusInactive,
+		DestPathTemplate: "{time:yyyy}/{filename}",
+		CreatedAt:        time.Now(),
+	}
+	h := handler.NewAgentsHandler(&mockAgentsDB{rule: rule}, nil, &mockDispatcher{}, nil, newTestLogger())
+	w := putRule(t, h, `{"status":"active"}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "status-only activation of a rule with deprecated {time} must warn")
+	assert.Contains(t, fmt.Sprint(warnings), "dest_path_template uses the deprecated reserved word")
+}
+
+func TestAgentsHandler_UpdateRule_FullUpdate_DeprecatedTimeTemplate_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	body := `{"name":"edited","bucket_id":"` + uuid.New().String() +
+		`","mode":"watch","base_path":"/data","path_pattern":"*","dest_path_template":"{time:yyyy}/{filename}","enabled":true}`
+	w := putRule(t, h, body)
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	warnings, ok := resp["warnings"].([]interface{})
+	require.True(t, ok, "deprecated {time} template must produce a warnings array")
+	assert.Contains(t, fmt.Sprint(warnings), "submit_time")
+}
+
+// Review P1-B: a bare reserved time field ({submit_time} or {time} without
+// LDML) can never compose — every upload would fail. Creation still succeeds
+// (D-030 §8: no template shape constraints), but the response must carry a
+// readable warning pointing at the LDML form.
+func TestAgentsHandler_CreateRule_BareReservedTimeTemplate_Warns(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	for _, tpl := range []string{"{submit_time}/{filename}", "{time}/{filename}"} {
+		body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"` + tpl + `"}`
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		testAgentsRouter(h).ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code, tpl)
+		var resp map[string]interface{}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		warnings, ok := resp["warnings"].([]interface{})
+		require.True(t, ok, "bare reserved time template %s must produce a warnings array", tpl)
+		assert.Contains(t, fmt.Sprint(warnings), "LDML", tpl)
+	}
 }
 
 // ── UpdateRule ────────────────────────────────────────────────────────────────

@@ -127,10 +127,93 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 | `{agent_id}`   | Agent UUID |
 | `{filename}`   | 原始文件名（含扩展名） |
 | `{ext}`        | 扩展名（不含点） |
+| `{submit_time}` | **该文件被提交上传的时刻**（`submitFile` 时刻，UTC）。⚠️ 不是「当前时刻」的通用时间变量——同一文件重复采集时它是稳定的（IC-BUG-50 / D-034）。**引用必须带 LDML 格式**（如 `{submit_time:yyyy/MM/dd}`）：**裸形式或非时间类型引用（`{submit_time}`、`{submit_time:s}`、`{time:3d}`）被三端一致拒绝**（见下方「保留字禁令」；实测：裸形式合成时类型不符报 `expects a string value`；解析出字符串时甚至能合成出错误键） |
+| `{time}`       | ⚠️ **已废弃（deprecated）**：`{submit_time}` 的旧名，**仍可渲染**（语义完全等价），无移除时间表；新建规则一律用 `{submit_time}`。经 UI 旧默认模板创建的存量规则仍带此名。**同样是别名而非独立变量**：见下方优先级节的镜像规则 |
 
-- 权威注入点：`pkg/trollsift/context.go`（`InjectContext`：`agent_name` / `agent_id`；
-  `filename` / `ext` 由 agent 上传路径构建时注入）
-- webui 镜像清单：`webui/src/utils/pathTemplate.ts:5`（`SYSTEM_TEMPLATE_VARIABLES`）
+- 权威注入点共**两处**（此前只写了第一处）：
+  1. `pkg/trollsift/context.go`（`InjectContext`：`agent_name` / `agent_id`）
+  2. `pkg/trollsift/uploadfields.go`（`InjectSubmitTime`：`submit_time` + 废弃别名
+     `time`，**互为镜像**；由 agent `injectUploadFields` 调用——`filename` / `ext` /
+     `submit_time` 全部 parse-first（`buildStoragePath` 与 `handleDryRun` 共用））
+- webui 镜像清单：`webui/src/utils/pathTemplate.ts:5`（`SYSTEM_TEMPLATE_VARIABLES`；
+  清单以 **LDML 形式**展示 `{submit_time:yyyy/MM/dd}`——裸形式被禁，见下）
+
+### 保留字禁令（三端共享约定，review B1）
+
+保留字 `submit_time` / `time` **只能以时间字段 + LDML 格式使用**（`{time:yyyy/MM/dd}`），
+`pkg/trollsift.ValidateReservedTimeUse` 是权威检测，**双向三端一致**：
+
+- **agent（硬拒绝，`buildStoragePath` 与 `handleDryRun` 共用 `reservedTimeMisuse`
+  gate）**：`path_pattern` 把保留字声明为**非时间字段**（`{submit_time:s}` 捕获任意
+  字符串——保留字被挪用，镜像规则还会把错误值传播到别名），或 `dest_path_template`
+  **裸 / 非时间类型引用**保留字，一律任务失败（IC-BUG-21 语义：可读错误、**绝不猜键**）。
+  时间类型解析（`{time:yyyy/MM}`，数据日期归档）**合法**。
+- **webui（创建时拦截）**：`validatePathTemplate` 拒绝裸引用并给出带格式示例；
+  变量清单以 LDML 形式展示。
+- **CP（创建/更新时提示）**：`warnings` 对 `path_pattern` 与 `dest_path_template`
+  **两个字段都**返回可读提示（不 422——REST 对模板无形状约束，D-030 第八条）；
+  文案以字段名开头，与 agent 的 `refusePathField` 平行。
+
+**kind 判定逐条对照表**（`pkg/trollsift/field.go` `parseFieldSpec` ↔
+`webui/src/utils/pathTemplate.ts` `reservedTimeKindError`，review C1——
+两处手工维护，改任一侧必须逐行核对另一侧）：
+
+| spec（`:` 之后的格式段，`|tz=...` 先剥离） | Go kind | TS 判定 | 保留字可用？ |
+|------|---------|---------|------|
+| 无（裸 `{time}`） | string（空 spec） | `/^$/` → str | ❌ 拒绝 |
+| `s`、`Ns`（如 `3s`） | string | `/^s$/`、`/^\d+s$/` | ❌ 拒绝 |
+| `d`、`Nd`、`0Nd`（如 `05d`） | int | `/^d$/`、`/^\d+d$/`、`/^0\d+d$/` | ❌ 拒绝 |
+| 其余（`yyyy`、`MM/dd`、`HH:mm|tz=...` …） | time（LDML） | 其余 | ✅ 唯一合法形态 |
+
+> ⚠️ **等价声明范围（review D1 收窄）**：TS 镜像只覆盖 **kind 判定与基础语法**
+> （括号平衡、变量名非空、`tz=` 非空）。**时区有效性由 Go 侧权威校验**
+> （`time.LoadLocation`，trollsift `New()`）——TS **不做**时区校验：浏览器没有
+> 权威 IANA 数据源，`Intl.supportedValuesOf('timeZone')` 可用性依环境且集合与
+> Go tzdata 不重合；「尾空格」「重复 `|tz=`」则需逐字镜像 Go 的切分逻辑。
+> 实测跨端不等价：`{time:yyyy|tz=Nope/Bad}`、`{time:yyyy|tz=Asia/Shanghai }`、
+> `{time:yyyy|tz=UTC|tz=UTC}` 全部通过 TS、全部被 Go `New()` 拒绝。
+> 因此 **CP 在创建/更新时用 Go `New()` 对 `path_pattern`（仅 trollsift 形态）与
+> `dest_path_template` 做完整校验**（与 agent 同库同判定），失败进 `warnings`
+> （不 422，D-030 第八条）——错误在保存响应可见，而非等到上传时。
+> `ValidateReservedTimeUse` 只管 kind，**不做**时区校验（分工如此，勿混）。
+
+### 优先级：解析结果 vs 注入值（IC-BUG-50 / D-034，review P1-A/P2-D 修正）
+
+**解析结果优先，注入不覆盖**——对**全部**系统变量与保留字统一成立
+（**含 `filename` / `ext`**）：`path_pattern` 从文件相对路径解析出**同名字段**时，
+一律用解析值；字段缺失才注入。权威实现在两处注入点本身（`InjectContext` 的
+exists 检查、`injectUploadFields` + `InjectSubmitTime` 的 inject-if-absent；
+`TestInjectContext_NoOverwrite`、`TestBuildStoragePath_SubmitTimeParsedFieldWins`、
+`TestBuildStoragePath_ParsedFilenameAndExtWin` 钉住）。因此：
+
+- 管理员把解析字段命名为 `submit_time`（或旧名 `time`、`filename`、`ext`）即可
+  **按解析值归档**，不会被注入值静默覆盖（IC-BUG-50 修复前 `{time}` 是无条件覆盖，
+  恰与此相反；PR #106 review P2-D 修复前 `filename`/`ext` 也在覆盖）。
+- 「想要注入值」的用法不受影响：解析字段不同名时（大多数规则）注入值生效。
+- 字段名共享前缀（如解析字段 `time_zone`）不会被保留字注入误伤——注入是
+  inject-if-absent，**不做模板子串前缀匹配**。
+
+**`time` ↔ `submit_time` 互为别名（不是两个独立变量，review P1-A）**：
+
+- 只解析了其中一个时，**解析值镜像给缺失的别名**——把存量规则的 `{time}` 按提示
+  迁移成 `{submit_time}` 不会改变合成结果（数据日期仍是数据日期）。
+- **两个都解析了：各用各的**——模板只合成自己引用的字段，两个独立解析结果
+  强制镜像反而会捏造出谁都没要的值。
+- 都没解析：两者都注入提交时刻（`submitFile` 时刻，同一值）。
+- 钉住：`TestInjectSubmitTime_AliasMatrix`（4 输入 × 逐格断言）、
+  `TestBuildStoragePath_MigratedLegacyTime_KeepsDataDate`。
+
+> ⚠️ **别名镜像与裸形式禁令是三端共享约定，不是 Go 侧的实现细节**——
+> webui 预览（`renderPathPreview`）必须实现同一条镜像规则（单侧解析→预览显示
+> **来源字段**的 `«name»`；双侧→各显示各的），否则预览与真实合成不一致。
+> Go 与 `pathTemplate.ts` 的手工双维护是已记录的脆弱点（见下方漂移风险点），
+> PR #106 二轮 review 的 B2 正是它咬人：预览层漏了镜像。改任一侧必须逐条对照另一侧。
+
+**webui 预览同规则（review P2-C/B2）**：`renderPathPreview` 对 `dynamicFields`
+（即 `path_pattern` 解析出的字段）**优先显示 `«name»` 占位**，包括带 LDML 的
+`{name:LDML}` 引用——解析优先意味着上传不会用当前时间，预览也不得显示当前时间；
+仅当字段不在 `dynamicFields` 里时才按当前时间渲染 LDML。保留字的镜像语义同样
+必须被预览实现，见上方警告块。
 
 ### 时间字段（LDML 语法）
 
@@ -139,13 +222,18 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 | 符号 | 含义 | 符号 | 含义 |
 |------|------|------|------|
 | `yyyy` | 四位年 | `HH` | 时（24h） |
-| `yy`   | 两位年 | `mm` | 分 |
-| `MM`   | 月     | `ss` | 秒 |
+| `yy`   | 两位年 | `mm` | **分** |
+| `MM`   | **月** | `ss` | 秒 |
 | `dd`   | 日     |      |    |
+
+> ⚠️ **大小写敏感**：`mm` = 分钟、`MM` = 月，写错**在建规则时不会被拦下**
+> （webui/REST 对模板无形状约束，D-030 第八条），**要到上传时才失败**
+> （实测报 `month out of range` 一类解析错误，按 IC-BUG-21 任务失败并告警）。
 
 - 权威解析：`pkg/trollsift/parser.go` / `pkg/trollsift/regex.go`
 - webui 预览渲染镜像：`webui/src/utils/pathTemplate.ts`（`formatLDML`）
-- 决策背景：`DECISIONS.md` **D-010**（引入 `pkg/trollsift` 统一路径模板）
+- 决策背景：`DECISIONS.md` **D-010**（引入 `pkg/trollsift` 统一路径模板）、
+  **D-034**（`{time}` → `{submit_time}` 改名与优先级对齐）
 
 ### 前导 `/` 的归一化（三端共享约定）
 
@@ -164,8 +252,10 @@ CP 的 REST 响应有三种固定信封形状，按端点类型选用：
 | webui（模板预览） | `webui/src/utils/pathTemplate.ts` `normalizeTemplate` | ✅ IC-1 修复（此前不剥，预览显示 `/my-agent/…` 而真实键是 `my-agent/…`） |
 | agent（dry-run 试运行） | `agent/cmd/agent/main.go` `handleDryRun` | ✅ IC-1 修复（此前用原始模板，且它与 webui 预览显示在**同一个表单**里，两个字段对同一模板给出不同答案） |
 
-webui 新建规则的默认模板就带前导 `/`（`webui/src/pages/Agents/RuleForm.tsx:104` =
-`/{agent_name}/{time:yyyy/MM/dd}/{filename}`），**经 UI 创建的规则全部命中**——这就是
+webui 新建规则的默认模板就带前导 `/`（`webui/src/pages/Agents/RuleForm.tsx:104`，
+D-034 起为 `/{agent_name}/{submit_time:yyyy/MM/dd}/{filename}`；D-034 前是
+`/{agent_name}/{time:yyyy/MM/dd}/{filename}`——**经 UI 创建的存量规则仍带旧名**，
+agent 侧继续按 deprecated 别名渲染，见上方系统变量表），**经 UI 创建的规则全部命中**——这就是
 `docs/tasks/bugs/open.md` **IC-BUG-16** 长期静默的原因。
 
 修复方向是**让 CP 与 webui 剥模板**，不是让 agent 停止剥路径：后者会改写所有既有对象键、需全量重铺。

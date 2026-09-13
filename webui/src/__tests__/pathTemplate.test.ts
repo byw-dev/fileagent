@@ -7,13 +7,118 @@ import {
 } from '../utils/pathTemplate'
 
 describe('SYSTEM_TEMPLATE_VARIABLES', () => {
-  it('should export 4 system variables', () => {
-    expect(SYSTEM_TEMPLATE_VARIABLES).toHaveLength(4)
+  it('should export the system variables (IC-BUG-50: incl. submit_time)', () => {
+    expect(SYSTEM_TEMPLATE_VARIABLES).toHaveLength(6)
     const keys = SYSTEM_TEMPLATE_VARIABLES.map((v) => v.key)
     expect(keys).toContain('{agent_name}')
     expect(keys).toContain('{agent_id}')
     expect(keys).toContain('{filename}')
     expect(keys).toContain('{ext}')
+  })
+
+  // IC-BUG-50: submit_time is the declared reserved word for the moment the
+  // file was submitted for upload; the deprecated {time} alias is listed so
+  // legacy rules are discoverable in the UI hints. Review P1-B: the list shows
+  // the LDML form — a bare reserved time field ({submit_time}/{time} without a
+  // format) can never compose, so the UI must not advertise it.
+  it('declares submit_time and the deprecated time alias in LDML form', () => {
+    const keys = SYSTEM_TEMPLATE_VARIABLES.map((v) => v.key)
+    expect(keys).toContain('{submit_time:yyyy/MM/dd}')
+    expect(keys).toContain('{time:yyyy/MM/dd}')
+    // The bare form must not be advertised anywhere in the list.
+    expect(keys).not.toContain('{submit_time}')
+    expect(keys).not.toContain('{time}')
+    const submitTime = SYSTEM_TEMPLATE_VARIABLES.find((v) => v.key.startsWith('{submit_time'))
+    expect(submitTime?.desc).toContain('上传')
+    const legacyTime = SYSTEM_TEMPLATE_VARIABLES.find((v) => v.key.startsWith('{time'))
+    expect(legacyTime?.desc).toContain('deprecated')
+  })
+})
+
+describe('renderPathPreview: submit_time (IC-BUG-50 / D-034)', () => {
+  it('renders the new default template with LDML', () => {
+    const preview = renderPathPreview('/{agent_name}/{submit_time:yyyy/MM/dd}/{filename}')
+    expect(preview).toMatch(/^my-agent\/\d{4}\/\d{2}\/\d{2}\/data\.csv$/)
+  })
+
+  // Review P1-B: the bare form is forbidden — it cannot compose at upload
+  // time, and the deprecation hint must never leak into the previewed key.
+  it('leaves the bare reserved word unchanged (no fake value, no hint text in the key)', () => {
+    expect(renderPathPreview('{submit_time}')).toBe('{submit_time}')
+    expect(renderPathPreview('{time}')).toBe('{time}')
+    expect(renderPathPreview('{time}')).not.toContain('deprecated')
+  })
+
+  // Review P1-B: the validator rejects the bare form with a readable message.
+  it('validatePathTemplate rejects the bare reserved time words', () => {
+    expect(validatePathTemplate('{submit_time}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{time}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{submit_time:yyyy/MM/dd}/{filename}')).toBeNull()
+    // time_zone is an ordinary field name, not the reserved word.
+    expect(validatePathTemplate('{time_zone}/{filename}')).toBeNull()
+  })
+
+  // Review C1: the validator must mirror the Go kind gate, not just the bare
+  // form — a typed NON-time reference ({submit_time:s}, {time:3d}) composes
+  // when the value was parsed as a string and is refused by the agent.
+  it('validatePathTemplate rejects typed non-time reserved words (kind gate parity)', () => {
+    expect(validatePathTemplate('{submit_time:s}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{time:s}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{submit_time:3s}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{time:3d}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{time:d}/{filename}')).toContain('LDML')
+    expect(validatePathTemplate('{time:05d}/{filename}')).toContain('LDML') // zero-pad int variant
+    // The supported forms stay valid.
+    expect(validatePathTemplate('{submit_time:yyyy/MM/dd}/{filename}')).toBeNull()
+    expect(validatePathTemplate('{time:yyyy|tz=Asia/Shanghai}/{filename}')).toBeNull()
+    expect(validatePathTemplate('{time:HH:mm:ss|tz=Asia/Shanghai}/{filename}')).toBeNull()
+    // time_zone with the same specs is an ordinary field: untouched.
+    expect(validatePathTemplate('{time_zone:s}/{filename}')).toBeNull()
+    expect(validatePathTemplate('{time_zone:3d}/{filename}')).toBeNull()
+  })
+
+  it('does not treat {time_zone} as a time field', () => {
+    // time_zone without LDML is not a reserved word: it stays unchanged
+    // (compose-time field from path_pattern), exactly like unknown variables.
+    expect(renderPathPreview('{time_zone}', ['time_zone'])).toBe('\u00ABtime_zone\u00BB')
+  })
+})
+
+describe('renderPathPreview: parsed fields win over the current-time rendering (review P2-C)', () => {
+  it('shows «name» for a dynamic field referenced with LDML — new name', () => {
+    // path_pattern parses submit_time (e.g. the data date): the local preview
+    // must not show the current time, which is what the upload would NOT use.
+    expect(renderPathPreview('{submit_time:yyyy/MM}/{filename}', ['submit_time']))
+      .toBe('\u00ABsubmit_time\u00BB/data.csv')
+  })
+
+  it('shows «name» for a dynamic field referenced with LDML — legacy name', () => {
+    expect(renderPathPreview('{time:yyyy/MM}/{filename}', ['time']))
+      .toBe('\u00ABtime\u00BB/data.csv')
+  })
+
+  it('still renders the current time for LDML fields that path_pattern does NOT parse', () => {
+    expect(renderPathPreview('{submit_time:yyyy/MM}/{filename}'))
+      .toMatch(/^\d{4}\/\d{2}\/data\.csv$/)
+  })
+
+  // Review B2: the preview must mirror the cross-alias semantics of
+  // trollsift.InjectSubmitTime — when exactly ONE reserved word was parsed,
+  // the missing alias composes with the SAME parsed value, so the preview
+  // shows the SOURCE field's «name» for both spellings.
+  it('mirrors parsed legacy time to the submit_time spelling', () => {
+    expect(renderPathPreview('{submit_time:yyyy}/{filename}', ['time']))
+      .toBe('\u00ABtime\u00BB/data.csv')
+  })
+
+  it('mirrors parsed submit_time to the legacy time spelling', () => {
+    expect(renderPathPreview('{time:yyyy}/{filename}', ['submit_time']))
+      .toBe('\u00ABsubmit_time\u00BB/data.csv')
+  })
+
+  it('keeps each spelling on its own parsed value when both were parsed', () => {
+    expect(renderPathPreview('{time:yyyy}/{submit_time:yyyy}/{filename}', ['time', 'submit_time']))
+      .toBe('\u00ABtime\u00BB/\u00ABsubmit_time\u00BB/data.csv')
   })
 })
 

@@ -17,6 +17,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/dirstore"
+	"github.com/byw-dev/fileagent/pkg/trollsift"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -713,6 +714,10 @@ type collectionRuleResponse struct {
 	// edit — without it an update would overwrite the stored metadata with {}.
 	Metadata  json.RawMessage `json:"metadata,omitempty"`
 	CreatedAt string          `json:"created_at"`
+	// Warnings carries non-fatal contract notices (IC-BUG-50 / D-034): a
+	// dest_path_template using the deprecated {time} reserved word still
+	// renders, but creation/update tells the admin to migrate to {submit_time}.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
@@ -736,6 +741,81 @@ func toRuleResponse(r *db.CollectionRule) collectionRuleResponse {
 		resp.CronExpr = r.CronExpr.String
 	}
 	return resp
+}
+
+// ruleTemplateWarnings returns the readable contract notices for BOTH rule
+// fields that decide the object key (review C2): path_pattern and
+// dest_path_template. This mirrors the agent's reservedTimeMisuse gate, which
+// checks both — checking only dest_path_template here would let the admin
+// create a rule the CP passes but the agent refuses at upload time.
+//
+// Deprecated {time}: a hint, not a rejection — existing rules created through
+// the Web UI's old default template must not break. The wording is
+// field-appropriate (review D2): path_pattern parses, dest_path_template only
+// composes — one template for both fields got this wrong.
+//
+// Misuse (ValidateReservedTimeUse: bare or non-time-typed reserved word)
+// matches the agent's hard refusal.
+//
+// Full syntax & timezone validity (review D1): the webui validator only
+// checks kind/basic syntax and cannot be authoritative about IANA zones —
+// measured cross-language gap ({tz=Nope/Bad}, trailing space, repeated |tz=
+// all pass the UI but fail trollsift.New). The CP runs the same New() the
+// agent runs (glob patterns are skipped: they are not trollsift) and reports
+// the error in warnings at save time, so it surfaces here rather than at
+// upload. Refusing the request outright would need a new decision — D-030 §8
+// keeps templates shape-unconstrained.
+func ruleTemplateWarnings(pathPattern, destPathTemplate string) []string {
+	var warnings []string
+	for _, f := range []struct{ field, value string }{
+		{"path_pattern", pathPattern},
+		{"dest_path_template", destPathTemplate},
+	} {
+		if trollsift.UsesDeprecatedTimeField(f.value) {
+			warnings = append(warnings, deprecatedNotice(f.field))
+		}
+		if reason := trollsift.ValidateReservedTimeUse(f.value); reason != "" {
+			warnings = append(warnings, f.field+": "+reason+
+				" — the agent refuses to compose such uploads (task failure, no guessed key)")
+		}
+		if f.field == "path_pattern" && !trollsift.IsTrollsiftPattern(f.value) {
+			continue
+		}
+		if _, err := trollsift.New(f.value); err != nil {
+			warnings = append(warnings, f.field+" is not a valid trollsift pattern; the agent will not compose it: "+err.Error())
+		}
+	}
+	return warnings
+}
+
+// deprecatedNotice wording per field (review D2): the parse-first exception
+// lives on the path_pattern side, so the dest hint references path_pattern.
+func deprecatedNotice(field string) string {
+	if field == "path_pattern" {
+		return "path_pattern uses the deprecated reserved word {time}; " +
+			"it still parses as a time field (parse results always win), " +
+			"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)"
+	}
+	return "dest_path_template uses the deprecated reserved word {time}; " +
+		"it still renders (the file's submit-for-upload instant, unless path_pattern parses a field with that name — parse results always win), " +
+		"but new rules should use {submit_time}, the declared name for the submit instant (see docs/design/contracts.md V-3)"
+}
+
+// respondRule writes a rule response, attaching contract warnings for the
+// deprecated {time} reserved word and reserved-word misuse in BOTH
+// path_pattern and dest_path_template (review C2), plus a Warn log so the
+// hint survives even for API clients that ignore the warnings field.
+func (h *AgentsHandler) respondRule(c *gin.Context, code int, rule *db.CollectionRule) {
+	resp := toRuleResponse(rule)
+	if warns := ruleTemplateWarnings(rule.PathPattern, rule.DestPathTemplate); warns != nil {
+		resp.Warnings = warns
+		h.logger.Warn("rule template/pattern contract warnings (IC-BUG-50 / D-034); migrate to {submit_time}",
+			zap.String("rule_id", rule.ID.String()),
+			zap.String("path_pattern", rule.PathPattern),
+			zap.String("dest_path_template", rule.DestPathTemplate),
+			zap.Strings("warnings", warns))
+	}
+	c.JSON(code, resp)
 }
 
 // rejectTailAppendMode enforces the IC-BUG-46 fail-closed block on
@@ -927,7 +1007,7 @@ func (h *AgentsHandler) CreateRule(c *gin.Context) {
 			h.logger.Warn("dispatch rule after create", zap.Error(err))
 		}
 	}
-	c.JSON(http.StatusCreated, toRuleResponse(rule))
+	h.respondRule(c, http.StatusCreated, rule)
 }
 
 // updateRuleRequest is the body expected by PUT /api/v1/agents/:id/rules/:rid.
@@ -1010,7 +1090,10 @@ func (h *AgentsHandler) updateRuleStatus(c *gin.Context, rid uuid.UUID, statusSt
 	}
 
 	h.redispatchRule(c.Request.Context(), rule, status)
-	c.JSON(http.StatusOK, toRuleResponse(rule))
+	// respondRule (not a bare c.JSON) so the status-only path — enabling a
+	// rule whose template misuses a reserved word or uses the deprecated
+	// {time} alias — also surfaces the contract warnings (review E1).
+	h.respondRule(c, http.StatusOK, rule)
 }
 
 // updateRuleFull applies a full-field edit of a collection rule. The update is
@@ -1111,7 +1194,7 @@ func (h *AgentsHandler) updateRuleFull(c *gin.Context, rid uuid.UUID, req update
 	// Re-dispatch so an active rule's content change hot-reloads on the Agent
 	// (offline agents pick it up via SyncRulesOnConnect on reconnect).
 	h.redispatchRule(c.Request.Context(), rule, status)
-	c.JSON(http.StatusOK, toRuleResponse(rule))
+	h.respondRule(c, http.StatusOK, rule)
 }
 
 // redispatchRule pushes the rule to its Agent when active, or cancels it when

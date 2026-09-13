@@ -101,7 +101,9 @@ const DEFAULT_VALUES: RuleFormValues = {
   recursive: false,
   append_mode: 'overwrite',
   enabled: true,
-  dest_path_template: '/{agent_name}/{time:yyyy/MM/dd}/{filename}',
+  // IC-BUG-50 / D-034: the default template uses the declared {submit_time}
+  // reserved word (the file's submit-for-upload instant), not the deprecated {time}.
+  dest_path_template: '/{agent_name}/{submit_time:yyyy/MM/dd}/{filename}',
   file_type: '',
   static_tags: [],
   path_tag_map: [],
@@ -144,6 +146,11 @@ function AgentRuleFormPage() {
   const [recursive, setRecursive] = useState(false)
   const [buckets, setBuckets] = useState<Bucket[]>([])
   const [submitting, setSubmitting] = useState(false)
+  // CP contract warnings returned by a successful create/update (IC-BUG-50 /
+  // review E1). When non-empty the form stays mounted so the admin can read
+  // the full hint — the rules list (the usual redirect target) does not
+  // return warnings, so navigating away would lose them entirely.
+  const [saveWarnings, setSaveWarnings] = useState<string[] | null>(null)
 
   // Edit mode: load the rule and prefill both the form initial values and the
   // local state the previews/conditionals depend on.
@@ -284,12 +291,20 @@ function AgentRuleFormPage() {
         // than the backend defaulting a missing value to {}.
         metadata: toRuleMetadata(values),
       }
-      if (isEdit && rid) {
-        await updateRule(agentId, rid, payload)
-        message.success('规则更新成功')
-      } else {
-        await createRule(agentId, payload)
-        message.success('规则创建成功')
+      // Both branches return the same envelope, so the warnings handling below
+      // is deliberately written ONCE: duplicating it per branch left the create
+      // copy unpinned by any test (review round 6).
+      const resp =
+        isEdit && rid
+          ? await updateRule(agentId, rid, payload)
+          : await createRule(agentId, payload)
+      message.success(isEdit && rid ? '规则更新成功' : '规则创建成功')
+      // IC-BUG-50 / review E1: surface the CP contract warnings instead of
+      // discarding them. The save itself succeeded; the hint stays on the form
+      // (closable) rather than vanishing into a toast or a redirect.
+      if (resp.warnings?.length) {
+        setSaveWarnings(resp.warnings)
+        return true
       }
       navigate(`/agents/${agentId}`, { state: { tab: 'rules' } })
       return true
@@ -317,6 +332,8 @@ function AgentRuleFormPage() {
         <Button onClick={() => navigate(`/agents/${agentId}`)}>← 返回</Button>
         <Title level={4} style={{ margin: 0 }}>{isEdit ? '编辑采集规则' : '新建采集规则'}</Title>
       </Space>
+
+      <SaveWarningsAlert warnings={saveWarnings} onClose={() => setSaveWarnings(null)} />
 
       {/*
         NOTE: StepsForm.submitter.render is the ONLY place to customise step
@@ -513,7 +530,7 @@ function AgentRuleFormPage() {
                 <div>
                   <Text code>{'{字段名:LDML格式}'}</Text>
                   <Text type="secondary" style={{ marginLeft: 4, fontSize: 12 }}>
-                    时间字段，例如 {'{'}{`time:yyyy/MM/dd`}{'}'} 、{'{'}{`ts:HH:mm:ss|tz=Asia/Shanghai`}{'}'}
+                    时间字段，例如 {'{'}{`submit_time:yyyy/MM/dd`}{'}'} 、{'{'}{`ts:HH:mm:ss|tz=Asia/Shanghai`}{'}'}
                   </Text>
                 </div>
               </div>
@@ -714,3 +731,41 @@ function AgentRuleFormPage() {
 }
 
 export default AgentRuleFormPage
+
+/**
+ * Readable, dismissible block for the CP's contract warnings returned by a
+ * successful rule create/update (IC-BUG-50 / review E1). Deliberately NOT a
+ * toast: the hints are multi-line prose (deprecation rationale, the exact
+ * invalid timezone, the LDML fix), the admin must be able to read them fully,
+ * and the usual redirect target (the rules list) does not return warnings at
+ * all — so a saved-with-warnings rule keeps the form mounted with this block
+ * above it until the admin dismisses it.
+ */
+export function SaveWarningsAlert({
+  warnings,
+  onClose,
+}: {
+  warnings: string[] | null
+  onClose: () => void
+}) {
+  if (!warnings?.length) return null
+  return (
+    <Alert
+      type="warning"
+      showIcon
+      closable
+      onClose={onClose}
+      message="规则已保存，但控制平面返回了以下提示："
+      description={
+        <ul style={{ margin: '8px 0 0', paddingLeft: 20 }}>
+          {warnings.map((w) => (
+            <li key={w} style={{ wordBreak: 'break-word' }}>
+              {w}
+            </li>
+          ))}
+        </ul>
+      }
+      style={{ marginBottom: 24 }}
+    />
+  )
+}
