@@ -497,7 +497,7 @@ func TestMarkFailed(t *testing.T) {
 	task := newTask("task-fail", "")
 	require.NoError(t, q.Enqueue(task))
 
-	require.NoError(t, q.MarkFailed("task-fail", "connection refused"))
+	require.NoError(t, q.MarkFailed(context.Background(), "task-fail", "connection refused", time.Now()))
 
 	tasks, err := q.ListByStatus(StatusFailed)
 	require.NoError(t, err)
@@ -512,7 +512,7 @@ func TestMarkFailed_IncrementRetryCount(t *testing.T) {
 	require.NoError(t, q.Enqueue(newTask("retry-task", "")))
 
 	for i := 1; i <= 3; i++ {
-		require.NoError(t, q.MarkFailed("retry-task", "err"))
+		require.NoError(t, q.MarkFailed(context.Background(), "retry-task", "err", time.Now()))
 		tasks, err := q.ListByStatus(StatusFailed)
 		require.NoError(t, err)
 		assert.Equal(t, i, tasks[0].RetryCount)
@@ -527,7 +527,7 @@ func TestMarkFailed_IncrementRetryCount(t *testing.T) {
 
 func TestMarkFailed_NotFound(t *testing.T) {
 	q := openMemQueue(t)
-	err := q.MarkFailed("nonexistent", "err")
+	err := q.MarkFailed(context.Background(), "nonexistent", "err", time.Now())
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrTaskNotFound)
 }
@@ -726,7 +726,7 @@ func TestCountActive_ExcludesCompleted(t *testing.T) {
 
 	// One running, one failed, one completed: only pending+running+failed count.
 	require.NoError(t, q.UpdateStatus("a", StatusRunning))
-	require.NoError(t, q.MarkFailed("b", "boom"))
+	require.NoError(t, q.MarkFailed(context.Background(), "b", "boom", time.Now()))
 	require.NoError(t, q.UpdateStatus("c", StatusCompleted))
 
 	n, err := q.CountActive()
@@ -760,7 +760,7 @@ func TestDeleteOldestEvictable_IncludesFailedSkipsRunning(t *testing.T) {
 	require.NoError(t, q.Enqueue(taskAt("running", 100)))
 	require.NoError(t, q.UpdateStatus("running", StatusRunning))
 	require.NoError(t, q.Enqueue(taskAt("failed", 200)))
-	require.NoError(t, q.MarkFailed("failed", "boom"))
+	require.NoError(t, q.MarkFailed(context.Background(), "failed", "boom", time.Now()))
 	require.NoError(t, q.Enqueue(taskAt("pending", 300)))
 
 	dropped, err := q.DeleteOldestEvictable("")
@@ -812,4 +812,134 @@ func TestDeleteOldestEvictable_ExcludedIsOnlyCandidate(t *testing.T) {
 	dropped, err := q.DeleteOldestEvictable("solo")
 	require.NoError(t, err)
 	assert.Nil(t, dropped)
+}
+
+// TestDeleteOldestEvictable_RecordsDurableAbort pins the IC-3 ②/P2 ordering:
+// evicting a task whose multipart upload is in flight must write the durable
+// abort record in the SAME transaction as the delete. The executor's own
+// best-effort record happens only AFTER the row is gone — a crash (or a failed
+// enqueue) in between would lose the upload identity for good, and no ILM
+// rule backstop exists on current MinIO builds.
+func TestDeleteOldestEvictable_RecordsDurableAbort(t *testing.T) {
+	q := openMemQueue(t)
+
+	task := taskAt("old", 100)
+	task.UploadID = "upload-evict-1"
+	task.Bucket = "bkt"
+	task.StoragePath = "obj/key"
+	require.NoError(t, q.Enqueue(task))
+	require.NoError(t, q.MarkFailed(context.Background(), "old", "boom", time.Now()))
+
+	// No abort record beforehand.
+	n, err := q.CountMultipartAborts(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, n)
+
+	dropped, err := q.DeleteOldestEvictable("")
+	require.NoError(t, err)
+	require.NotNil(t, dropped)
+
+	entries, err := q.DueMultipartAborts(context.Background(), time.Now(), 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "evicting a task with a live upload must durably record the abort")
+	assert.Equal(t, "upload-evict-1", entries[0].UploadID)
+	assert.Equal(t, "old", entries[0].TaskID)
+	assert.Equal(t, "bkt", entries[0].Bucket)
+	assert.Equal(t, "obj/key", entries[0].StoragePath)
+	assert.Equal(t, 0, entries[0].Attempts)
+
+	// Evicting a task WITHOUT an upload id must not leave a record behind.
+	require.NoError(t, q.Enqueue(taskAt("plain", 200)))
+	dropped, err = q.DeleteOldestEvictable("")
+	require.NoError(t, err)
+	require.NotNil(t, dropped)
+	entries, err = q.DueMultipartAborts(context.Background(), time.Now(), 10)
+	require.NoError(t, err)
+	assert.Len(t, entries, 1, "no abort record for a task without an upload id")
+}
+
+func TestSaveMultipartProgress_PersistsBothColumns(t *testing.T) {
+	q := openMemQueue(t)
+
+	require.NoError(t, q.Enqueue(taskAt("mp-1", 1)))
+
+	// Simulate per-part progress: initiate then two completed parts, as the
+	// uploader calls it (IC-BUG-5).
+	require.NoError(t, q.SaveMultipartProgress(context.Background(), "mp-1", "upload-abc", "", FileVersion{Mtime: 1, Size: 2}))
+	require.NoError(t, q.SaveMultipartProgress(context.Background(), "mp-1", "upload-abc", `{"parts":[{"PartNumber":1,"ETag":"e1"}]}`, FileVersion{Mtime: 1, Size: 2}))
+
+	tasks, err := q.ListByStatus(StatusPending)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, "upload-abc", tasks[0].UploadID)
+	assert.Contains(t, tasks[0].CompletedParts, "PartNumber")
+
+	// The reset path must keep the resume state so the task can continue
+	// rather than restart (IC-3 / IC-BUG-34 synergy).
+	require.NoError(t, q.UpdateStatus("mp-1", StatusRunning))
+	reset, err := q.ResetRunningToPending(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int64(1), reset)
+	tasks, err = q.ListByStatus(StatusPending)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, "upload-abc", tasks[0].UploadID, "reset must preserve upload_id for resume")
+	assert.NotEmpty(t, tasks[0].CompletedParts, "reset must preserve completed_parts for resume")
+}
+
+func TestSaveMultipartProgress_TaskNotFound(t *testing.T) {
+	q := openMemQueue(t)
+
+	err := q.SaveMultipartProgress(context.Background(), "missing", "upload-abc", "", FileVersion{})
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrTaskNotFound))
+}
+
+func TestSaveMultipartProgress_DatabaseError(t *testing.T) {
+	q := openMemQueue(t)
+
+	require.NoError(t, q.Close())
+	err := q.SaveMultipartProgress(context.Background(), "mp-err", "upload-abc", "", FileVersion{})
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, ErrTaskNotFound), "a closed DB is a real failure, not eviction")
+}
+
+// A failed DELETE inside the eviction transaction must roll the abort record
+// back together with the delete: a committed record for a task that still
+// exists would make the abort worker race the live task.
+func TestDeleteOldestEvictable_FailedDeleteRollsBackAbortRecord(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "queue.db")
+	q, err := Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = q.Close() })
+
+	task := taskAt("old", 100)
+	task.UploadID = "upload-rollback-1"
+	require.NoError(t, q.Enqueue(task))
+	require.NoError(t, q.MarkFailed(context.Background(), "old", "boom", time.Now()))
+	require.NoError(t, q.Enqueue(taskAt("new", 200)))
+
+	db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_busy_timeout=5000")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	_, err = db.Exec(`CREATE TRIGGER no_evict BEFORE DELETE ON upload_tasks BEGIN SELECT RAISE(ABORT, 'injected failure'); END;`)
+	require.NoError(t, err)
+
+	_, err = q.DeleteOldestEvictable("")
+	require.Error(t, err, "the injected DELETE failure must surface")
+
+	n, err := q.CountMultipartAborts(context.Background())
+	require.NoError(t, err)
+	assert.Zero(t, n, "the rolled-back transaction must not leave an abort record behind")
+	remaining, err := q.ListByStatus(StatusFailed)
+	require.NoError(t, err)
+	assert.Len(t, remaining, 1, "the evicted task must survive the failed eviction")
+}
+
+// MarkFailed on a broken database must surface the error.
+func TestMarkFailed_DatabaseError(t *testing.T) {
+	q := openMemQueue(t)
+	require.NoError(t, q.Enqueue(taskAt("t", 1)))
+	require.NoError(t, q.Close())
+	require.Error(t, q.MarkFailed(context.Background(), "t", "err", time.Now().Add(time.Minute)))
 }

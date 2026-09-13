@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync/atomic"
@@ -183,7 +184,7 @@ func TestExecutor_RetryCancelledByStop(t *testing.T) {
 	running, err := q.DequeuePending(1)
 	require.NoError(t, err)
 	require.Len(t, running, 1)
-	e.handleFailure(running[0], fmt.Errorf("boom"))
+	e.handleFailure(context.Background(), running[0], fmt.Errorf("boom"))
 
 	stopDone := make(chan struct{})
 	go func() { e.Stop(); close(stopDone) }()
@@ -214,7 +215,7 @@ func TestExecutor_RequeueFailureAfterCloseWarns(t *testing.T) {
 	running, err := q.DequeuePending(1)
 	require.NoError(t, err)
 	require.Len(t, running, 1)
-	e.handleFailure(running[0], fmt.Errorf("boom"))
+	e.handleFailure(context.Background(), running[0], fmt.Errorf("boom"))
 
 	require.NoError(t, q.Close()) // DB goes away before the retry wakes
 
@@ -438,4 +439,344 @@ func TestExecutor_TerminalUploadError_NoRetry(t *testing.T) {
 		reports, err := q.ListByStatus(queue.StatusReported)
 		return err == nil && len(reports) == 1
 	}, 2*time.Second, 20*time.Millisecond, "terminal failure must produce a success=false report")
+}
+
+// A failure to record the durable abort intent must be surfaced loudly: that
+// record is the only retryable identity left once the task row is gone or
+// final, and silently losing it would manufacture the orphan the whole IC-3
+// mechanism exists to prevent. The direct abort attempt must still run.
+func TestExecutor_AbortRecordWriteFailureWarns(t *testing.T) {
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	e := New(1, q, successUploader, zap.New(core), 0)
+
+	task := abandonTask(t, q)
+	task.RetryCount = maxRetries - 1
+
+	// Only the outbox INSERT fails: the atomic give-up marking (sentinel +
+	// abort record, R2) fails with it, so the task is NOT abandoned and stays
+	// recoverable with its upload identity intact.
+	failStatement(t, dsn, "no_abort_record", "INSERT", "multipart_abort_outbox")
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return nil
+	}))
+
+	e.handleFailure(context.Background(), task, fmt.Errorf("boom"))
+
+	assert.NotZero(t, logs.FilterMessage("executor: record give-up abandonment failed, keeping the task retryable").Len(),
+		"the failed atomic give-up must surface loudly")
+	// B: the fallback lands the row back in `failed` WITH a persisted
+	// schedule — schedulable by this process, not stalled as running.
+	failed, err := q.ListByStatus(queue.StatusFailed)
+	require.NoError(t, err)
+	require.Len(t, failed, 1, "the task stays recoverable via the backoff path")
+	assert.NotZero(t, failed[0].NextRetryAt, "the fallback must carry a persisted retry schedule")
+	assert.Equal(t, "upload-live-1", failed[0].UploadID,
+		"the upload identity survives for the retry to resume or abort it")
+	n, err := q.CountMultipartAborts(context.Background())
+	require.NoError(t, err)
+	assert.Zero(t, n, "no half-written abort record may exist without the sentinel")
+}
+
+// A broken database must not stop the abort worker: the listing failure is
+// warned and retried on the next tick, never fatal. (The same Start also
+// exercises recoverFailedTasks' own error branch.)
+func TestExecutor_AbortWorkerSurvivesDatabaseError(t *testing.T) {
+	q := newTestQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	e := New(1, q, successUploader, zap.New(core), 0)
+	e.abortPoll = 20 * time.Millisecond
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return nil
+	}))
+
+	require.NoError(t, q.Close())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	e.Start(ctx)
+	e.Stop()
+
+	assert.NotZero(t, logs.FilterMessage("executor: list due multipart aborts").Len())
+	assert.NotZero(t, logs.FilterMessage("executor: recover failed tasks").Len(),
+		"recoverFailedTasks must surface its listing failure")
+}
+
+// When the failed abort attempt cannot be recorded as failed (timer UPDATE
+// broken), the record keeps its old schedule — surfaced as a warning, never
+// silently dropped.
+func TestExecutor_AbortRetryTimerFailureWarns(t *testing.T) {
+	ctx := context.Background()
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	e := New(1, q, successUploader, zap.New(core), 0)
+	e.abortPoll = 20 * time.Millisecond
+
+	require.NoError(t, q.EnqueueMultipartAbort(ctx, &queue.AbortOutboxEntry{
+		UploadID: "upload-timer-1", TaskID: "task-1", Bucket: "b", StoragePath: "k",
+	}))
+	// Installed after the record exists, so the listing SELECT still sees it
+	// and only the attempt-recording UPDATE fails.
+	failStatement(t, dsn, "no_abort_timer", "UPDATE", "multipart_abort_outbox")
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return errors.New("minio unreachable")
+	}))
+
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	e.Start(sctx)
+
+	require.Eventually(t, func() bool {
+		return logs.FilterMessage("executor: record abort retry timer").Len() >= 1
+	}, 3*time.Second, 20*time.Millisecond)
+	e.Stop()
+}
+
+// A successful abort whose record removal fails leaves the record behind —
+// the next drain aborts again (harmless NoSuchUpload) — but the failure must
+// be visible.
+func TestExecutor_AbortRecordDeleteFailureWarns(t *testing.T) {
+	ctx := context.Background()
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	var calls atomic.Int32
+	e := New(1, q, successUploader, zap.New(core), 0)
+	e.abortPoll = 20 * time.Millisecond
+	e.abortTimeout = time.Second
+
+	require.NoError(t, q.EnqueueMultipartAbort(ctx, &queue.AbortOutboxEntry{
+		UploadID: "upload-del-1", TaskID: "task-1", Bucket: "b", StoragePath: "k",
+	}))
+	failStatement(t, dsn, "no_abort_delete", "DELETE", "multipart_abort_outbox")
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		calls.Add(1)
+		return nil
+	}))
+
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	e.Start(sctx)
+
+	require.Eventually(t, func() bool { return calls.Load() >= 1 }, 3*time.Second, 20*time.Millisecond)
+	assert.NotZero(t, logs.FilterMessage("executor: remove durable abort record after successful abort").Len())
+	e.Stop()
+}
+
+// If a recovered task's row is evicted between listing it and its scheduled
+// flip, the flip hits ErrTaskNotFound — an expected outcome that must stay
+// benign (no warning), exactly like the in-memory retry's eviction case.
+func TestExecutor_RecoveredRequeueOfEvictedTaskLogsNoWarning(t *testing.T) {
+	q := newTestQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	e := New(1, q, successUploader, zap.New(core), 0)
+	e.abortPoll = time.Hour
+
+	task := abandonTask(t, q)
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now().Add(300*time.Millisecond)))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	e.Start(ctx)
+
+	// Evict the failed row while recovery's timer is pending.
+	dropped, err := q.DeleteOldestEvictable("")
+	require.NoError(t, err)
+	require.NotNil(t, dropped)
+
+	time.Sleep(500 * time.Millisecond)
+	assert.Zero(t, logs.FilterMessage("executor: re-queue recovered task").Len(),
+		"an evicted row must not surface as a failed recovery")
+	e.Stop()
+}
+// R2: marking a task abandoned (never-retry sentinel) and recording its abort
+// intent must be ONE transaction. With the record written separately AFTER the
+// marking, a crash (or a failed record write) in between leaves a
+// failed-with-sentinel row whose upload ID nobody can ever retry — the exact
+// orphan this knife exists to kill. Same ordering rule as the uploader's first
+// persist (P1-c): make the state trackable BEFORE acting on it.
+func TestExecutor_AbandonStateAndAbortRecordAreAtomic(t *testing.T) {
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	var aborted atomic.Int32
+	e := New(1, q, successUploader, zap.New(core), 0)
+
+	task := abandonTask(t, q)
+
+	// Only the outbox INSERT fails: the terminal marking must fail with it,
+	// leaving the task in a recoverable state instead of abandoned-without-
+	// record. (The direct abort must NOT proceed either — abandoning in
+	// memory while the durable intent failed is the bug.)
+	failStatement(t, dsn, "no_abort_record", "INSERT", "multipart_abort_outbox")
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		aborted.Add(1)
+		return nil
+	}))
+
+	e.handleFailure(context.Background(), task, fmt.Errorf("%w: denied", ErrTerminalUpload))
+
+	assert.Zero(t, aborted.Load(),
+		"a task whose abort intent could not be made durable must not be abandoned")
+	// B: the fallback puts the row back into `failed` with a persisted
+	// schedule — schedulable by the CURRENT process (production flow:
+	// failed → pending → running → failed, never a stalled running row).
+	failed, err := q.ListByStatus(queue.StatusFailed)
+	require.NoError(t, err)
+	require.Len(t, failed, 1, "the task stays recoverable via the backoff path")
+	assert.NotZero(t, failed[0].NextRetryAt)
+	assert.Equal(t, "upload-live-1", failed[0].UploadID,
+		"the upload identity must survive for the retry to resume or abort it")
+	assert.NotZero(t, logs.FilterMessage("executor: record terminal abandonment failed, keeping the task retryable").Len(),
+		"the failed atomic marking must surface loudly")
+}
+
+// The same invariant, happy path with a failing abort (MinIO unreachable):
+// a terminal failure must leave BOTH the never-retry sentinel and a durable
+// abort record behind — the record is what the abort worker retries.
+func TestExecutor_TerminalFailureLeavesAbortRecord(t *testing.T) {
+	ctx := context.Background()
+	q := newTestQueue(t)
+	e := New(1, q, successUploader, zap.NewNop(), 0)
+	e.abortPoll = time.Hour
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return errors.New("minio unreachable")
+	}))
+
+	task := abandonTask(t, q)
+	e.handleFailure(ctx, task, fmt.Errorf("%w: denied", ErrTerminalUpload))
+
+	entries, err := q.DueMultipartAborts(ctx, time.Now(), 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "terminal failure must leave a durable abort record")
+	assert.Equal(t, "upload-live-1", entries[0].UploadID)
+}
+
+// B: the dedup-completed transition and its abort record must follow the same
+// order law as the terminal path (R2): the durable abort intent must be part
+// of the completion transition itself, not a best-effort write after it. With
+// the old split (abort hook first, UpdateStatus completed after) a crash in
+// between could leave a permanently-completed row whose upload identity was
+// never durably recorded — or an intent without its terminal state.
+func TestExecutor_DedupCompleteAndAbortRecordAreAtomic(t *testing.T) {
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+	var aborted atomic.Int32
+
+	// Task A failed mid-multipart and awaits its backoff retry (failed, with
+	// a live upload ID); task B already completed the same file version, so
+	// A's retry hits the dedup shortcut.
+	task := abandonTask(t, q)
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now().Add(time.Minute)))
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
+		FileSize: task.FileSize, FileMtime: task.FileMtime, UploadedAt: time.Now().Unix(),
+	}))
+
+	// Only the outbox INSERT fails: the completion transition must fail with
+	// it, leaving the task recoverable instead of completed-without-record.
+	failStatement(t, dsn, "no_abort_record", "INSERT", "multipart_abort_outbox")
+	e := New(1, q, successUploader, zap.New(core), 0)
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		aborted.Add(1)
+		return nil
+	}))
+
+	e.processTask(context.Background(), task)
+
+	assert.Zero(t, aborted.Load(),
+		"the upload must not be abandoned while its abort intent could not be made durable")
+	// B: the fallback lands the row back in `failed` with a schedule.
+	failed, err := q.ListByStatus(queue.StatusFailed)
+	require.NoError(t, err)
+	assert.Len(t, failed, 1, "the task stays recoverable; the retry redoes the dedup completion")
+	assert.NotZero(t, failed[0].NextRetryAt)
+	completed, err := q.ListByStatus(queue.StatusCompleted)
+	require.NoError(t, err)
+	assert.Empty(t, completed)
+	assert.NotZero(t, logs.FilterMessage("executor: record dedup completion with abort failed, keeping the task retryable").Len(),
+		"the failed atomic completion must surface loudly")
+}
+
+// The same invariant, happy path with a failing abort (MinIO unreachable):
+// dedup-completion must leave BOTH the completed status and a durable abort
+// record behind.
+func TestExecutor_DedupCompleteLeavesAbortRecord(t *testing.T) {
+	ctx := context.Background()
+	q := newTestQueue(t)
+	e := New(1, q, successUploader, zap.NewNop(), 0)
+	e.abortPoll = time.Hour
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return errors.New("minio unreachable")
+	}))
+
+	task := abandonTask(t, q)
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
+		FileSize: task.FileSize, FileMtime: task.FileMtime, UploadedAt: time.Now().Unix(),
+	}))
+	e.processTask(ctx, task)
+
+	entries, err := q.DueMultipartAborts(ctx, time.Now(), 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "dedup-completion must leave a durable abort record")
+	assert.Equal(t, "upload-live-1", entries[0].UploadID)
+	completed, err := q.ListByStatus(queue.StatusCompleted)
+	require.NoError(t, err)
+	assert.Len(t, completed, 1)
+}
+
+// B: the fallback after a failed atomic abandonment must keep the task
+// schedulable by THIS process. In production the row is RUNNING when the
+// marking fails (the retry flowed failed → pending → running), so a fallback
+// that merely returns would stall the row until the next restart's
+// ResetRunningToPending. The test reproduces the production state flow and
+// requires the task to be completed by the SAME process once the injection
+// is removed.
+func TestExecutor_DedupCompletionFallbackRequeuesInProcess(t *testing.T) {
+	q, dsn := newFileQueue(t)
+	core, logs := observer.New(zapcore.InfoLevel)
+
+	task := abandonTask(t, q) // running
+	// Production flow: the task failed on attempt 1 (failed + schedule), the
+	// retry requeued it (pending → running), and the dedup shortcut hits.
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now()))
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
+		FileSize: task.FileSize, FileMtime: task.FileMtime, UploadedAt: time.Now().Unix(),
+	}))
+
+	failStatement(t, dsn, "no_abort_record", "INSERT", "multipart_abort_outbox")
+	e := New(1, q, successUploader, zap.New(core), 0)
+	e.retryDelays = []time.Duration{50 * time.Millisecond}
+	e.abortPoll = time.Hour
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return nil
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	e.Start(ctx)
+
+	// The injected marking failure must be visible and the task must cycle
+	// back through the queue (not stall as a running row).
+	require.Eventually(t, func() bool {
+		return logs.FilterMessage("executor: record dedup completion with abort failed, keeping the task retryable").Len() >= 1
+	}, 5*time.Second, 20*time.Millisecond, "the failed atomic marking must surface")
+	failed, err := q.ListByStatus(queue.StatusFailed)
+	require.NoError(t, err)
+	require.Len(t, failed, 1,
+		"the row must land back in failed with a retry schedule, schedulable by this process")
+	assert.NotZero(t, failed[0].NextRetryAt, "the fallback must arm a persisted retry schedule")
+
+	// Injection removed: the same process must redo the completion and finish.
+	db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_busy_timeout=5000")
+	require.NoError(t, err)
+	_, err = db.Exec(`DROP TRIGGER no_abort_record`)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	require.Eventually(t, func() bool {
+		completed, err := q.ListByStatus(queue.StatusCompleted)
+		return err == nil && len(completed) == 1
+	}, 5*time.Second, 20*time.Millisecond,
+		"the task must be completed by the CURRENT process, not only after a restart")
+	e.Stop()
 }

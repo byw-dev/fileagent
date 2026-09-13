@@ -5,6 +5,8 @@
 # It uses `mc` (MinIO Client) to:
 #   1. Create the required buckets (data-sensor, tmp-uploads)
 #   2. Set a 7-day lifecycle expiry on tmp-uploads
+#   2b. Set a 7-day abort-incomplete-multipart lifecycle on data-sensor
+#       (backstop for multipart uploads orphaned by dead processes — IC-3 ③)
 #   3. Create the controlplane-admin IAM user and least-privilege policy
 #   4. Configure the webhook event notification target
 #   5. Subscribe data-sensor bucket to the webhook target
@@ -161,6 +163,7 @@ echo "==> Setting ${LIFECYCLE_DAYS}-day lifecycle on ${BUCKET_TMP}"
 
 # Build the lifecycle JSON in a temp file so we can pipe it to mc.
 LIFECYCLE_JSON=$(mktemp /tmp/fileagent-lifecycle-XXXXXX.json)
+ABORT_JSON=$(mktemp /tmp/fileagent-abort-XXXXXX.json)
 CP_POLICY_JSON=$(mktemp /tmp/fileagent-cp-policy-XXXXXX.json)
 PRESIGNED_BODY=$(mktemp /tmp/fileagent-presigned-body-XXXXXX.txt)
 CHECK_OBJECT=""
@@ -177,7 +180,7 @@ cleanup() {
   if [ -n "${CP_CHECK_ALIAS}" ]; then
     mc alias remove "${CP_CHECK_ALIAS}" >/dev/null 2>&1 || true
   fi
-  rm -f "${LIFECYCLE_JSON}" "${CP_POLICY_JSON}" "${PRESIGNED_BODY}"
+  rm -f "${LIFECYCLE_JSON}" "${CP_POLICY_JSON}" "${PRESIGNED_BODY}" "${ABORT_JSON}"
 }
 trap cleanup EXIT
 
@@ -195,6 +198,79 @@ EOF
 
 # Current mc releases accept lifecycle imports as JSON.
 mc ilm import "${MINIO_ALIAS}/${BUCKET_TMP}" <"${LIFECYCLE_JSON}"
+
+# ---------------------------------------------------------------------------
+# 3b. Abort-incomplete-multipart lifecycle on the data bucket (IC-3 ③)
+#
+# A backstop, not a replacement for the agent's explicit AbortMultipartUpload
+# on task abandonment (executor abandon hook): it covers uploads orphaned by a
+# process that died before it could abort — a crashed agent that never comes
+# back would otherwise leak uploaded parts without bound.
+#
+# ⚠️ KNOWN UPSTREAM LIMITATION (live-verified 2026-09-11, MinIO
+# RELEASE.2025-09-07T16-13-09Z): current MinIO releases do not implement the
+# AbortIncompleteMultipartUpload action at all. The Rule struct has no field
+# for it (commented out with a FIXME in internal/bucket/lifecycle/rule.go,
+# present from the 2021 lifecycle restructure through the final 2025-10-15
+# release; the repository was archived in 2026-04). Consequences, both
+# reproduced live:
+#   - an abort-only rule is rejected with InvalidArgument (HTTP 400), and
+#   - alongside a recognized action it is silently stripped.
+# We still write the rule so environments whose MinIO implements the action
+# get the backstop, and — because a rule that is silently dropped is worse
+# than no rule — we always read back the EFFECTIVE configuration from the
+# server and say loudly when it is missing. Do not weaken that check.
+# ---------------------------------------------------------------------------
+echo "==> Setting ${LIFECYCLE_DAYS}-day abort-incomplete-multipart rule on ${BUCKET_DATA}"
+
+cat >"${ABORT_JSON}" <<EOF
+{
+  "Rules": [
+    {
+      "ID": "abort-incomplete-multipart-data-sensor",
+      "Status": "Enabled",
+      "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": ${LIFECYCLE_DAYS}}
+    }
+  ]
+}
+EOF
+
+# The import may fail on servers whose lifecycle schema does not recognise the
+# action (all current releases). Bootstrap must not die over a best-effort
+# backstop, so a failure degrades to a loud warning, never a silent pass.
+if ! mc ilm import "${MINIO_ALIAS}/${BUCKET_DATA}" <"${ABORT_JSON}"; then
+  echo "WARNING: could not import the abort-incomplete-multipart lifecycle rule" >&2
+  echo "         on '${BUCKET_DATA}'. This MinIO release does not implement the" >&2
+  echo "         AbortIncompleteMultipartUpload action (upstream FIXME in" >&2
+  echo "         internal/bucket/lifecycle/rule.go). Orphaned multipart uploads of" >&2
+  echo "         agents that die before they can abort are NOT space-bounded on" >&2
+  echo "         this server; only the agent's explicit AbortMultipartUpload is." >&2
+  ABORT_RULE_EFFECTIVE="no"
+else
+  ABORT_RULE_EFFECTIVE="unknown"
+fi
+
+if [ "${ABORT_RULE_EFFECTIVE}" != "no" ]; then
+  # Read back the effective value from the server (never trust script text):
+  # the server may accept the import and silently drop the unsupported action.
+  ILM_JSON=$(mc ilm rule list "${MINIO_ALIAS}/${BUCKET_DATA}" --json)
+  case "${ILM_JSON}" in
+    *AbortIncompleteMultipartUpload*)
+      echo "    Verified: server returned the AbortIncompleteMultipartUpload rule (${LIFECYCLE_DAYS} days after initiation)"
+      ABORT_RULE_EFFECTIVE="yes"
+      ;;
+    *)
+      echo "WARNING: the lifecycle import was accepted, but reading back the effective" >&2
+      echo "         configuration from the server shows the AbortIncompleteMultipartUpload" >&2
+      echo "         action was silently stripped — same upstream limitation (FIXME in" >&2
+      echo "         MinIO internal/bucket/lifecycle/rule.go; repository archived 2026-04)." >&2
+      echo "         Orphaned multipart uploads of agents that die mid-upload are NOT" >&2
+      echo "         space-bounded on this MinIO release; the agent-side abort of" >&2
+      echo "         abandoned tasks is the only active cleanup." >&2
+      ABORT_RULE_EFFECTIVE="no"
+      ;;
+  esac
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Create/update the controlplane-admin IAM user and policy (idempotent)
@@ -410,6 +486,11 @@ echo ""
 echo "MinIO initialisation complete."
 echo "  Buckets   : ${BUCKET_DATA}, ${BUCKET_TMP}"
 echo "  Lifecycle : ${BUCKET_TMP} objects expire after ${LIFECYCLE_DAYS} days"
+if [ "${ABORT_RULE_EFFECTIVE}" = "yes" ]; then
+  echo "  Lifecycle : ${BUCKET_DATA} incomplete multipart uploads abort after ${LIFECYCLE_DAYS} days"
+else
+  echo "  Lifecycle : ${BUCKET_DATA} abort-incomplete-multipart rule NOT effective on this MinIO release (see warning above)"
+fi
 echo "  IAM user  : ${CP_ADMIN_ACCESS_KEY}"
 echo "  IAM policy: ${CP_POLICY_NAME}"
 echo "  Webhook   : ${WEBHOOK_TARGET_NAME} -> ${WEBHOOK_ENDPOINT}"

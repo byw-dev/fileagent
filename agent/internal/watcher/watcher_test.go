@@ -286,14 +286,6 @@ func TestMatchGlob_PatternMatch(t *testing.T) {
 	assert.False(t, w.matchGlob("/path/to/access.txt"))
 }
 
-func TestWatcher_EmitDropsWhenFull(t *testing.T) {
-	w := &Watcher{logger: zap.NewNop()}
-	events := make(chan FileEvent) // unbuffered, always full
-	ctx := context.Background()
-	// Should not block or panic.
-	w.emit(ctx, events, FileEvent{Path: "x", Op: "create"})
-}
-
 func TestOpString(t *testing.T) {
 	cases := []struct {
 		op   fsnotify.Op

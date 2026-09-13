@@ -64,7 +64,7 @@ func TestReportFailureDoesNotMarkProcessed(t *testing.T) {
 	require.ErrorIs(t, q.SaveReport(ctx, "missing", []byte("x")), ErrTaskNotFound)
 	task := &UploadTask{ID: "failed", RuleID: "rule", LocalPath: "file"}
 	require.NoError(t, q.Enqueue(task))
-	require.NoError(t, q.MarkFailed(task.ID, "failure"))
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "failure", time.Now()))
 	require.NoError(t, q.SaveReport(ctx, task.ID, []byte("failure")))
 	require.NoError(t, q.CompleteReported(ctx, task.ID, false, ""))
 	processed, err := q.IsProcessed(ctx, "rule", "file", task.FileMtime, task.FileSize)

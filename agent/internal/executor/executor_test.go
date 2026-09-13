@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"sync/atomic"
@@ -109,6 +111,173 @@ func TestExecutor_Dedup(t *testing.T) {
 	e.Stop()
 }
 
+// TestExecutor_FailedBackoffRecoveredAfterRestart pins the P1-d fix: the
+// failed-state backoff must not live only in a memory goroutine. A process
+// that exits during the backoff window used to leave the task `failed`
+// forever — its in-flight multipart upload neither resumed nor aborted, while
+// a new task for the same file version could enqueue over it. After a
+// "restart" (fresh executor over the same queue), the task must be re-queued
+// and RESUMED — not aborted.
+func TestExecutor_FailedBackoffRecoveredAfterRestart(t *testing.T) {
+	q := newTestQueue(t)
+	rec := &abandonRecorder{}
+
+	// Attempt 1: task fails while its multipart upload is in flight; the
+	// backoff retry is scheduled in memory.
+	task := abandonTask(t, q) // running, upload-live-1
+	e1 := New(1, q, failUploader, zap.NewNop(), 0)
+	e1.retryDelays = []time.Duration{50 * time.Millisecond}
+	require.NoError(t, e1.ConfigureAbandon(rec.abandon))
+	e1.handleFailure(context.Background(), task, fmt.Errorf("boom"))
+	// "Process exit": the sleeping in-memory retry goroutine dies with it.
+	e1.Stop()
+
+	// Fresh process over the same SQLite queue.
+	var uploads atomic.Int32
+	e2 := New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		uploads.Add(1)
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
+	}, zap.NewNop(), 0)
+	require.NoError(t, e2.ConfigureAbandon(rec.abandon))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	e2.Start(ctx)
+
+	require.Eventually(t, func() bool { return uploads.Load() >= 1 },
+		3*time.Second, 20*time.Millisecond,
+		"after a restart the failed task must be recovered into the queue and re-attempted")
+	assert.Zero(t, rec.calls.Load(),
+		"recovery resumes the task's upload — it must not abort it")
+	e2.Stop()
+
+	// The upload ID must have survived for the resume: the stub uploader
+	// completes the attempt, the result is persisted (reported, awaiting CP
+	// ack), and the row still carries the original upload id.
+	rows, err := q.ListByStatus(queue.StatusReported)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "upload-live-1", rows[0].UploadID,
+		"recovery must not clear the persisted upload id; the retry resumes it")
+}
+
+// A failed task whose persisted retry schedule is still in the future must
+// stay failed until due — recovery must not re-queue it early — and then be
+// flipped exactly once the schedule passes.
+func TestExecutor_RecoveryHonoursPersistedRetrySchedule(t *testing.T) {
+	q := newTestQueue(t)
+	task := abandonTask(t, q) // running, upload-live-1
+	// next_retry_at persists at second granularity; use a clearly-future
+	// schedule so the window cannot truncate away.
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now().Add(2*time.Second)))
+
+	e := New(1, q, successUploader, zap.NewNop(), 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	e.Start(ctx)
+
+	// Still within the backoff window: must remain failed.
+	time.Sleep(300 * time.Millisecond)
+	failed, err := q.ListByStatus(queue.StatusFailed)
+	require.NoError(t, err)
+	require.Len(t, failed, 1, "a task inside its persisted backoff window must not be re-queued early")
+
+	// Once the schedule passes, recovery's armed timer flips it — the pending
+	// window may be brief (a worker dequeues immediately), so accept any
+	// post-failed state.
+	require.Eventually(t, func() bool {
+		for _, st := range []string{queue.StatusPending, queue.StatusRunning, queue.StatusReported, queue.StatusCompleted} {
+			rows, err := q.ListByStatus(st)
+			if err == nil && len(rows) > 0 {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond, "the persisted schedule must be honoured and then fire")
+	e.Stop()
+}
+
+// A task abandoned before the restart (retry budget exhausted or terminal
+// failure — stamped with the never-retry sentinel) must never be resurrected
+// by startup recovery: re-running it would loop forever on a verdict that will
+// not change, and its upload was already aborted at abandonment time.
+func TestExecutor_RecoveryNeverResurrectsAbandonedTasks(t *testing.T) {
+	q := newTestQueue(t)
+	task := abandonTask(t, q)
+	// An abandoned task carries the never-retry sentinel, stamped by
+	// handleFailure's give-up/terminal branches (persistResult then flips it
+	// to reported; here we keep it in failed to test the sentinel itself).
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "permanent failure", time.Time{}))
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
+		FileSize: task.FileSize, FileMtime: task.FileMtime, UploadedAt: time.Now().Unix(),
+	}))
+
+	// "Restart".
+	var uploads atomic.Int32
+	e2 := New(1, q, func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+		uploads.Add(1)
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
+	}, zap.NewNop(), 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	e2.Start(ctx)
+
+	assert.Never(t, func() bool { return uploads.Load() > 0 },
+		600*time.Millisecond, 50*time.Millisecond,
+		"an abandoned task must not be resurrected by startup recovery")
+	failed, err := q.ListByStatus(queue.StatusFailed)
+	require.NoError(t, err)
+	assert.Len(t, failed, 1, "the abandoned task stays failed")
+	e2.Stop()
+}
+
+// R1: a legacy row written before the retry schedule was persisted
+// (next_retry_at = 0, the ALTER TABLE default) is UNDECIDABLE — it can be a
+// task abandoned on a terminal verdict by an older build (low retry count, so
+// the retry-count guard does not catch it) just as well as one awaiting
+// backoff. Recovery must treat it conservatively: NOT resurrect it (re-running
+// an abandoned upload would be wrong), and durably record an abort intent for
+// its in-flight upload so it cannot leak either.
+func TestExecutor_RecoveryTreatsLegacyFailedRowsAsAbandoned(t *testing.T) {
+	q, dsn := newFileQueue(t)
+
+	task := abandonTask(t, q) // running, upload-live-1
+	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now().Add(time.Minute)))
+	// Rewrite the row into the exact shape an older build left behind:
+	// failed, no persisted schedule, LOW retry count.
+	db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_busy_timeout=5000")
+	require.NoError(t, err)
+	_, err = db.Exec(`UPDATE upload_tasks SET next_retry_at=0, retry_count=1 WHERE id=?`, task.ID)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// "Restart" with a failing abort hook (MinIO unreachable) so the abort
+	// intent stays visible in the outbox instead of being drained away.
+	e := New(1, q, successUploader, zap.NewNop(), 0)
+	e.abortPoll = 20 * time.Millisecond
+	e.retryDelays = []time.Duration{time.Hour}
+	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, _ *queue.UploadTask) error {
+		return errors.New("minio unreachable")
+	}))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	e.Start(ctx)
+
+	assert.Never(t, func() bool {
+		failed, err := q.ListByStatus(queue.StatusFailed)
+		return err == nil && len(failed) == 0
+	}, 600*time.Millisecond, 50*time.Millisecond,
+		"a legacy failed row must never leave failed: it may be an abandoned task")
+	failed, err := q.ListByStatus(queue.StatusFailed)
+	require.NoError(t, err)
+	require.Len(t, failed, 1, "the legacy row stays failed (re-collection goes through the scan)")
+	entries, err := q.DueMultipartAborts(context.Background(), time.Now().Add(time.Hour), 10)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the legacy row's in-flight upload must get a durable abort intent")
+	assert.Equal(t, "upload-live-1", entries[0].UploadID)
+	e.Stop()
+}
+
 func TestExecutor_RetryDelay(t *testing.T) {
 	e := New(1, nil, nil, zap.NewNop(), 0)
 	assert.Equal(t, 1*time.Minute, e.retryDelay(1))
@@ -136,7 +305,7 @@ func TestExecutor_GivenUpAfterMaxRetries(t *testing.T) {
 	var requeued atomic.Bool
 	e := New(1, q, failUploader, zap.NewNop(), 0)
 	// Directly call handleFailure — at maxRetries, it should not re-queue.
-	e.handleFailure(runningTask, fmt.Errorf("permanent error"))
+	e.handleFailure(context.Background(), runningTask, fmt.Errorf("permanent error"))
 
 	time.Sleep(100 * time.Millisecond)
 	// Task should remain failed and not be re-queued.
@@ -388,7 +557,7 @@ func TestExecutor_RetryOfEvictedTaskLogsNoWarning(t *testing.T) {
 	// Enqueue a task, then drive it through a failure so a retry is scheduled.
 	task := newTask("r1", "/f1")
 	require.NoError(t, q.Enqueue(task))
-	e.handleFailure(task, fmt.Errorf("boom"))
+	e.handleFailure(context.Background(), task, fmt.Errorf("boom"))
 
 	// Evict the (now failed) task before the retry goroutine wakes.
 	dropped, err := q.DeleteOldestEvictable("")

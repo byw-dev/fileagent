@@ -4,7 +4,7 @@
  * - Create mode does not fetch and shows the create title.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { App } from 'antd'
 
@@ -41,7 +41,7 @@ const existingRule = {
   bucket_id: 'b-1',
   dest_path_template: 'out/{filename}',
   recursive: true,
-  append_mode: 'tail',
+  append_mode: 'overwrite',
   enabled: true,
   created_at: '2026-05-01T00:00:00Z',
 }
@@ -76,5 +76,36 @@ describe('AgentRuleFormPage edit mode', () => {
     renderAt(`/agents/${AGENT_ID}/rules/create`)
     expect(await screen.findByText('新建采集规则')).toBeInTheDocument()
     expect(mockListRules).not.toHaveBeenCalled()
+  })
+
+  // IC-BUG-46 fail-closed: the tail option must be selectable-by-sight only —
+  // selecting it would always end in a CP 422, so the UI disables it and
+  // states why instead of silently removing it.
+  it('disables the tail append-mode option and states the reason', async () => {
+    mockListRules.mockResolvedValue({ items: [existingRule] })
+    renderAt(`/agents/${AGENT_ID}/rules/${RULE_ID}/edit`)
+
+    expect(await screen.findByText('编辑采集规则')).toBeInTheDocument()
+
+    // Append mode lives in step 2; advance past step 1.
+    fireEvent.click(screen.getByRole('button', { name: '下一步' }))
+    await waitFor(() => expect(screen.getByLabelText('上传模式')).toBeInTheDocument())
+
+    // Open the append-mode dropdown (antd opens on mousedown on the selector).
+    const select = document.querySelector('#step2_append_mode')?.closest('.ant-select')
+    expect(select).not.toBeNull()
+    fireEvent.mouseDown(select!.querySelector('.ant-select-selector')!)
+
+    // The tail option is rendered but disabled, with a readable reason.
+    const tailOption = await screen.findByText(
+      (content, el) =>
+        el?.classList.contains('ant-select-item-option-content') === true &&
+        content.startsWith('tail（追加尾部）'),
+    )
+    const optionItem = tailOption.closest('.ant-select-item-option')
+    expect(optionItem).not.toBeNull()
+    expect(optionItem?.className).toContain('ant-select-item-option-disabled')
+    expect(optionItem?.getAttribute('aria-selected')).toBe('false')
+    expect(tailOption.textContent).toContain('已停用')
   })
 })

@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -71,6 +72,9 @@ type ObjectStore interface {
 	ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumber, maxParts int) (minio.ListObjectPartsResult, error)
 	// CompleteMultipartUpload finalises a multipart upload.
 	CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, parts []minio.CompletePart, opts minio.PutObjectOptions) (minio.UploadInfo, error)
+	// AbortMultipartUpload discards an unfinished multipart upload and all its
+	// uploaded parts.
+	AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) error
 }
 
 // minioAdapter wraps *minio.Core to satisfy the ObjectStore interface.
@@ -97,6 +101,10 @@ func (a *minioAdapter) ListObjectParts(ctx context.Context, bucket, object, uplo
 
 func (a *minioAdapter) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, parts []minio.CompletePart, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
 	return a.c.CompleteMultipartUpload(ctx, bucket, object, uploadID, parts, opts)
+}
+
+func (a *minioAdapter) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string) error {
+	return a.c.AbortMultipartUpload(ctx, bucket, object, uploadID)
 }
 
 // Uploader uploads files to MinIO and integrates with the local queue.
@@ -150,10 +158,12 @@ func normalise(cfg *Config) {
 // single-part and multipart strategies based on file size, and honours any
 // partially-uploaded state stored in the queue.
 //
-// When task.AppendMode is "tail" and task.FileOffset > 0, only the bytes
-// starting from FileOffset are uploaded (i.e., the tail appended since the
-// last upload). The object key is the same (task.StoragePath), so the
-// caller must ensure unique keys per chunk if full history is required.
+// ⚠️ IC-BUG-46: tasks with AppendMode "tail" are refused by the executor
+// BEFORE UploadFile is reached, so the tail-specific path below (offset > 0 →
+// Seek + PutObject to the same key) is currently unreachable. It must NOT be
+// re-enabled: PutObject replaces the whole object, so an incremental tail
+// upload would silently destroy the previously collected content. The correct
+// implementation (rolling chunks + server-side merge) is IC-15.
 func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*UploadResult, error) {
 	info, err := os.Stat(task.LocalPath)
 	if err != nil {
@@ -191,10 +201,36 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 
 	var result *UploadResult
 	threshold := int64(u.cfg.ThresholdMB) * 1024 * 1024
-	if uploadSize <= threshold {
-		result, err = u.singlePartUpload(ctx, task, offset, uploadSize)
+	// The file version this attempt would read (the top stat succeeded, or we
+	// would have returned above — "stat failed" can never reach the gate).
+	current := queue.FileVersion{Mtime: info.ModTime().Unix(), Size: info.Size()}
+	isMultipart := uploadSize > threshold
+
+	// Fail-closed resume gate (IC-3 R-A/A1/A2): the recorded parts may be
+	// skipped ONLY when canResumeParts holds for EVERY condition. Anything
+	// else — no snapshot, failed stat, changed version, shrunken single-part
+	// file — means the recorded multipart upload is discarded first (abort
+	// intent + abort) or the attempt fails (discard refused, A3), and the
+	// current content is uploaded from scratch. This gate lives at the ONE
+	// place every upload path flows through, so no path can bypass it.
+	if task.UploadID != "" {
+		if ok, reason := canResumeParts(task, current, true, isMultipart); !ok {
+			u.logger.Warn("uploader: recorded multipart upload cannot be resumed, discarding it",
+				zap.String("task_id", task.ID),
+				zap.String("upload_id", task.UploadID),
+				zap.String("reason", reason))
+			if derr := u.discardStaleUpload(ctx, task, task.UploadID); derr != nil {
+				return nil, fmt.Errorf("uploader: discard stale multipart upload %q: %w", task.UploadID, derr)
+			}
+			task.UploadID = ""
+			task.CompletedParts = ""
+		}
+	}
+
+	if isMultipart {
+		result, err = u.multipartUpload(ctx, task, current, fileSize)
 	} else {
-		result, err = u.multipartUpload(ctx, task, fileSize)
+		result, err = u.singlePartUpload(ctx, task, offset, uploadSize)
 	}
 	if err != nil {
 		return nil, err
@@ -202,6 +238,43 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 	result.SHA256 = sha
 	result.SizeBytes = uploadSize
 	return result, nil
+}
+
+// isNoSuchUpload reports whether err is (or wraps) a MinIO NoSuchUpload
+// response: the referenced multipart upload is confirmed gone (already
+// completed, aborted or expired), so there is nothing left to clean up.
+func isNoSuchUpload(err error) bool {
+	var resp minio.ErrorResponse
+	return errors.As(err, &resp) && resp.Code == "NoSuchUpload"
+}
+
+// AbandonUpload aborts the in-flight multipart upload recorded on task, if
+// any. It is called when a task is given up on — retry budget exhausted,
+// terminal failure, or queue eviction — because a multipart upload that will
+// never be completed or resumed leaks its uploaded parts without bound
+// (IC-3 ②). Single-part tasks (and tasks whose upload never initiated) carry
+// no upload ID and are a no-op.
+//
+// Tolerated as success: NoSuchUpload, i.e. the upload was already completed,
+// aborted or expired — in every case there is nothing left to clean up. Any
+// other error is returned so the caller can log and RETRY it: note that on the
+// current MinIO builds the bucket's AbortIncompleteMultipartUpload ILM rule is
+// NOT a reliable backstop (IC-3 ③: the action is rejected outright, or silently
+// stripped alongside Expiration), so a failed abort must keep a retryable local
+// identity — the executor's durable abort record (IC-3 P2) provides it.
+func (u *Uploader) AbandonUpload(ctx context.Context, task *queue.UploadTask) error {
+	if task == nil || task.UploadID == "" {
+		return nil
+	}
+	err := u.store.AbortMultipartUpload(ctx, task.Bucket, task.StoragePath, task.UploadID)
+	if err == nil {
+		return nil
+	}
+	if isNoSuchUpload(err) {
+		return nil
+	}
+	return fmt.Errorf("uploader: abort multipart upload %q of %q: %w",
+		task.UploadID, task.StoragePath, err)
 }
 
 // singlePartUpload uploads a file (or a portion of it) using PutObject.

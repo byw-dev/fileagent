@@ -99,11 +99,11 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 | ID | 标题 | 严重程度 | 涉及模块 |
 |----|------|---------|---------|
-| IC-BUG-1 | Agent 永远拿不到 STS 凭据，所有上传直接失败 | 🔴 P0 | controlplane + agent |
+| IC-BUG-1 | Agent 永远拿不到 STS 凭据，所有上传直接失败  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane + agent |
 | IC-BUG-2 | Agent 从不上报 `UploadResult`，索引主路径是死代码 ✅ 随 IC-2a 修复 | 🔴 P0 | agent |
-| IC-BUG-3 | STS session policy 前缀与实际对象键不匹配 | 🔴 P0 | controlplane |
-| IC-BUG-4 | STS session policy 缺 multipart 权限、多授 DeleteObject | 🔴 P0 | controlplane |
-| IC-BUG-5 | 断点续传状态从未落盘，重试永远从头重传 + 孤儿分片累积 | 🟠 P1 | agent |
+| IC-BUG-3 | STS session policy 前缀与实际对象键不匹配  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
+| IC-BUG-4 | STS session policy 缺 multipart 权限、多授 DeleteObject  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
+| IC-BUG-5 | 断点续传状态从未落盘，重试永远从头重传 + 孤儿分片累积 ✅ 随 IC-3 修复 | 🟠 P1 | agent |
 | IC-BUG-6 | minio-event 索引失败仍返回 200，MinIO 丢弃事件 | 🟠 P1 | controlplane |
 | IC-BUG-7 | 通过 API 新建的 bucket 不注册事件通知，文件永不入索引 | 🟠 P1 | controlplane + deploy |
 | IC-BUG-8 | `UpsertFileEntry` 无排序键，webhook 会把 agent 富字段覆盖为 NULL ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
@@ -114,16 +114,16 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-13 | `content_type` 两条索引路径都不赋值，且会被 upsert 清空 | 🟡 P2 | controlplane |
 | IC-BUG-14 | Dashboard `COUNT(*)` / `SUM` 全表扫描（规模隐患） | 🟡 P2 | controlplane |
 | IC-BUG-15 | 预签名下载 URL TTL 硬编码 15 分钟，大文件不够用 | 🟡 P2 | controlplane |
-| IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效 | 🟠 P1 | agent + controlplane |
-| IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效 | 🔴 P0 | agent |
-| IC-BUG-18 | Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上 | 🔴 P0 | agent |
+| IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效  ✅ 随 IC-1 修复 | 🟠 P1 | agent + controlplane |
+| IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效  ✅ 随 IC-1 修复 | 🔴 P0 | agent |
+| IC-BUG-18 | Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上  ✅ 随 IC-1 修复 | 🔴 P0 | agent |
 | IC-BUG-19 | minio-event 索引 URL 编码后的对象键（`%2F`），与真实键不符 ✅ 随 IC-2c 修复 | 🟠 P1 | controlplane |
 | IC-BUG-20 | bucket 集合变化后凭据不补发，新规则最长约 50 分钟持续 403 ✅ 随 IC-2b 修复 | 🟠 P1 | controlplane + agent |
 | IC-BUG-21 | 模板解析失败时猜一个对象键写进去，污染对账分片 ✅ 随 IC-2b 修复 | 🟡 P2 | agent |
-| IC-BUG-22 | `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token | 🔴 P0 | controlplane |
-| IC-BUG-23 | 吊销不生效：被吊销 agent 的 token 仍可用，且重连会把状态刷回 online | 🔴 P0 | controlplane |
-| IC-BUG-24 | `handleDryRunResult` 无归属校验，可对他人 rule 投递伪造试运行结果 | 🟡 P2 | controlplane |
-| IC-BUG-25 | 吊销切不断已建立的流：被吊销 agent 仍可心跳/上报，UI 显示在线且踢不掉 | 🟠 P1 | controlplane |
+| IC-BUG-22 | `PollApproval` 不校验 fingerprint，凭 agent UUID 即可换取 30 天 token  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
+| IC-BUG-23 | 吊销不生效：被吊销 agent 的 token 仍可用，且重连会把状态刷回 online  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
+| IC-BUG-24 | `handleDryRunResult` 无归属校验，可对他人 rule 投递伪造试运行结果  ✅ 随 IC-SEC-1 修复 | 🟡 P2 | controlplane |
+| IC-BUG-25 | 吊销切不断已建立的流：被吊销 agent 仍可心跳/上报，UI 显示在线且踢不掉  ✅ 随 IC-SEC-1 修复 | 🟠 P1 | controlplane |
 | IC-BUG-26 | `DeleteCollectionRule` 无归属约束，可删掉别的 agent 的规则 | 🟠 P1 | controlplane |
 | IC-BUG-27 | `handleDirectoryListing` 拿到 agentID 却只用于打日志，不校验归属 | 🟡 P2 | controlplane |
 | IC-BUG-28 | `registry.Register` 覆盖 map，重连时陈旧流的 defer 会关掉新连接的 SendCh ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
@@ -137,13 +137,17 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-36 | CP 凭据被 `init-minio.sh` 建成 **service account**，而 MinIO 的 service account 不能调 AssumeRole → 全新环境 STS 必然 `Access Denied` ✅ 已修（PR #97） | 🔴 P0 | deploy |
 | IC-BUG-37 | watcher 的 fsnotify 分支没有初始扫描，规则指向的**既有文件永不被采集**；而 polling 回退分支却会扫——同一条规则的行为取决于 fsnotify 是否可用 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
 | IC-BUG-38 | agent 的 `log.output` / `log.max_size_mb` / `log.max_backups` 解析了、校验了、写进文档了，就是没人读——日志只落 stdout，无文件、无轮转 | 🟡 P2 | agent |
-| IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 | 🟡 P2 | deploy + controlplane |
+| IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 ✅ 随 IC-3 修复（新增 `policy_script_test.go` 交叉校验） ✅ 随 IC-3 修复 | 🟡 P2 | deploy + controlplane |
 | IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 | 🟠 P1 | controlplane |
 | IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 | 🟡 P2 | deploy |
 | IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT | 🟡 P2 | agent |
 | IC-BUG-43 | close_wait 初始扫描跳过「仍在写」的文件，但 fsnotify 分支只扫一次、也没有后续事件兜底——写完即停的文件会被永久跳过 | 🟡 P2 | agent |
-| IC-BUG-44 | 阻塞式初始扫描在事件循环启动**之前**跑，大目录下 inotify 内核队列可能溢出（`IN_Q_OVERFLOW`），期间新建的文件静默丢失 | 🟡 P2 | agent |
+| IC-BUG-44 | 阻塞发送期间内核 watch 队列可能溢出——两个生产平台都会把溢出报上 `fw.Errors`（Linux `IN_Q_OVERFLOW` / Windows `ErrEventOverflow`），但代码只打一条 Warn 就扔了，缺一次安全网重扫闭环 | 🟠 P1 | agent |
 | IC-BUG-45 | tail 偏移在**事件发出时**推进而非**上传确认后**，一次彻底失败的 tail 上传会静默丢掉一段字节区间且无任何信号 | 🟡 P2 | agent |
+| IC-BUG-46 | **`append_mode=tail` 静默丢数据**：`singlePartUpload` 在 `offset>0` 时把**只含增量**的内容 `PutObject` 到同一键，对象被整体替换，此前已采集的内容从对象中消失 ◐ **拆半**：挡掉半边 ✅ 随 IC-3（CP 422 + agent 闸门 + UI 禁用）；**正确实现归 IC-15** | 🔴 P0 | agent |
+| IC-BUG-47 | 实时 fsnotify 事件路径仍用非阻塞 `emit`（满即丢弃），大量小文件并发写入时被丢弃的文件**永不被采集**——IC-5 的 F1 只修了初始扫描那一半 ✅ 随 IC-3 修复（4 处实时发送点全改 `emitBlocking`） | 🟠 P1 | agent |
+| IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 | 🟡 P2 | agent |
+| IC-BUG-49 | `dest_path_template` 带不带 `{time}` 隐式决定「追加后产生新版本对象 vs 覆盖同一对象」，**产品语义从未定义** | 🟡 P2 | 产品 + agent |
 
 ---
 
@@ -200,6 +204,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **文档冲突** | `system-design.md` §4.5 详细描述了续传流程，CLAUDE.md「关键实现模式」也写着「断点续传状态保存在 SQLite」——设计正确，实现缺失 |
 | **修复** | (1) 新增 `Queue.SaveMultipartProgress(id, uploadID, partsJSON)`，每片完成后落盘；(2) 任务终态（completed / 放弃）时调用 `AbortMultipartUpload`；(3) 给数据桶加 `AbortIncompleteMultipartUpload` ILM 规则兜底 |
 | **验收** | 上传 >64MB 文件，中途 kill agent，重启后从断点续传（日志可见跳过的分片数）；放弃的任务在 MinIO 侧无残留分片 |
+| **✅ 已修（IC-3，PR #105，2026-09-12）** | (1) `Queue.SaveMultipartProgress`（`queue.go`）在 initiate 与每片完成时落盘 `upload_id`/`completed_parts`；(2) 终态清理走 executor 的 `AbandonFunc` hook（`ConfigureAbandon` + `uploader.AbandonUpload`）：**放弃（重试耗尽）/ 终态失败（`ErrTerminalUpload`）/ 任务被逐出（capacity 逐出、退避中发现行已删）** 时 Abort，**`completed` 不 Abort**（`CompleteMultipartUpload` 已消费 uploadID，再 Abort 必然报错）；(3) `verifyRemoteParts` 对账保留为续传正确性的权威（本地记录仅是输入），验证失败（可能只是瞬时网络）**不** abort，宁可留给下一次对账。**IC-5 协同**：`ResetRunningToPending` 不清这两列 → 复位任务天然续传，**「大文件复位后全量重传」的已知限制由本刀关闭**。**⚠️ ILM 兜底一条在当前 MinIO 上不可实现**：实测（RELEASE.2025-09-07T16-13-09Z，直连 S3 XML PUT 复现）当前 MinIO 的 lifecycle schema 根本没有实现 `AbortIncompleteMultipartUpload`（`internal/bucket/lifecycle/rule.go` 自 2021 重构起该字段被注释成 FIXME，直到归档前的最终版 2025-10-15 仍在）——abort-only 规则 400 被拒、与其他动作共存则被**静默剥离**。`init-minio.sh` 仍写入该规则（面向将来实现了该 action 的构建），并读回生效值、不生效时响亮告警 |
+| **验收（live，已执行）** | ① 320MB 文件（part 5MiB——S3 非末片下限）传输中途 `SIGKILL` agent，重启后日志出现 `resuming multipart upload … skipped_parts=1` 且 upload_id 与 kill 前一致（非 part 1 重传），对象完整落桶、`file_entries` 一行；② `retry_max=0` agent 传中途删源文件 → 放弃 → 日志出现 `aborted multipart upload of abandoned task`，`ListMultipartUploads` 与 `mc ls --incomplete` 均无该 upload 的分片、无对象。live 用例 `ic3_live_integration_test.go`（开关 `IC3_LIVE=1`），两次运行均 PASS |
 
 ## IC-BUG-6 — minio-event 索引失败仍返回 200，MinIO 丢弃事件 🟠 P1
 
@@ -621,7 +627,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **归属** | 未排期。属「参数收了不用」类（与 IC-BUG-5/11 同类，本条是第三个实例——见上方「缺陷模式」一节） |
 
 
-## IC-BUG-39 — 脚本硬编码的 session policy 与 `storage/policy.go` 无联动 🟡 P2
+## IC-BUG-39 — 脚本硬编码的 session policy 与 `storage/policy.go` 无联动 🟡 P2 ✅ 已修（IC-3，PR #105）
 
 | 字段 | 内容 |
 |------|------|
@@ -632,6 +638,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 加交叉引用注释是最低限度；更好的做法是写一个 Go 测试，把脚本里那段 JSON 解出来与 `BuildSessionPolicy` 的输出比对，不一致即红 |
 | **验收** | 故意给 `policy.go` 加一个 Action 而不改脚本 → 必须有东西变红 |
 | **归属** | 未排期。宜与 IC-3 或 IC-8（下一次要动 policy 的刀）同刀 |
+| **✅ 已修（IC-3，PR #105，2026-09-12）** | 新增 `controlplane/internal/storage/policy_script_test.go`：解出脚本里的 `STS_SESSION_POLICY` JSON 与 `BuildSessionPolicy`（对脚本钉定的同一 bucket `data-sensor`）逐文档比对（`TestSessionPolicyMatchesInitScript` + 逐 statement 的 Action 集合断言 `TestSessionPolicyActionSetsMatch`）。反向变异已自验：给 `objectActions` 加 `s3:GetObject` 而不改脚本 → `go build` 通过且两条用例红；还原后 5/5 稳定绿。本刀未改 `policy.go`（IC-1 已把 `AbortMultipartUpload` 放进 `objectActions`），脚本无需同步 |
 
 ## IC-BUG-40 — CP 启动不校验 MinIO 凭据，故障延后到 agent 侧才爆 🟠 P1
 
@@ -678,17 +685,18 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 写完并关闭一个文件后立即启动 agent（落在去抖窗口内），该文件最终必须被采集；且仍不得上传处于写入中的文件（不能把 F2 修复退回去）|
 | **归属** | 未排期。归 agent 采集路径，宜与 IC-BUG-44 同刀（都是初始扫描的时序边界）|
 
-## IC-BUG-44 — 阻塞式初始扫描先于事件循环，inotify 队列可能溢出 🟡 P2
+## IC-BUG-44 — 阻塞发送期间内核 watch 队列溢出：溢出信号已送到手边，代码只 Warn 不补救 🟠 P1
 
 | 字段 | 内容 |
 |------|------|
-| **根因** | IC-5（PR #100）的 review F1 修复把初始扫描改成**阻塞发送**（背压取代丢弃），但扫描仍在**进入事件循环之前**执行。`fsnotify` 的 `Events` channel 无缓冲，在 `runFsnotify` / `runCloseWait` 启动前没有任何消费者 |
-| **精确位置** | `agent/internal/watcher/watcher.go` `Start` 中 `pollScan` 的调用位置（在 `runFsnotify` / `runCloseWait` 之前）|
-| **后果** | 5 万个既有文件 + 消费端受限于 SQLite 写入时，扫描会把 `Start` 阻塞数分钟；这期间新建的文件冲爆内核队列（`max_queued_events` 默认 16384）→ `IN_Q_OVERFLOW` → **这些 create 事件被静默丢弃，且没有任何后续扫描会找回它们** |
-| **注意** | 这是 F1 修复的**代价而非退步**：改成阻塞之前，同样的积压是直接被 `emit` 丢掉的（那更糟且无声）。本条是把风险从「必然丢」降到「极端规模下可能丢」之后剩下的尾巴 |
-| **修复** | 把初始扫描放进独立 goroutine，在事件循环**已经在消费**之后再跑；扫描与实时事件并发写同一个 channel 是安全的（`seen` map 的并发访问需加锁或改为扫描独占）|
-| **验收** | 大目录（万级）下启动 agent，同时持续创建新文件，既有文件与新建文件**都不丢** |
-| **归属** | 未排期。宜与 IC-BUG-43 同刀 |
+| **根因** | IC-BUG-47（IC-3 修复）把实时事件改成阻塞发送后，**发送阻塞期间 `fw.Events` 无人消费**，fsnotify 后端停止读取内核 watch 队列；持续突发可把队列冲爆（Linux `max_queued_events` 默认 16384）。**关键平台事实（codex 第六轮复核查证 fsnotify v1.8.0）**：溢出在**两个生产平台都是可见的**——Linux（生产）inotify 报 `IN_Q_OVERFLOW`、Windows（生产）ReadDirectoryChangesW 后端报 `fsnotify.ErrEventOverflow`，两者都会出现在 `fw.Errors` 上。**但当前 `fw.Errors` 分支只有一条 `w.logger.Warn`，没有任何恢复动作**——信号已经送到手边，代码接住了又扔掉 |
+| **精确位置** | `agent/internal/watcher/watcher.go` 两处 `fw.Errors` 分支（`runCloseWait` 与 `runFsnotify`，约 :214-218 / :263-268），均只 `logger.Warn("watcher: fsnotify error", …)` |
+| **后果** | 溢出期间排队的 create/write 事件丢失，对应文件不被采集。**性质与初判不同**：这不是「难以察觉的静默丢数据」——溢出信号两个生产平台都会明确报告，只差一步补救动作即可闭环。**因此从 P2 上调为 P1**：从「隐蔽隐患」变成「差一步闭环的缺口」，修复成本低、收益直接 |
+| **平台角色（重要，勿再搞反）** | Linux（**生产**）`IN_Q_OVERFLOW` **可见**；Windows（**生产**）`ErrEventOverflow` **可见**（fsnotify v1.8.0 查证）；macOS kqueue（**仅开发机**）不保证溢出可见，可能静默——**它只影响开发机上能不能复现这个分支，不影响生产的数据安全边界**。⚠️ 这是本 track 第 10 次「注释声称的性质不成立」，此前 watcher.go 注释曾声称 Windows 该层丢失可能静默，系错误 |
+| **修复** | **不需要发明任何检测手段**：在 `fw.Errors` 分支收到溢出错误（`IN_Q_OVERFLOW` / `fsnotify.ErrEventOverflow`）时触发一次**安全网重扫**（复用现有 `pollScan`），把溢出期间漏掉的文件找回来。可选地同时保留 Warn 日志并带上溢出标记。不动 emitBlocking 的背压语义——那是 IC-BUG-47 已验证的正确行为 |
+| **验收** | CI（ubuntu + windows）下制造队列溢出（小队列限制 + 持续突发），断言溢出后触发重扫、溢出窗口内创建的文件最终被采集 |
+| **⚠️ 流程事实（与直觉相反，值得后人知道）** | 对 fsnotify 这一类机制，**CI（ubuntu + windows）才是权威验证环境，本机 macOS 不是**——macOS kqueue 不报溢出，本地跑再多次也走不到 `fw.Errors` 的溢出分支，0 失败只代表「没测到」，不代表「没问题」。IC-BUG-44 的验收**必须在 CI 上看，不要被本机绿灯误导** |
+| **归属** | 未排期（IC-3 收尾明确不做本刀——安全网重扫是它自己那一刀）。宜与 IC-BUG-43 同刀（都是初始扫描的时序边界） |
 
 ## IC-BUG-45 — tail 偏移在发出事件时推进，而非上传确认后 🟡 P2
 
@@ -700,6 +708,51 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 让偏移推进与上传确认对齐：要么在 `CompleteReported` 之后回写偏移，要么让 watcher 不再持有权威偏移、每次都从 `processed_files` 读。后者更简单且与恢复路径天然一致 |
 | **验收** | tail 规则下让一次上传彻底失败，随后文件继续增长——下一次上传必须覆盖失败的那段字节，不得出现空洞 |
 | **归属** | 未排期。与 **IC-BUG-42** 同源（都是「任务失败后的状态推进」），宜同刀 |
+
+## IC-BUG-46 — `append_mode=tail` 静默丢数据 🔴 P0 ◐ 拆半（挡掉 ✅ IC-3 / 正确实现 → IC-15）
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | tail 模式下 `uploadSize = fileSize - offset`；当增量 ≤ 阈值（64MB，即**增量上传的常态**）时走 `singlePartUpload(ctx, task, offset, uploadSize)`，它 `Seek(offset)` 后 `PutObject(bucket, task.StoragePath, f, size)`——而 **`PutObject` 是整体替换对象**。 |
+| **精确位置** | `agent/internal/uploader/uploader.go` 的 `singlePartUpload`（`offset>0` 分支）；分流点在 `UploadFile` 的 `uploadSize <= threshold` |
+| **后果** | 第 1 次采集 offset=0 上传完整文件（如 1GB）→ 第 2 次 offset=1GB、增量 10MB → **对象被替换成只含那 10MB**，前 1GB 从对象中消失。若模板带 `{time}` 则变成一堆各含一段增量的散碎对象，同样不是设计文档所述的「以追加分片存储」的单一对象。**两种情况都错，第一种是数据丢失。** |
+| **为什么一直没暴露** | 设计文档 §4.4.3 给 tail 的适用场景是「大文件持续追加（> 200MB）、带宽敏感」。IC-BUG-11 当初只把死参数 `FileOffset`/`AppendMode` 接上（值传进去了），**从未实现 tail 需要的存储语义**——接上参数反而激活了这条丢数据的路径 |
+| **与 multipart 的概念冲突** | tail 的「分片」是**时间上的增量段**（第一次 0–1GB、第二次 1GB–1.2GB）；multipart 的「分片」是**空间上的固定切片**（part 1 = 0–64MB…）。两套概念被塞进同一条代码路径，所以 `multipartUpload` 会忽略 `offset`、整文件重传。而 >200MB 的目标文件**必然**超过 multipart 阈值，所以这不是边缘情况，是 tail 的主场景 |
+| **修复** | **本刀（IC-3）先 fail-closed 挡掉**：规则创建/更新时 `append_mode=tail` 返回 422 并说明原因；已存在的 tail 规则在上传路径上**显式失败并告警**，不得静默写坏对象。**正确实现见 IC-15**。⚠️ 挡掉的理由**不是「当前无消费方」**——一个已在 `system-design.md` / 规则 schema / proto 中对外提供的模式，会静默丢数据就必须先停；可见的失败优于静默的错误结果，与消费方多少无关 |
+| **验收** | 创建 `append_mode=tail` 的规则返回 422；已存在的 tail 规则触发上传时任务显式失败并留下可检索的告警，MinIO 侧**不产生**任何被替换的对象 |
+| **归属** | **挡掉随 IC-3；正确实现见 IC-15** |
+
+## IC-BUG-47 — 实时 fsnotify 路径仍会静默丢弃事件 🟠 P1 ✅ 已修（IC-3，PR #105）
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | IC-5 的 review F1 把**初始扫描**改成了阻塞发送（`emitBlocking`，背压取代丢弃），但**实时 fsnotify 事件循环仍在用非阻塞的 `emit`**——满即丢弃 |
+| **精确位置** | `agent/internal/watcher/watcher.go`：`emit` 的调用点在 `runFsnotify` / `runCloseWait`（约 :154 / :176 / :221 / :226）；`emitBlocking` 只用在 `pollScan`（约 :303）。消费端 channel 缓冲 64（`agent/cmd/agent/main.go` 约 :791） |
+| **后果** | 大量小文件并发写入 → 64 缓冲打满 → 事件被丢弃（仅一条 Warn）→ **那些文件永不被采集**，因为它们的 mtime/size 不会再变、也不会再有事件触发。其背压语义会让 fsnotify 停读内核 watch 队列，溢出风险见 **IC-BUG-44**（P1：溢出可见、缺安全网重扫） |
+| **与 F1 的关系** | **同一个缺陷的另一半**。F1 修复时双方都以为覆盖了整条路径，实际只修了初始扫描 |
+| **修复** | 实时事件路径同样改用 `emitBlocking`（4 处调用点），与 F1 同一模式 |
+| **验收** | 并发写入远超 channel 缓冲的小文件（如 500 个），断言**全部**被采集，一个不丢；变异（改回 `emit`）必须稳定红 |
+| **归属** | **随 IC-3 修复**（F1 的另一半，不修等于 F1 只做了一半） |
+
+## IC-BUG-48 — 内容身份靠推断而非验证，两类改写永不重采 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 判重与续传的内容身份都用 `mtime + size` **推断**。而 `verifyRemoteParts` 其实已经从 MinIO 拉回了**每个分片的 ETag**（即每片 MD5，一个真正的内容指纹），却**只是记下来、从不与本地字节比对** |
+| **精确位置** | `agent/internal/queue/queue.go` 的 `IsProcessed`（四元组判重）；`agent/internal/uploader/multipart.go` 的 `verifyRemoteParts`（拿到 ETag 未使用）；`canResumeParts` 的版本快照比对 |
+| **后果** | 两个盲区同源：① **同秒内同尺寸改写**的文件永不重采（IC-BUG-10 遗留）；② 已采集文件被删除后**原地重建且保留 mtime**（`cp -p`、备份恢复）→ 四元组命中 → 永不重采，而 MinIO 里是旧内容。**mtime 还是可被写入方任意设置的**（`touch`、`rsync -t`） |
+| **修复** | 把身份从推断升级为**验证**：已记录分片的 ETag 与**重新读取本地对应区间算出的 MD5** 比对；`mtime+size` 降级为廉价预筛。代价是本地重读已上传前缀（**纯本地 I/O，不走网络**；10GB 文件重读 10GB 本地，远比重传 10GB 便宜）。这是 S3 续传上传器的标准做法 |
+| **验收** | 同秒同尺寸改写后必须重采；保留 mtime 的原地重建（内容不同）必须重采；内容确实相同的重建仍可跳过（账本语义正确，无新内容可传） |
+| **归属** | **宜与 IC-15 同刀**——IC-15 本来就要定内容身份判据，一次解决续传版本判定 + 本条两个盲区 |
+
+## IC-BUG-49 — 追加写入后「新版本对象 vs 覆盖」语义未定义 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 一个已 `completed` 的文件被追加写入后，IC-5 ① 的四元组判重会正确地重新采集它。但**最终落到哪个对象键，由 `dest_path_template` 是否包含 `{time}` 隐式决定**，而这个产品语义从未被明确定义 |
+| **后果** | 模板带 `{time}` → 每次新键 → 索引里**多行**，同一文件的多个历史版本并存；不带 `{time}` → 同键 → 对象被**整体覆盖**、索引行更新。两种都「能工作」，但运维无法预期，也没有文档说明哪种是推荐形态 |
+| **修复** | **需要产品拍板**：追加写入应产生新版本对象，还是覆盖同一对象？定下之后在 `system-design.md` §4.4.3 写明，并在规则创建时对不匹配的模板给出提示 |
+| **归属** | 未排期，**需产品决策**。与 IC-15 的「采集中的索引状态」一并考虑更划算 |
 
 ---
 
