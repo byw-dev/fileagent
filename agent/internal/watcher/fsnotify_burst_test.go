@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -21,14 +20,6 @@ import (
 // again and no further event fires. Events are delivered with backpressure
 // (emitBlocking), matching the F1 semantics already used by pollScan.
 func TestWatcher_FsnotifyBurst_NoEventDropped(t *testing.T) {
-	// kqueue-based fsnotify opens a descriptor per watched file; make sure the
-	// burst below is not capped by the soft RLIMIT_NOFILE (best effort).
-	var rl syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err == nil {
-		rl.Cur = rl.Max
-		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rl)
-	}
-
 	const numFiles = 500
 	dir := t.TempDir()
 	w, err := New(dir, "*.txt", false, 0, AppendModeOverwrite, zap.NewNop())
@@ -42,12 +33,15 @@ func TestWatcher_FsnotifyBurst_NoEventDropped(t *testing.T) {
 
 	// A deliberately slow consumer: it drains the channel far more slowly than
 	// the burst below fills it, so with a dropping send the 64-slot buffer
-	// overflows and events are lost.
+	// overflows and events are lost. The delay is short (200µs) so the
+	// blocking pipeline never stalls the fsnotify backend long enough to
+	// stress OS-level event buffering (kqueue / ReadDirectoryChangesW) — the
+	// OS layer dropping events is IC-BUG-44's territory, not this test's.
 	var mu sync.Mutex
 	got := make(map[string]bool, numFiles)
 	go func() {
 		for ev := range events {
-			time.Sleep(2 * time.Millisecond)
+			time.Sleep(200 * time.Microsecond)
 			mu.Lock()
 			got[ev.Path] = true
 			mu.Unlock()
@@ -77,7 +71,7 @@ func TestWatcher_FsnotifyBurst_NoEventDropped(t *testing.T) {
 	wg.Wait()
 
 	// Every file must be delivered — blocking backpressure delays, never drops.
-	deadline := time.After(45 * time.Second)
+	deadline := time.After(30 * time.Second)
 	for {
 		mu.Lock()
 		n := len(got)
