@@ -89,12 +89,17 @@ type RuleDispatcher interface {
 type AgentRegistryClient interface {
 	Send(agentID string, msg *agentv1.ServerMessage) bool
 	IsOnline(agentID string) bool
-	// Disconnect cuts the agent's stream. Revocation needs it because the
-	// Revoke command it sends is cooperative and a compromised agent ignores it.
+	// Disconnect cuts the agent's stream by cancelling its context — the
+	// forced end. Revocation needs it because the Revoke command it sends is
+	// cooperative and a compromised agent ignores it.
 	Disconnect(agentID string) bool
+	// Stop ends the agent's stream gracefully: the handler returns without
+	// cancelling, so gRPC flushes the queued DATA frames before the trailers.
+	// It never waits on the agent.
+	Stop(agentID string) bool
 	// SendSync enqueues a message and waits a bounded timeout for the send
-	// goroutine to confirm it was written to the stream. Revoke uses it so the
-	// cooperative command is not lost to the Disconnect that immediately
+	// goroutine to confirm it was written to the stream. Revoke uses it so
+	// the cooperative command is not lost to the Disconnect that immediately
 	// follows; the bound must stay hard because a non-reading agent pins
 	// stream.Send forever.
 	SendSync(agentID string, msg *agentv1.ServerMessage, timeout time.Duration) bool
@@ -454,23 +459,28 @@ func (h *AgentsHandler) Revoke(c *gin.Context) {
 	}
 	if h.registry != nil && h.registry.IsOnline(id.String()) {
 		// Ask the agent to clean up its local token, and give the send
-		// goroutine a bounded moment to confirm the command was written to the
-		// stream (IC-BUG-32): a command still queued behind an in-flight
-		// stream.Send is lost to the Disconnect below. The bound is a hard
-		// cap — an agent that never reads its stream is cut on timeout, never
-		// waited on forever — and the wait is best-effort: the stream is cut
-		// regardless of the outcome, because the command is cooperative and a
-		// compromised agent ignores it anyway (IC-BUG-25).
-		h.registry.SendSync(id.String(), &agentv1.ServerMessage{
+		// goroutine a bounded moment to confirm the command was written to
+		// the stream (IC-BUG-32).
+		//
+		// The follow-up cut then has exactly two shapes, and the difference
+		// is the whole point of the fix: CONFIRMED, the RPC is ended
+		// gracefully (Stop) — the handler returns without cancelling, so
+		// gRPC flushes the queued command before the trailers and the agent
+		// deterministically receives it. UNCONFIRMED — the 1s cap expired
+		// because the agent is not reading or is starved of flow-control
+		// quota — the command never made it into the transport queue, so we
+		// cancel outright: this branch keeps the pre-fix best-effort
+		// behaviour and can still lose the command; the hard cap is what
+		// bounds it. Either way the stream is cut regardless — the command
+		// is cooperative and a compromised agent ignores it (IC-BUG-25).
+		if h.registry.SendSync(id.String(), &agentv1.ServerMessage{
 			Payload: &agentv1.ServerMessage_Revoke{
 				Revoke: &agentv1.RevokeCommand{Reason: "revoked_by_admin"},
 			},
-		}, revokeSendWait)
-		// …then cut the stream regardless. The command above is cooperative and
-		// a compromised agent will ignore it; without this it would keep
-		// heartbeating (appearing online, unkickable) and keep reporting
-		// uploads. See IC-BUG-25.
-		if h.registry.Disconnect(id.String()) {
+		}, revokeSendWait) {
+			h.registry.Stop(id.String())
+			h.logger.Info("revoke: agent stream ended gracefully", zap.String("agent_id", id.String()))
+		} else if h.registry.Disconnect(id.String()) {
 			h.logger.Info("revoke: agent stream cut", zap.String("agent_id", id.String()))
 		}
 	}

@@ -209,3 +209,39 @@ func TestSendSync_InterleavedSends(t *testing.T) {
 		assert.True(t, r.SendSync("agent-1", msg, time.Second))
 	}
 }
+
+// ── Stop (IC-SEC-2 ③ graceful path) ───────────────────────────────────────────
+
+// Stop marks the connection stopping, is idempotent, and is orthogonal to
+// Disconnect: graceful and forced teardown must not get in each other's way.
+func TestStop_MarksStopping_Idempotent(t *testing.T) {
+	r := NewAgentRegistry()
+	conn := r.Register("agent-1", nil, func() {})
+	defer func() { require.True(t, r.Unregister(conn)) }()
+
+	assert.False(t, conn.isStopping(), "a fresh connection is not stopping")
+	assert.True(t, r.Stop("agent-1"))
+	assert.True(t, conn.isStopping())
+	// Second stop must not panic (close of closed channel) — double revokes
+	// inside the teardown window are real.
+	assert.True(t, r.Stop("agent-1"))
+	assert.False(t, r.Stop("nobody"))
+
+	// Stop never touches the cancel func: Disconnect keeps its own semantics.
+	cancelled := make(chan struct{})
+	conn2 := r.Register("agent-2", nil, func() { close(cancelled) })
+	defer func() { require.True(t, r.Unregister(conn2)) }()
+	r.Stop("agent-2")
+	select {
+	case <-cancelled:
+		t.Fatal("Stop must not cancel the stream context — that is Disconnect's job")
+	default:
+	}
+	require.True(t, r.Disconnect("agent-2"))
+	select {
+	case <-cancelled:
+		// correct: Disconnect is the one that cancels.
+	default:
+		t.Fatal("Disconnect must cancel the stream context")
+	}
+}

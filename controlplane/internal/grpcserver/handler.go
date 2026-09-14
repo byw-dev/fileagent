@@ -216,11 +216,26 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	go func() {
 		for {
 			msg, err := stream.Recv()
-			select {
-			case recvCh <- recvResult{msg: msg, err: err}:
-				if err != nil {
-					return
+			if err != nil {
+				// The RPC has ended — the stream broke, the context was
+				// cancelled, or the handler returned gracefully (IC-BUG-32: on
+				// the graceful path nothing ever cancels ctx, and the main
+				// loop may already be gone, so nobody is reading recvCh).
+				// Deliver the error if someone is still there, then exit
+				// either way: blocking here on a reader that no longer exists
+				// would leak this goroutine for the lifetime of the process.
+				// Release: the RPC end cancels the stream context (gRPC's
+				// finishStream cancels it before the flush, and our ctx is its
+				// child), so this select always terminates; the pending Recv
+				// itself is released when the transport closes the stream.
+				select {
+				case recvCh <- recvResult{msg: msg, err: err}:
+				case <-ctx.Done():
 				}
+				return
+			}
+			select {
+			case recvCh <- recvResult{msg: msg, err: nil}:
 			case <-ctx.Done():
 				return
 			}
@@ -229,6 +244,22 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 
 	for {
 		select {
+		case <-conn.stopCh:
+			// Graceful stop (IC-BUG-32): Stop closed stopCh instead of
+			// cancelling ctx. Returning WITHOUT cancelling lets gRPC finish
+			// the RPC normally: the transport's FIFO flushes every DATA frame
+			// queued before the trailers — including the RevokeCommand whose
+			// write SendSync just confirmed — so the agent deterministically
+			// receives the command before the stream ends. Cancelling here
+			// would RST the queued frames away and reintroduce the race.
+			//
+			// Like the ctx.Done branch below, deliberately does not wait for
+			// the send goroutine: nothing on this path waits on the agent at
+			// all (review gate 4), and the deferred Unregister releases the
+			// send goroutine by closing SendCh.
+			s.logger.Info("connect: stream terminated by control plane",
+				zap.String("agent_id", agentID))
+			return status.Error(codes.PermissionDenied, "agent connection terminated")
 		case <-ctx.Done():
 			// Cancelled from outside — the agent was revoked (IC-BUG-25).
 			//
@@ -253,6 +284,15 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 				// read. Doing so used to pin this handler outside the select, so
 				// it could no longer observe ctx.Done at all — the agent made
 				// itself unrevokable.
+				//
+				// If a graceful stop is already in flight, though, cancelling
+				// here would race the transport's flush and discard the queued
+				// command (IC-BUG-32) — end the RPC the same way the stopCh
+				// branch does: a normal handler return, whose trailers go out
+				// after the queued DATA frames.
+				if conn.isStopping() {
+					return status.Error(codes.PermissionDenied, "agent connection terminated")
+				}
 				cancel()
 				return r.err
 			}

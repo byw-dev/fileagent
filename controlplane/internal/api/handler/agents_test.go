@@ -207,7 +207,9 @@ type mockAgentRegistry struct {
 	lastSent        *agentv1.ServerMessage
 	syncedTo        string
 	lastSynced      *agentv1.ServerMessage
+	lastSyncTimeout time.Duration
 	disconnectCalls int
+	stopCalls       int
 }
 
 func (m *mockAgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
@@ -215,14 +217,19 @@ func (m *mockAgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) boo
 	m.lastSent = msg
 	return m.sendOK
 }
-func (m *mockAgentRegistry) SendSync(agentID string, msg *agentv1.ServerMessage, _ time.Duration) bool {
+func (m *mockAgentRegistry) SendSync(agentID string, msg *agentv1.ServerMessage, timeout time.Duration) bool {
 	m.syncedTo = agentID
 	m.lastSynced = msg
+	m.lastSyncTimeout = timeout
 	return m.sendOK
 }
 func (m *mockAgentRegistry) IsOnline(_ string) bool { return m.online }
 func (m *mockAgentRegistry) Disconnect(_ string) bool {
 	m.disconnectCalls++
+	return m.online
+}
+func (m *mockAgentRegistry) Stop(_ string) bool {
+	m.stopCalls++
 	return m.online
 }
 
@@ -487,7 +494,7 @@ func TestAgentsHandler_Revoke_SendsRevokeCommandWhenOnline(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, w.Code)
 	// Revoke sends the command via SendSync (IC-SEC-2 ③): a bounded wait for
-	// the write-out confirmation, then the cut below regardless.
+	// the write-out confirmation.
 	require.NotNil(t, registry.lastSynced)
 	assert.Equal(t, agentID, registry.syncedTo)
 	revoke := registry.lastSynced.GetRevoke()
@@ -495,9 +502,38 @@ func TestAgentsHandler_Revoke_SendsRevokeCommandWhenOnline(t *testing.T) {
 	assert.Equal(t, "revoked_by_admin", revoke.GetReason())
 
 	// The command above is cooperative — a compromised agent ignores it and
-	// keeps heartbeating, so the stream has to be cut as well (IC-BUG-25).
+	// keeps heartbeating, so the stream has to be ended as well (IC-BUG-25).
+	// With the write confirmed, the end is graceful (Stop): gRPC flushes the
+	// queued command before the trailers, so the agent deterministically
+	// receives it. The forced cancel is only for the unconfirmed branch.
+	assert.Equal(t, 1, registry.stopCalls,
+		"a confirmed revoke must end the stream gracefully (Stop), not cancel it")
+	assert.Equal(t, 0, registry.disconnectCalls,
+		"cancelling after a confirmed write would discard the queued command (IC-BUG-32)")
+	// handler.revokeSendWait is the hard cap; if it ever changes, this test
+	// forces a conscious re-check of the non-reading-agent bound.
+	assert.Equal(t, time.Second, registry.lastSyncTimeout,
+		"the wait bound passed to SendSync must stay the hard 1s cap")
+}
+
+// When SendSync cannot confirm the write inside the hard cap (agent not
+// reading, quota starved), the command never made it into the transport queue
+// and the revoke falls back to the forced cancel.
+func TestAgentsHandler_Revoke_Unconfirmed_FallsBackToDisconnect(t *testing.T) {
+	mgr := &mockAgentMgr{}
+	registry := &mockAgentRegistry{online: true, sendOK: false}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, mgr, nil, registry, newTestLogger())
+	agentID := uuid.New().String()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+agentID+"/revoke", nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, 1, registry.disconnectCalls,
-		"revocation must cut the stream, not only ask the agent to stand down")
+		"an unconfirmed command must fall back to the forced cut")
+	assert.Equal(t, 0, registry.stopCalls,
+		"a graceful stop must never be taken without the write confirmation")
 }
 
 // Revocation must still succeed when the agent is already gone; there is simply

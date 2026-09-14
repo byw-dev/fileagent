@@ -58,6 +58,28 @@ type AgentConn struct {
 	// timeout (IC-BUG-28: a dismantled connection must never leave a waiter
 	// hanging).
 	writerDone chan struct{}
+	// stopCh, closed once by Stop, asks Connect to end the RPC gracefully:
+	// the handler returns without cancelling the stream context, so gRPC
+	// flushes the queued DATA frames before the trailers (IC-BUG-32). It is
+	// the confirmed-revoke path's release; CancelFunc is the forced one.
+	stopCh   chan struct{}
+	stopOnce sync.Once
+}
+
+// requestStop signals the graceful end. Idempotent: calling it more than once
+// (e.g. a double revoke inside the teardown window) must not panic.
+func (c *AgentConn) requestStop() {
+	c.stopOnce.Do(func() { close(c.stopCh) })
+}
+
+// isStopping reports whether a graceful stop has been requested.
+func (c *AgentConn) isStopping() bool {
+	select {
+	case <-c.stopCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // AgentRegistry tracks all active bidirectional agent connections.
@@ -87,6 +109,7 @@ func (r *AgentRegistry) Register(
 		CancelFunc:  cancelFn,
 		notify:      make(chan struct{}),
 		writerDone:  make(chan struct{}),
+		stopCh:      make(chan struct{}),
 	}
 	r.mu.Lock()
 	r.conns[agentID] = conn
@@ -135,6 +158,27 @@ func (r *AgentRegistry) Get(agentID string) *AgentConn {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.conns[agentID]
+}
+
+// Stop asks the agent's connection to end gracefully: the Connect handler
+// returns without cancelling the stream context, so gRPC finishes the RPC
+// normally — the transport's FIFO flushes the queued DATA frames before the
+// trailers, and a command confirmed written (SendSync) deterministically
+// reaches the agent before the stream ends. Contrast Disconnect, which
+// cancels the context and can discard queued frames with the RST.
+//
+// Stop itself never waits: it only closes a channel and returns, so no caller
+// can be dragged into waiting on a non-reading agent. It reports whether a
+// connection was asked to stop, and is safe to call more than once.
+func (r *AgentRegistry) Stop(agentID string) bool {
+	r.mu.RLock()
+	conn, ok := r.conns[agentID]
+	r.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	conn.requestStop()
+	return true
 }
 
 // enqueue performs the non-blocking send and assigns the FIFO sequence number
@@ -230,6 +274,13 @@ func (r *AgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
 // writerDone. The confirmation means "written to the transport", not "read by
 // the agent" — flow control guarantees the former is as far as an honest
 // bounded wait can go.
+//
+// Scope of the guarantee, stated plainly (IC-BUG-32): a CONFIRMED send pairs
+// with a graceful end (Stop), whose teardown order deterministically delivers
+// the queued message before the stream ends. An UNCONFIRMED send — the
+// timeout expired — keeps the pre-fix best-effort behaviour: the caller
+// falls back to a forceful cancel, which can still lose the command. The cap
+// bounds that branch; it does not fix it.
 func (r *AgentRegistry) SendSync(agentID string, msg *agentv1.ServerMessage, timeout time.Duration) bool {
 	r.mu.RLock()
 	conn, ok := r.conns[agentID]
