@@ -70,7 +70,11 @@ jobs:
         working-directory: agent
         run: |
           sudo sysctl -w fs.inotify.max_queued_events=4096
-          go test -tags overflow -run TestInotifyOverflow_SafetyNetRescan_RecoversLostFiles -v -count=1 -timeout 10m 2>&1 | tee overflow-test.log
+          go test -tags overflow -run TestInotifyOverflow_SafetyNetRescan_RecoversLostFiles -v -count=1 -timeout 10m ./internal/watcher 2>&1 | tee overflow-test.log
           grep -q "gate open" overflow-test.log || { echo "::error::overflow test was skipped (gate closed) — not allowed to pass silently"; exit 1; }
           grep -q "overflow is guaranteed" overflow-test.log || { echo "::error::kernel queue was not small enough to overflow — safety-net path not exercised"; exit 1; }
           grep -q "^--- PASS" overflow-test.log || { echo "::error::overflow test did not pass"; exit 1; }
+        env:
+          # The test file double-gates on the build tag AND this env var; the
+          # greps above fail the step if the test silently skipped.
+          FILEAGENT_TEST_INOTIFY_OVERFLOW: "1"
