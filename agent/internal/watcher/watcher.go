@@ -6,8 +6,10 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -44,6 +46,17 @@ type Watcher struct {
 
 	// tailOffsets tracks the last known byte offset per file for tail mode.
 	tailOffsets map[string]int64
+
+	// rechecks holds the one-shot close_wait debounce recheck timers keyed by
+	// path (IC-BUG-43). At most one live timer per path: re-arming replaces
+	// the previous timer. Guarded by seenMu; lazily initialized so a Watcher
+	// built by struct literal (tests) works without New.
+	rechecks map[string]*time.Timer
+
+	// seenMu guards rechecks and every access to a scan's seen map while
+	// debounce recheck callbacks (timer goroutines) may run concurrently
+	// with a scan on the event-loop goroutine.
+	seenMu sync.Mutex
 }
 
 // Append-mode constants. The canonical values live in the queue package (they
@@ -119,13 +132,19 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 	// Use the same scan as the polling fallback so files that predate watcher
 	// startup are collected consistently on both paths. Register watches first
 	// so changes made during the scan are still observed by fsnotify.
-	w.pollScan(ctx, events, make(map[string]time.Time))
+	//
+	// seen is shared with the event loop below so that the IC-BUG-44
+	// safety-net rescan does not re-emit unchanged files as "create", and so
+	// files emitted by an IC-BUG-43 debounce recheck are not re-emitted by a
+	// later rescan.
+	seen := make(map[string]time.Time)
+	w.scheduleDebounceRechecks(ctx, events, seen, w.pollScan(ctx, events, seen))
 
 	w.logger.Info("watcher: fsnotify started", zap.String("path", w.sourcePath))
 	if w.appendMode == AppendModeCloseWait {
-		return w.runCloseWait(ctx, events, fw)
+		return w.runCloseWait(ctx, events, fw, seen)
 	}
-	return w.runFsnotify(ctx, events, fw)
+	return w.runFsnotify(ctx, events, fw, seen)
 }
 
 // addWatchPaths registers the source path (and subdirectories when recursive)
@@ -150,10 +169,25 @@ func (w *Watcher) addWatchPaths(fw *fsnotify.Watcher) error {
 // the FileEvent is emitted only once the timer fires (i.e., once writes stop
 // for at least closeWaitDebounce). This approximates "file closed after write"
 // on platforms that do not expose a native close-write notification.
-func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher) error {
+//
+// Errors on fw.Errors (including watch-queue overflows) are handled by
+// handleWatchError, which triggers the IC-BUG-44 safety-net rescan on
+// overflow so files whose events were lost are recovered by mtime.
+func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher, seen map[string]time.Time) error {
+	return w.loopCloseWait(ctx, events, seen, fw.Events, fw.Errors)
+}
+
+// loopCloseWait is the close_wait event loop proper. The event and error
+// channels are parameters so tests can drive the loop deterministically
+// without a live fsnotify backend (whose channel lifecycle would race with
+// test-side injections).
+func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, evc <-chan fsnotify.Event, erc <-chan error) error {
 	type pendingEntry struct {
 		timer *time.Timer
-		op    string
+		// mu guards op: the loop goroutine updates it on every event while a
+		// firing timer goroutine reads it for the flush.
+		mu sync.Mutex
+		op string
 	}
 	pending := make(map[string]*pendingEntry)
 
@@ -166,6 +200,12 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 		// never collected (mtime/size never change again). Backpressure
 		// delays the debounce-flush goroutine instead.
 		w.emitBlocking(ctx, events, fe)
+		// Record the flushed mtime in the shared seen map so the IC-BUG-43
+		// debounce recheck and the IC-BUG-44 safety-net rescan do not
+		// re-emit the file the debounce flush already delivered.
+		w.seenMu.Lock()
+		seen[path] = fe.ModTime
+		w.seenMu.Unlock()
 	}
 
 	for {
@@ -176,7 +216,7 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 				p.timer.Stop()
 			}
 			return ctx.Err()
-		case ev, ok := <-fw.Events:
+		case ev, ok := <-evc:
 			if !ok {
 				return nil
 			}
@@ -202,22 +242,25 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 			if p, ok := pending[ev.Name]; ok {
 				// Reset existing timer.
 				p.timer.Reset(closeWaitDebounce)
+				p.mu.Lock()
 				p.op = op
+				p.mu.Unlock()
 			} else {
 				path := ev.Name // capture for closure
 				p := &pendingEntry{op: op}
 				p.timer = time.AfterFunc(closeWaitDebounce, func() {
-					flush(path, p.op)
+					p.mu.Lock()
+					op := p.op
+					p.mu.Unlock()
+					flush(path, op)
 				})
 				pending[path] = p
 			}
-		case err, ok := <-fw.Errors:
+		case err, ok := <-erc:
 			if !ok {
 				return nil
 			}
-			// Same IC-BUG-44 story as runFsnotify: overflow errors are only
-			// Warn-logged here; the safety-net rescan is that knife's job.
-			w.logger.Warn("watcher: fsnotify error", zap.Error(err))
+			w.handleWatchError(ctx, events, seen, err)
 		}
 	}
 }
@@ -232,22 +275,30 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 // the correct semantics here, as it already is for pollScan (PR #100 F1) and
 // runCloseWait.
 //
-// Known trade-off (IC-BUG-44, deliberately out of scope here): while the
-// send blocks, fw.Events is not drained, so fsnotify's backend stops reading
-// the kernel watch queue; a sustained burst can overflow it. Overflow is
-// visible on both production platforms: Linux (inotify) reports it as
-// IN_Q_OVERFLOW on fw.Errors, and Windows (production, ReadDirectoryChangesW
-// backend in fsnotify v1.8.0) surfaces a buffer overflow as fsnotify
-// .ErrEventOverflow on fw.Errors. In both cases a safety-net poll scan
-// triggered on such an error would recover the missed files — IC-BUG-44's
-// knife. Only macOS kqueue (dev machines, not production) may drop silently.
-// Both follow-ups belong to IC-BUG-44's knife, not this one.
-func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher) error {
+// Known trade-off (IC-BUG-47 + IC-BUG-44, accepted): while the send blocks,
+// fw.Events is not drained, so fsnotify's backend stops reading the kernel
+// watch queue; a sustained burst can overflow it. Overflow is visible on both
+// production platforms: Linux (inotify) reports it as IN_Q_OVERFLOW on
+// fw.Errors, and Windows (production, ReadDirectoryChangesW backend in
+// fsnotify v1.8.0) surfaces a buffer overflow as fsnotify.ErrEventOverflow on
+// fw.Errors — both are the same sentinel, fsnotify.ErrEventOverflow. When
+// that happens, handleWatchError triggers a safety-net rescan that recovers
+// the files missed during the overflow window. Only macOS kqueue (dev
+// machines, not production) may drop the overflow silently.
+func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher, seen map[string]time.Time) error {
+	return w.loopFsnotify(ctx, events, seen, fw.Events, fw.Errors)
+}
+
+// loopFsnotify is the plain (non-close_wait) fsnotify event loop proper. The
+// event and error channels are parameters so tests can drive the loop
+// deterministically without a live fsnotify backend (whose channel lifecycle
+// would race with test-side injections).
+func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, evc <-chan fsnotify.Event, erc <-chan error) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case ev, ok := <-fw.Events:
+		case ev, ok := <-evc:
 			if !ok {
 				return nil
 			}
@@ -261,15 +312,11 @@ func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *
 					w.emitBlocking(ctx, events, FileEvent{Path: ev.Name, Op: "remove"})
 				}
 			}
-		case err, ok := <-fw.Errors:
+		case err, ok := <-erc:
 			if !ok {
 				return nil
 			}
-			// IC-BUG-44: on Linux this can be IN_Q_OVERFLOW and on Windows
-			// fsnotify.ErrEventOverflow — both mean queued events were lost
-			// to a kernel-buffer overflow. Today only a Warn; the safety-net
-			// rescan on such errors is IC-BUG-44's knife.
-			w.logger.Warn("watcher: fsnotify error", zap.Error(err))
+			w.handleWatchError(ctx, events, seen, err)
 		}
 	}
 }
@@ -295,7 +342,14 @@ func (w *Watcher) runPolling(ctx context.Context, events chan<- FileEvent) error
 }
 
 // pollScan walks the source directory and emits events for new/changed files.
-func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time) {
+// It returns the paths that were skipped because they are still inside the
+// close_wait debounce window (empty outside close_wait mode). On the polling
+// path the caller ignores the result — the next tick re-checks those files
+// anyway; on the fsnotify path the caller arms one-shot recheck timers for
+// them so a file whose writer exited during the window is still collected
+// (IC-BUG-43).
+func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time) []string {
+	var skipped []string
 	walk := func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
@@ -311,43 +365,14 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 		// scan path bypasses the debounce timer in runCloseWait, so emitting
 		// here would upload a truncated file under its own {time} storage key
 		// that the later full upload never overwrites (PR #100 review F2).
-		// Skip it without marking seen — the close_wait flow (or a later scan,
-		// once the file is quiet) picks it up.
+		// The path is returned to the caller: on the fsnotify path a one-shot
+		// recheck re-examines it once the debounce window has passed
+		// (IC-BUG-43); on the polling path the next tick does.
 		if w.appendMode == AppendModeCloseWait && time.Since(info.ModTime()) < closeWaitDebounce {
+			skipped = append(skipped, path)
 			return nil
 		}
-		prev, known := seen[path]
-		if !known || info.ModTime().After(prev) {
-			op := "write"
-			if !known {
-				op = "create"
-			}
-
-			var offset int64
-			if w.appendMode == AppendModeTail {
-				offset = w.tailOffsets[path]
-			}
-
-			fe := FileEvent{
-				Path:       path,
-				ModTime:    info.ModTime(),
-				Size:       info.Size(),
-				Op:         op,
-				FileOffset: offset,
-			}
-			// Mark as seen and record the tail offset only after the event has
-			// been delivered: if the send is aborted (ctx cancelled) or would
-			// drop the event, the next scan must retry the file instead of
-			// silently skipping it forever (PR #100 review F1).
-			if !w.emitBlocking(ctx, events, fe) {
-				return errWalkAborted
-			}
-			seen[path] = info.ModTime()
-			if w.appendMode == AppendModeTail {
-				w.tailOffsets[path] = info.Size()
-			}
-		}
-		return nil
+		return w.scanFile(ctx, events, seen, path, info)
 	}
 
 	if w.recursive {
@@ -356,17 +381,168 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 		entries, err := os.ReadDir(w.sourcePath)
 		if err != nil {
 			w.logger.Warn("watcher: read dir error", zap.Error(err))
-			return
+			return skipped
 		}
 		for _, d := range entries {
 			if d.IsDir() {
 				continue
 			}
 			if walk(filepath.Join(w.sourcePath, d.Name()), d, nil) != nil {
-				return // ctx cancelled, stop scanning
+				return skipped // ctx cancelled, stop scanning
 			}
 		}
 	}
+	return skipped
+}
+
+// scanFile emits an event for a single file if it is new or has changed since
+// it was last recorded in seen. It is the per-file core shared by pollScan
+// and the debounce recheck (IC-BUG-43). seen may be touched concurrently by
+// recheck timer goroutines, so every access is guarded by seenMu; the emit
+// itself happens outside the lock (emitBlocking must not hold it).
+func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, path string, info os.FileInfo) error {
+	w.seenMu.Lock()
+	prev, known := seen[path]
+	w.seenMu.Unlock()
+	if known && !info.ModTime().After(prev) {
+		return nil
+	}
+	op := "write"
+	if !known {
+		op = "create"
+	}
+
+	var offset int64
+	if w.appendMode == AppendModeTail {
+		offset = w.tailOffsets[path]
+	}
+
+	fe := FileEvent{
+		Path:       path,
+		ModTime:    info.ModTime(),
+		Size:       info.Size(),
+		Op:         op,
+		FileOffset: offset,
+	}
+	// Mark as seen and record the tail offset only after the event has
+	// been delivered: if the send is aborted (ctx cancelled) or would
+	// drop the event, the next scan must retry the file instead of
+	// silently skipping it forever (PR #100 review F1).
+	if !w.emitBlocking(ctx, events, fe) {
+		return errWalkAborted
+	}
+	w.seenMu.Lock()
+	seen[path] = info.ModTime()
+	w.seenMu.Unlock()
+	if w.appendMode == AppendModeTail {
+		w.tailOffsets[path] = info.Size()
+	}
+	return nil
+}
+
+// handleWatchError reacts to an error delivered on fw.Errors; it is shared by
+// the runFsnotify and runCloseWait event loops. Overflow errors mean the
+// kernel/OS watch queue dropped queued events while no one was draining
+// fw.Events, so the only recovery is a safety-net rescan of the watched tree:
+// any file created or modified during the overflow window is re-discovered by
+// mtime (IC-BUG-44). fsnotify reports the same sentinel on both production
+// platforms — fsnotify.ErrEventOverflow (Linux inotify IN_Q_OVERFLOW and the
+// Windows ReadDirectoryChangesW buffer overflow) — so a single errors.Is
+// check covers both. Any other error is only logged.
+// handleWatchError reacts to an error delivered on fw.Errors; it is shared by
+// the runFsnotify and runCloseWait event loops. Overflow errors mean the
+// kernel/OS watch queue dropped queued events while no one was draining
+// fw.Events, so the only recovery is a safety-net rescan of the watched tree:
+// any file created or modified during the overflow window is re-discovered by
+// mtime (IC-BUG-44). fsnotify reports the same sentinel on both production
+// platforms — fsnotify.ErrEventOverflow (Linux inotify IN_Q_OVERFLOW and the
+// Windows ReadDirectoryChangesW buffer overflow) — so a single errors.Is
+// check covers both. Any other error is only logged.
+func (w *Watcher) handleWatchError(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, err error) {
+	if !errors.Is(err, fsnotify.ErrEventOverflow) {
+		w.logger.Warn("watcher: fsnotify error", zap.Error(err))
+		return
+	}
+	w.logger.Warn("watcher: fsnotify watch queue overflow, triggering safety-net rescan", zap.Error(err))
+	w.safetyNetRescan(ctx, events, seen)
+}
+
+// safetyNetRescan re-walks the watched tree after an overflow window and
+// re-arms debounce rechecks for files that are still being written.
+//
+// Trade-off (IC-BUG-44, deliberate): while this scan runs, fw.Events is not
+// drained, and the scan itself sends through emitBlocking — a consumer that
+// is slow again can in theory trigger a second overflow during the rescan.
+// That risk is bounded and acceptable: the rescan exists precisely to
+// recover from such windows, and the alternative (dropping the files
+// silently) is strictly worse. emitBlocking's backpressure semantics are
+// intentional (IC-BUG-47) and are deliberately not changed here.
+func (w *Watcher) safetyNetRescan(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time) {
+	w.scheduleDebounceRechecks(ctx, events, seen, w.pollScan(ctx, events, seen))
+}
+
+// scheduleDebounceRechecks arms one-shot recheck timers for the paths the
+// scan skipped because they were still inside the close_wait debounce window
+// (see pollScan).
+func (w *Watcher) scheduleDebounceRechecks(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, paths []string) {
+	for _, path := range paths {
+		w.scheduleDebounceRecheck(ctx, events, seen, path)
+	}
+}
+
+// debounceRecheckGrace pads the recheck deadline past the close_wait debounce
+// window so the quiet check at fire time does not race the writer's final
+// flush.
+const debounceRecheckGrace = 100 * time.Millisecond
+
+// scheduleDebounceRecheck arms a one-shot timer that re-examines path once
+// the close_wait debounce window has passed (IC-BUG-43). Without it, a file
+// whose writer finished and exited within closeWaitDebounce of watcher
+// startup would never be collected: the scan skips it (PR #100 review F2),
+// no fsnotify event ever fires for it again, and nothing else looks at it.
+// Re-arming for a path that already has a live timer replaces the timer.
+func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return // gone; nothing to collect
+	}
+	wait := closeWaitDebounce - time.Since(info.ModTime()) + debounceRecheckGrace
+	if wait < debounceRecheckGrace {
+		wait = debounceRecheckGrace
+	}
+	w.seenMu.Lock()
+	defer w.seenMu.Unlock()
+	if w.rechecks == nil {
+		w.rechecks = make(map[string]*time.Timer)
+	}
+	if old, ok := w.rechecks[path]; ok {
+		old.Stop()
+	}
+	w.rechecks[path] = time.AfterFunc(wait, func() {
+		w.recheckAfterDebounce(ctx, events, seen, path)
+	})
+}
+
+// recheckAfterDebounce is the timer callback for scheduleDebounceRecheck: it
+// re-examines a previously skipped path and emits it if it has gone quiet.
+// A file that is still hot is left alone — its live Write/Create events
+// drive the runCloseWait debounce flush instead.
+func (w *Watcher) recheckAfterDebounce(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, path string) {
+	w.seenMu.Lock()
+	delete(w.rechecks, path)
+	w.seenMu.Unlock()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return // gone; nothing to collect
+	}
+	// F2 invariant (PR #100): never emit a file that may still be written.
+	if w.appendMode == AppendModeCloseWait && time.Since(info.ModTime()) < closeWaitDebounce {
+		return
+	}
+	// errWalkAborted only means ctx was cancelled; the timer callback has
+	// nowhere to report it and the next scan retries the file (PR #100 F1).
+	_ = w.scanFile(ctx, events, seen, path, info)
 }
 
 // buildEvent constructs a FileEvent for the file at path using its current

@@ -57,3 +57,20 @@ jobs:
       - name: test
         working-directory: agent
         run: go test ./... -count=1
+
+      # IC-BUG-44: real kernel-queue overflow test. The inotify backend is the
+      # production backend (and the only one that reliably reports
+      # ErrEventOverflow), so this runs on Linux only. The file is
+      # double-gated (//go:build linux && overflow + env var); the sysctl
+      # makes the 20k-file burst actually overflow the kernel queue (some CI
+      # images raise the default), and the greps turn a silently-skipped or
+      # not-really-overflowing run into a hard failure.
+      - name: test (real inotify overflow — Linux only)
+        if: runner.os == 'Linux'
+        working-directory: agent
+        run: |
+          sudo sysctl -w fs.inotify.max_queued_events=4096
+          go test -tags overflow -run TestInotifyOverflow_SafetyNetRescan_RecoversLostFiles -v -count=1 -timeout 10m 2>&1 | tee overflow-test.log
+          grep -q "gate open" overflow-test.log || { echo "::error::overflow test was skipped (gate closed) — not allowed to pass silently"; exit 1; }
+          grep -q "overflow is guaranteed" overflow-test.log || { echo "::error::kernel queue was not small enough to overflow — safety-net path not exercised"; exit 1; }
+          grep -q "^--- PASS" overflow-test.log || { echo "::error::overflow test did not pass"; exit 1; }
