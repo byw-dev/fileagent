@@ -1147,3 +1147,160 @@ func TestCloseWaitFlush_PreventsRescanReemit(t *testing.T) {
 	case <-time.After(600 * time.Millisecond):
 	}
 }
+
+// ── PR #108 review F1: real-time deliveries must be recorded in seen ─────────
+
+// A file delivered in real time by the default (non-close_wait) loop must be
+// recorded in the shared seen map; otherwise the safety-net rescan re-emits
+// every real-time-delivered file as "create" on the next overflow.
+func TestLoopFsnotify_MarksSeenOnDelivery_NoRescanReemit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "live.txt")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error, 1)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = w.loopFsnotify(ctx, events, seen, evc, erc) }()
+
+	// A file arrives in real time and is delivered.
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	select {
+	case fe := <-events:
+		require.Equal(t, path, fe.Path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("real-time create was not delivered")
+	}
+
+	// The delivery must be recorded in seen (review F1).
+	w.seenMu.Lock()
+	_, known := seen[path]
+	w.seenMu.Unlock()
+	require.True(t, known, "real-time delivery must record the file in seen")
+
+	// An overflow rescan must therefore not re-emit the unchanged file.
+	erc <- fsnotify.ErrEventOverflow
+	select {
+	case fe := <-events:
+		t.Fatalf("rescan re-emitted a file already delivered in real time: %s (op=%s)", fe.Path, fe.Op)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Guard: remove events are not "deliveries" — they must not mark the file
+// seen (only create/write deliveries do).
+func TestLoopFsnotify_RemoveEvent_DoesNotMarkSeen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gone.txt")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = w.loopFsnotify(ctx, events, seen, evc, nil) }()
+
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Remove}
+	select {
+	case fe := <-events:
+		require.Equal(t, "remove", fe.Op)
+	case <-time.After(2 * time.Second):
+		t.Fatal("remove event was not delivered")
+	}
+
+	w.seenMu.Lock()
+	_, known := seen[path]
+	w.seenMu.Unlock()
+	assert.False(t, known, "remove events must not mark the file seen")
+}
+
+// ── PR #108 review F2: timer lifecycle on shutdown ────────────────────────────
+
+// When Start returns (ctx cancelled / rule cancelled / hot reload), every
+// pending debounce recheck timer must be stopped and dropped: the closures
+// otherwise keep the watcher, the seen map, the context and the events
+// channel alive per skipped path (the production concern is the leak — the
+// events channel itself is never closed in production, so this is not a
+// send-on-closed-channel crash).
+func TestWatcher_Start_Return_CleansUpRecheckTimers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hot.log")
+	require.NoError(t, os.WriteFile(path, []byte("still writing"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx, events) }()
+
+	// Wait until the initial scan has scheduled the debounce recheck.
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.rechecks) == 1
+	}, 3*time.Second, 10*time.Millisecond, "initial scan should schedule a debounce recheck for the hot file")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start did not return after context cancel")
+	}
+
+	w.seenMu.Lock()
+	n := len(w.rechecks)
+	w.seenMu.Unlock()
+	assert.Zero(t, n, "recheck timers must be stopped and cleared when Start returns")
+}
+
+// When the event loop exits because the fsnotify event channel closed (the
+// shutdown path that is NOT ctx cancellation), the per-file close_wait
+// debounce timers must be stopped too — a live timer would still flush into
+// the events channel after the loop is gone.
+func TestLoopCloseWait_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pending.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 8)
+	seen := make(map[string]time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+
+	// A write registers the pending debounce timer (fires ~500ms later).
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+
+	// The event channel closes (shutdown path distinct from ctx cancel).
+	close(evc)
+
+	// Give the loop time to exit, then make sure the flush never fires.
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case fe := <-events:
+		t.Fatalf("pending debounce timer was not stopped when the event loop exited: delivered %s", fe.Path)
+	case <-time.After(900 * time.Millisecond):
+	}
+}

@@ -123,6 +123,9 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 		return w.runPolling(ctx, events)
 	}
 	defer fw.Close()
+	// PR #108 review F2: drop every debounce recheck timer when the watcher
+	// shuts down, whatever path returns below.
+	defer w.stopAllRechecks()
 
 	if err := w.addWatchPaths(fw); err != nil {
 		w.logger.Warn("watcher: cannot add watch paths, using polling", zap.Error(err))
@@ -177,19 +180,21 @@ func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw 
 	return w.loopCloseWait(ctx, events, seen, fw.Events, fw.Errors)
 }
 
+// closeWaitPending is one file's in-flight close_wait debounce state.
+type closeWaitPending struct {
+	timer *time.Timer
+	// mu guards op: the loop goroutine updates it on every event while a
+	// firing timer goroutine reads it for the flush.
+	mu sync.Mutex
+	op string
+}
+
 // loopCloseWait is the close_wait event loop proper. The event and error
 // channels are parameters so tests can drive the loop deterministically
 // without a live fsnotify backend (whose channel lifecycle would race with
 // test-side injections).
 func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, evc <-chan fsnotify.Event, erc <-chan error) error {
-	type pendingEntry struct {
-		timer *time.Timer
-		// mu guards op: the loop goroutine updates it on every event while a
-		// firing timer goroutine reads it for the flush.
-		mu sync.Mutex
-		op string
-	}
-	pending := make(map[string]*pendingEntry)
+	pending := make(map[string]*closeWaitPending)
 
 	flush := func(path, op string) {
 		fe, err := w.buildEvent(path, op)
@@ -203,21 +208,18 @@ func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, se
 		// Record the flushed mtime in the shared seen map so the IC-BUG-43
 		// debounce recheck and the IC-BUG-44 safety-net rescan do not
 		// re-emit the file the debounce flush already delivered.
-		w.seenMu.Lock()
-		seen[path] = fe.ModTime
-		w.seenMu.Unlock()
+		w.markSeen(seen, path, fe.ModTime)
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			// Cancel all pending timers before returning.
-			for _, p := range pending {
-				p.timer.Stop()
-			}
+			stopPendingTimers(pending)
 			return ctx.Err()
 		case ev, ok := <-evc:
 			if !ok {
+				stopPendingTimers(pending)
 				return nil
 			}
 			if ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename) {
@@ -247,7 +249,7 @@ func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, se
 				p.mu.Unlock()
 			} else {
 				path := ev.Name // capture for closure
-				p := &pendingEntry{op: op}
+				p := &closeWaitPending{op: op}
 				p.timer = time.AfterFunc(closeWaitDebounce, func() {
 					p.mu.Lock()
 					op := p.op
@@ -258,6 +260,7 @@ func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, se
 			}
 		case err, ok := <-erc:
 			if !ok {
+				stopPendingTimers(pending)
 				return nil
 			}
 			w.handleWatchError(ctx, events, seen, err)
@@ -304,7 +307,17 @@ func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, see
 			}
 			if ev.Has(fsnotify.Create) || ev.Has(fsnotify.Write) {
 				if fe, err := w.buildEvent(ev.Name, opString(ev)); err == nil {
-					w.emitBlocking(ctx, events, fe)
+					// PR #108 review F1: record the delivered mtime in the
+					// shared seen map — otherwise every real-time-delivered
+					// file is invisible to the safety-net rescan, which
+					// would re-emit them all as "create" on the next
+					// overflow. Only on successful delivery: an aborted send
+					// must stay retryable (PR #100 F1). Tail mode is
+					// unaffected: buildEvent already advanced tailOffsets,
+					// and seen is mtime-only.
+					if w.emitBlocking(ctx, events, fe) {
+						w.markSeen(seen, ev.Name, fe.ModTime)
+					}
 				}
 			}
 			if ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename) {
@@ -440,15 +453,39 @@ func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen ma
 	return nil
 }
 
-// handleWatchError reacts to an error delivered on fw.Errors; it is shared by
-// the runFsnotify and runCloseWait event loops. Overflow errors mean the
-// kernel/OS watch queue dropped queued events while no one was draining
-// fw.Events, so the only recovery is a safety-net rescan of the watched tree:
-// any file created or modified during the overflow window is re-discovered by
-// mtime (IC-BUG-44). fsnotify reports the same sentinel on both production
-// platforms — fsnotify.ErrEventOverflow (Linux inotify IN_Q_OVERFLOW and the
-// Windows ReadDirectoryChangesW buffer overflow) — so a single errors.Is
-// check covers both. Any other error is only logged.
+// markSeen records the delivered mtime in the shared seen map. seen may be
+// touched concurrently by recheck timer goroutines, so every access is
+// guarded by seenMu. Callers must only call it after the event has actually
+// been delivered: an aborted send must leave the file retryable (PR #100 F1).
+func (w *Watcher) markSeen(seen map[string]time.Time, path string, modTime time.Time) {
+	w.seenMu.Lock()
+	seen[path] = modTime
+	w.seenMu.Unlock()
+}
+
+// stopAllRechecks stops and forgets every pending debounce recheck timer.
+// Called when Start returns (rule cancelled / hot reload): the timer
+// closures otherwise keep the watcher, the seen map, the context and the
+// events channel alive per skipped path — with a future mtime the wait can
+// be arbitrarily long. The events channel itself is never closed in
+// production, so the consequence is retention, not a send-after-close panic.
+func (w *Watcher) stopAllRechecks() {
+	w.seenMu.Lock()
+	defer w.seenMu.Unlock()
+	for path, t := range w.rechecks {
+		t.Stop()
+		delete(w.rechecks, path)
+	}
+}
+
+// stopPendingTimers stops every live close_wait debounce timer in pending.
+// Called on every exit path of loopCloseWait.
+func stopPendingTimers(pending map[string]*closeWaitPending) {
+	for _, p := range pending {
+		p.timer.Stop()
+	}
+}
+
 // handleWatchError reacts to an error delivered on fw.Errors; it is shared by
 // the runFsnotify and runCloseWait event loops. Overflow errors mean the
 // kernel/OS watch queue dropped queued events while no one was draining
