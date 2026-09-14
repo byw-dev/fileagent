@@ -54,5 +54,5 @@ SET bucket_id = $2,
 WHERE id = $1 AND agent_id = $14 AND org_id = $15
 RETURNING *;
 
--- name: DeleteCollectionRule :exec
-DELETE FROM collection_rules WHERE id = $1;
+-- name: DeleteCollectionRule :execrows
+DELETE FROM collection_rules WHERE id = $1 AND agent_id = $2 AND org_id = $3;

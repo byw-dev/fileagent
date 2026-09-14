@@ -31,6 +31,33 @@ type AgentConn struct {
 	// and read by the same connection's heartbeat handling — no concurrent
 	// access.
 	SyncDegraded bool
+
+	// sendMu guards the write-confirmation state below (IC-BUG-32). Lock
+	// order: the registry's r.mu.RLock covers only the map lookup and is
+	// always released (or held only across a non-blocking enqueue) BEFORE any
+	// waiting; the consumer goroutine never takes r.mu. The enqueue under
+	// sendMu must stay non-blocking (select + default): blocking on a full
+	// SendCh while holding sendMu would deadlock against the consumer, which
+	// needs sendMu to publish write progress.
+	sendMu sync.Mutex
+	// queuedSeq is the sequence number assigned to the most recent enqueue.
+	// Every channel element consumes one sequence number at enqueue time —
+	// Send and SendSync alike — so that FIFO order equals sequence order and a
+	// waiter can tell when its own message has been written.
+	queuedSeq uint64
+	// sentSeq is the number of messages the send goroutine has successfully
+	// written to the stream. With one consumer and FIFO delivery it is also
+	// the sequence number of the last written message.
+	sentSeq uint64
+	// notify is the generation channel for write progress: it is closed (and
+	// replaced) every time sentSeq advances, so waiters can select on it.
+	notify chan struct{}
+	// writerDone is closed exactly once when the send goroutine stops for any
+	// reason (ctx done, SendCh closed, send error). Waiters select on it so a
+	// torn-down connection releases them immediately instead of burning the
+	// timeout (IC-BUG-28: a dismantled connection must never leave a waiter
+	// hanging).
+	writerDone chan struct{}
 }
 
 // AgentRegistry tracks all active bidirectional agent connections.
@@ -58,6 +85,8 @@ func (r *AgentRegistry) Register(
 		SendCh:      make(chan *agentv1.ServerMessage, sendChCapacity),
 		ConnectedAt: time.Now(),
 		CancelFunc:  cancelFn,
+		notify:      make(chan struct{}),
+		writerDone:  make(chan struct{}),
 	}
 	r.mu.Lock()
 	r.conns[agentID] = conn
@@ -108,22 +137,112 @@ func (r *AgentRegistry) Get(agentID string) *AgentConn {
 	return r.conns[agentID]
 }
 
+// enqueue performs the non-blocking send and assigns the FIFO sequence number
+// the caller can wait on. The caller must hold r.mu (read) across this call:
+// that is what serialises the send against Unregister's close(SendCh).
+//
+// The send MUST be non-blocking (select + default). With a full SendCh,
+// blocking here while holding sendMu would deadlock the consumer, which needs
+// sendMu to publish write progress (see sendMu).
+func (c *AgentConn) enqueue(msg *agentv1.ServerMessage) (uint64, bool) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	select {
+	case c.SendCh <- msg:
+		c.queuedSeq++
+		return c.queuedSeq, true
+	default:
+		return 0, false
+	}
+}
+
+// noteWritten is called by the send goroutine after a successful stream.Send.
+// It advances the confirmed sequence and wakes every waiter.
+func (c *AgentConn) noteWritten() {
+	c.sendMu.Lock()
+	c.sentSeq++
+	close(c.notify)
+	c.notify = make(chan struct{})
+	c.sendMu.Unlock()
+}
+
+// markWriterStopped releases every pending write-confirmation waiter when the
+// send goroutine stops for any reason. Called exactly once, deferred at the
+// goroutine's single exit path.
+func (c *AgentConn) markWriterStopped() {
+	close(c.writerDone)
+}
+
+// waitForWrite blocks a bounded time until the message enqueued as seq has
+// been written to the stream (sentSeq >= seq), the send goroutine stops, or
+// the timeout elapses. It holds NO registry lock and no sendMu while waiting.
+func (c *AgentConn) waitForWrite(seq uint64, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		c.sendMu.Lock()
+		if c.sentSeq >= seq {
+			c.sendMu.Unlock()
+			return true
+		}
+		notify := c.notify
+		done := c.writerDone
+		c.sendMu.Unlock()
+		select {
+		case <-notify:
+			// Write progress: re-check the sequence.
+		case <-done:
+			// The send goroutine stopped; nothing else will be written.
+			return false
+		case <-timer.C:
+			return false
+		}
+	}
+}
+
 // Send enqueues a message to the agent's send channel.
 // Returns true if the message was queued, false if the agent is not connected
 // or the channel is full.
 func (r *AgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
 	r.mu.RLock()
 	conn, ok := r.conns[agentID]
-	defer r.mu.RUnlock()
 	if !ok {
+		r.mu.RUnlock()
 		return false
 	}
-	select {
-	case conn.SendCh <- msg:
-		return true
-	default:
+	_, sent := conn.enqueue(msg)
+	r.mu.RUnlock()
+	return sent
+}
+
+// SendSync enqueues a message and waits a bounded time for the send goroutine
+// to confirm the message was written to the stream, returning true only then.
+// It is the instrument for the one place where a lost command has a name
+// (Revoke, IC-BUG-32): Send alone only proves the command entered the queue,
+// and a Disconnect immediately after can cancel the stream before a send
+// goroutine that is busy with an earlier message ever reaches it.
+//
+// The bound is the caller's responsibility and must stay hard: an agent that
+// never reads its stream pins stream.Send in flow control forever, and this
+// call must never be the thing that waits for it. The enqueue is non-blocking
+// (a full queue is a refusal, as with Send), the wait holds no locks, and a
+// connection torn down mid-wait releases the waiter immediately via
+// writerDone. The confirmation means "written to the transport", not "read by
+// the agent" — flow control guarantees the former is as far as an honest
+// bounded wait can go.
+func (r *AgentRegistry) SendSync(agentID string, msg *agentv1.ServerMessage, timeout time.Duration) bool {
+	r.mu.RLock()
+	conn, ok := r.conns[agentID]
+	if !ok {
+		r.mu.RUnlock()
 		return false
 	}
+	seq, enqueued := conn.enqueue(msg)
+	r.mu.RUnlock()
+	if !enqueued {
+		return false
+	}
+	return conn.waitForWrite(seq, timeout)
 }
 
 // IsOnline reports whether the agent currently has an active connection.

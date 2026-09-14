@@ -127,6 +127,11 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	// goroutine is the consumer, so it must exist before the producers run.
 	sendErr := make(chan error, 1)
 	go func() {
+		// Release any SendSync waiter when this goroutine stops, whatever the
+		// reason: nothing else will be written, so making them burn their
+		// whole timeout would be pointless (and on the Revoke path, the
+		// timeout IS the stream cut).
+		defer conn.markWriterStopped()
 		for {
 			select {
 			case <-ctx.Done():
@@ -141,6 +146,8 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 					sendErr <- err
 					return
 				}
+				// Publish write progress for SendSync waiters (IC-BUG-32).
+				conn.noteWritten()
 			}
 		}
 	}()
@@ -655,9 +662,15 @@ func (s *Server) handleDirectoryListing(agentID string, listing *agentv1.Directo
 	}
 
 	if listing.GetError() != "" {
-		s.dirResultStore.Deliver(listing.GetRequestId(), dirstore.Result{
+		if !s.dirResultStore.Deliver(listing.GetRequestId(), agentID, dirstore.Result{
 			Error: listing.GetError(),
-		})
+		}) {
+			s.logger.Warn("dir listing discarded: not addressed to this agent, or already timed out",
+				zap.String("agent_id", agentID),
+				zap.String("request_id", listing.GetRequestId()),
+			)
+			return
+		}
 		return
 	}
 
@@ -680,7 +693,14 @@ func (s *Server) handleDirectoryListing(agentID string, listing *agentv1.Directo
 		entries = append(entries, entry)
 	}
 
-	s.dirResultStore.Deliver(listing.GetRequestId(), dirstore.Result{Entries: entries})
+	if !s.dirResultStore.Deliver(listing.GetRequestId(), agentID, dirstore.Result{Entries: entries}) {
+		s.logger.Warn("dir listing discarded: not addressed to this agent, or already timed out",
+			zap.String("agent_id", agentID),
+			zap.String("request_id", listing.GetRequestId()),
+			zap.Int("entries", len(entries)),
+		)
+		return
+	}
 	s.logger.Debug("dir listing delivered",
 		zap.String("agent_id", agentID),
 		zap.String("request_id", listing.GetRequestId()),

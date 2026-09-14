@@ -41,6 +41,9 @@ type mockAgentsDB struct {
 	fullUpdateErr error
 	renameErr     error
 	deleteErr     error
+	deleteRows    int64
+	deleteCalls   int
+	lastDeleteID  uuid.UUID
 	logs          []*db.UploadLog
 	logsErr       error
 	logsCount     int64
@@ -141,7 +144,11 @@ func (m *mockAgentsDB) UpdateCollectionRule(_ context.Context, arg db.UpdateColl
 		UpdatedAt:        time.Now(),
 	}, nil
 }
-func (m *mockAgentsDB) DeleteCollectionRule(_ context.Context, _ uuid.UUID) error { return m.deleteErr }
+func (m *mockAgentsDB) DeleteCollectionRule(_ context.Context, id uuid.UUID, _ uuid.UUID, _ uuid.UUID) (int64, error) {
+	m.deleteCalls++
+	m.lastDeleteID = id
+	return m.deleteRows, m.deleteErr
+}
 func (m *mockAgentsDB) ListUploadLogs(_ context.Context, _ db.ListUploadLogsParams) ([]*db.UploadLog, error) {
 	return m.logs, m.logsErr
 }
@@ -163,11 +170,21 @@ func (m *mockAgentMgr) RevokeAgent(_ context.Context, _ uuid.UUID, _ uuid.UUID) 
 }
 
 type mockDispatcher struct {
-	dispatchErr    error
-	cancelErr      error
-	dispatched     int
-	cancelled      int
-	lastDispatched *db.CollectionRule
+	dispatchErr       error
+	cancelErr         error
+	dispatched        int
+	cancelled         int
+	lastDispatched    *db.CollectionRule
+	lastCancelRuleID  string
+	lastCancelAgentID string
+	cancelCalls       []mockCancelCall
+}
+
+// mockCancelCall records one DispatchRuleCancel invocation with its full
+// argument list, so tests can assert exactly who was told what.
+type mockCancelCall struct {
+	ruleID  string
+	agentID string
 }
 
 func (m *mockDispatcher) DispatchRule(_ context.Context, rule *db.CollectionRule) error {
@@ -175,8 +192,11 @@ func (m *mockDispatcher) DispatchRule(_ context.Context, rule *db.CollectionRule
 	m.lastDispatched = rule
 	return m.dispatchErr
 }
-func (m *mockDispatcher) DispatchRuleCancel(_ context.Context, _, _ string) error {
+func (m *mockDispatcher) DispatchRuleCancel(_ context.Context, ruleID, agentID string) error {
 	m.cancelled++
+	m.lastCancelRuleID = ruleID
+	m.lastCancelAgentID = agentID
+	m.cancelCalls = append(m.cancelCalls, mockCancelCall{ruleID: ruleID, agentID: agentID})
 	return m.cancelErr
 }
 
@@ -185,12 +205,19 @@ type mockAgentRegistry struct {
 	sendOK          bool
 	sentTo          string
 	lastSent        *agentv1.ServerMessage
+	syncedTo        string
+	lastSynced      *agentv1.ServerMessage
 	disconnectCalls int
 }
 
 func (m *mockAgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
 	m.sentTo = agentID
 	m.lastSent = msg
+	return m.sendOK
+}
+func (m *mockAgentRegistry) SendSync(agentID string, msg *agentv1.ServerMessage, _ time.Duration) bool {
+	m.syncedTo = agentID
+	m.lastSynced = msg
 	return m.sendOK
 }
 func (m *mockAgentRegistry) IsOnline(_ string) bool { return m.online }
@@ -202,10 +229,16 @@ func (m *mockAgentRegistry) Disconnect(_ string) bool {
 // mockDirStore implements handler.DirListingStore for tests.
 // If result is non-nil, Register immediately sends it into the returned channel.
 type mockDirStore struct {
-	result *dirstore.Result
+	result            *dirstore.Result
+	lastRegisterAgent string
+	lastRegisterReqID string
+	registerCalls     int
 }
 
-func (m *mockDirStore) Register(_ string) <-chan dirstore.Result {
+func (m *mockDirStore) Register(requestID, agentID string) <-chan dirstore.Result {
+	m.registerCalls++
+	m.lastRegisterReqID = requestID
+	m.lastRegisterAgent = agentID
 	ch := make(chan dirstore.Result, 1)
 	if m.result != nil {
 		ch <- *m.result
@@ -453,9 +486,11 @@ func TestAgentsHandler_Revoke_SendsRevokeCommandWhenOnline(t *testing.T) {
 	testAgentsRouter(h).ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
-	require.NotNil(t, registry.lastSent)
-	assert.Equal(t, agentID, registry.sentTo)
-	revoke := registry.lastSent.GetRevoke()
+	// Revoke sends the command via SendSync (IC-SEC-2 ③): a bounded wait for
+	// the write-out confirmation, then the cut below regardless.
+	require.NotNil(t, registry.lastSynced)
+	assert.Equal(t, agentID, registry.syncedTo)
+	revoke := registry.lastSynced.GetRevoke()
 	require.NotNil(t, revoke)
 	assert.Equal(t, "revoked_by_admin", revoke.GetReason())
 
@@ -536,6 +571,25 @@ func TestAgentsHandler_ListDir_WithDirStore_AgentOnline_Returns200WithEntries(t 
 	assert.Equal(t, "file.csv", entry["name"])
 	assert.Equal(t, "/data/file.csv", entry["path"])
 	assert.Equal(t, false, entry["is_dir"])
+}
+
+// IC-SEC-2 ②: the REST side must register the pending request as addressed to
+// the URL agent, so the store can refuse a listing delivered by any other one.
+func TestAgentsHandler_ListDir_RegistersWithURIAgent(t *testing.T) {
+	agentID := uuid.New()
+	registry := &mockAgentRegistry{online: true, sendOK: true}
+	store := &mockDirStore{result: &dirstore.Result{}}
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, nil, registry, newTestLogger())
+	h.WithDirStore(store)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+agentID.String()+"/list-dir", bytes.NewBufferString(`{"path":"/data"}`))
+	req.Header.Set("Content-Type", "application/json")
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, 1, store.registerCalls)
+	assert.Equal(t, agentID.String(), store.lastRegisterAgent,
+		"Register must record the agent the command is sent to")
+	assert.NotEmpty(t, store.lastRegisterReqID)
 }
 
 // When the agent reports an error the handler returns 502 with the agent's
@@ -726,7 +780,7 @@ func TestAgentsHandler_CreateRule_InvalidTimezone_Warns(t *testing.T) {
 		assert.Contains(t, fmt.Sprint(warnings), "invalid timezone", tpl)
 	}
 	// A valid timezone must not warn (note: {time:...} would legitimately warn as
-// the deprecated alias — use the declared {submit_time} name).
+	// the deprecated alias — use the declared {submit_time} name).
 	body := `{"bucket_id":"` + uuid.New().String() + `","name":"rule1","mode":"watch","base_path":"/data","path_pattern":"*.log","dest_path_template":"{submit_time:yyyy|tz=Asia/Shanghai}/{filename}"}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+uuid.New().String()+"/rules", bytes.NewBufferString(body))
@@ -1001,12 +1055,92 @@ func TestAgentsHandler_UpdateRule_FullUpdate_NotFound(t *testing.T) {
 // ── DeleteRule ────────────────────────────────────────────────────────────────
 
 func TestAgentsHandler_DeleteRule_Success(t *testing.T) {
+	// The owner deleting their own rule keeps working: 204 + one cancel to the
+	// rule's owner (IC-SEC-2 ①).
+	agentID := uuid.New()
+	rule := &db.CollectionRule{ID: uuid.New(), AgentID: agentID, OrgID: uuid.New()}
 	dispatcher := &mockDispatcher{}
-	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, dispatcher, nil, newTestLogger())
+	mockDB := &mockAgentsDB{rule: rule, deleteRows: 1}
+	h := handler.NewAgentsHandler(mockDB, nil, dispatcher, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/"+agentID.String()+"/rules/"+rule.ID.String(), nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNoContent, w.Code)
+	assert.Equal(t, 1, dispatcher.cancelled)
+	assert.Equal(t, agentID.String(), dispatcher.lastCancelAgentID)
+}
+
+// IC-SEC-2 ①: the delete path must be scoped to the rule's owner. A rule id
+// is client-supplied, so "DELETE /agents/<A>/rules/<rid>" with a rid belonging
+// to agent B must not remove B's rule, must not dispatch any cancel, and must
+// answer 404 — the same treatment updateRuleFull already gives a mismatch.
+// The scoped DELETE (id + agent_id + org_id) is the guard: it runs with the
+// row's owner and reports 0 rows, which both refuses the delete and closes the
+// read-then-delete race window.
+func TestAgentsHandler_DeleteRule_WrongOwner_Returns404WithoutCancelOrDelete(t *testing.T) {
+	urlAgent := uuid.New()
+	rule := &db.CollectionRule{ID: uuid.New(), AgentID: uuid.New(), OrgID: uuid.New()}
+	dispatcher := &mockDispatcher{}
+	// deleteRows defaults to 0: the scoped DELETE matched nothing, i.e. the
+	// rule (owned by another agent) is still in the DB.
+	mockDB := &mockAgentsDB{rule: rule}
+	h := handler.NewAgentsHandler(mockDB, nil, dispatcher, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/"+urlAgent.String()+"/rules/"+rule.ID.String(), nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Equal(t, 0, dispatcher.cancelled,
+		"a refused delete must not dispatch any cancel")
+	assert.Empty(t, dispatcher.cancelCalls)
+	// The refusal happens inside the scoped DELETE, which must still have been
+	// attempted with the rule row's identity — not skipped, not re-keyed to the
+	// URL agent.
+	assert.Equal(t, 1, mockDB.deleteCalls)
+	assert.Equal(t, rule.ID, mockDB.lastDeleteID)
+}
+
+// IC-SEC-2 ①: the cancel recipient must come from the DB row, never from the
+// URL. The mock returns a rule whose owner differs from the URL agent (the DB
+// enforces ownership; the handler does not re-check), and the delete succeeds,
+// so the cancel must be dispatched to the row's AgentID.
+func TestAgentsHandler_DeleteRule_CancelGoesToDBRowOwner(t *testing.T) {
+	urlAgent := uuid.New()
+	rowOwner := uuid.New()
+	rule := &db.CollectionRule{ID: uuid.New(), AgentID: rowOwner, OrgID: uuid.New()}
+	dispatcher := &mockDispatcher{}
+	mockDB := &mockAgentsDB{rule: rule, deleteRows: 1}
+	h := handler.NewAgentsHandler(mockDB, nil, dispatcher, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/"+urlAgent.String()+"/rules/"+rule.ID.String(), nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	require.Equal(t, http.StatusNoContent, w.Code)
+	require.Equal(t, 1, dispatcher.cancelled)
+	assert.Equal(t, rule.ID.String(), dispatcher.lastCancelRuleID)
+	assert.Equal(t, rowOwner.String(), dispatcher.lastCancelAgentID,
+		"the cancel recipient must be the DB row's agent, not c.Param(\"id\")")
+}
+
+// IC-SEC-2 ①: an unknown rule id must 404 before anything is deleted or
+// dispatched.
+func TestAgentsHandler_DeleteRule_UnknownRule_Returns404WithoutCancel(t *testing.T) {
+	dispatcher := &mockDispatcher{}
+	mockDB := &mockAgentsDB{ruleGetErr: sql.ErrNoRows}
+	h := handler.NewAgentsHandler(mockDB, nil, dispatcher, nil, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/"+uuid.New().String()+"/rules/"+uuid.New().String(), nil)
 	testAgentsRouter(h).ServeHTTP(w, req)
-	assert.Equal(t, http.StatusNoContent, w.Code)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Equal(t, 0, dispatcher.cancelled)
+	assert.Equal(t, 0, mockDB.deleteCalls)
+}
+
+// IC-SEC-2 ①: the URL agent id must still be parsed and validated.
+func TestAgentsHandler_DeleteRule_InvalidAgentID_Returns400(t *testing.T) {
+	h := handler.NewAgentsHandler(&mockAgentsDB{}, nil, &mockDispatcher{}, nil, newTestLogger())
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/not-a-uuid/rules/"+uuid.New().String(), nil)
+	testAgentsRouter(h).ServeHTTP(w, req)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 // ── ListUploadLogs ────────────────────────────────────────────────────────────
@@ -1087,9 +1221,11 @@ func TestAgentsHandler_DeleteRule_InvalidRuleID(t *testing.T) {
 }
 
 func TestAgentsHandler_DeleteRule_DBError(t *testing.T) {
-	h := handler.NewAgentsHandler(&mockAgentsDB{deleteErr: assert.AnError}, nil, nil, nil, newTestLogger())
+	rule := &db.CollectionRule{ID: uuid.New(), AgentID: uuid.New(), OrgID: uuid.New()}
+	mockDB := &mockAgentsDB{rule: rule, deleteErr: assert.AnError}
+	h := handler.NewAgentsHandler(mockDB, nil, nil, nil, newTestLogger())
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/"+uuid.New().String()+"/rules/"+uuid.New().String(), nil)
+	req, _ := http.NewRequest(http.MethodDelete, "/api/v1/agents/"+uuid.New().String()+"/rules/"+rule.ID.String(), nil)
 	testAgentsRouter(h).ServeHTTP(w, req)
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }

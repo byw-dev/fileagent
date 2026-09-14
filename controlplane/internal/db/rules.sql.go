@@ -92,13 +92,16 @@ func (q *Queries) CreateCollectionRule(ctx context.Context, arg CreateCollection
 	return &i, err
 }
 
-const deleteCollectionRule = `-- name: DeleteCollectionRule :exec
-DELETE FROM collection_rules WHERE id = $1
+const deleteCollectionRule = `-- name: DeleteCollectionRule :execrows
+DELETE FROM collection_rules WHERE id = $1 AND agent_id = $2 AND org_id = $3
 `
 
-func (q *Queries) DeleteCollectionRule(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.ExecContext(ctx, deleteCollectionRule, id)
-	return err
+func (q *Queries) DeleteCollectionRule(ctx context.Context, iD uuid.UUID, agentID uuid.UUID, orgID uuid.UUID) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteCollectionRule, iD, agentID, orgID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const getCollectionRuleByID = `-- name: GetCollectionRuleByID :one

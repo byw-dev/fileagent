@@ -3,6 +3,7 @@ package grpcserver
 import (
 	"context"
 	"testing"
+	"time"
 
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/stretchr/testify/assert"
@@ -131,4 +132,80 @@ func TestAgentRegistryReconnectWhileSending(t *testing.T) {
 	require.True(t, r.Unregister(current))
 	require.False(t, r.Unregister(current))
 	require.False(t, r.Unregister(nil))
+}
+
+// ── SendSync (IC-SEC-2 ③) ─────────────────────────────────────────────────────
+
+// startFakeConsumer mimics the production send goroutine at registry level:
+// it consumes SendCh in order and publishes write progress per message.
+func startFakeConsumer(conn *AgentConn) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer conn.markWriterStopped()
+		for msg := range conn.SendCh {
+			_ = msg
+			conn.noteWritten()
+		}
+	}()
+	return func() { close(conn.SendCh); <-done }
+}
+
+func TestSendSync_ConfirmsAfterWrite(t *testing.T) {
+	r := NewAgentRegistry()
+	conn := r.Register("agent-1", nil, func() {})
+	stop := startFakeConsumer(conn)
+	defer stop()
+
+	msg := &agentv1.ServerMessage{Payload: &agentv1.ServerMessage_Ping{Ping: &agentv1.PingCommand{}}}
+	assert.True(t, r.SendSync("agent-1", msg, time.Second),
+		"the consumer confirmed the write, so SendSync must report success")
+}
+
+func TestSendSync_TimeoutWhenNothingIsWritten(t *testing.T) {
+	r := NewAgentRegistry()
+	_ = r.Register("agent-1", nil, func() {})
+	// No consumer: nothing is ever dequeued, nothing is ever written.
+
+	start := time.Now()
+	ok := r.SendSync("agent-1", &agentv1.ServerMessage{}, 100*time.Millisecond)
+	elapsed := time.Since(start)
+	assert.False(t, ok, "a write that never happened must not be confirmed")
+	assert.Less(t, elapsed, 500*time.Millisecond,
+		"the bound is hard: the waiter must not hang past it")
+}
+
+func TestSendSync_AgentNotConnected(t *testing.T) {
+	r := NewAgentRegistry()
+	assert.False(t, r.SendSync("nobody", &agentv1.ServerMessage{}, 100*time.Millisecond))
+}
+
+func TestSendSync_QueueFull_IsRefusal(t *testing.T) {
+	r := NewAgentRegistry()
+	conn := r.Register("agent-1", nil, func() {})
+	defer func() { require.True(t, r.Unregister(conn)) }()
+	// No consumer: the buffer fills up and stays full.
+	for i := 0; i < sendChCapacity; i++ {
+		require.True(t, r.Send("agent-1", &agentv1.ServerMessage{}))
+	}
+	assert.False(t, r.SendSync("agent-1", &agentv1.ServerMessage{}, time.Second),
+		"a full queue is a refusal, exactly as with Send — never a blocking wait")
+}
+
+// TestSendSync_InterleavedSends confirms that messages enqueued with plain
+// Send consume sequence numbers too: a SendSync waiter must not be released
+// by writes of messages that were queued behind its own.
+func TestSendSync_InterleavedSends(t *testing.T) {
+	r := NewAgentRegistry()
+	conn := r.Register("agent-1", nil, func() {})
+	stop := startFakeConsumer(conn)
+	defer stop()
+
+	msg := &agentv1.ServerMessage{Payload: &agentv1.ServerMessage_Ping{Ping: &agentv1.PingCommand{}}}
+	require.True(t, r.SendSync("agent-1", msg, time.Second))
+	// Repeat a few rounds: sequence assignment must stay exact under reuse.
+	for i := 0; i < 10; i++ {
+		assert.True(t, r.Send("agent-1", msg))
+		assert.True(t, r.SendSync("agent-1", msg, time.Second))
+	}
 }

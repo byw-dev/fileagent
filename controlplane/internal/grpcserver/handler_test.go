@@ -478,11 +478,17 @@ func TestWithDeps_SetsFields(t *testing.T) {
 type mockDirDeliverer struct {
 	delivered  []dirstore.Result
 	requestIDs []string
+	agentIDs   []string
+	// refused makes Deliver report a refused delivery (zero value = accepted,
+	// so the happy-path tests keep their shape).
+	refused bool
 }
 
-func (m *mockDirDeliverer) Deliver(requestID string, result dirstore.Result) {
+func (m *mockDirDeliverer) Deliver(requestID, agentID string, result dirstore.Result) bool {
 	m.requestIDs = append(m.requestIDs, requestID)
+	m.agentIDs = append(m.agentIDs, agentID)
 	m.delivered = append(m.delivered, result)
+	return !m.refused
 }
 
 // ── handleDirectoryListing tests ──────────────────────────────────────────────
@@ -540,6 +546,55 @@ func TestHandleDirectoryListing_DeliversError(t *testing.T) {
 	require.Len(t, d.delivered, 1)
 	assert.Equal(t, "permission denied", d.delivered[0].Error)
 	assert.Empty(t, d.delivered[0].Entries)
+}
+
+// IC-SEC-2 ②: the agentID handed to the store must be the one from the
+// stream, not anything the message body could influence, so a listing sent by
+// agent A against a request issued to agent B is refused by the store and the
+// waiter never sees it. Uses the real dirstore to pin the end-to-end refusal.
+func TestHandleDirectoryListing_WrongAgentListing_IsRefused(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	store := dirstore.New()
+	srv.WithDirResultStore(store)
+
+	// The request was issued to agent-b; the waiter is already reading.
+	waiterCh := store.Register("req-x", "agent-b")
+
+	// agent-a answers with a listing for that request id.
+	msg := &agentv1.AgentMessage{
+		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: &agentv1.DirectoryListing{
+			RequestId: "req-x",
+			Path:      "/data",
+			Entries:   []*agentv1.FsEntry{{Name: "forged", IsDir: false}},
+		}},
+	}
+	srv.handleAgentMessage(context.Background(), "agent-a", msg)
+
+	select {
+	case got := <-waiterCh:
+		t.Fatalf("the waiter received a listing delivered by the wrong agent: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The legitimate answer from agent-b still gets through: the refusal must
+	// not consume the pending entry.
+	msgOk := &agentv1.AgentMessage{
+		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: &agentv1.DirectoryListing{
+			RequestId: "req-x",
+			Path:      "/data",
+			Entries:   []*agentv1.FsEntry{{Name: "real", IsDir: false}},
+		}},
+	}
+	srv.handleAgentMessage(context.Background(), "agent-b", msgOk)
+
+	select {
+	case got := <-waiterCh:
+		require.Len(t, got.Entries, 1)
+		assert.Equal(t, "real", got.Entries[0].Name)
+	case <-time.After(time.Second):
+		t.Fatal("timeout: legitimate listing not delivered")
+	}
 }
 
 func TestHandleDirectoryListing_NilDirResultStore_NoPanic(t *testing.T) {

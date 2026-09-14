@@ -75,18 +75,38 @@ func TestCreateCollectionRule_DBError(t *testing.T) {
 
 func TestDeleteCollectionRule_Success(t *testing.T) {
 	q, mock, _ := newTestQueries(t)
-	mock.ExpectExec("DELETE FROM collection_rules").WillReturnResult(sqlmock.NewResult(1, 1))
 
-	err := q.DeleteCollectionRule(context.Background(), uuid.New())
+	id, agentID, orgID := uuid.New(), uuid.New(), uuid.New()
+	// The delete is scoped to the rule's owner (IC-SEC-2 ①): the WHERE clause
+	// must pin id, agent_id and org_id together.
+	mock.ExpectExec("DELETE FROM collection_rules WHERE id = \\$1 AND agent_id = \\$2 AND org_id = \\$3").
+		WithArgs(id, agentID, orgID).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	rows, err := q.DeleteCollectionRule(context.Background(), id, agentID, orgID)
 	require.NoError(t, err)
+	assert.Equal(t, int64(1), rows)
 }
 
 func TestDeleteCollectionRule_DBError(t *testing.T) {
 	q, mock, _ := newTestQueries(t)
 	mock.ExpectExec("DELETE FROM collection_rules").WillReturnError(assert.AnError)
 
-	err := q.DeleteCollectionRule(context.Background(), uuid.New())
+	_, err := q.DeleteCollectionRule(context.Background(), uuid.New(), uuid.New(), uuid.New())
 	require.Error(t, err)
+}
+
+// IC-SEC-2 ①: a delete that matched no row (rule belongs to another agent or
+// org) must be reported as 0 affected rows, not swallowed as success.
+func TestDeleteCollectionRule_NoMatch_ReportsZeroRows(t *testing.T) {
+	q, mock, _ := newTestQueries(t)
+	mock.ExpectExec("DELETE FROM collection_rules").
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	rows, err := q.DeleteCollectionRule(context.Background(), uuid.New(), uuid.New(), uuid.New())
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), rows)
 }
 
 // ── GetCollectionRuleByID ─────────────────────────────────────────────────────

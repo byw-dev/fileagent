@@ -10,7 +10,7 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
-> **计数（2026-09-13，PR #106 合并后）**：共 **52** 条 = **已关闭 31** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 20**（**4 条挡** 6/7/9/40 + **14 条可推** + **2 条拆半** 13 与 46）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。⚠️ **IC-BUG-13 也是拆半**（`content_type` 防清空半边随 IC-2a 已关、**填值半边仍开**），总览表那一行没有标记，容易被误数进「可推」——以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**。
+> **计数（2026-09-13，PR #107 合并后）**：共 **52** 条 = **已关闭 31** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 20**（**4 条挡** 6/7/9/40 + **14 条可推** + **2 条拆半** 13 与 46）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。⚠️ **IC-BUG-13 也是拆半**（`content_type` 防清空半边随 IC-2a 已关、**填值半边仍开**），总览表那一行没有标记，容易被误数进「可推」——以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -113,7 +113,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-10 | `IsProcessed` 忽略 mtime/size，文件修改后永不重传 ✅ 随 IC-5 修复 | 🟡 P2 | agent |
 | IC-BUG-11 | tail 模式 `file_offset` / `append_mode` 是死参数 ✅ 随 IC-5 修复 | 🟡 P2 | agent |
 | IC-BUG-12 | 上传无超时；重试耗尽后不通知 Control Plane ✅ 两半均已修复（上报半边随 IC-2a，超时半边随 IC-5）| 🟡 P2 | agent |
-| IC-BUG-13 | `content_type` 两条索引路径都不赋值，且会被 upsert 清空 | 🟡 P2 | controlplane |
+| IC-BUG-13 | `content_type` 两条索引路径都不赋值，且会被 upsert 清空 ◐ **拆半**：防清空半边 ✅ 随 IC-2a 已关，填值半边仍开 | 🟡 P2 | controlplane |
 | IC-BUG-14 | Dashboard `COUNT(*)` / `SUM` 全表扫描（规模隐患） | 🟡 P2 | controlplane |
 | IC-BUG-15 | 预签名下载 URL TTL 硬编码 15 分钟，大文件不够用 | 🟡 P2 | controlplane |
 | IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效  ✅ 随 IC-1 修复 | 🟠 P1 | agent + controlplane |
