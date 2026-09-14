@@ -80,24 +80,19 @@ func pinSendGoroutine(t *testing.T, registry *AgentRegistry, agentID string) int
 	return 0
 }
 
-// TestRevoke_Confirmed_DeliversCommandBeforeStreamEnd is the core IC-BUG-32
-// acceptance: a NORMAL agent — one that is reading its stream, with no
-// artificial backlog — must receive the RevokeCommand before the stream ends
-// when the write was confirmed. The confirmed path ends the RPC gracefully
-// (Stop, no cancel), so the ordering is guaranteed by the protocol teardown
-// (queued DATA frames flush before the trailers), not by a race; this test is
-// therefore deterministic and is gated on -count=50.
+// TestRevoke_IdlePath_DeliversCommandBeforeStreamEnd guards the ONLY half of
+// IC-BUG-32 that is deterministic server-side: with an IDLE send path (no
+// backlog, the writer parked on select) the queued command is handed to the
+// transport and flushed before any teardown, so the reading agent receives it
+// before the stream ends. This is a contract guard for the idle path — it is
+// NOT fix-evidence for the backlog race (that path delivered ~100% before this
+// knife as well; see the card's 20000/20000 measurement) and it must never be
+// cited as proof that the pinned-scenario flake is eliminated.
 //
-// Deliberately NOT a pinned-writer test: an end-to-end delivery assertion
-// under a multi-megabyte unread backlog is unsound in this grpc-go version —
-// the client transport can discard still-buffered DATA when the trailers
-// arrive, independently of the control-plane mechanism (verified by byte-level
-// capture on both directions: the server's wire order was correct while the
-// client application saw 1 of 4 messages). The race that IC-BUG-32 describes
-// is inherently probabilistic to reproduce end-to-end; its red evidence is
-// recorded in the task report and the deterministic guards for the mechanism
-// live in the handler-level mock tests.
-func TestRevoke_Confirmed_DeliversCommandBeforeStreamEnd(t *testing.T) {
+// The pinned/backlogged scenario has its own test below with honest,
+// weaker assertions — its delivery outcome cannot be asserted from the
+// server side at all.
+func TestRevoke_IdlePath_DeliversCommandBeforeStreamEnd(t *testing.T) {
 	agentID := "44444444-4444-4444-4444-444444444444"
 	client, bearer, registry := newFullServerForAgent(t, agentID, &mockStateDB{agentStatus: db.AgentStatusApproved})
 
@@ -169,6 +164,121 @@ func TestRevoke_Confirmed_DeliversCommandBeforeStreamEnd(t *testing.T) {
 	}
 	require.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
 		2*time.Second, 10*time.Millisecond, "handler must return and unregister")
+}
+
+// TestRevoke_Backlog_HardCapAndCut restores the pinned-scenario coverage of
+// IC-BUG-32 with assertions the server can actually keep.
+//
+// The setup is the original falsifiable one (kept verbatim from the first
+// cut): the send goroutine is pinned inside stream.Send behind an unread
+// backlog, the RevokeCommand is enqueued behind it, and only then does the
+// client start reading. What is asserted:
+//   - the pin precondition itself (the reproduction is real, not assumed);
+//   - the revoke returns within the hard cap plus margin;
+//   - the stream IS cut and the registry entry reclaimed.
+//
+// What is deliberately NOT asserted: that the command arrives before the cut.
+// It cannot be, from the server side: stream.Send returns when the frame is
+// queued, not flushed, there is no API to wait for the wire, and the stream
+// teardown does not wait for the peer to open its flow-control window —
+// unflushed queued frames are discarded at teardown. Measured on this exact
+// harness: ~50% delivery with the pre-fix Send+Disconnect ordering and ~45%
+// with the graceful ordering (byte-level capture: the server's wire order was
+// correct; the client transport received every byte; the application saw 1 of
+// 4 messages). Delivery under backlog is therefore best-effort and is
+// recorded as the unclosed half of IC-BUG-32, not silently asserted away.
+// The deterministic idle-path contract has its own test above.
+func TestRevoke_Backlog_HardCapAndCut(t *testing.T) {
+	agentID := "44444444-4444-4444-4444-444444444444"
+	client, bearer, registry := newFullServerForAgent(t, agentID, &mockStateDB{agentStatus: db.AgentStatusApproved})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", bearer))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return registry.IsOnline(agentID) },
+		2*time.Second, 20*time.Millisecond, "agent must be registered")
+
+	// ── Precondition: pin the send goroutine inside stream.Send ──────────────
+	// The client is NOT reading yet; pinSendGoroutine asserts the pin.
+	depth := pinSendGoroutine(t, registry, agentID)
+
+	// ── Fire the REST revoke; gate on the command being enqueued ─────────────
+	h := handler.NewAgentsHandler(nil, stubAgentMgr{}, nil, registry, zap.NewNop())
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		claims := &auth.Claims{}
+		claims.Role = "super_admin"
+		claims.OrgID = uuid.New().String()
+		claims.Subject = uuid.New().String()
+		c.Set("jwt_claims", claims)
+		c.Next()
+	})
+	r.POST("/api/v1/agents/:id/revoke", h.Revoke)
+
+	revokeStarted := time.Now()
+	revokeDone := make(chan struct{})
+	revokeCode := http.StatusInternalServerError
+	go func() {
+		defer close(revokeDone)
+		w := httptest.NewRecorder()
+		req, _ := http.NewRequest(http.MethodPost, "/api/v1/agents/"+agentID+"/revoke", nil)
+		r.ServeHTTP(w, req)
+		revokeCode = w.Code
+	}()
+	require.Eventually(t, func() bool {
+		conn := registry.Get(agentID)
+		return conn == nil || len(conn.SendCh) == depth+1
+	}, 2*time.Second, 5*time.Millisecond, "the revoke command must be enqueued")
+
+	// ── Only now does the client start reading ───────────────────────────────
+	received := make(chan *agentv1.ServerMessage, 16)
+	streamErr := make(chan error, 1)
+	go func() {
+		for {
+			msg, err := stream.Recv()
+			if err != nil {
+				streamErr <- err
+				return
+			}
+			received <- msg
+		}
+	}()
+
+	select {
+	case <-revokeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("revoke handler did not return within the hard cap + margin")
+	}
+	revokeElapsed := time.Since(revokeStarted)
+
+	// The stream must be torn down — the one promise that holds for every
+	// backlog shape. Whether the command itself made it out is best-effort
+	// (see the doc comment) and is only logged, never asserted.
+	var gotRevoke bool
+delivered:
+	for {
+		select {
+		case msg := <-received:
+			if msg.GetRevoke() != nil {
+				gotRevoke = true
+			}
+		case err := <-streamErr:
+			assert.Equal(t, codes.PermissionDenied, status.Code(err),
+				"the stream must be cut after the revoke")
+			break delivered
+		case <-time.After(3 * time.Second):
+			t.Fatal("stream was not torn down after revoke")
+		}
+	}
+	t.Logf("backlog revoke: delivered_before_cut=%v (best-effort, not asserted)", gotRevoke)
+
+	require.Eventually(t, func() bool { return !registry.IsOnline(agentID) },
+		2*time.Second, 10*time.Millisecond, "handler must return and unregister")
+	assert.Equal(t, http.StatusOK, revokeCode)
+	assert.Less(t, revokeElapsed, 3*time.Second,
+		"revoke must respect the hard cap plus margin")
 }
 
 // TestSendSync_WaiterReleasedWhenWriterStops parks a SendSync waiter behind a
