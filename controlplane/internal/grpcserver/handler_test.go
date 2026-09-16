@@ -193,7 +193,7 @@ func TestHandleHeartbeat_UpdatesCache(t *testing.T) {
 	c := newMockCache()
 	srv.WithDeps(nil, c, nil, nil, nil)
 
-	srv.handleHeartbeat(context.Background(), "agent-abc",
+	srv.handleHeartbeat(context.Background(), "agent-abc", nil,
 		&agentv1.Heartbeat{UptimeSeconds: 120})
 
 	onlineKey := cache.AgentOnlineKey("agent-abc")
@@ -207,7 +207,7 @@ func TestHandleHeartbeat_CachesTelemetrySnapshot(t *testing.T) {
 	c := newMockCache()
 	srv.WithDeps(nil, c, nil, nil, nil)
 
-	srv.handleHeartbeat(context.Background(), "agent-xyz",
+	srv.handleHeartbeat(context.Background(), "agent-xyz", nil,
 		&agentv1.Heartbeat{UptimeSeconds: 300, QueueDepth: 7, Version: "0.1.0"})
 
 	raw, ok := c.sets[cache.AgentStatsKey("agent-xyz")]
@@ -232,7 +232,8 @@ func TestHandleHeartbeat_UpdatesLastSeenAt(t *testing.T) {
 	srv.WithStateDB(stateDB)
 	srv.WithDeps(nil, nil, nil, nil, nil)
 
-	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+	srv.handleHeartbeat(context.Background(), agentID, nil,
+		&agentv1.Heartbeat{UptimeSeconds: 30})
 	assert.True(t, stateDB.lastSeenCalled, "UpdateAgentLastSeen should have been called")
 }
 
@@ -245,7 +246,8 @@ func TestHandleHeartbeat_RestoresOnlineWhenStale(t *testing.T) {
 	srv.WithStateDB(stateDB)
 	srv.WithDeps(nil, nil, nil, nats, nil)
 
-	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+	srv.handleHeartbeat(context.Background(), agentID, nil,
+		&agentv1.Heartbeat{UptimeSeconds: 30})
 
 	assert.Equal(t, 1, stateDB.markOnlineCalls)
 	assert.Contains(t, nats.published, "events.agent.online",
@@ -334,7 +336,8 @@ func TestHandleHeartbeat_NoOnlineEventWhenAlreadyOnline(t *testing.T) {
 	srv.WithStateDB(stateDB)
 	srv.WithDeps(nil, nil, nil, nats, nil)
 
-	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+	srv.handleHeartbeat(context.Background(), agentID, nil,
+		&agentv1.Heartbeat{UptimeSeconds: 30})
 
 	assert.Equal(t, 1, stateDB.markOnlineCalls)
 	assert.NotContains(t, nats.published, "events.agent.online",
@@ -347,7 +350,7 @@ func TestHandleHeartbeat_NilStateDB_NoPanic(t *testing.T) {
 	srv.WithDeps(nil, nil, nil, nil, nil)
 
 	assert.NotPanics(t, func() {
-		srv.handleHeartbeat(context.Background(), "agent-xyz",
+		srv.handleHeartbeat(context.Background(), "agent-xyz", nil,
 			&agentv1.Heartbeat{UptimeSeconds: 10})
 	})
 }
@@ -359,7 +362,7 @@ func TestHandleHeartbeat_NilCache(t *testing.T) {
 
 	// Should not panic when cache is nil
 	assert.NotPanics(t, func() {
-		srv.handleHeartbeat(context.Background(), "agent-xyz",
+		srv.handleHeartbeat(context.Background(), "agent-xyz", nil,
 			&agentv1.Heartbeat{UptimeSeconds: 10})
 	})
 }
@@ -387,7 +390,7 @@ func TestHandleAgentMessage_Heartbeat(t *testing.T) {
 			Heartbeat: &agentv1.Heartbeat{UptimeSeconds: 30},
 		},
 	}
-	srv.handleAgentMessage(context.Background(), "agent-1", msg)
+	srv.handleAgentMessage(context.Background(), "agent-1", nil, msg)
 
 	_, ok := c.sets[cache.AgentOnlineKey("agent-1")]
 	assert.True(t, ok)
@@ -404,7 +407,7 @@ func TestHandleAgentMessage_UploadResult(t *testing.T) {
 		},
 	}
 	assert.NotPanics(t, func() {
-		srv.handleAgentMessage(context.Background(), "agent-2", msg)
+		srv.handleAgentMessage(context.Background(), "agent-2", nil, msg)
 	})
 }
 
@@ -417,7 +420,7 @@ func TestHandleAgentMessage_UnknownMessage(t *testing.T) {
 		Payload:   nil,
 	}
 	assert.NotPanics(t, func() {
-		srv.handleAgentMessage(context.Background(), "agent-3", msg)
+		srv.handleAgentMessage(context.Background(), "agent-3", nil, msg)
 	})
 }
 
@@ -514,7 +517,7 @@ func TestHandleDirectoryListing_DeliversEntries(t *testing.T) {
 	msg := &agentv1.AgentMessage{
 		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: listing},
 	}
-	srv.handleAgentMessage(context.Background(), "agent-1", msg)
+	srv.handleAgentMessage(context.Background(), "agent-1", nil, msg)
 
 	require.Len(t, d.delivered, 1)
 	assert.Equal(t, "req-1", d.requestIDs[0])
@@ -545,7 +548,7 @@ func TestHandleDirectoryListing_DeliversError(t *testing.T) {
 	msg := &agentv1.AgentMessage{
 		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: listing},
 	}
-	srv.handleAgentMessage(context.Background(), "agent-1", msg)
+	srv.handleAgentMessage(context.Background(), "agent-1", nil, msg)
 
 	require.Len(t, d.delivered, 1)
 	assert.Equal(t, "permission denied", d.delivered[0].Error)
@@ -573,7 +576,7 @@ func TestHandleDirectoryListing_WrongAgentListing_IsRefused(t *testing.T) {
 			Entries:   []*agentv1.FsEntry{{Name: "forged", IsDir: false}},
 		}},
 	}
-	srv.handleAgentMessage(context.Background(), "agent-a", msg)
+	srv.handleAgentMessage(context.Background(), "agent-a", nil, msg)
 
 	select {
 	case got := <-waiterCh:
@@ -590,7 +593,7 @@ func TestHandleDirectoryListing_WrongAgentListing_IsRefused(t *testing.T) {
 			Entries:   []*agentv1.FsEntry{{Name: "real", IsDir: false}},
 		}},
 	}
-	srv.handleAgentMessage(context.Background(), "agent-b", msgOk)
+	srv.handleAgentMessage(context.Background(), "agent-b", nil, msgOk)
 
 	select {
 	case got := <-waiterCh:
@@ -610,6 +613,6 @@ func TestHandleDirectoryListing_NilDirResultStore_NoPanic(t *testing.T) {
 		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: listing},
 	}
 	assert.NotPanics(t, func() {
-		srv.handleAgentMessage(context.Background(), "agent-1", msg)
+		srv.handleAgentMessage(context.Background(), "agent-1", nil, msg)
 	})
 }

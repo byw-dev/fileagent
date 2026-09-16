@@ -811,7 +811,7 @@ func TestServer_Heartbeat_RenewsDegradedMarker(t *testing.T) {
 	conn := registry.Register(agentID, nil, nil)
 	conn.SyncDegraded = true // 该连接的同步处于降级——CP 自身的权威状态
 
-	s.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 1})
+	s.handleHeartbeat(context.Background(), agentID, conn, &agentv1.Heartbeat{UptimeSeconds: 1})
 
 	renewals := 0
 	for _, k := range mc.setLog {
@@ -980,4 +980,43 @@ func TestServer_Connect_RevokedMidSetup_IsCutNotPersisted(t *testing.T) {
 	assert.False(t, registry.IsOnline(agentID),
 		"the racing connection must not stay in the registry")
 	assert.Equal(t, 1, stateDB.markOnlineUsableCalls)
+}
+
+// PR #109 re-review P2-1: a heartbeat must renew the degraded marker from ITS
+// OWN connection's state. The heartbeat carries only an agentID, and looking
+// the connection up by id at handling time returns whichever connection is
+// registered NOW — after a reconnect that is the replacement, and reading the
+// replacement's SyncDegraded from the displaced connection's handler
+// goroutine is a data race with the replacement's setup (found by -race).
+func TestHeartbeat_DegradedRenew_BindsToItsOwnConnection(t *testing.T) {
+	agentID := "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+	s := New(zap.NewNop())
+	mc := newMockCache()
+	registry := NewAgentRegistry()
+	s.cache = mc
+	s.registry = registry
+
+	connO := registry.Register(agentID, nil, nil) // displaced, NOT degraded
+	connN := registry.Register(agentID, nil, nil) // current, degraded
+	connN.SyncDegraded = true
+
+	hb := &agentv1.Heartbeat{UptimeSeconds: 1}
+
+	// The displaced connection's heartbeat: O is not degraded, so no renewal.
+	s.handleHeartbeat(context.Background(), agentID, connO, hb)
+	for _, k := range mc.setLog {
+		if k == cache.AgentSyncDegradedKey(agentID) {
+			t.Fatal("a heartbeat from a non-degraded connection renewed the degraded marker of another connection")
+		}
+	}
+
+	// The current connection's heartbeat: N is degraded, renewal expected.
+	s.handleHeartbeat(context.Background(), agentID, connN, hb)
+	renewals := 0
+	for _, k := range mc.setLog {
+		if k == cache.AgentSyncDegradedKey(agentID) {
+			renewals++
+		}
+	}
+	assert.Positive(t, renewals, "the degraded connection's own heartbeat must renew the marker")
 }

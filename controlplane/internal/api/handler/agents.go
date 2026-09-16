@@ -458,17 +458,20 @@ func (h *AgentsHandler) Revoke(c *gin.Context) {
 		// goroutine a bounded moment to confirm the command was written to
 		// the stream (IC-BUG-32).
 		//
-		// The follow-up cut then has exactly two shapes, and the difference
-		// is the whole point of the fix: CONFIRMED, the RPC is ended
-		// gracefully (Stop) — the handler returns without cancelling, so
-		// gRPC flushes the queued command before the trailers and the agent
-		// deterministically receives it. UNCONFIRMED — the 1s cap expired
-		// because the agent is not reading or is starved of flow-control
-		// quota — the command never made it into the transport queue, so we
-		// cancel outright: this branch keeps the pre-fix best-effort
-		// behaviour and can still lose the command; the hard cap is what
-		// bounds it. Either way the stream is cut regardless — the command
-		// is cooperative and a compromised agent ignores it (IC-BUG-25).
+		// The follow-up cut then has exactly two shapes. CONFIRMED: the RPC
+		// is ended gracefully (Stop) — the handler returns without
+		// cancelling, so queued frames are flushed in order before the
+		// trailers. On the IDLE path (no backlog — the steady state) that
+		// deterministically delivers the command; under a backlog the
+		// confirm only proves the command is QUEUED (there is no wire-flush
+		// API), the teardown does not wait for the peer's window, and
+		// delivery there is best-effort — measured ~50% with an immediate
+		// cancel and ~45% here, recorded as the unclosed half of IC-BUG-32.
+		// UNCONFIRMED — the 1s cap expired because the agent is not reading
+		// or is starved of flow-control quota — the command may not even be
+		// queued, so we cancel outright. Either way the stream is cut
+		// regardless — the command is cooperative and a compromised agent
+		// ignores it (IC-BUG-25).
 		// The teardown is bound to the connection captured inside
 		// RevokeConn (PR #109 review P1-3): a reconnect registering a new
 		// connection under the same id mid-wait must not redirect the cut —

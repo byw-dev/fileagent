@@ -420,3 +420,96 @@ func TestSendSync_AfterUnregister_IsRefusedNotPanic(t *testing.T) {
 			"an unregistered connection must refuse sends, never enqueue on its closed channel")
 	})
 }
+
+// PR #109 re-review P2-3a: the identity re-check inside sendSync must compare
+// the ENTRY, not merely its existence. After a displacement the agentID still
+// has an entry (the replacement) — an existence check would let the displaced
+// connection enqueue into its own (no longer owned) channel.
+func TestSendSync_DisplacedConnection_IsRefusedEvenIfIDStillRegistered(t *testing.T) {
+	r := NewAgentRegistry()
+	connO := r.Register("agent-1", nil, func() {})
+	r.Register("agent-1", nil, func() {}) // displaces O; the id now maps to N
+
+	require.NotPanics(t, func() {
+		assert.False(t, connO.sendSync(&agentv1.ServerMessage{}, 50*time.Millisecond),
+			"the displaced connection must be refused outright")
+	})
+	assert.Zero(t, connO.queuedSeq,
+		"the refused send must not consume a sequence number")
+	assert.Zero(t, len(connO.SendCh),
+		"the refused send must not leave a message on the displaced connection's channel")
+}
+
+// PR #109 re-review P2-3b: the graceful branch must stop the CAPTURED
+// connection, not whatever the id maps to by then. The consumer is gated so
+// the confirm lands only when the test releases it — after the replacement
+// has been registered. The replacement's stopCh must stay open.
+func TestRevokeConn_GracefulStopsTheCapturedConnectionOnly(t *testing.T) {
+	r := NewAgentRegistry()
+	connO := r.Register("agent-1", nil, func() {})
+	release := make(chan struct{})
+	stopConsumer := make(chan struct{})
+	go func() {
+		defer connO.markWriterStopped()
+		for {
+			select {
+			case <-stopConsumer:
+				return
+			case msg := <-connO.SendCh:
+				_ = msg
+				<-release // blocked before noteWritten
+				connO.noteWritten()
+			}
+		}
+	}()
+	defer close(stopConsumer)
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- r.RevokeConn("agent-1", &agentv1.ServerMessage{}, 2*time.Second)
+	}()
+	// Wait until the command left the queue (the consumer holds it), then
+	// displace O with a replacement.
+	require.Eventually(t, func() bool { return len(connO.SendCh) == 0 },
+		2*time.Second, 5*time.Millisecond, "the consumer must have dequeued the command")
+	connN := r.Register("agent-1", nil, func() {})
+
+	close(release) // O's confirm lands now
+	select {
+	case graceful := <-done:
+		assert.True(t, graceful)
+	case <-time.After(3 * time.Second):
+		t.Fatal("RevokeConn did not return within the hard cap plus margin")
+	}
+	assert.True(t, connO.isStopping(),
+		"the graceful stop must land on the connection the command was confirmed on")
+	assert.False(t, connN.isStopping(),
+		"the replacement connection must not be stopped by another connection's revoke")
+}
+
+// PR #109 re-review P2-4: the writer-done release must not depend on the send
+// goroutine having STARTED. A connection registered and then unregistered
+// before Connect starts its writer (e.g. the mid-setup revocation cut) closes
+// SendCh, but only the writer's defer used to close writerDone — a waiter
+// parked in waitForWrite then burned its whole timer for nothing.
+func TestSendSync_WaiterReleasedWhenWriterNeverStarted(t *testing.T) {
+	r := NewAgentRegistry()
+	conn := r.Register("agent-1", nil, func() {})
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- conn.sendSync(&agentv1.ServerMessage{}, 2*time.Second)
+	}()
+	time.Sleep(50 * time.Millisecond) // the waiter is parked
+	require.True(t, r.Unregister(conn))
+
+	start := time.Now()
+	select {
+	case ok := <-done:
+		assert.False(t, ok)
+		assert.Less(t, time.Since(start), time.Second,
+			"the unregister must release the waiter promptly, not leave it burning the timer")
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("waiter not released after unregister — the writer-never-started path leaks the wait")
+	}
+}

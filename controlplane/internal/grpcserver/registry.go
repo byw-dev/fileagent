@@ -27,9 +27,12 @@ type AgentConn struct {
 	// instead). The Control Plane — not the cache — is the authority on the
 	// degraded condition: the cache is a projection that can lose keys to
 	// eviction or restart, and heartbeat renewal must rebuild from this state,
-	// not from key existence (review R6). Written once during Connect setup
-	// and read by the same connection's heartbeat handling — no concurrent
-	// access.
+	// not from key existence (review R6). Written during THIS connection's
+	// Connect setup and read by THIS connection's handler goroutine while
+	// dispatching its heartbeats — the binding is by connection, and the
+	// handler must never re-look the connection up by agentID: after a
+	// reconnect that returns the replacement, and the read would race the
+	// replacement's setup write (PR #109 re-review P2-1).
 	SyncDegraded bool
 
 	// sendMu guards the write-confirmation state below (IC-BUG-32). Lock
@@ -52,12 +55,14 @@ type AgentConn struct {
 	// notify is the generation channel for write progress: it is closed (and
 	// replaced) every time sentSeq advances, so waiters can select on it.
 	notify chan struct{}
-	// writerDone is closed exactly once when the send goroutine stops for any
-	// reason (ctx done, SendCh closed, send error). Waiters select on it so a
-	// torn-down connection releases them immediately instead of burning the
-	// timeout (IC-BUG-28: a dismantled connection must never leave a waiter
-	// hanging).
+	// writerDone is closed exactly once — either when the send goroutine
+	// stops for any reason (ctx done, SendCh closed, send error) or, if that
+	// goroutine never started, when the connection is unregistered
+	// (PR #109 re-review P2-4). Waiters select on it so a torn-down
+	// connection releases them immediately instead of burning the timeout
+	// (IC-BUG-28: a dismantled connection must never leave a waiter hanging).
 	writerDone chan struct{}
+	writerOnce sync.Once
 	// registry is the back-reference sendSync needs to take r.mu for the
 	// enqueue (set at Register time; the conn is only ever used through its
 	// owning registry).
@@ -132,7 +137,9 @@ func (r *AgentRegistry) Register(
 }
 
 // Unregister removes only the current connection and reports whether it owned
-// the registry entry. Send holds the same lock until its nonblocking send ends.
+// the registry entry. Send holds the same lock until its nonblocking send
+// ends. It also closes the write-confirmation broadcast, so waiters are
+// released whether or not the send goroutine ever started.
 func (r *AgentRegistry) Unregister(conn *AgentConn) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -141,6 +148,10 @@ func (r *AgentRegistry) Unregister(conn *AgentConn) bool {
 	}
 	close(conn.SendCh)
 	delete(r.conns, conn.AgentID)
+	// Release write-confirmation waiters even when the send goroutine never
+	// started (the connection is torn down before Connect reaches the
+	// goroutine spawn) — otherwise they burn their whole timeout.
+	conn.markWriterStopped()
 	return true
 }
 
@@ -171,7 +182,9 @@ func (r *AgentRegistry) Disconnect(agentID string) bool {
 // captures the agent's current connection, enqueues msg on it, waits the
 // bounded timeout for the write to be confirmed, then ends THAT connection —
 // graceful (stop, normal RPC end) on confirmation, forced (cancel) on timeout.
-// It reports whether the teardown was graceful.
+// It reports whether the teardown was graceful. Delivery scope is the same as
+// SendSync's: deterministic on the idle path, best-effort under a backlog —
+// the confirm is queue-time, not wire-time.
 //
 // The binding matters (PR #109 review P1-3): a reconnect can register a new
 // connection under the same id while the wait is in flight, and a by-id
@@ -271,11 +284,12 @@ func (c *AgentConn) noteWritten() {
 	c.sendMu.Unlock()
 }
 
-// markWriterStopped releases every pending write-confirmation waiter when the
-// send goroutine stops for any reason. Called exactly once, deferred at the
-// goroutine's single exit path.
+// markWriterStopped releases every pending write-confirmation waiter. Idempotent
+// by design: it runs from the send goroutine's single exit path AND from
+// Unregister, which covers the case where the goroutine never started at all
+// (writer-never-started path, PR #109 re-review P2-4).
 func (c *AgentConn) markWriterStopped() {
-	close(c.writerDone)
+	c.writerOnce.Do(func() { close(c.writerDone) })
 }
 
 // sendSync is SendSync for one specific connection (no registry lookup), so a
@@ -366,12 +380,17 @@ func (r *AgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
 // the agent" — flow control guarantees the former is as far as an honest
 // bounded wait can go.
 //
-// Scope of the guarantee, stated plainly (IC-BUG-32): a CONFIRMED send pairs
-// with a graceful end (Stop), whose teardown order deterministically delivers
-// the queued message before the stream ends. An UNCONFIRMED send — the
-// timeout expired — keeps the pre-fix best-effort behaviour: the caller
-// falls back to a forceful cancel, which can still lose the command. The cap
-// bounds that branch; it does not fix it.
+// Scope of the guarantee, stated plainly and kept narrow (IC-BUG-32, and PR
+// #109's reviews which measured this): the confirm means QUEUED, not flushed
+// — there is no server API to wait for the wire, and the stream teardown does
+// not wait for the peer to open its flow-control window. On an IDLE send path
+// (writer parked, no backlog — the steady state) the queued message is
+// flushed before any teardown and the delivery is deterministic, covered by
+// TestRevoke_IdlePath_DeliversCommandBeforeStreamEnd. Under a backlog the
+// delivery is best-effort in BOTH teardown shapes (measured ~50% with an
+// immediate cancel, ~45% with the graceful end) — that half is recorded as
+// the unclosed part of IC-BUG-32 in docs/tasks/bugs/open.md. The cap bounds
+// the wait; it does not fix the delivery.
 func (r *AgentRegistry) SendSync(agentID string, msg *agentv1.ServerMessage, timeout time.Duration) bool {
 	r.mu.RLock()
 	conn, ok := r.conns[agentID]

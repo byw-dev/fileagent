@@ -251,11 +251,16 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 		case <-conn.stopCh:
 			// Graceful stop (IC-BUG-32): Stop closed stopCh instead of
 			// cancelling ctx. Returning WITHOUT cancelling lets gRPC finish
-			// the RPC normally: the transport's FIFO flushes every DATA frame
-			// queued before the trailers — including the RevokeCommand whose
-			// write SendSync just confirmed — so the agent deterministically
-			// receives the command before the stream ends. Cancelling here
-			// would RST the queued frames away and reintroduce the race.
+			// the RPC normally: the transport's FIFO writes queued DATA
+			// frames before the trailers. Delivery caveat, kept honest (see
+			// SendSync's scope note and the IC-BUG-32 card): on the IDLE path
+			// — no backlog — the confirmed command is flushed before the
+			// trailers and deterministically reaches the agent; under a
+			// backlog the queued frames may never fit through the
+			// flow-control window before teardown and are discarded, so
+			// delivery there is best-effort in this shape too. Cancelling
+			// here would RST queued frames away instead of flushing them in
+			// order, which is strictly worse and re-introduces the race.
 			//
 			// Like the ctx.Done branch below, deliberately does not wait for
 			// the send goroutine: nothing on this path waits on the agent at
@@ -300,7 +305,7 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 				cancel()
 				return r.err
 			}
-			s.handleAgentMessage(ctx, agentID, r.msg)
+			s.handleAgentMessage(ctx, agentID, conn, r.msg)
 		}
 	}
 }
@@ -518,10 +523,10 @@ func (s *Server) pushCredentials(ctx context.Context, agentID string) {
 }
 
 // handleAgentMessage processes a single incoming message from an agent.
-func (s *Server) handleAgentMessage(ctx context.Context, agentID string, msg *agentv1.AgentMessage) {
+func (s *Server) handleAgentMessage(ctx context.Context, agentID string, conn *AgentConn, msg *agentv1.AgentMessage) {
 	switch p := msg.Payload.(type) {
 	case *agentv1.AgentMessage_Heartbeat:
-		s.handleHeartbeat(ctx, agentID, p.Heartbeat)
+		s.handleHeartbeat(ctx, agentID, conn, p.Heartbeat)
 	case *agentv1.AgentMessage_UploadResult:
 		s.handleUploadResult(ctx, agentID, p.UploadResult)
 	case *agentv1.AgentMessage_DirectoryListing:
@@ -536,7 +541,7 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, msg *ag
 	}
 }
 
-func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv1.Heartbeat) {
+func (s *Server) handleHeartbeat(ctx context.Context, agentID string, conn *AgentConn, hb *agentv1.Heartbeat) {
 	if s.cache != nil {
 		if err := s.cache.Set(ctx, cache.AgentOnlineKey(agentID), "1", agentOnlineTTL); err != nil {
 			s.logger.Warn("heartbeat: refresh online TTL failed", zap.Error(err))
@@ -552,11 +557,17 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 		// the cache authoritative and the lost key permanent until reconnect.
 		// Clearing stays where it is: a successful sync and disconnect both
 		// delete, so the projection can never outlive its condition.
-		if s.registry != nil {
-			if conn := s.registry.Get(agentID); conn != nil && conn.SyncDegraded {
-				if err := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); err != nil {
-					s.logger.Warn("heartbeat: renew degraded marker failed", zap.String("agent_id", agentID), zap.Error(err))
-				}
+		// The degraded state is read from the connection the heartbeat
+		// actually arrived on — NOT re-looked-up by agentID (PR #109 re-review
+		// P2-1): a lookup by id returns whichever connection is registered at
+		// handling time, which after a reconnect is the replacement — reading
+		// its field from the displaced connection's handler goroutine races
+		// the replacement's setup write. Written during this connection's own
+		// Connect setup and read here in the same handler goroutine, so no
+		// lock is needed once the binding is by connection.
+		if conn != nil && conn.SyncDegraded {
+			if err := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); err != nil {
+				s.logger.Warn("heartbeat: renew degraded marker failed", zap.String("agent_id", agentID), zap.Error(err))
 			}
 		}
 	}
