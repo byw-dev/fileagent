@@ -1304,3 +1304,133 @@ func TestLoopCloseWait_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
 	case <-time.After(900 * time.Millisecond):
 	}
 }
+
+// ── PR #108 review F3: exactly-once delivery for the same file version ───────
+
+// The close_wait debounce recheck and the real-time debounce flush can race
+// on the same file version: both run "check seen → send → record seen" and
+// neither is atomic. This test makes the double delivery STRUCTURAL, not a
+// probabilistic alignment probe: with a parked consumer, the recheck blocks
+// inside emitBlocking (its seen check already passed), and the flush — which
+// today has no seen check at all — blocks behind it. Both deliveries
+// therefore always complete, deterministically, no matter how the
+// goroutines interleave. After the fix the two sites arbitrate through a
+// per-path in-flight claim and exactly one delivery happens.
+func TestCloseWait_RecheckAndFlush_SameVersionDeliveredOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "raced.log")
+	require.NoError(t, os.WriteFile(path, []byte("same version"), 0o644))
+	// Quiet so the recheck's still-writing guard lets it through; the loop
+	// path does not consult mtime, so the Write event still registers the
+	// pending debounce timer.
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, past, past))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent) // unbuffered: deliveries park the senders
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+
+	// A: the debounce flush path — a Write event registers the pending
+	// timer, which fires ~closeWaitDebounce later.
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+
+	// B: the debounce recheck path — started immediately, so it claims the
+	// delivery and parks inside emitBlocking long before the flush timer
+	// fires. The claim is observable: exactly one inflight entry.
+	go w.recheckAfterDebounce(ctx, events, seen, path)
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 1
+	}, 2*time.Second, 5*time.Millisecond, "recheck should hold the in-flight claim")
+
+	// The flush fires at ~500ms. Give it time to either be REJECTED by the
+	// claim (fix) or to take its own second claim (pre-fix / M11) and park
+	// in emitBlocking. Only after this window do we start draining, so a
+	// second claimer is observed BEFORE the first delivery completes —
+	// otherwise the seen write would mask the missing inflight check.
+	time.Sleep(closeWaitDebounce + 400*time.Millisecond)
+
+	w.seenMu.Lock()
+	claims := len(w.inflight)
+	w.seenMu.Unlock()
+
+	// Drain every claimed delivery.
+	delivered := 0
+	readDeadline := time.After(2 * time.Second)
+	var firstOp, secondOp string
+	for delivered < claims {
+		select {
+		case fe := <-events:
+			if delivered == 0 {
+				firstOp = fe.Op
+			}
+			delivered++
+		case <-readDeadline:
+			t.Fatalf("delivered %d of %d claimed deliveries", delivered, claims)
+		}
+	}
+	// Nothing further may arrive.
+	select {
+	case fe := <-events:
+		secondOp = fe.Op
+		t.Fatalf("double-send race: first op=%s second op=%s (inflight now=%d)", firstOp, secondOp, func() int {
+			w.seenMu.Lock()
+			defer w.seenMu.Unlock()
+			return len(w.inflight)
+		}())
+	case <-time.After(600 * time.Millisecond):
+	}
+	// Exactly-once: one claim, one delivery.
+	assert.Equal(t, 1, claims, "the same file version must be claimed and delivered exactly once")
+}
+
+// A claim whose delivery is interrupted (emitBlocking returns false on ctx
+// cancel) must roll back: no leftover inflight entry, seen not written. A
+// stuck claim would make every future claim for the same version fail and
+// a file that never changes again would silently never be collected — the
+// exact class of defect this knife exists to kill — so completeDelivery is
+// deferred, covering panics and early returns too.
+func TestScanFile_ClaimReleasedOnAbortedDelivery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aborted.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+	// Quiet past the close_wait debounce window, otherwise the recheck's
+	// still-writing guard returns before the claim is ever taken.
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, past, past))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	// Unbuffered with no reader: `events <- fe` can never proceed, so
+	// emitBlocking deterministically fails on the cancelled ctx instead of
+	// racing between the ready ctx.Done and a buffered send slot.
+	events := make(chan FileEvent)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // emit will be aborted
+
+	w.recheckAfterDebounce(ctx, events, seen, path)
+
+	select {
+	case fe := <-events:
+		t.Fatalf("aborted delivery must not emit: %s", fe.Path)
+	default:
+	}
+
+	w.seenMu.Lock()
+	left := len(w.inflight)
+	_, known := seen[path]
+	w.seenMu.Unlock()
+	assert.Zero(t, left, "aborted delivery must roll back the in-flight claim")
+	assert.False(t, known, "aborted delivery must not mark seen (file stays retryable)")
+}

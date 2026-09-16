@@ -57,6 +57,14 @@ type Watcher struct {
 	// debounce recheck callbacks (timer goroutines) may run concurrently
 	// with a scan on the event-loop goroutine.
 	seenMu sync.Mutex
+
+	// inflight tracks paths whose delivery is currently in progress, keyed
+	// by the mtime being delivered (PR #108 review F3). It is the exactly-
+	// once gate for a file version across the goroutines that all run
+	// "check seen → send → record seen": the close_wait debounce flush, the
+	// debounce recheck and the overflow-rescan scan. Guarded by seenMu;
+	// lazily initialized so a Watcher built by struct literal works.
+	inflight map[string]time.Time
 }
 
 // Append-mode constants. The canonical values live in the queue package (they
@@ -201,14 +209,32 @@ func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, se
 		if err != nil {
 			return
 		}
+		// Exactly-once arbitration for the same file version (PR #108
+		// review F3): the debounce recheck and this flush can race on the
+		// same mtime; the claim makes exactly one of them deliver.
+		//
+		// Skipping on a lost claim does NOT orphan the file: the claimant
+		// either delivers it (done) or rolls its claim back — and a
+		// rollback happens only when emitBlocking fails, which only happens
+		// on ctx cancellation, i.e. the shutdown path (agent stop / rule
+		// cancel / hot reload). There is no periodic scan in close_wait
+		// mode, so "the next scan retries" does not exist at runtime; the
+		// shutdown closes the loop instead: after a reload/restart the new
+		// Watcher starts with a fresh seen map and its initial scan
+		// re-discovers the file (scheduling a fresh recheck if it is still
+		// hot), and a cancelled rule leaves the file with no rule to belong
+		// to. See completeDelivery for the same reasoning.
+		if !w.claimDelivery(seen, path, fe.ModTime) {
+			return
+		}
+		delivered := false
+		defer func() { w.completeDelivery(seen, path, fe.ModTime, delivered) }()
 		// IC-BUG-47: blocking send — a dropped event here means the file is
 		// never collected (mtime/size never change again). Backpressure
 		// delays the debounce-flush goroutine instead.
-		w.emitBlocking(ctx, events, fe)
-		// Record the flushed mtime in the shared seen map so the IC-BUG-43
-		// debounce recheck and the IC-BUG-44 safety-net rescan do not
-		// re-emit the file the debounce flush already delivered.
-		w.markSeen(seen, path, fe.ModTime)
+		if w.emitBlocking(ctx, events, fe) {
+			delivered = true
+		}
 	}
 
 	for {
@@ -315,6 +341,18 @@ func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, see
 					// must stay retryable (PR #100 F1). Tail mode is
 					// unaffected: buildEvent already advanced tailOffsets,
 					// and seen is mtime-only.
+					//
+					// NOTE (PR #108 review F3): this loop deliberately does
+					// NOT participate in claimDelivery/completeDelivery. In
+					// non-close_wait mode there are no debounce rechecks and
+					// no flush, and handleWatchError (→ safetyNetRescan →
+					// pollScan) is invoked from THIS select loop, so the
+					// real-time delivery and the rescan's scanFile run on
+					// the same goroutine, serially — the non-atomic
+					// "check seen → send → record seen" never races here.
+					// If the rescan is ever moved to its own goroutine, it
+					// MUST be routed through claimDelivery like every other
+					// delivery site, or the exactly-once guarantee breaks.
 					if w.emitBlocking(ctx, events, fe) {
 						w.markSeen(seen, ev.Name, fe.ModTime)
 					}
@@ -437,16 +475,28 @@ func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen ma
 		Op:         op,
 		FileOffset: offset,
 	}
+	// Exactly-once arbitration for the same file version (PR #108 review
+	// F3): a rescan, a recheck and the debounce flush all funnel through
+	// here or through flush. completeDelivery runs via defer so a panic or
+	// an early return can never leak the claim.
+	if !w.claimDelivery(seen, path, info.ModTime()) {
+		return nil // already delivered, or same/newer version in flight
+	}
 	// Mark as seen and record the tail offset only after the event has
 	// been delivered: if the send is aborted (ctx cancelled) or would
 	// drop the event, the next scan must retry the file instead of
-	// silently skipping it forever (PR #100 review F1).
+	// silently skipping it forever (PR #100 review F1). The seen write
+	// itself is done by completeDelivery (monotonic) below.
+	// The defer guarantees the claim is settled on EVERY exit path —
+	// including panics and future early returns. A leaked claim would make
+	// every future claim for the same version fail and a file that never
+	// changes again would silently never be collected.
+	delivered := false
+	defer func() { w.completeDelivery(seen, path, info.ModTime(), delivered) }()
 	if !w.emitBlocking(ctx, events, fe) {
 		return errWalkAborted
 	}
-	w.seenMu.Lock()
-	seen[path] = info.ModTime()
-	w.seenMu.Unlock()
+	delivered = true
 	if w.appendMode == AppendModeTail {
 		w.tailOffsets[path] = info.Size()
 	}
@@ -461,6 +511,71 @@ func (w *Watcher) markSeen(seen map[string]time.Time, path string, modTime time.
 	w.seenMu.Lock()
 	seen[path] = modTime
 	w.seenMu.Unlock()
+}
+
+// claimDelivery atomically claims the right to deliver one version (mtime)
+// of path — PR #108 review F3. Several goroutines run the same non-atomic
+// "check seen → send → record seen" sequence for the same file: the
+// close_wait debounce flush (timer goroutine), the debounce recheck (timer
+// goroutine) and the overflow-rescan scan (event-loop goroutine). Without
+// arbitration two of them can deliver the same version twice. The claim
+// does the seen check and the placeholder insert in ONE locked section;
+// the send itself must happen OUTSIDE seenMu (emitBlocking can block, and
+// holding the lock across it would stall the whole watcher).
+//
+// Returns false — meaning "do not deliver" — when:
+//   - seen already holds this or a newer mtime (already delivered), or
+//   - another goroutine holds the claim for this or a newer mtime (its
+//     owner delivers); an OLDER in-flight version is superseded, because
+//     the file has moved on and the newer version wins.
+//
+// The caller MUST pair the claim with completeDelivery via defer, so panics
+// and early returns can never leave a stuck claim: a leaked claim would
+// make every future claim for the same version fail and a file that never
+// changes again would silently never be collected.
+func (w *Watcher) claimDelivery(seen map[string]time.Time, path string, modTime time.Time) bool {
+	w.seenMu.Lock()
+	defer w.seenMu.Unlock()
+	if prev, known := seen[path]; known && !modTime.After(prev) {
+		return false // already delivered at this or a newer version
+	}
+	if cur, busy := w.inflight[path]; busy && !modTime.After(cur) {
+		return false // same or newer version already in flight; its owner delivers
+	}
+	if w.inflight == nil {
+		w.inflight = make(map[string]time.Time)
+	}
+	w.inflight[path] = modTime
+	return true
+}
+
+// completeDelivery settles a claim made by claimDelivery: it releases the
+// in-flight placeholder — only if it still belongs to this claim, so a
+// superseded claim cannot disturb its replacement — and, when delivered,
+// records the mtime in seen monotonically (a late older-version delivery
+// must never move the seen cursor backwards). delivered=false only rolls
+// the placeholder back; the file stays retryable (PR #100 F1).
+//
+// Rollback (delivered=false) happens only when emitBlocking fails, and
+// emitBlocking fails only on ctx cancellation — i.e. on the shutdown path
+// (agent stop / rule cancel / hot reload). There is no periodic scan in
+// close_wait mode, so "the next scan retries it" is NOT available at
+// runtime; what actually closes the loop is the shutdown itself: after a
+// reload or restart the new Watcher starts with a fresh seen map and its
+// initial scan re-discovers the file (scheduling a fresh recheck if it is
+// still hot), and if the rule was cancelled the file has no rule left to
+// belong to. So no file is orphaned by a rolled-back claim.
+func (w *Watcher) completeDelivery(seen map[string]time.Time, path string, modTime time.Time, delivered bool) {
+	w.seenMu.Lock()
+	defer w.seenMu.Unlock()
+	if delivered {
+		if prev, known := seen[path]; !known || modTime.After(prev) {
+			seen[path] = modTime
+		}
+	}
+	if cur, busy := w.inflight[path]; busy && cur == modTime {
+		delete(w.inflight, path)
+	}
 }
 
 // stopAllRechecks stops and forgets every pending debounce recheck timer.
