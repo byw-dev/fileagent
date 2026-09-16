@@ -58,6 +58,10 @@ type AgentConn struct {
 	// timeout (IC-BUG-28: a dismantled connection must never leave a waiter
 	// hanging).
 	writerDone chan struct{}
+	// registry is the back-reference sendSync needs to take r.mu for the
+	// enqueue (set at Register time; the conn is only ever used through its
+	// owning registry).
+	registry *AgentRegistry
 	// stopCh, closed once by Stop, asks Connect to end the RPC gracefully:
 	// the handler returns without cancelling the stream context, so gRPC
 	// flushes the queued DATA frames before the trailers (IC-BUG-32). It is
@@ -110,8 +114,18 @@ func (r *AgentRegistry) Register(
 		notify:      make(chan struct{}),
 		writerDone:  make(chan struct{}),
 		stopCh:      make(chan struct{}),
+		registry:    r,
 	}
 	r.mu.Lock()
+	if prev, ok := r.conns[agentID]; ok && prev != conn && prev.CancelFunc != nil {
+		// A reconnect displaced the previous connection. Cancel it here: its
+		// handler returns, its deferred Unregister no-ops on the identity
+		// check, and no stale stream can outlive its registry entry to keep
+		// heartbeating or uploading after a revoke that raced the reconnect
+		// (PR #109 review P1-3). Same family as IC-BUG-28's identity rule —
+		// registry entries and their teardown are per CONNECTION, not per id.
+		prev.CancelFunc()
+	}
 	r.conns[agentID] = conn
 	r.mu.Unlock()
 	return conn
@@ -147,6 +161,53 @@ func (r *AgentRegistry) Disconnect(agentID string) bool {
 	conn, ok := r.conns[agentID]
 	r.mu.RUnlock()
 	if !ok || conn.CancelFunc == nil {
+		return false
+	}
+	conn.CancelFunc()
+	return true
+}
+
+// RevokeConn performs the whole revoke teardown bound to ONE connection: it
+// captures the agent's current connection, enqueues msg on it, waits the
+// bounded timeout for the write to be confirmed, then ends THAT connection —
+// graceful (stop, normal RPC end) on confirmation, forced (cancel) on timeout.
+// It reports whether the teardown was graceful.
+//
+// The binding matters (PR #109 review P1-3): a reconnect can register a new
+// connection under the same id while the wait is in flight, and a by-id
+// teardown would then cut the replacement while the stale connection — the
+// one the command was confirmed on — lives on outside the registry, free to
+// keep heartbeating and uploading (nothing on an established stream re-checks
+// the DB revocation state). Register cancels a connection it displaces, so
+// both ends of that race are covered; this is the same family as IC-BUG-28's
+// identity rule: teardown is by connection, never by id.
+func (r *AgentRegistry) RevokeConn(agentID string, msg *agentv1.ServerMessage, timeout time.Duration) bool {
+	r.mu.RLock()
+	conn, ok := r.conns[agentID]
+	r.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	if conn.sendSync(msg, timeout) {
+		r.stopConn(conn)
+		return true
+	}
+	r.disconnectConn(conn)
+	return false
+}
+
+// stopConn asks one specific connection to end gracefully.
+func (r *AgentRegistry) stopConn(conn *AgentConn) bool {
+	if conn == nil {
+		return false
+	}
+	conn.requestStop()
+	return true
+}
+
+// disconnectConn force-cancels one specific connection's context.
+func (r *AgentRegistry) disconnectConn(conn *AgentConn) bool {
+	if conn == nil || conn.CancelFunc == nil {
 		return false
 	}
 	conn.CancelFunc()
@@ -217,6 +278,25 @@ func (c *AgentConn) markWriterStopped() {
 	close(c.writerDone)
 }
 
+// sendSync is SendSync for one specific connection (no registry lookup), so a
+// caller that captured a conn keeps talking to THAT conn even if a reconnect
+// replaces the registry entry mid-flight (PR #109 review P1-3).
+func (c *AgentConn) sendSync(msg *agentv1.ServerMessage, timeout time.Duration) bool {
+	r := c.registry
+	if r == nil {
+		return false
+	}
+	// The enqueue must hold the registry read lock (see enqueue): it
+	// serialises against Unregister's close(SendCh).
+	r.mu.RLock()
+	seq, enqueued := c.enqueue(msg)
+	r.mu.RUnlock()
+	if !enqueued {
+		return false
+	}
+	return c.waitForWrite(seq, timeout)
+}
+
 // waitForWrite blocks a bounded time until the message enqueued as seq has
 // been written to the stream (sentSeq >= seq), the send goroutine stops, or
 // the timeout elapses. It holds NO registry lock and no sendMu while waiting.
@@ -284,16 +364,11 @@ func (r *AgentRegistry) Send(agentID string, msg *agentv1.ServerMessage) bool {
 func (r *AgentRegistry) SendSync(agentID string, msg *agentv1.ServerMessage, timeout time.Duration) bool {
 	r.mu.RLock()
 	conn, ok := r.conns[agentID]
-	if !ok {
-		r.mu.RUnlock()
-		return false
-	}
-	seq, enqueued := conn.enqueue(msg)
 	r.mu.RUnlock()
-	if !enqueued {
+	if !ok {
 		return false
 	}
-	return conn.waitForWrite(seq, timeout)
+	return conn.sendSync(msg, timeout)
 }
 
 // IsOnline reports whether the agent currently has an active connection.

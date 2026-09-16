@@ -33,7 +33,7 @@ ORDER BY created_at DESC;
 UPDATE collection_rules
 SET status = $2,
     updated_at = NOW()
-WHERE id = $1
+WHERE id = $1 AND agent_id = $3 AND org_id = $4
 RETURNING *;
 
 -- name: UpdateCollectionRule :one

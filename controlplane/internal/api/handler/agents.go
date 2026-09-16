@@ -64,7 +64,9 @@ type AgentsDB interface {
 	ListCollectionRulesByAgent(ctx context.Context, agentID uuid.UUID) ([]*db.CollectionRule, error)
 	GetCollectionRuleByID(ctx context.Context, id uuid.UUID) (*db.CollectionRule, error)
 	CreateCollectionRule(ctx context.Context, arg db.CreateCollectionRuleParams) (*db.CollectionRule, error)
-	UpdateCollectionRuleStatus(ctx context.Context, iD uuid.UUID, status db.RuleStatus) (*db.CollectionRule, error)
+	// UpdateCollectionRuleStatus is scoped to the URL agent and the caller's
+	// org like every other rule write; a mismatch surfaces as sql.ErrNoRows.
+	UpdateCollectionRuleStatus(ctx context.Context, iD uuid.UUID, status db.RuleStatus, agentID, orgID uuid.UUID) (*db.CollectionRule, error)
 	UpdateCollectionRule(ctx context.Context, arg db.UpdateCollectionRuleParams) (*db.CollectionRule, error)
 	// DeleteCollectionRule removes the rule only when it belongs to the given
 	// agent and org, and reports how many rows the delete actually removed.
@@ -89,20 +91,14 @@ type RuleDispatcher interface {
 type AgentRegistryClient interface {
 	Send(agentID string, msg *agentv1.ServerMessage) bool
 	IsOnline(agentID string) bool
-	// Disconnect cuts the agent's stream by cancelling its context — the
-	// forced end. Revocation needs it because the Revoke command it sends is
-	// cooperative and a compromised agent ignores it.
-	Disconnect(agentID string) bool
-	// Stop ends the agent's stream gracefully: the handler returns without
-	// cancelling, so gRPC flushes the queued DATA frames before the trailers.
-	// It never waits on the agent.
-	Stop(agentID string) bool
-	// SendSync enqueues a message and waits a bounded timeout for the send
-	// goroutine to confirm it was written to the stream. Revoke uses it so
-	// the cooperative command is not lost to the Disconnect that immediately
-	// follows; the bound must stay hard because a non-reading agent pins
-	// stream.Send forever.
-	SendSync(agentID string, msg *agentv1.ServerMessage, timeout time.Duration) bool
+	// RevokeConn performs the connection-bound revoke teardown: capture the
+	// agent's CURRENT connection, send the command to it, wait the bounded
+	// timeout for the write to be confirmed, then end THAT connection —
+	// graceful on confirmation, forced on timeout. The binding is the point
+	// (PR #109 review P1-3): a by-id teardown would cut whichever connection
+	// is registered by then and could strand the stale one the command was
+	// actually confirmed on.
+	RevokeConn(agentID string, msg *agentv1.ServerMessage, timeout time.Duration) bool
 }
 
 // AgentCacheClient is the cache interface used by AgentsHandler.
@@ -473,14 +469,18 @@ func (h *AgentsHandler) Revoke(c *gin.Context) {
 		// behaviour and can still lose the command; the hard cap is what
 		// bounds it. Either way the stream is cut regardless — the command
 		// is cooperative and a compromised agent ignores it (IC-BUG-25).
-		if h.registry.SendSync(id.String(), &agentv1.ServerMessage{
+		// The teardown is bound to the connection captured inside
+		// RevokeConn (PR #109 review P1-3): a reconnect registering a new
+		// connection under the same id mid-wait must not redirect the cut —
+		// and Register cancels the connection it displaces, so no stale
+		// stream survives either way.
+		if h.registry.RevokeConn(id.String(), &agentv1.ServerMessage{
 			Payload: &agentv1.ServerMessage_Revoke{
 				Revoke: &agentv1.RevokeCommand{Reason: "revoked_by_admin"},
 			},
 		}, revokeSendWait) {
-			h.registry.Stop(id.String())
 			h.logger.Info("revoke: agent stream ended gracefully", zap.String("agent_id", id.String()))
-		} else if h.registry.Disconnect(id.String()) {
+		} else {
 			h.logger.Info("revoke: agent stream cut", zap.String("agent_id", id.String()))
 		}
 	}
@@ -1103,8 +1103,17 @@ func (h *AgentsHandler) UpdateRule(c *gin.Context) {
 	h.updateRuleStatus(c, rid, req.Status)
 }
 
-// updateRuleStatus applies an enable/disable toggle.
+// updateRuleStatus applies an enable/disable toggle. The write is scoped to
+// the URL agent and the caller's org (PR #109 review P1-2) — the status-only
+// request shape is a rule write like any other, and an unscooped one would let
+// "PUT /agents/<A>/rules/<B's rule>" disable B's rule and dispatch a cancel
+// to B.
 func (h *AgentsHandler) updateRuleStatus(c *gin.Context, rid uuid.UUID, statusStr string) {
+	agentID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
+		return
+	}
 	status := db.RuleStatus(statusStr)
 	switch status {
 	case db.RuleStatusActive, db.RuleStatusInactive:
@@ -1113,7 +1122,7 @@ func (h *AgentsHandler) updateRuleStatus(c *gin.Context, rid uuid.UUID, statusSt
 		return
 	}
 
-	rule, err := h.db.UpdateCollectionRuleStatus(c.Request.Context(), rid, status)
+	rule, err := h.db.UpdateCollectionRuleStatus(c.Request.Context(), rid, status, agentID, orgIDFromClaims(c))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			middleware.RespondError(c, http.StatusNotFound, "NOT_FOUND", "rule not found", nil)
@@ -1257,9 +1266,12 @@ func (h *AgentsHandler) DeleteRule(c *gin.Context) {
 		middleware.NotImplemented(c)
 		return
 	}
-	// The URL agent id stays a validated route parameter even though ownership
-	// itself is decided by the DB: an unparsable id is a malformed request.
-	if _, err := uuid.Parse(c.Param("id")); err != nil {
+	// The URL agent id is the scope the CALLER claims, and the delete
+	// predicate below is keyed on it (PR #109 review P1-1): passing the rule
+	// row's own AgentID instead would be a tautology that silently deletes
+	// another agent's rule. An unparsable id is a malformed request.
+	urlAgentID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
 		middleware.RespondError(c, http.StatusBadRequest, "INVALID_ID", "invalid agent id", nil)
 		return
 	}
@@ -1285,10 +1297,12 @@ func (h *AgentsHandler) DeleteRule(c *gin.Context) {
 	}
 	orgID := orgIDFromClaims(c)
 
-	// The delete itself is scoped to the owner (id + agent_id + org_id); rows
-	// == 0 means the rule is gone or not the caller's, and nothing — not even
-	// a cancel — may be dispatched for a delete that did not happen.
-	rows, err := h.db.DeleteCollectionRule(c.Request.Context(), rid, rule.AgentID, orgID)
+	// The delete is scoped by the URL agent (the claimed scope) plus the org;
+	// rows == 0 means the rule is gone or not the caller's, and nothing — not
+	// even a cancel — may be dispatched for a delete that did not happen. The
+	// cancel below still goes to the row's owner as defense in depth: on the
+	// success path the two are necessarily equal.
+	rows, err := h.db.DeleteCollectionRule(c.Request.Context(), rid, urlAgentID, orgID)
 	if err != nil {
 		h.logger.Error("delete rule", zap.Error(err))
 		middleware.RespondError(c, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to delete rule", nil)
