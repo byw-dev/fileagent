@@ -10,7 +10,7 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
-> **计数（2026-09-13，PR #107 合并后）**：共 **52** 条 = **已关闭 31** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 20**（**4 条挡** 6/7/9/40 + **14 条可推** + **2 条拆半** 13 与 46）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。⚠️ **IC-BUG-13 也是拆半**（`content_type` 防清空半边随 IC-2a 已关、**填值半边仍开**），总览表那一行没有标记，容易被误数进「可推」——以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**。
+> **计数（2026-09-13，PR #107 合并后）**：共 **52** 条 = **已关闭 31** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 20**（**4 条挡** 6/7/9/40 + **13 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。⚠️ **IC-BUG-13 也是拆半**（`content_type` 防清空半边随 IC-2a 已关、**填值半边仍开**），总览表那一行没有标记，容易被误数进「可推」——以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -132,7 +132,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-29 | `UploadResult.rule_id` 无归属校验，agent 可把上传记到别人的规则上并借其元数据打标 ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-30 | 规则 cancel 无补偿通道：断连期间删除的规则，agent 重连后继续采集上传 ✅ 随 IC-2b 修复（快照形态）| 🟠 P1 | controlplane + agent |
 | IC-BUG-31 | `registry.Send` 队列满即静默丢弃，且 Connect 在消费者启动前入队 ✅ 两半均已修复（ack 半边随 IC-2a，结构半边随 IC-2b）| 🟠 P1 | controlplane |
-| IC-BUG-32 | `Revoke` 的 `Send` 与 `Disconnect` 存在竞态窗口，命令可能在切流前被丢弃 | 🟡 P2 | controlplane |
+| IC-BUG-32 | `Revoke` 的 `Send` 与 `Disconnect` 存在竞态窗口，命令可能在切流前被丢弃 ◐ **拆半**：有界等待 + teardown 二态 ✅ 随 IC-SEC-2（空闲路径送达确定性成立）；积压下送达保证未关（服务端无 flush 等待 API，关闭路径=应用层 ACK，未排期） | 🟡 P2 | controlplane |
 | IC-BUG-33 | 失败的上报仍写 `file_entries` 行，制造「DB 有、对象无」的反向幽灵 ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-34 | agent 重启后 `running` 态任务无复位，永久孤儿：不重传也不上报 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
 | IC-BUG-35 | `init-minio.sh` 默认 CP 服务账号 access key 超出 MinIO 20 字符上限，脚本第 4 步必失败 ✅ 已修（PR #97） | 🟠 P1 | deploy |
@@ -530,7 +530,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 给一个 agent 配 40 条 active 规则，重连后 40 条全部生效且凭据到达；单测覆盖「SendCh 满时调用方可观测到失败」（`DispatchRule` 不再吞掉） |
 | **ack 半边已随 IC-2a ④ 关闭（2026-09-11）** | ack 仍走 best-effort 的 `registry.Send`（**没有**去把 `Send` 改成可靠——那正是 M-2 的错误方向），改法是 agent 侧 `reported` 超时回退重发；幂等由 `task_id` + `(bucket_id, storage_path)` + `observed_at` 三者保证。live 回归：代理**故意丢掉第一个 ack**，任务仍自愈完成（`upload_logs` 因此有 2 行，首报 + 重报）。**结构半边已随 IC-2b ④ 关闭（2026-09-11）**：`Connect` 的发送 goroutine 提前到 `SyncRulesOnConnect`/`pushCredentials` 之前启动（消除无消费者入队），`DispatchRule` 不再吞 `Send` 失败（返回错误给调用方）。行为级证据：40 条规则 + 凭据在旧形态下 5/5 确定性丢 8 条 + 凭据（恰好送达 32 条）→ 快照形态（IC-BUG-30 的 D-033）下 5/5 全部送达。ack 半边仍按 IC-2a ④ 的超时回退模型（`Send` 保持 best-effort）。**残留**：单次同步 1 条消息无压力，但经 API 批量改动大量规则时增量通道的 burst 会重现（未修，待立卡）；`registry.Send` 仍是 `select/default` 队满即丢，靠各消费方自带补偿
 
-## IC-BUG-32 — `Revoke` 的 `Send` 与 `Disconnect` 存在竞态窗口，命令可能在切流前被丢弃 🟡 P2
+## IC-BUG-32 — `Revoke` 的 `Send` 与 `Disconnect` 存在竞态窗口，命令可能在切流前被丢弃 🟡 P2 ◐ 拆半（有界等待与 teardown 二态 ✅ IC-SEC-2 / 积压下送达保证 → 未排期）
 
 | 字段 | 内容 |
 |------|------|
@@ -542,6 +542,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **来源** | 原埋在 IC-BUG-25 的「备注（本刀未处理）」里，处置写的是「随 IC-2 顺手处理」。2026-09-10 的 M-2 类扫描把它升格为独立卡片 |
 | **修复** | 让切流等一个**有界**的短窗：`Send` 之后不立刻 cancel，等发送 goroutine 确认写出（或固定等 ≤1s）再 `Disconnect`，超时则直接切。**上限必须是硬的**——绝不能无限等一个不读流的 agent，那会重蹈 IC-BUG-25 复审里 MF-4 的覆辙 |
 | **验收** | bufconn 用例：正常 agent 被吊销时先收到 `RevokeCommand`、流随后才断；**不读流的 agent 在上限时间内仍被切断**（不因等待而挂住 handler） |
+| **◐ 已关半边（IC-SEC-2，2026-09-14）** | `Send`→`Disconnect` 之间加 **1s 硬上限的有界等待**（`registry.SendSync`：入队即分配 FIFO 序号、发送 goroutine 写出确认才放行；等待零锁、队满即拒绝、teardown 立即释放等待者）；teardown 二态：确认→`registry.Stop` 正常收尾（不 cancel、不 RST 在途写）、超时→`Disconnect` 强制切。「切流 regardless」语义保持。**空闲路径**（writer park 在 select、无积压——稳态常态）命令先于断流送达，确定性成立并有契约测试（`TestRevoke_IdlePath_DeliversCommandBeforeStreamEnd`，-count=50）；不读流的 agent 在上限内被切断、等待者必被释放（`TestRevoke_NonReadingAgent_StillCutWithinCap` / `TestSendSync_WaiterReleasedWhenWriterStops`，各 -count=50）；handler 级分支守卫（确认→Stop / 超时→Disconnect、上限恒 1s）变异可红 |
+| **◐ 未关半边（拆半，未排期）** | **积压下服务端无法保证「命令先于断流送达」**。根因（2026-09-14 复核实证）：`stream.Send` 返回=帧**入队**而非上 wire，服务端没有等待 flush 的 API，流收尾也不等对端开窗——未 flush 的排队帧（含命令）在收尾时被丢弃。同一钉住 harness 实测：Send+立即 Disconnect ~50%、graceful 收尾 ~45%，无实质改善；双向字节捕获证明服务端 wire 顺序正确、客户端 transport 收齐全部字节、应用只见 1/4 条（bufconn 上「未读积压 + trailers」另有客户端 transport 丢弃缓冲帧的角点）。**关闭路径=agent 对 RevokeCommand 的应用层 ACK + CP 有界等待、超时回退强制切断，跨 proto/agent/CP 三端，不属于 IC-SEC-2（`agent/` 另有归属），未排期**。空闲路径契约与积压路径诚实口径分别由 `TestRevoke_IdlePath_*` 与 `TestRevoke_Backlog_HardCapAndCut`（送达仅记日志、明示尽力而为、不断言）钉住 |
 
 ## IC-BUG-33 — 失败的上报仍写 `file_entries` 行，制造反向幽灵 🟠 P1 ✅ 已修（IC-2a ⑥）
 
