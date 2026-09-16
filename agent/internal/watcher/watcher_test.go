@@ -1148,51 +1148,12 @@ func TestCloseWaitFlush_PreventsRescanReemit(t *testing.T) {
 	}
 }
 
-// ── PR #108 review F1: real-time deliveries must be recorded in seen ─────────
-
-// A file delivered in real time by the default (non-close_wait) loop must be
-// recorded in the shared seen map; otherwise the safety-net rescan re-emits
-// every real-time-delivered file as "create" on the next overflow.
-func TestLoopFsnotify_MarksSeenOnDelivery_NoRescanReemit(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "live.txt")
-	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
-
-	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
-	require.NoError(t, err)
-
-	seen := make(map[string]time.Time)
-	evc := make(chan fsnotify.Event)
-	erc := make(chan error, 1)
-	events := make(chan FileEvent, 8)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	go func() { _ = w.loopFsnotify(ctx, events, seen, evc, erc) }()
-
-	// A file arrives in real time and is delivered.
-	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
-	select {
-	case fe := <-events:
-		require.Equal(t, path, fe.Path)
-	case <-time.After(2 * time.Second):
-		t.Fatal("real-time create was not delivered")
-	}
-
-	// The delivery must be recorded in seen (review F1).
-	w.seenMu.Lock()
-	_, known := seen[path]
-	w.seenMu.Unlock()
-	require.True(t, known, "real-time delivery must record the file in seen")
-
-	// An overflow rescan must therefore not re-emit the unchanged file.
-	erc <- fsnotify.ErrEventOverflow
-	select {
-	case fe := <-events:
-		t.Fatalf("rescan re-emitted a file already delivered in real time: %s (op=%s)", fe.Path, fe.Op)
-	case <-time.After(300 * time.Millisecond):
-	}
-}
+// ── PR #108 review F1 → P1: the F1 guards were reverted by the P1 ruling ─────
+// (F1 marked real-time deliveries seen; the codex review P1 proved that this
+// took away the overflow rescan's retry opportunity and traded an unbounded
+// silent-loss mode for a bounded amplification. The guards below were the
+// F1 versions; TestLoopFsnotify_RescanRetriesRealTimeDeliveredFiles at the
+// bottom of this file pins the reverted behaviour.)
 
 // Guard: remove events are not "deliveries" — they must not mark the file
 // seen (only create/write deliveries do).
@@ -1646,4 +1607,53 @@ func TestRecheckTimer_ReplaceKeepsNewTimerTracked(t *testing.T) {
 
 	require.True(t, tracked, "the replacement timer must stay tracked")
 	assert.Same(t, timerB, cur, "timer A must not delete the replacement's tracking entry")
+}
+
+// ── PR #108 codex 复审 P1: seen 语义回退为「已交付」前的守卫（见卡片 IC-BUG-53） ─
+
+// The safety-net rescan is a RETRY OPPORTUNITY: real-time deliveries are not
+// durable (emitBlocking=true only means the event entered the in-memory
+// channel — the downstream submit can still fail), so the rescan must
+// re-emit files it finds even if they were delivered in real time. Seen is
+// deliberately NOT written on the real-time path, so the overflow rescan
+// never skips a file just because it was delivered once. (The trade-off —
+// bounded re-delivery vs. unbounded silent loss — is argued in the
+// loopFsnotify comment; the watcher-side residual gap is IC-BUG-53.)
+func TestLoopFsnotify_RescanRetriesRealTimeDeliveredFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "retryable.txt")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error, 1)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = w.loopFsnotify(ctx, events, seen, evc, erc) }()
+
+	// The file is delivered in real time (first delivery consumed below).
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	select {
+	case fe := <-events:
+		require.Equal(t, path, fe.Path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("real-time create was not delivered")
+	}
+
+	// An overflow rescan must RE-EMIT the file: the real-time delivery is
+	// not durable, and this rescan is the retry opportunity for the window
+	// between delivery and durable enqueue.
+	erc <- fsnotify.ErrEventOverflow
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+		assert.Equal(t, "create", fe.Op)
+	case <-time.After(2 * time.Second):
+		t.Fatal("safety-net rescan skipped a real-time-delivered file — the retry opportunity is lost (P1 regression)")
+	}
 }

@@ -339,14 +339,33 @@ func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, see
 			}
 			if ev.Has(fsnotify.Create) || ev.Has(fsnotify.Write) {
 				if fe, err := w.buildEvent(ev.Name, opString(ev)); err == nil {
-					// PR #108 review F1: record the delivered mtime in the
-					// shared seen map — otherwise every real-time-delivered
-					// file is invisible to the safety-net rescan, which
-					// would re-emit them all as "create" on the next
-					// overflow. Only on successful delivery: an aborted send
-					// must stay retryable (PR #100 F1). Tail mode is
-					// unaffected: buildEvent already advanced tailOffsets,
-					// and seen is mtime-only.
+					// PR #108 review F1 → P1 (codex 复审): the real-time
+					// path deliberately does NOT write seen. Seen means
+					// "delivered", and emitBlocking=true only proves the
+					// event entered the in-memory channel — the downstream
+					// submit can still fail (only Warn-logged, see
+					// IC-BUG-53). Marking seen here would take away the
+					// overflow rescan's retry opportunity for exactly those
+					// files, turning a transient downstream failure into a
+					// permanent silent miss for the watcher's lifetime.
+					// Trade-off, deliberately accepted: after an overflow
+					// the rescan re-emits files that were already delivered
+					// in real time. That amplification is BOUNDED — one
+					// rescan round per overflow, downstream IsProcessed
+					// (rule+path+mtime+size) deduplicates, and the known
+					// amplification point is IC-BUG-42 (EnqueueIfNoActive
+					// does not block `failed`) — while keeping markSeen
+					// would be UNBOUNDED silent loss. Trading unbounded for
+					// bounded is what this fix is for.
+					//
+					// Asymmetry vs. close_wait, on purpose: the close_wait
+					// flush/recheck/scan path keeps recording seen because
+					// (1) the exactly-once claim arbitration (F3) depends on
+					// the seen write, and (2) that path's "no retry after a
+					// downstream failure" behaviour predates this knife —
+					// it is not a regression introduced here. Only the
+					// real-time path's behaviour changed (F1 added markSeen,
+					// which P1 reverts).
 					//
 					// NOTE (PR #108 review F3): this loop deliberately does
 					// NOT participate in claimDelivery/completeDelivery. In
@@ -359,9 +378,7 @@ func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, see
 					// If the rescan is ever moved to its own goroutine, it
 					// MUST be routed through claimDelivery like every other
 					// delivery site, or the exactly-once guarantee breaks.
-					if w.emitBlocking(ctx, events, fe) {
-						w.markSeen(seen, ev.Name, fe.ModTime)
-					}
+					w.emitBlocking(ctx, events, fe)
 				}
 			}
 			if ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename) {
@@ -636,6 +653,23 @@ func (w *Watcher) handleWatchError(ctx context.Context, events chan<- FileEvent,
 // recover from such windows, and the alternative (dropping the files
 // silently) is strictly worse. emitBlocking's backpressure semantics are
 // intentional (IC-BUG-47) and are deliberately not changed here.
+// Trade-off (IC-BUG-44, deliberate): while this scan runs, fw.Events is not
+// drained, and the scan itself sends through emitBlocking — a consumer that
+// is slow again can in theory trigger a second overflow during the rescan.
+// That risk is bounded and acceptable: the rescan exists precisely to
+// recover from such windows, and the alternative (dropping the files
+// silently) is strictly worse. emitBlocking's backpressure semantics are
+// intentional (IC-BUG-47) and are deliberately not changed here.
+//
+// Bounded, honestly stated (PR #108 review P1): the rescan re-emits files
+// that were already delivered in real time, because seen on the real-time
+// path is deliberately not written (see loopFsnotify for the trade-off
+// argument). The amplification per overflow round is bounded: one rescan
+// pass, and the downstream IsProcessed check (rule+path+mtime+size)
+// deduplicates the re-deliveries; the known remaining amplification point
+// is IC-BUG-42. What the rescan must never do is skip a file it finds —
+// it is the retry opportunity for every delivery that did not durably
+// enqueue downstream.
 func (w *Watcher) safetyNetRescan(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time) {
 	w.scheduleDebounceRechecks(ctx, events, seen, w.pollScan(ctx, events, seen))
 }

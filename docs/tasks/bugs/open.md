@@ -10,7 +10,7 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
-> **计数（2026-09-13，PR #106 合并后）**：共 **52** 条 = **已关闭 31** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 20**（**4 条挡** 6/7/9/40 + **14 条可推** + **2 条拆半** 13 与 46）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。⚠️ **IC-BUG-13 也是拆半**（`content_type` 防清空半边随 IC-2a 已关、**填值半边仍开**），总览表那一行没有标记，容易被误数进「可推」——以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**。
+> **计数（2026-09-16，PR #108 review 后）**：共 **53** 条 = **已关闭 31** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 21**（**4 条挡** 6/7/9/40 + **15 条可推** + **2 条拆半** 13 与 46）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。⚠️ **IC-BUG-13 也是拆半**（`content_type` 防清空半边随 IC-2a 已关、**填值半边仍开**），总览表那一行没有标记，容易被误数进「可推」——以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -153,6 +153,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-50 | `time` 是**未声明的保留字**（三端契约只有 agent 知道）、**优先级与同体系系统变量相反**（无条件覆盖解析结果）、且**名字误导**（实为「文件被提交上传的时刻」）✅ 随 D-034 修复（PR #106：改名 `{submit_time}` + 解析结果优先 + 旧名 deprecated 兼容） | 🟡 P2 | agent + controlplane + webui |
 | IC-BUG-51 | 上报的 `sha256` / `size_bytes` / 实际上传字节**来自三次独立的文件读**，三者可以描述文件的不同版本；且 `PutObject` 返回的 ETag 虽已拿到却无人用来复核 | 🟠 P1 | agent |
 | IC-BUG-52 | `dry_run_limit` 的**有效上限恒为 10**：CP 只在响应端按它裁剪（1–10 生效），**从不下发给 agent**，而 agent 硬编码上限 10——请求 11–50 被静默压成 10，且无截断标记 | 🟡 P2 | controlplane + agent + proto |
+| IC-BUG-53 | watcher 的 `seen` 语义是「**已交付**」而非「**已持久入队**」：下游 `submitFile` 提交/判重失败**只 Warn 不重试**，文件此后不再变化时**永不被采集**（初扫路径自 PR #100 F1 起即受影响，实时路径因 IC-BUG-44/43 的 P1 裁决而**保留重试机会**） | 🟡 P2 | agent |
 
 ---
 
@@ -807,3 +808,17 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 - 已关闭 Bug：[`closed.md`](closed.md)
 - 当前活跃任务：[`../active.md`](../active.md)
+
+## IC-BUG-53 — watcher 的 seen 语义是「已交付」而非「已持久入队」，下游提交失败只 Warn、重试机会因此丧失 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | watcher 侧把事件送进内存 channel（`emitBlocking` 返回 true）就算「处理完毕」并记入 `seen`——但 `emitBlocking=true` **只证明事件进了 channel，不证明下游已持久入队**。消费端 `runWatcher` 收到事件后调 `submitFile`，其中 `exec.Submit` 失败（SQLite busy timeout、磁盘 I/O 等）**只打一条 Warn**；`IsProcessed` 出错也是 Warn 后继续。此后该文件若不再变化（日志轮转后的旧文件、一次性落地的文件），就再没有任何事件触发，**当前 watcher 生命周期内永不被采集，且无任何可见信号**。安全网重扫（IC-BUG-44）本可兜住这类窗口——它按 mtime 重发一切未见过的文件——但凡是 seen 已记录的文件它也会跳过，所以这个洞对 seen 已覆盖的文件同样成立 |
+| **精确位置** | `agent/cmd/agent/main.go` 的 `submitFile`：`exec.Submit` 失败分支与 `IsProcessed` 出错分支，两处均只有 `logger.Warn` 后继续；watcher 侧的 seen 语义见 `agent/internal/watcher/watcher.go` 的 `scanFile` / `markSeen`（「交付成功即记 seen」） |
+| **范围（两条路径受影响程度不同）** | ① **初扫路径（pollScan→scanFile）自 PR #100 F1 起即受影响**——F1 的注释只承诺「发送层失败可重试」（emitBlocking 返回 false 时不标 seen），从未承诺「下游持久化失败可重试」，这是既有行为，非 IC-BUG-44/43 引入；② **实时 fsnotify 路径**在 PR #108 的 F1 修复中曾把 markSeen 加到实时交付后，**codex 复审 P1 证实那会挡掉溢出重扫对实时交付文件唯一的一次重试机会**（无界静默漏采 vs 有界重发放大），已按裁决撤回——**实时路径现在保留了重试机会**，见 `loopFsnotify` 注释里的交换论证。③ close_wait 路径（flush/recheck/rescan）保留「交付即记 seen」：F3 的恰一次仲裁依赖它，且其行为与 ① 同源、非本刀新增退化 |
+| **后果** | 下游一次瞬时提交失败 → 该文件永久漏采（当前 watcher 生命周期内）。与 IC-BUG-37/47/44 同一族——「文件静默不被采集」正是数据面最忌讳的失败类别，区别只在于丢失发生在交付之后、入队之前这一段 |
+| **修复** | 长期形态是**交付→持久化闭环**：下游持久入队后向 watcher 回传确认（FileEvent 携带 ack 回调或独立的 ack channel），确认到达才记 seen；需处理 ack 丢失/顺序/泄漏，并与 executor 的重试退避层对齐（「任务入队失败」与「任务执行失败」是两层，ack 语义要定清楚）——跨 watcher 与 main 的边界，**独立一刀**。短期兜底已由 IC-BUG-44 的安全网重扫提供一半（重扫是 seen 之外文件的重试机会）；也可考虑先修 submitFile 的静默失败本身（失败可见化/重试/阻塞消费），但同样动下游语义，宜单独评估 |
+| **验收** | 构造 Submit 失败（mock executor 返回错误）→ 文件在后续安全网重扫或重启后的初扫中必须被重新提交；ack 闭环落地后：Submit 失败的文件在确认缺失时必须被重新交付，且恰一次仲裁（PR #108 F3）不因 ack 机制破坏 |
+| **定级理由** | 🟡 P2 而非 P1：触发条件是「下游提交失败 + 文件此后不再变化」两个条件的交集，且初扫路径的暴露窗口受限于安全网重扫与重启频率（重启即全量重扫兜底）；但后果属「静默漏采」族，高于一般正确性缺陷，不宜 P3 |
+| **发现路径** | PR #108（IC-BUG-44/43 + 评审 F1/F2/F3/P1/P2）的 codex 复审：P1 指出 F1 的 markSeen 挡掉了溢出重扫的重试机会，协调者复核后裁决按 (b) 撤回实时路径 markSeen（保留有界重发放大），并把「seen ≠ 已持久」这个全局洞立卡为本条 |
+| **归属** | 未排期。修复归属就是上面 (a) 那条闭环的刀；与 IC-BUG-42（重复提交同源：都是交付/入队边界的状态语义）、IC-BUG-44（安全网重扫是本条唯一的运行期兜底）关联紧密 |
