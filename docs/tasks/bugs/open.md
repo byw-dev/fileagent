@@ -538,7 +538,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **⚠️ 量级修正（2026-09-10 评审实测）** | 初版写「约半数丢失」——**证伪**。复刻 `handler.go:115-132` 的 select 结构 + `agents.go:401/410` 的调用序实测：发送 goroutine **已 park 在 select 上**（`SendCh` 空）时，channel 直接交接，`SendCh` 分支在 `Send` 返回前就已提交，随后的 `cancel()` 追不上——**20000 次 100% 送达**；只有 goroutine **不在 select** 时（正卡在前一条消息的 `stream.Send` 里，或尚未启动）两分支才同时就绪，此时 49.6%。**稳态下的空闲连接正是前者**，所以「约半数」不成立 |
 | **真正的主窗口** | 不是 select 的随机选择，而是：`ctx.Done()` 让 `Connect` 的主循环 `return`、RPC 就此结束，**后续的 `stream.Send` 必然失败**。即命令是否送出取决于「发送 goroutine 有没有抢在 handler 返回之前把它写进流」——这是个时间赛跑，不是 50/50 的掷硬币 |
 | **精确位置** | `controlplane/internal/api/handler/agents.go:399-413`（`Send` 后立即 `Disconnect`）；`controlplane/internal/grpcserver/handler.go:114-129`（发送 goroutine 的 select） |
-| **后果** | 有限。切流是硬手段且已经生效（IC-SEC-1），协作式命令本就尽力而为。真实损失是**守规矩的 agent 收不到 `Revoke` 就不执行 `handleRevokeCommand`**，本地 token 留在磁盘上直到 30 天 TTL 到期。安全上不构成新暴露面——状态闸门（IC-BUG-23 修复）已拦住它重连 |
+| **后果** | 有限。切流是硬手段且已经生效（IC-SEC-1），协作式命令本就尽力而为。真实损失是**守规矩的 agent 收不到 `Revoke` 就不执行 `handleRevokeCommand`**，本地 token 留在磁盘上直到 30 天 TTL 到期。安全上不构成新暴露面——状态闸门（IC-BUG-23 修复）拦住重连，**且 PR #109 评审补上了中途竞态的另一半**（此前这句话说重了）：过首检但被吊销事务抢先的连接原先只被记一条 warning、会全功能存活到 STS 过期，现于 `MarkAgentOnlineIfUsable`=0 时立即 PermissionDenied（`TestServer_Connect_RevokedMidSetup_IsCutNotPersisted`） |
 | **来源** | 原埋在 IC-BUG-25 的「备注（本刀未处理）」里，处置写的是「随 IC-2 顺手处理」。2026-09-10 的 M-2 类扫描把它升格为独立卡片 |
 | **修复** | 让切流等一个**有界**的短窗：`Send` 之后不立刻 cancel，等发送 goroutine 确认写出（或固定等 ≤1s）再 `Disconnect`，超时则直接切。**上限必须是硬的**——绝不能无限等一个不读流的 agent，那会重蹈 IC-BUG-25 复审里 MF-4 的覆辙 |
 | **验收** | bufconn 用例：正常 agent 被吊销时先收到 `RevokeCommand`、流随后才断；**不读流的 agent 在上限时间内仍被切断**（不因等待而挂住 handler） |

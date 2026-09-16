@@ -286,9 +286,20 @@ func (c *AgentConn) sendSync(msg *agentv1.ServerMessage, timeout time.Duration) 
 	if r == nil {
 		return false
 	}
-	// The enqueue must hold the registry read lock (see enqueue): it
-	// serialises against Unregister's close(SendCh).
+	// The enqueue runs under the registry read lock, and the connection's
+	// identity is re-verified in the SAME critical section. Either alone is
+	// not enough: holding the RLock only fences a CONCURRENT Unregister — an
+	// Unregister that already COMPLETED between the caller's capture and this
+	// acquisition has closed SendCh for good, and re-acquiring the read lock
+	// will not reopen it (PR #109 re-review P1-a, process-panic DoS). The
+	// identity check closes that window: if the entry is gone or was replaced,
+	// the enqueue is refused and the caller falls back to the forced teardown
+	// of its captured connection.
 	r.mu.RLock()
+	if r.conns[c.AgentID] != c {
+		r.mu.RUnlock()
+		return false
+	}
 	seq, enqueued := c.enqueue(msg)
 	r.mu.RUnlock()
 	if !enqueued {

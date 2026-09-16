@@ -957,3 +957,27 @@ func TestServer_Heartbeat_RebuildsDegradedMarkerAfterExternalDelete(t *testing.T
 		"the next heartbeat must rebuild the marker from the connection's own degraded state — "+
 			"renewal conditioned on key existence cannot self-heal a lost key (R6)")
 }
+
+// PR #109 re-review P1-b: a connection that passed its first liveness check
+// but lost the race against a revocation (MarkAgentOnlineIfUsable returns 0)
+// must be cut immediately — PermissionDenied, not registered, no heartbeats,
+// no uploads. Logging the constraint hit and continuing would leave the
+// connection fully live for the lifetime of its STS session.
+func TestServer_Connect_RevokedMidSetup_IsCutNotPersisted(t *testing.T) {
+	agentID := "88888888-8888-8888-8888-888888888888"
+	stateDB := &mockStateDB{agentStatus: db.AgentStatusApproved, markOnlineUsableNoMatch: true}
+	client, bearer, registry := newFullServerForAgent(t, agentID, stateDB)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", bearer))
+	require.NoError(t, err, "the stream opens; the rejection arrives on first Recv")
+
+	_, err = stream.Recv()
+	require.Error(t, err)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err),
+		"the mid-setup revocation must end the RPC, not just log a warning")
+	assert.False(t, registry.IsOnline(agentID),
+		"the racing connection must not stay in the registry")
+	assert.Equal(t, 1, stateDB.markOnlineUsableCalls)
+}

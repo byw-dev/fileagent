@@ -108,11 +108,15 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 				s.logger.Warn("connect: update status to online failed", zap.Error(dbErr))
 			case rows == 0:
 				// The status left the usable set between the liveness check and
-				// this write — i.e. the agent was revoked mid-connect. The
-				// constraint did its job; log it, because this is the only place
-				// that race is ever visible.
+				// this write — i.e. the agent was revoked mid-connect, and this
+				// connection is the one that raced it. Ending the RPC here is
+				// the actual gate: a warning alone would leave the connection
+				// registered and fully live — heartbeats, upload reports and
+				// STS-backed data-plane writes all included — for as long as
+				// the agent keeps the stream open (PR #109 re-review P1-b).
 				s.logger.Warn("connect: agent left the usable state during connect setup",
 					zap.String("agent_id", agentID))
+				return status.Error(codes.PermissionDenied, "agent connection terminated")
 			}
 		}
 	}

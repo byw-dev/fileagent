@@ -85,16 +85,17 @@ func (m *mockNATS) Publish(subject string, _ []byte) error {
 type mockStateDB struct {
 	// agentStatus backs GetAgentByID; the zero value "" is treated as
 	// not-usable, so tests that need the liveness gate to pass must set it.
-	agentStatus           db.AgentStatus
-	agentErr              error
-	lastSeenCalled        bool
-	updateStatus          db.AgentStatus
-	markOnlineRows        int64 // rows returned by MarkAgentOnlineIfOffline (0 = not offline / no restore)
-	markOnlineUsableCalls int
-	markOnlineCalls       int
-	markOfflineRows       int64 // rows returned by MarkAgentOfflineIfOnline (0 = already offline)
-	markOfflineErr        error
-	markOfflineCalls      int
+	agentStatus             db.AgentStatus
+	agentErr                error
+	lastSeenCalled          bool
+	updateStatus            db.AgentStatus
+	markOnlineRows          int64 // rows returned by MarkAgentOnlineIfOffline (0 = not offline / no restore)
+	markOnlineUsableNoMatch bool  // MarkAgentOnlineIfUsable reports 0 rows: the status left the usable set mid-setup
+	markOnlineUsableCalls   int
+	markOnlineCalls         int
+	markOfflineRows         int64 // rows returned by MarkAgentOfflineIfOnline (0 = already offline)
+	markOfflineErr          error
+	markOfflineCalls        int
 }
 
 func (m *mockStateDB) GetAgentByID(_ context.Context, id uuid.UUID) (*db.Agent, error) {
@@ -116,6 +117,9 @@ func (m *mockStateDB) UpdateAgentStatus(_ context.Context, _ uuid.UUID, status d
 
 func (m *mockStateDB) MarkAgentOnlineIfUsable(_ context.Context, _ uuid.UUID) (int64, error) {
 	m.markOnlineUsableCalls++
+	if m.markOnlineUsableNoMatch {
+		return 0, nil
+	}
 	return 1, nil
 }
 

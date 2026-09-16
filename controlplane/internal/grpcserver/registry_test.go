@@ -310,6 +310,14 @@ func TestRevokeConn_BindsToTheCapturedConnection(t *testing.T) {
 	default:
 		t.Fatal("the captured connection was not torn down")
 	}
+	// The cut must have landed on the CAPTURED connection: a by-id teardown
+	// here would cancel the replacement — the one connection the revoke has
+	// no business touching — while claiming to have handled the stale one.
+	select {
+	case <-cancelledN:
+		t.Fatal("the teardown hit the replacement connection instead of the captured one (by-id regression)")
+	default:
+	}
 }
 
 // RevokeConn with a confirming consumer ends the captured connection
@@ -393,4 +401,22 @@ func TestSendSync_WaitsForItsOwnMessageNotPlainSends(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("SendSync never confirmed its own message")
 	}
+}
+
+// PR #109 re-review P1-a: a connection-scoped sendSync must refuse (not
+// panic) when the connection was unregistered between the caller's capture
+// and the enqueue. Capture-and-enqueue are two lock acquisitions; an
+// Unregister can complete in between and close(SendCh) — sending on it takes
+// the whole process down. Inside the lock the conn's identity is re-checked:
+// holding the RLock only fences a CONCURRENT Unregister, it cannot reopen a
+// channel that a completed one already closed.
+func TestSendSync_AfterUnregister_IsRefusedNotPanic(t *testing.T) {
+	r := NewAgentRegistry()
+	conn := r.Register("agent-1", nil, func() {})
+	require.True(t, r.Unregister(conn), "setup: the connection is unregistered and its SendCh closed")
+
+	require.NotPanics(t, func() {
+		assert.False(t, conn.sendSync(&agentv1.ServerMessage{}, 50*time.Millisecond),
+			"an unregistered connection must refuse sends, never enqueue on its closed channel")
+	})
 }
