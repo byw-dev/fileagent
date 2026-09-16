@@ -1593,3 +1593,57 @@ func TestSeen_MonotonicWrite_OldVersionLateCompletion(t *testing.T) {
 	default:
 	}
 }
+
+// ── PR #108 codex 复审 P2: timer 交接不得误删替代者 ──────────────────────────
+
+// Timer A fires and blocks on seenMu; while it waits, the overflow rescan
+// re-arms the same path with timer B (scheduleDebounceRecheck's replace path
+// — old.Stop() cannot stop an already-fired timer, so the entry is
+// overwritten). When A finally gets the lock it must NOT delete B's
+// tracking entry: an unconditional delete would leave B untracked, so
+// stopAllRechecks could never Stop it — the review-F2 leak would come back
+// (with a future mtime, B's closure holds the watcher for years).
+func TestRecheckTimer_ReplaceKeepsNewTimerTracked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hot.log")
+	require.NoError(t, os.WriteFile(path, []byte("still writing"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Schedule recheck A for the hot file.
+	w.scheduleDebounceRecheck(ctx, events, seen, path)
+	w.seenMu.Lock()
+	timerA := w.rechecks[path]
+	w.seenMu.Unlock()
+	require.NotNil(t, timerA)
+
+	// Hold seenMu so A's callback blocks the moment it fires, and let A
+	// fire (its wait is debounce - since(mtime) + grace ≈ 600ms).
+	w.seenMu.Lock()
+	time.Sleep(closeWaitDebounce + debounceRecheckGrace + 500*time.Millisecond)
+
+	// While A is parked on the lock, the rescan replaces the entry with B —
+	// scheduleDebounceRecheck's replace also bumps the per-path generation.
+	timerB := time.AfterFunc(time.Hour, func() {})
+	defer timerB.Stop()
+	w.recheckGen++
+	w.recheckGens[path] = w.recheckGen
+	w.rechecks[path] = timerB
+	w.seenMu.Unlock()
+
+	// Give A's callback time to run its (guarded) settle.
+	time.Sleep(300 * time.Millisecond)
+
+	w.seenMu.Lock()
+	cur, tracked := w.rechecks[path]
+	w.seenMu.Unlock()
+
+	require.True(t, tracked, "the replacement timer must stay tracked")
+	assert.Same(t, timerB, cur, "timer A must not delete the replacement's tracking entry")
+}

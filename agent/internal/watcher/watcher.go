@@ -49,9 +49,15 @@ type Watcher struct {
 
 	// rechecks holds the one-shot close_wait debounce recheck timers keyed by
 	// path (IC-BUG-43). At most one live timer per path: re-arming replaces
-	// the previous timer. Guarded by seenMu; lazily initialized so a Watcher
-	// built by struct literal (tests) works without New.
-	rechecks map[string]*time.Timer
+	// the previous timer. recheckGens carries the per-path generation used
+	// by settleRecheck to tell "my own entry" from "a replacement's entry"
+	// (codex review P2) — a fired callback waiting on seenMu must not delete
+	// the timer that replaced it. recheckGen is the monotonic counter.
+	// All three guarded by seenMu; lazily initialized so a Watcher built by
+	// struct literal (tests) works without New.
+	rechecks    map[string]*time.Timer
+	recheckGens map[string]uint64
+	recheckGen  uint64
 
 	// seenMu guards rechecks and every access to a scan's seen map while
 	// debounce recheck callbacks (timer goroutines) may run concurrently
@@ -590,6 +596,7 @@ func (w *Watcher) stopAllRechecks() {
 	for path, t := range w.rechecks {
 		t.Stop()
 		delete(w.rechecks, path)
+		delete(w.recheckGens, path)
 	}
 }
 
@@ -667,12 +674,39 @@ func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- Fil
 	if w.rechecks == nil {
 		w.rechecks = make(map[string]*time.Timer)
 	}
+	if w.recheckGens == nil {
+		w.recheckGens = make(map[string]uint64)
+	}
 	if old, ok := w.rechecks[path]; ok {
 		old.Stop()
 	}
+	w.recheckGen++
+	gen := w.recheckGen
+	w.recheckGens[path] = gen
 	w.rechecks[path] = time.AfterFunc(wait, func() {
+		// gen is captured by value (fixed at closure creation, race-free);
+		// settleRecheck only drops the tracking entry when this callback is
+		// still the current generation — a fired-but-locked callback must
+		// not delete the timer that replaced it (codex review P2).
+		w.settleRecheck(path, gen)
 		w.recheckAfterDebounce(ctx, events, seen, path)
 	})
+}
+
+// settleRecheck removes the recheck tracking entry for path only if this
+// callback is still the current generation: scheduleDebounceRecheck's
+// replace path installs a new timer (and a new generation) while an old,
+// already-fired callback may still be waiting on seenMu — an unconditional
+// delete would drop the replacement's entry, leaving that timer untracked
+// and un-Stop-able, so the review-F2 timer leak would come back through
+// this exact race (codex review P2).
+func (w *Watcher) settleRecheck(path string, gen uint64) {
+	w.seenMu.Lock()
+	if w.recheckGens[path] == gen {
+		delete(w.rechecks, path)
+		delete(w.recheckGens, path)
+	}
+	w.seenMu.Unlock()
 }
 
 // recheckAfterDebounce is the timer callback for scheduleDebounceRecheck: it
@@ -680,10 +714,6 @@ func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- Fil
 // A file that is still hot is left alone — its live Write/Create events
 // drive the runCloseWait debounce flush instead.
 func (w *Watcher) recheckAfterDebounce(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, path string) {
-	w.seenMu.Lock()
-	delete(w.rechecks, path)
-	w.seenMu.Unlock()
-
 	info, err := os.Stat(path)
 	if err != nil {
 		return // gone; nothing to collect
