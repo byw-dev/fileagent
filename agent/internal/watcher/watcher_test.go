@@ -1023,6 +1023,7 @@ func TestWatcher_CloseWait_StartWithinDebounceWindow_FileEventuallyCollected(t *
 
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond // short debounce: recheck fires within ms
 
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1092,6 +1093,7 @@ func TestOverflowRescan_CloseWaitHotFile_CollectedAfterDebounce(t *testing.T) {
 
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond // short debounce: recheck fires within ms
 
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1241,6 +1243,7 @@ func TestLoopCloseWait_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
 
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond // short debounce: pending timer fires within ms
 
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
@@ -1251,13 +1254,15 @@ func TestLoopCloseWait_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
 
 	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
 
-	// A write registers the pending debounce timer (fires ~500ms later).
+	// A write registers the pending debounce timer (fires ~w.debounce later).
 	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
 
 	// The event channel closes (shutdown path distinct from ctx cancel).
 	close(evc)
 
-	// Give the loop time to exit, then make sure the flush never fires.
+	// Give the loop time to exit, then make sure the flush never fires:
+	// with the 30ms debounce the flush would land well inside the window
+	// even under CPU contention, so the guard stays meaningful.
 	time.Sleep(100 * time.Millisecond)
 	select {
 	case fe := <-events:
@@ -1289,6 +1294,7 @@ func TestCloseWait_RecheckAndFlush_SameVersionDeliveredOnce(t *testing.T) {
 
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond // short debounce: no wall-clock window to miss
 
 	seen := make(map[string]time.Time)
 	evc := make(chan fsnotify.Event)
@@ -1300,7 +1306,7 @@ func TestCloseWait_RecheckAndFlush_SameVersionDeliveredOnce(t *testing.T) {
 	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
 
 	// A: the debounce flush path — a Write event registers the pending
-	// timer, which fires ~closeWaitDebounce later.
+	// timer, which fires ~w.debounce later.
 	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
 
 	// B: the debounce recheck path — started immediately, so it claims the
@@ -1313,12 +1319,12 @@ func TestCloseWait_RecheckAndFlush_SameVersionDeliveredOnce(t *testing.T) {
 		return len(w.inflight) == 1
 	}, 2*time.Second, 5*time.Millisecond, "recheck should hold the in-flight claim")
 
-	// The flush fires at ~500ms. Give it time to either be REJECTED by the
-	// claim (fix) or to take its own second claim (pre-fix / M11) and park
-	// in emitBlocking. Only after this window do we start draining, so a
-	// second claimer is observed BEFORE the first delivery completes —
+	// The flush fires at ~w.debounce. Give it time to either be REJECTED by
+	// the claim (fix) or to take its own second claim (pre-fix / M11) and
+	// park in emitBlocking. Only after this window do we start draining, so
+	// a second claimer is observed BEFORE the first delivery completes —
 	// otherwise the seen write would mask the missing inflight check.
-	time.Sleep(closeWaitDebounce + 400*time.Millisecond)
+	time.Sleep(w.debounce + 400*time.Millisecond)
 
 	w.seenMu.Lock()
 	claims := len(w.inflight)
@@ -1409,6 +1415,9 @@ func TestFlushDelivery_SettlesClaimAndMarksSeen(t *testing.T) {
 
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
+	// Short debounce: the flush fires within milliseconds, so the test does
+	// not depend on a wall-clock window surviving CPU contention.
+	w.debounce = 30 * time.Millisecond
 
 	seen := make(map[string]time.Time)
 	evc := make(chan fsnotify.Event)
@@ -1419,8 +1428,8 @@ func TestFlushDelivery_SettlesClaimAndMarksSeen(t *testing.T) {
 
 	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
 
-	// The real debounce timer fires ~closeWaitDebounce after the Write
-	// event; with a buffered consumer the flush delivers immediately.
+	// The (short) debounce timer fires after the Write event; with a
+	// buffered consumer the flush delivers immediately.
 	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
 
 	var fe FileEvent
@@ -1431,16 +1440,16 @@ func TestFlushDelivery_SettlesClaimAndMarksSeen(t *testing.T) {
 		t.Fatal("flush never delivered the file")
 	}
 
-	w.seenMu.Lock()
-	left := len(w.inflight)
-	w.seenMu.Unlock()
-	assert.Zero(t, left, "successful flush delivery must settle its in-flight claim")
-
-	w.seenMu.Lock()
-	mt, known := seen[path]
-	w.seenMu.Unlock()
-	require.True(t, known, "flush delivery must record the delivered mtime in seen")
-	assert.True(t, mt.Equal(fe.ModTime), "seen must carry the flushed version's mtime")
+	// Receiving the event does NOT imply the flush goroutine has run its
+	// deferred completeDelivery yet — settle is a separate scheduling step,
+	// so assert on the SETTLED STATE, never on the instant after the read.
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		mt, known := seen[path]
+		return len(w.inflight) == 0 && known && mt.Equal(fe.ModTime)
+	}, 1*time.Second, 5*time.Millisecond,
+		"successful flush delivery must settle its claim and record seen")
 }
 
 // Q2 (abort half): a flush whose delivery is aborted (ctx cancelled while
@@ -1454,6 +1463,7 @@ func TestFlushDelivery_ClaimReleasedOnAbortedDelivery(t *testing.T) {
 
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond // short debounce: no wall-clock window to miss
 
 	seen := make(map[string]time.Time)
 	evc := make(chan fsnotify.Event)
@@ -1577,7 +1587,10 @@ func TestRecheckTimer_ReplaceKeepsNewTimerTracked(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Schedule recheck A for the hot file.
+	// Schedule recheck A for the hot file. A short debounce makes the fire
+	// wait ≈ debounceRecheckGrace, so the test does not depend on a
+	// wall-clock window surviving CPU contention.
+	w.debounce = 30 * time.Millisecond
 	w.scheduleDebounceRecheck(ctx, events, seen, path)
 	w.seenMu.Lock()
 	timerA := w.rechecks[path]
@@ -1585,9 +1598,9 @@ func TestRecheckTimer_ReplaceKeepsNewTimerTracked(t *testing.T) {
 	require.NotNil(t, timerA)
 
 	// Hold seenMu so A's callback blocks the moment it fires, and let A
-	// fire (its wait is debounce - since(mtime) + grace ≈ 600ms).
+	// fire well within the grace-dominated wait.
 	w.seenMu.Lock()
-	time.Sleep(closeWaitDebounce + debounceRecheckGrace + 500*time.Millisecond)
+	time.Sleep(debounceRecheckGrace + 500*time.Millisecond)
 
 	// While A is parked on the lock, the rescan replaces the entry with B —
 	// scheduleDebounceRecheck's replace also bumps the per-path generation.

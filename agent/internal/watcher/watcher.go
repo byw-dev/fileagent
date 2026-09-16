@@ -71,6 +71,11 @@ type Watcher struct {
 	// debounce recheck and the overflow-rescan scan. Guarded by seenMu;
 	// lazily initialized so a Watcher built by struct literal works.
 	inflight map[string]time.Time
+
+	// debounce is the close_wait debounce window. Zero means the production
+	// default (closeWaitDebounce); tests may set a short value to avoid
+	// wall-clock timing assumptions. See debounceWindow.
+	debounce time.Duration
 }
 
 // Append-mode constants. The canonical values live in the queue package (they
@@ -113,6 +118,16 @@ func New(sourcePath, fileGlob string, recursive bool, pollInterval time.Duration
 		logger:       logger,
 		tailOffsets:  make(map[string]int64),
 	}, nil
+}
+
+// debounceWindow returns the effective close_wait debounce window. Tests may
+// shorten the window per-watcher (w.debounce) so timing-sensitive cases make
+// no wall-clock assumptions; zero means the production default.
+func (w *Watcher) debounceWindow() time.Duration {
+	if w.debounce > 0 {
+		return w.debounce
+	}
+	return closeWaitDebounce
 }
 
 // SeedTailOffsets pre-loads per-file byte offsets recovered from persisted
@@ -275,14 +290,14 @@ func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, se
 			op := opString(ev)
 			if p, ok := pending[ev.Name]; ok {
 				// Reset existing timer.
-				p.timer.Reset(closeWaitDebounce)
+				p.timer.Reset(w.debounceWindow())
 				p.mu.Lock()
 				p.op = op
 				p.mu.Unlock()
 			} else {
 				path := ev.Name // capture for closure
 				p := &closeWaitPending{op: op}
-				p.timer = time.AfterFunc(closeWaitDebounce, func() {
+				p.timer = time.AfterFunc(w.debounceWindow(), func() {
 					p.mu.Lock()
 					op := p.op
 					p.mu.Unlock()
@@ -442,7 +457,7 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 		// The path is returned to the caller: on the fsnotify path a one-shot
 		// recheck re-examines it once the debounce window has passed
 		// (IC-BUG-43); on the polling path the next tick does.
-		if w.appendMode == AppendModeCloseWait && time.Since(info.ModTime()) < closeWaitDebounce {
+		if w.appendMode == AppendModeCloseWait && time.Since(info.ModTime()) < w.debounceWindow() {
 			skipped = append(skipped, path)
 			return nil
 		}
@@ -699,7 +714,7 @@ func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- Fil
 	if err != nil {
 		return // gone; nothing to collect
 	}
-	wait := closeWaitDebounce - time.Since(info.ModTime()) + debounceRecheckGrace
+	wait := w.debounceWindow() - time.Since(info.ModTime()) + debounceRecheckGrace
 	if wait < debounceRecheckGrace {
 		wait = debounceRecheckGrace
 	}
@@ -753,7 +768,7 @@ func (w *Watcher) recheckAfterDebounce(ctx context.Context, events chan<- FileEv
 		return // gone; nothing to collect
 	}
 	// F2 invariant (PR #100): never emit a file that may still be written.
-	if w.appendMode == AppendModeCloseWait && time.Since(info.ModTime()) < closeWaitDebounce {
+	if w.appendMode == AppendModeCloseWait && time.Since(info.ModTime()) < w.debounceWindow() {
 		return
 	}
 	// errWalkAborted only means ctx was cancelled; the timer callback has
