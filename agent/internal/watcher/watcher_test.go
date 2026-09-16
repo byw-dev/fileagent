@@ -1434,3 +1434,162 @@ func TestScanFile_ClaimReleasedOnAbortedDelivery(t *testing.T) {
 	assert.Zero(t, left, "aborted delivery must roll back the in-flight claim")
 	assert.False(t, known, "aborted delivery must not mark seen (file stays retryable)")
 }
+
+// ── PR #108 review F3 补钉 Q2/Q3（codex 复审） ────────────────────────────────
+
+// Q2: the flush site must settle its claim after a SUCCESSFUL delivery —
+// otherwise the version stays in-flight forever (every later claim for the
+// same version fails) and seen stays empty (the delivered version is
+// invisible to rescans).
+func TestFlushDelivery_SettlesClaimAndMarksSeen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "flushed.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+
+	// The real debounce timer fires ~closeWaitDebounce after the Write
+	// event; with a buffered consumer the flush delivers immediately.
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+
+	var fe FileEvent
+	select {
+	case fe = <-events:
+		require.Equal(t, path, fe.Path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("flush never delivered the file")
+	}
+
+	w.seenMu.Lock()
+	left := len(w.inflight)
+	w.seenMu.Unlock()
+	assert.Zero(t, left, "successful flush delivery must settle its in-flight claim")
+
+	w.seenMu.Lock()
+	mt, known := seen[path]
+	w.seenMu.Unlock()
+	require.True(t, known, "flush delivery must record the delivered mtime in seen")
+	assert.True(t, mt.Equal(fe.ModTime), "seen must carry the flushed version's mtime")
+}
+
+// Q2 (abort half): a flush whose delivery is aborted (ctx cancelled while
+// parked in emitBlocking) must roll its claim back via the deferred
+// completeDelivery — a leaked claim would block every later claim for the
+// same version.
+func TestFlushDelivery_ClaimReleasedOnAbortedDelivery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aborted-flush.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent) // unbuffered, never read: emit parks
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+
+	// The flush fires ~500ms later, claims and parks in emitBlocking.
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 1
+	}, 2*time.Second, 5*time.Millisecond, "flush should hold the claim while parked in emitBlocking")
+
+	// Aborting the ctx unblocks emitBlocking with delivered=false; the
+	// deferred completeDelivery must roll the claim back.
+	cancel()
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 0
+	}, 1*time.Second, 5*time.Millisecond, "aborted flush delivery must roll back the in-flight claim")
+}
+
+// Q3: seen's monotonic write — a late OLD-version completion (parked in its
+// emit while a NEWER version already delivered and settled) must not move
+// seen backwards, and the current version must not be re-emitted afterwards.
+func TestSeen_MonotonicWrite_OldVersionLateCompletion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "versions.log")
+	require.NoError(t, os.WriteFile(path, []byte("v1"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// v1 claims and parks mid-delivery.
+	require.NoError(t, os.Chtimes(path, time.Now().Add(-2*time.Hour), time.Now().Add(-2*time.Hour)))
+	info1, err := os.Stat(path)
+	require.NoError(t, err)
+	eventsOld := make(chan FileEvent)    // parked: v1's emit blocks
+	eventsNew := make(chan FileEvent, 8) // v2 delivers immediately
+
+	go func() { _ = w.scanFile(ctx, eventsOld, seen, path, info1) }()
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		cur, busy := w.inflight[path]
+		return busy && cur.Equal(info1.ModTime())
+	}, 2*time.Second, 5*time.Millisecond, "v1 should hold the claim while parked")
+
+	// The file moves on; the newer version delivers and settles FIRST.
+	require.NoError(t, os.Chtimes(path, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)))
+	info2, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, w.scanFile(ctx, eventsNew, seen, path, info2))
+
+	w.seenMu.Lock()
+	mt, known := seen[path]
+	w.seenMu.Unlock()
+	require.True(t, known)
+	require.True(t, mt.Equal(info2.ModTime()), "seen must carry the newer version")
+
+	// Drain v1's parked emit; its late completion must not regress seen.
+	select {
+	case <-eventsOld:
+	case <-time.After(2 * time.Second):
+		t.Fatal("v1 never delivered")
+	}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 0
+	}, 1*time.Second, 5*time.Millisecond, "late v1 claim must settle")
+
+	w.seenMu.Lock()
+	late, _ := seen[path]
+	w.seenMu.Unlock()
+	assert.True(t, late.Equal(info2.ModTime()),
+		"a late older-version completion must not move seen backwards")
+
+	// A follow-up scan must not re-emit the current version.
+	select {
+	case fe := <-eventsNew: // drain v2's earlier delivery first
+		_ = fe
+	default:
+	}
+	w.pollScan(ctx, eventsNew, seen)
+	select {
+	case fe := <-eventsNew:
+		t.Fatalf("follow-up scan re-emitted the current version: %s (op=%s)", fe.Path, fe.Op)
+	default:
+	}
+}
