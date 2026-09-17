@@ -704,7 +704,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | **不需要发明任何检测手段**：在 `fw.Errors` 分支收到溢出错误（`IN_Q_OVERFLOW` / `fsnotify.ErrEventOverflow`）时触发一次**安全网重扫**（复用现有 `pollScan`），把溢出期间漏掉的文件找回来。可选地同时保留 Warn 日志并带上溢出标记。不动 emitBlocking 的背压语义——那是 IC-BUG-47 已验证的正确行为 |
 | **验收** | CI（ubuntu + windows）下制造队列溢出（小队列限制 + 持续突发），断言溢出后触发重扫、溢出窗口内创建的文件最终被采集 |
 | **⚠️ 流程事实（与直觉相反，值得后人知道）** | 对 fsnotify 这一类机制，**CI（ubuntu + windows）才是权威验证环境，本机 macOS 不是**——macOS kqueue 不报溢出，本地跑再多次也走不到 `fw.Errors` 的溢出分支，0 失败只代表「没测到」，不代表「没问题」。IC-BUG-44 的验收**必须在 CI 上看，不要被本机绿灯误导** |
-| **归属** | ✅ **已随 PR #108 修复**（与 IC-BUG-43 同刀）。修法：`handleWatchError` 命中 `fsnotify.ErrEventOverflow` 即触发复用 `pollScan` 的安全网重扫；CI 有真实内核溢出测试把关 |
+| **归属** | ✅ **已随 PR #108 修复**（与 IC-BUG-43 同刀）。修法：`handleWatchError` 命中 `fsnotify.ErrEventOverflow` 即触发复用 `pollScan` 的安全网重扫；CI 把关——⚠️ 限定：**真实内核溢出测试仅 Linux 覆盖**（`ci-agent.yml` 该步骤带 `if: runner.os == 'Linux'`，测试文件 build tag 为 `linux && overflow`），**Windows 侧是注入 `fsnotify.ErrEventOverflow` 的分支级覆盖**，并未制造真实 `ReadDirectoryChangesW` 缓冲溢出；卡片「验收」行写的 ubuntu+windows 真实溢出**只兑现了一半**，余下半边仍是低优先级测试缺口 |
 
 ## IC-BUG-45 — tail 偏移在发出事件时推进，而非上传确认后 🟡 P2
 
@@ -736,7 +736,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 |------|------|
 | **根因** | IC-5 的 review F1 把**初始扫描**改成了阻塞发送（`emitBlocking`，背压取代丢弃），但**实时 fsnotify 事件循环仍在用非阻塞的 `emit`**——满即丢弃 |
 | **精确位置** | `agent/internal/watcher/watcher.go`：`emit` 的调用点在 `runFsnotify` / `runCloseWait`（约 :154 / :176 / :221 / :226）；`emitBlocking` 只用在 `pollScan`（约 :303）。消费端 channel 缓冲 64（`agent/cmd/agent/main.go` 约 :791） |
-| **后果** | 大量小文件并发写入 → 64 缓冲打满 → 事件被丢弃（仅一条 Warn）→ **那些文件永不被采集**，因为它们的 mtime/size 不会再变、也不会再有事件触发。其背压语义会让 fsnotify 停读内核 watch 队列，溢出风险见 **IC-BUG-44**（P1：溢出可见、缺安全网重扫） |
+| **后果** | 大量小文件并发写入 → 64 缓冲打满 → 事件被丢弃（仅一条 Warn）→ **那些文件永不被采集**，因为它们的 mtime/size 不会再变、也不会再有事件触发。其背压语义会让 fsnotify 停读内核 watch 队列，溢出风险见 **IC-BUG-44**（P1：溢出可见、缺安全网重扫——**已随 PR #108 补上安全网重扫**） |
 | **与 F1 的关系** | **同一个缺陷的另一半**。F1 修复时双方都以为覆盖了整条路径，实际只修了初始扫描 |
 | **修复** | 实时事件路径同样改用 `emitBlocking`（4 处调用点），与 F1 同一模式 |
 | **验收** | 并发写入远超 channel 缓冲的小文件（如 500 个），断言**全部**被采集，一个不丢；变异（改回 `emit`）必须稳定红 |
@@ -800,7 +800,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | 字段 | 内容 |
 |------|------|
 | **根因** | `dry_run_limit` 走的是**一条半截的链路**：CP 接收并校验（`<=0` 补 10、`>50` 夹到 50），**在响应端按它裁剪**（`for i, f := range result.GetFiles() { if i >= req.DryRunLimit { break } }`），但构造 `ServerMessage_PushRule` 时**不把它带给 agent**——`PushRuleCommand` / `CollectionRule` 里不存在这个字段。agent 侧是**硬编码常量** `defaultDryRunLimit = 10`，与请求无关，达限即 `filepath.SkipAll`。**于是 1–10 的请求值真实生效（CP 裁剪），11–50 被 agent 的固定上限压成 10** |
-| **精确位置** | `controlplane/internal/api/handler/agents.go:616-621`（校验与夹取）、`:643-656`（构造 PushRule，未携带）、`:672-673`（响应端按 limit 裁剪——**正是这一处让 1–10 生效**）；`agent/cmd/agent/main.go:1096`（`const defaultDryRunLimit = 10`）、`:1136-1137`（达限 `filepath.SkipAll`，无截断日志）；`proto/v1/agent.proto` 的 `PushRuleCommand` / `CollectionRule` 无 limit 字段，`DryRunResult` 只有 `rule_id`/`files`/`error`，**无截断或总数字段** |
+| **精确位置** | `controlplane/internal/api/handler/agents.go` 的 `TestRule`/`handleDryRun` 一段：校验与夹取、构造 PushRule（未携带）、响应端按 limit 裁剪（**正是这一处让 1–10 生效**）。⚠️ **行号刻意不写**——PR #109 给该文件加了 126 行，原记的 `:616-621`/`:643-656`/`:672-673` 已全部打偏；按函数名定位，不要按行号；`agent/cmd/agent/main.go:1096`（`const defaultDryRunLimit = 10`）、`:1136-1137`（达限 `filepath.SkipAll`，无截断日志）；`proto/v1/agent.proto` 的 `PushRuleCommand` / `CollectionRule` 无 limit 字段，`DryRunResult` 只有 `rule_id`/`files`/`error`，**无截断或总数字段** |
 | **后果** | **匹配数超过 10 时**，调用方（Web UI / SDK）请求 50 条预览**最多仍只拿到 10 条，且没有任何提示**——没有截断标记、没有警告、没有错误（`DryRunResult` 里压根没有这类字段）。API 契约上这个参数看起来完全生效（它被认真校验并夹取到 50），实际**有效上限恒为 10**。规则模板改错时，预览只看 10 条会让人误以为「匹配面就这么大」 |
 | **发现经过** | **PR #107 二轮 review 中被顺带撞见**——起因是核对 `phase-3-rft.md` 的「已落地」措辞是否过强，该文 `:866` 要求 `config.toml` 新增 `[collection].dry_run_limit`（注释写明「上限 50」），核实后发现 agent 既无该配置项、也不接收下发值。⚠️ **立卡时把性质写成了「参数收了不用」，三轮 review 读码证伪**（漏看了 CP 响应端的裁剪）——本条本身就是「只验证支持自己结论的那一半代码」的实例 |
 | **所属模式** | ⚠️ **不是**「参数收了不用」的第 4 个实例——立卡时如此归类，**经 PR #107 三轮 review 证伪**：该参数在 CP 响应裁剪端**确实生效**（1–10），并非收了不用。它属于另一种形态：**同一个参数由两端各自设限，而其中一端从不知道另一端的值**，于是对外承诺的上限（50）与实际能力（10）长期不一致且无人发现。暂不立类（仅此一例） |
