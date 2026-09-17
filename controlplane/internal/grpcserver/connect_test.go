@@ -426,6 +426,9 @@ func (d *bulkSyncDispatcher) SyncRulesOnConnect(_ context.Context, agentID strin
 		},
 	})
 	// Mirror pushCredentials: the credentials push follows the rule sync.
+	// (Its Send return value is dropped, mirroring production's best-effort
+	// push; the F5 test asserts arrival — acceptable here because these two
+	// messages go into an EMPTY buffer with the consumer already running.)
 	d.registry.Send(agentID, &agentv1.ServerMessage{
 		Payload: &agentv1.ServerMessage_Credentials{
 			Credentials: &agentv1.CredentialsPayload{AccessKey: "AKID"},
@@ -515,7 +518,11 @@ func TestServer_Connect_FortyRules_AllDelivered(t *testing.T) {
 //   不被接受 → SyncRulesOnConnect 返回错误 → Connect 结束流 → 用例红。
 
 // consumerPinningDispatcher 模拟任意在同步期间入队的下发方：打满缓冲后，
-// 要求观察到排空才继续，最后再补一条凭据（复刻 sync + pushCredentials 两股生产）。
+// 要求观察到排空才继续。不再补发尾部凭据消息：曾用一次非阻塞 Send 发它并
+// 被测试当作必然送达（PR #109 收尾时 codex 判定的偶发源）——「尽力而为」的
+// 发送不能当「必然成功」断言，与 IC-BUG-32 同病；本用例的命题（消费者先于
+// 生产者启动）由「40 条超过容量的规则全部到达」独立钉住，凭据与规则的顺序
+// 由下方 F5 用例单独钉住。
 type consumerPinningDispatcher struct {
 	registry *AgentRegistry
 	total    int // 要送达的规则消息数，必须 > sendChCapacity
@@ -552,11 +559,6 @@ func (d *consumerPinningDispatcher) SyncRulesOnConnect(ctx context.Context, agen
 			}
 		}
 	}
-	d.registry.Send(agentID, &agentv1.ServerMessage{
-		Payload: &agentv1.ServerMessage_Credentials{
-			Credentials: &agentv1.CredentialsPayload{AccessKey: "AKID"},
-		},
-	})
 	return nil
 }
 
@@ -609,25 +611,20 @@ func TestServer_Connect_SendConsumerRunsBeforeSync(t *testing.T) {
 	require.NoError(t, err)
 
 	rules := make(map[string]bool)
-	gotCreds := false
 	for {
 		msg, rErr := stream.Recv()
 		if rErr != nil {
 			break
 		}
-		switch p := msg.GetPayload().(type) {
-		case *agentv1.ServerMessage_PushRule:
+		if p, ok := msg.GetPayload().(*agentv1.ServerMessage_PushRule); ok {
 			rules[p.PushRule.GetRule().GetRuleId()] = true
-		case *agentv1.ServerMessage_Credentials:
-			gotCreds = true
 		}
-		if len(rules) == total && gotCreds {
+		if len(rules) == total {
 			break
 		}
 	}
 	assert.Len(t, rules, total,
 		"every message enqueued during the sync must be delivered — which requires the send consumer to run before the sync")
-	assert.True(t, gotCreds)
 }
 
 // ── F5（IC-2b review 二轮）：凭据必须先于规则到达 ──────────────────────────────
