@@ -41,7 +41,7 @@ Phase 4  完善与收尾    🔄 进行中（D-022 单二进制#60、D-023 迁�
 > **元数据 6c Phase 1 已收官（2026-07-14）**：MT-1…MT-6 全部合并（PR #69–#79），追踪 `docs/tasks/metadata-phase1.md`。
 > **当前 track（2026-09-08 拍板）**：**写入准入与索引一致性（IC-0…IC-14）**——审计发现 Agent 数据面从未端到端
 > 跑通过，且不存在 MinIO↔PostgreSQL 对账机制。决策 D-030 / D-031，设计 `docs/design/consistency-and-ingest.md`，
-> 追踪 `docs/tasks/consistency-ingest.md`，缺陷 `docs/tasks/bugs/open.md`（IC-BUG-1…IC-BUG-53，已关 31 / 撤销 1 / 未关 21）。
+> 追踪 `docs/tasks/consistency-ingest.md`，缺陷 `docs/tasks/bugs/open.md`（IC-BUG-1…IC-BUG-53，已关 33 / 撤销 1 / 未关 19）。
 > **WR track（Web UI 重做 WR-2…10）暂停让位**（WR-1 地基已合并 #66/#67，恢复方法见
 > `docs/tasks/webui-redesign-impl.md`）。未排期：proto→buf ／ Phase 2（按信号）。当前态见 `docs/tasks/active.md`。
 

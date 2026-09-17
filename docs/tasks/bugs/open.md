@@ -10,7 +10,7 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
-> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判）**：共 **53** 条 = **已关闭 31** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 21**（**4 条挡** 6/7/9/40 + **14 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
+> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判）**：共 **53** 条 = **已关闭 33** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 19**（**4 条挡** 6/7/9/40 + **12 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -126,8 +126,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-23 | 吊销不生效：被吊销 agent 的 token 仍可用，且重连会把状态刷回 online  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
 | IC-BUG-24 | `handleDryRunResult` 无归属校验，可对他人 rule 投递伪造试运行结果  ✅ 随 IC-SEC-1 修复 | 🟡 P2 | controlplane |
 | IC-BUG-25 | 吊销切不断已建立的流：被吊销 agent 仍可心跳/上报，UI 显示在线且踢不掉  ✅ 随 IC-SEC-1 修复 | 🟠 P1 | controlplane |
-| IC-BUG-26 | `DeleteCollectionRule` 无归属约束，可删掉别的 agent 的规则 | 🟠 P1 | controlplane |
-| IC-BUG-27 | `handleDirectoryListing` 拿到 agentID 却只用于打日志，不校验归属 | 🟡 P2 | controlplane |
+| IC-BUG-26 | `DeleteCollectionRule` 无归属约束，可删掉别的 agent 的规则 ✅ 随 IC-SEC-2 修复（PR #109；同刀补掉 `UpdateCollectionRuleStatus` 的同类旁路）| 🟠 P1 | controlplane |
+| IC-BUG-27 | `handleDirectoryListing` 拿到 agentID 却只用于打日志，不校验归属 ✅ 随 IC-SEC-2 修复（PR #109）| 🟡 P2 | controlplane |
 | IC-BUG-28 | `registry.Register` 覆盖 map，重连时陈旧流的 defer 会关掉新连接的 SendCh ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-29 | `UploadResult.rule_id` 无归属校验，agent 可把上传记到别人的规则上并借其元数据打标 ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-30 | 规则 cancel 无补偿通道：断连期间删除的规则，agent 重连后继续采集上传 ✅ 随 IC-2b 修复（快照形态）| 🟠 P1 | controlplane + agent |
@@ -453,7 +453,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **备注（本刀未处理）** | `Revoke` 里先 `Send(RevokeCommand)` 再立刻 `Disconnect`，二者存在竞态：发送 goroutine 的 `select` 在 `ctx.Done()` 与 `SendCh` 同时就绪时随机取分支，协作式命令可能被丢弃，agent 因此不清理本地 token。影响很小（命令本就尽力而为，切流才是硬手段）。**已于 2026-09-10 的 M-2 类扫描升格为独立卡片 IC-BUG-32**，原「随 IC-2 顺手处理」的处置作废——一个已知实例埋在别的卡片注释里而没被当成一类去扫，正是 M-2 长期未被扫描的原因 |
 | **验收** | ✅ bufconn 端到端用例：`Disconnect` 后客户端 `Recv` 返回 `PermissionDenied`（非阻塞），registry 条目被清空（证明 handler 已返回、defer 已跑）。变异验证：退回旧的阻塞 `Recv` 结构后该用例在 5s 超时处失败。**残留**：UI 在线状态靠 Redis 90s TTL 过期而非立即，`handleDirectoryListing` 不带 ctx——见下方备注 |
 
-## IC-BUG-26 — `DeleteCollectionRule` 无归属约束 🟠 P1
+## IC-BUG-26 — `DeleteCollectionRule` 无归属约束 🟠 P1 ✅ 已修（IC-SEC-2，PR #109）
 
 | 字段 | 内容 |
 |------|------|
@@ -464,7 +464,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **归属（2026-09-10）** | 从 IC-2 ⑧ 移到 **IC-SEC-2**（与 IC-BUG-27/32 同刀；IC-BUG-28 已改判移入 IC-2a ⑧）。**不挡数据面可用**：单组织 + 管理员鉴权下是越权面而非可利用漏洞，不该混进 IC-2a 的上报链路 review |
 | **验收** | 用 agent A 的路径删 B 的 rule 返回 404 且 B 的规则仍在；删自己的规则仍正常 |
 
-## IC-BUG-27 — `handleDirectoryListing` 不校验归属 🟡 P2
+## IC-BUG-27 — `handleDirectoryListing` 不校验归属 🟡 P2 ✅ 已修（IC-SEC-2，PR #109）
 
 | 字段 | 内容 |
 |------|------|
