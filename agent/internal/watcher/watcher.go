@@ -668,13 +668,6 @@ func (w *Watcher) handleWatchError(ctx context.Context, events chan<- FileEvent,
 // recover from such windows, and the alternative (dropping the files
 // silently) is strictly worse. emitBlocking's backpressure semantics are
 // intentional (IC-BUG-47) and are deliberately not changed here.
-// Trade-off (IC-BUG-44, deliberate): while this scan runs, fw.Events is not
-// drained, and the scan itself sends through emitBlocking — a consumer that
-// is slow again can in theory trigger a second overflow during the rescan.
-// That risk is bounded and acceptable: the rescan exists precisely to
-// recover from such windows, and the alternative (dropping the files
-// silently) is strictly worse. emitBlocking's backpressure semantics are
-// intentional (IC-BUG-47) and are deliberately not changed here.
 //
 // Bounded, honestly stated (PR #108 review P1): the rescan re-emits files
 // that were already delivered in real time, because seen on the real-time
@@ -682,9 +675,12 @@ func (w *Watcher) handleWatchError(ctx context.Context, events chan<- FileEvent,
 // argument). The amplification per overflow round is bounded: one rescan
 // pass, and the downstream IsProcessed check (rule+path+mtime+size)
 // deduplicates the re-deliveries; the known remaining amplification point
-// is IC-BUG-42. What the rescan must never do is skip a file it finds —
-// it is the retry opportunity for every delivery that did not durably
-// enqueue downstream.
+// is IC-BUG-42. What the rescan must never skip is a file that has NOT yet
+// been recorded in seen — for the real-time path that is every file whose
+// downstream enqueue did not durably succeed, and the rescan is those
+// files' retry opportunity. It DOES skip files already in seen (initial
+// scan, close_wait deliveries, earlier rescan rounds) — see IC-BUG-53 for
+// the watcher-side residual gap that implies.
 func (w *Watcher) safetyNetRescan(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time) {
 	w.scheduleDebounceRechecks(ctx, events, seen, w.pollScan(ctx, events, seen))
 }

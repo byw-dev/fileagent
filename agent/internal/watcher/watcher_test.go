@@ -1031,6 +1031,16 @@ func TestWatcher_CloseWait_StartWithinDebounceWindow_FileEventuallyCollected(t *
 
 	go func() { _ = w.Start(ctx, events) }()
 
+	// Sync point before waiting for the delivery: the initial scan must
+	// have armed the recheck for the hot file. Without this the test would
+	// depend on a wall-clock window ("scan + timer fire within 4s") instead
+	// of observing the scheduling directly.
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.rechecks) == 1
+	}, 3*time.Second, 5*time.Millisecond, "initial scan should arm the debounce recheck for the hot file")
+
 	select {
 	case fe := <-events:
 		assert.Equal(t, path, fe.Path)
@@ -1473,7 +1483,9 @@ func TestFlushDelivery_ClaimReleasedOnAbortedDelivery(t *testing.T) {
 
 	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
 
-	// The flush fires ~500ms later, claims and parks in emitBlocking.
+	// The flush fires ~w.debounce (30ms here) later, claims and parks in
+	// emitBlocking. The eventual claim observation below is the sync point,
+	// not the timer's wall clock.
 	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
 	require.Eventually(t, func() bool {
 		w.seenMu.Lock()
