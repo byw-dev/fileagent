@@ -50,11 +50,11 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 | 检查面 | 结果 |
 |---|---|
-| 嵌套路由 `/agents/:id/rules/:rid` | ❌ `DELETE` 未校验父子关系（**IC-BUG-26**）。同路由 `PUT` 是安全的——`UpdateCollectionRule` 带 `AND agent_id AND org_id` |
+| 嵌套路由 `/agents/:id/rules/:rid` | ✅ **已随 PR #109 修复**（扫描当时：`DELETE` 未校验父子关系，**IC-BUG-26**）。现 `DELETE` 谓词带 URL agent + org，0 行→404；同刀还补掉了「只改状态」那条旁路（扫描当时误以为同路由 `PUT` 整体安全——完整更新确实带 `AND agent_id AND org_id`，但 status-only 分支当时未作用域化）|
 | 嵌套路由 `/tag-keys/:key/values/:vid` | ✅ 安全，`DeleteTagValue` 带 `AND tag_key_id = $2` |
 | gRPC `DryRunResult` | ✅ 已修（IC-SEC-1，收件人绑在 store 上） |
-| gRPC `DirectoryListing` | ❌ 拿到 agentID 只打日志（**IC-BUG-27**） |
-| gRPC `UploadResult` | ❌ **新发现（IC-BUG-29）** |
+| gRPC `DirectoryListing` | ✅ **已随 PR #109 修复**（扫描当时：拿到 agentID 只打日志，**IC-BUG-27**）。现 `Deliver` 校验收件人，不匹配即丢弃并告警 |
+| gRPC `UploadResult` | ✅ **已随 IC-2a / PR #98 修复**（扫描当时新发现，**IC-BUG-29**：`rule_id` 无归属校验）|
 | gRPC `Heartbeat` | ✅ 不含资源 ID |
 
 **一个不是缺陷、但该记的架构事实**：单条按 ID 的 `Get`/`Update`/`Delete` **普遍不带 `org_id`**
@@ -75,11 +75,11 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | 检查面 | 结果 |
 |---|---|
 | `PushRule`（`DispatchRule`，规则新建/启用） | ✅ **有补偿**——离线时跳过，重连由 `SyncRulesOnConnect` 补推 |
-| `CancelRule`（`DispatchRuleCancel`，停用/删除） | ❌ **无补偿通道（IC-BUG-30）**——离线即放弃，而 `SyncRulesOnConnect` 只推 active 规则，从不推 cancel |
-| `SyncRulesOnConnect` / `pushCredentials` 的投递容量 | ❌ **静默丢弃（IC-BUG-31）**——`SendCh` cap 32，且这两处都在发送 goroutine 启动**之前**入队 |
-| `Revoke` 的 `Send` → `Disconnect` | ❌ **竞态（IC-BUG-32）**——原埋在 IC-BUG-25 的「备注（本刀未处理）」里，本次升格为独立卡片 |
+| `CancelRule`（`DispatchRuleCancel`，停用/删除） | ✅ **已随 IC-2b / PR #103 修复（改快照形态）**（扫描当时：**IC-BUG-30** 无补偿通道——离线即放弃，而 `SyncRulesOnConnect` 只推 active 规则，从不推 cancel）|
+| `SyncRulesOnConnect` / `pushCredentials` 的投递容量 | ✅ **已随 IC-2a / PR #98（ack 半边）+ IC-2b / PR #103（结构半边）修复，两半齐全**（扫描当时：**IC-BUG-31** 静默丢弃——`SendCh` cap 32，且这两处都在发送 goroutine 启动**之前**入队）|
+| `Revoke` 的 `Send` → `Disconnect` | ◐ **拆半：空闲路径已随 IC-SEC-2 / PR #109 关闭，积压下送达保证未排期**（扫描当时：**IC-BUG-32** 竞态，原埋在 IC-BUG-25 的「备注（本刀未处理）」里，本次升格为独立卡片）|
 | `TestRule`（dry-run `PushRule`） | ✅ 请求-响应型：30s 超时 + store 记收件人（`dryrun/store.go:40` `Register(reqID, agentID)`），`Send` 失败立即 409 |
-| `ListDirectory` | ◐ **M-2 视角安全**（30s 超时 + `Send` 失败立即 409，不存在「以为送到了」），但 **M-1 视角有洞**——`dirstore/store.go:44` 是 `Register(requestID)`，不记收件人，即仍开着的 IC-BUG-27。初版把这格写成「store 记收件人」是错的（评审证伪） |
+| `ListDirectory` | ✅ **M-1 的洞已随 PR #109 补上**（M-2 视角当时即安全：30s 超时 + `Send` 失败立即 409，不存在「以为送到了」）。扫描当时 `dirstore/store.go` 是 `Register(requestID)` 不记收件人，即 IC-BUG-27；现为 `Register(reqID, agentID)` + `Deliver` 比对收件人。⚠️ 初版曾把这格写成「store 记收件人」，被评审证伪——**那是当时的错误，不是现在的状态** |
 | `Ping` | ⚠️ **幻影检查面**：8 个 `Send` 调用点里根本没有 Ping。`proto/v1/agent.proto:118,128` 声明了 `PingCommand`，但 **CP 无任何 `ServerMessage_Ping` 构造点**，agent 侧的 `case *agentv1.ServerMessage_Ping` 是死分支。两侧皆死，不构成 M-2 检查面 |
 | agent 侧 `rules` 表 | ⚠️ **不是 M-2，但该记**：有 `UpsertRule`（`queue.go:419`）与 `GetRule`（`:436`），但 `GetRule` **只有测试调用**（`queue_test.go:230/245/252`），生产代码无人读——**一张只写不读的死表**。它同时决定了 IC-BUG-30 的爆炸半径止于 agent 进程重启（规则只从 `SyncRulesOnConnect` 来） |
 
