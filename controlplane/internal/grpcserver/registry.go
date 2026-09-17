@@ -236,10 +236,15 @@ func (r *AgentRegistry) Get(agentID string) *AgentConn {
 
 // Stop asks the agent's connection to end gracefully: the Connect handler
 // returns without cancelling the stream context, so gRPC finishes the RPC
-// normally — the transport's FIFO flushes the queued DATA frames before the
-// trailers, and a command confirmed written (SendSync) deterministically
-// reaches the agent before the stream ends. Contrast Disconnect, which
-// cancels the context and can discard queued frames with the RST.
+// normally and queued DATA frames are written before the trailers in FIFO
+// order. Delivery scope, kept honest (see SendSync's scope note and the
+// IC-BUG-32 card): on the IDLE path (no backlog) a command confirmed written
+// is flushed before the trailers and deterministically reaches the agent;
+// under a backlog the queued frames may never fit through the peer's window
+// before teardown and delivery there is best-effort. The contrast with
+// Disconnect is ordering, not a delivery guarantee: Disconnect cancels the
+// context and can discard queued frames with the RST, while Stop lets the
+// queue drain in order — neither can force the peer to read.
 //
 // Stop itself never waits: it only closes a channel and returns, so no caller
 // can be dragged into waiting on a non-reading agent. It reports whether a

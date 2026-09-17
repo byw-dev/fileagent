@@ -790,8 +790,7 @@ func TestServer_Connect_RuleSyncDegraded_KeepsStreamAndMarksCache(t *testing.T) 
 
 	// 降级标记必须落缓存（API/UI 可读），而不是只有一条 ERROR 日志。
 	assert.Eventually(t, func() bool {
-		_, ok := mc.sets[cache.AgentSyncDegradedKey(agentID)]
-		return ok
+		return mc.has(cache.AgentSyncDegradedKey(agentID))
 	}, 3*time.Second, 50*time.Millisecond, "the degraded state must be observable via the cache")
 }
 
@@ -803,7 +802,7 @@ func TestServer_Heartbeat_RenewsDegradedMarker(t *testing.T) {
 	agentID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
 	logger, _ := zap.NewDevelopment()
 	mc := newMockCache()
-	mc.sets[cache.AgentSyncDegradedKey(agentID)] = "1" // 连接建立时的降级标记（已到期临界）
+	mc.setKey(cache.AgentSyncDegradedKey(agentID), "1") // 连接建立时的降级标记（已到期临界）
 	registry := NewAgentRegistry()
 	s := New(logger)
 	s.cache = mc
@@ -813,12 +812,7 @@ func TestServer_Heartbeat_RenewsDegradedMarker(t *testing.T) {
 
 	s.handleHeartbeat(context.Background(), agentID, conn, &agentv1.Heartbeat{UptimeSeconds: 1})
 
-	renewals := 0
-	for _, k := range mc.setLog {
-		if k == cache.AgentSyncDegradedKey(agentID) {
-			renewals++
-		}
-	}
+	renewals := mc.setCount(cache.AgentSyncDegradedKey(agentID))
 	assert.Positive(t, renewals,
 		"a heartbeat on a degraded connection must renew the degraded marker — "+
 			"otherwise the TTL outlives the observability of a still-degraded connection (R5-B)")
@@ -841,7 +835,7 @@ func TestServer_Connect_ClearsDegradedMarkerOnDisconnect(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	registry := NewAgentRegistry()
 	mc := newMockCache()
-	mc.sets[cache.AgentSyncDegradedKey(agentID)] = "1"
+	mc.setKey(cache.AgentSyncDegradedKey(agentID), "1")
 	srv := New(logger)
 	srv.WithDeps(registry, mc, jwtSvc, &mockNATS{}, nil)
 	// The sync itself is DEGRADED — the marker is (re)written by this
@@ -879,12 +873,7 @@ func TestServer_Connect_ClearsDegradedMarkerOnDisconnect(t *testing.T) {
 		5*time.Second, 20*time.Millisecond, "handler must return on half-close")
 
 	assert.Eventually(t, func() bool {
-		for _, k := range mc.dels {
-			if k == cache.AgentSyncDegradedKey(agentID) {
-				return true
-			}
-		}
-		return false
+		return mc.delContains(cache.AgentSyncDegradedKey(agentID))
 	}, 3*time.Second, 50*time.Millisecond,
 		"disconnect must clear the degraded marker — after that there is no degraded condition to observe (R5-B)")
 }
@@ -940,19 +929,17 @@ func TestServer_Heartbeat_RebuildsDegradedMarkerAfterExternalDelete(t *testing.T
 
 	key := cache.AgentSyncDegradedKey(agentID)
 	require.Eventually(t, func() bool {
-		_, ok := mc.sets[key]
-		return ok
+		return mc.has(key)
 	}, 3*time.Second, 50*time.Millisecond, "the degraded sync must mark the agent")
 
 	// 模拟 Redis 驱逐/重启：键没了，但降级条件仍在（连接仍降级）。
-	delete(mc.sets, key)
+	mc.deleteKey(key)
 
 	// 下一次心跳必须重建标记。
 	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hb-1",
 		Payload: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{UptimeSeconds: 2}}}))
 	assert.Eventually(t, func() bool {
-		_, ok := mc.sets[key]
-		return ok
+		return mc.has(key)
 	}, 3*time.Second, 50*time.Millisecond,
 		"the next heartbeat must rebuild the marker from the connection's own degraded state — "+
 			"renewal conditioned on key existence cannot self-heal a lost key (R6)")
@@ -1012,11 +999,6 @@ func TestHeartbeat_DegradedRenew_BindsToItsOwnConnection(t *testing.T) {
 
 	// The current connection's heartbeat: N is degraded, renewal expected.
 	s.handleHeartbeat(context.Background(), agentID, connN, hb)
-	renewals := 0
-	for _, k := range mc.setLog {
-		if k == cache.AgentSyncDegradedKey(agentID) {
-			renewals++
-		}
-	}
+	renewals := mc.setCount(cache.AgentSyncDegradedKey(agentID))
 	assert.Positive(t, renewals, "the degraded connection's own heartbeat must renew the marker")
 }

@@ -3,6 +3,7 @@ package grpcserver
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,6 +38,12 @@ func (m *mockAgentMgr) PollApproval(ctx context.Context, req *agentv1.PollApprov
 // ── Mock CacheClient ──────────────────────────────────────────────────────────
 
 type mockCache struct {
+	// mu guards every field: Connect's deferred cleanup calls Del from a
+	// different goroutine than the test's assertions, so unlocked reads
+	// would be data races — and a racy test double disables -race for the
+	// whole package, which is exactly the tool that catches
+	// connection-identity bugs (PR #109 re-review, fourth round).
+	mu     sync.Mutex
 	sets   map[string]string
 	setLog []string // every Set, in order — lets tests tell a renewal from a seed
 	dels   []string
@@ -48,6 +55,8 @@ func newMockCache() *mockCache {
 
 func (m *mockCache) Set(_ context.Context, key string, value interface{}, _ time.Duration) error {
 	s, _ := value.(string)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.sets[key] = s
 	m.setLog = append(m.setLog, key)
 	return nil
@@ -56,6 +65,8 @@ func (m *mockCache) Set(_ context.Context, key string, value interface{}, _ time
 // Exists satisfies the extended CacheClient used by the degraded-marker
 // renewal; presence follows the last Set.
 func (m *mockCache) Exists(_ context.Context, keys ...string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, k := range keys {
 		if _, ok := m.sets[k]; ok {
 			return 1, nil
@@ -65,8 +76,67 @@ func (m *mockCache) Exists(_ context.Context, keys ...string) (int64, error) {
 }
 
 func (m *mockCache) Del(_ context.Context, keys ...string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.dels = append(m.dels, keys...)
 	return nil
+}
+
+// ── locked accessors for test assertions ─────────────────────────────────────
+
+// setKey seeds a value under the lock.
+func (m *mockCache) setKey(key, value string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sets[key] = value
+}
+
+// has reports presence under the lock.
+func (m *mockCache) has(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.sets[key]
+	return ok
+}
+
+// get returns the value under the lock.
+func (m *mockCache) get(key string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.sets[key]
+	return v, ok
+}
+
+// deleteKey removes a key under the lock.
+func (m *mockCache) deleteKey(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sets, key)
+}
+
+// setCount counts how many Set calls touched key (renewals vs a seed).
+func (m *mockCache) setCount(key string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, k := range m.setLog {
+		if k == key {
+			n++
+		}
+	}
+	return n
+}
+
+// delContains reports whether any Del named key.
+func (m *mockCache) delContains(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, k := range m.dels {
+		if k == key {
+			return true
+		}
+	}
+	return false
 }
 
 // ── Mock NATSPublisher ────────────────────────────────────────────────────────
@@ -197,7 +267,7 @@ func TestHandleHeartbeat_UpdatesCache(t *testing.T) {
 		&agentv1.Heartbeat{UptimeSeconds: 120})
 
 	onlineKey := cache.AgentOnlineKey("agent-abc")
-	_, ok := c.sets[onlineKey]
+	ok := c.has(onlineKey)
 	assert.True(t, ok)
 }
 
@@ -210,7 +280,7 @@ func TestHandleHeartbeat_CachesTelemetrySnapshot(t *testing.T) {
 	srv.handleHeartbeat(context.Background(), "agent-xyz", nil,
 		&agentv1.Heartbeat{UptimeSeconds: 300, QueueDepth: 7, Version: "0.1.0"})
 
-	raw, ok := c.sets[cache.AgentStatsKey("agent-xyz")]
+	raw, ok := c.get(cache.AgentStatsKey("agent-xyz"))
 	require.True(t, ok, "stats snapshot should be cached")
 
 	var snap struct {
@@ -392,8 +462,7 @@ func TestHandleAgentMessage_Heartbeat(t *testing.T) {
 	}
 	srv.handleAgentMessage(context.Background(), "agent-1", nil, msg)
 
-	_, ok := c.sets[cache.AgentOnlineKey("agent-1")]
-	assert.True(t, ok)
+	assert.True(t, c.has(cache.AgentOnlineKey("agent-1")))
 }
 
 func TestHandleAgentMessage_UploadResult(t *testing.T) {
