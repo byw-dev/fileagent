@@ -991,11 +991,9 @@ func TestHeartbeat_DegradedRenew_BindsToItsOwnConnection(t *testing.T) {
 
 	// The displaced connection's heartbeat: O is not degraded, so no renewal.
 	s.handleHeartbeat(context.Background(), agentID, connO, hb)
-	for _, k := range mc.setLog {
-		if k == cache.AgentSyncDegradedKey(agentID) {
-			t.Fatal("a heartbeat from a non-degraded connection renewed the degraded marker of another connection")
-		}
-	}
+	// All mockCache access goes through the locked accessors.
+	assert.Zero(t, mc.setCount(cache.AgentSyncDegradedKey(agentID)),
+		"a heartbeat from a non-degraded connection renewed the degraded marker of another connection")
 
 	// The current connection's heartbeat: N is degraded, renewal expected.
 	s.handleHeartbeat(context.Background(), agentID, connN, hb)
