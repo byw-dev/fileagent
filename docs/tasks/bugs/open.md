@@ -10,7 +10,7 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
-> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判）**：共 **53** 条 = **已关闭 33** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 19**（**4 条挡** 6/7/9/40 + **12 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
+> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判）**：共 **53** 条 = **已关闭 35** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 17**（**4 条挡** 6/7/9/40 + **10 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -143,8 +143,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 | 🟠 P1 | controlplane |
 | IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 | 🟡 P2 | deploy |
 | IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT | 🟡 P2 | agent |
-| IC-BUG-43 | close_wait 初始扫描跳过「仍在写」的文件，但 fsnotify 分支只扫一次、也没有后续事件兜底——写完即停的文件会被永久跳过 | 🟡 P2 | agent |
-| IC-BUG-44 | 阻塞发送期间内核 watch 队列可能溢出——两个生产平台都会把溢出报上 `fw.Errors`（Linux `IN_Q_OVERFLOW` / Windows `ErrEventOverflow`），但代码只打一条 Warn 就扔了，缺一次安全网重扫闭环 | 🟠 P1 | agent |
+| IC-BUG-43 | close_wait 初始扫描跳过「仍在写」的文件，但 fsnotify 分支只扫一次、也没有后续事件兜底——写完即停的文件会被永久跳过 ✅ 随 IC-BUG-44 同刀修复（PR #108：一次性 debounce recheck）| 🟡 P2 | agent |
+| IC-BUG-44 | 阻塞发送期间内核 watch 队列可能溢出——两个生产平台都会把溢出报上 `fw.Errors`（Linux `IN_Q_OVERFLOW` / Windows `ErrEventOverflow`），但代码只打一条 Warn 就扔了，缺一次安全网重扫闭环 ✅ 已修（PR #108：溢出触发安全网重扫）| 🟠 P1 | agent |
 | IC-BUG-45 | tail 偏移在**事件发出时**推进而非**上传确认后**，一次彻底失败的 tail 上传会静默丢掉一段字节区间且无任何信号 | 🟡 P2 | agent |
 | IC-BUG-46 | **`append_mode=tail` 静默丢数据**：`singlePartUpload` 在 `offset>0` 时把**只含增量**的内容 `PutObject` 到同一键，对象被整体替换，此前已采集的内容从对象中消失 ◐ **拆半**：挡掉半边 ✅ 随 IC-3（CP 422 + agent 闸门 + UI 禁用）；**正确实现归 IC-15** | 🔴 P0 | agent |
 | IC-BUG-47 | 实时 fsnotify 事件路径仍用非阻塞 `emit`（满即丢弃），大量小文件并发写入时被丢弃的文件**永不被采集**——IC-5 的 F1 只修了初始扫描那一半 ✅ 随 IC-3 修复（4 处实时发送点全改 `emitBlocking`） | 🟠 P1 | agent |
@@ -682,7 +682,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 任务失败进入退避期间重复提交同一四元组 → 只产生一个任务；退避结束后正常重试；而一个**已放弃**（重试耗尽）的任务不得阻止该文件日后被重新采集 |
 | **归属** | 未排期。宜与 IC-3（续传落盘，同样要动 `upload_tasks` 的状态与列）同刀 |
 
-## IC-BUG-43 — close_wait 初始扫描跳过的文件没有兜底路径 🟡 P2
+## IC-BUG-43 — close_wait 初始扫描跳过的文件没有兜底路径 🟡 P2 ✅ 已修（PR #108）
 
 | 字段 | 内容 |
 |------|------|
@@ -691,9 +691,9 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **后果** | logrotate 写完并关闭 `/data/app.log` 后 100ms agent 启动 → 扫描认为它还在去抖窗口内、跳过且不标 `seen` → 写入方已退出、永不再有 Write/Create 事件 → **该文件永不被采集**。窗口很窄（≤ 去抖时长），但症状与 IC-BUG-37 完全相同 |
 | **修复** | 二选一：(a) 给跳过的路径挂一个一次性定时器，去抖窗口过后单独重查这些路径；(b) 在 fsnotify 分支加一次有界的延迟重扫（只针对上一轮跳过的集合，不是全量重扫）。(a) 更省，且不引入周期性全量扫描的成本 |
 | **验收** | 写完并关闭一个文件后立即启动 agent（落在去抖窗口内），该文件最终必须被采集；且仍不得上传处于写入中的文件（不能把 F2 修复退回去）|
-| **归属** | 未排期。归 agent 采集路径，宜与 IC-BUG-44 同刀（都是初始扫描的时序边界）|
+| **归属** | ✅ **已随 PR #108 修复**（与 IC-BUG-44 同刀，如卡片原先建议）。修法：按路径挂一次性 recheck 定时器，F2「绝不上传写入中的文件」不变式保留 |
 
-## IC-BUG-44 — 阻塞发送期间内核 watch 队列溢出：溢出信号已送到手边，代码只 Warn 不补救 🟠 P1
+## IC-BUG-44 — 阻塞发送期间内核 watch 队列溢出：溢出信号已送到手边，代码只 Warn 不补救 🟠 P1 ✅ 已修（PR #108）
 
 | 字段 | 内容 |
 |------|------|
@@ -704,7 +704,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | **不需要发明任何检测手段**：在 `fw.Errors` 分支收到溢出错误（`IN_Q_OVERFLOW` / `fsnotify.ErrEventOverflow`）时触发一次**安全网重扫**（复用现有 `pollScan`），把溢出期间漏掉的文件找回来。可选地同时保留 Warn 日志并带上溢出标记。不动 emitBlocking 的背压语义——那是 IC-BUG-47 已验证的正确行为 |
 | **验收** | CI（ubuntu + windows）下制造队列溢出（小队列限制 + 持续突发），断言溢出后触发重扫、溢出窗口内创建的文件最终被采集 |
 | **⚠️ 流程事实（与直觉相反，值得后人知道）** | 对 fsnotify 这一类机制，**CI（ubuntu + windows）才是权威验证环境，本机 macOS 不是**——macOS kqueue 不报溢出，本地跑再多次也走不到 `fw.Errors` 的溢出分支，0 失败只代表「没测到」，不代表「没问题」。IC-BUG-44 的验收**必须在 CI 上看，不要被本机绿灯误导** |
-| **归属** | 未排期（IC-3 收尾明确不做本刀——安全网重扫是它自己那一刀）。宜与 IC-BUG-43 同刀（都是初始扫描的时序边界） |
+| **归属** | ✅ **已随 PR #108 修复**（与 IC-BUG-43 同刀）。修法：`handleWatchError` 命中 `fsnotify.ErrEventOverflow` 即触发复用 `pollScan` 的安全网重扫；CI 有真实内核溢出测试把关 |
 
 ## IC-BUG-45 — tail 偏移在发出事件时推进，而非上传确认后 🟡 P2
 
