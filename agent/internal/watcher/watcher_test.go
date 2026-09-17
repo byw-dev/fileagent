@@ -51,7 +51,7 @@ func TestWatcher_PollingDetectsNewFile(t *testing.T) {
 	case fe := <-events:
 		assert.Equal(t, "create", fe.Op)
 		assert.Equal(t, filepath.Join(dir, "hello.txt"), fe.Path)
-	case <-time.After(2*time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("did not receive file event in time")
 	}
 }
@@ -82,7 +82,7 @@ func TestWatcher_PollingDetectsModifiedFile(t *testing.T) {
 	case fe := <-events:
 		assert.Equal(t, "write", fe.Op)
 		assert.Equal(t, path, fe.Path)
-	case <-time.After(1*time.Second):
+	case <-time.After(1 * time.Second):
 		t.Fatal("did not receive modify event")
 	}
 }
@@ -144,7 +144,7 @@ func TestWatcher_FsnotifyStart_ContextCancel(t *testing.T) {
 	select {
 	case err := <-done:
 		assert.ErrorIs(t, err, context.Canceled)
-	case <-time.After(2*time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("Start did not return after context cancel")
 	}
 }
@@ -215,7 +215,7 @@ func TestWatcher_FsnotifyDetectsNewFile(t *testing.T) {
 	select {
 	case fe := <-events:
 		assert.Equal(t, filepath.Join(dir, "new.txt"), fe.Path)
-	case <-time.After(4*time.Second):
+	case <-time.After(4 * time.Second):
 		t.Fatal("did not receive fsnotify event")
 	}
 }
@@ -270,7 +270,7 @@ func TestWatcher_RecursiveFsnotify(t *testing.T) {
 	select {
 	case fe := <-events:
 		assert.Contains(t, fe.Path, "deep.dat")
-	case <-time.After(4*time.Second):
+	case <-time.After(4 * time.Second):
 		t.Fatal("recursive fsnotify did not fire")
 	}
 }
@@ -327,36 +327,36 @@ func TestWatcher_BuildEvent_GlobMismatch(t *testing.T) {
 // ── append_mode tests ─────────────────────────────────────────────────────────
 
 func TestWatcher_TailMode_FileOffset_IsTracked(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "data.txt")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.txt")
 
-// Write initial 10 bytes.
-require.NoError(t, os.WriteFile(path, []byte("0123456789"), 0o644))
+	// Write initial 10 bytes.
+	require.NoError(t, os.WriteFile(path, []byte("0123456789"), 0o644))
 
-w := &Watcher{
-fileGlob:    "*.txt",
-appendMode:  AppendModeTail,
-tailOffsets: make(map[string]int64),
-}
+	w := &Watcher{
+		fileGlob:    "*.txt",
+		appendMode:  AppendModeTail,
+		tailOffsets: make(map[string]int64),
+	}
 
-// First event — offset should be 0 (nothing uploaded yet).
-fe, err := w.buildEvent(path, "create")
-require.NoError(t, err)
-assert.Equal(t, int64(0), fe.FileOffset, "first event: offset should be 0")
-assert.Equal(t, int64(10), fe.Size)
+	// First event — offset should be 0 (nothing uploaded yet).
+	fe, err := w.buildEvent(path, "create")
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), fe.FileOffset, "first event: offset should be 0")
+	assert.Equal(t, int64(10), fe.Size)
 
-// Append 5 more bytes.
-f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
-require.NoError(t, err)
-_, err = f.WriteString("ABCDE")
-require.NoError(t, err)
-f.Close()
+	// Append 5 more bytes.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = f.WriteString("ABCDE")
+	require.NoError(t, err)
+	f.Close()
 
-// Second event — offset should be 10 (bytes already uploaded).
-fe2, err := w.buildEvent(path, "write")
-require.NoError(t, err)
-assert.Equal(t, int64(10), fe2.FileOffset, "second event: offset should be previous size")
-assert.Equal(t, int64(15), fe2.Size)
+	// Second event — offset should be 10 (bytes already uploaded).
+	fe2, err := w.buildEvent(path, "write")
+	require.NoError(t, err)
+	assert.Equal(t, int64(10), fe2.FileOffset, "second event: offset should be previous size")
+	assert.Equal(t, int64(15), fe2.Size)
 }
 
 // Regression for PR #100 review F1 (same product symptom as IC-BUG-37): the
@@ -531,221 +531,1154 @@ func TestWatcher_TailMode_PollScan_FileOffset(t *testing.T) {
 	assert.Equal(t, int64(0), firstEvent.FileOffset, "first event offset should be 0")
 }
 func TestWatcher_CloseWaitMode_DebounceEmitsOnce(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "app.log")
-require.NoError(t, os.WriteFile(path, []byte("line1\n"), 0o644))
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	require.NoError(t, os.WriteFile(path, []byte("line1\n"), 0o644))
 
-w, err := New(dir, "*.log", false, 50*time.Millisecond, AppendModeCloseWait, zap.NewNop())
-require.NoError(t, err)
+	w, err := New(dir, "*.log", false, 50*time.Millisecond, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
 
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-events := make(chan FileEvent, 8)
-go func() { _ = w.Start(ctx, events) }()
+	events := make(chan FileEvent, 8)
+	go func() { _ = w.Start(ctx, events) }()
 
-// Wait for at least one event (the initial poll scan may not fire in close_wait,
-// but the fallback polling still should).
-var received int
-deadline := time.After(3 * time.Second)
+	// Wait for at least one event (the initial poll scan may not fire in close_wait,
+	// but the fallback polling still should).
+	var received int
+	deadline := time.After(3 * time.Second)
 loop:
-for {
-select {
-case <-events:
-received++
-case <-deadline:
-break loop
-}
-}
-// We should receive at least one event.
-assert.GreaterOrEqual(t, received, 0, "close_wait mode: no error")
+	for {
+		select {
+		case <-events:
+			received++
+		case <-deadline:
+			break loop
+		}
+	}
+	// We should receive at least one event.
+	assert.GreaterOrEqual(t, received, 0, "close_wait mode: no error")
 }
 
 func TestWatcher_AppendModeOverwrite_OffsetIsAlwaysZero(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "data.txt")
-require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.txt")
+	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
 
-w := &Watcher{
-fileGlob:    "*.txt",
-appendMode:  AppendModeOverwrite,
-tailOffsets: make(map[string]int64),
-}
+	w := &Watcher{
+		fileGlob:    "*.txt",
+		appendMode:  AppendModeOverwrite,
+		tailOffsets: make(map[string]int64),
+	}
 
-fe, err := w.buildEvent(path, "create")
-require.NoError(t, err)
-assert.Equal(t, int64(0), fe.FileOffset, "overwrite mode: offset should always be 0")
+	fe, err := w.buildEvent(path, "create")
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), fe.FileOffset, "overwrite mode: offset should always be 0")
 }
 
 // ── Direct runCloseWait / runFsnotify unit tests ──────────────────────────────
 
 func TestRunCloseWait_ContextCancel_ReturnsError(t *testing.T) {
-fw, err := fsnotify.NewWatcher()
-require.NoError(t, err)
-defer fw.Close()
+	fw, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	defer fw.Close()
 
-w := &Watcher{
-fileGlob:    "*.txt",
-appendMode:  AppendModeCloseWait,
-tailOffsets: make(map[string]int64),
-logger:      zap.NewNop(),
-}
-events := make(chan FileEvent, 4)
-ctx, cancel := context.WithCancel(context.Background())
-cancel() // cancel immediately
+	w := &Watcher{
+		fileGlob:    "*.txt",
+		appendMode:  AppendModeCloseWait,
+		tailOffsets: make(map[string]int64),
+		logger:      zap.NewNop(),
+	}
+	events := make(chan FileEvent, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
 
-err = w.runCloseWait(ctx, events, fw)
-require.Error(t, err)
+	err = w.runCloseWait(ctx, events, fw, make(map[string]time.Time))
+	require.Error(t, err)
 }
 
 func TestRunCloseWait_RemoveEvent_EmittedImmediately(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "app.log")
-require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
 
-fw, err := fsnotify.NewWatcher()
-require.NoError(t, err)
-defer fw.Close()
-require.NoError(t, fw.Add(dir))
+	fw, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	defer fw.Close()
+	require.NoError(t, fw.Add(dir))
 
-w := &Watcher{
-fileGlob:    "*.log",
-appendMode:  AppendModeCloseWait,
-tailOffsets: make(map[string]int64),
-logger:      zap.NewNop(),
-}
+	w := &Watcher{
+		fileGlob:    "*.log",
+		appendMode:  AppendModeCloseWait,
+		tailOffsets: make(map[string]int64),
+		logger:      zap.NewNop(),
+	}
 
-events := make(chan FileEvent, 4)
-ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-defer cancel()
+	events := make(chan FileEvent, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-go func() { _ = w.runCloseWait(ctx, events, fw) }()
+	go func() { _ = w.runCloseWait(ctx, events, fw, make(map[string]time.Time)) }()
 
-// Trigger Remove event.
-require.NoError(t, os.Remove(path))
+	// Trigger Remove event.
+	require.NoError(t, os.Remove(path))
 
-select {
-case fe := <-events:
-assert.Equal(t, "remove", fe.Op)
-case <-time.After(2 * time.Second):
-t.Fatal("no remove event received")
-}
+	select {
+	case fe := <-events:
+		assert.Equal(t, "remove", fe.Op)
+	case <-time.After(2 * time.Second):
+		t.Fatal("no remove event received")
+	}
 }
 
 func TestRunCloseWait_WriteEvent_DebounceEmits(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "app.log")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
 
-fw, err := fsnotify.NewWatcher()
-require.NoError(t, err)
-defer fw.Close()
-require.NoError(t, fw.Add(dir))
+	fw, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	defer fw.Close()
+	require.NoError(t, fw.Add(dir))
 
-w := &Watcher{
-fileGlob:    "*.log",
-appendMode:  AppendModeCloseWait,
-tailOffsets: make(map[string]int64),
-logger:      zap.NewNop(),
-}
+	w := &Watcher{
+		fileGlob:    "*.log",
+		appendMode:  AppendModeCloseWait,
+		tailOffsets: make(map[string]int64),
+		logger:      zap.NewNop(),
+	}
 
-events := make(chan FileEvent, 4)
-ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-defer cancel()
+	events := make(chan FileEvent, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 
-go func() { _ = w.runCloseWait(ctx, events, fw) }()
+	go func() { _ = w.runCloseWait(ctx, events, fw, make(map[string]time.Time)) }()
 
-// Trigger a Create/Write event.
-require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+	// Trigger a Create/Write event.
+	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
 
-select {
-case fe := <-events:
-assert.NotEmpty(t, fe.Op)
-assert.Equal(t, path, fe.Path)
-case <-time.After(2 * time.Second):
-t.Fatal("no write event received after debounce")
-}
+	select {
+	case fe := <-events:
+		assert.NotEmpty(t, fe.Op)
+		assert.Equal(t, path, fe.Path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("no write event received after debounce")
+	}
 }
 
 func TestRunCloseWait_NonMatchingGlob_Ignored(t *testing.T) {
-dir := t.TempDir()
+	dir := t.TempDir()
 
-fw, err := fsnotify.NewWatcher()
-require.NoError(t, err)
-defer fw.Close()
-require.NoError(t, fw.Add(dir))
+	fw, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	defer fw.Close()
+	require.NoError(t, fw.Add(dir))
 
-w := &Watcher{
-fileGlob:    "*.txt",
-appendMode:  AppendModeCloseWait,
-tailOffsets: make(map[string]int64),
-logger:      zap.NewNop(),
-}
+	w := &Watcher{
+		fileGlob:    "*.txt",
+		appendMode:  AppendModeCloseWait,
+		tailOffsets: make(map[string]int64),
+		logger:      zap.NewNop(),
+	}
 
-events := make(chan FileEvent, 4)
-ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-defer cancel()
+	events := make(chan FileEvent, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
 
-go func() { _ = w.runCloseWait(ctx, events, fw) }()
+	go func() { _ = w.runCloseWait(ctx, events, fw, make(map[string]time.Time)) }()
 
-// Create a .log file (doesn't match *.txt)
-require.NoError(t, os.WriteFile(filepath.Join(dir, "test.log"), []byte("x"), 0o644))
+	// Create a .log file (doesn't match *.txt)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "test.log"), []byte("x"), 0o644))
 
-<-ctx.Done()
-assert.Empty(t, events)
+	<-ctx.Done()
+	assert.Empty(t, events)
 }
 
 func TestRunFsnotify_EventsChannelClosed_ReturnsNil(t *testing.T) {
-fw, err := fsnotify.NewWatcher()
-require.NoError(t, err)
+	fw, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
 
-w := &Watcher{
-fileGlob:    "*.txt",
-tailOffsets: make(map[string]int64),
-logger:      zap.NewNop(),
-}
-events := make(chan FileEvent, 4)
-ctx := context.Background()
+	w := &Watcher{
+		fileGlob:    "*.txt",
+		tailOffsets: make(map[string]int64),
+		logger:      zap.NewNop(),
+	}
+	events := make(chan FileEvent, 4)
+	ctx := context.Background()
 
-done := make(chan error, 1)
-go func() { done <- w.runFsnotify(ctx, events, fw) }()
+	done := make(chan error, 1)
+	go func() { done <- w.runFsnotify(ctx, events, fw, make(map[string]time.Time)) }()
 
-// Closing the watcher will close the fw.Events channel.
-fw.Close()
+	// Closing the watcher will close the fw.Events channel.
+	fw.Close()
 
-select {
-case err := <-done:
-assert.NoError(t, err)
-case <-time.After(2 * time.Second):
-t.Fatal("runFsnotify did not return after channel close")
-}
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("runFsnotify did not return after channel close")
+	}
 }
 
 func TestRunFsnotify_RemoveEvent_Emitted(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "data.txt")
-require.NoError(t, os.WriteFile(path, []byte("x"), 0o644))
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.txt")
+	require.NoError(t, os.WriteFile(path, []byte("x"), 0o644))
 
-fw, err := fsnotify.NewWatcher()
-require.NoError(t, err)
-defer fw.Close()
-require.NoError(t, fw.Add(dir))
+	fw, err := fsnotify.NewWatcher()
+	require.NoError(t, err)
+	defer fw.Close()
+	require.NoError(t, fw.Add(dir))
 
-w := &Watcher{
-fileGlob:    "*.txt",
-tailOffsets: make(map[string]int64),
-logger:      zap.NewNop(),
+	w := &Watcher{
+		fileGlob:    "*.txt",
+		tailOffsets: make(map[string]int64),
+		logger:      zap.NewNop(),
+	}
+	events := make(chan FileEvent, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = w.runFsnotify(ctx, events, fw, make(map[string]time.Time)) }()
+	require.NoError(t, os.Remove(path))
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, "remove", fe.Op)
+	case <-time.After(2 * time.Second):
+		t.Fatal("no remove event received")
+	}
 }
-events := make(chan FileEvent, 4)
-ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-defer cancel()
 
-go func() { _ = w.runFsnotify(ctx, events, fw) }()
-require.NoError(t, os.Remove(path))
+// ── IC-BUG-44: overflow errors must trigger a safety-net rescan ───────────────
 
-select {
-case fe := <-events:
-assert.Equal(t, "remove", fe.Op)
-case <-time.After(2 * time.Second):
-t.Fatal("no remove event received")
+// Feeding fsnotify.ErrEventOverflow to handleWatchError must trigger the
+// safety-net rescan so files missed during the overflow window are recovered.
+func TestHandleWatchError_Overflow_TriggersRescan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lost.log")
+	require.NoError(t, os.WriteFile(path, []byte("written during overflow"), 0o644))
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, past, past))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	w.handleWatchError(ctx, events, make(map[string]time.Time), fsnotify.ErrEventOverflow)
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+		assert.Equal(t, "create", fe.Op)
+	default:
+		t.Fatal("overflow error did not trigger the safety-net rescan")
+	}
 }
+
+// Any other error must only be logged — no rescan.
+func TestHandleWatchError_PlainError_DoesNotRescan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	w.handleWatchError(ctx, events, make(map[string]time.Time), errors.New("fsnotify: bogus failure"))
+
+	select {
+	case fe := <-events:
+		t.Fatalf("non-overflow error triggered a rescan: %s", fe.Path)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// The rescan must re-emit a file that changed after it was last seen, as
+// "write" (not "create") — proving seen state is shared between the initial
+// scan and the rescan (design point (a) of IC-BUG-44).
+func TestHandleWatchError_RescanReEmitsChangedFileAsWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "changed.log")
+	require.NoError(t, os.WriteFile(path, []byte("v1"), 0o644))
+	stale := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(path, stale, stale))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	// seen as of the initial scan: the file was already collected at v1.
+	seen := map[string]time.Time{path: stale}
+
+	// The file changed after the initial scan; its events were lost to the
+	// overflow window.
+	fresh := time.Now()
+	require.NoError(t, os.Chtimes(path, fresh, fresh))
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	w.handleWatchError(ctx, events, seen, fsnotify.ErrEventOverflow)
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+		assert.Equal(t, "write", fe.Op, "changed file must be re-emitted as write, not create")
+	default:
+		t.Fatal("rescan did not re-emit the changed file")
+	}
+}
+
+// The rescan must NOT re-emit unchanged files already present in seen: the
+// seen map is shared across the initial scan and rescans, so an overflow
+// rescan does not spam the queue with one "create" per existing file.
+func TestHandleWatchError_RescanSkipsUnchangedFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "unchanged.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := map[string]time.Time{path: info.ModTime()}
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	w.handleWatchError(ctx, events, seen, fsnotify.ErrEventOverflow)
+
+	select {
+	case fe := <-events:
+		t.Fatalf("rescan re-emitted an unchanged file: %s (op=%s)", fe.Path, fe.Op)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Branch coverage: the same overflow handling must be reachable from the
+// runFsnotify event loop itself. The loop is driven through injected channels
+// (loopFsnotify) with the same sentinel value the Linux (IN_Q_OVERFLOW) and
+// Windows (ReadDirectoryChangesW) backends report on queue overflow — a live
+// backend cannot be used here because its channel lifecycle races with
+// test-side injection.
+func TestRunFsnotify_OverflowError_TriggersRescan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lost.txt")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error, 1)
+	erc <- fsnotify.ErrEventOverflow
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = w.loopFsnotify(ctx, events, make(map[string]time.Time), evc, erc) }()
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("overflow error on the error channel did not trigger the safety-net rescan in loopFsnotify")
+	}
+}
+
+// Branch coverage: the plain-error path through the loop must not rescan.
+func TestRunFsnotify_PlainError_DoesNotRescan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error, 1)
+	erc <- errors.New("fsnotify: bogus failure")
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = w.loopFsnotify(ctx, events, make(map[string]time.Time), evc, erc) }()
+
+	select {
+	case fe := <-events:
+		t.Fatalf("non-overflow error triggered a rescan in loopFsnotify: %s", fe.Path)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Branch coverage: runCloseWait's error branch must trigger the rescan too.
+// The file's mtime is an hour old so the rescan is allowed to emit it.
+func TestRunCloseWait_OverflowError_TriggersRescan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lost.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, past, past))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error, 1)
+	erc <- fsnotify.ErrEventOverflow
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = w.loopCloseWait(ctx, events, make(map[string]time.Time), evc, erc) }()
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("overflow error on the error channel did not trigger the safety-net rescan in loopCloseWait")
+	}
+}
+
+// ── IC-BUG-43: files skipped inside the close_wait debounce window ────────────
+
+// A quiet (writer already exited) file that was skipped by the scan must be
+// emitted by the debounce recheck — exactly once: the recheck marks it seen
+// so later rescans do not re-emit it.
+func TestRecheckAfterDebounce_QuietFile_EmittedOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dropped.log")
+	require.NoError(t, os.WriteFile(path, []byte("writer already exited"), 0o644))
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, past, past))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	w.recheckAfterDebounce(ctx, events, seen, path)
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+		assert.Equal(t, "create", fe.Op)
+	default:
+		t.Fatal("quiet file was not emitted by the debounce recheck")
+	}
+
+	w.recheckAfterDebounce(ctx, events, seen, path)
+	select {
+	case fe := <-events:
+		t.Fatalf("quiet file was re-emitted by a second recheck: %s", fe.Path)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// F2 invariant at the recheck level: a file still inside the debounce window
+// must never be emitted by the recheck (never upload a file being written).
+func TestRecheckAfterDebounce_StillWriting_NotEmitted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "active.log")
+	require.NoError(t, os.WriteFile(path, []byte("partial"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	w.recheckAfterDebounce(ctx, events, seen, path)
+
+	select {
+	case fe := <-events:
+		t.Fatalf("file still being written was emitted by the recheck: %s", fe.Path)
+	case <-time.After(600 * time.Millisecond):
+	}
+}
+
+// Acceptance (IC-BUG-43): a file written and closed right before agent start
+// — inside the debounce window — must still be collected eventually.
+func TestWatcher_CloseWait_StartWithinDebounceWindow_FileEventuallyCollected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "written-and-closed.log")
+	require.NoError(t, os.WriteFile(path, []byte("writer exited just now"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond // short debounce: recheck fires within ms
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() { _ = w.Start(ctx, events) }()
+
+	// Sync point before waiting for the delivery: the initial scan must
+	// have armed the recheck for the hot file. Without this the test would
+	// depend on a wall-clock window ("scan + timer fire within 4s") instead
+	// of observing the scheduling directly.
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.rechecks) == 1
+	}, 3*time.Second, 5*time.Millisecond, "initial scan should arm the debounce recheck for the hot file")
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+		assert.Equal(t, "create", fe.Op)
+	case <-time.After(4 * time.Second):
+		t.Fatal("file written and closed within the debounce window was never collected")
+	}
+}
+
+// F2 invariant, end to end: a file that keeps receiving writes must not be
+// emitted — neither by the initial scan, nor by a debounce recheck, nor by
+// the close_wait flush — while it is hot. Once writes stop, the close_wait
+// debounce flush collects it.
+func TestWatcher_CloseWait_ActivelyWrittenFile_NotEmittedWhileHot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "streaming.log")
+	require.NoError(t, os.WriteFile(path, []byte("start"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx, events) }()
+
+	// Keep the file hot across more than one debounce window.
+	hotDeadline := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(hotDeadline) {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+		require.NoError(t, err)
+		_, err = f.WriteString("x")
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	select {
+	case fe := <-events:
+		t.Fatalf("actively written file was emitted while hot: %s (op=%s)", fe.Path, fe.Op)
+	default:
+	}
+
+	// After the final write the close_wait debounce flush collects it.
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+	case <-time.After(3 * time.Second):
+		t.Fatal("file was never collected after writes stopped")
+	}
+}
+
+// IC-BUG-44 + IC-BUG-43 combined: an overflow rescan in close_wait mode must
+// skip a file that is still inside the debounce window (F2) but arm a recheck
+// so the file is collected once the writer goes quiet.
+func TestOverflowRescan_CloseWaitHotFile_CollectedAfterDebounce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "burst.log")
+	require.NoError(t, os.WriteFile(path, []byte("created during overflow, still hot"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond // short debounce: recheck fires within ms
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	w.handleWatchError(ctx, events, make(map[string]time.Time), fsnotify.ErrEventOverflow)
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+	case <-time.After(4 * time.Second):
+		t.Fatal("hot file skipped by the overflow rescan was never rechecked")
+	}
+}
+
+// The close_wait debounce flush must record the delivered mtime in the shared
+// seen map: after the flush has emitted a file, the IC-BUG-44 safety-net
+// rescan must not re-emit it.
+func TestCloseWaitFlush_PreventsRescanReemit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "flushed.log")
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+
+	// A write lands, the debounce window passes, the flush emits.
+	require.NoError(t, os.WriteFile(path, []byte("done"), 0o644))
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+
+	select {
+	case fe := <-events:
+		require.Equal(t, path, fe.Path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("debounce flush never emitted the file")
+	}
+
+	// An overflow arrives afterwards: the rescan sees the file already in
+	// seen (marked by the flush) and must not re-emit it.
+	go func() { erc <- fsnotify.ErrEventOverflow }()
+
+	select {
+	case fe := <-events:
+		t.Fatalf("safety-net rescan re-emitted a file the debounce flush already delivered: %s (op=%s)", fe.Path, fe.Op)
+	case <-time.After(600 * time.Millisecond):
+	}
+}
+
+// ── PR #108 review F1 → P1: the F1 guards were reverted by the P1 ruling ─────
+// (F1 marked real-time deliveries seen; the codex review P1 proved that this
+// took away the overflow rescan's retry opportunity and traded an unbounded
+// silent-loss mode for a bounded amplification. The guards below were the
+// F1 versions; TestLoopFsnotify_RescanRetriesRealTimeDeliveredFiles at the
+// bottom of this file pins the reverted behaviour.)
+
+// Guard: remove events are not "deliveries" — they must not mark the file
+// seen (only create/write deliveries do).
+func TestLoopFsnotify_RemoveEvent_DoesNotMarkSeen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gone.txt")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = w.loopFsnotify(ctx, events, seen, evc, nil) }()
+
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Remove}
+	select {
+	case fe := <-events:
+		require.Equal(t, "remove", fe.Op)
+	case <-time.After(2 * time.Second):
+		t.Fatal("remove event was not delivered")
+	}
+
+	w.seenMu.Lock()
+	_, known := seen[path]
+	w.seenMu.Unlock()
+	assert.False(t, known, "remove events must not mark the file seen")
+}
+
+// ── PR #108 review F2: timer lifecycle on shutdown ────────────────────────────
+
+// When Start returns (ctx cancelled / rule cancelled / hot reload), every
+// pending debounce recheck timer must be stopped and dropped: the closures
+// otherwise keep the watcher, the seen map, the context and the events
+// channel alive per skipped path (the production concern is the leak — the
+// events channel itself is never closed in production, so this is not a
+// send-on-closed-channel crash).
+func TestWatcher_Start_Return_CleansUpRecheckTimers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hot.log")
+	require.NoError(t, os.WriteFile(path, []byte("still writing"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx, events) }()
+
+	// Wait until the initial scan has scheduled the debounce recheck.
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.rechecks) == 1
+	}, 3*time.Second, 10*time.Millisecond, "initial scan should schedule a debounce recheck for the hot file")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start did not return after context cancel")
+	}
+
+	w.seenMu.Lock()
+	n := len(w.rechecks)
+	w.seenMu.Unlock()
+	assert.Zero(t, n, "recheck timers must be stopped and cleared when Start returns")
+}
+
+// When the event loop exits because the fsnotify event channel closed (the
+// shutdown path that is NOT ctx cancellation), the per-file close_wait
+// debounce timers must be stopped too — a live timer would still flush into
+// the events channel after the loop is gone.
+func TestLoopCloseWait_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pending.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond // short debounce: pending timer fires within ms
+
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 8)
+	seen := make(map[string]time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+
+	// A write registers the pending debounce timer (fires ~w.debounce later).
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+
+	// The event channel closes (shutdown path distinct from ctx cancel).
+	close(evc)
+
+	// Give the loop time to exit, then make sure the flush never fires:
+	// with the 30ms debounce the flush would land well inside the window
+	// even under CPU contention, so the guard stays meaningful.
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case fe := <-events:
+		t.Fatalf("pending debounce timer was not stopped when the event loop exited: delivered %s", fe.Path)
+	case <-time.After(900 * time.Millisecond):
+	}
+}
+
+// ── PR #108 review F3: exactly-once delivery for the same file version ───────
+
+// The close_wait debounce recheck and the real-time debounce flush can race
+// on the same file version: both run "check seen → send → record seen" and
+// neither is atomic. This test makes the double delivery STRUCTURAL, not a
+// probabilistic alignment probe: with a parked consumer, the recheck blocks
+// inside emitBlocking (its seen check already passed), and the flush — which
+// today has no seen check at all — blocks behind it. Both deliveries
+// therefore always complete, deterministically, no matter how the
+// goroutines interleave. After the fix the two sites arbitrate through a
+// per-path in-flight claim and exactly one delivery happens.
+func TestCloseWait_RecheckAndFlush_SameVersionDeliveredOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "raced.log")
+	require.NoError(t, os.WriteFile(path, []byte("same version"), 0o644))
+	// Quiet so the recheck's still-writing guard lets it through; the loop
+	// path does not consult mtime, so the Write event still registers the
+	// pending debounce timer.
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, past, past))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond // short debounce: no wall-clock window to miss
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent) // unbuffered: deliveries park the senders
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+
+	// A: the debounce flush path — a Write event registers the pending
+	// timer, which fires ~w.debounce later.
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+
+	// B: the debounce recheck path — started immediately, so it claims the
+	// delivery and parks inside emitBlocking long before the flush timer
+	// fires. The claim is observable: exactly one inflight entry.
+	go w.recheckAfterDebounce(ctx, events, seen, path)
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 1
+	}, 2*time.Second, 5*time.Millisecond, "recheck should hold the in-flight claim")
+
+	// The flush fires at ~w.debounce. Give it time to either be REJECTED by
+	// the claim (fix) or to take its own second claim (pre-fix / M11) and
+	// park in emitBlocking. Only after this window do we start draining, so
+	// a second claimer is observed BEFORE the first delivery completes —
+	// otherwise the seen write would mask the missing inflight check.
+	time.Sleep(w.debounce + 400*time.Millisecond)
+
+	w.seenMu.Lock()
+	claims := len(w.inflight)
+	w.seenMu.Unlock()
+
+	// Drain every claimed delivery.
+	delivered := 0
+	readDeadline := time.After(2 * time.Second)
+	var firstOp, secondOp string
+	for delivered < claims {
+		select {
+		case fe := <-events:
+			if delivered == 0 {
+				firstOp = fe.Op
+			}
+			delivered++
+		case <-readDeadline:
+			t.Fatalf("delivered %d of %d claimed deliveries", delivered, claims)
+		}
+	}
+	// Nothing further may arrive.
+	select {
+	case fe := <-events:
+		secondOp = fe.Op
+		t.Fatalf("double-send race: first op=%s second op=%s (inflight now=%d)", firstOp, secondOp, func() int {
+			w.seenMu.Lock()
+			defer w.seenMu.Unlock()
+			return len(w.inflight)
+		}())
+	case <-time.After(600 * time.Millisecond):
+	}
+	// Exactly-once: one claim, one delivery.
+	assert.Equal(t, 1, claims, "the same file version must be claimed and delivered exactly once")
+}
+
+// A claim whose delivery is interrupted (emitBlocking returns false on ctx
+// cancel) must roll back: no leftover inflight entry, seen not written. A
+// stuck claim would make every future claim for the same version fail and
+// a file that never changes again would silently never be collected — the
+// exact class of defect this knife exists to kill — so completeDelivery is
+// deferred, covering panics and early returns too.
+func TestScanFile_ClaimReleasedOnAbortedDelivery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aborted.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+	// Quiet past the close_wait debounce window, otherwise the recheck's
+	// still-writing guard returns before the claim is ever taken.
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, past, past))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	// Unbuffered with no reader: `events <- fe` can never proceed, so
+	// emitBlocking deterministically fails on the cancelled ctx instead of
+	// racing between the ready ctx.Done and a buffered send slot.
+	events := make(chan FileEvent)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // emit will be aborted
+
+	w.recheckAfterDebounce(ctx, events, seen, path)
+
+	select {
+	case fe := <-events:
+		t.Fatalf("aborted delivery must not emit: %s", fe.Path)
+	default:
+	}
+
+	w.seenMu.Lock()
+	left := len(w.inflight)
+	_, known := seen[path]
+	w.seenMu.Unlock()
+	assert.Zero(t, left, "aborted delivery must roll back the in-flight claim")
+	assert.False(t, known, "aborted delivery must not mark seen (file stays retryable)")
+}
+
+// ── PR #108 review F3 补钉 Q2/Q3（codex 复审） ────────────────────────────────
+
+// Q2: the flush site must settle its claim after a SUCCESSFUL delivery —
+// otherwise the version stays in-flight forever (every later claim for the
+// same version fails) and seen stays empty (the delivered version is
+// invisible to rescans).
+func TestFlushDelivery_SettlesClaimAndMarksSeen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "flushed.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+	// Short debounce: the flush fires within milliseconds, so the test does
+	// not depend on a wall-clock window surviving CPU contention.
+	w.debounce = 30 * time.Millisecond
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+
+	// The (short) debounce timer fires after the Write event; with a
+	// buffered consumer the flush delivers immediately.
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+
+	var fe FileEvent
+	select {
+	case fe = <-events:
+		require.Equal(t, path, fe.Path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("flush never delivered the file")
+	}
+
+	// Receiving the event does NOT imply the flush goroutine has run its
+	// deferred completeDelivery yet — settle is a separate scheduling step,
+	// so assert on the SETTLED STATE, never on the instant after the read.
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		mt, known := seen[path]
+		return len(w.inflight) == 0 && known && mt.Equal(fe.ModTime)
+	}, 1*time.Second, 5*time.Millisecond,
+		"successful flush delivery must settle its claim and record seen")
+}
+
+// Q2 (abort half): a flush whose delivery is aborted (ctx cancelled while
+// parked in emitBlocking) must roll its claim back via the deferred
+// completeDelivery — a leaked claim would block every later claim for the
+// same version.
+func TestFlushDelivery_ClaimReleasedOnAbortedDelivery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aborted-flush.log")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond // short debounce: no wall-clock window to miss
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent) // unbuffered, never read: emit parks
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+
+	// The flush fires ~w.debounce (30ms here) later, claims and parks in
+	// emitBlocking. The eventual claim observation below is the sync point,
+	// not the timer's wall clock.
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 1
+	}, 2*time.Second, 5*time.Millisecond, "flush should hold the claim while parked in emitBlocking")
+
+	// Aborting the ctx unblocks emitBlocking with delivered=false; the
+	// deferred completeDelivery must roll the claim back.
+	cancel()
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 0
+	}, 1*time.Second, 5*time.Millisecond, "aborted flush delivery must roll back the in-flight claim")
+}
+
+// Q3: seen's monotonic write — a late OLD-version completion (parked in its
+// emit while a NEWER version already delivered and settled) must not move
+// seen backwards, and the current version must not be re-emitted afterwards.
+func TestSeen_MonotonicWrite_OldVersionLateCompletion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "versions.log")
+	require.NoError(t, os.WriteFile(path, []byte("v1"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// v1 claims and parks mid-delivery.
+	require.NoError(t, os.Chtimes(path, time.Now().Add(-2*time.Hour), time.Now().Add(-2*time.Hour)))
+	info1, err := os.Stat(path)
+	require.NoError(t, err)
+	eventsOld := make(chan FileEvent)    // parked: v1's emit blocks
+	eventsNew := make(chan FileEvent, 8) // v2 delivers immediately
+
+	go func() { _ = w.scanFile(ctx, eventsOld, seen, path, info1) }()
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		cur, busy := w.inflight[path]
+		return busy && cur.Equal(info1.ModTime())
+	}, 2*time.Second, 5*time.Millisecond, "v1 should hold the claim while parked")
+
+	// The file moves on; the newer version delivers and settles FIRST.
+	require.NoError(t, os.Chtimes(path, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)))
+	info2, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, w.scanFile(ctx, eventsNew, seen, path, info2))
+
+	w.seenMu.Lock()
+	mt, known := seen[path]
+	w.seenMu.Unlock()
+	require.True(t, known)
+	require.True(t, mt.Equal(info2.ModTime()), "seen must carry the newer version")
+
+	// Drain v1's parked emit; its late completion must not regress seen.
+	select {
+	case <-eventsOld:
+	case <-time.After(2 * time.Second):
+		t.Fatal("v1 never delivered")
+	}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 0
+	}, 1*time.Second, 5*time.Millisecond, "late v1 claim must settle")
+
+	w.seenMu.Lock()
+	late, _ := seen[path]
+	w.seenMu.Unlock()
+	assert.True(t, late.Equal(info2.ModTime()),
+		"a late older-version completion must not move seen backwards")
+
+	// A follow-up scan must not re-emit the current version.
+	select {
+	case fe := <-eventsNew: // drain v2's earlier delivery first
+		_ = fe
+	default:
+	}
+	w.pollScan(ctx, eventsNew, seen)
+	select {
+	case fe := <-eventsNew:
+		t.Fatalf("follow-up scan re-emitted the current version: %s (op=%s)", fe.Path, fe.Op)
+	default:
+	}
+}
+
+// ── PR #108 codex 复审 P2: timer 交接不得误删替代者 ──────────────────────────
+
+// Timer A fires and blocks on seenMu; while it waits, the overflow rescan
+// re-arms the same path with timer B (scheduleDebounceRecheck's replace path
+// — old.Stop() cannot stop an already-fired timer, so the entry is
+// overwritten). When A finally gets the lock it must NOT delete B's
+// tracking entry: an unconditional delete would leave B untracked, so
+// stopAllRechecks could never Stop it — the review-F2 leak would come back
+// (with a future mtime, B's closure holds the watcher for years).
+func TestRecheckTimer_ReplaceKeepsNewTimerTracked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hot.log")
+	require.NoError(t, os.WriteFile(path, []byte("still writing"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Schedule recheck A for the hot file. A short debounce makes the fire
+	// wait ≈ debounceRecheckGrace, so the test does not depend on a
+	// wall-clock window surviving CPU contention.
+	w.debounce = 30 * time.Millisecond
+	w.scheduleDebounceRecheck(ctx, events, seen, path)
+	w.seenMu.Lock()
+	timerA := w.rechecks[path]
+	w.seenMu.Unlock()
+	require.NotNil(t, timerA)
+
+	// Hold seenMu so A's callback blocks the moment it fires, and let A
+	// fire well within the grace-dominated wait.
+	w.seenMu.Lock()
+	time.Sleep(debounceRecheckGrace + 500*time.Millisecond)
+
+	// While A is parked on the lock, the rescan replaces the entry with B —
+	// scheduleDebounceRecheck's replace also bumps the per-path generation.
+	timerB := time.AfterFunc(time.Hour, func() {})
+	defer timerB.Stop()
+	w.recheckGen++
+	w.recheckGens[path] = w.recheckGen
+	w.rechecks[path] = timerB
+	w.seenMu.Unlock()
+
+	// Give A's callback time to run its (guarded) settle.
+	time.Sleep(300 * time.Millisecond)
+
+	w.seenMu.Lock()
+	cur, tracked := w.rechecks[path]
+	w.seenMu.Unlock()
+
+	require.True(t, tracked, "the replacement timer must stay tracked")
+	assert.Same(t, timerB, cur, "timer A must not delete the replacement's tracking entry")
+}
+
+// ── PR #108 codex 复审 P1: seen 语义回退为「已交付」前的守卫（见卡片 IC-BUG-53） ─
+
+// The safety-net rescan is a RETRY OPPORTUNITY: real-time deliveries are not
+// durable (emitBlocking=true only means the event entered the in-memory
+// channel — the downstream submit can still fail), so the rescan must
+// re-emit files it finds even if they were delivered in real time. Seen is
+// deliberately NOT written on the real-time path, so the overflow rescan
+// never skips a file just because it was delivered once. (The trade-off —
+// bounded re-delivery vs. unbounded silent loss — is argued in the
+// loopFsnotify comment; the watcher-side residual gap is IC-BUG-53.)
+func TestLoopFsnotify_RescanRetriesRealTimeDeliveredFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "retryable.txt")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error, 1)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	go func() { _ = w.loopFsnotify(ctx, events, seen, evc, erc) }()
+
+	// The file is delivered in real time (first delivery consumed below).
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	select {
+	case fe := <-events:
+		require.Equal(t, path, fe.Path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("real-time create was not delivered")
+	}
+
+	// An overflow rescan must RE-EMIT the file: the real-time delivery is
+	// not durable, and this rescan is the retry opportunity for the window
+	// between delivery and durable enqueue.
+	erc <- fsnotify.ErrEventOverflow
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+		assert.Equal(t, "create", fe.Op)
+	case <-time.After(2 * time.Second):
+		t.Fatal("safety-net rescan skipped a real-time-delivered file — the retry opportunity is lost (P1 regression)")
+	}
 }
