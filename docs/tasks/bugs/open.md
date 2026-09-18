@@ -10,7 +10,7 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
-> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判）**：共 **53** 条 = **已关闭 35** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 17**（**4 条挡** 6/7/9/40 + **10 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
+> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判）**：共 **54** 条 = **已关闭 35** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 18**（**4 条挡** 6/7/9/40 + **11 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -154,6 +154,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-51 | 上报的 `sha256` / `size_bytes` / 实际上传字节**来自三次独立的文件读**，三者可以描述文件的不同版本；且 `PutObject` 返回的 ETag 虽已拿到却无人用来复核 | 🟠 P1 | agent |
 | IC-BUG-52 | `dry_run_limit` 的**有效上限恒为 10**：CP 只在响应端按它裁剪（1–10 生效），**从不下发给 agent**，而 agent 硬编码上限 10——请求 11–50 被静默压成 10，且无截断标记 | 🟡 P2 | controlplane + agent + proto |
 | IC-BUG-53 | watcher 的 `seen` 语义是「**已交付**」而非「**已持久入队**」：下游 `submitFile` 提交/判重失败**只 Warn 不重试**，文件此后不再变化时**永不被采集**（初扫路径自 PR #100 F1 起即受影响，实时路径因 IC-BUG-44/43 的 P1 裁决而**保留重试机会**） | 🟡 P2 | agent |
+| IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 | 🟡 P2 | docs |
 
 ---
 
@@ -698,7 +699,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | 字段 | 内容 |
 |------|------|
 | **根因** | IC-BUG-47（IC-3 修复）把实时事件改成阻塞发送后，**发送阻塞期间 `fw.Events` 无人消费**，fsnotify 后端停止读取内核 watch 队列；持续突发可把队列冲爆（Linux `max_queued_events` 默认 16384）。**关键平台事实（codex 第六轮复核查证 fsnotify v1.8.0）**：溢出在**两个生产平台都是可见的**——Linux（生产）inotify 报 `IN_Q_OVERFLOW`、Windows（生产）ReadDirectoryChangesW 后端报 `fsnotify.ErrEventOverflow`，两者都会出现在 `fw.Errors` 上。**但当前 `fw.Errors` 分支只有一条 `w.logger.Warn`，没有任何恢复动作**——信号已经送到手边，代码接住了又扔掉 |
-| **精确位置** | `agent/internal/watcher/watcher.go` 两处 `fw.Errors` 分支（`runCloseWait` 与 `runFsnotify`，约 :214-218 / :263-268），均只 `logger.Warn("watcher: fsnotify error", …)` |
+| **精确位置（发现时）** | ⚠️ 以下为**发现时**的状态，PR #108 已修复：`agent/internal/watcher/watcher.go` 两处 `fw.Errors` 分支（`runCloseWait` 与 `runFsnotify`，约 :214-218 / :263-268），当时均只 `logger.Warn("watcher: fsnotify error", …)` |
 | **后果** | 溢出期间排队的 create/write 事件丢失，对应文件不被采集。**性质与初判不同**：这不是「难以察觉的静默丢数据」——溢出信号两个生产平台都会明确报告，只差一步补救动作即可闭环。**因此从 P2 上调为 P1**：从「隐蔽隐患」变成「差一步闭环的缺口」，修复成本低、收益直接 |
 | **平台角色（重要，勿再搞反）** | Linux（**生产**）`IN_Q_OVERFLOW` **可见**；Windows（**生产**）`ErrEventOverflow` **可见**（fsnotify v1.8.0 查证）；macOS kqueue（**仅开发机**）不保证溢出可见，可能静默——**它只影响开发机上能不能复现这个分支，不影响生产的数据安全边界**。⚠️ 这是本 track 第 10 次「注释声称的性质不成立」，此前 watcher.go 注释曾声称 Windows 该层丢失可能静默，系错误 |
 | **修复** | **不需要发明任何检测手段**：在 `fw.Errors` 分支收到溢出错误（`IN_Q_OVERFLOW` / `fsnotify.ErrEventOverflow`）时触发一次**安全网重扫**（复用现有 `pollScan`），把溢出期间漏掉的文件找回来。可选地同时保留 Warn 日志并带上溢出标记。不动 emitBlocking 的背压语义——那是 IC-BUG-47 已验证的正确行为 |
@@ -774,6 +775,19 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复（D-034）** | 改名 **`{submit_time}`**（语义 = 文件被提交上传的时刻，UTC，与 `agent_name`/`filename` 命名一致）；优先级改为**解析结果优先**（与 `agent_name`/`agent_id` 同规则，权威注入点收敛为 `pkg/trollsift.InjectSubmitTime`，inject-if-absent 不再做模板子串匹配，`{time_zone}` 前缀误伤从结构上消除）；**旧名 `{time}` 保留为 deprecated 别名**、渲染语义完全等价（存量 UI 规则不破坏），CP 创建/更新时返回 `warnings` 可读提示；webui 默认模板与 `SYSTEM_TEMPLATE_VARIABLES`、`contracts.md` V-3 三端同步。**PR #106 一轮 review 修正（D-034 补记 1）**：① 别名互为镜像（单侧解析镜像给缺失别名，双侧解析各用各的）——否则照 deprecation 提示迁移反而落错位置；② **裸形式禁令**：`{submit_time}`/`{time}` 不带 LDML 无法合成（实测 `expects a string value`），webui 校验拦截 + UI 清单改带格式展示 + CP warnings 提示，弃用提示不进对象键；③ `filename`/`ext` 统一解析优先（契约此前声称与实现不符，本 track 第 11 次）；④ webui 预览 dynamicFields 优先于当前时间渲染。**二轮 review 修正（D-034 补记 2）**：⑤ **裸/非时间类型保留字 agent 侧无条件拒绝**（`ValidateReservedTimeUse` 双向检测，`reservedTimeMisuse` gate 覆盖 buildStoragePath 与 handleDryRun；IC-BUG-21 语义不猜键）——首轮禁令只覆盖「裸字段+注入 Time」，path_pattern 解析出 string 时照样合成（实测 `HELLO/a.csv`），三端口径矛盾；⑥ webui 预览补齐**别名镜像**（首轮只做了 dynamicFields 优先，跨别名场景预览与合成不一致），镜像规则升格为 V-3 三端共享约定。**三轮 review 修正**：⑦ webui 校验与 Go **kind 判定等价**（首轮只拦裸形式，typed `{submit_time:s}` 放行、agent 却拒），V-3 落 spec→kind 逐条对照表；⑧ CP warnings 覆盖 **path_pattern**（首轮只查 dest——「CP 放行、agent 必拒」的规则要到上传时才失败），文案以字段名开头与 agent refusePathField 平行；⑨ D-034 补记 2 的存量代价修正为完整组合清单（裸/string 解析 + dest 裸/typed 引用**原先能合成**的组合如实列入，不再淡化）。**四轮 review 修正**：⑩ **时区有效性不做 TS 镜像、权威校验收归 Go 端**——实测 `{tz=Nope/Bad}`、尾空格、重复 `|tz=` 三形态 TS 放行而 Go `New()` 全拒；CP 创建/更新时用 Go `New()` 对两字段完整校验并进 `warnings`（错误在保存时可见），TS 等价声明收窄为「kind + 基础语法」（`ValidateReservedTimeUse` 保持只管 kind，未改）；⑪ dest 的 deprecated 提示动词修正（dest 只合成不解析，"parses" 硬套误导），两字段文案分别成立；⑫ D-034 代价矩阵穷尽并显式区分「能跑→失败」（2 行，真实行为变更）与「失败→失败」（3 行，仅错误更可读） |
 | **验收** | `TestBuildStoragePath_SubmitTimeInjectedFromUploadInstant` / `SubmitTimeParsedFieldWins` / `LegacyTimeAliasStillWorks` / `LegacyTimeParsedFieldWins` / `TimeZoneFieldNotClobbered` / `MigratedLegacyTime_KeepsDataDate` / `ParsedSubmitTimeReferencedAsLegacyTime` / `BothParsed_EachKeepsOwnValue` / `ParsedFilenameAndExtWin` / `FilenameExtInjectedWhenNotParsed`（agent）；`InjectSubmitTime` 全套 + **交叉别名矩阵 4 格** + `UsesBareReservedTimeField` / `BareReservedTimeField_CannotCompose`（pkg/trollsift）；CP 创建/更新 deprecation + 裸形式提示；webui `pathTemplate.test.ts`（变量清单 LDML 形式、裸形式原样保留且校验拦截、parsed-first 预览新旧名各一） |
 | **归属** | ✅ 随本刀修复（分支 `fix/ic-bug-50-rename-time-reserved-word`，决策 D-034） |
+
+## IC-BUG-54 — 已关闭条目内部仍用无限定现在时描述旧实现 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 本账本把同一条事实在**七处**各写一遍：总览表、卡片、M-1/M-2 扫描表、分诊表、任务表、track 文件、必读入口。关闭一条缺陷时，人只会去改自己想得起来的那几处，**卡片正文与任务行「内容」列几乎从不更新**——它们本是「发现时的描述」，却用无限定的现在时（「当前」「从不」「仍」「尚未」「未排期」）写成，读起来像现状 |
+| **发现路径** | PR #109 的 codex 复核（第 6 轮）。⚠️ **同一类错误在该 PR 中连续出现五次**：只扫改过的三个文件 → 漏标 26/27 → 漏标 43/44 → 漏改 `active.md` 的平行叙述 → 漏改 M-1/M-2 扫描表。每次修完都以为收口了，下一轮又从新位置冒出来——这本身就是「冗余度高到任何单点修改都不可能自洽」的证据 |
+| **具体实例（PR #109 评审逐条列出，未在本刀修复者）** | **卡片正文**：`open.md:499`（IC-BUG-29「当前为零——agent 从不上报」）、`:555`（IC-BUG-33 同）、`:589`（IC-BUG-35 归属仍「未排期」）、`:603/:606`（IC-BUG-36「尚未查实」「恢复 IC-2a 前必须查实」「未排期」——**答案其实就写在 :608**）、`:621/:623`（IC-BUG-37「`IsProcessed` 当前忽略」「未排期」，已随 IC-5 关闭）、`:648`（IC-BUG-39「未排期」，已随 IC-3 关闭）。**任务行「内容」列**：`consistency-ingest.md:256`（IC-2b ✅ 却仍说当前同步在无消费者时入队）、`:259`（IC-5 ✅ 却仍说当前没有启动复位）。**设计与入口文档**：`docs/design/consistency-and-ingest.md` 与 `docs/tasks/active.md:16-19` 仍写「Agent 数据面**从未跑通**、当前只有 webhook 写索引」——该前提已被 IC-1/IC-2a/IC-3 推翻并有 live 证据 |
+| **后果** | 读者进入单张卡片而不读到末尾的关闭补记，会把已完成项继续当成当前缺陷；新实现者按设计文档与 `active.md` 判断现状，会**重复安排已经完成的 IC-1/IC-2a/IC-3 工作**。这与总览行、卡片标题的 ✅ 直接冲突，且冲突方向是「让人多做已做过的事」 |
+| **修复（评审建议的系统性修法，本刀只做了一半）** | ① **任务表**：在表前统一声明「内容列是开工前基线快照」——**已随 PR #109 落地**；② **卡片**：把正文里的「当前/从不/仍」统一改成「**发现时／修复前**」，并在「归属」字段写明实际关闭归属；③ **设计与入口文档**：把已被推翻的前提就地更正，而不是留着让人误读。②③ 未做 |
+| **验收** | 对每一条已标 ✅ 的缺陷，其卡片正文与任务行不得出现无限定的现在时状态断言；机械检查：取总览表的已关闭 ID 集，扫其卡片正文中的「当前/从不/仍/尚未/未排期」，命中即需带「发现时/修复前」限定 |
+| **⚠️ 范围争议（如实记录）** | PR #109 评审把本条判为**阻塞该 PR**；协调者提出异议——评审自己在上一轮对「分诊表仅收录 31 条」等问题的裁决是「**未被本提交扩大**的存量问题…不阻塞本 PR」，而本条绝大多数实例由 IC-2a/IC-2b/IC-3/IC-5/PR #97 等更早的刀留下，本刀既未扩大也未触碰。最终按后一标准处理：**本刀只修自己造成的自相矛盾**（IC-BUG-44 卡片、IC-SEC-2 任务行 `:255/:285`）+ 加基线声明，其余立本卡。留此记录是为了让下一个人知道这里判过一次、依据是什么 |
+| **归属** | 未排期。纯文档整理，无代码风险；建议与「分诊表仅收录 31 条（42…53 未收录）」「`open.md:203/:300` 标题与总览行标记不一致」两条存量一并做 |
 
 ---
 
