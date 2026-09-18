@@ -3,6 +3,7 @@ package grpcserver
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,6 +38,12 @@ func (m *mockAgentMgr) PollApproval(ctx context.Context, req *agentv1.PollApprov
 // ── Mock CacheClient ──────────────────────────────────────────────────────────
 
 type mockCache struct {
+	// mu guards every field: Connect's deferred cleanup calls Del from a
+	// different goroutine than the test's assertions, so unlocked reads
+	// would be data races — and a racy test double disables -race for the
+	// whole package, which is exactly the tool that catches
+	// connection-identity bugs (PR #109 re-review, fourth round).
+	mu     sync.Mutex
 	sets   map[string]string
 	setLog []string // every Set, in order — lets tests tell a renewal from a seed
 	dels   []string
@@ -48,6 +55,8 @@ func newMockCache() *mockCache {
 
 func (m *mockCache) Set(_ context.Context, key string, value interface{}, _ time.Duration) error {
 	s, _ := value.(string)
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.sets[key] = s
 	m.setLog = append(m.setLog, key)
 	return nil
@@ -56,6 +65,8 @@ func (m *mockCache) Set(_ context.Context, key string, value interface{}, _ time
 // Exists satisfies the extended CacheClient used by the degraded-marker
 // renewal; presence follows the last Set.
 func (m *mockCache) Exists(_ context.Context, keys ...string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, k := range keys {
 		if _, ok := m.sets[k]; ok {
 			return 1, nil
@@ -65,8 +76,67 @@ func (m *mockCache) Exists(_ context.Context, keys ...string) (int64, error) {
 }
 
 func (m *mockCache) Del(_ context.Context, keys ...string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.dels = append(m.dels, keys...)
 	return nil
+}
+
+// ── locked accessors for test assertions ─────────────────────────────────────
+
+// setKey seeds a value under the lock.
+func (m *mockCache) setKey(key, value string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sets[key] = value
+}
+
+// has reports presence under the lock.
+func (m *mockCache) has(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.sets[key]
+	return ok
+}
+
+// get returns the value under the lock.
+func (m *mockCache) get(key string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.sets[key]
+	return v, ok
+}
+
+// deleteKey removes a key under the lock.
+func (m *mockCache) deleteKey(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.sets, key)
+}
+
+// setCount counts how many Set calls touched key (renewals vs a seed).
+func (m *mockCache) setCount(key string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, k := range m.setLog {
+		if k == key {
+			n++
+		}
+	}
+	return n
+}
+
+// delContains reports whether any Del named key.
+func (m *mockCache) delContains(key string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, k := range m.dels {
+		if k == key {
+			return true
+		}
+	}
+	return false
 }
 
 // ── Mock NATSPublisher ────────────────────────────────────────────────────────
@@ -85,16 +155,17 @@ func (m *mockNATS) Publish(subject string, _ []byte) error {
 type mockStateDB struct {
 	// agentStatus backs GetAgentByID; the zero value "" is treated as
 	// not-usable, so tests that need the liveness gate to pass must set it.
-	agentStatus           db.AgentStatus
-	agentErr              error
-	lastSeenCalled        bool
-	updateStatus          db.AgentStatus
-	markOnlineRows        int64 // rows returned by MarkAgentOnlineIfOffline (0 = not offline / no restore)
-	markOnlineUsableCalls int
-	markOnlineCalls       int
-	markOfflineRows       int64 // rows returned by MarkAgentOfflineIfOnline (0 = already offline)
-	markOfflineErr        error
-	markOfflineCalls      int
+	agentStatus             db.AgentStatus
+	agentErr                error
+	lastSeenCalled          bool
+	updateStatus            db.AgentStatus
+	markOnlineRows          int64 // rows returned by MarkAgentOnlineIfOffline (0 = not offline / no restore)
+	markOnlineUsableNoMatch bool  // MarkAgentOnlineIfUsable reports 0 rows: the status left the usable set mid-setup
+	markOnlineUsableCalls   int
+	markOnlineCalls         int
+	markOfflineRows         int64 // rows returned by MarkAgentOfflineIfOnline (0 = already offline)
+	markOfflineErr          error
+	markOfflineCalls        int
 }
 
 func (m *mockStateDB) GetAgentByID(_ context.Context, id uuid.UUID) (*db.Agent, error) {
@@ -116,6 +187,9 @@ func (m *mockStateDB) UpdateAgentStatus(_ context.Context, _ uuid.UUID, status d
 
 func (m *mockStateDB) MarkAgentOnlineIfUsable(_ context.Context, _ uuid.UUID) (int64, error) {
 	m.markOnlineUsableCalls++
+	if m.markOnlineUsableNoMatch {
+		return 0, nil
+	}
 	return 1, nil
 }
 
@@ -189,11 +263,11 @@ func TestHandleHeartbeat_UpdatesCache(t *testing.T) {
 	c := newMockCache()
 	srv.WithDeps(nil, c, nil, nil, nil)
 
-	srv.handleHeartbeat(context.Background(), "agent-abc",
+	srv.handleHeartbeat(context.Background(), "agent-abc", nil,
 		&agentv1.Heartbeat{UptimeSeconds: 120})
 
 	onlineKey := cache.AgentOnlineKey("agent-abc")
-	_, ok := c.sets[onlineKey]
+	ok := c.has(onlineKey)
 	assert.True(t, ok)
 }
 
@@ -203,10 +277,10 @@ func TestHandleHeartbeat_CachesTelemetrySnapshot(t *testing.T) {
 	c := newMockCache()
 	srv.WithDeps(nil, c, nil, nil, nil)
 
-	srv.handleHeartbeat(context.Background(), "agent-xyz",
+	srv.handleHeartbeat(context.Background(), "agent-xyz", nil,
 		&agentv1.Heartbeat{UptimeSeconds: 300, QueueDepth: 7, Version: "0.1.0"})
 
-	raw, ok := c.sets[cache.AgentStatsKey("agent-xyz")]
+	raw, ok := c.get(cache.AgentStatsKey("agent-xyz"))
 	require.True(t, ok, "stats snapshot should be cached")
 
 	var snap struct {
@@ -228,7 +302,8 @@ func TestHandleHeartbeat_UpdatesLastSeenAt(t *testing.T) {
 	srv.WithStateDB(stateDB)
 	srv.WithDeps(nil, nil, nil, nil, nil)
 
-	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+	srv.handleHeartbeat(context.Background(), agentID, nil,
+		&agentv1.Heartbeat{UptimeSeconds: 30})
 	assert.True(t, stateDB.lastSeenCalled, "UpdateAgentLastSeen should have been called")
 }
 
@@ -241,7 +316,8 @@ func TestHandleHeartbeat_RestoresOnlineWhenStale(t *testing.T) {
 	srv.WithStateDB(stateDB)
 	srv.WithDeps(nil, nil, nil, nats, nil)
 
-	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+	srv.handleHeartbeat(context.Background(), agentID, nil,
+		&agentv1.Heartbeat{UptimeSeconds: 30})
 
 	assert.Equal(t, 1, stateDB.markOnlineCalls)
 	assert.Contains(t, nats.published, "events.agent.online",
@@ -330,7 +406,8 @@ func TestHandleHeartbeat_NoOnlineEventWhenAlreadyOnline(t *testing.T) {
 	srv.WithStateDB(stateDB)
 	srv.WithDeps(nil, nil, nil, nats, nil)
 
-	srv.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 30})
+	srv.handleHeartbeat(context.Background(), agentID, nil,
+		&agentv1.Heartbeat{UptimeSeconds: 30})
 
 	assert.Equal(t, 1, stateDB.markOnlineCalls)
 	assert.NotContains(t, nats.published, "events.agent.online",
@@ -343,7 +420,7 @@ func TestHandleHeartbeat_NilStateDB_NoPanic(t *testing.T) {
 	srv.WithDeps(nil, nil, nil, nil, nil)
 
 	assert.NotPanics(t, func() {
-		srv.handleHeartbeat(context.Background(), "agent-xyz",
+		srv.handleHeartbeat(context.Background(), "agent-xyz", nil,
 			&agentv1.Heartbeat{UptimeSeconds: 10})
 	})
 }
@@ -355,7 +432,7 @@ func TestHandleHeartbeat_NilCache(t *testing.T) {
 
 	// Should not panic when cache is nil
 	assert.NotPanics(t, func() {
-		srv.handleHeartbeat(context.Background(), "agent-xyz",
+		srv.handleHeartbeat(context.Background(), "agent-xyz", nil,
 			&agentv1.Heartbeat{UptimeSeconds: 10})
 	})
 }
@@ -383,10 +460,9 @@ func TestHandleAgentMessage_Heartbeat(t *testing.T) {
 			Heartbeat: &agentv1.Heartbeat{UptimeSeconds: 30},
 		},
 	}
-	srv.handleAgentMessage(context.Background(), "agent-1", msg)
+	srv.handleAgentMessage(context.Background(), "agent-1", nil, msg)
 
-	_, ok := c.sets[cache.AgentOnlineKey("agent-1")]
-	assert.True(t, ok)
+	assert.True(t, c.has(cache.AgentOnlineKey("agent-1")))
 }
 
 func TestHandleAgentMessage_UploadResult(t *testing.T) {
@@ -400,7 +476,7 @@ func TestHandleAgentMessage_UploadResult(t *testing.T) {
 		},
 	}
 	assert.NotPanics(t, func() {
-		srv.handleAgentMessage(context.Background(), "agent-2", msg)
+		srv.handleAgentMessage(context.Background(), "agent-2", nil, msg)
 	})
 }
 
@@ -413,7 +489,7 @@ func TestHandleAgentMessage_UnknownMessage(t *testing.T) {
 		Payload:   nil,
 	}
 	assert.NotPanics(t, func() {
-		srv.handleAgentMessage(context.Background(), "agent-3", msg)
+		srv.handleAgentMessage(context.Background(), "agent-3", nil, msg)
 	})
 }
 
@@ -478,11 +554,17 @@ func TestWithDeps_SetsFields(t *testing.T) {
 type mockDirDeliverer struct {
 	delivered  []dirstore.Result
 	requestIDs []string
+	agentIDs   []string
+	// refused makes Deliver report a refused delivery (zero value = accepted,
+	// so the happy-path tests keep their shape).
+	refused bool
 }
 
-func (m *mockDirDeliverer) Deliver(requestID string, result dirstore.Result) {
+func (m *mockDirDeliverer) Deliver(requestID, agentID string, result dirstore.Result) bool {
 	m.requestIDs = append(m.requestIDs, requestID)
+	m.agentIDs = append(m.agentIDs, agentID)
 	m.delivered = append(m.delivered, result)
+	return !m.refused
 }
 
 // ── handleDirectoryListing tests ──────────────────────────────────────────────
@@ -504,7 +586,7 @@ func TestHandleDirectoryListing_DeliversEntries(t *testing.T) {
 	msg := &agentv1.AgentMessage{
 		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: listing},
 	}
-	srv.handleAgentMessage(context.Background(), "agent-1", msg)
+	srv.handleAgentMessage(context.Background(), "agent-1", nil, msg)
 
 	require.Len(t, d.delivered, 1)
 	assert.Equal(t, "req-1", d.requestIDs[0])
@@ -535,11 +617,60 @@ func TestHandleDirectoryListing_DeliversError(t *testing.T) {
 	msg := &agentv1.AgentMessage{
 		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: listing},
 	}
-	srv.handleAgentMessage(context.Background(), "agent-1", msg)
+	srv.handleAgentMessage(context.Background(), "agent-1", nil, msg)
 
 	require.Len(t, d.delivered, 1)
 	assert.Equal(t, "permission denied", d.delivered[0].Error)
 	assert.Empty(t, d.delivered[0].Entries)
+}
+
+// IC-SEC-2 ②: the agentID handed to the store must be the one from the
+// stream, not anything the message body could influence, so a listing sent by
+// agent A against a request issued to agent B is refused by the store and the
+// waiter never sees it. Uses the real dirstore to pin the end-to-end refusal.
+func TestHandleDirectoryListing_WrongAgentListing_IsRefused(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	srv := New(logger)
+	store := dirstore.New()
+	srv.WithDirResultStore(store)
+
+	// The request was issued to agent-b; the waiter is already reading.
+	waiterCh := store.Register("req-x", "agent-b")
+
+	// agent-a answers with a listing for that request id.
+	msg := &agentv1.AgentMessage{
+		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: &agentv1.DirectoryListing{
+			RequestId: "req-x",
+			Path:      "/data",
+			Entries:   []*agentv1.FsEntry{{Name: "forged", IsDir: false}},
+		}},
+	}
+	srv.handleAgentMessage(context.Background(), "agent-a", nil, msg)
+
+	select {
+	case got := <-waiterCh:
+		t.Fatalf("the waiter received a listing delivered by the wrong agent: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The legitimate answer from agent-b still gets through: the refusal must
+	// not consume the pending entry.
+	msgOk := &agentv1.AgentMessage{
+		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: &agentv1.DirectoryListing{
+			RequestId: "req-x",
+			Path:      "/data",
+			Entries:   []*agentv1.FsEntry{{Name: "real", IsDir: false}},
+		}},
+	}
+	srv.handleAgentMessage(context.Background(), "agent-b", nil, msgOk)
+
+	select {
+	case got := <-waiterCh:
+		require.Len(t, got.Entries, 1)
+		assert.Equal(t, "real", got.Entries[0].Name)
+	case <-time.After(time.Second):
+		t.Fatal("timeout: legitimate listing not delivered")
+	}
 }
 
 func TestHandleDirectoryListing_NilDirResultStore_NoPanic(t *testing.T) {
@@ -551,6 +682,6 @@ func TestHandleDirectoryListing_NilDirResultStore_NoPanic(t *testing.T) {
 		Payload: &agentv1.AgentMessage_DirectoryListing{DirectoryListing: listing},
 	}
 	assert.NotPanics(t, func() {
-		srv.handleAgentMessage(context.Background(), "agent-1", msg)
+		srv.handleAgentMessage(context.Background(), "agent-1", nil, msg)
 	})
 }

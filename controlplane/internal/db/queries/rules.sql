@@ -33,7 +33,7 @@ ORDER BY created_at DESC;
 UPDATE collection_rules
 SET status = $2,
     updated_at = NOW()
-WHERE id = $1
+WHERE id = $1 AND agent_id = $3 AND org_id = $4
 RETURNING *;
 
 -- name: UpdateCollectionRule :one
@@ -54,5 +54,5 @@ SET bucket_id = $2,
 WHERE id = $1 AND agent_id = $14 AND org_id = $15
 RETURNING *;
 
--- name: DeleteCollectionRule :exec
-DELETE FROM collection_rules WHERE id = $1;
+-- name: DeleteCollectionRule :execrows
+DELETE FROM collection_rules WHERE id = $1 AND agent_id = $2 AND org_id = $3;

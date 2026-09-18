@@ -95,7 +95,9 @@ type AgentStateDB interface {
 // DirResultDeliverer receives directory-listing results from the agent gRPC
 // stream and delivers them to the waiting REST handler.
 type DirResultDeliverer interface {
-	Deliver(requestID string, result dirstore.Result)
+	// Deliver reports whether the result was accepted; it is refused when the
+	// request id was not issued to this agent.
+	Deliver(requestID, agentID string, result dirstore.Result) bool
 }
 
 // DryRunResultDeliverer receives dry-run results from the agent gRPC stream

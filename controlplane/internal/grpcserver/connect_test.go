@@ -426,6 +426,9 @@ func (d *bulkSyncDispatcher) SyncRulesOnConnect(_ context.Context, agentID strin
 		},
 	})
 	// Mirror pushCredentials: the credentials push follows the rule sync.
+	// (Its Send return value is dropped, mirroring production's best-effort
+	// push; the F5 test asserts arrival — acceptable here because these two
+	// messages go into an EMPTY buffer with the consumer already running.)
 	d.registry.Send(agentID, &agentv1.ServerMessage{
 		Payload: &agentv1.ServerMessage_Credentials{
 			Credentials: &agentv1.CredentialsPayload{AccessKey: "AKID"},
@@ -515,7 +518,11 @@ func TestServer_Connect_FortyRules_AllDelivered(t *testing.T) {
 //   不被接受 → SyncRulesOnConnect 返回错误 → Connect 结束流 → 用例红。
 
 // consumerPinningDispatcher 模拟任意在同步期间入队的下发方：打满缓冲后，
-// 要求观察到排空才继续，最后再补一条凭据（复刻 sync + pushCredentials 两股生产）。
+// 要求观察到排空才继续。不再补发尾部凭据消息：曾用一次非阻塞 Send 发它并
+// 被测试当作必然送达（PR #109 收尾时 codex 判定的偶发源）——「尽力而为」的
+// 发送不能当「必然成功」断言，与 IC-BUG-32 同病；本用例的命题（消费者先于
+// 生产者启动）由「40 条超过容量的规则全部到达」独立钉住，凭据与规则的顺序
+// 由下方 F5 用例单独钉住。
 type consumerPinningDispatcher struct {
 	registry *AgentRegistry
 	total    int // 要送达的规则消息数，必须 > sendChCapacity
@@ -552,11 +559,6 @@ func (d *consumerPinningDispatcher) SyncRulesOnConnect(ctx context.Context, agen
 			}
 		}
 	}
-	d.registry.Send(agentID, &agentv1.ServerMessage{
-		Payload: &agentv1.ServerMessage_Credentials{
-			Credentials: &agentv1.CredentialsPayload{AccessKey: "AKID"},
-		},
-	})
 	return nil
 }
 
@@ -609,25 +611,20 @@ func TestServer_Connect_SendConsumerRunsBeforeSync(t *testing.T) {
 	require.NoError(t, err)
 
 	rules := make(map[string]bool)
-	gotCreds := false
 	for {
 		msg, rErr := stream.Recv()
 		if rErr != nil {
 			break
 		}
-		switch p := msg.GetPayload().(type) {
-		case *agentv1.ServerMessage_PushRule:
+		if p, ok := msg.GetPayload().(*agentv1.ServerMessage_PushRule); ok {
 			rules[p.PushRule.GetRule().GetRuleId()] = true
-		case *agentv1.ServerMessage_Credentials:
-			gotCreds = true
 		}
-		if len(rules) == total && gotCreds {
+		if len(rules) == total {
 			break
 		}
 	}
 	assert.Len(t, rules, total,
 		"every message enqueued during the sync must be delivered — which requires the send consumer to run before the sync")
-	assert.True(t, gotCreds)
 }
 
 // ── F5（IC-2b review 二轮）：凭据必须先于规则到达 ──────────────────────────────
@@ -790,8 +787,7 @@ func TestServer_Connect_RuleSyncDegraded_KeepsStreamAndMarksCache(t *testing.T) 
 
 	// 降级标记必须落缓存（API/UI 可读），而不是只有一条 ERROR 日志。
 	assert.Eventually(t, func() bool {
-		_, ok := mc.sets[cache.AgentSyncDegradedKey(agentID)]
-		return ok
+		return mc.has(cache.AgentSyncDegradedKey(agentID))
 	}, 3*time.Second, 50*time.Millisecond, "the degraded state must be observable via the cache")
 }
 
@@ -803,7 +799,7 @@ func TestServer_Heartbeat_RenewsDegradedMarker(t *testing.T) {
 	agentID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
 	logger, _ := zap.NewDevelopment()
 	mc := newMockCache()
-	mc.sets[cache.AgentSyncDegradedKey(agentID)] = "1" // 连接建立时的降级标记（已到期临界）
+	mc.setKey(cache.AgentSyncDegradedKey(agentID), "1") // 连接建立时的降级标记（已到期临界）
 	registry := NewAgentRegistry()
 	s := New(logger)
 	s.cache = mc
@@ -811,14 +807,9 @@ func TestServer_Heartbeat_RenewsDegradedMarker(t *testing.T) {
 	conn := registry.Register(agentID, nil, nil)
 	conn.SyncDegraded = true // 该连接的同步处于降级——CP 自身的权威状态
 
-	s.handleHeartbeat(context.Background(), agentID, &agentv1.Heartbeat{UptimeSeconds: 1})
+	s.handleHeartbeat(context.Background(), agentID, conn, &agentv1.Heartbeat{UptimeSeconds: 1})
 
-	renewals := 0
-	for _, k := range mc.setLog {
-		if k == cache.AgentSyncDegradedKey(agentID) {
-			renewals++
-		}
-	}
+	renewals := mc.setCount(cache.AgentSyncDegradedKey(agentID))
 	assert.Positive(t, renewals,
 		"a heartbeat on a degraded connection must renew the degraded marker — "+
 			"otherwise the TTL outlives the observability of a still-degraded connection (R5-B)")
@@ -841,7 +832,7 @@ func TestServer_Connect_ClearsDegradedMarkerOnDisconnect(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 	registry := NewAgentRegistry()
 	mc := newMockCache()
-	mc.sets[cache.AgentSyncDegradedKey(agentID)] = "1"
+	mc.setKey(cache.AgentSyncDegradedKey(agentID), "1")
 	srv := New(logger)
 	srv.WithDeps(registry, mc, jwtSvc, &mockNATS{}, nil)
 	// The sync itself is DEGRADED — the marker is (re)written by this
@@ -879,12 +870,7 @@ func TestServer_Connect_ClearsDegradedMarkerOnDisconnect(t *testing.T) {
 		5*time.Second, 20*time.Millisecond, "handler must return on half-close")
 
 	assert.Eventually(t, func() bool {
-		for _, k := range mc.dels {
-			if k == cache.AgentSyncDegradedKey(agentID) {
-				return true
-			}
-		}
-		return false
+		return mc.delContains(cache.AgentSyncDegradedKey(agentID))
 	}, 3*time.Second, 50*time.Millisecond,
 		"disconnect must clear the degraded marker — after that there is no degraded condition to observe (R5-B)")
 }
@@ -940,20 +926,74 @@ func TestServer_Heartbeat_RebuildsDegradedMarkerAfterExternalDelete(t *testing.T
 
 	key := cache.AgentSyncDegradedKey(agentID)
 	require.Eventually(t, func() bool {
-		_, ok := mc.sets[key]
-		return ok
+		return mc.has(key)
 	}, 3*time.Second, 50*time.Millisecond, "the degraded sync must mark the agent")
 
 	// 模拟 Redis 驱逐/重启：键没了，但降级条件仍在（连接仍降级）。
-	delete(mc.sets, key)
+	mc.deleteKey(key)
 
 	// 下一次心跳必须重建标记。
 	require.NoError(t, stream.Send(&agentv1.AgentMessage{MessageId: "hb-1",
 		Payload: &agentv1.AgentMessage_Heartbeat{Heartbeat: &agentv1.Heartbeat{UptimeSeconds: 2}}}))
 	assert.Eventually(t, func() bool {
-		_, ok := mc.sets[key]
-		return ok
+		return mc.has(key)
 	}, 3*time.Second, 50*time.Millisecond,
 		"the next heartbeat must rebuild the marker from the connection's own degraded state — "+
 			"renewal conditioned on key existence cannot self-heal a lost key (R6)")
+}
+
+// PR #109 re-review P1-b: a connection that passed its first liveness check
+// but lost the race against a revocation (MarkAgentOnlineIfUsable returns 0)
+// must be cut immediately — PermissionDenied, not registered, no heartbeats,
+// no uploads. Logging the constraint hit and continuing would leave the
+// connection fully live for the lifetime of its STS session.
+func TestServer_Connect_RevokedMidSetup_IsCutNotPersisted(t *testing.T) {
+	agentID := "88888888-8888-8888-8888-888888888888"
+	stateDB := &mockStateDB{agentStatus: db.AgentStatusApproved, markOnlineUsableNoMatch: true}
+	client, bearer, registry := newFullServerForAgent(t, agentID, stateDB)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := client.Connect(metadata.AppendToOutgoingContext(ctx, "authorization", bearer))
+	require.NoError(t, err, "the stream opens; the rejection arrives on first Recv")
+
+	_, err = stream.Recv()
+	require.Error(t, err)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err),
+		"the mid-setup revocation must end the RPC, not just log a warning")
+	assert.False(t, registry.IsOnline(agentID),
+		"the racing connection must not stay in the registry")
+	assert.Equal(t, 1, stateDB.markOnlineUsableCalls)
+}
+
+// PR #109 re-review P2-1: a heartbeat must renew the degraded marker from ITS
+// OWN connection's state. The heartbeat carries only an agentID, and looking
+// the connection up by id at handling time returns whichever connection is
+// registered NOW — after a reconnect that is the replacement, and reading the
+// replacement's SyncDegraded from the displaced connection's handler
+// goroutine is a data race with the replacement's setup (found by -race).
+func TestHeartbeat_DegradedRenew_BindsToItsOwnConnection(t *testing.T) {
+	agentID := "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+	s := New(zap.NewNop())
+	mc := newMockCache()
+	registry := NewAgentRegistry()
+	s.cache = mc
+	s.registry = registry
+
+	connO := registry.Register(agentID, nil, nil) // displaced, NOT degraded
+	connN := registry.Register(agentID, nil, nil) // current, degraded
+	connN.SyncDegraded = true
+
+	hb := &agentv1.Heartbeat{UptimeSeconds: 1}
+
+	// The displaced connection's heartbeat: O is not degraded, so no renewal.
+	s.handleHeartbeat(context.Background(), agentID, connO, hb)
+	// All mockCache access goes through the locked accessors.
+	assert.Zero(t, mc.setCount(cache.AgentSyncDegradedKey(agentID)),
+		"a heartbeat from a non-degraded connection renewed the degraded marker of another connection")
+
+	// The current connection's heartbeat: N is degraded, renewal expected.
+	s.handleHeartbeat(context.Background(), agentID, connN, hb)
+	renewals := mc.setCount(cache.AgentSyncDegradedKey(agentID))
+	assert.Positive(t, renewals, "the degraded connection's own heartbeat must renew the marker")
 }
