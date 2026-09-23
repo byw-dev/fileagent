@@ -263,42 +263,74 @@ func main() {
 	// and answered 200 so MinIO's head-of-line queue is freed.
 	webhookFails := handler.NewRedisWebhookFailStore(redisClient, queries)
 	webhookDeadLetters := handler.NewDBDeadLetterSink(queries)
+	// S-1 (PR #110 round-2 review): verify the dead-letter sink is usable at
+	// startup — a missing table or lost grants would otherwise go unnoticed
+	// until the first indexing failure blocks the feed (B2 fail-closed). The
+	// probe needs only INSERT/UPDATE on webhook_dead_letters, which the
+	// UpsertDeadLetter statement exercises. Failures surface as a degraded
+	// /healthz plus a loud structured log; the runbook entry lives in
+	// consistency-and-ingest.md §3.6.
+	// Probe once at startup (a per-request write would spam the table);
+	// /healthz then reports the cached result. The probe row is deleted so the
+	// table stays clean; a failure is non-fatal (the service still starts —
+	// MinIO delivery is independent) but is loudly logged and reported as
+	// degraded so operators see it immediately.
+	deadLetterProbe := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := queries.UpsertDeadLetterWrap(ctx, db.UpsertDeadLetterParams{
+			DedupKey:  "__healthcheck__",
+			EventName: "healthcheck",
+			Bucket:    "",
+			Key:       "",
+		}); err != nil {
+			return err
+		}
+		_, err := queries.DeleteDeadLetterWrap(ctx, "__healthcheck__")
+		return err
+	}
+	deadLetterProbeErr := deadLetterProbe()
+	if deadLetterProbeErr != nil {
+		logger.Error("webhook dead-letter sink NOT ready: index processing will be blocked (B2 fail-closed) once any event fails — fix webhook_dead_letters table/grants",
+			zap.Error(deadLetterProbeErr))
+	}
 
 	// ── Build HTTP router ────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
-		JWTSecret:           cfg.JWTSecret,
-		Logger:              logger,
-		JWTService:          authSvc,
-		AuthDB:              handler.NewQueriesAuthDB(queries),
-		UsersDB:             queries,
-		FileTypesDB:         queries,
-		TagKeysDB:           queries,
-		PendingTagsDB:       queries,
-		RetagJobsDB:         queries,
-		FileTagsDB:          queries,
-		BatchTagDB:          queries,
-		FilesDB:             queries,
-		MinIOSigner:         &minioPresigner{client: minioPresignClient},
-		BucketsDB:           queries,
-		MinIOAdmin:          &minioBucketMaker{client: minioAdminClient},
-		EventRulesDB:        queries,
-		UploadLogsDB:        queries,
-		AgentsDB:            queries,
-		AgentMgr:            agentMgr,
-		Dispatcher:          dispatcher,
-		Registry:            registry,
-		AgentCache:          redisClient,
-		DirStore:            dirStore,
-		DryRunStore:         dryRunStore,
-		MinioIndexer:        ix,
-		WebhookSecret:       cfg.InternalWebhookSecret,
-		WebhookFailCounters: webhookFails,
-		WebhookDeadLetters:  webhookDeadLetters,
-		WebhookFailLimit:    cfg.WebhookFailLimit,
-		StatsDB:             queries,
-		RateLimiter:         redisClient,
-		RateLimitPerMinute:  cfg.APIRateLimitPerMinute,
-		WebUIFS:             webui.FS(), // nil in pure-API build; embedded assets under `webui` tag
+		JWTSecret:              cfg.JWTSecret,
+		Logger:                 logger,
+		JWTService:             authSvc,
+		AuthDB:                 handler.NewQueriesAuthDB(queries),
+		UsersDB:                queries,
+		FileTypesDB:            queries,
+		TagKeysDB:              queries,
+		PendingTagsDB:          queries,
+		RetagJobsDB:            queries,
+		FileTagsDB:             queries,
+		BatchTagDB:             queries,
+		FilesDB:                queries,
+		MinIOSigner:            &minioPresigner{client: minioPresignClient},
+		BucketsDB:              queries,
+		MinIOAdmin:             &minioBucketMaker{client: minioAdminClient},
+		EventRulesDB:           queries,
+		UploadLogsDB:           queries,
+		AgentsDB:               queries,
+		AgentMgr:               agentMgr,
+		Dispatcher:             dispatcher,
+		Registry:               registry,
+		AgentCache:             redisClient,
+		DirStore:               dirStore,
+		DryRunStore:            dryRunStore,
+		MinioIndexer:           ix,
+		WebhookSecret:          cfg.InternalWebhookSecret,
+		WebhookFailCounters:    webhookFails,
+		WebhookDeadLetters:     webhookDeadLetters,
+		WebhookFailLimit:       cfg.WebhookFailLimit,
+		WebhookDeadLetterProbe: func() bool { return deadLetterProbeErr == nil },
+		StatsDB:                queries,
+		RateLimiter:            redisClient,
+		RateLimitPerMinute:     cfg.APIRateLimitPerMinute,
+		WebUIFS:                webui.FS(), // nil in pure-API build; embedded assets under `webui` tag
 	})
 
 	httpSrv := &http.Server{

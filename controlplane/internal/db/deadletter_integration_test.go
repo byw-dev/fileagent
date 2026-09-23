@@ -100,7 +100,9 @@ func TestDeadLetterUpsertMutation(t *testing.T) {
 	require.NoError(t, tx.QueryRowContext(ctx, "SELECT event_seq FROM webhook_dead_letters WHERE dedup_key=$1", "b1/k1/seq-2").Scan(&seq))
 
 	// 4. delete removes exactly one
-	require.NoError(t, q.DeleteDeadLetter(ctx, "b1/k1/seq-1"))
+	deleted, err := q.DeleteDeadLetterWrap(ctx, "b1/k1/seq-1")
+	require.NoError(t, err)
+	require.True(t, deleted, "DeleteDeadLetterWrap must report the deleted row")
 	require.NoError(t, tx.QueryRowContext(ctx, "SELECT count(*) FROM webhook_dead_letters").Scan(&n))
 	assert.Equal(t, 1, n)
 	_ = seq

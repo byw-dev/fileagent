@@ -37,3 +37,10 @@ func (q *Queries) UpsertDeadLetterWrap(ctx context.Context, arg UpsertDeadLetter
 	_, err := q.UpsertDeadLetter(ctx, arg)
 	return err
 }
+
+// DeleteDeadLetter removes a dead letter row after a successful redrive
+// (operator replay flow, §3.6). Returns whether a row was deleted.
+func (q *Queries) DeleteDeadLetterWrap(ctx context.Context, dedupKey string) (bool, error) {
+	rows, err := q.DeleteDeadLetter(ctx, dedupKey)
+	return rows > 0, err
+}

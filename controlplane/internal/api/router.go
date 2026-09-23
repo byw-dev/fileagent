@@ -55,6 +55,12 @@ type RouterConfig struct {
 	WebhookDeadLetters handler.DeadLetterSink
 	// WebhookFailLimit is the poison-pill retry cap (WEBHOOK_FAIL_LIMIT).
 	WebhookFailLimit int64
+	// WebhookDeadLetterProbe reports whether the dead-letter sink was verified
+	// usable at startup (S-1). When non-nil and it returns false, /healthz
+	// reports 503 "degraded" so a broken table/grant is caught at startup
+	// instead of blocking the feed at the first indexing failure (B2
+	// fail-closed).
+	WebhookDeadLetterProbe func() bool
 	StatsDB          handler.StatsDB // nil → stats endpoint returns 501
 
 	// RateLimiter backs the per-user API rate-limit middleware. When nil, or
@@ -81,7 +87,20 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 
 	// ── Health check (no auth required) ─────────────────────────────────────
 	r.GET("/healthz", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		// S-1 (PR #110 round-2 review): a broken dead-letter sink (missing
+		// table, lost INSERT/UPDATE grants) is invisible until an event actually
+		// fails indexing — by then every subsequent event is held in MinIO's
+		// queue (B2 fail-closed) and healthy traffic is blocked by a permission
+		// problem this probe would have caught. Prometheus metrics remain out
+		// of scope (T4-1 deferred); the check plus structured logging is the
+		// agreed operability surface.
+		status := http.StatusOK
+		body := gin.H{"status": "ok"}
+		if cfg.WebhookDeadLetterProbe != nil && !cfg.WebhookDeadLetterProbe() {
+			status = http.StatusServiceUnavailable
+			body = gin.H{"status": "degraded", "reason": "dead-letter sink unavailable"}
+		}
+		c.JSON(status, body)
 	})
 
 	// ── Internal MinIO event webhook (authenticated by shared secret) ───────

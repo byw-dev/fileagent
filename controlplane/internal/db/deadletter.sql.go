@@ -31,13 +31,16 @@ func (q *Queries) CountDeadLetters(ctx context.Context) (int64, error) {
 	return count, err
 }
 
-const deleteDeadLetter = `-- name: DeleteDeadLetter :exec
+const deleteDeadLetter = `-- name: DeleteDeadLetter :execrows
 DELETE FROM webhook_dead_letters WHERE dedup_key = $1
 `
 
-func (q *Queries) DeleteDeadLetter(ctx context.Context, dedupKey string) error {
-	_, err := q.db.ExecContext(ctx, deleteDeadLetter, dedupKey)
-	return err
+func (q *Queries) DeleteDeadLetter(ctx context.Context, dedupKey string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteDeadLetter, dedupKey)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const deleteStaleWebhookFailCounters = `-- name: DeleteStaleWebhookFailCounters :execrows

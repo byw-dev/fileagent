@@ -362,7 +362,6 @@ func TestIC4A_CounterUnavailable_RetriesSafe(t *testing.T) {
 	assert.Equal(t, 0, dead.count())
 }
 
-// TestIC4A_DefaultFloor: an out-of-range (sub-floor) configured limit falls
 // TestIC4A_DefaultFloorAndBoundary pins the S1 quantities exactly:
 //  - default 600 with the strict `>` ⇒ dead letter on the 601st failure;
 //  - MinWebhookFailLimit=60 is the safety floor (config.Validate rejects
@@ -392,7 +391,7 @@ func TestIC4A_MutationMatrix(t *testing.T) {
 		assert.False(t, handler.ShouldDeadLetter(2, 2), "at-cap must retry")
 		assert.True(t, handler.ShouldDeadLetter(3, 2), "past-cap must dead-letter")
 	})
-	t.Run("M2_default_cap_has_margin", func(t *testing.T) {
+	t.Run("M2_default_cap_is_assumption_not_margin", func(t *testing.T) {
 		// Mutation: default 1 → killed by TestIC4A_DefaultFloor.
 		assert.Greater(t, handler.DefaultWebhookFailLimit, int64(30))
 		assert.GreaterOrEqual(t, handler.MinWebhookFailLimit, int64(1))

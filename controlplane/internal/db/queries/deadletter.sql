@@ -31,7 +31,7 @@ RETURNING *;
 -- name: CountDeadLetters :one
 SELECT count(*) FROM webhook_dead_letters;
 
--- name: DeleteDeadLetter :exec
+-- name: DeleteDeadLetter :execrows
 DELETE FROM webhook_dead_letters WHERE dedup_key = $1;
 
 -- IC-4a round-2 rework (B-OLD-1/B-NEW-1): PostgreSQL-backed failure counters —

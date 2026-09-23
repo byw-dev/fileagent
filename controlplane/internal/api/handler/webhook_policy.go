@@ -61,11 +61,16 @@ import (
 // RTO or maintenance window differs MUST size WEBHOOK_FAIL_LIMIT accordingly.
 const DefaultWebhookFailLimit int64 = 600
 
-// MinWebhookFailLimit is the safety floor for the cap. Below it, ordinary
-// transient blips (~1-2 retry rounds) would be dead-lettered on almost the
-// first failure, which defeats the retry mechanism entirely. Configurations
-// below the floor are rejected at startup by config.Validate — silently
-// lowering the floor is not an option (S1).
+// MinWebhookFailLimit is the safety floor for the cap (S-2, PR #110 round-2
+// review). Like the default, this is a DECLARED POLICY VALUE, not a derived
+// requirement: 60 × ~3s ≈ 3 minutes of tolerated outage — enough that
+// ordinary 1-2 retry-round blips are never dead-lettered, with no
+// project-authoritative RTO to derive it from. Operators should raise it
+// alongside WEBHOOK_FAIL_LIMIT for larger windows. Below the floor,
+// config.Validate rejects the configuration at startup (never a silent
+// fallback). ⚠️ Deployments that had explicitly configured 1–59 while this
+// PR is un-merged will change from bootable to FATAL — intentional (see the
+// PR description's configuration-constraints section).
 const MinWebhookFailLimit int64 = 60
 
 // webhookFailCounterTTL is the sliding TTL refreshed on every counter
@@ -82,9 +87,11 @@ const webhookFailCounterTTL = 7 * 24 * time.Hour
 // The counter MUST be persistent — process memory alone would reset on a CP
 // crash (the most likely companion of an indexing outage) or an ops restart,
 // and a poison pill whose counter resets can never reach the cap: the feed
-// would stay blocked forever. Redis backs this store in production, with a
-// bounded in-process fallback for Redis outages (B1); the interface keeps the
-// handler unit-testable without a real Redis.
+// would stay blocked forever. The production store layers TWO persistent
+// backends (round-2 rework, B-OLD-1/B-NEW-1): Redis as the fast path and
+// PostgreSQL (webhook_fail_counters, migration 000009) as the durable
+// fallback; with both down the handler fail-closes on 5xx (B2). The interface
+// keeps the handler unit-testable without real backends.
 type WebhookFailStore interface {
 	// IncrFailCount increments the persistent failure counter for one event
 	// identity and returns the new value.
