@@ -103,9 +103,15 @@ func (s *recordingSink) last() handler.DeadLetter {
 	return s.rows[len(s.rows)-1]
 }
 
+// ic4aHandlerDead wires a MinioEventHandler with the full failure machinery
+// and a caller-provided dead-letter sink (so tests can inject flaky sinks).
+func ic4aHandlerDead(ix *mockIndexerClient, fails *countingFailStore, dead handler.DeadLetterSink, limit int64) *handler.MinioEventHandler {
+	return handler.NewMinioEventHandlerWithPolicy(ix, testWebhookSecret, fails, dead, limit, newTestLogger())
+}
+
 // ic4aHandler wires a MinioEventHandler with the full failure machinery.
 func ic4aHandler(ix *mockIndexerClient, fails *countingFailStore, dead *recordingSink, limit int64) *handler.MinioEventHandler {
-	return handler.NewMinioEventHandlerWithPolicy(ix, testWebhookSecret, fails, dead, limit, newTestLogger())
+	return ic4aHandlerDead(ix, fails, dead, limit)
 }
 
 // eventWithSequencer builds a Records payload with a sequencer, so retries of
