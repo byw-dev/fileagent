@@ -445,7 +445,34 @@ O(未结算的授权) + O(总量 / 轮转预算)      ← 两项都有界且可�
 
 CP 已持有一个 root 权限的 MinIO client（`cmd/server/main.go:206`），可直接复用作列举通道。
 
-### 3.6 血缘
+### 3.6 死信表与 redrive 规程（IC-4a，2026-09 新增）
+
+> **⚠️ 本节表结构以代码为准**：`controlplane/migrations/000007_webhook_dead_letter.up.sql` 与
+> `controlplane/internal/db/queries/deadletter.sql`。
+
+webhook 处理失败超过毒丸上限（§6.5.1）后，事件落入 **`webhook_dead_letters`** 表（迁移 000007）：
+`dedup_key / event_name / bucket / key / size_bytes / etag / observed_at / event_seq / fail_count /
+last_error / active`，按 `dedup_key`（bucket+key+sequencer）唯一。
+
+**谁来 redrive：运维（人工或脚本），不是 CP 自动重试。** 每一行都是 MinIO 不会再发的丢失事件；
+自动重试会重启毒丸问题，也违背「超限即放行队头」的本意。规程：
+
+1. **查**：`SELECT * FROM webhook_dead_letters ORDER BY created_at DESC;`（`active=true` 的行优先——
+   见第 4 步）。
+2. **判**：`last_error` 是瞬时类（连接超时、PG 不可用）还是持久类（桶已删除、键非法）。持久类
+   直接人工处置，不要盲目重放。
+3. **重放**：对 `ObjectCreated` 按行调用索引（等价于重投该事件）；对 `ObjectRemoved` 先做第 4 步
+   再重放删除。重放幂等：upsert 的守卫（§3.4）与 `UNIQUE (bucket_id, storage_path)` 兑底。
+4. **ObjectRemoved 必须先强制置分片 `active`**（列 `active=true` 已在落死信时标记）：丢失的
+   delete 是「PG 有 / MinIO 无」，三级对账检不出；删除不推进 `object_keys.last_modified`，
+   已封存的归档分片永不解封。IC-12 落地前无分片表可置位，该标志仅作标记；IC-12 落地后，
+   redrive 流程必须对 `active=true` 的行调用强制解封。重放成功后删除该行。
+5. **告警**：`fail_count` 与行数应接告警——一行死信就是一行无人知晓的索引缺失。
+
+> **与 IC-2c 的关系（(c-2)）**：解码失败原本「索引原值 + Warn」，本刀改判为死信（从 MinIO 不可达，
+> 属载荷被篡改；进索引会写入无人匹配的 `storage_path`），并且 5xx 请求重投一次以防传输损坏。
+
+### 3.7 血缘
 
 将 [`metadata-model.md`](./metadata-model.md) P2.3 的 run 模型提前实施
 （触发信号「ETL 开始建设」已到达）：`lineage_runs` / `run_inputs` / `file_entries.run_id`。

@@ -47,6 +47,11 @@ services:
       - "9001:9001"
     tmpfs:
       - /data
+    # IC-4a ③ note: /data is a tmpfs here BY DESIGN — the test environment is
+    # ephemeral (`down -v` after runs). init-minio.sh, when run against this
+    # environment, should point WEBHOOK_QUEUE_DIR at any in-container path
+    # (e.g. /tmp/minio-webhook-queue is fine for tests) via the env override;
+    # the /data default targets the persistent dev volume.
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
