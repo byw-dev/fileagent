@@ -347,8 +347,11 @@ func TestIC4A_UnparseablePayload_SinkFailure_Retries(t *testing.T) {
 		"B2 applies to the parse-failure dead letter too: persist failure ⇒ 5xx")
 }
 
-// TestIC4A_CounterUnavailable_RetriesSafe: if the counter backend errors, the
-// safe default is 5xx (retry), never a dead letter on an infrastructure blip.
+// TestIC4A_CounterUnavailable_RetriesSafe: if even the FALLBACK counter stack
+// fails (a fully broken store — unreachable with the wired production store,
+// kept as a contract test), the only non-lossy default is 5xx; no dead letter
+// on an infrastructure blip. The feed-stall risk of this path is closed by the
+// B1 fallback (TestRED_CounterBackendDown_FallbackKeepsCount).
 func TestIC4A_CounterUnavailable_RetriesSafe(t *testing.T) {
 	ix := &mockIndexerClient{err: assert.AnError}
 	fails := newCountingFailStore()
@@ -360,10 +363,15 @@ func TestIC4A_CounterUnavailable_RetriesSafe(t *testing.T) {
 }
 
 // TestIC4A_DefaultFloor: an out-of-range (sub-floor) configured limit falls
-// back to the default instead of dead-lettering on the first hiccup.
-func TestIC4A_DefaultFloor(t *testing.T) {
-	assert.Greater(t, handler.DefaultWebhookFailLimit, int64(30),
-		"the default cap must exceed a 90s transient outage at ~3s/retry (30 rounds) with margin")
+// TestIC4A_DefaultFloorAndBoundary pins the S1 quantities exactly:
+//  - default 600 with the strict `>` ⇒ dead letter on the 601st failure;
+//  - MinWebhookFailLimit=60 is the safety floor (config.Validate rejects
+//    below-floor values; the constructor no longer silently substitutes 600).
+func TestIC4A_DefaultFloorAndBoundary(t *testing.T) {
+	assert.Equal(t, int64(600), handler.DefaultWebhookFailLimit)
+	assert.Equal(t, int64(60), handler.MinWebhookFailLimit)
+	assert.False(t, handler.ShouldDeadLetter(600, 600), "at the 600 cap: still retry (601st fails)")
+	assert.True(t, handler.ShouldDeadLetter(601, 600), "601st failure: dead-letter")
 }
 
 // ── Mutation matrix ──────────────────────────────────────────────────────────

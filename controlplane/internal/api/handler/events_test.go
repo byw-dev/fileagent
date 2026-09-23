@@ -969,14 +969,13 @@ func TestMinioEventHandler_DecodesObjectKey_Deletion(t *testing.T) {
 	assert.Equal(t, "a/b/中 文.csv", ix.deletedKey)
 }
 
-// TestMinioEventHandler_InvalidEncoding_GoesToDeadLetter pins the IC-4a (c-2)
+// TestMinioEventHandler_InvalidEncoding_NotIndexed pins the IC-4a (c-2)
 // upgrade of the IC-2c fallback: a key that fails URL decoding must NOT be
-// indexed under its raw value (a storage_path no real object matches) — it is
-// dead-lettered instead, and the request is answered 5xx so MinIO retries in
-// case the payload was a one-off transport corruption. From MinIO itself this
-// path is unreachable (QueryEscape output is always valid), so the index never
-// loses anything that was really there.
-func TestMinioEventHandler_InvalidEncoding_GoesToDeadLetter(t *testing.T) {
+// indexed under its raw value (a storage_path no real object matches), and the
+// first delivery is answered 5xx so MinIO retries (B3: decode failures share
+// the counted state machine — see webhook_rework_red_test.go for the
+// over-cap dead-letter path).
+func TestMinioEventHandler_InvalidEncoding_NotIndexed(t *testing.T) {
 	ix := &mockIndexerClient{}
 	w := postMinioEvent(t, ix, minioEventBody(t, "s3:ObjectCreated:Put", "data-sensor", "a%2Gb.csv"))
 	assert.Equal(t, http.StatusInternalServerError, w.Code,
