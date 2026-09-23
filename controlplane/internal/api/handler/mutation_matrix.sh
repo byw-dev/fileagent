@@ -38,7 +38,7 @@ mutate_and_test "M1_shouldDeadLetter_ge" controlplane/internal/api/handler/webho
 # M2: default cap 600 → 1 (poison pill dead-letters on first hiccup)
 mutate_and_test "M2_default_limit" controlplane/internal/api/handler/webhook_policy.go \
   "const DefaultWebhookFailLimit int64 = 600" "const DefaultWebhookFailLimit int64 = 1" \
-  "TestIC4A_DefaultFloor|TestIC4A_MutationMatrix"
+  "TestIC4A_DefaultFloorAndBoundary|TestIC4A_MutationMatrix"
 
 # M3: identity drops the sequencer (retries of distinct events share a counter)
 mutate_and_test "M3_identity_no_seq" controlplane/internal/api/handler/webhook_policy.go \
@@ -75,6 +75,40 @@ mutate_and_test "M7_no_count" controlplane/internal/api/handler/events.go \
   'count, err := h.fails.IncrFailCount(ctx, DeadLetterRedisKey(identity))' \
   'count, err := int64(1), error(nil)' \
   "TestIC4A_FailureOverCap_DeadLetters200|TestIC4A_CounterPersistsAcrossStoreInstances"
+
+# M8 (B2): dead-letter persist failure must keep 5xx + counter. Mutating
+# deadLetter() to swallow the error would be killed by the B2 red tests.
+mutate_and_test "M8_deadLetter_swallow" controlplane/internal/api/handler/events.go \
+  'return err
+	}
+	logDeadLetter(h.logger, dl)' \
+  'return nil
+	}
+	logDeadLetter(h.logger, dl)' \
+  "TestRED_SinkFailure_Returns5xx_KeepsCounter|TestRED_SinkRecovers_NextRedeliveryLandsDeadLetter"
+
+# M9 (B1): the in-process fallback is the guard against counter-backend
+# outages; removing it would be killed by the B1 red test.
+mutate_and_test "M9_fallback_disabled" controlplane/internal/api/handler/webhook_policy.go \
+  'return s.incrFallback(identity), nil' \
+  'return 0, err' \
+  "TestRED_CounterBackendDown_FallbackKeepsCount"
+
+# M10 (B3): decode errors must enter the counted state machine. Bypassing it
+# (direct dead letter + 5xx, the pre-rework behaviour) is killed by the B3 pair.
+mutate_and_test "M10_decode_bypass_counting" controlplane/internal/api/handler/events.go \
+  'if h.handleIndexFailure(c.Request.Context(), bucket, rec.S3.Object.Key, rec, err) {
+				failed = true
+			}' \
+  'failed = true' \
+  "TestRED_DecodeFailure_OverCap_DeadLetter200|TestRED_DecodeFailure_UnderCap_Retries"
+
+# M11 (S2): the payload hash must be content-derived; a fixed key would make
+# distinct bad payloads overwrite each other's dead letter.
+mutate_and_test "M11_fixed_hash" controlplane/internal/api/handler/events.go \
+  '"unparseable:" + HashPayload(raw)' \
+  '"unparseable:fixed"' \
+  "TestIC4A_UnparseablePayload_DistinctPayloadsDoNotOverwrite|TestIC4A_UnparseablePayload_DeadLetter200"
 
 echo "----"
 echo "killed=$PASS survived=$FAIL"
