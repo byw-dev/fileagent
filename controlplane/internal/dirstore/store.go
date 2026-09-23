@@ -3,7 +3,8 @@
 //
 // Flow:
 //  1. The REST handler calls Register to allocate a result channel keyed by
-//     request_id, then sends the ListDirectoryCommand to the agent.
+//     request_id, recording which agent the request was sent to, then sends
+//     the ListDirectoryCommand to the agent.
 //  2. When the agent responds via the gRPC stream the grpcserver handler calls
 //     Deliver, which pushes the result into the channel.
 //  3. The REST handler reads from the channel (with a context deadline) and
@@ -32,35 +33,56 @@ type Result struct {
 // Store maps pending request IDs to single-element result channels.
 // It is safe for concurrent use from multiple goroutines.
 type Store struct {
-	m sync.Map // map[string]chan Result
+	m sync.Map // map[string]*pending
+}
+
+// pending couples a waiting channel with the agent the request was sent to, so
+// a result can be matched against its intended recipient.
+type pending struct {
+	ch      chan Result
+	agentID string
 }
 
 // New returns an empty Store.
 func New() *Store { return &Store{} }
 
-// Register allocates a buffered channel for requestID and returns it.
+// Register allocates a buffered channel for requestID, recording which agent
+// the request is being sent to, and returns the channel.
 // The caller MUST call Cancel if it gives up (e.g. on timeout) to prevent
 // the channel from leaking.
-func (s *Store) Register(requestID string) <-chan Result {
+func (s *Store) Register(requestID, agentID string) <-chan Result {
 	ch := make(chan Result, 1)
-	s.m.Store(requestID, ch)
+	s.m.Store(requestID, &pending{ch: ch, agentID: agentID})
 	return ch
 }
 
-// Deliver sends result to the channel registered under requestID and removes
-// the entry from the store.  No-op when requestID is not registered (e.g. the
-// caller already timed out and called Cancel).
-func (s *Store) Deliver(requestID string, result Result) {
-	if v, ok := s.m.LoadAndDelete(requestID); ok {
-		if ch, ok := v.(chan Result); ok {
-			select {
-			case ch <- result:
-			default:
-				// The waiter has already given up (cancelled or timed out) and
-				// is no longer reading from the channel.  Drop the result.
-			}
-		}
+// Deliver sends result to the channel registered under requestID, but only
+// when agentID matches the agent the request was sent to. It removes the entry
+// on a match, and is a no-op when requestID is unknown (e.g. the caller already
+// timed out and called Cancel).
+//
+// The recipient check is the ownership rule for this path: requestID is a
+// correlation id the Control Plane allocated for one specific agent, so
+// "was this addressed to you" is the question worth asking. Checking it here
+// rather than at the caller keeps the invariant next to the state it protects.
+// A mismatch is reported so the caller can log it.
+func (s *Store) Deliver(requestID, agentID string, result Result) bool {
+	v, ok := s.m.Load(requestID)
+	if !ok {
+		return false
 	}
+	p, ok := v.(*pending)
+	if !ok || p.agentID != agentID {
+		return false
+	}
+	s.m.Delete(requestID)
+	select {
+	case p.ch <- result:
+	default:
+		// The waiter has already given up (cancelled or timed out) and
+		// is no longer reading from the channel.  Drop the result.
+	}
+	return true
 }
 
 // Cancel removes the entry for requestID without delivering a result.

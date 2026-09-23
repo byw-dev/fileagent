@@ -92,13 +92,16 @@ func (q *Queries) CreateCollectionRule(ctx context.Context, arg CreateCollection
 	return &i, err
 }
 
-const deleteCollectionRule = `-- name: DeleteCollectionRule :exec
-DELETE FROM collection_rules WHERE id = $1
+const deleteCollectionRule = `-- name: DeleteCollectionRule :execrows
+DELETE FROM collection_rules WHERE id = $1 AND agent_id = $2 AND org_id = $3
 `
 
-func (q *Queries) DeleteCollectionRule(ctx context.Context, id uuid.UUID) error {
-	_, err := q.db.ExecContext(ctx, deleteCollectionRule, id)
-	return err
+func (q *Queries) DeleteCollectionRule(ctx context.Context, iD uuid.UUID, agentID uuid.UUID, orgID uuid.UUID) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteCollectionRule, iD, agentID, orgID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const getCollectionRuleByID = `-- name: GetCollectionRuleByID :one
@@ -261,12 +264,17 @@ const updateCollectionRuleStatus = `-- name: UpdateCollectionRuleStatus :one
 UPDATE collection_rules
 SET status = $2,
     updated_at = NOW()
-WHERE id = $1
+WHERE id = $1 AND agent_id = $3 AND org_id = $4
 RETURNING id, org_id, agent_id, bucket_id, name, mode, status, base_path, path_pattern, dest_path_template, recursive, cron_expr, run_once_on_start, append_mode, metadata, created_at, updated_at
 `
 
-func (q *Queries) UpdateCollectionRuleStatus(ctx context.Context, iD uuid.UUID, status RuleStatus) (*CollectionRule, error) {
-	row := q.db.QueryRowContext(ctx, updateCollectionRuleStatus, iD, status)
+func (q *Queries) UpdateCollectionRuleStatus(ctx context.Context, iD uuid.UUID, status RuleStatus, agentID uuid.UUID, orgID uuid.UUID) (*CollectionRule, error) {
+	row := q.db.QueryRowContext(ctx, updateCollectionRuleStatus,
+		iD,
+		status,
+		agentID,
+		orgID,
+	)
 	var i CollectionRule
 	err := row.Scan(
 		&i.ID,

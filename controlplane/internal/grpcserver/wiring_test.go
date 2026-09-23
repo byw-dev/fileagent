@@ -592,7 +592,7 @@ func TestHandleAgentMessage_DryRunResult_UsesStreamIdentity(t *testing.T) {
 	reqID := uuid.NewString()
 	ch := store.Register(reqID, testAgentID)
 
-	srv.handleAgentMessage(context.Background(), testAgentID, &agentv1.AgentMessage{
+	srv.handleAgentMessage(context.Background(), testAgentID, nil, &agentv1.AgentMessage{
 		Payload: &agentv1.AgentMessage_DryRunResult{
 			DryRunResult: &agentv1.DryRunResult{RuleId: reqID},
 		},

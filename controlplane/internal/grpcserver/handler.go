@@ -108,11 +108,15 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 				s.logger.Warn("connect: update status to online failed", zap.Error(dbErr))
 			case rows == 0:
 				// The status left the usable set between the liveness check and
-				// this write — i.e. the agent was revoked mid-connect. The
-				// constraint did its job; log it, because this is the only place
-				// that race is ever visible.
+				// this write — i.e. the agent was revoked mid-connect, and this
+				// connection is the one that raced it. Ending the RPC here is
+				// the actual gate: a warning alone would leave the connection
+				// registered and fully live — heartbeats, upload reports and
+				// STS-backed data-plane writes all included — for as long as
+				// the agent keeps the stream open (PR #109 re-review P1-b).
 				s.logger.Warn("connect: agent left the usable state during connect setup",
 					zap.String("agent_id", agentID))
+				return status.Error(codes.PermissionDenied, "agent connection terminated")
 			}
 		}
 	}
@@ -127,6 +131,11 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	// goroutine is the consumer, so it must exist before the producers run.
 	sendErr := make(chan error, 1)
 	go func() {
+		// Release any SendSync waiter when this goroutine stops, whatever the
+		// reason: nothing else will be written, so making them burn their
+		// whole timeout would be pointless (and on the Revoke path, the
+		// timeout IS the stream cut).
+		defer conn.markWriterStopped()
 		for {
 			select {
 			case <-ctx.Done():
@@ -141,6 +150,8 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 					sendErr <- err
 					return
 				}
+				// Publish write progress for SendSync waiters (IC-BUG-32).
+				conn.noteWritten()
 			}
 		}
 	}()
@@ -209,11 +220,26 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 	go func() {
 		for {
 			msg, err := stream.Recv()
-			select {
-			case recvCh <- recvResult{msg: msg, err: err}:
-				if err != nil {
-					return
+			if err != nil {
+				// The RPC has ended — the stream broke, the context was
+				// cancelled, or the handler returned gracefully (IC-BUG-32: on
+				// the graceful path nothing ever cancels ctx, and the main
+				// loop may already be gone, so nobody is reading recvCh).
+				// Deliver the error if someone is still there, then exit
+				// either way: blocking here on a reader that no longer exists
+				// would leak this goroutine for the lifetime of the process.
+				// Release: the RPC end cancels the stream context (gRPC's
+				// finishStream cancels it before the flush, and our ctx is its
+				// child), so this select always terminates; the pending Recv
+				// itself is released when the transport closes the stream.
+				select {
+				case recvCh <- recvResult{msg: msg, err: err}:
+				case <-ctx.Done():
 				}
+				return
+			}
+			select {
+			case recvCh <- recvResult{msg: msg, err: nil}:
 			case <-ctx.Done():
 				return
 			}
@@ -222,6 +248,27 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 
 	for {
 		select {
+		case <-conn.stopCh:
+			// Graceful stop (IC-BUG-32): Stop closed stopCh instead of
+			// cancelling ctx. Returning WITHOUT cancelling lets gRPC finish
+			// the RPC normally: the transport's FIFO writes queued DATA
+			// frames before the trailers. Delivery caveat, kept honest (see
+			// SendSync's scope note and the IC-BUG-32 card): on the IDLE path
+			// — no backlog — the confirmed command is flushed before the
+			// trailers and deterministically reaches the agent; under a
+			// backlog the queued frames may never fit through the
+			// flow-control window before teardown and are discarded, so
+			// delivery there is best-effort in this shape too. Cancelling
+			// here would RST queued frames away instead of flushing them in
+			// order, which is strictly worse and re-introduces the race.
+			//
+			// Like the ctx.Done branch below, deliberately does not wait for
+			// the send goroutine: nothing on this path waits on the agent at
+			// all (review gate 4), and the deferred Unregister releases the
+			// send goroutine by closing SendCh.
+			s.logger.Info("connect: stream terminated by control plane",
+				zap.String("agent_id", agentID))
+			return status.Error(codes.PermissionDenied, "agent connection terminated")
 		case <-ctx.Done():
 			// Cancelled from outside — the agent was revoked (IC-BUG-25).
 			//
@@ -246,10 +293,19 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[agentv1.AgentMessage, a
 				// read. Doing so used to pin this handler outside the select, so
 				// it could no longer observe ctx.Done at all — the agent made
 				// itself unrevokable.
+				//
+				// If a graceful stop is already in flight, though, cancelling
+				// here would race the transport's flush and discard the queued
+				// command (IC-BUG-32) — end the RPC the same way the stopCh
+				// branch does: a normal handler return, whose trailers go out
+				// after the queued DATA frames.
+				if conn.isStopping() {
+					return status.Error(codes.PermissionDenied, "agent connection terminated")
+				}
 				cancel()
 				return r.err
 			}
-			s.handleAgentMessage(ctx, agentID, r.msg)
+			s.handleAgentMessage(ctx, agentID, conn, r.msg)
 		}
 	}
 }
@@ -467,10 +523,10 @@ func (s *Server) pushCredentials(ctx context.Context, agentID string) {
 }
 
 // handleAgentMessage processes a single incoming message from an agent.
-func (s *Server) handleAgentMessage(ctx context.Context, agentID string, msg *agentv1.AgentMessage) {
+func (s *Server) handleAgentMessage(ctx context.Context, agentID string, conn *AgentConn, msg *agentv1.AgentMessage) {
 	switch p := msg.Payload.(type) {
 	case *agentv1.AgentMessage_Heartbeat:
-		s.handleHeartbeat(ctx, agentID, p.Heartbeat)
+		s.handleHeartbeat(ctx, agentID, conn, p.Heartbeat)
 	case *agentv1.AgentMessage_UploadResult:
 		s.handleUploadResult(ctx, agentID, p.UploadResult)
 	case *agentv1.AgentMessage_DirectoryListing:
@@ -485,7 +541,7 @@ func (s *Server) handleAgentMessage(ctx context.Context, agentID string, msg *ag
 	}
 }
 
-func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv1.Heartbeat) {
+func (s *Server) handleHeartbeat(ctx context.Context, agentID string, conn *AgentConn, hb *agentv1.Heartbeat) {
 	if s.cache != nil {
 		if err := s.cache.Set(ctx, cache.AgentOnlineKey(agentID), "1", agentOnlineTTL); err != nil {
 			s.logger.Warn("heartbeat: refresh online TTL failed", zap.Error(err))
@@ -501,11 +557,17 @@ func (s *Server) handleHeartbeat(ctx context.Context, agentID string, hb *agentv
 		// the cache authoritative and the lost key permanent until reconnect.
 		// Clearing stays where it is: a successful sync and disconnect both
 		// delete, so the projection can never outlive its condition.
-		if s.registry != nil {
-			if conn := s.registry.Get(agentID); conn != nil && conn.SyncDegraded {
-				if err := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); err != nil {
-					s.logger.Warn("heartbeat: renew degraded marker failed", zap.String("agent_id", agentID), zap.Error(err))
-				}
+		// The degraded state is read from the connection the heartbeat
+		// actually arrived on — NOT re-looked-up by agentID (PR #109 re-review
+		// P2-1): a lookup by id returns whichever connection is registered at
+		// handling time, which after a reconnect is the replacement — reading
+		// its field from the displaced connection's handler goroutine races
+		// the replacement's setup write. Written during this connection's own
+		// Connect setup and read here in the same handler goroutine, so no
+		// lock is needed once the binding is by connection.
+		if conn != nil && conn.SyncDegraded {
+			if err := s.cache.Set(ctx, cache.AgentSyncDegradedKey(agentID), "1", agentSyncDegradedTTL); err != nil {
+				s.logger.Warn("heartbeat: renew degraded marker failed", zap.String("agent_id", agentID), zap.Error(err))
 			}
 		}
 	}
@@ -655,9 +717,15 @@ func (s *Server) handleDirectoryListing(agentID string, listing *agentv1.Directo
 	}
 
 	if listing.GetError() != "" {
-		s.dirResultStore.Deliver(listing.GetRequestId(), dirstore.Result{
+		if !s.dirResultStore.Deliver(listing.GetRequestId(), agentID, dirstore.Result{
 			Error: listing.GetError(),
-		})
+		}) {
+			s.logger.Warn("dir listing discarded: not addressed to this agent, or already timed out",
+				zap.String("agent_id", agentID),
+				zap.String("request_id", listing.GetRequestId()),
+			)
+			return
+		}
 		return
 	}
 
@@ -680,7 +748,14 @@ func (s *Server) handleDirectoryListing(agentID string, listing *agentv1.Directo
 		entries = append(entries, entry)
 	}
 
-	s.dirResultStore.Deliver(listing.GetRequestId(), dirstore.Result{Entries: entries})
+	if !s.dirResultStore.Deliver(listing.GetRequestId(), agentID, dirstore.Result{Entries: entries}) {
+		s.logger.Warn("dir listing discarded: not addressed to this agent, or already timed out",
+			zap.String("agent_id", agentID),
+			zap.String("request_id", listing.GetRequestId()),
+			zap.Int("entries", len(entries)),
+		)
+		return
+	}
 	s.logger.Debug("dir listing delivered",
 		zap.String("agent_id", agentID),
 		zap.String("request_id", listing.GetRequestId()),
