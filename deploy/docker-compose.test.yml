@@ -47,11 +47,16 @@ services:
       - "9001:9001"
     tmpfs:
       - /data
-    # IC-4a ③ note: /data is a tmpfs here BY DESIGN — the test environment is
-    # ephemeral (`down -v` after runs). init-minio.sh, when run against this
-    # environment, should point WEBHOOK_QUEUE_DIR at any in-container path
-    # (e.g. /tmp/minio-webhook-queue is fine for tests) via the env override;
-    # the /data default targets the persistent dev volume.
+    # IC-4a ③ note (updated by the PR #110 review, S3): /data is a tmpfs here
+    # BY DESIGN — this compose is a FUNCTIONAL-ONLY test environment; it does
+    # NOT exercise webhook-queue persistence, and there is no override that
+    # could (any in-container path on tmpfs dies with the container, and
+    # init-minio.sh rejects /tmp/* queue dirs on purpose). The persistence
+    # guarantee (undelivered events survive a MinIO container restart) is
+    # verified live against the dev environment (docker-compose.dev.yml,
+    # minio_data named volume) — see the IC-4a acceptance record. If an
+    # automated persistence regression is ever wanted, add a named-volume
+    # profile here, not a tmpfs path override.
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s

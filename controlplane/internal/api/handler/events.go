@@ -684,11 +684,14 @@ func (h *UploadLogsHandler) Get(c *gin.Context) {
 // MinIO object events in the file index.
 type IndexerClient interface {
 	// IndexUpload records an ObjectCreated event in the file index.
-	// It is called in a best-effort, non-blocking fashion; errors are only
-	// logged (warn level) and do not affect the HTTP response.
+	// A returned error is a PROCESSING failure: the handler counts it under
+	// the event's identity and answers 5xx (under the cap) so MinIO redelivers,
+	// or dead-letters the event past the cap — see webhook_policy.go. This is
+	// the core IC-4a semantic; errors are NOT "logged only".
 	IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string) error
 	// IndexDeletion records an ObjectRemoved event: it soft-deletes the matching
-	// file entry and publishes events.file.deleted. Best-effort like IndexUpload.
+	// file entry and publishes events.file.deleted. Errors follow the same
+	// counted failure path as IndexUpload.
 	IndexDeletion(ctx context.Context, bucketName, objectKey string, observedAt time.Time, eventSeq string) error
 }
 
