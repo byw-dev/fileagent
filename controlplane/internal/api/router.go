@@ -55,7 +55,7 @@ type RouterConfig struct {
 	WebhookDeadLetters handler.DeadLetterSink
 	// WebhookFailLimit is the poison-pill retry cap (WEBHOOK_FAIL_LIMIT).
 	WebhookFailLimit int64
-	StatsDB       handler.StatsDB          // nil → stats endpoint returns 501
+	StatsDB          handler.StatsDB // nil → stats endpoint returns 501
 
 	// RateLimiter backs the per-user API rate-limit middleware. When nil, or
 	// when RateLimitPerMinute <= 0, rate limiting is disabled.

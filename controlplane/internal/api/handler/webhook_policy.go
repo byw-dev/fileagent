@@ -218,5 +218,3 @@ func logDeadLetter(logger *zap.Logger, dl DeadLetter) {
 		zap.Bool("removed", dl.Removed),
 	)
 }
-
-
