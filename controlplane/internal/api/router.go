@@ -45,6 +45,16 @@ type RouterConfig struct {
 	DryRunStore   handler.DryRunStore      // nil → test-rule returns 501
 	MinioIndexer  handler.IndexerClient    // nil → minio webhook events are only logged
 	WebhookSecret string                   // shared secret for /internal/minio-event; empty → endpoint rejects all
+
+	// WebhookFailCounters backs the IC-4a poison-pill failure counters. When
+	// nil, failures are still answered 5xx but never dead-lettered (testing
+	// / degraded wiring only — production always wires Redis here).
+	WebhookFailCounters handler.WebhookFailStore
+	// WebhookDeadLetters is the dead-letter sink (webhook_dead_letters table).
+	// When nil, exhausted events are only logged (testing / degraded wiring).
+	WebhookDeadLetters handler.DeadLetterSink
+	// WebhookFailLimit is the poison-pill retry cap (WEBHOOK_FAIL_LIMIT).
+	WebhookFailLimit int64
 	StatsDB       handler.StatsDB          // nil → stats endpoint returns 501
 
 	// RateLimiter backs the per-user API rate-limit middleware. When nil, or
@@ -75,7 +85,19 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	})
 
 	// ── Internal MinIO event webhook (authenticated by shared secret) ───────
-	minioH := handler.NewMinioEventHandler(cfg.MinioIndexer, cfg.WebhookSecret, cfg.Logger)
+	// IC-4a: wired with the persistent failure counters and the dead-letter
+	// sink when provided; the poison pill then dead-limits events that keep
+	// failing, instead of letting one bad event block the feed forever.
+	var minioH *handler.MinioEventHandler
+	if cfg.WebhookFailCounters != nil && cfg.WebhookDeadLetters != nil {
+		minioH = handler.NewMinioEventHandlerWithPolicy(cfg.MinioIndexer, cfg.WebhookSecret, cfg.WebhookFailCounters, cfg.WebhookDeadLetters, cfg.WebhookFailLimit, cfg.Logger)
+	} else {
+		if cfg.WebhookFailCounters == nil || cfg.WebhookDeadLetters == nil {
+			cfg.Logger.Warn("minio event webhook: failure policy incompletely wired (counters/dead-letters nil); " +
+				"failed events will retry but never dead-letter — the poison-pill guard is DISABLED")
+		}
+		minioH = handler.NewMinioEventHandler(cfg.MinioIndexer, cfg.WebhookSecret, cfg.Logger)
+	}
 	r.POST("/internal/minio-event", minioH.Handle)
 
 	// ── Auth routes ──────────────────────────────────────────────────────────

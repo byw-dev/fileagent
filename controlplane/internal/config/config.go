@@ -80,6 +80,16 @@ type Config struct {
 	// index from an external source and must be authenticated.
 	InternalWebhookSecret string
 
+	// WebhookFailLimit is the IC-4a poison-pill retry cap (IC-BUG-6): after
+	// this many failed deliveries of ONE webhook event (identified by
+	// bucket+key+sequencer), the event is dead-lettered into
+	// webhook_dead_letters and answered 200 so MinIO's head-of-line blocking
+	// queue is freed. Default 600: the webhook queue retries ~every 3s, so 600
+	// attempts ≈ 30 minutes of tolerated outage — long enough to ride out a PG
+	// restart/failover (the acceptance requires surviving a PG outage), short
+	// enough that a true poison pill cannot stall the feed indefinitely.
+	WebhookFailLimit int64
+
 	// BootstrapAdminUsername is the username used for first-start admin creation.
 	// Default: "admin".
 	BootstrapAdminUsername string
@@ -158,6 +168,7 @@ func Load() (*Config, error) {
 	cfg.LogLevel = envString("LOG_LEVEL", "info")
 	cfg.APIRateLimitPerMinute = envInt("API_RATE_LIMIT_PER_MINUTE", 600)
 	cfg.InternalWebhookSecret = os.Getenv("INTERNAL_WEBHOOK_SECRET")
+	cfg.WebhookFailLimit = int64(envInt("WEBHOOK_FAIL_LIMIT", 600))
 	cfg.BootstrapAdminUsername = envString("BOOTSTRAP_ADMIN_USERNAME", "admin")
 	cfg.BootstrapAdminPassword = os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
 	cfg.BootstrapAdminForceReset = envBool("BOOTSTRAP_ADMIN_FORCE_RESET", false)

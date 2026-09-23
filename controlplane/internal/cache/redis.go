@@ -5,7 +5,9 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -117,6 +119,15 @@ end
 return count
 `)
 
+// Incr atomically increments the counter at key and returns its new value.
+// Unlike IncrWithWindow it applies no TTL — the caller owns the counter's
+// lifetime and removes the key explicitly (webhook poison-pill counters,
+// IC-4a ①: a persistent failure count must survive CP restarts, so the key
+// must not silently expire).
+func (c *Client) Incr(ctx context.Context, key string) (int64, error) {
+	return c.rdb.Incr(ctx, key).Result()
+}
+
 // IncrWithWindow atomically increments the fixed-window counter at key and
 // returns its new value. On the first increment of a window it sets the key to
 // expire after window, so subsequent increments within the window share the
@@ -134,6 +145,26 @@ func (c *Client) IncrWithWindow(ctx context.Context, key string, window time.Dur
 	}
 	seconds := int(window / time.Second)
 	return fixedWindowScript.Run(ctx, c.rdb, []string{key}, seconds).Int64()
+}
+
+// GetInt64 reads an integer counter stored at key. Returns 0 and a nil error
+// when the key does not exist (an absent counter means "no failures yet").
+// Any other read/parse failure is returned to the caller — a poison-pill
+// decision must not silently treat a Redis outage as "counter at zero" and
+// answer 5xx forever; callers decide how to fail.
+func (c *Client) GetInt64(ctx context.Context, key string) (int64, error) {
+	val, err := c.rdb.Get(ctx, key).Result()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("cache: counter %q is not an integer: %q", key, val)
+	}
+	return n, nil
 }
 
 // MGet returns the values at the given keys in order; a missing key yields a nil

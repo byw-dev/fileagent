@@ -71,3 +71,13 @@ func LockRuleDispatchKey(ruleID string) string {
 func SessionKey(token string) string {
 	return fmt.Sprintf("session:%s", token)
 }
+
+// WebhookFailCountKey returns the Redis key holding the persistent failure
+// counter for one MinIO webhook event (IC-4a ①). identity is the event's
+// dedup key ("{bucket}/{key}/{sequencer}"). The counter must be persistent
+// (not in-process): a poison-pill event must survive a CP restart, otherwise
+// the retry cap can never be reached and the queue head stays blocked forever.
+// The key carries no TTL — the counter is removed explicitly on success.
+func WebhookFailCountKey(identity string) string {
+	return fmt.Sprintf("webhook:fail:%s", identity)
+}

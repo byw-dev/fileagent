@@ -256,6 +256,14 @@ func main() {
 	retagWorker := worker.NewRetagWorker(queries, logger)
 	go retagWorker.Run(ctx, 0)
 
+	// IC-4a: the webhook failure policy — persistent per-event failure
+	// counters (Redis) and the dead-letter sink (webhook_dead_letters table).
+	// Together with the retry cap they form the poison-pill guard: an event
+	// that keeps failing is retried (5xx) until the cap, then dead-lettered
+	// and answered 200 so MinIO's head-of-line queue is freed.
+	webhookFails := handler.NewRedisWebhookFailStore(redisClient)
+	webhookDeadLetters := handler.NewDBDeadLetterSink(queries)
+
 	// ── Build HTTP router ────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
 		JWTSecret:          cfg.JWTSecret,
@@ -284,6 +292,9 @@ func main() {
 		DryRunStore:        dryRunStore,
 		MinioIndexer:       ix,
 		WebhookSecret:      cfg.InternalWebhookSecret,
+		WebhookFailCounters: webhookFails,
+		WebhookDeadLetters: webhookDeadLetters,
+		WebhookFailLimit:   cfg.WebhookFailLimit,
 		StatsDB:            queries,
 		RateLimiter:        redisClient,
 		RateLimitPerMinute: cfg.APIRateLimitPerMinute,

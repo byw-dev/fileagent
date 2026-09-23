@@ -30,3 +30,10 @@ func (q *Queries) MarkObservedFileDeleted(ctx context.Context, arg DeleteIndexed
 	}
 	return entry, err == nil, err == nil, err
 }
+
+// UpsertDeadLetter stores (or refreshes) one webhook dead letter (IC-4a).
+// Upsert by dedup key: a re-drowned event refreshes its row.
+func (q *Queries) UpsertDeadLetterWrap(ctx context.Context, arg UpsertDeadLetterParams) error {
+	_, err := q.UpsertDeadLetter(ctx, arg)
+	return err
+}

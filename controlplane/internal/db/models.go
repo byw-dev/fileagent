@@ -557,3 +557,20 @@ type User struct {
 	CreatedAt    time.Time      `db:"created_at" json:"created_at"`
 	UpdatedAt    time.Time      `db:"updated_at" json:"updated_at"`
 }
+
+type WebhookDeadLetter struct {
+	ID         uuid.UUID      `db:"id" json:"id"`
+	DedupKey   string         `db:"dedup_key" json:"dedup_key"`
+	EventName  string         `db:"event_name" json:"event_name"`
+	Bucket     string         `db:"bucket" json:"bucket"`
+	Key        string         `db:"key" json:"key"`
+	SizeBytes  int64          `db:"size_bytes" json:"size_bytes"`
+	Etag       sql.NullString `db:"etag" json:"etag"`
+	ObservedAt sql.NullTime   `db:"observed_at" json:"observed_at"`
+	EventSeq   sql.NullString `db:"event_seq" json:"event_seq"`
+	FailCount  int32          `db:"fail_count" json:"fail_count"`
+	LastError  sql.NullString `db:"last_error" json:"last_error"`
+	Active     bool           `db:"active" json:"active"`
+	CreatedAt  time.Time      `db:"created_at" json:"created_at"`
+	UpdatedAt  time.Time      `db:"updated_at" json:"updated_at"`
+}

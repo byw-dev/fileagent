@@ -702,6 +702,15 @@ type MinioEventHandler struct {
 	logger  *zap.Logger
 	indexer IndexerClient // optional; nil disables indexing
 	secret  string        // shared webhook secret; empty disables the endpoint
+	// fails is the persistent failure-counter backend (nil disables counting
+	// and the poison pill; used only by tests that exercise parsing routes).
+	fails WebhookFailStore
+	// dead is where exhausted events are persisted (nil skips persistence;
+	// production wiring always provides both).
+	dead DeadLetterSink
+	// failLimit is the poison-pill retry cap (WEBHOOK_FAIL_LIMIT). After this
+	// many failed deliveries one event is dead-lettered and answered 200.
+	failLimit int64
 }
 
 // NewMinioEventHandler returns a new MinioEventHandler.
@@ -716,6 +725,32 @@ func NewMinioEventHandler(indexer IndexerClient, secret string, logger *zap.Logg
 			"the /internal/minio-event endpoint will reject all requests until it is configured")
 	}
 	return &MinioEventHandler{logger: logger, indexer: indexer, secret: secret}
+}
+
+// NewMinioEventHandlerWithPolicy returns a MinioEventHandler wired with the
+// IC-4a failure machinery: the persistent failure-counter store, the
+// dead-letter sink and the poison-pill retry cap. Production wiring uses this
+// constructor; NewMinioEventHandler (counters nil) remains for tests that
+// exercise only parsing/auth routing.
+func NewMinioEventHandlerWithPolicy(indexer IndexerClient, secret string, fails WebhookFailStore, dead DeadLetterSink, failLimit int64, logger *zap.Logger) *MinioEventHandler {
+	if failLimit < MinWebhookFailLimit {
+		logger.Warn("minio event webhook: WEBHOOK_FAIL_LIMIT below the floor; using the default",
+			zap.Int64("configured", failLimit),
+			zap.Int64("floor", MinWebhookFailLimit),
+			zap.Int64("default", DefaultWebhookFailLimit),
+		)
+		failLimit = DefaultWebhookFailLimit
+	}
+	logger.Info("minio event webhook: failure policy configured",
+		zap.Int64("fail_limit", failLimit),
+		zap.Bool("counter_store", fails != nil),
+		zap.Bool("dead_letter_sink", dead != nil),
+	)
+	h := NewMinioEventHandler(indexer, secret, logger)
+	h.fails = fails
+	h.dead = dead
+	h.failLimit = failLimit
+	return h
 }
 
 // authorized reports whether the request carries the correct shared secret.
@@ -807,6 +842,18 @@ func decodeObjectKey(raw string) (string, error) {
 }
 
 // Handle handles POST /internal/minio-event.
+//
+// Response contract (IC-4a ① / IC-BUG-6) — one path for every failure kind:
+//
+//	a record indexes cleanly      → 200 (event consumed)
+//	a record fails, under the cap → 5xx (MinIO retries; the counter persists)
+//	a record fails, over the cap  → dead-letter row + 200 (queue head freed)
+//
+// Parse failures and decode failures flow through the SAME machinery (no
+// 4xx/5xx split: MinIO retries 400 like 500, dev-measured). A payload that
+// cannot be parsed at all is dead-lettered immediately — it can never succeed,
+// so counting retries would only block the feed for the cap's duration before
+// reaching the same verdict.
 func (h *MinioEventHandler) Handle(c *gin.Context) {
 	if !h.authorized(c) {
 		h.logger.Warn("minio event: rejected unauthorized webhook call",
@@ -817,22 +864,56 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 
 	var payload minioS3Event
 	if err := c.ShouldBindJSON(&payload); err != nil {
-		// MinIO may send different payload shapes; accept any JSON and log.
-		h.logger.Warn("minio event: failed to parse payload", zap.Error(err))
+		// The payload is not parseable, so no event identity can be recovered
+		// from it — dead-letter what we know and free the queue. Counting
+		// retries would be pointless: the failure is deterministic, and with
+		// no identity there is nothing to count under anyway. The response is
+		// 200 on purpose (see the contract above; 4xx would be retried too).
+		h.logger.Error("minio event: failed to parse payload; dead-lettering",
+			zap.Error(err))
+		h.deadLetter(c.Request.Context(), DeadLetter{
+			DedupKey:  "unparseable-payload",
+			EventName: "unknown",
+			FailCount: 1,
+			LastError: err.Error(),
+		})
 		c.Status(http.StatusOK)
 		return
 	}
 
+	failed := false
 	for _, rec := range payload.Records {
 		bucket := rec.S3.Bucket.Name
 		// The key is URL-encoded by MinIO; decode it before it reaches the index
 		// or anything else, since storage_path must hold the real object key.
 		key, err := decodeObjectKey(rec.S3.Object.Key)
 		if err != nil {
-			h.logger.Warn("minio event: object key is not valid URL encoding; falling back to the raw key",
+			// IC-2c used to fall back to indexing the raw key here. With a
+			// dead-letter store that fallback is strictly worse: it would write
+			// a storage_path no real object matches. From MinIO this path is
+			// unreachable (QueryEscape output is always valid query escaping);
+			// a decode failure means the payload was not produced by MinIO, so
+			// the event goes to the dead-letter table instead of the index
+			// (IC-4a (c-2), an upgrade of the old warn-and-index fallback).
+			h.logger.Error("minio event: object key is not valid URL encoding; dead-lettering",
 				zap.String("bucket", bucket),
 				zap.String("raw_key", rec.S3.Object.Key),
 				zap.Error(err))
+			h.deadLetter(c.Request.Context(), DeadLetter{
+				DedupKey:   DeadLetterIdentity(bucket, rec.S3.Object.Key, rec.S3.Object.Sequencer),
+				EventName:  rec.EventName,
+				Bucket:     bucket,
+				Key:        rec.S3.Object.Key,
+				SizeBytes:  rec.S3.Object.Size,
+				ETag:       rec.S3.Object.ETag,
+				ObservedAt: rec.EventTime,
+				EventSeq:   rec.S3.Object.Sequencer,
+				FailCount:  1,
+				LastError:  err.Error(),
+				Removed:    strings.HasPrefix(rec.EventName, "s3:ObjectRemoved:"),
+			})
+			failed = true
+			continue
 		}
 		h.logger.Info("minio event received",
 			zap.String("event", rec.EventName),
@@ -847,21 +928,115 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 		// ObjectRemoved:* soft-deletes the entry and emits events.file.deleted.
 		// Previously every event was indexed as an upload, so deletions were
 		// mis-recorded and file_deleted event rules never fired.
+		var indexErr error
+		removed := strings.HasPrefix(rec.EventName, "s3:ObjectRemoved:")
 		switch {
-		case strings.HasPrefix(rec.EventName, "s3:ObjectRemoved:"):
-			if err := h.indexer.IndexDeletion(c.Request.Context(), bucket, key, rec.EventTime, rec.S3.Object.Sequencer); err != nil {
-				h.logger.Warn("minio event: index deletion failed",
-					zap.String("bucket", bucket), zap.String("key", key), zap.Error(err))
-			}
+		case removed:
+			indexErr = h.indexer.IndexDeletion(c.Request.Context(), bucket, key, rec.EventTime, rec.S3.Object.Sequencer)
 		case strings.HasPrefix(rec.EventName, "s3:ObjectCreated:"):
-			if err := h.indexer.IndexUpload(c.Request.Context(), bucket, key, rec.S3.Object.Size, rec.S3.Object.ETag, rec.EventTime, rec.S3.Object.Sequencer); err != nil {
-				h.logger.Warn("minio event: index upload failed",
-					zap.String("bucket", bucket), zap.String("key", key), zap.Error(err))
-			}
+			indexErr = h.indexer.IndexUpload(c.Request.Context(), bucket, key, rec.S3.Object.Size, rec.S3.Object.ETag, rec.EventTime, rec.S3.Object.Sequencer)
 		default:
 			h.logger.Debug("minio event: ignoring unhandled event type",
 				zap.String("event", rec.EventName))
 		}
+		if indexErr != nil {
+			// The single failure path: count under the event's identity, then
+			// either 5xx (retry) or dead-letter + 200 (free the queue).
+			if h.handleIndexFailure(c.Request.Context(), bucket, key, rec, indexErr) {
+				failed = true
+			}
+			continue
+		}
+		h.clearFailCount(c.Request.Context(), bucket, key, rec)
+	}
+	if failed {
+		// Any record needing a retry fails the whole request with 5xx; MinIO
+		// redelivers the payload and the successful records re-run their
+		// (idempotent) upserts.
+		c.Status(http.StatusInternalServerError)
+		return
 	}
 	c.Status(http.StatusOK)
+}
+
+// handleIndexFailure implements the one failure path. It returns true when the
+// request must be answered 5xx (retry), false when the event was dead-lettered
+// (the caller answers 200 and the queue moves on).
+func (h *MinioEventHandler) handleIndexFailure(ctx context.Context, bucket, key string, rec minioEventRecord, indexErr error) bool {
+	removed := strings.HasPrefix(rec.EventName, "s3:ObjectRemoved:")
+	identity := DeadLetterIdentity(bucket, key, rec.S3.Object.Sequencer)
+	h.logger.Warn("minio event: indexing failed",
+		zap.String("event", rec.EventName),
+		zap.String("bucket", bucket),
+		zap.String("key", key),
+		zap.String("dedup_key", identity),
+		zap.Error(indexErr))
+	if h.fails == nil {
+		// No counter store wired (tests / degraded wiring): retry, matching the
+		// pre-IC-4a mechanism but with the correct status code.
+		return true
+	}
+	count, err := h.fails.IncrFailCount(ctx, DeadLetterRedisKey(identity))
+	if err != nil {
+		// The counter is unavailable: retrying is the safe default. A CP-side
+		// Redis outage is transient by nature; dead-lettering on a counter
+		// failure would bury good events under an infrastructure blip.
+		h.logger.Error("minio event: failure counter unavailable; requesting retry",
+			zap.String("dedup_key", identity), zap.Error(err))
+		return true
+	}
+	if !ShouldDeadLetter(count, h.failLimit) {
+		h.logger.Warn("minio event: requesting redelivery",
+			zap.String("dedup_key", identity),
+			zap.Int64("fail_count", count),
+			zap.Int64("fail_limit", h.failLimit),
+		)
+		return true
+	}
+	h.deadLetter(ctx, DeadLetter{
+		DedupKey:   identity,
+		EventName:  rec.EventName,
+		Bucket:     bucket,
+		Key:        key,
+		SizeBytes:  rec.S3.Object.Size,
+		ETag:       rec.S3.Object.ETag,
+		ObservedAt: rec.EventTime,
+		EventSeq:   rec.S3.Object.Sequencer,
+		FailCount:  count,
+		LastError:  indexErr.Error(),
+		Removed:    removed,
+	})
+	// The counter's job is done — the event will not be retried again unless a
+	// fresh copy arrives, and its row refreshes on the same dedup key.
+	h.clearFailCount(ctx, bucket, key, rec)
+	return false
+}
+
+// deadLetter persists one exhausted event. Persistence failure must not
+// change the response: the decision is already made and logged; a failed
+// insert surfaces in logs and metrics, not by pretending to retry again.
+func (h *MinioEventHandler) deadLetter(ctx context.Context, dl DeadLetter) {
+	logDeadLetter(h.logger, dl)
+	if h.dead == nil {
+		return
+	}
+	if err := h.dead.DeadLetter(ctx, dl); err != nil {
+		h.logger.Error("minio event: FAILED to persist dead letter; the event is lost unless it is replayed — check webhook_dead_letters writes",
+			zap.String("dedup_key", dl.DedupKey), zap.Error(err))
+	}
+}
+
+// clearFailCount drops the persistent counter after success. Errors are only
+// logged: a leftover counter makes a future genuine failure dead-letter
+// early, which is the conservative direction (and self-corrects once the
+// event is dead-lettered).
+func (h *MinioEventHandler) clearFailCount(ctx context.Context, bucket, key string, rec minioEventRecord) {
+	if h.fails == nil {
+		return
+	}
+	identity := DeadLetterIdentity(bucket, key, rec.S3.Object.Sequencer)
+	if err := h.fails.ClearFailCount(ctx, DeadLetterRedisKey(identity)); err != nil {
+		h.logger.Warn("minio event: could not clear failure counter",
+			zap.String("dedup_key", identity), zap.Error(err))
+	}
 }
