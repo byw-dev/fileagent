@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"sync"
+	"io"
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
@@ -96,127 +96,93 @@ type WebhookFailStore interface {
 	ClearFailCount(ctx context.Context, identity string) error
 }
 
-// NewRedisWebhookFailStore builds the Redis-backed failure-counter store
-// (production wiring). B1: while Redis is unavailable the store falls back to
-// a bounded in-process per-identity counter so the retry cap stays reachable
-// even during a long Redis outage; entries expire and are dropped once Redis
-// answers again. System-design appendix D pins the CP to a single instance,
-// so process-local counters are safe as a degradation path (Redis remains the
-// durable source once it recovers: every successful Redis op supersedes the
-// fallback count for that identity).
-func NewRedisWebhookFailStore(client *cache.Client) WebhookFailStore {
-	return &redisFailStore{client: client, fallback: make(map[string]*fallbackCounter)}
+// NewRedisWebhookFailStore builds the production failure-counter store:
+// Redis fast path with a PostgreSQL-backed durable fallback (round-2 rework,
+// B-OLD-1 / B-NEW-1). The previous in-process map is gone — the IC-4 card
+// forbids in-process counting ("重启后计数归零，永远到不了上限"), and its
+// capacity eviction could reset an existing identity's count. PostgreSQL is
+// already a required dependency (the dead-letter sink lives there), so the
+// fallback adds no new infrastructure: if PG is ALSO down, the handler's B2
+// fail-closed already answers 5xx and nothing is lost.
+//
+// Merge semantics on Redis recovery (A-1): every successful Redis INCR takes
+// max(redisCount, pgFallbackCount) and writes it back to Redis, so repeated
+// Redis outages can never repeatedly reset the count and postpone the cap.
+func NewRedisWebhookFailStore(client *cache.Client, pg DBTX) WebhookFailStore {
+	return &redisFailStore{client: client, pg: pg}
 }
 
-// fallbackCounterTTL bounds each in-process fallback entry; fallbackCountLimit
-// bounds how many identities the fallback tracks. Both are deliberately
-// generous relative to the default cap window (~30 min): the fallback exists
-// only to survive a Redis outage longer than that, and an unbounded map would
-// trade one unbounded resource for another (B1's requirement is a BOUNDED
-// escape path, not an unbounded one).
-const (
-	fallbackEntryTTL   = 2 * time.Hour
-	fallbackCountLimit = 10000
-)
+// DBTX is the minimal database interface the PG fallback needs (satisfied by
+// *db.Queries); an interface keeps the store unit-testable without a real DB.
+type DBTX interface {
+	IncrWebhookFailCounter(ctx context.Context, dedupKey string) (int64, error)
+	GetWebhookFailCounter(ctx context.Context, dedupKey string) (int64, error)
+	ClearWebhookFailCounter(ctx context.Context, dedupKey string) error
+}
 
-// redisFailStore adapts *cache.Client to WebhookFailStore.
+// redisFailStore: Redis fast path + PostgreSQL durable fallback.
 type redisFailStore struct {
 	client *cache.Client
-
-	// fallback is the B1 escape path: per-identity counters kept ONLY while
-	// Redis is unreachable. Entries expire via fallbackEntryTTL and the map
-	// is capped at fallbackCountLimit entries (oldest-expiry evicted).
-	mu       sync.Mutex
-	fallback map[string]*fallbackCounter
+	pg     DBTX
 }
 
-type fallbackCounter struct {
-	count   int64
-	expires time.Time
-}
-
-// incrFallback advances the in-process counter for one identity, evicting
-// expired entries and enforcing the map cap.
-func (s *redisFailStore) incrFallback(identity string) int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now()
-	if len(s.fallback) >= fallbackCountLimit {
-		// Evict expired entries first; if still full, drop the earliest
-		// expiring entry (single-instance CP: the map is bounded by design).
-		for k, v := range s.fallback {
-			if v.expires.Before(now) {
-				delete(s.fallback, k)
-			}
-		}
-		if len(s.fallback) >= fallbackCountLimit {
-			var oldestKey string
-			var oldest time.Time
-			for k, v := range s.fallback {
-				if oldestKey == "" || v.expires.Before(oldest) {
-					oldest = v.expires
-					oldestKey = k
-				}
-			}
-			if oldestKey != "" {
-				delete(s.fallback, oldestKey)
-			}
-		}
-	}
-	e, ok := s.fallback[identity]
-	if !ok || e.expires.Before(now) {
-		s.fallback[identity] = &fallbackCounter{count: 1, expires: now.Add(fallbackEntryTTL)}
-		return 1
-	}
-	e.count++
-	e.expires = now.Add(fallbackEntryTTL)
-	return e.count
-}
-
-// readFallback returns the in-process count for one identity (0 if absent).
-func (s *redisFailStore) readFallback(identity string) int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.fallback[identity]; ok && e.expires.After(time.Now()) {
-		return e.count
-	}
-	return 0
-}
-
-// dropFallback discards the in-process entry once Redis answers again.
-func (s *redisFailStore) dropFallback(identity string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.fallback, identity)
-}
-
-// IncrFailCount increments the persistent failure counter for the event.
-// Redis ops refresh the sliding TTL (S1); when Redis is down the bounded
-// in-process fallback keeps the count advancing (B1) so the cap stays
-// reachable and the feed cannot be stalled by a broken counter backend.
+// IncrFailCount increments the persistent failure counter for the event:
+// Redis (sliding 7d TTL) first; on Redis failure the count advances in
+// PostgreSQL — durable across CP restarts (B-OLD-1) with no capacity
+// eviction to reset a live identity (B-NEW-1).
 func (s *redisFailStore) IncrFailCount(ctx context.Context, identity string) (int64, error) {
 	count, err := s.client.IncrRefreshTTL(ctx, cache.WebhookFailCountKey(identity), webhookFailCounterTTL)
 	if err == nil {
-		s.dropFallback(identity) // Redis recovered: it supersedes any local count
-		return count, nil
+		return s.mergeRecovered(ctx, identity, count)
 	}
-	return s.incrFallback(identity), nil
+	// Redis unavailable → PostgreSQL counter (persistent).
+	pgCount, pgErr := s.pg.IncrWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
+	if pgErr != nil {
+		// Redis AND PG down → B2 fail-closed territory. Propagate the error so
+		// the handler answers 5xx; the event stays in MinIO's queue.
+		return 0, pgErr
+	}
+	return pgCount, nil
+}
+
+// mergeRecovered implements A-1: on Redis recovery, never let the durable PG
+// progress be silently reset — take the max of both and pin it in Redis.
+// The PG row is cleared afterwards; it will be recreated only if Redis fails
+// again, starting from the merged value.
+func (s *redisFailStore) mergeRecovered(ctx context.Context, identity string, redisCount int64) (int64, error) {
+	pgCount, err := s.pg.GetWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
+	if err != nil || pgCount <= redisCount {
+		return redisCount, nil
+	}
+	// PG has more progress (Redis must have lost key/TTL): pin the larger
+	// value so the cap is not postponed.
+	merged := pgCount
+	if setErr := s.client.Set(ctx, cache.WebhookFailCountKey(identity), merged, webhookFailCounterTTL); setErr != nil {
+		// Couldn't pin in Redis — keep PG as the authority by leaving the row.
+		return merged, nil
+	}
+	_ = s.pg.ClearWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
+	return merged, nil
 }
 
 // FailCount reads the persistent failure counter for the event, falling back
-// to the in-process count while Redis is unavailable.
+// to the PostgreSQL count while Redis is unavailable.
 func (s *redisFailStore) FailCount(ctx context.Context, identity string) (int64, error) {
 	count, err := s.client.GetInt64(ctx, cache.WebhookFailCountKey(identity))
 	if err == nil {
 		return count, nil
 	}
-	return s.readFallback(identity), nil
+	pgCount, pgErr := s.pg.GetWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
+	if pgErr != nil {
+		return 0, pgErr
+	}
+	return pgCount, nil
 }
 
 // ClearFailCount drops the counter after a durable verdict (dead letter
-// stored or delivery succeeded).
+// stored or delivery succeeded): both Redis and the PG fallback row.
 func (s *redisFailStore) ClearFailCount(ctx context.Context, identity string) error {
-	s.dropFallback(identity)
+	_ = s.pg.ClearWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
 	return s.client.Del(ctx, cache.WebhookFailCountKey(identity))
 }
 
@@ -257,12 +223,47 @@ func DeadLetterRedisKey(identity string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// maxWebhookParseBytes is the parse-time body cap (B-NEW-2, PR #110 round-2
+// review). It must be far above any legitimate MinIO notification: an envelope
+// with a few thousand records and metadata stays in the tens of KiB, so 8MiB
+// leaves a >100x margin while still bounding a hostile body. Reading cap+1
+// distinguishes oversized from malformed — a silently truncated prefix is
+// never treated as a complete payload. Configurable via WEBHOOK_MAX_PARSE_BYTES
+// for deployments with genuinely larger envelopes.
+const maxWebhookParseBytes = 8 << 20
+
 // maxDeadLetterPayloadBytes caps how much raw body is captured for the
-// unparseable-payload dead letter (S2). Large enough for any plausible MinIO
-// notification; small enough that a hostile 100MB garbage body cannot blow up
-// a dead-letter row. Bodies larger than this are truncated at the cap (the
-// captured prefix is still enough to identify and hand-replay the source).
+// unparseable-payload dead letter (S2). Independent from the parse cap
+// (B-NEW-2 item 4): large enough for any plausible single-record notification,
+// smaller than the parse cap so a hostile 100MB garbage body cannot blow up a
+// dead-letter row. Bodies larger than this are captured truncated, with the
+// DeadLetter.Truncated flag set — the dedup hash is computed over the FULL
+// body elsewhere, so identity is unaffected by the capture cap.
 const maxDeadLetterPayloadBytes = 64 << 10
+
+// readBodyCapped reads at most cap bytes and reports whether the body was
+// LARGER than cap (detected by reading cap+1 bytes — io.LimitReader alone
+// silently returns a prefix, which is exactly the bug B-NEW-2 closed).
+func readBodyCapped(r io.Reader, cap int64) (body []byte, oversized bool, err error) {
+	full, err := io.ReadAll(io.LimitReader(r, cap+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(full)) > cap {
+		return full[:cap], true, nil
+	}
+	return full, false, nil
+}
+
+// captureRawPayload bounds the raw bytes stored in a dead letter: full body
+// when it fits, otherwise a prefix (the Truncated flag marks it; the dedup
+// hash is computed over the full body, so identity is unaffected).
+func captureRawPayload(raw []byte) string {
+	if int64(len(raw)) <= maxDeadLetterPayloadBytes {
+		return string(raw)
+	}
+	return string(raw[:maxDeadLetterPayloadBytes])
+}
 
 // hashPayload derives the dedup key component for an unparseable payload:
 // deterministic, bounded, and distinct per distinct bad payload (S2 — a fixed
@@ -301,13 +302,20 @@ type DeadLetter struct {
 	LastError string
 	// RawPayload carries the raw request bytes for payloads that could not be
 	// parsed (S2) so an operator can replay them; bounded by
-	// maxDeadLetterPayloadBytes. Nil for events whose structured fields were
-	// decoded fine — those rows carry everything needed for replay in the
-	// typed columns. Trade-off note (S2): the raw webhook body may contain
-	// object keys (customer data by construction — this system's whole
-	// purpose is storing them), no credentials; the DB already holds
-	// storage_path values, so the marginal exposure is the payload envelope.
+	// maxDeadLetterPayloadBytes (Truncated marks a prefix-only capture).
+	// Sensitive-content note (S3, PR #110 round-2 review): a standard MinIO/S3
+	// notification envelope can carry MORE than object keys — userIdentity
+	// (principal ids), requestParameters (source IP, principal), request/host
+	// IDs and other operational metadata. None are credentials, but they ARE
+	// operational metadata: table access must follow the same DB access
+	// controls as the rest of the index schema; rows are cleared on redrive
+	// (DeleteDeadLetter) or by the operator; and the raw value must NEVER be
+	// emitted into logs — log only the dedup key and its length.
 	RawPayload string
+	// Truncated marks dead letters whose stored RawPayload is only a prefix of
+	// the real body (B-NEW-2 item 4: raw capture is decoupled from the parse
+	// cap; the dedup hash is over the FULL body, so identity is unaffected).
+	Truncated bool
 	// Removed marks ObjectRemoved dead letters (d): a lost delete is a
 	// "PG has / MinIO hasn't" divergence that reconciliation cannot self-heal
 	// (deletes never advance the shard-activity signal), so the future redrive
@@ -350,7 +358,8 @@ func (s *dbDeadLetterSink) DeadLetter(ctx context.Context, dl DeadLetter) error 
 		FailCount:  int32(dl.FailCount),
 		LastError:  sql.NullString{String: dl.LastError, Valid: dl.LastError != ""},
 		Active:     dl.Removed,
-		RawPayload: sql.NullString{String: dl.RawPayload, Valid: dl.RawPayload != ""},
+		RawPayload:   sql.NullString{String: dl.RawPayload, Valid: dl.RawPayload != ""},
+		RawTruncated: dl.Truncated,
 	})
 }
 

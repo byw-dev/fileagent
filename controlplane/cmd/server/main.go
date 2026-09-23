@@ -261,7 +261,7 @@ func main() {
 	// Together with the retry cap they form the poison-pill guard: an event
 	// that keeps failing is retried (5xx) until the cap, then dead-lettered
 	// and answered 200 so MinIO's head-of-line queue is freed.
-	webhookFails := handler.NewRedisWebhookFailStore(redisClient)
+	webhookFails := handler.NewRedisWebhookFailStore(redisClient, queries)
 	webhookDeadLetters := handler.NewDBDeadLetterSink(queries)
 
 	// ── Build HTTP router ────────────────────────────────────────────────────

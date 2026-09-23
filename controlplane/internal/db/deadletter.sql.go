@@ -8,7 +8,17 @@ package db
 import (
 	"context"
 	"database/sql"
+	"time"
 )
+
+const clearWebhookFailCounter = `-- name: ClearWebhookFailCounter :exec
+DELETE FROM webhook_fail_counters WHERE dedup_key = $1
+`
+
+func (q *Queries) ClearWebhookFailCounter(ctx context.Context, dedupKey string) error {
+	_, err := q.db.ExecContext(ctx, clearWebhookFailCounter, dedupKey)
+	return err
+}
 
 const countDeadLetters = `-- name: CountDeadLetters :one
 SELECT count(*) FROM webhook_dead_letters
@@ -30,16 +40,59 @@ func (q *Queries) DeleteDeadLetter(ctx context.Context, dedupKey string) error {
 	return err
 }
 
+const deleteStaleWebhookFailCounters = `-- name: DeleteStaleWebhookFailCounters :execrows
+DELETE FROM webhook_fail_counters WHERE updated_at < $1::timestamptz
+`
+
+func (q *Queries) DeleteStaleWebhookFailCounters(ctx context.Context, before time.Time) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteStaleWebhookFailCounters, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const getWebhookFailCounter = `-- name: GetWebhookFailCounter :one
+SELECT count FROM webhook_fail_counters WHERE dedup_key = $1
+`
+
+func (q *Queries) GetWebhookFailCounter(ctx context.Context, dedupKey string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, getWebhookFailCounter, dedupKey)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const incrWebhookFailCounter = `-- name: IncrWebhookFailCounter :one
+
+INSERT INTO webhook_fail_counters (dedup_key, count, updated_at)
+VALUES ($1, 1, now())
+ON CONFLICT (dedup_key) DO UPDATE SET
+    count      = webhook_fail_counters.count + 1,
+    updated_at = now()
+RETURNING count
+`
+
+// IC-4a round-2 rework (B-OLD-1/B-NEW-1): PostgreSQL-backed failure counters —
+// the durable fallback when Redis is unavailable (CP restarts must not reset
+// the count; the previous in-process map violated the IC-4 (b) constraint).
+func (q *Queries) IncrWebhookFailCounter(ctx context.Context, dedupKey string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, incrWebhookFailCounter, dedupKey)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const upsertDeadLetter = `-- name: UpsertDeadLetter :one
 
 INSERT INTO webhook_dead_letters (
     dedup_key, event_name, bucket, key,
     size_bytes, etag, observed_at, event_seq,
-    fail_count, last_error, active, raw_payload
+    fail_count, last_error, active, raw_payload, raw_truncated
 ) VALUES (
     $1, $2, $3, $4,
     $5, $6, $7, $8,
-    $9, $10, $11, $12
+    $9, $10, $11, $12, $13
 )
 ON CONFLICT (dedup_key) DO UPDATE SET
     event_name  = EXCLUDED.event_name,
@@ -53,23 +106,25 @@ ON CONFLICT (dedup_key) DO UPDATE SET
     last_error  = EXCLUDED.last_error,
     active      = EXCLUDED.active,
     raw_payload = EXCLUDED.raw_payload,
+    raw_truncated = EXCLUDED.raw_truncated,
     updated_at  = now()
-RETURNING id, dedup_key, event_name, bucket, key, size_bytes, etag, observed_at, event_seq, fail_count, last_error, active, created_at, updated_at, raw_payload
+RETURNING id, dedup_key, event_name, bucket, key, size_bytes, etag, observed_at, event_seq, fail_count, last_error, active, created_at, updated_at, raw_payload, raw_truncated
 `
 
 type UpsertDeadLetterParams struct {
-	DedupKey   string         `db:"dedup_key" json:"dedup_key"`
-	EventName  string         `db:"event_name" json:"event_name"`
-	Bucket     string         `db:"bucket" json:"bucket"`
-	Key        string         `db:"key" json:"key"`
-	SizeBytes  int64          `db:"size_bytes" json:"size_bytes"`
-	Etag       sql.NullString `db:"etag" json:"etag"`
-	ObservedAt sql.NullTime   `db:"observed_at" json:"observed_at"`
-	EventSeq   sql.NullString `db:"event_seq" json:"event_seq"`
-	FailCount  int32          `db:"fail_count" json:"fail_count"`
-	LastError  sql.NullString `db:"last_error" json:"last_error"`
-	Active     bool           `db:"active" json:"active"`
-	RawPayload sql.NullString `db:"raw_payload" json:"raw_payload"`
+	DedupKey     string         `db:"dedup_key" json:"dedup_key"`
+	EventName    string         `db:"event_name" json:"event_name"`
+	Bucket       string         `db:"bucket" json:"bucket"`
+	Key          string         `db:"key" json:"key"`
+	SizeBytes    int64          `db:"size_bytes" json:"size_bytes"`
+	Etag         sql.NullString `db:"etag" json:"etag"`
+	ObservedAt   sql.NullTime   `db:"observed_at" json:"observed_at"`
+	EventSeq     sql.NullString `db:"event_seq" json:"event_seq"`
+	FailCount    int32          `db:"fail_count" json:"fail_count"`
+	LastError    sql.NullString `db:"last_error" json:"last_error"`
+	Active       bool           `db:"active" json:"active"`
+	RawPayload   sql.NullString `db:"raw_payload" json:"raw_payload"`
+	RawTruncated bool           `db:"raw_truncated" json:"raw_truncated"`
 }
 
 // IC-4a: dead-letter storage for MinIO webhook events that exhausted the
@@ -89,6 +144,7 @@ func (q *Queries) UpsertDeadLetter(ctx context.Context, arg UpsertDeadLetterPara
 		arg.LastError,
 		arg.Active,
 		arg.RawPayload,
+		arg.RawTruncated,
 	)
 	var i WebhookDeadLetter
 	err := row.Scan(
@@ -107,6 +163,7 @@ func (q *Queries) UpsertDeadLetter(ctx context.Context, arg UpsertDeadLetterPara
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.RawPayload,
+		&i.RawTruncated,
 	)
 	return &i, err
 }

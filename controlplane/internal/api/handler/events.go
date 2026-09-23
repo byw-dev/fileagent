@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -870,14 +869,44 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 	}
 
 	var payload minioS3Event
-	// Read the raw body (bounded) BEFORE binding: the parse-failure dead letter
-	// (S2) must carry the bytes that failed to parse so an operator can replay
-	// them, and the dedup key is the payload hash — a fixed string would make
-	// different bad payloads overwrite each other's row.
-	raw, readErr := io.ReadAll(io.LimitReader(c.Request.Body, maxDeadLetterPayloadBytes))
+	// Read the full body with an explicit oversized check (B-NEW-2, PR #110
+	// round-2 review): io.LimitReader at the capture cap silently returned a
+	// prefix, so a VALID large payload was truncated into a parse error,
+	// dead-lettered and answered 200 — a silent data-loss path. Reading
+	// limit+1 distinguishes the two: body ≤ maxWebhookParseBytes is parsed
+	// normally (valid large payloads index fine); anything over the parse cap
+	// is answered 5xx (MinIO redelivers; the operator raises the cap or the
+	// event is handled manually) — never a silent 200. The dedup hash is
+	// computed over the FULL body. Raw capture for the dead letter has its
+	// own smaller cap and a truncated flag (see captureRawPayload).
+	raw, oversized, readErr := readBodyCapped(c.Request.Body, maxWebhookParseBytes)
 	if readErr != nil {
 		h.logger.Error("minio event: failed to read request body; requesting redelivery",
 			zap.Error(readErr))
+		c.Status(http.StatusInternalServerError)
+		return
+	}
+	if oversized {
+		// Explicit terminal state for oversized payloads: NOT a silent 200.
+		// 5xx keeps the event in MinIO's queue; the operator either raises
+		// WEBHOOK_MAX_PARSE_BYTES (deployments whose envelopes genuinely exceed
+		// the default) or handles the event manually. The dead letter records
+		// what happened, with the truncated prefix stored for identification.
+		h.logger.Error("minio event: payload exceeds the parse cap; dead-lettering with truncated capture and answering 5xx — raise WEBHOOK_MAX_PARSE_BYTES if this is legitimate",
+			zap.Int("parse_cap", maxWebhookParseBytes),
+			zap.Int("captured_prefix_len", len(raw)))
+		dl := DeadLetter{
+			DedupKey:   "oversized:" + HashPayload(raw),
+			EventName:  "oversized",
+			FailCount:  1,
+			LastError:  "payload exceeds WEBHOOK_MAX_PARSE_BYTES",
+			RawPayload: string(raw),
+			Truncated:  true,
+		}
+		if err := h.deadLetter(c.Request.Context(), dl); err != nil {
+			c.Status(http.StatusInternalServerError)
+			return
+		}
 		c.Status(http.StatusInternalServerError)
 		return
 	}
@@ -895,7 +924,8 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 			EventName:  "unknown",
 			FailCount:  1,
 			LastError:  err.Error(),
-			RawPayload: string(raw),
+			RawPayload: captureRawPayload(raw),
+			Truncated:  len(raw) > maxDeadLetterPayloadBytes,
 		}
 		if err := h.deadLetter(c.Request.Context(), dl); err != nil {
 			c.Status(http.StatusInternalServerError)

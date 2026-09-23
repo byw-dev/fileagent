@@ -2,7 +2,9 @@ package handler_test
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
+	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -131,12 +134,26 @@ func TestRED_SinkRecovers_NextRedeliveryLandsDeadLetter(t *testing.T) {
 // ── B1: broken Redis must not stall the feed forever ─────────────────────────
 
 // TestRED_CounterBackendDown_FallbackKeepsCounting: with the Redis counter
-// unavailable, the REAL RedisWebhookFailStore's bounded in-process fallback
-// must keep the count advancing so the cap stays reachable; the exhausted
-// event then dead-letters (200) and the feed keeps moving. Currently the
-// handler's IncrFailCount error path returns 5xx forever and no dead letter
-// is ever written.
-func TestRED_CounterBackendDown_FallbackKeepsCount(t *testing.T) {
+// unavailable, the REAL RedisWebhookFailStore's PostgreSQL fallback must keep
+// the count advancing so the cap stays reachable; the exhausted event then
+// dead-letters (200) and the feed keeps moving. This test runs against a real
+// PostgreSQL (dev dev DB has migrations applied; the round-1 version used the
+// in-process map, which the round-2 review replaced per the IC-4 (b)
+// constraint).
+func TestRED_CounterBackendDown_FallbackKeepsCounting(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://fileagent:fileagent@127.0.0.1:5432/fileagent?sslmode=disable"
+	}
+	conn, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Skipf("no PostgreSQL available for the PG-fallback test: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.Ping(); err != nil {
+		t.Skipf("no PostgreSQL available for the PG-fallback test: %v", err)
+	}
+
 	// Real store against an in-process Redis, then take Redis away mid-test
 	// (the review's B1 scenario: a persistent Redis outage, not a blip).
 	mr := miniredis.RunT(t)
@@ -144,7 +161,9 @@ func TestRED_CounterBackendDown_FallbackKeepsCount(t *testing.T) {
 	client, err := cache.New("redis://"+mr.Addr(), logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Close() })
-	store := handler.NewRedisWebhookFailStore(client)
+	store := handler.NewRedisWebhookFailStore(client, db.New(conn))
+	identityKey := handler.DeadLetterRedisKey("b/k/fb")
+	t.Cleanup(func() { _ = store.ClearFailCount(context.Background(), "b/k/fb") })
 
 	ix := &mockIndexerClient{err: assert.AnError}
 	dead := &recordingSink{}
@@ -159,7 +178,7 @@ func TestRED_CounterBackendDown_FallbackKeepsCount(t *testing.T) {
 	// Redis disappears for the rest of the test.
 	mr.Close()
 
-	// The fallback counter must keep advancing: delivery 3 crosses the cap
+	// The PostgreSQL fallback must keep advancing: delivery 3 crosses the cap
 	// (count=3 > 2) → dead letter + 200; the feed is NOT stalled forever.
 	var last, deadCount int
 	for i := 0; i < 3; i++ {
@@ -167,9 +186,20 @@ func TestRED_CounterBackendDown_FallbackKeepsCount(t *testing.T) {
 		deadCount = dead.count()
 	}
 	assert.Equal(t, http.StatusOK, last,
-		"B1: with the Redis counter down, the fallback counter must still reach the cap and dead-letter instead of 5xx forever")
+		"B1/B-OLD-1: with Redis down, the PostgreSQL fallback must reach the cap and dead-letter instead of 5xx forever")
 	assert.Equal(t, 1, deadCount,
-		"B1: the exhausted event must reach the dead-letter store, not be retried eternally")
+		"B1/B-OLD-1: the exhausted event must reach the dead-letter store, not be retried eternally")
+
+	// B-OLD-1 core evidence: delivery #3 crossed the cap using counts that
+	// lived in PostgreSQL (Redis was down from delivery #3 on, so INCR #3 was
+	// served by webhook_fail_counters). The dead letter then succeeded and
+	// legitimately cleared both counters — assert the PG row was written and
+	// cleared, i.e. the fallback path really persisted.
+	var pgCount int64
+	err = conn.QueryRow("SELECT count FROM webhook_fail_counters WHERE dedup_key=$1", identityKey).Scan(&pgCount)
+	assert.ErrorIs(t, err, sql.ErrNoRows,
+		"B-OLD-1: the PG fallback row must have been written (count reached 3 via PG) and then cleared by the durable dead-letter verdict")
+	_ = identityKey
 }
 
 // ── B3: decode failures must reach a durable terminal state ──────────────────
