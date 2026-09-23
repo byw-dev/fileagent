@@ -247,3 +247,56 @@ func TestRED_DecodeFailure_OverCap_DeadLetter200(t *testing.T) {
 }
 
 var _ = time.Now // retained for tag-stability of the test file
+
+// TestMergeRecovered_TakesMax pins A-1 through the public API: with PG
+// holding more progress than Redis (Redis lost its key/TTL during an outage),
+// the next Redis-recovered increment must adopt the LARGER value — repeated
+// Redis outages can never repeatedly reset the count and postpone the cap.
+func TestMergeRecovered_TakesMax(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://fileagent:fileagent@127.0.0.1:5432/fileagent?sslmode=disable"
+	}
+	conn, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Skipf("no PostgreSQL available: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.Ping(); err != nil {
+		t.Skipf("no PostgreSQL available: %v", err)
+	}
+	q := db.New(conn)
+	identity := "b/k/mergemax"
+	t.Cleanup(func() {
+		_ = q.ClearWebhookFailCounter(context.Background(), handler.DeadLetterRedisKey(identity))
+	})
+
+	mr := miniredis.RunT(t)
+	logger, _ := zap.NewDevelopment()
+	client, err := cache.New("redis://"+mr.Addr(), logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	store := handler.NewRedisWebhookFailStore(client, q)
+
+	// Simulate the outage's aftermath: Redis holds a low count (key survived
+	// at 1), PG holds the higher durable progress (5).
+	_, err = store.IncrFailCount(context.Background(), identity) // Redis=1, PG row cleared by merge
+	require.NoError(t, err)
+	_, err = q.IncrWebhookFailCounter(context.Background(), handler.DeadLetterRedisKey(identity)) // PG=1
+	require.NoError(t, err)
+	_, err = q.IncrWebhookFailCounter(context.Background(), handler.DeadLetterRedisKey(identity)) // PG=2
+	require.NoError(t, err)
+	_, err = q.IncrWebhookFailCounter(context.Background(), handler.DeadLetterRedisKey(identity)) // PG=3
+	require.NoError(t, err)
+	_, err = q.IncrWebhookFailCounter(context.Background(), handler.DeadLetterRedisKey(identity)) // PG=4
+	require.NoError(t, err)
+
+	// Redis-recovers increment: Redis INCR makes its count 2, but PG holds 4
+	// (the durable progress). A-1: the merged value must be max(2, 4) = 4 —
+	// adopting the raw Redis count (2) would RESET the durable progress and
+	// postpone the cap on every Redis outage.
+	count, err := store.IncrFailCount(context.Background(), identity)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), count,
+		"A-1: merge must take max(redis, pg) — the durable PG progress (4) must not be reset by a stale Redis count (2)")
+}

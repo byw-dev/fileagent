@@ -89,3 +89,45 @@ func TestRED_BNEW2_DistinctLargePayloads_DistinctHashes(t *testing.T) {
 	assert.NotEqual(t, h1, h2,
 		"B-NEW-2: the dedup hash must be computed over the FULL body, not a 64KiB prefix (two payloads sharing a prefix would overwrite each other's dead letter)")
 }
+
+// TestOversizedPayload_DeadLetterAnd5xx: a payload exceeding the parse cap
+// must be explicitly terminal — dead-lettered (truncated capture, flagged)
+// and answered 5xx so MinIO redelivers — NEVER silently parsed or 200'd.
+// This is the mutant-killing companion to the oversized detection guard
+// (M13): without the limit+1 check, an oversized body would be truncated and
+// parsed/acknowledged like any normal payload.
+func TestOversizedPayload_DeadLetterAnd5xx(t *testing.T) {
+	ix := &mockIndexerClient{}
+	fails := newCountingFailStore()
+	dead := &recordingSink{}
+	h := ic4aHandler(ix, fails, dead, 5)
+
+	// Build a body larger than maxWebhookParseBytes (8MiB).
+	filler := strings.Repeat("z", 9<<20)
+	body := `{"filler":"` + filler + `","Records":[]}`
+	require.Greater(t, int64(len(body)), handler.MaxWebhookParseBytesForTest())
+
+	w := postIC4A(t, h, body)
+	assert.Equal(t, http.StatusInternalServerError, w.Code,
+		"oversized payload must be answered 5xx (kept in MinIO's queue), never a silent 200")
+	assert.False(t, ix.called, "oversized payload must not be parsed/indexed")
+	require.Equal(t, 1, dead.count(), "oversized payload must land a dead letter recording the event")
+	dl := dead.last()
+	assert.Equal(t, "oversized", dl.EventName)
+	assert.True(t, dl.Truncated, "the raw capture of an oversized body must be flagged truncated")
+}
+
+// TestOversizedPayload_SinkFailure_Still5xx: the B2 rule applies to oversized
+// dead letters too — persist failure keeps the 5xx.
+func TestOversizedPayload_SinkFailure_Still5xx(t *testing.T) {
+	ix := &mockIndexerClient{}
+	fails := newCountingFailStore()
+	dead := &flakySink{fail: true}
+	h := ic4aHandlerDead(ix, fails, dead, 5)
+
+	filler := strings.Repeat("z", 9<<20)
+	body := `{"filler":"` + filler + `","Records":[]}`
+	w := postIC4A(t, h, body)
+	assert.Equal(t, http.StatusInternalServerError, w.Code,
+		"oversized + sink failure must still be 5xx (B2: no silent 200)")
+}

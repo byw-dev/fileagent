@@ -248,6 +248,10 @@ const maxWebhookParseBytes = 8 << 20
 // body elsewhere, so identity is unaffected by the capture cap.
 const maxDeadLetterPayloadBytes = 64 << 10
 
+// MaxWebhookParseBytesForTest exposes the parse cap for tests (unexported
+// consts can't be referenced from handler_test).
+func MaxWebhookParseBytesForTest() int64 { return maxWebhookParseBytes }
+
 // readBodyCapped reads at most cap bytes and reports whether the body was
 // LARGER than cap (detected by reading cap+1 bytes — io.LimitReader alone
 // silently returns a prefix, which is exactly the bug B-NEW-2 closed).
@@ -354,17 +358,17 @@ type dbDeadLetterSink struct {
 // event refreshes the row instead of duplicating it).
 func (s *dbDeadLetterSink) DeadLetter(ctx context.Context, dl DeadLetter) error {
 	return s.store.UpsertDeadLetterWrap(ctx, db.UpsertDeadLetterParams{
-		DedupKey:   dl.DedupKey,
-		EventName:  dl.EventName,
-		Bucket:     dl.Bucket,
-		Key:        dl.Key,
-		SizeBytes:  dl.SizeBytes,
-		Etag:       sql.NullString{String: dl.ETag, Valid: dl.ETag != ""},
-		ObservedAt: sql.NullTime{Time: dl.ObservedAt, Valid: !dl.ObservedAt.IsZero()},
-		EventSeq:   sql.NullString{String: dl.EventSeq, Valid: dl.EventSeq != ""},
-		FailCount:  int32(dl.FailCount),
-		LastError:  sql.NullString{String: dl.LastError, Valid: dl.LastError != ""},
-		Active:     dl.Removed,
+		DedupKey:     dl.DedupKey,
+		EventName:    dl.EventName,
+		Bucket:       dl.Bucket,
+		Key:          dl.Key,
+		SizeBytes:    dl.SizeBytes,
+		Etag:         sql.NullString{String: dl.ETag, Valid: dl.ETag != ""},
+		ObservedAt:   sql.NullTime{Time: dl.ObservedAt, Valid: !dl.ObservedAt.IsZero()},
+		EventSeq:     sql.NullString{String: dl.EventSeq, Valid: dl.EventSeq != ""},
+		FailCount:    int32(dl.FailCount),
+		LastError:    sql.NullString{String: dl.LastError, Valid: dl.LastError != ""},
+		Active:       dl.Removed,
 		RawPayload:   sql.NullString{String: dl.RawPayload, Valid: dl.RawPayload != ""},
 		RawTruncated: dl.Truncated,
 	})

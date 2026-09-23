@@ -89,13 +89,20 @@ mutate_and_test "M8_deadLetter_swallow" controlplane/internal/api/handler/events
 
 # M9 (B1): the in-process fallback is the guard against counter-backend
 # outages; removing it would be killed by the B1 red test.
-mutate_and_test "M9_fallback_disabled" controlplane/internal/api/handler/webhook_policy.go \
-  'return s.incrFallback(identity), nil' \
-  'return 0, err' \
-  "TestRED_CounterBackendDown_FallbackKeepsCount"
+# M9 (B2, oversized variant): the oversized dead letter must be gated on
+# durable persistence too — swallowing the sink error would answer 200 and
+# silently lose the event. Killed by TestOversizedPayload_SinkFailure_Still5xx.
+mutate_and_test "M9_oversized_persist_gate" controlplane/internal/api/handler/events.go \
+  '		if err := h.deadLetter(c.Request.Context(), dl); err != nil {
+			c.Status(http.StatusInternalServerError)
+			return
+		}
+		c.Status(http.StatusInternalServerError)
+		return' \
+  '		c.Status(http.StatusOK)
+		return' \
+  "TestOversizedPayload_SinkFailure_Still5xx"
 
-# M10 (B3): decode errors must enter the counted state machine. Bypassing it
-# (direct dead letter + 5xx, the pre-rework behaviour) is killed by the B3 pair.
 mutate_and_test "M10_decode_bypass_counting" controlplane/internal/api/handler/events.go \
   'if h.handleIndexFailure(c.Request.Context(), bucket, rec.S3.Object.Key, rec, err) {
 				failed = true
@@ -109,6 +116,30 @@ mutate_and_test "M11_fixed_hash" controlplane/internal/api/handler/events.go \
   '"unparseable:" + HashPayload(raw)' \
   '"unparseable:fixed"' \
   "TestIC4A_UnparseablePayload_DistinctPayloadsDoNotOverwrite|TestIC4A_UnparseablePayload_DeadLetter200"
+
+# M12 (B-OLD-1): the PG fallback is the durable counter layer. Mutating
+# IncrFailCount to return an error when Redis fails (i.e. dropping the PG
+# path) would be killed by the B-OLD-1 test.
+mutate_and_test "M12_pg_fallback_dropped" controlplane/internal/api/handler/webhook_policy.go \
+  '	pgCount, pgErr := s.pg.IncrWebhookFailCounter(ctx, DeadLetterRedisKey(identity))' \
+  '	return 0, err' \
+  "TestRED_CounterBackendDown_FallbackKeepsCounting"
+
+# M13 (B-NEW-2): oversized detection must exist — removing the limit+1 check
+# (silently truncating) would be killed by the valid-large-payload test.
+mutate_and_test "M13_oversized_detection" controlplane/internal/api/handler/webhook_policy.go \
+  '	if int64(len(full)) > cap {
+		return full[:cap], true, nil
+	}' \
+  '	if false {
+		return full[:cap], true, nil
+	}' \
+  "TestOversizedPayload_DeadLetterAnd5xx"
+
+mutate_and_test "M14_merge_max" controlplane/internal/api/handler/webhook_policy.go \
+  '	merged := pgCount' \
+  '	merged := redisCount' \
+  "TestMergeRecovered_TakesMax"
 
 echo "----"
 echo "killed=$PASS survived=$FAIL"

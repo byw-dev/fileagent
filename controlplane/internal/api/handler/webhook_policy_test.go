@@ -363,9 +363,9 @@ func TestIC4A_CounterUnavailable_RetriesSafe(t *testing.T) {
 }
 
 // TestIC4A_DefaultFloorAndBoundary pins the S1 quantities exactly:
-//  - default 600 with the strict `>` ⇒ dead letter on the 601st failure;
-//  - MinWebhookFailLimit=60 is the safety floor (config.Validate rejects
-//    below-floor values; the constructor no longer silently substitutes 600).
+//   - default 600 with the strict `>` ⇒ dead letter on the 601st failure;
+//   - MinWebhookFailLimit=60 is the safety floor (config.Validate rejects
+//     below-floor values; the constructor no longer silently substitutes 600).
 func TestIC4A_DefaultFloorAndBoundary(t *testing.T) {
 	assert.Equal(t, int64(600), handler.DefaultWebhookFailLimit)
 	assert.Equal(t, int64(60), handler.MinWebhookFailLimit)
