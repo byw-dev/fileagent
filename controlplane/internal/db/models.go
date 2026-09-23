@@ -573,4 +573,5 @@ type WebhookDeadLetter struct {
 	Active     bool           `db:"active" json:"active"`
 	CreatedAt  time.Time      `db:"created_at" json:"created_at"`
 	UpdatedAt  time.Time      `db:"updated_at" json:"updated_at"`
+	RawPayload sql.NullString `db:"raw_payload" json:"raw_payload"`
 }

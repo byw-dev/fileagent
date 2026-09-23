@@ -303,8 +303,9 @@ func TestIC4A_CreationDeadLetter_NotRemoved(t *testing.T) {
 }
 
 // TestIC4A_UnparseablePayload_DeadLetter200: a payload that cannot be parsed
-// at all is dead-lettered immediately and answered 200 — there is no identity
-// to count under, and 4xx would be retried by MinIO just like 5xx.
+// at all is dead-lettered under its PAYLOAD HASH (S2: distinct bad payloads
+// get distinct rows carrying the raw bytes — no fixed string, no mutual
+// overwrite) and answered 200 once the dead letter is durably stored.
 func TestIC4A_UnparseablePayload_DeadLetter200(t *testing.T) {
 	ix := &mockIndexerClient{}
 	fails := newCountingFailStore()
@@ -314,8 +315,36 @@ func TestIC4A_UnparseablePayload_DeadLetter200(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, 0, fails.totalIncrements(), "no identity → nothing to count")
 	require.Equal(t, 1, dead.count())
-	assert.Equal(t, "unparseable-payload", dead.last().DedupKey)
+	dl := dead.last()
+	assert.Equal(t, "unparseable:"+handler.HashPayload([]byte("not-json-at-all")), dl.DedupKey)
+	assert.Equal(t, "not-json-at-all", dl.RawPayload, "the raw bytes must be stored for replay (S2)")
 	assert.False(t, ix.called)
+}
+
+// TestIC4A_UnparseablePayload_DistinctPayloadsDoNotOverwrite: two different
+// bad payloads must produce two distinct dead letters (S2), not upsert each
+// other away under one fixed key.
+func TestIC4A_UnparseablePayload_DistinctPayloadsDoNotOverwrite(t *testing.T) {
+	ix := &mockIndexerClient{}
+	fails := newCountingFailStore()
+	dead := &recordingSink{}
+	h := ic4aHandler(ix, fails, dead, 5)
+	_ = postIC4A(t, h, "garbage-one")
+	_ = postIC4A(t, h, "garbage-two-entirely")
+	require.Equal(t, 2, dead.count(), "distinct bad payloads must not overwrite each other (S2)")
+}
+
+// TestIC4A_UnparseablePayload_SinkFailure_Retries: the parse-failure dead
+// letter is governed by the same B2 rule — sink failure ⇒ 5xx, the event
+// stays in MinIO's queue, nothing is lost silently.
+func TestIC4A_UnparseablePayload_SinkFailure_Retries(t *testing.T) {
+	ix := &mockIndexerClient{}
+	fails := newCountingFailStore()
+	dead := &flakySink{fail: true}
+	h := ic4aHandlerDead(ix, fails, dead, 5)
+	w := postIC4A(t, h, "not-json-at-all")
+	assert.Equal(t, http.StatusInternalServerError, w.Code,
+		"B2 applies to the parse-failure dead letter too: persist failure ⇒ 5xx")
 }
 
 // TestIC4A_CounterUnavailable_RetriesSafe: if the counter backend errors, the

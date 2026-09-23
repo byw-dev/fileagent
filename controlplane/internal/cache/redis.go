@@ -121,11 +121,35 @@ return count
 
 // Incr atomically increments the counter at key and returns its new value.
 // Unlike IncrWithWindow it applies no TTL — the caller owns the counter's
-// lifetime and removes the key explicitly (webhook poison-pill counters,
-// IC-4a ①: a persistent failure count must survive CP restarts, so the key
-// must not silently expire).
+// lifetime and removes the key explicitly. Prefer IncrRefreshTTL when orphan
+// hygiene matters (a caller whose clear step can fail would otherwise leak
+// keys forever).
 func (c *Client) Incr(ctx context.Context, key string) (int64, error) {
 	return c.rdb.Incr(ctx, key).Result()
+}
+
+// incrRefreshTTLScript atomically increments a counter and refreshes its TTL
+// on every increment (sliding expiry). Doing both in one Lua script keeps the
+// key's lifetime pinned to "last failure" rather than "first failure".
+var incrRefreshTTLScript = redis.NewScript(`
+local count = redis.call("INCR", KEYS[1])
+redis.call("EXPIRE", KEYS[1], ARGV[1])
+return count
+`)
+
+// IncrRefreshTTL atomically increments the counter at key and (re)sets its
+// expiry to ttl, so the key expires ttl after the LAST increment rather than
+// the first (sliding window). Used by the webhook failure counters (IC-4a):
+// a delivery loop retries every ~3s, so the TTL must comfortably outlast both
+// the outage window and the operator redrive window; a counter whose owner
+// never reaches a durable verdict still expires instead of leaking forever.
+// The expiry is applied at Redis EXPIRE's whole-second precision; ttl below
+// one second is rejected (an EXPIRE of 0 deletes the key immediately).
+func (c *Client) IncrRefreshTTL(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	if ttl < time.Second {
+		return 0, fmt.Errorf("cache: IncrRefreshTTL requires ttl >= 1s, got %s", ttl)
+	}
+	return incrRefreshTTLScript.Run(ctx, c.rdb, []string{key}, int(ttl/time.Second)).Int64()
 }
 
 // IncrWithWindow atomically increments the fixed-window counter at key and

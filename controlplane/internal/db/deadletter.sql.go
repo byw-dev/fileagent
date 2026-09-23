@@ -35,11 +35,11 @@ const upsertDeadLetter = `-- name: UpsertDeadLetter :one
 INSERT INTO webhook_dead_letters (
     dedup_key, event_name, bucket, key,
     size_bytes, etag, observed_at, event_seq,
-    fail_count, last_error, active
+    fail_count, last_error, active, raw_payload
 ) VALUES (
     $1, $2, $3, $4,
     $5, $6, $7, $8,
-    $9, $10, $11
+    $9, $10, $11, $12
 )
 ON CONFLICT (dedup_key) DO UPDATE SET
     event_name  = EXCLUDED.event_name,
@@ -52,8 +52,9 @@ ON CONFLICT (dedup_key) DO UPDATE SET
     fail_count  = EXCLUDED.fail_count,
     last_error  = EXCLUDED.last_error,
     active      = EXCLUDED.active,
+    raw_payload = EXCLUDED.raw_payload,
     updated_at  = now()
-RETURNING id, dedup_key, event_name, bucket, key, size_bytes, etag, observed_at, event_seq, fail_count, last_error, active, created_at, updated_at
+RETURNING id, dedup_key, event_name, bucket, key, size_bytes, etag, observed_at, event_seq, fail_count, last_error, active, created_at, updated_at, raw_payload
 `
 
 type UpsertDeadLetterParams struct {
@@ -68,11 +69,12 @@ type UpsertDeadLetterParams struct {
 	FailCount  int32          `db:"fail_count" json:"fail_count"`
 	LastError  sql.NullString `db:"last_error" json:"last_error"`
 	Active     bool           `db:"active" json:"active"`
+	RawPayload sql.NullString `db:"raw_payload" json:"raw_payload"`
 }
 
 // IC-4a: dead-letter storage for MinIO webhook events that exhausted the
 // poison-pill retry cap (IC-BUG-6). Redrive is operator-driven; see the
-// migration header and docs/design/consistency-and-ingest.md §3.7.
+// migration header and docs/design/consistency-and-ingest.md §3.6.
 func (q *Queries) UpsertDeadLetter(ctx context.Context, arg UpsertDeadLetterParams) (*WebhookDeadLetter, error) {
 	row := q.db.QueryRowContext(ctx, upsertDeadLetter,
 		arg.DedupKey,
@@ -86,6 +88,7 @@ func (q *Queries) UpsertDeadLetter(ctx context.Context, arg UpsertDeadLetterPara
 		arg.FailCount,
 		arg.LastError,
 		arg.Active,
+		arg.RawPayload,
 	)
 	var i WebhookDeadLetter
 	err := row.Scan(
@@ -103,6 +106,7 @@ func (q *Queries) UpsertDeadLetter(ctx context.Context, arg UpsertDeadLetterPara
 		&i.Active,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.RawPayload,
 	)
 	return &i, err
 }

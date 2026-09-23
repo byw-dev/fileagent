@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 )
 
 // Config holds the complete runtime configuration for the Control Plane.
@@ -214,6 +216,13 @@ func (c *Config) Validate() error {
 	}
 	if c.AgentTokenTTL <= 0 {
 		return errors.New("AGENT_TOKEN_TTL must be a positive duration")
+	}
+	// S1 (PR #110 review): below-floor WEBHOOK_FAIL_LIMIT is a startup failure,
+	// not a silent fallback — limit=1 tolerates ~3s of outage, which would
+	// dead-letter ordinary DB blips and defeat the retry mechanism entirely.
+	if c.WebhookFailLimit < handler.MinWebhookFailLimit {
+		return fmt.Errorf("WEBHOOK_FAIL_LIMIT=%d is below the safety floor %d — a few-second blip would dead-letter events; raise it to exceed (expected outage seconds ÷ 3)",
+			c.WebhookFailLimit, handler.MinWebhookFailLimit)
 	}
 	return nil
 }

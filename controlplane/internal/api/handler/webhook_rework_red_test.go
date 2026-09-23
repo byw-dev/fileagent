@@ -7,9 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
+	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,7 +100,7 @@ func TestRED_SinkFailure_Returns5xx_KeepsCounter(t *testing.T) {
 	n, err := fails.FailCount(context.Background(), redisKeyOf("b/k/sinkdown"))
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), n, "B2: the counter must survive a failed dead-letter persist")
-	assert.Equal(t, 1, dead.count(), "B2: nothing was durably recorded")
+	assert.Equal(t, 0, dead.count(), "B2: nothing was durably recorded while the sink fails")
 }
 
 // TestRED_SinkRecovers_NextRedeliveryLandsDeadLetter: after the sink comes
@@ -128,23 +131,45 @@ func TestRED_SinkRecovers_NextRedeliveryLandsDeadLetter(t *testing.T) {
 // ── B1: broken Redis must not stall the feed forever ─────────────────────────
 
 // TestRED_CounterBackendDown_FallbackKeepsCounting: with the Redis counter
-// unavailable, the bounded in-process fallback must keep the count advancing
-// so the cap stays reachable; the exhausted event then dead-letters (200) and
-// the feed keeps moving. Currently: 5xx forever, no dead letter ever.
+// unavailable, the REAL RedisWebhookFailStore's bounded in-process fallback
+// must keep the count advancing so the cap stays reachable; the exhausted
+// event then dead-letters (200) and the feed keeps moving. Currently the
+// handler's IncrFailCount error path returns 5xx forever and no dead letter
+// is ever written.
 func TestRED_CounterBackendDown_FallbackKeepsCount(t *testing.T) {
-	ix := &mockIndexerClient{err: assert.AnError}
-	fails := newCountingFailStore()
-	fails.incrErr = assert.AnError // Redis down for the whole test
-	dead := &recordingSink{}
-	h := ic4aHandler(ix, fails, dead, 2)
+	// Real store against an in-process Redis, then take Redis away mid-test
+	// (the review's B1 scenario: a persistent Redis outage, not a blip).
+	mr := miniredis.RunT(t)
+	logger, _ := zap.NewDevelopment()
+	client, err := cache.New("redis://"+mr.Addr(), logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	store := handler.NewRedisWebhookFailStore(client)
 
-	var last int
-	for i := 0; i < 4; i++ {
-		last = postIC4A(t, h, eventWithSequencer("s3:ObjectCreated:Put", "b", "k", "reddown", 1)).Code
+	ix := &mockIndexerClient{err: assert.AnError}
+	dead := &recordingSink{}
+	h := handler.NewMinioEventHandlerWithPolicy(ix, testWebhookSecret, store, dead, 2, newTestLogger())
+
+	// Sanity: while Redis is up, counting works (2 rounds, both 5xx).
+	require.Equal(t, http.StatusInternalServerError,
+		postIC4A(t, h, eventWithSequencer("s3:ObjectCreated:Put", "b", "k", "fb", 1)).Code)
+	require.Equal(t, http.StatusInternalServerError,
+		postIC4A(t, h, eventWithSequencer("s3:ObjectCreated:Put", "b", "k", "fb", 1)).Code)
+
+	// Redis disappears for the rest of the test.
+	mr.Close()
+
+	// The fallback counter must keep advancing: delivery 3 crosses the cap
+	// (count=3 > 2) → dead letter + 200; the feed is NOT stalled forever.
+	var last, deadCount int
+	for i := 0; i < 3; i++ {
+		last = postIC4A(t, h, eventWithSequencer("s3:ObjectCreated:Put", "b", "k", "fb", 1)).Code
+		deadCount = dead.count()
 	}
 	assert.Equal(t, http.StatusOK, last,
 		"B1: with the Redis counter down, the fallback counter must still reach the cap and dead-letter instead of 5xx forever")
-	assert.Equal(t, 1, dead.count(), "B1: the exhausted event must reach the dead-letter store, not be retried eternally")
+	assert.Equal(t, 1, deadCount,
+		"B1: the exhausted event must reach the dead-letter store, not be retried eternally")
 }
 
 // ── B3: decode failures must reach a durable terminal state ──────────────────

@@ -85,15 +85,17 @@ func TestDeadLetterUpsertMutation(t *testing.T) {
 	assert.Equal(t, 1, n, "a re-drowned event must not duplicate its dead letter")
 	assert.Equal(t, int32(9), row2.FailCount)
 
-	// 3. (d) removed flag round-trips
+	// 3. (d) removed flag + raw payload (S2) round-trip
 	removed := base
 	removed.DedupKey = "b1/k1/seq-2"
 	removed.EventName = "s3:ObjectRemoved:Delete"
 	removed.Active = true
+	removed.RawPayload = sql.NullString{String: "raw-bytes", Valid: true}
 	row3, err := q.UpsertDeadLetter(ctx, removed)
 	require.NoError(t, err)
 	assert.True(t, row3.Active, "ObjectRemoved dead letters must carry the force-active flag")
 	assert.Equal(t, "s3:ObjectRemoved:Delete", row3.EventName)
+	assert.Equal(t, "raw-bytes", row3.RawPayload.String, "the raw payload must round-trip (S2)")
 	var seq sql.NullString
 	require.NoError(t, tx.QueryRowContext(ctx, "SELECT event_seq FROM webhook_dead_letters WHERE dedup_key=$1", "b1/k1/seq-2").Scan(&seq))
 
