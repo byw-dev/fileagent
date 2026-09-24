@@ -147,7 +147,7 @@ jobs:
       # 且客户端与服务端版本天然一致，不会各自漂移。
       - name: Install mc (extract from the pinned MinIO image)
         run: |
-          IMAGE="$(grep -oE 'minio/minio:RELEASE\.[0-9A-Za-z.:-]+' deploy/docker-compose.dev.yml | head -1)"
+          IMAGE="$(grep -oE '[a-z0-9./]*minio/minio:RELEASE\.[0-9A-Za-z.:-]+' deploy/docker-compose.dev.yml | head -1)"
           if [ -z "$IMAGE" ]; then
             echo "::error::无法从 deploy/docker-compose.dev.yml 解析出钉定的 MinIO 镜像 tag"
             exit 1

@@ -65,7 +65,14 @@ services:
     # no longer ship `mc` (it moved to the separate minio/mc image), so a `latest`
     # pull could silently break the healthcheck. If you bump this, switch the
     # healthcheck to a minio/mc sidecar or an mc-free probe.
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    # ⚠️ registry 必须是 quay.io，不是 Docker Hub：MinIO 已转向商用，2026 年彻底
+    # 移除了 Docker Hub 上的 minio/minio、minio/mc 镜像以及 dl.min.io 的 mc 下载，
+    # 实测 `docker manifest inspect minio/minio:*` 一律
+    # 「repository does not exist」（而 postgres/redis/nats 均正常）。
+    # 有本地缓存的机器察觉不到，任何全新环境或 CI runner 会直接起不来。
+    # 版本同时钉死：镜像内自带 mc（healthcheck 与 init-minio.sh 都依赖它），
+    # 新版已把 mc 拆走。
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
     container_name: fileagent-minio
     command: server /data --console-address ":9001"
     environment:
