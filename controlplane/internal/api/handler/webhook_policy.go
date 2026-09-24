@@ -45,8 +45,9 @@ import (
 //
 // Two durable-verdict rules (B1/B2, PR #110 review) complete the state
 // machine — see handleIndexFailure in events.go:
-//   - a broken counter backend must not stall the feed forever: the store
-//     falls back to a bounded in-process counter so the cap stays reachable;
+//   - the failure series is authoritative in PostgreSQL and monotonic across
+//     Redis outages, CP restarts and Redis data loss (round-3: Redis is a
+//     cache, not a second authority — the max-merge is gone);
 //   - a failed dead-letter PERSIST must answer 5xx and keep the counter (a
 //     200 after a failed persist silently loses the event; the dead-letter
 //     sink shares PostgreSQL with the indexer, so long PG outages hit exactly

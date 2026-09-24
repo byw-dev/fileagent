@@ -12,9 +12,10 @@
 -- is a cold, operator-facing record. Different lifecycles, different hygiene.
 --
 -- Expiry: rows are tombstoned by updated_at (sliding, refreshed on every
--- increment by the ON CONFLICT clause); a periodic/launch-time cleanup deletes
--- rows older than webhookFailCounterTTL (7d, mirroring the Redis TTL). No
--- capacity eviction exists — PostgreSQL rows are the durable fallback, and
+-- increment by the ON CONFLICT clause); the cleanup is executed by
+-- handler.RunStaleCounterCleanup (startup + hourly sweep in cmd/server/main.go,
+-- TTL = 7d mirroring the Redis cache TTL — round-3 S-1 wired the caller). No
+-- capacity eviction exists — PostgreSQL rows are the durable series, and
 -- evicting a live count would re-open B-NEW-1.
 CREATE TABLE IF NOT EXISTS webhook_fail_counters (
     dedup_key  TEXT PRIMARY KEY,
