@@ -12,7 +12,13 @@
 ## 0. 一句话结论
 
 **目标 A 的十二环，在 dev 上全部实跑通过了。** 一台 agent + CP + Web UI，配一条采集规则，
-文件采上去、索引里查得到、能下载——**每一环都有命令与输出为证**（§1）。
+文件采上去、索引里查得到、能下载（§1）。
+
+> ⚠️ **证据强度修正**：初版称「每一环都有命令与输出为证」，**说过头了**。
+> 真正留下可复核原始证据的是 sha256 三方一致、依赖缺失矩阵、`file_entries` 字段这几项；
+> 其余若干环（如 CP 重启后 3 条规则重新同步、150MB multipart）**只有作者断言**。
+> 这些结论此后由 **PR #114 的 e2e 冒烟在 CI 上独立复现**（`smoke.sh` 十二环全绿），
+> 但那是事后补的旁证，不是本报告当时的证据。
 
 这与立项背景（2026-09-08「Agent 数据面从未端到端跑通过」）并不矛盾：那之后的 IC-1…IC-4a
 把主路径修通了。
@@ -20,7 +26,7 @@
 > **⚠️ 一条重要限定（事后补）**：上面这句「跑通了」成立的前提是**机器上已经缓存了
 > MinIO 镜像**。该镜像此后已从 Docker Hub 下架，所以在一台真正干净的机器上，
 > 十二环在第一步就起不来（G-A2）。**本审计自己没发现这一点**，是被本机缓存骗过去的。
-> 两条挡 A 项均已随 PR #114 修复。
+> G-A2 已随 PR #114 修复；**G-A1 只修了一半**（`CLAUDE.md` 已修，根 `README.md` 仍是坏的）。
 
 本次审计的价值因此不在"发现链路是断的"，而在两件事：
 
@@ -94,24 +100,38 @@ MinIO 那一行与 `docs/ops/deployment.md` §0 的「任一依赖不可达即�
 ## 2. 声称漂移清单
 
 每条都带**三分类**。按章程纪律 7，拿不准一律归「文档撒谎」或「本是计划」，
-**不默认归「代码欠债」**；本清单**没有任何一条**被判为代码欠债——
-无一条能给出「曾被明确承诺」的证据。共 14 条。
+**不默认归「代码欠债」**。共 14 个 ID（AUD-1…14）。
+
+> 🔴 **2026-09-24 修正（PR #115 评审发现）**：本节初版断言「**没有任何一条是代码欠债**」，
+> **该断言已被仓库自己的账本证伪**。`docs/tasks/backlog.md:39-55`（**PR #111，立于审计前三天**）
+> 早已把「CI 没有 PostgreSQL，PG 关键测试静默 skip」与「覆盖率门槛写明却无人执行」
+> 明确登记为 🟠 P1 技术债——**这就是章程纪律 7 要求的「曾被明确承诺」的证据**。
+> 更难堪的是：`backlog.md:48` **连 79.9% 这个数都已经写好了**（还分析了根因是 sqlc
+> 生成代码只被 integration-tag 测试覆盖），`backlog.md:55` 甚至**预告了本报告 §4 的
+> 「CI 闸」建议**并点名 `WEBHOOK_MAX_PARSE_BYTES` 是同族问题——正是章程的校准项 #1。
+>
+> **失败原因**：审计读了 `active.md`，**没有打开 `backlog.md`**。于是把已登记的技术债
+> 当成新发现的「文档撒谎」，又在此基础上做了一个穷尽性断言。
+> 这正是「断言『不存在 / 从不 / 只有 N 种』之前先去找反证面」（章程纪律 3）的反面教材。
+>
+> **改判结果**：**AUD-8 / AUD-10 / AUD-11 三条重新归类为「代码欠债」**（已有承诺证据），
+> 且**均非本审计的新发现**。下表已更新。
 
 | ID | 出处 | 实际情况 | 分类 | 严重度 |
 |----|------|---------|------|--------|
-| **AUD-1** | `CLAUDE.md:273`、`README.md:214` 直接 `bash init-minio.sh` | 脚本默认 `WEBHOOK_ENDPOINT=http://controlplane:8080/...`，dev compose 里**没有** `controlplane` 服务；MinIO 在 config-set 时**真的去拨号**，解析失败 → 脚本 `exit 1`，第 6/7 步（事件订阅 + 三项自检）全部未执行 | 文档撒谎 | 🔴 高 |
-| **AUD-2** | `CLAUDE.md:268-270` `migrate -database … -path ./migrations up` | D-023 起迁移已内嵌，启动自动应用（实测 `version:10`）。该步骤已无必要，且 `migrate` CLI 未必在机器上 | 文档撒谎 | 🟠 中 |
-| **AUD-3** | `CLAUDE.md:266` dev 用 `make build` | `make build` 产出**纯 API 二进制**，`GET /` = **404**，没有 Web UI。A 要求 Web UI，须 `make bundle` / `-tags webui`。dev 章节从未提及 | 文档撒谎 | 🔴 高 |
+| **AUD-1** | `b79b92e:CLAUDE.md:273`（已随 #114 修）、**`README.md:214`（至今未修）** 直接 `bash init-minio.sh` | 脚本默认 `WEBHOOK_ENDPOINT=http://controlplane:8080/...`，dev compose 里**没有** `controlplane` 服务；MinIO 在 config-set 时**真的去拨号**，解析失败 → 脚本 `exit 1`，第 6/7 步（事件订阅 + 三项自检）全部未执行 | 文档撒谎 | 🔴 高 |
+| **AUD-2** | `b79b92e:CLAUDE.md:268-270` `migrate …`（已随 #114 修；根 `README.md:232` 仍在，但标注了「可选」） | D-023 起迁移已内嵌，启动自动应用（实测 `version:10`）。该步骤已无必要，且 `migrate` CLI 未必在机器上 | 文档撒谎 | 🟠 中 |
+| **AUD-3** | `b79b92e:CLAUDE.md:266`（已随 #114 修）、**`README.md:225`（至今未修）** 用 `make build` | `make build` 产出**纯 API 二进制**，`GET /` = **404**，没有 Web UI。A 要求 Web UI，须 `make bundle` / `-tags webui`。dev 章节从未提及 | 文档撒谎 | 🔴 高 |
 | **AUD-4** | `docs/ops/deployment.md:12` 「任一依赖不可达即退出（无重试循环）」，依赖表含 MinIO | 对 PG/Redis/NATS 成立；**对 MinIO 不成立**——CP 照常启动且 `/healthz` 200 | 文档撒谎 | 🟠 中 |
 | **AUD-5** | `deploy/config/controlplane.env:2` 「由 `deploy/scripts/start-controlplane.sh` 加载」 | `deploy/scripts/` 下**只有** `init-minio.sh`，该脚本不存在 | 文档撒谎 | 🟢 低 |
 | **AUD-6** | `docs/ops/operations.md` §1「CP 配置参考」 | 漏了代码实读的 `WEBHOOK_FAIL_LIMIT`、`WEBHOOK_MAX_PARSE_BYTES`（两者均有启动校验与安全下限） | 文档撒谎（不完整） | 🟢 低 |
 | **AUD-7** | `controlplane/internal/api/handler/webhook_r2_red_test.go:43` 「covered in `redis_fail_store_r2_test.go`」 | 该文件**全仓库不存在**。真实覆盖在 `webhook_r3_red_test.go` 等处 | 文档撒谎 | 🟢 低 |
-| **AUD-8** | `CLAUDE.md` 覆盖率 Go ≥80%、核心 ≥90%、webui ≥80% | **无任何执行者**（CI/Makefile 零处）。实测 CP **79.9%**、agent **75.4%**，均低于声称门槛 | 文档撒谎（门槛无执行力） | 🟠 中 |
-| **AUD-9** | `agent/internal/watcher/watcher.go:85` 「overwrite（default mode）」 | 描述属实，但后果未被任何文档写明——见 §3 | 本是计划 | — |
-| **AUD-10** | CI 绿 | `ci-cp.yml` / `ci-agent.yml` 跑 `go test ./...`，**不带 `-tags=integration`**，且**全仓库无一个 workflow 有 `services:` 块**。→ **11 个** `//go:build integration` 文件从未在 CI 跑过；另 **4 个**非 tag 但依赖 PG 的测试文件在 CI 里 **SKIP 成绿色**（实测：`TEST_DATABASE_URL` 指向不可达 DSN 时 `--- SKIP` 且包级结果仍是 `ok`）。**唯一的反例是好的**：`linux && overflow` 那个文件在 `ci-agent.yml` 里真跑，并用 grep 断言「没被静默跳过」 | 文档撒谎（"CI 绿"的含义被高估） | 🔴 高 |
-| **AUD-11** | `webui` 22 个 vitest 文件 + `pnpm test` | **没有任何 CI workflow 运行它们**（`build-webui.yml` 是 `workflow_dispatch` 且只 build） | 文档撒谎 | 🟠 中 |
-| **AUD-12** | `CLAUDE.md` Node **24**（`>=24.0.0 <25.0.0`） | 本机 Node **26.9.0**，`make build-webui` 照常成功（`BUILD_EXIT=0`）——约束未被执行 | 文档撒谎（约束无执行力） | 🟢 低 |
-| **AUD-13** | `WEBHOOK_QUEUE_DIR=/data/minio-webhook-queue` | `/data` 是 MinIO 的存储根，该队列目录被 **`mc ls` 当作 bucket 列出**（与 data-sensor 并列）。CP 的 bucket API 读 PG，故未污染 UI | 文档撒谎（副作用未记） | 🟢 低 |
+| **AUD-8** | `CLAUDE.md` 覆盖率 Go ≥80%、核心 ≥90%、webui ≥80% | **无任何执行者**（CI/Makefile 零处）。覆盖率是**环境敏感值**，不是模块属性：无 PG **79.4%** / PG 在线但未设 `TEST_DATABASE_URL` **79.9%** / 四个 PG 文件全开 **80.1%**；agent **75.4%**。CI 条件（无 PG）下的真值是 **79.4%** | **代码欠债** ⚠️ 非新发现 | 🟠 中 |
+| ~~**AUD-9**~~ | `agent/internal/watcher/watcher.go:85` 「overwrite（default mode）」 | **注释与实现完全一致，不存在任何声称漂移**。这是一条**实证发现**（默认模式的写放大，见 §3），**不该出现在本表**——三分类只适用于「检测到分歧」之后的归因 | ❌ 归类错误，已移出 | — |
+| **AUD-10** ⚠️ 非新发现 | CI 绿 | `ci-cp.yml` / `ci-agent.yml` 跑 `go test ./...`，**不带 `-tags=integration`**，且**全仓库无一个 workflow 有 `services:` 块**。→ **11 个** `//go:build integration` 文件从未在 CI 跑过；另 **4 个**非 tag 但依赖 PG 的测试文件在 CI 里 **SKIP 成绿色**（实测：`TEST_DATABASE_URL` 指向不可达 DSN 时 `--- SKIP` 且包级结果仍是 `ok`）。**唯一的反例是好的**：`linux && overflow` 那个文件在 `ci-agent.yml` 里真跑，并用 grep 断言「没被静默跳过」 | **代码欠债**（`backlog.md:47` 已登记） | 🔴 高 |
+| **AUD-11** ⚠️ 非新发现 | `webui` 22 个 vitest 文件 + `pnpm test` | **没有任何 CI workflow 运行它们**（`build-webui.yml` 是 `workflow_dispatch` 且只 build） | **代码欠债**（`backlog.md:68` 的 T4-2 明写「webui / sdk-python 仍缺」） | 🟠 中 |
+| ~~**AUD-12**~~ | `CLAUDE.md` Node **24**（`>=24.0.0 <25.0.0`） | **推理不成立，本条撤回**。`webui/package.json` 声明的是**支持范围**，CI（`build-webui.yml` / `ci-smoke.yml`）都确实装 Node 24。审计在一个**不受支持的** Node 26 上碰巧构建成功，只说明本地未开 `engine-strict`，**既不能证伪该约束、也不能说明 Node 26 受支持** | ❌ 已撤回 | — |
+| ~~**AUD-13**~~（非漂移，属实证观察） | `WEBHOOK_QUEUE_DIR=/data/minio-webhook-queue` | `/data` 是 MinIO 的存储根，该队列目录被 **`mc ls` 当作 bucket 列出**（与 data-sensor 并列）。CP 的 bucket API 读 PG，故未污染 UI | 文档撒谎（副作用未记） | 🟢 低 |
 | **AUD-14** | `docs/tasks/bugs/open.md:237` IC-BUG-7 的「后果」行：「在当前架构下（**webhook 是唯一写入路径**），通过 Web UI 创建的任何 bucket，其文件都**永远不会进入索引**」 | **前提已被 IC-2a 推翻**。实测：在 API 新建的桶上采集一个文件，`file_entries` 出现该行且 `source=agent`——agent 的 `UploadResult` 才是主写入路径，与 bucket 是否订阅 webhook 无关。卡片**标题仍成立**（确实没注册通知），但**后果与 🟠 P1 定级已不成立** | 文档撒谎（缺陷卡的事实断言过期） | 🟠 中 |
 
 ### 校准集复核（章程 §6）
@@ -134,9 +154,16 @@ MinIO 那一行与 `docs/ops/deployment.md` §0 的「任一依赖不可达即�
 
 > 按 A 的标尺重新二分，**未沿用** 2026-09-11 的旧口径。
 
-### 🔴 挡 A（2 条，均已随 PR #114 修复）
+### 🔴 挡 A（2 条：G-A2 已修，**G-A1 仅修了一半**）
 
-**G-A1 — 首次运行路径跑不通**（= AUD-1 + AUD-2 + AUD-3）✅ 已修（#114）
+**G-A1 — 首次运行路径跑不通**（= AUD-1 + AUD-2 + AUD-3）◐ **只修了一半**
+
+> 🔴 **2026-09-24 修正**：本节初版写「✅ 已修（#114）」，**不成立**。
+> #114 只改了 `CLAUDE.md`，**没有动仓库根目录的 `README.md`**——而后者才是最显眼的入口。
+> 根 `README.md` 的 Quick Start **至今仍可稳定复现 AUD-1 与 AUD-3**：
+> 第 3 步在 CP 尚未启动时就跑 `bash deploy/scripts/init-minio.sh`（且不覆盖 webhook endpoint），
+> 第 4 步 `make build`（不含 Web UI），第 5 步才启动 CP。
+> **G-A1 仍然挡 A，需要一条 follow-up。**
 
 A 是「一个**可运行**的版本」。照 `CLAUDE.md` 的 dev 章节逐条执行，新环境**起不来**：
 `init-minio.sh` exit 1（webhook 端点不可达）、`migrate` 步骤已废、`make build` 没有 Web UI。
@@ -160,10 +187,14 @@ docker: Error response from daemon: pull access denied for minio/minio,
 repository does not exist or may require 'docker login'
 ```
 
-`docker manifest inspect` 逐个确认（绕过本地缓存）：`minio/minio` 的所有 tag、
-`minio/mc` 全部不可拉，而 `postgres:15-alpine` / `redis:7-alpine` / `nats:2-alpine` /
-`alpine:3.20` 均正常——**不是限流、不是网络，是镜像确实没了**（MinIO 转向商用，
-同时移除了 `dl.min.io` 的 mc CLI 下载）。
+`docker manifest inspect` 实测（绕过本地缓存）：**`minio/minio:latest`、compose 原先钉的
+`minio/minio:RELEASE.2025-04-22T22-12-26Z`、`minio/mc:latest` 三者均不可拉**，
+而 `postgres:15-alpine` / `redis:7-alpine` / `nats:2-alpine` / `alpine:3.20` 均正常
+——**足以排除限流与网络**，也足以证明原 compose 在无缓存机器上起不来。
+
+> ⚠️ **不要过度外推**（评审指出）：上面测的是**这三个具体 tag**，不是「所有 tag」；
+> 「因为转向商用所以移除」是**合理推断而非已证因果**。已证明的是那条具体的部署故障，
+> 不是一次完整的供应链审计。
 
 影响面：`docker-compose.dev.yml` / `prod.yml` / `test.yml` **三个都起不来**。
 修复：registry 换 `quay.io/minio/minio`（仍可拉，含钉的那个 tag，镜像内容一致）。
@@ -230,7 +261,7 @@ upload_logs 行数: 1    （完整 157286400 字节，一次成功）
 章程 §12 说「本审计最有价值的产出可能不是清单，而是一道 CI 闸」。本轮的经验支持这个判断，
 但**优先级排序和章程的设想不同**：
 
-本轮 13 条漂移里，靠 grep 类脚本捞出来的多是低严重度的（AUD-5/6/7/12/13）；
+本轮 14 个 ID 里（AUD-9/12/13 经评审已撤回或移出漂移表，实际漂移 11 条），靠 grep 类脚本捞出来的多是低严重度的（AUD-5/6/7）；
 真正重的三条——AUD-1（首次运行断）、AUD-3（默认构建没 UI）、AUD-9 的写放大——
 **都是跑一遍才发现的，静态检查捞不到**。
 
@@ -255,9 +286,21 @@ upload_logs 行数: 1    （完整 157286400 字节，一次成功）
 
 ---
 
-## 5. 机械层脚本（可复跑）
+## 5. 机械层脚本
 
-与本文同目录：
+与本文同目录。
+
+> ⚠️ **定位修正（PR #115 评审）**：初版称它们是「判定脚本、必然收敛」，**不对**。
+> `m1*` / `m2*` 四个脚本都**以 0 退出并输出大量已知假阳性**（错误码常量被当成环境变量、
+> 相对路径与示例文件被报成 missing、`MIGRATIONS_PATH` 被报成「文档写了代码没读」——
+> 而 `operations.md` 恰恰是在说它**已被移除**）。
+> 它们是**人工用的候选生成器**，需要人来筛；**不能直接接成 CI 闸**，否则会制造大量假红。
+> §4 的建议据此调整：真要做那道闸，得先给每条规则加白名单/基线和非零失败语义。
+>
+> `m-deps.sh` 已于本次修订重写：初版硬编码作者绝对路径且**不校验前提**，
+> 在没起 dev 环境的机器上会让四轮全部因缺 PostgreSQL 而失败、却仍打上
+> redis/nats/minio 的标签——**一份看起来像结论的假矩阵**。现在加了前置断言、
+> 路径自推导，以及「失败原因必须真的指向本轮停掉的那个依赖」的交叉校验。
 
 | 脚本 | 作用 |
 |------|------|
