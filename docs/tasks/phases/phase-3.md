@@ -30,7 +30,9 @@ Phase 4 收尾：D-022 单二进制#60 / D-023 迁移嵌入+T4-3#61 / D-024 MinI
 T3-3 Python SDK + Control Plane 联调 ⏸️ 已推后
 ```
 
-> 当前态与下一步候选见 `docs/tasks/active.md`（无进行中实现任务；候选=元数据6c Phase 1 / webui 重做 / proto→buf）。
+> 当前态与下一步**一律以 [`docs/tasks/active.md`](../active.md) 的「下一步」一节为准**。
+> ⚠️ ~~候选=元数据6c Phase 1 / webui 重做 / proto→buf~~ —— 该候选清单已过期（2026-09-24）：
+> 元数据 Phase 1 已收官（#69–#79）、webui 重做已暂停、proto→buf 已落地（D-032）。
 
 ---
 
