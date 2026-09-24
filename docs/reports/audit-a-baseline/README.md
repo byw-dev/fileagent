@@ -28,12 +28,14 @@
 > **⚠️ 一条重要限定（事后补）**：上面这句「跑通了」成立的前提是**机器上已经缓存了
 > MinIO 镜像**。该镜像此后已从 Docker Hub 下架，所以在一台真正干净的机器上，
 > 十二环在第一步就起不来（G-A2）。**本审计自己没发现这一点**，是被本机缓存骗过去的。
-> G-A2 已随 PR #114 修复；**G-A1 只修了一半**（`CLAUDE.md` 已修，根 `README.md` 仍是坏的）。
+> **两条挡 A 项现已全部修复**：G-A2 随 PR #114；G-A1 分两刀——`CLAUDE.md` 随 #114，
+> 根 `README.md` 随 **#116**（#114 漏了它，是 #115 的评审揪出来的）。
 
 本次审计的价值因此不在"发现链路是断的"，而在两件事：
 
 1. **首次运行路径是断的**（§3，挡 A 两条之一）——照着仓库文档走，新环境起不来。
-   （`CLAUDE.md` 那半边已随 #114 修；**根 `README.md` 至今未修**。）
+   （两个入口都已修：`CLAUDE.md` 随 #114，根 `README.md` 随 **#116**——#114 漏了后者，
+   是本报告 PR 的评审揪出来的。）
    三处文档错误，修复成本都是改几行字。（另一条 G-A2 是审计**漏掉**的，见 §3。）
 2. **默认采集模式有 150 倍写放大**（AUD-9，§2）——A 的三个标准都达成，但这是上线前
    必须处理的一条，且**能力已存在**，只是默认值选错了。
@@ -122,9 +124,9 @@ MinIO 那一行与 `docs/ops/deployment.md` §0 的「任一依赖不可达即�
 
 | ID | 出处 | 实际情况 | 分类 | 严重度 |
 |----|------|---------|------|--------|
-| **AUD-1** | `b79b92e:CLAUDE.md:273`（已随 #114 修）、**`README.md:214`（至今未修）** 直接 `bash init-minio.sh` | 脚本默认 `WEBHOOK_ENDPOINT=http://controlplane:8080/...`，dev compose 里**没有** `controlplane` 服务；MinIO 在 config-set 时**真的去拨号**，解析失败 → 脚本 `exit 1`，第 6/7 步（事件订阅 + 三项自检）全部未执行 | 文档撒谎 | 🔴 高 |
+| **AUD-1** | `b79b92e:CLAUDE.md:273`（随 #114 修）、`4a870c1:README.md:214`（随 **#116** 修）直接 `bash init-minio.sh` | 脚本默认 `WEBHOOK_ENDPOINT=http://controlplane:8080/...`，dev compose 里**没有** `controlplane` 服务；MinIO 在 config-set 时**真的去拨号**，解析失败 → 脚本 `exit 1`，第 6/7 步（事件订阅 + 三项自检）全部未执行 | 文档撒谎 | 🔴 高 |
 | **AUD-2** | `b79b92e:CLAUDE.md:268-270` `migrate …`（已随 #114 修；根 `README.md:198-209` 仍在，但**标注了「可选」并说明迁移已内嵌**，故根 README 这一处不构成缺陷） | D-023 起迁移已内嵌，启动自动应用（实测 `version:10`）。该步骤已无必要，且 `migrate` CLI 未必在机器上 | 文档撒谎 | 🟠 中 |
-| **AUD-3** | `b79b92e:CLAUDE.md:266`（已随 #114 修）、**`README.md:225`（至今未修）** 用 `make build` | `make build` 产出**纯 API 二进制**，`GET /` = **404**，没有 Web UI。A 要求 Web UI，须 `make bundle` / `-tags webui`。dev 章节从未提及 | 文档撒谎 | 🔴 高 |
+| **AUD-3** | `b79b92e:CLAUDE.md:266`（随 #114 修）、`4a870c1:README.md:225`（随 **#116** 修）用 `make build` | `make build` 产出**纯 API 二进制**，`GET /` = **404**，没有 Web UI。A 要求 Web UI，须 `make bundle` / `-tags webui`。dev 章节从未提及 | 文档撒谎 | 🔴 高 |
 | **AUD-4** | `docs/ops/deployment.md:12` 「任一依赖不可达即退出（无重试循环）」，依赖表含 MinIO | 对 PG/Redis/NATS 成立；**对 MinIO 不成立**——CP 照常启动且 `/healthz` 200 | 文档撒谎 | 🟠 中 |
 | **AUD-5** | `deploy/config/controlplane.env:2` 「由 `deploy/scripts/start-controlplane.sh` 加载」 | `deploy/scripts/` 下**只有** `init-minio.sh`，该脚本不存在 | 文档撒谎 | 🟢 低 |
 | **AUD-6** | `docs/ops/operations.md` §1「CP 配置参考」 | 漏了代码实读的 `WEBHOOK_FAIL_LIMIT`、`WEBHOOK_MAX_PARSE_BYTES`（两者均有启动校验与安全下限） | 文档撒谎（不完整） | 🟢 低 |
@@ -139,7 +141,9 @@ MinIO 那一行与 `docs/ops/deployment.md` §0 的「任一依赖不可达即�
 
 > ⚠️ **引用形式说明**：本报告写于 #114 合并**之前**，故 `CLAUDE.md` 的行号钉在修复前的
 > `b79b92e`；直接打开**当前** `CLAUDE.md` 的同名行会看到**修好后的内容**，与表中所述相反。
-> 根 `README.md` 的引用则是**当前仍然成立**的。
+> 根 `README.md` 的引用同理钉在 **#116 之前**的 `4a870c1`（`git show 4a870c1:README.md | sed -n '214p'`
+> → `bash deploy/scripts/init-minio.sh`；`sed -n '225p'` → `make build`）。
+> **两个入口现在都已修好**，所以直接打开当前文件看到的都是修正后的内容。
 >
 > `b79b92e:CLAUDE.md:266` 里末尾的数字是**行号，不是 Git 语法的一部分**
 > ——`git show 'b79b92e:CLAUDE.md:266'` 会报 `path ... does not exist`。复核请用：
@@ -170,17 +174,19 @@ MinIO 那一行与 `docs/ops/deployment.md` §0 的「任一依赖不可达即�
 
 > 按 A 的标尺重新二分，**未沿用** 2026-09-11 的旧口径。
 
-### 🔴 挡 A（2 条：G-A2 已修，**G-A1 仅修了一半**）
+### 🔴 挡 A（2 条，**均已修复**）
 
-**G-A1 — 首次运行路径跑不通**（= AUD-1 + AUD-2 + AUD-3）◐ **只修了一半**
+**G-A1 — 首次运行路径跑不通**（= AUD-1 + AUD-2 + AUD-3）✅ **已修（#114 + #116）**
 
-> 🔴 **2026-09-24 修正**：本节初版写「✅ 已修（#114）」，**不成立**。
-> #114 只改了 `CLAUDE.md`，**没有动仓库根目录的 `README.md`**——而后者才是最显眼的入口。
-> 根 `README.md` 的 Quick Start **至今仍可稳定复现 AUD-1 与 AUD-3**：
-> 第 3 步在 CP 尚未启动时就跑 `bash deploy/scripts/init-minio.sh`（且不覆盖 webhook endpoint），
-> 第 4 步 `make build`（不含 Web UI），第 5 步才启动 CP。
-> **G-A1 仍然挡 A。** follow-up 已开：**PR #116**（重排根 README 的 Quick Start，
-> 并顺带修掉两份文档共有的 `MINIO_ENDPOINT` 格式冲突）。**#116 合并后本条可改为 ✅。**
+> 🔴 **修订留痕（本条改过两次，值得记住的是过程）**：
+> 初版写「✅ 已修（#114）」——**不成立**。#114 只改了 `CLAUDE.md`，
+> **漏了仓库根目录的 `README.md`**，而后者才是最显眼的入口：它的 Quick Start
+> 在 CP 尚未启动时就跑 `init-minio.sh`（且不覆盖 webhook endpoint），
+> 并用不含 Web UI 的 `make build`。**这是 #115 的独立评审揪出来的**，
+> 我自己复核「已修」时没有去看根 README。
+> 已随 **PR #116** 补齐（重排 Quick Start，并顺带修掉两份文档共有的
+> `MINIO_ENDPOINT` 格式冲突——`init-minio.sh` 要含 scheme 的完整 URL，
+> CP 的同名配置是 `host:port`）。
 
 A 是「一个**可运行**的版本」。**审计当时（#114 之前）**，照 `CLAUDE.md` 的 dev 章节
 逐条执行，新环境**起不来**：`init-minio.sh` exit 1（webhook 端点不可达）、`migrate`
@@ -194,10 +200,11 @@ A 是「一个**可运行**的版本」。**审计当时（#114 之前）**，�
 | 入口 | AUD-1（init-minio 顺序 + 端点） | AUD-2（手工 migrate） | AUD-3（`make build` 无 UI） |
 |---|---|---|---|
 | `CLAUDE.md` | ✅ 已随 #114 修 | ✅ 已随 #114 删 | ✅ 已随 #114 改 `make bundle` |
-| 根 `README.md` | ❌ **仍坏**（→ #116） | — 本就标注「可选」并说明迁移已内嵌，**不构成缺陷** | ❌ **仍坏**（→ #116） |
+| 根 `README.md` | ✅ 已随 #116 修 | — 本就标注「可选」并说明迁移已内嵌，**不构成缺陷** | ✅ 已随 #116 修 |
 
-也就是说：**剩下要做的只是把 AUD-1 / AUD-3 的同样修法应用到根 `README.md`**
-（`migrate` 那条在根 README 上不适用）。这正是 **PR #116** 的内容。
+**G-A1 至此完全关闭。** 两个入口都已修正，且 #116 的新步骤是**逐字执行验证**过的
+（compose 就绪 → `make bundle` → CP `healthz` OK 且 `GET /` = 200 → `init-minio.sh`
+三项自检通过）。
 
 **G-A2 — MinIO 镜像已从 Docker Hub 下架，任何全新环境都起不来** ✅ 已修（#114）
 
