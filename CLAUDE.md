@@ -281,6 +281,10 @@ until curl -sf -o /dev/null http://127.0.0.1:8080/healthz; do sleep 1; done   # 
 #    连带后面的事件订阅与三项自检都不会执行。
 #    ⚠️ 脚本默认的 http://controlplane:8080/... 只在 docker-compose.prod.yml 里成立
 #    （那里 CP 是同网络里的容器）；dev 的 CP 跑在宿主上，必须覆盖为 host.docker.internal。
+# ⚠️ 同名变量、格式不同（两份文档都踩过）：init-minio.sh 的 MINIO_ENDPOINT 是 mc 用的
+#    **完整 URL（含 scheme）**，而 controlplane 的同名配置是 **host:port（无 scheme）**。
+#    你若在本终端 source 过 CP 的 env 文件，这里**必须显式覆盖**，否则 mc 报 Invalid URL。
+MINIO_ENDPOINT=http://localhost:9000 \
 WEBHOOK_ENDPOINT=http://host.docker.internal:8080/internal/minio-event \
 WEBHOOK_AUTH_TOKEN="$INTERNAL_WEBHOOK_SECRET" \
   bash deploy/scripts/init-minio.sh

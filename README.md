@@ -172,16 +172,19 @@ fileagent/
 - Go 1.24+
 - Node.js 24 LTS (krypton) + pnpm 11（通过 Corepack 管理）
 - Python 3.10+ + Poetry（仅 SDK 开发）
-- [golang-migrate](https://github.com/golang-migrate/migrate) CLI（数据库迁移）
+- [golang-migrate](https://github.com/golang-migrate/migrate) CLI —— **可选**，仅用于手工提前迁移或排查；
+  正常启动**不需要**它（迁移已嵌入二进制，见第 2 步）
+
+> **⚡ 想直接确认整条链路是通的**：`bash deploy/scripts/smoke.sh`
+> 一条命令跑完下面全部步骤并验证「文件采上去 / 索引查得到 / 能下载」（约 1 分钟）。
+> 它用独立的 compose 项目名与高位端口，**可与你正在跑的环境并存**，结束自清理。
+> CI 跑的就是它，所以下面这套步骤不会再悄悄过期。
 
 ### 1. 启动基础服务
 
 ```bash
-cd deploy
-docker compose -f docker-compose.dev.yml up -d
-
-# 确认全部 healthy
-docker compose -f docker-compose.dev.yml ps
+docker compose -f deploy/docker-compose.dev.yml up -d --wait   # --wait 等 healthcheck 通过
+docker compose -f deploy/docker-compose.dev.yml ps
 ```
 
 本地服务端口：
@@ -195,49 +198,69 @@ docker compose -f docker-compose.dev.yml ps
 | NATS | 4222 |
 | NATS Monitor | 8222 |
 
-### 2. 初始化数据库
+### 2. 初始化数据库（可选）
 
-> 说明：这一步是**可选**的。`controlplane` 启动时会自动执行数据库迁移（`db.Migrate`）。
-> 迁移文件已**嵌入二进制**（`//go:embed`，见 D-023），无需 `MIGRATIONS_PATH`、也无需随二进制分发
-> `migrations/` 目录。仅当你希望手动提前迁移，或单独排查迁移问题时，才需要用下面的 golang-migrate CLI。
+> `controlplane` 启动时会自动执行数据库迁移（`db.Migrate`）。迁移文件已**嵌入二进制**
+> （`//go:embed`，见 D-023），无需 `MIGRATIONS_PATH`、也无需随二进制分发 `migrations/` 目录。
+> **正常流程可以直接跳到第 3 步**；仅当你想手工提前迁移或单独排查迁移问题时才需要下面的命令。
 
 ```bash
 export DATABASE_URL="postgres://fileagent:fileagent@localhost:5432/fileagent?sslmode=disable"
-
-cd controlplane
-migrate -database "$DATABASE_URL" -path ./migrations up
+cd controlplane && migrate -database "$DATABASE_URL" -path ./migrations up
 ```
 
-### 3. 初始化 MinIO
+### 3. 构建二进制
 
 ```bash
-bash deploy/scripts/init-minio.sh
+make bundle        # 含 Web UI 的 controlplane + agent
+```
+
+> ⚠️ **`make build` 与 `make bundle` 不等价**：`make build` 产出的是**纯 API 二进制**，
+> 访问 `/` 会返回 **404**，没有 Web UI。需要管理后台就必须用 `make bundle`
+> （或 `go build -tags webui`）。只做后端开发、不需要界面时才用：
+>
+> ```bash
+> make build              # 纯 API，无 Web UI
+> make build-controlplane
+> make build-agent
+> ```
+
+### 4. 启动 Control Plane
+
+```bash
+cp controlplane/.env.example controlplane/.env    # 首次
+set -a && source controlplane/.env && set +a
+./bin/controlplane                                 # 前台常驻；健康检查 :8080/healthz
+```
+
+### 5. 初始化 MinIO
+
+> ⚠️ **必须在 Control Plane 已经启动之后再跑**（所以它排在第 4 步后面）。
+> 原因：MinIO 在配置 webhook 通知时会**真的去拨**那个地址，CP 没在监听则脚本整体
+> 失败退出，连带后面的事件订阅与三项自检都不会执行。
+> CP 是前台进程，请在**另一个终端**执行本步，或先把 CP 放后台。
+
+```bash
+# ⚠️ 同名变量、格式不同（两份文档都踩过）：init-minio.sh 的 MINIO_ENDPOINT 是 mc 用的
+#    **完整 URL（含 scheme）**，而 controlplane 的同名配置是 **host:port（无 scheme）**。
+#    你若在本终端 source 过 CP 的 env 文件，这里**必须显式覆盖**，否则 mc 报 Invalid URL。
+MINIO_ENDPOINT=http://localhost:9000 \
+# ⚠️ 脚本默认的 http://controlplane:8080/... 只在 docker-compose.prod.yml 里成立
+#    （那里 CP 是同一 docker 网络中的容器）；本地 CP 跑在宿主上，必须覆盖：
+WEBHOOK_ENDPOINT=http://host.docker.internal:8080/internal/minio-event \
+WEBHOOK_AUTH_TOKEN=changeme \
+  bash deploy/scripts/init-minio.sh
+# WEBHOOK_AUTH_TOKEN 须与 controlplane/.env 的 INTERNAL_WEBHOOK_SECRET 一致
+# （.env.example 的默认值就是 changeme）
 ```
 
 脚本幂等，重复执行不报错。需要 `mc` 与 `curl` 均在 PATH（自检要用 curl 的 `--aws-sigv4`）。执行内容：创建 `data-sensor` 和 `tmp-uploads` Bucket，配置 7 天 Lifecycle，创建供 Control Plane 使用的真实 IAM 用户及最小权限 policy，配置 Webhook 事件通知，并用该用户自检 CP 运行时真正要用的三件事——STS AssumeRole、建桶、预签名下载。脚本默认 access key 为 `cpAdminIAM000000000`；若覆盖 `CP_ADMIN_ACCESS_KEY`，长度须为 3–20 字符，`CP_ADMIN_SECRET_KEY` 须为 8–40 字符（这是脚本自己的收敛口径：MinIO 对 IAM 用户只强制下界 3 / 8，20 / 40 上界是 service account 的限制，收敛到同一窗口便于两种账号形态互换）。
 
 > 重跑脚本**不会**擅自换掉已存在 IAM 用户的 secret：先用传入凭据试一次 AssumeRole，通过就保留原样；不通过则报错退出、不做改动。确实要轮换时显式传 `CP_ADMIN_ROTATE=1`，之后必须同步更新 Control Plane 的 `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` 并重启。
 
-### 4. 构建二进制
+### 6. 启动 Edge Agent
 
 ```bash
-# 构建全部（输出到 bin/）
-make build
-
-# 或单独构建
-make build-controlplane
-make build-agent
-```
-
-### 5. 启动服务
-
-```bash
-# Control Plane（推荐从示例文件复制后集中维护环境变量）
-cp controlplane/.env.example controlplane/.env
-set -a && source controlplane/.env && set +a
-./bin/controlplane
-
-# Edge Agent（需先准备 TOML 配置文件）
 # 支持 --config 参数，也支持 AGENT_CONFIG 环境变量
 cp agent/config.toml.example agent/config.toml
 ./bin/agent --config /path/to/agent.toml
