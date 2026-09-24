@@ -47,6 +47,16 @@ services:
       - "9001:9001"
     tmpfs:
       - /data
+    # IC-4a ③ note (updated by the PR #110 review, S3): /data is a tmpfs here
+    # BY DESIGN — this compose is a FUNCTIONAL-ONLY test environment; it does
+    # NOT exercise webhook-queue persistence, and there is no override that
+    # could (any in-container path on tmpfs dies with the container, and
+    # init-minio.sh rejects /tmp/* queue dirs on purpose). The persistence
+    # guarantee (undelivered events survive a MinIO container restart) is
+    # verified live against the dev environment (docker-compose.dev.yml,
+    # minio_data named volume) — see the IC-4a acceptance record. If an
+    # automated persistence regression is ever wanted, add a named-volume
+    # profile here, not a tmpfs path override.
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s

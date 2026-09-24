@@ -45,7 +45,27 @@ type RouterConfig struct {
 	DryRunStore   handler.DryRunStore      // nil → test-rule returns 501
 	MinioIndexer  handler.IndexerClient    // nil → minio webhook events are only logged
 	WebhookSecret string                   // shared secret for /internal/minio-event; empty → endpoint rejects all
-	StatsDB       handler.StatsDB          // nil → stats endpoint returns 501
+
+	// WebhookFailCounters backs the IC-4a poison-pill failure counters. When
+	// nil, failures are still answered 5xx but never dead-lettered (testing
+	// / degraded wiring only — production always wires Redis here).
+	WebhookFailCounters handler.WebhookFailStore
+	// WebhookDeadLetters is the dead-letter sink (webhook_dead_letters table).
+	// When nil, exhausted events are only logged (testing / degraded wiring).
+	WebhookDeadLetters handler.DeadLetterSink
+	// WebhookFailLimit is the poison-pill retry cap (WEBHOOK_FAIL_LIMIT).
+	WebhookFailLimit int64
+	// WebhookMaxParseBytes is the /internal/minio-event request-body parse
+	// cap (WEBHOOK_MAX_PARSE_BYTES, round-3 B-2-3): above it, bodies are
+	// oversized (dead letter + 5xx).
+	WebhookMaxParseBytes int64
+	// WebhookDeadLetterProbe reports whether the dead-letter sink was verified
+	// usable at startup (S-1). When non-nil and it returns false, /healthz
+	// reports 503 "degraded" so a broken table/grant is caught at startup
+	// instead of blocking the feed at the first indexing failure (B2
+	// fail-closed).
+	WebhookDeadLetterProbe func() bool
+	StatsDB                handler.StatsDB // nil → stats endpoint returns 501
 
 	// RateLimiter backs the per-user API rate-limit middleware. When nil, or
 	// when RateLimitPerMinute <= 0, rate limiting is disabled.
@@ -71,11 +91,36 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 
 	// ── Health check (no auth required) ─────────────────────────────────────
 	r.GET("/healthz", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		// S-1 (PR #110 round-2 review): a broken dead-letter sink (missing
+		// table, lost INSERT/UPDATE grants) is invisible until an event actually
+		// fails indexing — by then every subsequent event is held in MinIO's
+		// queue (B2 fail-closed) and healthy traffic is blocked by a permission
+		// problem this probe would have caught. Prometheus metrics remain out
+		// of scope (T4-1 deferred); the check plus structured logging is the
+		// agreed operability surface.
+		status := http.StatusOK
+		body := gin.H{"status": "ok"}
+		if cfg.WebhookDeadLetterProbe != nil && !cfg.WebhookDeadLetterProbe() {
+			status = http.StatusServiceUnavailable
+			body = gin.H{"status": "degraded", "reason": "dead-letter sink unavailable"}
+		}
+		c.JSON(status, body)
 	})
 
 	// ── Internal MinIO event webhook (authenticated by shared secret) ───────
-	minioH := handler.NewMinioEventHandler(cfg.MinioIndexer, cfg.WebhookSecret, cfg.Logger)
+	// IC-4a: wired with the persistent failure counters and the dead-letter
+	// sink when provided; the poison pill then dead-limits events that keep
+	// failing, instead of letting one bad event block the feed forever.
+	var minioH *handler.MinioEventHandler
+	if cfg.WebhookFailCounters != nil && cfg.WebhookDeadLetters != nil {
+		minioH = handler.NewMinioEventHandlerWithPolicyParseCap(cfg.MinioIndexer, cfg.WebhookSecret, cfg.WebhookFailCounters, cfg.WebhookDeadLetters, cfg.WebhookFailLimit, cfg.WebhookMaxParseBytes, cfg.Logger)
+	} else {
+		if cfg.WebhookFailCounters == nil || cfg.WebhookDeadLetters == nil {
+			cfg.Logger.Warn("minio event webhook: failure policy incompletely wired (counters/dead-letters nil); " +
+				"failed events will retry but never dead-letter — the poison-pill guard is DISABLED")
+		}
+		minioH = handler.NewMinioEventHandler(cfg.MinioIndexer, cfg.WebhookSecret, cfg.Logger)
+	}
 	r.POST("/internal/minio-event", minioH.Handle)
 
 	// ── Auth routes ──────────────────────────────────────────────────────────

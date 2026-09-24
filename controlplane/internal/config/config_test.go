@@ -109,6 +109,51 @@ func TestLoad_CustomAgentTokenTTL(t *testing.T) {
 	assert.Equal(t, 168*time.Hour, cfg.AgentTokenTTL)
 }
 
+// TestValidate_WebhookFailLimit_Floor pins the S-2 (PR #110 round-2) gate:
+// below the floor (60) the config must be REJECTED at startup — a cap that
+// low dead-letters ordinary transient blips and defeats the retry mechanism.
+// Exactly at the floor must pass. The floor is a declared policy value (~3
+// minutes of tolerated outage at MinIO's ~3s retry cadence), not a measured
+// requirement; see webhook_policy.go's sizing note.
+func TestValidate_WebhookFailLimit_Floor(t *testing.T) {
+	t.Run("below floor rejected", func(t *testing.T) {
+		setEnv(t, validEnv())
+		setEnv(t, map[string]string{"WEBHOOK_FAIL_LIMIT": "59"})
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Error(t, cfg.Validate())
+	})
+	t.Run("at floor accepted", func(t *testing.T) {
+		setEnv(t, validEnv())
+		setEnv(t, map[string]string{"WEBHOOK_FAIL_LIMIT": "60"})
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.NoError(t, cfg.Validate())
+	})
+}
+
+// TestValidate_WebhookMaxParseBytes_Floor pins the parse-cap safety floor
+// (PR #110 round-4). The guard existed in Validate but no test pinned it:
+// removing the error left the whole suite green. A near-zero parse cap turns
+// every normal notification into a permanent 5xx — a self-inflicted outage the
+// operator cannot distinguish from a genuine one.
+func TestValidate_WebhookMaxParseBytes_Floor(t *testing.T) {
+	t.Run("below floor rejected", func(t *testing.T) {
+		setEnv(t, validEnv())
+		setEnv(t, map[string]string{"WEBHOOK_MAX_PARSE_BYTES": "65535"}) // floor-1
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.Error(t, cfg.Validate())
+	})
+	t.Run("at floor accepted", func(t *testing.T) {
+		setEnv(t, validEnv())
+		setEnv(t, map[string]string{"WEBHOOK_MAX_PARSE_BYTES": "65536"}) // floor
+		cfg, err := Load()
+		require.NoError(t, err)
+		assert.NoError(t, cfg.Validate())
+	})
+}
+
 func TestValidate_RejectsNonPositiveAgentTokenTTL(t *testing.T) {
 	setEnv(t, validEnv())
 	cfg, err := Load()

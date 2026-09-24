@@ -48,6 +48,12 @@ services:
       - "9001:9001"
     volumes:
       - minio_data:/data
+      # IC-4a ③ (IC-BUG-9): the webhook delivery queue must live on a
+      # persistent volume. init-minio.sh points queue_dir at
+      # /data/minio-webhook-queue (inside the minio_data volume), so undelivered
+      # events survive both `docker restart` and `docker compose down/up` with
+      # a named volume. Previously the queue sat in /tmp and was wiped — or,
+      # drifted, empty (sendSync drops failed deliveries outright).
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s

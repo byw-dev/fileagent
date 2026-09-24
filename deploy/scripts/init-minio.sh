@@ -31,6 +31,12 @@
 #   WEBHOOK_ENDPOINT        URL MinIO pushes events to  (default: http://controlplane:8080/internal/minio-event)
 #   WEBHOOK_AUTH_TOKEN      Shared secret for webhook   (default: changeme)
 #   WEBHOOK_TARGET_NAME     mc webhook config key       (default: primary)
+#   WEBHOOK_QUEUE_DIR       Persistent queue directory INSIDE the MinIO
+#                           container (IC-4a ③ / IC-BUG-9). Must live on the
+#                           persistent minio_data volume, NOT /tmp — /tmp is
+#                           wiped on container recreation and every undelivered
+#                           event would be lost. Default: /data/minio-webhook-queue
+#                           (the minio_data volume is mounted at /data).
 
 set -euo pipefail
 
@@ -50,6 +56,11 @@ MINIO_ROLE_ARN="${MINIO_ROLE_ARN:-arn:aws:iam:::role/agent-role}"
 WEBHOOK_ENDPOINT="${WEBHOOK_ENDPOINT:-http://controlplane:8080/internal/minio-event}"
 WEBHOOK_AUTH_TOKEN="${WEBHOOK_AUTH_TOKEN:-changeme}"
 WEBHOOK_TARGET_NAME="${WEBHOOK_TARGET_NAME:-primary}"
+# IC-4a ③ (IC-BUG-9): the queue MUST sit on a persistent volume. /tmp inside
+# the container is ephemeral — a MinIO container recreation silently drops
+# every undelivered event. /data is the minio_data volume (see
+# docker-compose.dev.yml), so the queue survives restarts AND recreations.
+WEBHOOK_QUEUE_DIR="${WEBHOOK_QUEUE_DIR:-/data/minio-webhook-queue}"
 
 BUCKET_DATA="data-sensor"
 BUCKET_TMP="tmp-uploads"
@@ -353,6 +364,13 @@ mc admin policy attach "${MINIO_ALIAS}" "${CP_POLICY_NAME}" --user "${CP_ADMIN_A
 # ---------------------------------------------------------------------------
 # 5. Configure webhook event notification target (idempotent)
 #    mc admin config set is a full replace, so running it multiple times is safe.
+#    IC-4a ③ (IC-BUG-9): queue_dir MUST be on the persistent volume. The old
+#    value (/tmp/minio-webhook-queue) was wiped on container recreation; and a
+#    dev-drifted config had it EMPTY, which makes MinIO use sendSync — failed
+#    deliveries are dropped outright, not even queued.
+#    ⚠️ The script verifies the EFFECTIVE value after the restart (mc admin
+#    config get), because a stale config or a failed restart would otherwise
+#    leave the drift invisible — that exact drift is how IC-BUG-9 was found.
 # ---------------------------------------------------------------------------
 echo "==> Configuring webhook notification target '${WEBHOOK_TARGET_NAME}'"
 mc admin config set "${MINIO_ALIAS}" \
@@ -360,7 +378,7 @@ mc admin config set "${MINIO_ALIAS}" \
   "endpoint=${WEBHOOK_ENDPOINT}" \
   "auth_token=${WEBHOOK_AUTH_TOKEN}" \
   "queue_limit=10000" \
-  "queue_dir=/tmp/minio-webhook-queue"
+  "queue_dir=${WEBHOOK_QUEUE_DIR}"
 
 # Restart MinIO to apply the config change (required for webhook settings)
 echo "==> Restarting MinIO service to apply config changes"
@@ -375,6 +393,35 @@ until mc ready "${MINIO_ALIAS}" --quiet 2>/dev/null || [ "${RETRIES}" -le 0 ]; d
 done
 if [ "${RETRIES}" -le 0 ]; then
   echo "ERROR: MinIO did not become ready after restart." >&2
+  exit 1
+fi
+
+# --- Effective-config verification (IC-BUG-9 lesson) -----------------------
+# The script value is a wish; the effective value is the truth. queue_dir=
+# (empty) or still pointing at /tmp means the persistent-queue guarantee does
+# NOT hold, and MinIO will silently drop failed deliveries (sendSync).
+EFFECTIVE_WEBHOOK="$(mc admin config get "${MINIO_ALIAS}" "notify_webhook:${WEBHOOK_TARGET_NAME}")"
+EFFECTIVE_QUEUE_DIR="${EFFECTIVE_WEBHOOK#*queue_dir=}"
+EFFECTIVE_QUEUE_DIR="${EFFECTIVE_QUEUE_DIR%% *}"
+if [ -z "${EFFECTIVE_QUEUE_DIR}" ]; then
+  echo "ERROR: notify_webhook:${WEBHOOK_TARGET_NAME} effective queue_dir is EMPTY —" >&2
+  echo "       MinIO will run in sendSync mode and DROP failed deliveries (IC-BUG-9)." >&2
+  echo "       Effective config: ${EFFECTIVE_WEBHOOK}" >&2
+  exit 1
+fi
+case "${EFFECTIVE_QUEUE_DIR}" in
+  /tmp/*)
+    echo "ERROR: effective queue_dir '${EFFECTIVE_QUEUE_DIR}' is on the ephemeral /tmp —" >&2
+    echo "       undelivered events die with the container (IC-BUG-9)." >&2
+    exit 1
+    ;;
+  *)
+    echo "==> Verified effective queue_dir: ${EFFECTIVE_QUEUE_DIR}"
+    ;;
+esac
+if [[ "${EFFECTIVE_WEBHOOK}" != *"endpoint=${WEBHOOK_ENDPOINT}"* ]]; then
+  echo "ERROR: effective endpoint does not match the configured value;" >&2
+  echo "       expected endpoint=${WEBHOOK_ENDPOINT} in: ${EFFECTIVE_WEBHOOK}" >&2
   exit 1
 fi
 

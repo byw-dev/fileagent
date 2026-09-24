@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 )
 
 // Config holds the complete runtime configuration for the Control Plane.
@@ -79,6 +81,23 @@ type Config struct {
 	// endpoint fails closed and rejects every request, since it mutates the file
 	// index from an external source and must be authenticated.
 	InternalWebhookSecret string
+
+	// WebhookMaxParseBytes is the IC-4a request-body parse cap for
+	// /internal/minio-event (round-3 B-2-3): bodies above it are oversized
+	// (dead letter + 5xx, never a silent 200). Default 8MiB; must stay at or
+	// above the 64KiB dead-letter capture floor — a near-zero cap turns every
+	// normal notification into a permanent 5xx (self-inflicted config), so
+	// config.Validate rejects sub-floor values.
+	WebhookMaxParseBytes int64
+	// WebhookFailLimit is the IC-4a poison-pill retry cap (IC-BUG-6): after
+	// this many failed deliveries of ONE webhook event (identified by
+	// bucket+key+sequencer), the event is dead-lettered into
+	// webhook_dead_letters and answered 200 so MinIO's head-of-line blocking
+	// queue is freed. Default 600: the webhook queue retries ~every 3s, so 600
+	// attempts ≈ 30 minutes of tolerated outage — long enough to ride out a PG
+	// restart/failover (the acceptance requires surviving a PG outage), short
+	// enough that a true poison pill cannot stall the feed indefinitely.
+	WebhookFailLimit int64
 
 	// BootstrapAdminUsername is the username used for first-start admin creation.
 	// Default: "admin".
@@ -158,6 +177,9 @@ func Load() (*Config, error) {
 	cfg.LogLevel = envString("LOG_LEVEL", "info")
 	cfg.APIRateLimitPerMinute = envInt("API_RATE_LIMIT_PER_MINUTE", 600)
 	cfg.InternalWebhookSecret = os.Getenv("INTERNAL_WEBHOOK_SECRET")
+	cfg.WebhookFailLimit = int64(envInt("WEBHOOK_FAIL_LIMIT", 600))
+	// Default 8MiB (see handler.maxWebhookParseBytes for the sizing rationale).
+	cfg.WebhookMaxParseBytes = int64(envInt("WEBHOOK_MAX_PARSE_BYTES", int(handler.MaxWebhookParseBytesForTest())))
 	cfg.BootstrapAdminUsername = envString("BOOTSTRAP_ADMIN_USERNAME", "admin")
 	cfg.BootstrapAdminPassword = os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
 	cfg.BootstrapAdminForceReset = envBool("BOOTSTRAP_ADMIN_FORCE_RESET", false)
@@ -203,6 +225,17 @@ func (c *Config) Validate() error {
 	}
 	if c.AgentTokenTTL <= 0 {
 		return errors.New("AGENT_TOKEN_TTL must be a positive duration")
+	}
+	// S1 (PR #110 review): below-floor WEBHOOK_FAIL_LIMIT is a startup failure,
+	// not a silent fallback — limit=1 tolerates ~3s of outage, which would
+	// dead-letter ordinary DB blips and defeat the retry mechanism entirely.
+	if c.WebhookFailLimit < handler.MinWebhookFailLimit {
+		return fmt.Errorf("WEBHOOK_FAIL_LIMIT=%d is below the safety floor %d — a few-second blip would dead-letter events; raise it to exceed (expected outage seconds ÷ 3)",
+			c.WebhookFailLimit, handler.MinWebhookFailLimit)
+	}
+	if c.WebhookMaxParseBytes < handler.MinWebhookParseCap {
+		return fmt.Errorf("WEBHOOK_MAX_PARSE_BYTES=%d is below the safety floor %d — a near-zero parse cap turns every normal notification into a permanent 5xx",
+			c.WebhookMaxParseBytes, handler.MinWebhookParseCap)
 	}
 	return nil
 }

@@ -1806,7 +1806,8 @@ MINIO_VOLUMES="https://minio{1...4}.internal:9000/data{1...4} \
 > 当前实现与此相反——它是唯一的写入路径。另有两处必须修的缺陷：`queue_dir` 位于易失的 `/tmp`
 > （MinIO 重启即丢未投递事件，IC-BUG-9）；CP 索引失败仍返回 200，MinIO 据此丢弃事件、永不重投（IC-BUG-6）。
 > 且通过 API 新建的 bucket 不会注册通知规则（IC-BUG-7）。见
-> [`consistency-and-ingest.md`](./consistency-and-ingest.md) §1.3。
+> [`consistency-and-ingest.md`](./consistency-and-ingest.md) §1.3。**IC-4a（2026-09）已修 IC-BUG-6/9：
+> 失败语义 + 毒丸 + 死信表见本节末「失败语义与死信」；`queue_dir` 已迁至持久卷路径。IC-BUG-7 归 IC-4b。**
 >
 > 📌 **目标形态（D-031）**：本节的 `notify_webhook` 将改为 `notify_nats` + JetStream，
 > 以获得「投递与处理解耦 / 可重放 / 全局单调序号（供排序键与链路自证）」三项能力，排期在对账阶段（IC-11）。
@@ -1817,17 +1818,52 @@ mc admin config set myminio notify_webhook:primary \
     endpoint="http://controlplane.internal:8080/internal/minio-event" \
     auth_token="<共享密钥>" \
     queue_limit="10000" \
-    queue_dir="/tmp/minio-webhook-queue"
+    queue_dir="/data/minio-webhook-queue"
 
 mc event add myminio/data-sensor arn:minio:sqs::primary:webhook \
     --ignore-existing \
     --event "put,delete"
 ```
 
+> ⚠️ **`queue_dir` 必须落在持久卷上（IC-4a ③ / IC-BUG-9）**：`/data` 是 MinIO 容器的数据卷
+> （`docker-compose.dev.yml` 的 `minio_data`）。**不要写 `/tmp/...`**（容器重建即丢队列），
+> 也**绝不能留空**——`queue_dir` 为空时 MinIO 走 `sendSync`，投递失败直接丢弃、连队列都没有
+> （dev 实测即此形态，IC-BUG-9 由此发现）。**验收查生效值**（`mc admin config get`），不是脚本文本；
+> `init-minio.sh` 现已内置生效值校验（空值 / `/tmp` 前缀直接报错退出）。
+
 **Control Plane 侧鉴权（D-014）**：`/internal/minio-event` 会把外部输入写入
 `file_entries`，故必须鉴权。CP 用配置项 `INTERNAL_WEBHOOK_SECRET` 校验 MinIO 发来的
 `auth_token`（`Authorization` 头，兼容 `Bearer <token>` 与裸 token，常量时间比较）。
 **未配置密钥时端点失败即拒（fail-closed）**，拒绝一切请求而非放行，避免未鉴权写入。
+
+### 6.5.1 失败语义与死信（IC-4a ①，IC-BUG-6）
+
+**唯一一条路径，不按 4xx/5xx 分流**（dev 实测 MinIO 对 400 与 500 一视同仁、都重投）：
+
+```text
+处理失败（索引/解析/键解码）
+  → 按事件身份 bucket+key+sequencer 计数（Redis 键 webhook:fail:<sha256>，持久化）
+    → 未超上限（WEBHOOK_FAIL_LIMIT，默认 600）：返回 5xx，MinIO 重投
+    → 已超上限：落 webhook_dead_letters 表 + 返回 200（放行队头阻塞单队列）
+```
+
+- **事件身份**：webhook 请求头只有 `Host / User-Agent / Content-Length / Authorization /
+  Content-Type`——没有事件 ID、没有重试计数。身份用 `bucket+key+sequencer` 构造（S3 为同一
+  对象排序定义的键，重投期间稳定）。
+- **计数器必须持久化**：进程内存计数在 CP 重启（索引故障最常见的伴随事件）后归零，
+  毒丸永远到不了上限。Redis 键 `webhook:fail:<sha256(identity)>`，无 TTL，成功时显式删除。
+- **上限取值**：默认 600 ≈ 30 分钟容忍窗口（重投约 3s 一轮）。须大于「预期故障时长 ÷ 3s」，
+  否则与「断开 PG → 恢复后补齐」的验收冲突；也不宜过大，否则毒丸横行期间整条 feed 停摆。
+- **死信表 `webhook_dead_letters`**：含 `dedup_key / event_name / bucket / key / size / etag /
+  observed_at / event_seq / fail_count / last_error / active`。**redrive 由运维执行**（人工或脚本重放），
+  不是自动重试——每一行都是 MinIO 不会再发的丢失事件，规程见
+  [`consistency-and-ingest.md`](./consistency-and-ingest.md) §3.7。
+- **(d) ObjectRemoved 死信置 `active=true`**：丢失的 delete 是「PG 有 / MinIO 无」，三级对账
+  检不出（L3 管此方向但删除不推进 `object_keys.last_modified`，已封存分片永不解封）。redrive 时
+  必须把对应分片强制置 `active`，标志位随死信行落表。
+- **(c-2) 解码失败进死信**：IC-2c 的「索引原值 + Warn」兜底改判为死信 + 5xx（MinIO 实际不可达
+  该路径，属载荷被篡改；进索引会写入无人匹配的 `storage_path`）。
+- **幂等**：重投会重复索引，由 `UNIQUE (bucket_id, storage_path)` upsert 兜住，不另造去重。
 
 ## 6.6 MinIO 管理功能在后台的集成
 
@@ -2472,6 +2508,7 @@ MINIO_ACCESS_KEY=<ak>
 MINIO_SECRET_KEY=<sk>
 MINIO_USE_SSL=true
 INTERNAL_WEBHOOK_SECRET=<共享密钥>
+WEBHOOK_FAIL_LIMIT=600
 JWT_SECRET=<256位随机字符串>
 JWT_ACCESS_TOKEN_TTL=2h
 JWT_REFRESH_TOKEN_TTL=720h

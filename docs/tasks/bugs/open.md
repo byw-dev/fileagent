@@ -10,7 +10,7 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
-> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判）**：共 **54** 条 = **已关闭 35** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 18**（**4 条挡** 6/7/9/40 + **11 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
+> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判；2026-09-24 IC-4a 关闭 6/9；**IC-BUG-6 的 (d) 只落了 `active=true` 标记位，无消费方，强制解封归 IC-12 的验收与依赖（PR #110 复审 B4）**）**：共 **54** 条 = **已关闭 37** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 16**（**2 条挡** 7/40 + **11 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -106,10 +106,10 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-3 | STS session policy 前缀与实际对象键不匹配  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
 | IC-BUG-4 | STS session policy 缺 multipart 权限、多授 DeleteObject  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
 | IC-BUG-5 | 断点续传状态从未落盘，重试永远从头重传 + 孤儿分片累积 ✅ 随 IC-3 修复 | 🟠 P1 | agent |
-| IC-BUG-6 | minio-event 索引失败仍返回 200，MinIO 丢弃事件 | 🟠 P1 | controlplane |
+| IC-BUG-6 | minio-event 索引失败仍返回 200，MinIO 丢弃事件 ✅ 随 IC-4a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-7 | 通过 API 新建的 bucket 不注册事件通知，文件永不入索引 | 🟠 P1 | controlplane + deploy |
 | IC-BUG-8 | `UpsertFileEntry` 无排序键，webhook 会把 agent 富字段覆盖为 NULL ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
-| IC-BUG-9 | webhook `queue_dir` 位于 `/tmp`，MinIO 重启即丢未投递事件 | 🟠 P1 | deploy |
+| IC-BUG-9 | webhook `queue_dir` 位于 `/tmp`，MinIO 重启即丢未投递事件 ✅ 随 IC-4a 修复 | 🟠 P1 | deploy |
 | IC-BUG-10 | `IsProcessed` 忽略 mtime/size，文件修改后永不重传 ✅ 随 IC-5 修复 | 🟡 P2 | agent |
 | IC-BUG-11 | tail 模式 `file_offset` / `append_mode` 是死参数 ✅ 随 IC-5 修复 | 🟡 P2 | agent |
 | IC-BUG-12 | 上传无超时；重试耗尽后不通知 Control Plane ✅ 两半均已修复（上报半边随 IC-2a，超时半边随 IC-5）| 🟡 P2 | agent |
@@ -214,16 +214,16 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **✅ 已修（IC-3，PR #105，2026-09-12）** | (1) `Queue.SaveMultipartProgress`（`queue.go`）在 initiate 与每片完成时落盘 `upload_id`/`completed_parts`；(2) 终态清理走 executor 的 `AbandonFunc` hook（`ConfigureAbandon` + `uploader.AbandonUpload`）：**放弃（重试耗尽）/ 终态失败（`ErrTerminalUpload`）/ 任务被逐出（capacity 逐出、退避中发现行已删）** 时 Abort，**`completed` 不 Abort**（`CompleteMultipartUpload` 已消费 uploadID，再 Abort 必然报错）；(3) `verifyRemoteParts` 对账保留为续传正确性的权威（本地记录仅是输入），验证失败（可能只是瞬时网络）**不** abort，宁可留给下一次对账。**IC-5 协同**：`ResetRunningToPending` 不清这两列 → 复位任务天然续传，**「大文件复位后全量重传」的已知限制由本刀关闭**。**⚠️ ILM 兜底一条在当前 MinIO 上不可实现**：实测（RELEASE.2025-09-07T16-13-09Z，直连 S3 XML PUT 复现）当前 MinIO 的 lifecycle schema 根本没有实现 `AbortIncompleteMultipartUpload`（`internal/bucket/lifecycle/rule.go` 自 2021 重构起该字段被注释成 FIXME，直到归档前的最终版 2025-10-15 仍在）——abort-only 规则 400 被拒、与其他动作共存则被**静默剥离**。`init-minio.sh` 仍写入该规则（面向将来实现了该 action 的构建），并读回生效值、不生效时响亮告警 |
 | **验收（live，已执行）** | ① 320MB 文件（part 5MiB——S3 非末片下限）传输中途 `SIGKILL` agent，重启后日志出现 `resuming multipart upload … skipped_parts=1` 且 upload_id 与 kill 前一致（非 part 1 重传），对象完整落桶、`file_entries` 一行；② `retry_max=0` agent 传中途删源文件 → 放弃 → 日志出现 `aborted multipart upload of abandoned task`，`ListMultipartUploads` 与 `mc ls --incomplete` 均无该 upload 的分片、无对象。live 用例 `ic3_live_integration_test.go`（开关 `IC3_LIVE=1`），两次运行均 PASS |
 
-## IC-BUG-6 — minio-event 索引失败仍返回 200，MinIO 丢弃事件 🟠 P1
+## IC-BUG-6 — minio-event 索引失败仍返回 200，MinIO 丢弃事件 🟠 P1 ✅ 已修（IC-4a）
 
 | 字段 | 内容 |
 |------|------|
 | **根因** | `IndexUpload` / `IndexDeletion` 出错只 `logger.Warn`，处理器最终无条件 `c.Status(http.StatusOK)`；JSON 解析失败同样返回 200 |
-| **精确位置** | `controlplane/internal/api/handler/events.go:803-812`、`:818`、`:779-784` |
+| **精确位置** | `controlplane/internal/api/handler/events.go:803-812`、`:818`、`:779-784`（修复前的行号） |
 | **后果** | MinIO 看到 200 即从 `queue_dir` 删除该事件、永不重投。一次瞬时 DB 抖动 = 永久丢失文件记录，且无任何机制能发现（当前无对账） |
-| **修复** | 索引失败返回 5xx 让 MinIO 重投。**⚠️ 不得按 4xx/5xx 分流**——初版写「解析失败返回 400，坏载荷不该无限重投」，**dev 实测证伪**：MinIO 对 400 与 500 一视同仁（都走 `sendSync.func1()` 失败分支，日志 `returned '400 Bad Request'`），配上 IC-4 ③ 的持久 `queue_dir` 后 400 会被无限重投并队头阻塞整条流。统一走「计数 → 未超限 5xx → 超限落死信 + 返 200 放行」。注意保持幂等——重投会重复索引，由 `UNIQUE (bucket_id, storage_path)` upsert 兜住 |
-| **⚠️ 5xx 会阻塞整条事件流（2026-09-10 dev 实测）** | MinIO 的 `queue_dir` 是**队头阻塞的单队列**：对前 3 次投递返回 500，实测后续的 delete 与 create **全部排队等待**（约 3s 一次重试），直到那条失败事件成功才按原序一次性放行。**含义**：一个持久失败的事件（如 bucket 行缺失导致 `IndexUpload` 恒错）会让该 target 的**索引 feed 无限期停摆**，止血变断流。**因此 IC-4 ① 必须带毒丸处理**：同一事件重试超过上限 → 落死信（日志/表）→ 返 200 放行队列，而不是无限 5xx。**副作用**（有序性）见 IC-BUG-8 卡片的 `observed_at` 定案 |
-| **验收** | 断开 PG 后触发一次 ObjectCreated，端点返回 5xx；恢复 PG 后 MinIO 重投，`file_entries` 出现该行 |
+| **✅ 已修（IC-4a，2026-09）** | **唯一一条失败路径，不按 4xx/5xx 分流**（dev 实测 MinIO 对 400/500 一视同仁）：处理失败 → 按事件身份（`bucket+key+sequencer`，webhook 请求头无事件 ID）在 **PG 权威单调计数器**（三轮返工定型：**PostgreSQL `webhook_fail_counters` 表是唯一权威**（迁移 000009），每次失败原子 upsert +1、重启存活、无容量驱逐；PG 不可用即 propagate error → 5xx（B2 fail-closed）。**Redis 键 `webhook:fail:<sha256>`（7 天滑动 TTL）仅作 best-effort 缓存**：写失败不影响正确性，读 miss 回落 PG。进程内计数被明令禁止（B-OLD-1/B-NEW-1）；二轮曾用的 `max(redis, pg)` 合并**已废除**——三轮复审证明它会吞失败次数且非原子）上计数 → 未超上限（`WEBHOOK_FAIL_LIMIT`，默认 600 是声明式政策值 ≈ 30 分钟容忍窗口，硬性要求为 `limit > 预期故障秒数 ÷ 3`，低于安全下限 60 启动即 FATAL）返回 5xx 让 MinIO 重投 → 超限落 **`webhook_dead_letters` 表**（迁移 000007；000008 加 raw_payload、000009 加计数表与 raw_truncated）并返回 200 放行队头阻塞单队列；**死信持久化失败时保留计数、返回 5xx**（二轮 B2 收紧：绝不以 200 静默丢事件）。**谁 redrive**：运维（人工/脚本重放），规程见 `consistency-and-ingest.md` §3.6；死信表含完整重放载荷与 `last_error`。**(d) 只落了标记位，未完成**（PR #110 复审 B4 裁决）：ObjectRemoved 死信行落 `active=true`，但全仓无任何消费方（无 List 查询、无解封运行时代码）——「对 ObjectRemoved 死信强制解封对应分片」是 **IC-12 的验收项与依赖**，IC-4a 不得以 (d) 完成收官；丢失的 delete 属「PG 有 / MinIO 无」，删除不推进 `object_keys.last_modified`，若死信重放前不解封，已封存分片将永不解封。**(c-2)** IC-2c 的解码失败「索引原值 + Warn」兜底改判为死信 + 5xx（进索引会写入无人匹配的 `storage_path`）。配置项 `WEBHOOK_FAIL_LIMIT`（默认 600，非 hardcode）；变异矩阵 16 项护栏各自被杀（`BUILD_OK` 验证）；live 证据：断 PG → 5xx + Redis 计数爬升 → 恢复 PG → 重投入索引、计数清零；毒丸 3 次失败后落表且 200，后续正常事件不被队头阻塞 |
+| **验收** | 断开 PG 后触发一次 ObjectCreated，端点返回 5xx；恢复 PG 后 MinIO 重投，`file_entries` 出现该行 ✅ live 已执行（CP 日志 `indexing failed` + `requesting redelivery`、MinIO 日志 `500 Internal Server Error`、PG 恢复后重投、`file_entries` 补齐） |
+| **🔴 刻意留下（IC-4a 未做，勿当成已闭环）** | ① **IC-4b**：`MakeBucket` 后 `SetBucketNotification` + 启动时幂等 ensure / ARN 可配置 / IC-BUG-7——本刀未动 ②。② **自动 redrive** 不存在：`webhook_dead_letters` 的重放是运维动作，无告警接线（`fail_count`/行数建议接监控）。③ **死信的 (d) 强制置分片 active 目前只是标记**（`active=true` 列）——IC-12 落地前无 `shard_state` 表可置位，redrive 流程须等 IC-12 后才能真正执行解封。④ **解码失败走同一失败状态机**（PR #110 复审 B3 返工）：未超上限 5xx 重投、超限且死信持久化成功后 200 —— 终态持久可达，不会无限队头阻塞（首次实现恒 5xx 绕过计数器，已返工修复并有「先红」用例钉住） |
 
 > 📌 本条是**止血修法**。结构性修法是 **D-031**——改用 `notify_nats` + JetStream 后，
 > 「是否重投」由 ack 语义决定，而不再依赖「CP 返回什么 HTTP 状态码」这一易错约定。排期在对账阶段（IC-11）。
@@ -253,7 +253,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **⚠️ 守卫以代码为准** | 本条的 SQL 守卫已连续三轮「新写 → 一执行就碎」。IC-2a ⓪ 要求先落 PoC（真迁移 + 真 upsert + 表驱动测试 + 变异开关），此后 **`consistency-and-ingest.md` §3.4 只表达意图与不变式，SQL 文本以代码为准** |
 | **✅ 已修（IC-2a ⑤，2026-09-11）** | 迁移 `000006_index_observation` 加 `observed_at` / `source` / `event_seq` / `meta_incomplete`；upsert 加守卫（`>` OR（`=` AND `event_seq` 决胜），任一侧 NULL 放行）、富字段一律 `COALESCE`；软删除走新增的 `MarkObservedFileDeleted` 包装，**同样带守卫并推进 `observed_at`/`event_seq`**，且区分「守卫压制」与「行不存在」——两者都不当 error 上抛（否则 IC-4 ① 会重投，队头阻塞索引 feed）。**证伪能力由真 PostgreSQL 的变异矩阵钉着**：`db/ingest_integration_test.go` 的 `TestObservationMutationMatrix`，A1/A2/A3′/P2/A4b/LPAD 六项基线全绿，七种变异各自被它声称防的那条用例杀掉。**live 实证**：webhook 晚到的那一行 `source` 已变成 `minio_event`，而 `agent_id`/`rule_id`/`sha256` **全部保留未被清空**
 
-## IC-BUG-9 — webhook `queue_dir` 位于 `/tmp` 🟠 P1
+## IC-BUG-9 — webhook `queue_dir` 位于 `/tmp` 🟠 P1 ✅ 已修（IC-4a）
 
 | 字段 | 内容 |
 |------|------|
@@ -261,9 +261,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **精确位置** | `deploy/scripts/init-minio.sh:125`；`docs/design/system-design.md:1799`（同样的示例配置） |
 | **后果** | MinIO 容器重启/重建 → 未投递事件全部丢失，无任何补偿。叠加 IC-BUG-6 后，事件丢失有两条独立通道 |
 | **⚠️ 实测：脚本值与生效值不符（2026-09-10）** | dev 环境 `mc admin config get myminio notify_webhook:primary` 显示 `queue_dir=`（**空**），与 `init-minio.sh:125` 写的 `/tmp/minio-webhook-queue` 不符。`queue_dir` 为空时 MinIO 走 `sendSync`——**投递失败直接丢弃，连队列都没有**（容器日志可见 `Error: not connected to target server/service`）。因此 IC-4 ③ 的验收必须查**生效值**（`mc admin config get`）而非脚本文本 |
-| **IC-11 不解决** | `notify_nats` 同样有 `queue_dir` / `queue_limit`（实测确认）。分诊表初版曾写「IC-11 会连 `queue_dir` 一起删掉、别修」，**已于 2026-09-10 改判**，见 D-031「全量扫描结论」|
-| **修复** | 改为持久卷路径；同步更新 §6.5 的示例配置 |
-| **验收** | 停 CP → 写入若干对象 → 重启 MinIO 容器 → 启 CP，事件仍被投递、`file_entries` 补齐 |
+| **✅ 已修（IC-4a ③，2026-09）** | ① `init-minio.sh` 的 `queue_dir` 改为 `WEBHOOK_QUEUE_DIR`（默认 `/data/minio-webhook-queue`，落在 `minio_data` 持久卷上，`docker-compose.dev.yml` 已挂载），并**新增生效值校验**：`mc admin config get` 读回后，`queue_dir` 为空或 `/tmp` 前缀直接报错退出——IC-BUG-9 正是以「脚本与生效值不符」的方式被发现的，脚本现在自己防这个。`docker-compose.test.yml` 注明测试环境 `/data` 为 tmpfs、须用 env 覆盖指向易失路径属预期。② `system-design.md` §6.5 示例配置同步更新并写明红线（空值 = `sendSync` 直接丢弃）。**live 证据**：生效值 `queue_dir=/data/minio-webhook-queue`（非空、持久卷路径）；停 CP → 写入两个对象 → `docker restart` MinIO 容器 → 重启后事件从持久队列投递、`file_entries` 补齐 |
+| **验收 ✅ live 已执行** | 停 CP → 写入若干对象 → 重启 MinIO 容器 → 启 CP，事件仍被投递、`file_entries` 补齐（队列文件在容器重启后仍在 `/data/minio-webhook-queue`，CP 启动后 2 条全部投递并索引） |
 
 ## IC-BUG-10 — `IsProcessed` 忽略 mtime/size，文件修改后永不重传 🟡 P2 ✅ 已修（IC-5，PR #100）
 

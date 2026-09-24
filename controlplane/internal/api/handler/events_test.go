@@ -843,7 +843,12 @@ func TestMinioEventHandler_Handle_NilIndexer(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
-func TestMinioEventHandler_Handle_IndexerError_StillReturns200(t *testing.T) {
+// TestMinioEventHandler_Handle_IndexerError_Returns5xx pins IC-4a / IC-BUG-6:
+// an indexing failure must be answered 5xx so MinIO redelivers. The old
+// behaviour (200, MinIO drops the event forever) is the bug this fix closes.
+// This handler instance has no counter store wired, so every failure is a
+// plain retry.
+func TestMinioEventHandler_Handle_IndexerError_Returns5xx(t *testing.T) {
 	ix := &mockIndexerClient{err: assert.AnError}
 	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
 	body := `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1}}}]}`
@@ -851,8 +856,7 @@ func TestMinioEventHandler_Handle_IndexerError_StillReturns200(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	testMinioEventRouter(h).ServeHTTP(w, req)
-	// Indexer error is non-fatal; still 200.
-	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, http.StatusInternalServerError, w.Code, "indexing failure must return 5xx so MinIO retries (IC-BUG-6)")
 	assert.True(t, ix.called)
 }
 
@@ -965,16 +969,18 @@ func TestMinioEventHandler_DecodesObjectKey_Deletion(t *testing.T) {
 	assert.Equal(t, "a/b/中 文.csv", ix.deletedKey)
 }
 
-// TestMinioEventHandler_InvalidEncoding_FallsBackToRawKey asserts the decode
-// failure path: an unparseable escape must not drop the event, because losing a
-// create leaves MinIO holding an object the index never learns about. The raw
-// key is indexed instead (and logged as a warning).
-func TestMinioEventHandler_InvalidEncoding_FallsBackToRawKey(t *testing.T) {
+// TestMinioEventHandler_InvalidEncoding_NotIndexed pins the IC-4a (c-2)
+// upgrade of the IC-2c fallback: a key that fails URL decoding must NOT be
+// indexed under its raw value (a storage_path no real object matches), and the
+// first delivery is answered 5xx so MinIO retries (B3: decode failures share
+// the counted state machine — see webhook_rework_red_test.go for the
+// over-cap dead-letter path).
+func TestMinioEventHandler_InvalidEncoding_NotIndexed(t *testing.T) {
 	ix := &mockIndexerClient{}
 	w := postMinioEvent(t, ix, minioEventBody(t, "s3:ObjectCreated:Put", "data-sensor", "a%2Gb.csv"))
-	assert.Equal(t, http.StatusOK, w.Code)
-	require.True(t, ix.called, "an undecodable key must still be indexed, not dropped")
-	assert.Equal(t, "a%2Gb.csv", ix.lastKey)
+	assert.Equal(t, http.StatusInternalServerError, w.Code,
+		"an undecodable key must be retried (5xx), not indexed under its raw value")
+	assert.False(t, ix.called, "an undecodable key must not reach the index with its raw value")
 }
 
 // ── Webhook authentication (G-3) ──────────────────────────────────────────────

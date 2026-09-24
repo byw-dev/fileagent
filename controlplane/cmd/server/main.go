@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -252,42 +254,128 @@ func main() {
 	offlineSweeper := worker.NewOfflineSweeper(queries, redisClient, nats, bootstrap.DefaultOrgID, logger)
 	go offlineSweeper.Run(ctx, 0)
 
+	// S-1 (round-3 review): the webhook_fail_counters lifecycle claim in
+	// migration 000009 (stale rows cleaned after 7d) needs a REAL caller —
+	// sweep at startup and periodically, until shutdown. Coarse interval: the
+	// sweep is hygiene, not latency-sensitive. (Prometheus remains deferred —
+	// T4-1; deletions are observable via structured logs.)
+	go handler.RunStaleCounterCleanup(ctx, queries, handler.WebhookFailCounterTTL(), time.Hour, logger)
+
 	// Retro-tagging worker drains the retag_jobs outbox (e.g. pending-value merge).
 	retagWorker := worker.NewRetagWorker(queries, logger)
 	go retagWorker.Run(ctx, 0)
 
+	// IC-4a: the webhook failure policy — persistent per-event failure
+	// counters (Redis) and the dead-letter sink (webhook_dead_letters table).
+	// Together with the retry cap they form the poison-pill guard: an event
+	// that keeps failing is retried (5xx) until the cap, then dead-lettered
+	// and answered 200 so MinIO's head-of-line queue is freed.
+	webhookFails := handler.NewRedisWebhookFailStore(redisClient, queries)
+	webhookDeadLetters := handler.NewDBDeadLetterSink(queries)
+	// S-1 (PR #110 round-2 review): verify the dead-letter sink is usable at
+	// startup — a missing table or lost grants would otherwise go unnoticed
+	// until the first indexing failure blocks the feed (B2 fail-closed). The
+	// probe needs only INSERT/UPDATE on webhook_dead_letters, which the
+	// UpsertDeadLetter statement exercises. Failures surface as a degraded
+	// /healthz plus a loud structured log; the runbook entry lives in
+	// consistency-and-ingest.md §3.6.
+	// S-2 (round-3 review): the sink readiness must be DYNAMIC — a one-shot
+	// startup probe would leave /healthz permanently 503 after a transient
+	// startup-window failure, and permanently 200 after a later sink failure.
+	// A background goroutine re-probes with backoff and publishes the result
+	// atomically; /healthz reads the cached verdict. No per-request writes.
+	deadLetterProbe := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := queries.UpsertDeadLetterWrap(ctx, db.UpsertDeadLetterParams{
+			DedupKey:  "__healthcheck__",
+			EventName: "healthcheck",
+			Bucket:    "",
+			Key:       "",
+		}); err != nil {
+			return err
+		}
+		_, err := queries.DeleteDeadLetterWrap(ctx, "__healthcheck__")
+		return err
+	}
+	var sinkReady atomic.Bool
+	var sinkProbeMu sync.Mutex
+	probeSink := func(initial bool) {
+		sinkProbeMu.Lock()
+		defer sinkProbeMu.Unlock()
+		err := deadLetterProbe()
+		wasReady := sinkReady.Load()
+		sinkReady.Store(err == nil)
+		switch {
+		case err != nil && (initial || wasReady):
+			logger.Error("webhook dead-letter sink NOT ready: index processing will be blocked (B2 fail-closed) once any event fails — fix webhook_dead_letters table/grants",
+				zap.Error(err))
+		case err == nil && !initial && !wasReady:
+			logger.Info("webhook dead-letter sink recovered; /healthz exits degraded")
+		}
+	}
+	probeSink(true)
+	go func() {
+		// Re-probe with capped exponential backoff: fast retries while
+		// degraded (recover quickly), slow while healthy (cheap liveness).
+		interval := 30 * time.Second
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				probeSink(false)
+				if sinkReady.Load() {
+					interval = time.Minute
+				} else {
+					if interval < 5*time.Minute {
+						interval *= 2
+					}
+				}
+				timer.Reset(interval)
+			}
+		}
+	}()
+
 	// ── Build HTTP router ────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
-		JWTSecret:          cfg.JWTSecret,
-		Logger:             logger,
-		JWTService:         authSvc,
-		AuthDB:             handler.NewQueriesAuthDB(queries),
-		UsersDB:            queries,
-		FileTypesDB:        queries,
-		TagKeysDB:          queries,
-		PendingTagsDB:      queries,
-		RetagJobsDB:        queries,
-		FileTagsDB:         queries,
-		BatchTagDB:         queries,
-		FilesDB:            queries,
-		MinIOSigner:        &minioPresigner{client: minioPresignClient},
-		BucketsDB:          queries,
-		MinIOAdmin:         &minioBucketMaker{client: minioAdminClient},
-		EventRulesDB:       queries,
-		UploadLogsDB:       queries,
-		AgentsDB:           queries,
-		AgentMgr:           agentMgr,
-		Dispatcher:         dispatcher,
-		Registry:           registry,
-		AgentCache:         redisClient,
-		DirStore:           dirStore,
-		DryRunStore:        dryRunStore,
-		MinioIndexer:       ix,
-		WebhookSecret:      cfg.InternalWebhookSecret,
-		StatsDB:            queries,
-		RateLimiter:        redisClient,
-		RateLimitPerMinute: cfg.APIRateLimitPerMinute,
-		WebUIFS:            webui.FS(), // nil in pure-API build; embedded assets under `webui` tag
+		JWTSecret:              cfg.JWTSecret,
+		Logger:                 logger,
+		JWTService:             authSvc,
+		AuthDB:                 handler.NewQueriesAuthDB(queries),
+		UsersDB:                queries,
+		FileTypesDB:            queries,
+		TagKeysDB:              queries,
+		PendingTagsDB:          queries,
+		RetagJobsDB:            queries,
+		FileTagsDB:             queries,
+		BatchTagDB:             queries,
+		FilesDB:                queries,
+		MinIOSigner:            &minioPresigner{client: minioPresignClient},
+		BucketsDB:              queries,
+		MinIOAdmin:             &minioBucketMaker{client: minioAdminClient},
+		EventRulesDB:           queries,
+		UploadLogsDB:           queries,
+		AgentsDB:               queries,
+		AgentMgr:               agentMgr,
+		Dispatcher:             dispatcher,
+		Registry:               registry,
+		AgentCache:             redisClient,
+		DirStore:               dirStore,
+		DryRunStore:            dryRunStore,
+		MinioIndexer:           ix,
+		WebhookSecret:          cfg.InternalWebhookSecret,
+		WebhookFailCounters:    webhookFails,
+		WebhookDeadLetters:     webhookDeadLetters,
+		WebhookFailLimit:       cfg.WebhookFailLimit,
+		WebhookMaxParseBytes:   cfg.WebhookMaxParseBytes,
+		WebhookDeadLetterProbe: sinkReady.Load,
+		StatsDB:                queries,
+		RateLimiter:            redisClient,
+		RateLimitPerMinute:     cfg.APIRateLimitPerMinute,
+		WebUIFS:                webui.FS(), // nil in pure-API build; embedded assets under `webui` tag
 	})
 
 	httpSrv := &http.Server{
