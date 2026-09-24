@@ -7,10 +7,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
+	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,4 +71,48 @@ func TestS1_StaleCounterCleanup(t *testing.T) {
 	assert.Equal(t, int64(1), deleted, "the stale row must be reported as deleted")
 	assert.False(t, rowExists(staleDK), "rows older than the TTL must be removed (the migration's lifecycle claim must be true)")
 	assert.True(t, rowExists(freshDK), "fresh rows must survive the cleanup")
+}
+
+// TestFailCount_CacheMissFallsThroughToPG: a Redis cache miss (key expired or
+// lost) must NOT regress the series — the authoritative PG count is returned.
+func TestFailCount_CacheMissFallsThroughToPG(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://fileagent:fileagent@127.0.0.1:5432/fileagent?sslmode=disable"
+	}
+	conn, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Skipf("no PostgreSQL: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.Ping(); err != nil {
+		t.Skipf("no PostgreSQL: %v", err)
+	}
+	q := db.New(conn)
+	identity := "b/k/cachemiss"
+	dk := handler.DeadLetterRedisKey(identity)
+	_, _ = conn.Exec("DELETE FROM webhook_fail_counters WHERE dedup_key=$1", dk)
+	t.Cleanup(func() { _ = q.ClearWebhookFailCounter(context.Background(), dk) })
+
+	// Authoritative count = 3 (PG), cache empty.
+	for i := 0; i < 3; i++ {
+		_, err := q.IncrWebhookFailCounter(context.Background(), dk)
+		require.NoError(t, err)
+	}
+
+	// Redis fresh + empty: the read must fall through to PG (3), never 0.
+	mr := miniredis.RunT(t)
+	logger, _ := zap.NewDevelopment()
+	client, err := cache.New("redis://"+mr.Addr(), logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	store := handler.NewRedisWebhookFailStore(client, q)
+
+	count, err := store.FailCount(context.Background(), identity)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), count,
+		"a cache miss must fall through to the authoritative PG count — the series never regresses")
+
+	// The read path is read-only: the cache is repopulated by the next
+	// IncrFailCount (the write path owns cache refreshes).
 }
