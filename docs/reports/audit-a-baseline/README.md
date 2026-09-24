@@ -179,7 +179,8 @@ MinIO 那一行与 `docs/ops/deployment.md` §0 的「任一依赖不可达即�
 > 根 `README.md` 的 Quick Start **至今仍可稳定复现 AUD-1 与 AUD-3**：
 > 第 3 步在 CP 尚未启动时就跑 `bash deploy/scripts/init-minio.sh`（且不覆盖 webhook endpoint），
 > 第 4 步 `make build`（不含 Web UI），第 5 步才启动 CP。
-> **G-A1 仍然挡 A，需要一条 follow-up。**
+> **G-A1 仍然挡 A。** follow-up 已开：**PR #116**（重排根 README 的 Quick Start，
+> 并顺带修掉两份文档共有的 `MINIO_ENDPOINT` 格式冲突）。**#116 合并后本条可改为 ✅。**
 
 A 是「一个**可运行**的版本」。照 `CLAUDE.md` 的 dev 章节逐条执行，新环境**起不来**：
 `init-minio.sh` exit 1（webhook 端点不可达）、`migrate` 步骤已废、`make build` 没有 Web UI。
