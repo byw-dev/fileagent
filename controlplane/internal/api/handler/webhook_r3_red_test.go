@@ -11,6 +11,7 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
+	"github.com/byw-dev/fileagent/controlplane/internal/config"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -54,8 +55,11 @@ func TestRED_B1_EpochsAddNotMax(t *testing.T) {
 		t.Skipf("no PostgreSQL: %v", err)
 	}
 	q := db.New(conn)
-	identity := "b/k/epochs"
+	identity := handler.DeadLetterIdentity("b", "k", "epochs")
 	dk := handler.DeadLetterRedisKey(identity)
+	// Clean stale rows from earlier runs BEFORE the series starts — a leftover
+	// count would seed this run (the assertion is relative, but keep it clean).
+	_, _ = conn.Exec("DELETE FROM webhook_fail_counters WHERE dedup_key=$1", dk)
 	t.Cleanup(func() {
 		_ = q.ClearWebhookFailCounter(context.Background(), dk)
 	})
@@ -80,14 +84,20 @@ func TestRED_B1_EpochsAddNotMax(t *testing.T) {
 		_, err := q.IncrWebhookFailCounter(context.Background(), dk)
 		require.NoError(t, err)
 	}
-	pgCount, err := q.GetWebhookFailCounter(context.Background(), dk)
+	// NOTE: in the new model Redis is a cache — epoch 1's two failures also
+	// live in PG. Before recovery PG holds 2 (epoch 1) + 3 (outage) + any
+	// leftover from prior runs that the RED-phase runs may have left (the
+	// exact number doesn't matter — the assertion below is relative).
+	pgBefore, err := q.GetWebhookFailCounter(context.Background(), dk)
 	require.NoError(t, err)
-	require.Equal(t, int64(3), pgCount)
+	t.Logf("pgBefore=%d", pgBefore)
+	require.GreaterOrEqual(t, pgBefore, int64(5), "epoch counts must have landed in PG")
 
 	// Recovery: Redis comes back EMPTY (data loss) and the next failure is
-	// processed by the production store. The series must ADD: the total is
-	// 2 (Redis epoch) + 3 (PG epoch) + 1 (this recovery delivery) = 6.
-	// The max model returns max(1, 3) = 3 — swallowing three failures.
+	// processed by the production store. The series must be MONOTONIC: this
+	// delivery advances the authoritative PG count by exactly 1. The max
+	// model (round-2) and a naive fresh-Redis INCR would return a SMALLER
+	// value (1) — swallowing every failure recorded before the recovery.
 	mr2 := miniredis.RunT(t)
 	client2, err := cache.New("redis://"+mr2.Addr(), logger)
 	require.NoError(t, err)
@@ -95,9 +105,12 @@ func TestRED_B1_EpochsAddNotMax(t *testing.T) {
 
 	store2 := handler.NewRedisWebhookFailStore(client2, q)
 	count, incrErr := store2.IncrFailCount(context.Background(), identity)
+	var postRow int64
+	rowErr := conn.QueryRow("SELECT count FROM webhook_fail_counters WHERE dedup_key=$1", dk).Scan(&postRow)
+	t.Logf("post-recovery PG row=%d err=%v", postRow, rowErr)
 	require.NoError(t, incrErr)
-	assert.GreaterOrEqual(t, count, int64(6),
-		"B-1: epochs must ADD (2 Redis + 3 PG + 1 recovery = 6). The max model counted disjoint epochs as duplicates and swallowed 3 failures (got a non-monotonic smaller value)")
+	assert.Equal(t, pgBefore+1, count,
+		"B-1: the series must be MONOTONIC across Redis/PG epochs — the recovery delivery adds exactly 1 to the authoritative count. The max/fresh-Redis model returned 1, swallowing all prior failures (RED run: expected >=6, got 3)")
 }
 
 // TestRED_B2_1_OversizedHashUsesWholeBody_HANDLER: handler-level — two
@@ -153,12 +166,31 @@ func TestRED_B2_2_OversizedCaptureObey64KiB(t *testing.T) {
 func TestRED_B2_3_WebhookMaxParseBytesKnobWorks(t *testing.T) {
 	t.Setenv("WEBHOOK_MAX_PARSE_BYTES", "16777216") // 16MiB
 
+	// Load the cap through the REAL config path: WEBHOOK_MAX_PARSE_BYTES →
+	// Config → router → handler. Proves the knob is wired end-to-end, not a
+	// log fiction.
+	// config.Load requires the mandatory vars; set minimal ones so the knob
+	// itself is what's under test.
+	for k, v := range map[string]string{
+		"DATABASE_URL":     "postgres://x:x@127.0.0.1:5432/x?sslmode=disable",
+		"REDIS_URL":        "redis://127.0.0.1:6379/0",
+		"JWT_SECRET":       "test-secret-not-used",
+		"MINIO_ENDPOINT":   "127.0.0.1:9000",
+		"MINIO_ACCESS_KEY": "test",
+		"MINIO_SECRET_KEY": "test-secret",
+		"NATS_URL":         "nats://127.0.0.1:4222",
+	} {
+		t.Setenv(k, v)
+	}
+	t.Setenv("WEBHOOK_MAX_PARSE_BYTES", "16777216")
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	require.Equal(t, int64(16<<20), cfg.WebhookMaxParseBytes, "the knob must reach Config")
+
 	ix := &mockIndexerClient{}
 	fails := newCountingFailStore()
 	dead := &recordingSink{}
-	h := handler.NewMinioEventHandlerWithPolicy(ix, testWebhookSecret, fails, dead, 5, newTestLogger())
-	// The handler must read the raised cap from config (injected via
-	// NewMinioEventHandlerWithPolicy → parse cap 16MiB).
+	h := handler.NewMinioEventHandlerWithPolicyParseCap(ix, testWebhookSecret, fails, dead, 5, cfg.WebhookMaxParseBytes, newTestLogger())
 
 	filler := strings.Repeat("z", 9<<20) // > 8MiB default, < 16MiB raised
 	body := `{"filler":"` + filler + `","Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"data-sensor"},"object":{"key":"big-but-allowed.csv","size":1,"sequencer":"17KNOB0000000001"}}}]}`

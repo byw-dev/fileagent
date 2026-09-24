@@ -326,6 +326,7 @@ func main() {
 		WebhookFailCounters:    webhookFails,
 		WebhookDeadLetters:     webhookDeadLetters,
 		WebhookFailLimit:       cfg.WebhookFailLimit,
+		WebhookMaxParseBytes:   cfg.WebhookMaxParseBytes,
 		WebhookDeadLetterProbe: func() bool { return deadLetterProbeErr == nil },
 		StatsDB:                queries,
 		RateLimiter:            redisClient,

@@ -55,13 +55,17 @@ type RouterConfig struct {
 	WebhookDeadLetters handler.DeadLetterSink
 	// WebhookFailLimit is the poison-pill retry cap (WEBHOOK_FAIL_LIMIT).
 	WebhookFailLimit int64
+	// WebhookMaxParseBytes is the /internal/minio-event request-body parse
+	// cap (WEBHOOK_MAX_PARSE_BYTES, round-3 B-2-3): above it, bodies are
+	// oversized (dead letter + 5xx).
+	WebhookMaxParseBytes int64
 	// WebhookDeadLetterProbe reports whether the dead-letter sink was verified
 	// usable at startup (S-1). When non-nil and it returns false, /healthz
 	// reports 503 "degraded" so a broken table/grant is caught at startup
 	// instead of blocking the feed at the first indexing failure (B2
 	// fail-closed).
 	WebhookDeadLetterProbe func() bool
-	StatsDB          handler.StatsDB // nil → stats endpoint returns 501
+	StatsDB                handler.StatsDB // nil → stats endpoint returns 501
 
 	// RateLimiter backs the per-user API rate-limit middleware. When nil, or
 	// when RateLimitPerMinute <= 0, rate limiting is disabled.
@@ -109,7 +113,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// failing, instead of letting one bad event block the feed forever.
 	var minioH *handler.MinioEventHandler
 	if cfg.WebhookFailCounters != nil && cfg.WebhookDeadLetters != nil {
-		minioH = handler.NewMinioEventHandlerWithPolicy(cfg.MinioIndexer, cfg.WebhookSecret, cfg.WebhookFailCounters, cfg.WebhookDeadLetters, cfg.WebhookFailLimit, cfg.Logger)
+		minioH = handler.NewMinioEventHandlerWithPolicyParseCap(cfg.MinioIndexer, cfg.WebhookSecret, cfg.WebhookFailCounters, cfg.WebhookDeadLetters, cfg.WebhookFailLimit, cfg.WebhookMaxParseBytes, cfg.Logger)
 	} else {
 		if cfg.WebhookFailCounters == nil || cfg.WebhookDeadLetters == nil {
 			cfg.Logger.Warn("minio event webhook: failure policy incompletely wired (counters/dead-letters nil); " +

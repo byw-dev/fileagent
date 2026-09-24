@@ -171,8 +171,9 @@ func TestIC4A_FailureOverCap_DeadLetters200(t *testing.T) {
 	fails := newCountingFailStore()
 	dead := &recordingSink{}
 	// Two prior deliveries failed (pre-existing counter state, keyed the same
-	// way the handler does: hash of the event identity).
-	id := handler.DeadLetterRedisKey("b/k/deadkey")
+	// way the handler passes it: the RAW event identity — the store hashes
+	// internally for both backends).
+	id := "b/k/deadkey"
 	fails.IncrFailCount(context.Background(), id)
 	fails.IncrFailCount(context.Background(), id)
 	code := postWithFails(t, ix, fails, dead, 2, eventWithSequencer("s3:ObjectCreated:Put", "b", "k", "deadkey", 1))
@@ -200,7 +201,7 @@ func TestIC4A_Boundary_AtCapStillRetries(t *testing.T) {
 // TestIC4A_SuccessClearsCounter: after a successful delivery the persistent
 // counter is removed, so an unrelated later failure starts from zero.
 func TestIC4A_SuccessClearsCounter(t *testing.T) {
-	identity := handler.DeadLetterRedisKey("b/k/succ")
+	identity := "b/k/succ"
 	// Pre-seed two failures, then deliver successfully.
 	fails := newCountingFailStore()
 	fails.IncrFailCount(context.Background(), identity)
@@ -248,7 +249,7 @@ func TestIC4A_RetriesShareOneCounter(t *testing.T) {
 		require.Equal(t, http.StatusInternalServerError, code, "delivery %d stays under the cap", i+1)
 	}
 	assert.Equal(t, 3, fails.totalIncrements(), "three deliveries of one event = three increments")
-	n, err := fails.FailCount(context.Background(), redisKeyOf("b/k/same"))
+	n, err := fails.FailCount(context.Background(), "b/k/same")
 	require.NoError(t, err)
 	assert.Equal(t, int64(3), n)
 }

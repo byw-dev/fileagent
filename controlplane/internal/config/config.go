@@ -82,6 +82,13 @@ type Config struct {
 	// index from an external source and must be authenticated.
 	InternalWebhookSecret string
 
+	// WebhookMaxParseBytes is the IC-4a request-body parse cap for
+	// /internal/minio-event (round-3 B-2-3): bodies above it are oversized
+	// (dead letter + 5xx, never a silent 200). Default 8MiB; must stay at or
+	// above the 64KiB dead-letter capture floor — a near-zero cap turns every
+	// normal notification into a permanent 5xx (self-inflicted config), so
+	// config.Validate rejects sub-floor values.
+	WebhookMaxParseBytes int64
 	// WebhookFailLimit is the IC-4a poison-pill retry cap (IC-BUG-6): after
 	// this many failed deliveries of ONE webhook event (identified by
 	// bucket+key+sequencer), the event is dead-lettered into
@@ -171,6 +178,8 @@ func Load() (*Config, error) {
 	cfg.APIRateLimitPerMinute = envInt("API_RATE_LIMIT_PER_MINUTE", 600)
 	cfg.InternalWebhookSecret = os.Getenv("INTERNAL_WEBHOOK_SECRET")
 	cfg.WebhookFailLimit = int64(envInt("WEBHOOK_FAIL_LIMIT", 600))
+	// Default 8MiB (see handler.maxWebhookParseBytes for the sizing rationale).
+	cfg.WebhookMaxParseBytes = int64(envInt("WEBHOOK_MAX_PARSE_BYTES", int(handler.MaxWebhookParseBytesForTest())))
 	cfg.BootstrapAdminUsername = envString("BOOTSTRAP_ADMIN_USERNAME", "admin")
 	cfg.BootstrapAdminPassword = os.Getenv("BOOTSTRAP_ADMIN_PASSWORD")
 	cfg.BootstrapAdminForceReset = envBool("BOOTSTRAP_ADMIN_FORCE_RESET", false)
@@ -223,6 +232,10 @@ func (c *Config) Validate() error {
 	if c.WebhookFailLimit < handler.MinWebhookFailLimit {
 		return fmt.Errorf("WEBHOOK_FAIL_LIMIT=%d is below the safety floor %d — a few-second blip would dead-letter events; raise it to exceed (expected outage seconds ÷ 3)",
 			c.WebhookFailLimit, handler.MinWebhookFailLimit)
+	}
+	if c.WebhookMaxParseBytes < handler.MinWebhookParseCap {
+		return fmt.Errorf("WEBHOOK_MAX_PARSE_BYTES=%d is below the safety floor %d — a near-zero parse cap turns every normal notification into a permanent 5xx",
+			c.WebhookMaxParseBytes, handler.MinWebhookParseCap)
 	}
 	return nil
 }

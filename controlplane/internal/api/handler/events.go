@@ -714,6 +714,10 @@ type MinioEventHandler struct {
 	// failLimit is the poison-pill retry cap (WEBHOOK_FAIL_LIMIT). After this
 	// many failed deliveries one event is dead-lettered and answered 200.
 	failLimit int64
+	// parseCap is the request-body parse cap (WEBHOOK_MAX_PARSE_BYTES,
+	// B-2-3): bodies above it are oversized (dead letter + 5xx). Injected so
+	// tests can exercise the boundary; production value comes from Config.
+	parseCap int64
 }
 
 // NewMinioEventHandler returns a new MinioEventHandler.
@@ -727,7 +731,7 @@ func NewMinioEventHandler(indexer IndexerClient, secret string, logger *zap.Logg
 		logger.Warn("minio event webhook: INTERNAL_WEBHOOK_SECRET is not set; " +
 			"the /internal/minio-event endpoint will reject all requests until it is configured")
 	}
-	return &MinioEventHandler{logger: logger, indexer: indexer, secret: secret}
+	return &MinioEventHandler{logger: logger, indexer: indexer, secret: secret, parseCap: DefaultWebhookParseCap()}
 }
 
 // NewMinioEventHandlerWithPolicy returns a MinioEventHandler wired with the
@@ -736,6 +740,17 @@ func NewMinioEventHandler(indexer IndexerClient, secret string, logger *zap.Logg
 // constructor; NewMinioEventHandler (counters nil) remains for tests that
 // exercise only parsing/auth routing.
 func NewMinioEventHandlerWithPolicy(indexer IndexerClient, secret string, fails WebhookFailStore, dead DeadLetterSink, failLimit int64, logger *zap.Logger) *MinioEventHandler {
+	return NewMinioEventHandlerWithPolicyParseCap(indexer, secret, fails, dead, failLimit, DefaultWebhookParseCap(), logger)
+}
+
+// DefaultWebhookParseCap returns the default parse cap (used by the
+// convenience constructor).
+func DefaultWebhookParseCap() int64 { return maxWebhookParseBytes }
+
+// NewMinioEventHandlerWithPolicyParseCap is the full constructor (round-3
+// B-2-3): the parse cap is injected so WEBHOOK_MAX_PARSE_BYTES is a real,
+// testable knob.
+func NewMinioEventHandlerWithPolicyParseCap(indexer IndexerClient, secret string, fails WebhookFailStore, dead DeadLetterSink, failLimit int64, parseCap int64, logger *zap.Logger) *MinioEventHandler {
 	if failLimit < MinWebhookFailLimit {
 		// S1: never silently replace the configured value. Below the floor the
 		// cap is dangerously short (limit=1 tolerates ~3s), so this logs a
@@ -752,10 +767,23 @@ func NewMinioEventHandlerWithPolicy(indexer IndexerClient, secret string, fails 
 		zap.Bool("counter_store", fails != nil),
 		zap.Bool("dead_letter_sink", dead != nil),
 	)
+	if parseCap < MinWebhookParseCap {
+		logger.Warn("minio event webhook: parse cap below the safety floor — near-zero caps turn every normal notification into a permanent 5xx; production configs below the floor are rejected at startup",
+			zap.Int64("configured", parseCap),
+			zap.Int64("floor", MinWebhookParseCap),
+		)
+	}
+	logger.Info("minio event webhook: failure policy configured",
+		zap.Int64("fail_limit", failLimit),
+		zap.Int64("parse_cap", parseCap),
+		zap.Bool("counter_store", fails != nil),
+		zap.Bool("dead_letter_sink", dead != nil),
+	)
 	h := NewMinioEventHandler(indexer, secret, logger)
 	h.fails = fails
 	h.dead = dead
 	h.failLimit = failLimit
+	h.parseCap = parseCap
 	return h
 }
 
@@ -869,17 +897,12 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 	}
 
 	var payload minioS3Event
-	// Read the full body with an explicit oversized check (B-NEW-2, PR #110
-	// round-2 review): io.LimitReader at the capture cap silently returned a
-	// prefix, so a VALID large payload was truncated into a parse error,
-	// dead-lettered and answered 200 — a silent data-loss path. Reading
-	// limit+1 distinguishes the two: body ≤ maxWebhookParseBytes is parsed
-	// normally (valid large payloads index fine); anything over the parse cap
-	// is answered 5xx (MinIO redelivers; the operator raises the cap or the
-	// event is handled manually) — never a silent 200. The dedup hash is
-	// computed over the FULL body. Raw capture for the dead letter has its
-	// own smaller cap and a truncated flag (see captureRawPayload).
-	raw, oversized, readErr := readBodyCapped(c.Request.Body, maxWebhookParseBytes)
+	// Read the body with an explicit oversized check (B-NEW-2 → B-2, PR #110
+	// round-3 review): reading cap+1 distinguishes oversized from malformed —
+	// a silently truncated prefix is never mistaken for a complete payload.
+	// The body is consumed to the end (tee-hashed by readBodyCapped) so the
+	// dedup hash covers the FULL body, not just the prefix kept for capture.
+	raw, oversized, fullHash, readErr := readBodyCapped(c.Request.Body, h.parseCap)
 	if readErr != nil {
 		h.logger.Error("minio event: failed to read request body; requesting redelivery",
 			zap.Error(readErr))
@@ -888,19 +911,21 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 	}
 	if oversized {
 		// Explicit terminal state for oversized payloads: NOT a silent 200.
-		// 5xx keeps the event in MinIO's queue; the operator either raises
-		// WEBHOOK_MAX_PARSE_BYTES (deployments whose envelopes genuinely exceed
-		// the default) or handles the event manually. The dead letter records
-		// what happened, with the truncated prefix stored for identification.
+		// 5xx keeps the event in MinIO's queue; the operator raises
+		// WEBHOOK_MAX_PARSE_BYTES (the knob is wired through Config, with a
+		// startup floor — see config.Validate) or handles the event manually.
+		// The dead letter records the event with a 64KiB-captured prefix and
+		// the FULL-body hash as its dedup key, so distinct oversized payloads
+		// never overwrite each other's row.
 		h.logger.Error("minio event: payload exceeds the parse cap; dead-lettering with truncated capture and answering 5xx — raise WEBHOOK_MAX_PARSE_BYTES if this is legitimate",
-			zap.Int("parse_cap", maxWebhookParseBytes),
+			zap.Int64("parse_cap", h.parseCap),
 			zap.Int("captured_prefix_len", len(raw)))
 		dl := DeadLetter{
-			DedupKey:   "oversized:" + HashPayload(raw),
+			DedupKey:   "oversized:" + fullHash,
 			EventName:  "oversized",
 			FailCount:  1,
 			LastError:  "payload exceeds WEBHOOK_MAX_PARSE_BYTES",
-			RawPayload: string(raw),
+			RawPayload: captureRawPayload(raw),
 			Truncated:  true,
 		}
 		if err := h.deadLetter(c.Request.Context(), dl); err != nil {
@@ -920,7 +945,7 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 		h.logger.Error("minio event: failed to parse payload; dead-lettering",
 			zap.Error(err))
 		dl := DeadLetter{
-			DedupKey:   "unparseable:" + HashPayload(raw),
+			DedupKey:   "unparseable:" + fullHash,
 			EventName:  "unknown",
 			FailCount:  1,
 			LastError:  err.Error(),
@@ -1022,7 +1047,7 @@ func (h *MinioEventHandler) handleIndexFailure(ctx context.Context, bucket, key 
 		// pre-IC-4a mechanism but with the correct status code.
 		return true
 	}
-	count, err := h.fails.IncrFailCount(ctx, DeadLetterRedisKey(identity))
+	count, err := h.fails.IncrFailCount(ctx, identity)
 	if err != nil {
 		// The whole counter stack failed (Redis AND the in-process fallback).
 		// Retry is still the only non-lossy default; this path is effectively
@@ -1094,7 +1119,7 @@ func (h *MinioEventHandler) clearFailCount(ctx context.Context, bucket, key stri
 		return
 	}
 	identity := DeadLetterIdentity(bucket, key, rec.S3.Object.Sequencer)
-	if err := h.fails.ClearFailCount(ctx, DeadLetterRedisKey(identity)); err != nil {
+	if err := h.fails.ClearFailCount(ctx, identity); err != nil {
 		h.logger.Warn("minio event: could not clear failure counter",
 			zap.String("dedup_key", identity), zap.Error(err))
 	}

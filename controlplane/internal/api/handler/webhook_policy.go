@@ -103,94 +103,88 @@ type WebhookFailStore interface {
 	ClearFailCount(ctx context.Context, identity string) error
 }
 
-// NewRedisWebhookFailStore builds the production failure-counter store:
-// Redis fast path with a PostgreSQL-backed durable fallback (round-2 rework,
-// B-OLD-1 / B-NEW-1). The previous in-process map is gone — the IC-4 card
-// forbids in-process counting ("重启后计数归零，永远到不了上限"), and its
-// capacity eviction could reset an existing identity's count. PostgreSQL is
-// already a required dependency (the dead-letter sink lives there), so the
-// fallback adds no new infrastructure: if PG is ALSO down, the handler's B2
-// fail-closed already answers 5xx and nothing is lost.
+// NewRedisWebhookFailStore builds the production failure-counter store
+// (round-3 rework, B-1): **PostgreSQL is the authoritative monotonic
+// counter**; Redis is only a cache/accelerator in front of it.
 //
-// Merge semantics on Redis recovery (A-1): every successful Redis INCR takes
-// max(redisCount, pgFallbackCount) and writes it back to Redis, so repeated
-// Redis outages can never repeatedly reset the count and postpone the cap.
+// Why (round-3 review): the previous max(redis, pg) merge treated counts
+// from DISJOINT delivery epochs (Redis = before the outage, PG = during)
+// as duplicates of each other and swallowed failures; the SELECT→SET→DELETE
+// merge was also non-atomic and could return non-monotonic values.
+//
+// Model now: every failure atomically upserts the PG row (the single
+// authoritative series, monotonic under PostgreSQL row locking — the
+// previous round's review already verified this upsert has no lost
+// update). Redis caches the value to keep the hot path off PG; a Redis
+// cache miss (expiry, eviction, loss) simply re-reads PG — the series
+// never regresses. The PG row is deleted ONLY after a durable verdict:
+// successful indexing or a durably stored dead letter.
+//
+// If BOTH Redis and PG are unavailable, IncrFailCount errors and the
+// handler fail-closes with 5xx (B2): the event stays in MinIO's queue.
 func NewRedisWebhookFailStore(client *cache.Client, pg DBTX) WebhookFailStore {
 	return &redisFailStore{client: client, pg: pg}
 }
 
-// DBTX is the minimal database interface the PG fallback needs (satisfied by
-// *db.Queries); an interface keeps the store unit-testable without a real DB.
+// DBTX is the minimal database interface the authoritative counter needs
+// (satisfied by *db.Queries); an interface keeps the store unit-testable
+// without a real DB.
 type DBTX interface {
 	IncrWebhookFailCounter(ctx context.Context, dedupKey string) (int64, error)
 	GetWebhookFailCounter(ctx context.Context, dedupKey string) (int64, error)
 	ClearWebhookFailCounter(ctx context.Context, dedupKey string) error
 }
 
-// redisFailStore: Redis fast path + PostgreSQL durable fallback.
+// redisFailStore: Redis cache in front of the authoritative PG counter.
 type redisFailStore struct {
 	client *cache.Client
 	pg     DBTX
 }
 
-// IncrFailCount increments the persistent failure counter for the event:
-// Redis (sliding 7d TTL) first; on Redis failure the count advances in
-// PostgreSQL — durable across CP restarts (B-OLD-1) with no capacity
-// eviction to reset a live identity (B-NEW-1).
+// IncrFailCount advances the authoritative monotonic series: the PG row is
+// atomically upserted (+1) on every failure; Redis caches the result with a
+// sliding TTL. On Redis failure the count still advances via PG alone — the
+// series is monotonic regardless of Redis state, and CP restarts / Redis
+// data loss can never reset it.
 func (s *redisFailStore) IncrFailCount(ctx context.Context, identity string) (int64, error) {
-	count, err := s.client.IncrRefreshTTL(ctx, cache.WebhookFailCountKey(identity), webhookFailCounterTTL)
-	if err == nil {
-		return s.mergeRecovered(ctx, identity, count)
-	}
-	// Redis unavailable → PostgreSQL counter (persistent).
-	pgCount, pgErr := s.pg.IncrWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
-	if pgErr != nil {
-		// Redis AND PG down → B2 fail-closed territory. Propagate the error so
+	// identity arrives RAW (bucket/key/sequencer); both backends use the
+	// hashed form so keys stay bounded and byte-safe.
+	dk := DeadLetterRedisKey(identity)
+	pgCount, err := s.pg.IncrWebhookFailCounter(ctx, dk)
+	if err != nil {
+		// PG unavailable → B2 fail-closed territory. Propagate the error so
 		// the handler answers 5xx; the event stays in MinIO's queue.
-		return 0, pgErr
+		return 0, err
 	}
+	// Best-effort cache write: a failed cache refresh is harmless (the next
+	// read falls through to PG), so errors are not propagated.
+	_ = s.client.Set(ctx, cache.WebhookFailCountKey(identity), pgCount, webhookFailCounterTTL)
 	return pgCount, nil
 }
 
-// mergeRecovered implements A-1: on Redis recovery, never let the durable PG
-// progress be silently reset — take the max of both and pin it in Redis.
-// The PG row is cleared afterwards; it will be recreated only if Redis fails
-// again, starting from the merged value.
-func (s *redisFailStore) mergeRecovered(ctx context.Context, identity string, redisCount int64) (int64, error) {
-	pgCount, err := s.pg.GetWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
-	if err != nil || pgCount <= redisCount {
-		return redisCount, nil
-	}
-	// PG has more progress (Redis must have lost key/TTL): pin the larger
-	// value so the cap is not postponed.
-	merged := pgCount
-	if setErr := s.client.Set(ctx, cache.WebhookFailCountKey(identity), merged, webhookFailCounterTTL); setErr != nil {
-		// Couldn't pin in Redis — keep PG as the authority by leaving the row.
-		return merged, nil
-	}
-	_ = s.pg.ClearWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
-	return merged, nil
-}
-
-// FailCount reads the persistent failure counter for the event, falling back
-// to the PostgreSQL count while Redis is unavailable.
+// FailCount reads the cached value when present, otherwise the authoritative
+// PG count. A cache miss never regresses the series.
 func (s *redisFailStore) FailCount(ctx context.Context, identity string) (int64, error) {
 	count, err := s.client.GetInt64(ctx, cache.WebhookFailCountKey(identity))
-	if err == nil {
+	if err == nil && count > 0 {
 		return count, nil
 	}
 	pgCount, pgErr := s.pg.GetWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
 	if pgErr != nil {
-		return 0, pgErr
+		// No PG row = no failures recorded (not an error condition).
+		return 0, nil
 	}
 	return pgCount, nil
 }
 
 // ClearFailCount drops the counter after a durable verdict (dead letter
-// stored or delivery succeeded): both Redis and the PG fallback row.
+// stored or delivery succeeded): the authoritative PG row plus the cache.
 func (s *redisFailStore) ClearFailCount(ctx context.Context, identity string) error {
-	_ = s.pg.ClearWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
-	return s.client.Del(ctx, cache.WebhookFailCountKey(identity))
+	pgErr := s.pg.ClearWebhookFailCounter(ctx, DeadLetterRedisKey(identity))
+	if err := s.client.Del(ctx, cache.WebhookFailCountKey(identity)); err != nil {
+		return err
+	}
+	return pgErr
 }
 
 // DeadLetterSink is where exhausted events land (IC-4a (c)).
@@ -239,6 +233,14 @@ func DeadLetterRedisKey(identity string) string {
 // for deployments with genuinely larger envelopes.
 const maxWebhookParseBytes = 8 << 20
 
+// MinWebhookParseCap is the safety floor for WEBHOOK_MAX_PARSE_BYTES
+// (B-2-3, round-3 review): a cap near zero turns every normal notification
+// into a permanent 5xx (self-inflicted config). 64KiB ≈ the dead-letter
+// capture cap — a floor at the capture size keeps ordinary notifications
+// parseable while still rejecting obviously self-harming values. Validated
+// at startup by config.Validate (no silent fallback).
+const MinWebhookParseCap int64 = 64 << 10
+
 // maxDeadLetterPayloadBytes caps how much raw body is captured for the
 // unparseable-payload dead letter (S2). Independent from the parse cap
 // (B-NEW-2 item 4): large enough for any plausible single-record notification,
@@ -252,18 +254,28 @@ const maxDeadLetterPayloadBytes = 64 << 10
 // consts can't be referenced from handler_test).
 func MaxWebhookParseBytesForTest() int64 { return maxWebhookParseBytes }
 
-// readBodyCapped reads at most cap bytes and reports whether the body was
-// LARGER than cap (detected by reading cap+1 bytes — io.LimitReader alone
-// silently returns a prefix, which is exactly the bug B-NEW-2 closed).
-func readBodyCapped(r io.Reader, cap int64) (body []byte, oversized bool, err error) {
-	full, err := io.ReadAll(io.LimitReader(r, cap+1))
+// readBodyCapped reads the request body up to cap bytes and reports whether
+// the body was LARGER than cap (detected by reading cap+1 bytes —
+// io.LimitReader alone silently returns a prefix, which is the bug B-NEW-2
+// closed). B-2-1 (round-3): the ENTIRE body is consumed and hashed — the
+// returned hash always covers the full body even when oversized, so two
+// payloads sharing only a prefix can never collide on one dedup key.
+func readBodyCapped(r io.Reader, cap int64) (body []byte, oversized bool, fullHash string, err error) {
+	hasher := sha256.New()
+	tee := io.TeeReader(r, hasher)
+	full, err := io.ReadAll(io.LimitReader(tee, cap+1))
 	if err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
+	// Drain whatever the parser cap excluded so the hash sees the whole body.
+	if _, err := io.Copy(io.Discard, tee); err != nil {
+		return nil, false, "", err
+	}
+	hash := hex.EncodeToString(hasher.Sum(nil))
 	if int64(len(full)) > cap {
-		return full[:cap], true, nil
+		return full[:cap], true, hash, nil
 	}
-	return full, false, nil
+	return full, false, hash, nil
 }
 
 // captureRawPayload bounds the raw bytes stored in a dead letter: full body
