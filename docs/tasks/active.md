@@ -78,8 +78,11 @@ IC 残留项在 **CI 绿灯可信 + 账本重判**之前都不动。
 
 **已落地防回归**：[`deploy/scripts/smoke.sh`](../../deploy/scripts/smoke.sh) +
 `.github/workflows/ci-smoke.yml` —— 十二环 + webhook 探针，约 1 分钟。
-⚠️ 它带 `paths:` 过滤（`agent/` `controlplane/` `webui/` `pkg/` `api/` `proto/` `deploy/` +
-`go.*` / `tools/` / `Makefile`），**纯文档 PR 不触发**——所以「PR 必过」只对碰代码的 PR 成立。
+⚠️ 它带 `paths:` 过滤，**只有命中所列路径的 PR 才会触发**：
+`agent/**` `controlplane/**` `webui/**` `pkg/**` `api/**` `proto/**` `deploy/**`、
+`go.mod` `go.sum` `go.work` `go.work.sum`、`tools/**`、`Makefile`、**以及 workflow 自身**。
+准确边界是「**命中上列 paths**」，不是「碰代码」——例如 `sdk/python/**`、`sdk/java/**`
+不在清单里，改它们同样不触发。纯文档 PR 当然也不触发。
 
 > ⚠️ 两条会影响后续判断的事实：
 > ① **「CI 绿」的含义被高估**：11 个 `//go:build integration` 文件从未在 CI 跑过，
