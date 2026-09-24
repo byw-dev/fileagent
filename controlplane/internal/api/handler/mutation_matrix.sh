@@ -72,7 +72,7 @@ mutate_and_test "M6_5xx_back_to_200" controlplane/internal/api/handler/events.go
 
 # M7: failure counter not persisted (in-memory semantics — retries never reach cap)
 mutate_and_test "M7_no_count" controlplane/internal/api/handler/events.go \
-  'count, err := h.fails.IncrFailCount(ctx, DeadLetterRedisKey(identity))' \
+  'count, err := h.fails.IncrFailCount(ctx, identity)' \
   'count, err := int64(1), error(nil)' \
   "TestIC4A_FailureOverCap_DeadLetters200|TestIC4A_CounterPersistsAcrossStoreInstances"
 
@@ -108,38 +108,56 @@ mutate_and_test "M10_decode_bypass_counting" controlplane/internal/api/handler/e
 				failed = true
 			}' \
   'failed = true' \
-  "TestRED_DecodeFailure_OverCap_DeadLetter200|TestRED_DecodeFailure_UnderCap_Retries"
+  "TestDecodeFailure_StateMachine_UnderCapRetries_OverCapDeadLetter"
 
 # M11 (S2): the payload hash must be content-derived; a fixed key would make
 # distinct bad payloads overwrite each other's dead letter.
 mutate_and_test "M11_fixed_hash" controlplane/internal/api/handler/events.go \
-  '"unparseable:" + HashPayload(raw)' \
+  '"unparseable:" + fullHash' \
   '"unparseable:fixed"' \
   "TestIC4A_UnparseablePayload_DistinctPayloadsDoNotOverwrite|TestIC4A_UnparseablePayload_DeadLetter200"
 
 # M12 (B-OLD-1): the PG fallback is the durable counter layer. Mutating
 # IncrFailCount to return an error when Redis fails (i.e. dropping the PG
 # path) would be killed by the B-OLD-1 test.
-mutate_and_test "M12_pg_fallback_dropped" controlplane/internal/api/handler/webhook_policy.go \
-  '	pgCount, pgErr := s.pg.IncrWebhookFailCounter(ctx, DeadLetterRedisKey(identity))' \
-  '	return 0, err' \
-  "TestRED_CounterBackendDown_FallbackKeepsCounting"
-
-# M13 (B-NEW-2): oversized detection must exist — removing the limit+1 check
-# (silently truncating) would be killed by the valid-large-payload test.
 mutate_and_test "M13_oversized_detection" controlplane/internal/api/handler/webhook_policy.go \
   '	if int64(len(full)) > cap {
-		return full[:cap], true, nil
+		return full[:cap], true, hash, nil
 	}' \
   '	if false {
-		return full[:cap], true, nil
+		return full[:cap], false, hash, nil
 	}' \
   "TestOversizedPayload_DeadLetterAnd5xx"
 
-mutate_and_test "M14_merge_max" controlplane/internal/api/handler/webhook_policy.go \
-  '	merged := pgCount' \
-  '	merged := redisCount' \
-  "TestMergeRecovered_TakesMax"
+mutate_and_test "M15_pg_authority_dropped" controlplane/internal/api/handler/webhook_policy.go \
+  '	pgCount, err := s.pg.IncrWebhookFailCounter(ctx, dk)' \
+  '	return 0, err' \
+  "TestCounterSeries_MonotonicAcrossRedisLoss"
+
+# M16 (B-2-1): the full-body hash is the oversized dedup key. Reverting to
+# hashing the truncated capture would make prefix-sharing payloads collide.
+mutate_and_test "M16_oversized_hash_prefix" controlplane/internal/api/handler/events.go \
+  'DedupKey:   "oversized:" + fullHash,' \
+  'DedupKey:   "oversized:" + HashPayload(raw),' \
+  "TestRED_B2_1_OversizedHashUsesWholeBody_HANDLER"
+
+# M17 (B-2-2): oversized capture must go through captureRawPayload (64KiB).
+# Writing the 8MiB parse buffer directly breaks the capture cap.
+mutate_and_test "M17_oversized_capture_uncapped" controlplane/internal/api/handler/events.go \
+  'RawPayload: captureRawPayload(raw),' \
+  'RawPayload: string(raw),' \
+  "TestRED_B2_2_OversizedCaptureObey64KiB"
+
+# M18 (S-1): the stale sweep must actually delete — a no-op delete leaves the
+# table growing unboundedly. Killed by TestS1_StaleCounterCleanup.
+mutate_and_test "M18_stale_sweep_noop" controlplane/internal/api/handler/webhook_policy.go \
+  'func CleanupStaleWebhookFailCounters(ctx context.Context, pg DBTX, ttl time.Duration) (int64, error) {
+	return pg.DeleteStaleWebhookFailCounters(ctx, time.Now().Add(-ttl))
+}' \
+  'func CleanupStaleWebhookFailCounters(ctx context.Context, pg DBTX, ttl time.Duration) (int64, error) {
+	return 0, nil
+}' \
+  "TestS1_StaleCounterCleanup"
 
 echo "----"
 echo "killed=$PASS survived=$FAIL"

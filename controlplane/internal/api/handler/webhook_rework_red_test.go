@@ -202,3 +202,29 @@ func TestCounterSeries_MonotonicAcrossRedisLoss(t *testing.T) {
 	require.NoError(t, conn.QueryRow("SELECT count(*) FROM webhook_fail_counters WHERE dedup_key=$1", dk).Scan(&n))
 	assert.Equal(t, 0, n, "the PG row is cleared after the durable verdict")
 }
+
+// ── B3 (round-2, kept for M10): decode failures must reach a durable state ───
+
+// TestDecodeFailure_StateMachine_UnderCapRetries_OverCapDeadLetter: decode
+// failures flow through the SAME counted state machine as indexing failures —
+// under the cap 5xx (retry), past the cap a dead letter + 200. Killed by the
+// M10 mutation (decode bypasses counting).
+func TestDecodeFailure_StateMachine_UnderCapRetries_OverCapDeadLetter(t *testing.T) {
+	ix := &mockIndexerClient{}
+	fails := newCountingFailStore()
+	dead := &recordingSink{}
+	h := ic4aHandler(ix, fails, dead, 1)
+
+	// Delivery 1: count=1, not > 1 → 5xx, NOT dead-lettered yet.
+	w1 := postIC4A(t, h, minioEventBody(t, "s3:ObjectCreated:Put", "data-sensor", "a%2Gb.csv"))
+	assert.Equal(t, http.StatusInternalServerError, w1.Code,
+		"under the cap a decode failure must be retried (5xx)")
+	assert.Equal(t, 0, dead.count(), "no dead letter before the cap")
+
+	// Delivery 2: count=2 > 1 → dead letter + 200.
+	w2 := postIC4A(t, h, minioEventBody(t, "s3:ObjectCreated:Put", "data-sensor", "a%2Gb.csv"))
+	assert.Equal(t, http.StatusOK, w2.Code,
+		"an exhausted decode failure must reach the durable terminal state")
+	require.Equal(t, 1, dead.count())
+	assert.Equal(t, "data-sensor/a%2Gb.csv/", dead.last().DedupKey)
+}
