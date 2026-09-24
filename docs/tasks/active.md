@@ -117,12 +117,10 @@ IC 残留项在 **CI 绿灯可信 + 账本重判**之前都不动。
 - **WR（Web UI 重做）**——UI 现已实登验证可用
 - **覆盖率补到 80%**——差 0.6 个百分点，为凑数写测试正是 CLAUDE.md 禁止的
 
-### 已提出、待单独拍板
+### 已提出但明确延后
 
-- **合并 `controlplane/migrations/*.sql`**（当前 10 个 up）：产品已提出，方向认可。
-  ⚠️ 合并后 `schema_migrations` 版本号与任何已存在的本地库对不上，**所有人的本地 dev 库须重建**
-  （`docker compose down -v`）；CI 的 codegen-drift 闸与 `migrate_test.go` 的内嵌迁移断言要一起验。
-  **单独一刀，不夹带。**
+- **合并 `controlplane/migrations/*.sql`** → 已归 [`backlog.md`](backlog.md)「技术债」。
+  产品定性（2026-09-24）：**不影响功能逻辑，只影响维护与开发体验**，可延后。
 
 ---
 
