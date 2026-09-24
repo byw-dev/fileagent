@@ -140,9 +140,20 @@ jobs:
           chmod +x bin/controlplane bin/agent
           ls -l bin/
 
-      - name: Install mc (init-minio.sh 需要 mc + curl)
+      # init-minio.sh 需要 mc + curl。⚠️ 不要从 dl.min.io 下载：MinIO 仓库已于
+      # 2026-04 归档，该地址现在返回的是一段公告文本而不是二进制（首次 CI 实测，
+      # 表现为 `/usr/local/bin/mc: line 1: 410: command not found`）。
+      # 改从 compose 里已经钉版本的 minio/minio 镜像里抽——无外部下载，
+      # 且客户端与服务端版本天然一致，不会各自漂移。
+      - name: Install mc (extract from the pinned MinIO image)
         run: |
-          curl -sSL -o /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc
+          IMAGE="$(grep -oE 'minio/minio:RELEASE\.[0-9A-Za-z.:-]+' deploy/docker-compose.dev.yml | head -1)"
+          if [ -z "$IMAGE" ]; then
+            echo "::error::无法从 deploy/docker-compose.dev.yml 解析出钉定的 MinIO 镜像 tag"
+            exit 1
+          fi
+          echo "extracting mc from $IMAGE"
+          docker run --rm --entrypoint cat "$IMAGE" /usr/bin/mc > /usr/local/bin/mc
           chmod +x /usr/local/bin/mc
           mc --version
 
