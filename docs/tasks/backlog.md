@@ -127,14 +127,17 @@ CP↔MinIO 不再 hairpin。
 [`metadata-phase1.md`](metadata-phase1.md)）。分期、验收清单、恢复方法均在权威追踪文件
 [`webui-redesign-impl.md`](webui-redesign-impl.md)。实施采用**在现有基线上改造（非重写）**。
 
-## 元数据 / 标签 / 数据集能力（epic · 已拍板 6c，D-025）→ Phase 1 已排期，见专项追踪文件
+## 元数据 / 标签 / 数据集能力（epic · 已拍板 6c，D-025）→ **Phase 1 已收官**，见专项追踪文件
 
 **来源**：Claude Design round 6–7；已拍板混合模型 `6c`（D-025 + 2026-07-10 补充）。**权威设计**：
 [`docs/design/metadata-model.md`](../design/metadata-model.md)（Phase 1 工程设计 + Phase 2 留存）。
 
-**Phase 1 · 受控标签**已从"待规划"升级为**当前选定 track**（2026-07-10 价值优先决策，WR-2…10 暂停让位）：
-任务拆分 **MT-1…MT-6**、验收要点、执行纪律均落于权威追踪文件
-[`metadata-phase1.md`](metadata-phase1.md)。起手 MT-1+MT-2 薄纵切。
+~~**Phase 1 · 受控标签**已从"待规划"升级为**当前选定 track**（2026-07-10 价值优先决策，WR-2…10 暂停让位）~~
+⚠️ **已过期**：**Phase 1（MT-1…MT-6）已于 2026-07-14 全部收官**（PR #69–#79），
+既不是「当前选定 track」，也不需要「起手 MT-1+MT-2」。任务拆分、验收要点与执行纪律见
+[`metadata-phase1.md`](metadata-phase1.md)（含收官 banner）。
+**Phase 2（数据集 / 血缘）按信号触发，未排期。**
+当前执行顺序见 [`active.md`](active.md)「下一步」。
 
 **Phase 2 · 数据集注册表 + 衍生数据入口 + 血缘 run 模型（deferred）** —— 薄层不动文件表。
 **设计已完整留存**于 `metadata-model.md` P2.1–P2.3（2026-07-10 修订：血缘从数据集级改为 run 模型；
@@ -260,7 +263,14 @@ Linux CI 是 bash 5，**跑绿也证明不了任何事**。GitHub 的 macOS runn
 `.github/workflows/ci-deploy.yml`（`paths: deploy/**`，跑 shellcheck + 矩阵）。
 
 **优先级**：🟡 中。不是纯健壮性——`deploy/` 是**唯一一处「改坏了单测和 live e2e 都不会红」的地方**，
-而它恰恰决定新环境能不能起来。**排期**：产品已定在 PR #97 + #98 合并之后开工——**两者均已于 2026-09-11 合并（`13eb730` / `91c1628`），条件已满足，可开工**。
+而它恰恰决定新环境能不能起来。~~**排期**：产品已定在 PR #97 + #98 合并之后开工——两者均已于 2026-09-11 合并
+（`13eb730` / `91c1628`），条件已满足，可开工~~
+⚠️ **2026-09-24 更新**：前置条件确已满足，但**它不在当前执行顺序里**——当前顺序见
+[`active.md`](active.md)「下一步」，各步互为前提，请勿据此另起一条并行开工路径。
+另：本条的核心理由「`deploy/` 是唯一一处改坏了单测和 live e2e 都不会红的地方」
+**已被 PR #114 部分推翻**——端到端冒烟（`deploy/scripts/smoke.sh` + `ci-smoke.yml`）
+现在真的会跑 `init-minio.sh` 与三个 compose，`deploy/**` 也在其 `paths:` 触发清单里。
+重新开工前应先按现状重估这条的价值与范围。
 
 
 ---
