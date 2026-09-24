@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -252,6 +254,13 @@ func main() {
 	offlineSweeper := worker.NewOfflineSweeper(queries, redisClient, nats, bootstrap.DefaultOrgID, logger)
 	go offlineSweeper.Run(ctx, 0)
 
+	// S-1 (round-3 review): the webhook_fail_counters lifecycle claim in
+	// migration 000009 (stale rows cleaned after 7d) needs a REAL caller —
+	// sweep at startup and periodically, until shutdown. Coarse interval: the
+	// sweep is hygiene, not latency-sensitive. (Prometheus remains deferred —
+	// T4-1; deletions are observable via structured logs.)
+	go handler.RunStaleCounterCleanup(ctx, queries, handler.WebhookFailCounterTTL(), time.Hour, logger)
+
 	// Retro-tagging worker drains the retag_jobs outbox (e.g. pending-value merge).
 	retagWorker := worker.NewRetagWorker(queries, logger)
 	go retagWorker.Run(ctx, 0)
@@ -270,11 +279,11 @@ func main() {
 	// UpsertDeadLetter statement exercises. Failures surface as a degraded
 	// /healthz plus a loud structured log; the runbook entry lives in
 	// consistency-and-ingest.md §3.6.
-	// Probe once at startup (a per-request write would spam the table);
-	// /healthz then reports the cached result. The probe row is deleted so the
-	// table stays clean; a failure is non-fatal (the service still starts —
-	// MinIO delivery is independent) but is loudly logged and reported as
-	// degraded so operators see it immediately.
+	// S-2 (round-3 review): the sink readiness must be DYNAMIC — a one-shot
+	// startup probe would leave /healthz permanently 503 after a transient
+	// startup-window failure, and permanently 200 after a later sink failure.
+	// A background goroutine re-probes with backoff and publishes the result
+	// atomically; /healthz reads the cached verdict. No per-request writes.
 	deadLetterProbe := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -289,11 +298,46 @@ func main() {
 		_, err := queries.DeleteDeadLetterWrap(ctx, "__healthcheck__")
 		return err
 	}
-	deadLetterProbeErr := deadLetterProbe()
-	if deadLetterProbeErr != nil {
-		logger.Error("webhook dead-letter sink NOT ready: index processing will be blocked (B2 fail-closed) once any event fails — fix webhook_dead_letters table/grants",
-			zap.Error(deadLetterProbeErr))
+	var sinkReady atomic.Bool
+	var sinkProbeMu sync.Mutex
+	probeSink := func(initial bool) {
+		sinkProbeMu.Lock()
+		defer sinkProbeMu.Unlock()
+		err := deadLetterProbe()
+		wasReady := sinkReady.Load()
+		sinkReady.Store(err == nil)
+		switch {
+		case err != nil && (initial || wasReady):
+			logger.Error("webhook dead-letter sink NOT ready: index processing will be blocked (B2 fail-closed) once any event fails — fix webhook_dead_letters table/grants",
+				zap.Error(err))
+		case err == nil && !initial && !wasReady:
+			logger.Info("webhook dead-letter sink recovered; /healthz exits degraded")
+		}
 	}
+	probeSink(true)
+	go func() {
+		// Re-probe with capped exponential backoff: fast retries while
+		// degraded (recover quickly), slow while healthy (cheap liveness).
+		interval := 30 * time.Second
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				probeSink(false)
+				if sinkReady.Load() {
+					interval = time.Minute
+				} else {
+					if interval < 5*time.Minute {
+						interval *= 2
+					}
+				}
+				timer.Reset(interval)
+			}
+		}
+	}()
 
 	// ── Build HTTP router ────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
@@ -327,7 +371,7 @@ func main() {
 		WebhookDeadLetters:     webhookDeadLetters,
 		WebhookFailLimit:       cfg.WebhookFailLimit,
 		WebhookMaxParseBytes:   cfg.WebhookMaxParseBytes,
-		WebhookDeadLetterProbe: func() bool { return deadLetterProbeErr == nil },
+		WebhookDeadLetterProbe: sinkReady.Load,
 		StatsDB:                queries,
 		RateLimiter:            redisClient,
 		RateLimitPerMinute:     cfg.APIRateLimitPerMinute,

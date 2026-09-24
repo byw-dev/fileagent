@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_webhook_fail_counters_updated_at;

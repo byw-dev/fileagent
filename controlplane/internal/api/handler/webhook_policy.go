@@ -133,6 +133,7 @@ type DBTX interface {
 	IncrWebhookFailCounter(ctx context.Context, dedupKey string) (int64, error)
 	GetWebhookFailCounter(ctx context.Context, dedupKey string) (int64, error)
 	ClearWebhookFailCounter(ctx context.Context, dedupKey string) error
+	DeleteStaleWebhookFailCounters(ctx context.Context, before time.Time) (int64, error)
 }
 
 // redisFailStore: Redis cache in front of the authoritative PG counter.
@@ -185,6 +186,51 @@ func (s *redisFailStore) ClearFailCount(ctx context.Context, identity string) er
 		return err
 	}
 	return pgErr
+}
+
+// WebhookFailCounterTTL exposes the counter TTL for the cleanup runner
+// (main.go) — the authoritative PG series and the Redis cache share one
+// lifecycle value so the two backends age identically.
+func WebhookFailCounterTTL() time.Duration { return webhookFailCounterTTL }
+
+// CleanupStaleWebhookFailCounters deletes counter rows untouched for longer
+// than ttl (S-1, round-3 review): the authoritative series lives in PG, so
+// the lifecycle claim in migration 000009 (stale cleanup after 7d) must have
+// a REAL caller — without it the table grows unboundedly with historical
+// failure identities. Runs at startup and periodically (RunStaleCounterCleanup).
+func CleanupStaleWebhookFailCounters(ctx context.Context, pg DBTX, ttl time.Duration) (int64, error) {
+	return pg.DeleteStaleWebhookFailCounters(ctx, time.Now().Add(-ttl))
+}
+
+// RunStaleCounterCleanup sweeps stale counter rows immediately and then on a
+// ticker until ctx is cancelled (S-1). interval should be coarse (the sweep
+// is hygiene, not latency-sensitive); each round logs deletions so growth is
+// observable in structured logs (no Prometheus — T4-1 deferred).
+func RunStaleCounterCleanup(ctx context.Context, pg DBTX, ttl time.Duration, interval time.Duration, logger *zap.Logger) {
+	sweep := func() {
+		deleted, err := CleanupStaleWebhookFailCounters(ctx, pg, ttl)
+		if err != nil {
+			logger.Warn("webhook fail-counter stale sweep failed",
+				zap.Error(err))
+			return
+		}
+		if deleted > 0 {
+			logger.Info("webhook fail-counter stale sweep",
+				zap.Int64("deleted", deleted),
+				zap.Duration("ttl", ttl))
+		}
+	}
+	sweep()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
 }
 
 // DeadLetterSink is where exhausted events land (IC-4a (c)).
