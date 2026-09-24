@@ -20,6 +20,15 @@ on:
       - 'api/**'
       - 'proto/**'
       - 'deploy/**'
+      # 构建解析的直接输入：go.work 决定模块解析，tools/go.mod 决定 CI 用的 Go 版本
+      # （下面 setup-go 的 go-version-file 就读它）。漏掉它们，一个能改坏编译的 PR
+      # 就完全不触发这条冒烟。
+      - 'go.mod'
+      - 'go.sum'
+      - 'go.work'
+      - 'go.work.sum'
+      - 'tools/**'
+      - 'Makefile'
       - '.github/workflows/ci-smoke.yml'
   push:
     branches: [master]
@@ -31,6 +40,15 @@ on:
       - 'api/**'
       - 'proto/**'
       - 'deploy/**'
+      # 构建解析的直接输入：go.work 决定模块解析，tools/go.mod 决定 CI 用的 Go 版本
+      # （下面 setup-go 的 go-version-file 就读它）。漏掉它们，一个能改坏编译的 PR
+      # 就完全不触发这条冒烟。
+      - 'go.mod'
+      - 'go.sum'
+      - 'go.work'
+      - 'go.work.sum'
+      - 'tools/**'
+      - 'Makefile'
       - '.github/workflows/ci-smoke.yml'
 
 concurrency:

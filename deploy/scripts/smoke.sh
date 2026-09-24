@@ -35,6 +35,10 @@ COMPOSE="docker compose -f deploy/docker-compose.dev.yml"
 BIN_DIR="${FA_BIN_DIR:-}"
 WORK="${FA_WORK_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/fileagent-smoke.XXXXXX")}"
 mkdir -p "$WORK"
+# mc 的配置是**全局**的（~/.mc/config.json）。init-minio.sh 会 `mc alias set myminio ...`，
+# 不隔离就会把开发者指向 dev MinIO 的同名 alias 覆盖成 smoke 的高位端口，
+# 且清理阶段无法还原——容器/端口/卷隔离得再干净，这一处仍会污染宿主。
+export MC_CONFIG_DIR="$WORK/mc"
 CP_PID=""
 AGENT_PID=""
 
@@ -48,7 +52,10 @@ cleanup() {
   if [ "${KEEP:-0}" = "1" ]; then
     echo ""
     echo "KEEP=1 — 保留环境供排查：项目 ${COMPOSE_PROJECT_NAME}，工作目录 ${WORK}"
-    echo "  清理：docker compose -p ${COMPOSE_PROJECT_NAME} -f deploy/docker-compose.dev.yml down -v"
+    echo "  清理容器：docker compose -p ${COMPOSE_PROJECT_NAME} -f deploy/docker-compose.dev.yml down -v"
+    # CP / agent 是宿主进程，KEEP=1 不杀它们；本地忘了收会占住端口，
+    # 下一次运行只会表现为「CP /healthz 就绪 超时」，很难联想到是上一次的残留。
+    echo "  清理进程：kill ${CP_PID} ${AGENT_PID}   # controlplane / agent"
     return $rc
   fi
   echo ""
@@ -93,6 +100,23 @@ sha256_of() {
 # wait_for 的谓词写成函数（而非 bash -c 字符串），否则子 shell 里没有上面这些函数
 agent_is_pending() { psql_q "select 1 from agents where status='pending'" | grep -q 1; }
 file_is_indexed()  { psql_q "select 1 from file_entries where file_name='smoke.csv' and status='completed'" | grep -q 1; }
+probe_is_indexed() { psql_q "select 1 from file_entries where storage_path='probe/webhook-probe.txt' and source='minio_event'" | grep -q 1; }
+
+# ── 前置检查：端口冲突要立刻说清楚 ─────────────────────────────────────────
+# 否则症状是 60 秒后的「CP /healthz 就绪 超时」，看不出是端口被占
+# （最常见来源：上一次 KEEP=1 运行遗留的 CP 进程）。
+if command -v lsof >/dev/null 2>&1; then
+for port_spec in "${CP_HTTP_PORT}:Control Plane HTTP" "${CP_GRPC_PORT}:Control Plane gRPC" \
+                 "${FA_POSTGRES_PORT}:PostgreSQL" "${FA_REDIS_PORT}:Redis" \
+                 "${FA_MINIO_PORT}:MinIO" "${FA_NATS_PORT}:NATS"; do
+  port="${port_spec%%:*}"; what="${port_spec#*:}"
+  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "  ✗ 端口 ${port}（${what}）已被占用：" >&2
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | tail -n +2 | sed 's/^/      /' >&2
+    fail "先释放该端口，或用环境变量指定别的端口（见脚本头部注释）"
+  fi
+done
+fi  # 无 lsof 则跳过（不是所有环境都装了；CI 上端口本来就是干净的）
 
 # ── ① 基础设施 ─────────────────────────────────────────────────────────────
 step "① 拉起基础设施（独立项目 ${COMPOSE_PROJECT_NAME}）"
@@ -163,7 +187,14 @@ ok "REST 登录成功"
 UI_CODE="$(curl -s -o "$WORK/index.html" -w '%{http_code}' "http://127.0.0.1:${CP_HTTP_PORT}/")"
 [ "$UI_CODE" = "200" ] || fail "GET / 返回 ${UI_CODE}，Web UI 未嵌入（需 -tags webui / make bundle）"
 grep -qi '<div id="root"\|<title>' "$WORK/index.html" || fail "GET / 返回 200 但不像 SPA 首页"
-ok "Web UI 已随二进制提供"
+# 只验首页会放过「壳在、资产全 404」的 bundle。取 index.html 引用的第一个 JS chunk
+# 真下一遍：嵌入不完整 / dist 拷贝漏文件时这里才会红。
+UI_ASSET="$(grep -oE '/assets/[^"]+\.js' "$WORK/index.html" | head -1)"
+[ -n "$UI_ASSET" ] || fail "index.html 未引用任何 /assets/*.js，Web UI 产物不完整"
+ASSET_CODE="$(curl -s -o "$WORK/asset.js" -w '%{http_code}' "http://127.0.0.1:${CP_HTTP_PORT}${UI_ASSET}")"
+[ "$ASSET_CODE" = "200" ] || fail "SPA 资产 ${UI_ASSET} 返回 ${ASSET_CODE}，Web UI 无法运行"
+[ "$(wc -c < "$WORK/asset.js")" -gt 1000 ] || fail "SPA 资产 ${UI_ASSET} 过小，疑似错误页而非 JS"
+ok "Web UI 已随二进制提供（首页 + 资产 ${UI_ASSET} 均可取）"
 
 # ── ③ Agent 注册 → 审批 → RUNNING ─────────────────────────────────────────
 step "③ Agent 注册 → 审批 → gRPC 连接"
@@ -229,7 +260,6 @@ RULE_HTTP="$(api -o "$WORK/rule.json" -w '%{http_code}' \
     \"base_path\": \"$WORK/watch\",
     \"path_pattern\": \"{name}.csv\",
     \"dest_path_template\": \"smoke/{submit_time:yyyy/MM/dd}/{filename}\",
-    \"append_mode\": \"close_wait\",
     \"recursive\": true,
     \"enabled\": true
   }")"
@@ -242,7 +272,13 @@ wait_for "④ STS 凭据已下发给 agent" 60 \
 
 # ── ⑦⑧⑨⑩ 落文件 → 采集 → 直传 → 索引 ────────────────────────────────────
 step "⑦⑧⑨⑩ 落文件 → 采集 → 直传 MinIO → 索引"
-printf 'ts,sensor,value\n2026-01-01T00:00:00Z,s1,42.5\n' > "$WORK/watch/smoke.csv"
+# 原子落盘：先写到监听目录之外，再 mv 进去。
+# 这样只产生一个 CREATE 事件，断言「上传恰好 1 次」才是确定性的；
+# 同时规则用的是**默认** append_mode（overwrite，无防抖），所以这条护栏
+# 守的是真正的默认路径，而不是 close_wait 自己。
+mkdir -p "$WORK/stage"
+printf 'ts,sensor,value\n2026-01-01T00:00:00Z,s1,42.5\n' > "$WORK/stage/smoke.csv"
+mv "$WORK/stage/smoke.csv" "$WORK/watch/smoke.csv"
 SRC_SHA="$(sha256_of "$WORK/watch/smoke.csv")"
 
 wait_for "file_entries 出现索引行" 120 file_is_indexed
@@ -261,11 +297,25 @@ DB_SHA="$(fe sha256)"
 [ "$(fe rule_id)"  != "<null>" ] || fail "file_entries.rule_id 为空（归属信息丢失）"
 ok "索引行字段正确（source=agent / sha256 / agent_id / rule_id）"
 
-# 写放大护栏：一个原子写出的小文件只应产生一条上传记录。
-# 默认 append_mode=overwrite 无防抖时，慢写文件会产生几十上百条（审计实测 150 条）。
+# 写放大护栏：规则用的是默认 append_mode（overwrite），文件是原子 mv 进来的，
+# 所以恰好 1 条是确定的。默认模式一旦再次出现重复上传（审计实测一个 150MB
+# 文件产生 150 次完整上传），这里就会红。
 UPLOADS="$(psql_q "select count(*) from upload_logs where storage_path like 'smoke/%'")"
 [ "$UPLOADS" = "1" ] || fail "upload_logs 有 $UPLOADS 条记录，期望 1 条（重复上传 / 写放大）"
 ok "上传次数为 1（无写放大）"
+
+# ── webhook 投递（配置契约护栏）────────────────────────────────────────────
+# 上面所有断言都要求 source='agent'，也就是**主路径**。这意味着 webhook 整条
+# 链路（MinIO 通知 → CP 鉴权 → 索引）就算完全坏掉，上面也全是绿的——
+# INTERNAL_WEBHOOK_SECRET 与 init-minio.sh 的 WEBHOOK_AUTH_TOKEN 一旦漂移，
+# CP 会 401 拒绝所有事件，而没有任何断言会红（评审实测：故意写错 token 仍全绿）。
+# 所以这里绕开 agent 直接往 bucket 里放一个对象，断言它以 source='minio_event'
+# 进索引——这是对账兜底能力的唯一探针。
+step "webhook 投递（绕过 agent 的对账兜底路径）"
+printf 'webhook probe\n' > "$WORK/probe.txt"
+mc cp --quiet "$WORK/probe.txt" "myminio/data-sensor/probe/webhook-probe.txt" >/dev/null \
+  || fail "mc cp 失败（无法投放 webhook 探针对象）"
+wait_for "MinIO 事件经 webhook 进索引（source=minio_event）" 90 probe_is_indexed
 
 # ── ⑪ 列表查询 ─────────────────────────────────────────────────────────────
 step "⑪ 文件列表 / 查询"

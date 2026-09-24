@@ -269,9 +269,12 @@ make bundle
 
 # 3) 启动 Control Plane
 #    ⚠️ 不需要 migrate CLI：迁移已内嵌进二进制，启动时自动应用（D-023）
+#    ⚠️ CP 是常驻前台进程。下面用 nohup 放后台，好让第 4 步能在同一个终端接着跑；
+#       想看实时日志就另开一个终端前台跑 ./bin/controlplane，再在原终端执行第 4 步。
 cp controlplane/.env.example deploy/config/controlplane.env   # 首次；deploy/config/ 已 gitignore
 set -a && . deploy/config/controlplane.env && set +a
-./bin/controlplane
+nohup ./bin/controlplane > /tmp/fileagent-cp.log 2>&1 &
+until curl -sf -o /dev/null http://127.0.0.1:8080/healthz; do sleep 1; done   # 等它真的起来
 
 # 4) 初始化 MinIO（首次）——⚠️ 必须在 Control Plane 已经在监听之后再跑
 #    原因：MinIO 配置 webhook 时会**真的去拨**这个地址，CP 没起来则整个脚本失败退出，
