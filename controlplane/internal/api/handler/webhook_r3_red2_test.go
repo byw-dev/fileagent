@@ -116,3 +116,61 @@ func TestFailCount_CacheMissFallsThroughToPG(t *testing.T) {
 	// The read path is read-only: the cache is repopulated by the next
 	// IncrFailCount (the write path owns cache refreshes).
 }
+
+// TestRunStaleCounterCleanup_RunsAndStops: the background sweeper must run
+// its first sweep immediately (startup hygiene — S-1) and exit on ctx cancel.
+func TestRunStaleCounterCleanup_RunsAndStops(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://fileagent:fileagent@127.0.0.1:5432/fileagent?sslmode=disable"
+	}
+	conn, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Skipf("no PostgreSQL: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.Ping(); err != nil {
+		t.Skipf("no PostgreSQL: %v", err)
+	}
+	q := db.New(conn)
+	dk := handler.DeadLetterRedisKey("b/k/sweep-runner")
+	_, _ = conn.Exec("DELETE FROM webhook_fail_counters WHERE dedup_key=$1", dk)
+	t.Cleanup(func() { _ = q.ClearWebhookFailCounter(context.Background(), dk) })
+
+	// Seed a stale row, then let the runner's immediate sweep delete it.
+	_, err = q.IncrWebhookFailCounter(context.Background(), dk)
+	require.NoError(t, err)
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	_, err = conn.Exec("UPDATE webhook_fail_counters SET updated_at=$1 WHERE dedup_key=$2", old, dk)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		handler.RunStaleCounterCleanup(ctx, q, 7*24*time.Hour, time.Hour, newTestLogger())
+		close(done)
+	}()
+	// The immediate sweep is synchronous at runner start; a short wait makes
+	// the assertion deterministic without sleeping the full interval.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var exists bool
+		err := conn.QueryRow("SELECT EXISTS(SELECT 1 FROM webhook_fail_counters WHERE dedup_key=$1)", dk).Scan(&exists)
+		require.NoError(t, err)
+		if !exists {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var exists bool
+	require.NoError(t, conn.QueryRow("SELECT EXISTS(SELECT 1 FROM webhook_fail_counters WHERE dedup_key=$1)", dk).Scan(&exists))
+	assert.False(t, exists, "the runner's startup sweep must delete stale rows (S-1 lifecycle must be real)")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runner must exit when ctx is cancelled")
+	}
+	assert.True(t, handler.WebhookFailCounterTTL() > 0)
+}
