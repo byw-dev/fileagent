@@ -4,13 +4,13 @@
 services:
   postgres:
     image: postgres:15-alpine
-    container_name: fileagent-dev-postgres
+    container_name: ${FA_CONTAINER_PREFIX:-fileagent-dev}-postgres
     environment:
       POSTGRES_USER: fileagent
       POSTGRES_PASSWORD: fileagent
       POSTGRES_DB: fileagent
     ports:
-      - "5432:5432"
+      - "${FA_POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -23,9 +23,9 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: fileagent-dev-redis
+    container_name: ${FA_CONTAINER_PREFIX:-fileagent-dev}-redis
     ports:
-      - "6379:6379"
+      - "${FA_REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -37,15 +37,22 @@ services:
     restart: unless-stopped
 
   minio:
-    image: minio/minio:latest
-    container_name: fileagent-dev-minio
+    # ⚠️ registry 必须是 quay.io，不是 Docker Hub：MinIO 已转向商用，2026 年彻底
+    # 移除了 Docker Hub 上的 minio/minio、minio/mc 镜像以及 dl.min.io 的 mc 下载，
+    # 实测 `docker manifest inspect minio/minio:*` 一律
+    # 「repository does not exist」（而 postgres/redis/nats 均正常）。
+    # 有本地缓存的机器察觉不到，任何全新环境或 CI runner 会直接起不来。
+    # 版本同时钉死：镜像内自带 mc（healthcheck 与 init-minio.sh 都依赖它），
+    # 新版已把 mc 拆走。
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: ${FA_CONTAINER_PREFIX:-fileagent-dev}-minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${FA_MINIO_PORT:-9000}:9000"
+      - "${FA_MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio_data:/data
       # IC-4a ③ (IC-BUG-9): the webhook delivery queue must live on a
@@ -54,6 +61,12 @@ services:
       # events survive both `docker restart` and `docker compose down/up` with
       # a named volume. Previously the queue sat in /tmp and was wiped — or,
       # drifted, empty (sendSync drops failed deliveries outright).
+    # MinIO 需要主动回连跑在宿主上的 Control Plane（notify_webhook）。
+    # Docker Desktop 自带 host.docker.internal，但 Linux 的 Docker Engine 没有——
+    # GitHub Actions 的 ubuntu runner 正是后者。host-gateway 在两边都成立，
+    # 所以这一行让同一份配置在本地与 CI 上行为一致。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
@@ -64,11 +77,11 @@ services:
 
   nats:
     image: nats:2-alpine
-    container_name: fileagent-dev-nats
+    container_name: ${FA_CONTAINER_PREFIX:-fileagent-dev}-nats
     command: ["-js", "-m", "8222"]
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "${FA_NATS_PORT:-4222}:4222"
+      - "${FA_NATS_MONITOR_PORT:-8222}:8222"
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
       interval: 10s

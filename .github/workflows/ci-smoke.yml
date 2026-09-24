@@ -1,0 +1,183 @@
+name: CI — E2E Smoke
+
+# 目标 A 的端到端冒烟：一台 agent + Control Plane + Web UI，配一条采集规则，
+# 文件采上去 / 索引里查得到 / 能下载。最终判据是「下载回来的字节与源文件
+# sha256 一致」——断言业务不变量，不断言日志文案。
+#
+# 为什么是跨模块触发：这条冒烟守的是整条链路，任何一端的改动都可能弄断它，
+# 所以 paths 不能照抄 ci-cp.yml 的 controlplane/**。
+#
+# 三个 job 用 needs: 串联而不是跨 workflow 复用产物：同一次 run = 同一个 commit，
+# 不可能取到别的提交的构建物；上游 job 挂了 smoke 直接不执行，而不是拿旧产物假绿。
+
+on:
+  pull_request:
+    paths:
+      - 'agent/**'
+      - 'controlplane/**'
+      - 'webui/**'
+      - 'pkg/**'
+      - 'api/**'
+      - 'proto/**'
+      - 'deploy/**'
+      # 构建解析的直接输入：go.work 决定模块解析，tools/go.mod 决定 CI 用的 Go 版本
+      # （下面 setup-go 的 go-version-file 就读它）。漏掉它们，一个能改坏编译的 PR
+      # 就完全不触发这条冒烟。
+      - 'go.mod'
+      - 'go.sum'
+      - 'go.work'
+      - 'go.work.sum'
+      - 'tools/**'
+      - 'Makefile'
+      - '.github/workflows/ci-smoke.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'agent/**'
+      - 'controlplane/**'
+      - 'webui/**'
+      - 'pkg/**'
+      - 'api/**'
+      - 'proto/**'
+      - 'deploy/**'
+      # 构建解析的直接输入：go.work 决定模块解析，tools/go.mod 决定 CI 用的 Go 版本
+      # （下面 setup-go 的 go-version-file 就读它）。漏掉它们，一个能改坏编译的 PR
+      # 就完全不触发这条冒烟。
+      - 'go.mod'
+      - 'go.sum'
+      - 'go.work'
+      - 'go.work.sum'
+      - 'tools/**'
+      - 'Makefile'
+      - '.github/workflows/ci-smoke.yml'
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. Web UI：整条流水线里最贵的一步，只做一次 ────────────────────────────
+  build-webui:
+    name: Build Web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Install + build
+        working-directory: webui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webui-dist
+          path: webui/dist/
+          retention-days: 1
+
+  # ── 2. 二进制：Go 编译走 setup-go 缓存，通常几十秒 ─────────────────────────
+  build-binaries:
+    name: Build binaries
+    needs: build-webui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go.mod
+          cache-dependency-path: |
+            controlplane/go.sum
+            agent/go.sum
+
+      # -tags webui 编译需要 dist/ 先就位（目标 A 含 Web UI）
+      - uses: actions/download-artifact@v4
+        with:
+          name: webui-dist
+          path: controlplane/internal/webui/dist
+
+      - name: Build
+        run: |
+          mkdir -p bin
+          cd controlplane && go build -tags webui -o ../bin/controlplane ./cmd/server && cd ..
+          cd agent && go build -o ../bin/agent ./cmd/agent && cd ..
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-binaries
+          path: bin/
+          retention-days: 1
+
+  # ── 3. 冒烟：只跑，不编译 ─────────────────────────────────────────────────
+  smoke:
+    name: E2E smoke (目标 A 十二环)
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: smoke-binaries
+          path: bin
+
+      # ⚠️ upload-artifact 不保留可执行位，下载回来必须补 chmod，
+      #    否则 smoke.sh 会因为「二进制不可执行」而退回去自己编译（静默变慢），
+      #    或者直接失败。
+      - name: Restore exec bit
+        run: |
+          chmod +x bin/controlplane bin/agent
+          ls -l bin/
+
+      # init-minio.sh 需要 mc + curl。⚠️ 不要从 dl.min.io 下载：MinIO 仓库已于
+      # 2026-04 归档，该地址现在返回的是一段公告文本而不是二进制（首次 CI 实测，
+      # 表现为 `/usr/local/bin/mc: line 1: 410: command not found`）。
+      # 改从 compose 里已经钉版本的 minio/minio 镜像里抽——无外部下载，
+      # 且客户端与服务端版本天然一致，不会各自漂移。
+      - name: Install mc (extract from the pinned MinIO image)
+        run: |
+          IMAGE="$(grep -oE '[a-z0-9./]*minio/minio:RELEASE\.[0-9A-Za-z.:-]+' deploy/docker-compose.dev.yml | head -1)"
+          if [ -z "$IMAGE" ]; then
+            echo "::error::无法从 deploy/docker-compose.dev.yml 解析出钉定的 MinIO 镜像 tag"
+            exit 1
+          fi
+          echo "extracting mc from $IMAGE"
+          docker run --rm --entrypoint cat "$IMAGE" /usr/bin/mc > /usr/local/bin/mc
+          chmod +x /usr/local/bin/mc
+          mc --version
+
+      - name: Run smoke
+        env:
+          FA_BIN_DIR: bin
+          FA_WORK_DIR: ${{ runner.temp }}/smoke
+          # runner 是一次性 VM，跑完即销毁，所以不需要脚本自己清理；
+          # 而 KEEP=1 能让失败时容器与日志留到下面的 dump 步骤——
+          # 否则清理会先把证据删掉，红灯就成了「红了但看不出为什么」。
+          KEEP: '1'
+        run: bash deploy/scripts/smoke.sh
+
+      # 失败时把 CP / agent 日志捞出来——冒烟红了但看不到为什么，等于没红
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "── docker compose ps ──"
+          docker compose -p fileagent-smoke -f deploy/docker-compose.dev.yml ps || true
+          echo "── 基础设施日志 ──"
+          docker compose -p fileagent-smoke -f deploy/docker-compose.dev.yml logs --tail=100 || true
+          echo "── Control Plane ──"
+          tail -n 200 "${{ runner.temp }}/smoke/cp.log" || true
+          echo "── Agent ──"
+          tail -n 200 "${{ runner.temp }}/smoke/agent.log" || true
+          echo "── init-minio ──"
+          tail -n 60 "${{ runner.temp }}/smoke/init-minio.log" || true

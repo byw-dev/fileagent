@@ -254,23 +254,36 @@ type:
 
 ## 本地开发环境启动
 
+> **⚡ 一条命令验证整条链路**：`bash deploy/scripts/smoke.sh`
+> 它是下面这套步骤的**可执行版本**（CI 的 `ci-smoke.yml` 跑的就是它），
+> 默认用独立项目名与高位端口，可与你正在跑的 dev 环境并存、互不影响。
+> 手工分步操作见下。
+
 ```bash
-# 启动所有基础服务（PostgreSQL、Redis、MinIO、NATS）
-cd deploy
-docker compose -f docker-compose.dev.yml up -d
+# 1) 启动基础服务（PostgreSQL、Redis、MinIO、NATS），--wait 等 healthcheck 通过
+docker compose -f deploy/docker-compose.dev.yml up -d --wait
 
-# 检查服务状态
-docker compose -f docker-compose.dev.yml ps
+# 2) 构建。⚠️ `make build` 产出的是**纯 API 二进制，不含 Web UI**（GET / 会 404）；
+#    要 Web UI 必须用 bundle（或 go build -tags webui）
+make bundle
 
-# 构建所有二进制（输出到 bin/）
-make build
+# 3) 启动 Control Plane
+#    ⚠️ 不需要 migrate CLI：迁移已内嵌进二进制，启动时自动应用（D-023）
+#    ⚠️ CP 是常驻前台进程。下面用 nohup 放后台，好让第 4 步能在同一个终端接着跑；
+#       想看实时日志就另开一个终端前台跑 ./bin/controlplane，再在原终端执行第 4 步。
+cp controlplane/.env.example deploy/config/controlplane.env   # 首次；deploy/config/ 已 gitignore
+set -a && . deploy/config/controlplane.env && set +a
+nohup ./bin/controlplane > /tmp/fileagent-cp.log 2>&1 &
+until curl -sf -o /dev/null http://127.0.0.1:8080/healthz; do sleep 1; done   # 等它真的起来
 
-# 初始化数据库（首次）
-cd controlplane
-migrate -database "$DATABASE_URL" -path ./migrations up
-
-# 初始化 MinIO（首次）
-bash ../deploy/scripts/init-minio.sh
+# 4) 初始化 MinIO（首次）——⚠️ 必须在 Control Plane 已经在监听之后再跑
+#    原因：MinIO 配置 webhook 时会**真的去拨**这个地址，CP 没起来则整个脚本失败退出，
+#    连带后面的事件订阅与三项自检都不会执行。
+#    ⚠️ 脚本默认的 http://controlplane:8080/... 只在 docker-compose.prod.yml 里成立
+#    （那里 CP 是同网络里的容器）；dev 的 CP 跑在宿主上，必须覆盖为 host.docker.internal。
+WEBHOOK_ENDPOINT=http://host.docker.internal:8080/internal/minio-event \
+WEBHOOK_AUTH_TOKEN="$INTERNAL_WEBHOOK_SECRET" \
+  bash deploy/scripts/init-minio.sh
 ```
 
 **本地服务端口：**

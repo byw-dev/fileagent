@@ -104,7 +104,7 @@ bash deploy/scripts/init-minio.sh
 >   -e MINIO_ROOT_USER=<同上> -e MINIO_ROOT_PASSWORD=<同上> \
 >   -e CP_ADMIN_ACCESS_KEY=<同 A.1> -e CP_ADMIN_SECRET_KEY=<同 A.1> \
 >   -e WEBHOOK_AUTH_TOKEN=<同 INTERNAL_WEBHOOK_SECRET> \
->   --entrypoint bash minio/minio:RELEASE.2025-04-22T22-12-26Z /s/init-minio.sh
+>   --entrypoint bash quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z /s/init-minio.sh
 > ```
 >
 > 说明：镜像 tag 与 `docker-compose.prod.yml` 里 pin 的一致（换 tag 前先确认镜像里仍有 `mc` 与
