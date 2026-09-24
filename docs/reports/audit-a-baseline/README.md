@@ -17,8 +17,10 @@
 > ⚠️ **证据强度修正**：初版称「每一环都有命令与输出为证」，**说过头了**。
 > 真正留下可复核原始证据的是 sha256 三方一致、依赖缺失矩阵、`file_entries` 字段这几项；
 > 其余若干环（如 CP 重启后 3 条规则重新同步、150MB multipart）**只有作者断言**。
-> 这些结论此后由 **PR #114 的 e2e 冒烟在 CI 上独立复现**（`smoke.sh` 十二环全绿），
-> 但那是事后补的旁证，不是本报告当时的证据。
+> 此后 **PR #114 的 e2e 冒烟在 CI 上独立复现了目标 A 的主链**（`smoke.sh` 十二环全绿）。
+> ⚠️ **但它只覆盖主链**：`smoke.sh` 用的是一个几十字节的 `smoke.csv`，**既不重启 CP、
+> 也不跑 150MB multipart**。所以上面列举的那几项具体观察**至今仍然只有作者断言**，
+> 冒烟并不能替它们背书。
 
 这与立项背景（2026-09-08「Agent 数据面从未端到端跑通过」）并不矛盾：那之后的 IC-1…IC-4a
 把主路径修通了。
@@ -30,7 +32,8 @@
 
 本次审计的价值因此不在"发现链路是断的"，而在两件事：
 
-1. **首次运行路径是断的**（§3，挡 A 两条之一）——照着 `CLAUDE.md` 走，新环境起不来。
+1. **首次运行路径是断的**（§3，挡 A 两条之一）——照着仓库文档走，新环境起不来。
+   （`CLAUDE.md` 那半边已随 #114 修；**根 `README.md` 至今未修**。）
    三处文档错误，修复成本都是改几行字。（另一条 G-A2 是审计**漏掉**的，见 §3。）
 2. **默认采集模式有 150 倍写放大**（AUD-9，§2）——A 的三个标准都达成，但这是上线前
    必须处理的一条，且**能力已存在**，只是默认值选错了。
@@ -120,7 +123,7 @@ MinIO 那一行与 `docs/ops/deployment.md` §0 的「任一依赖不可达即�
 | ID | 出处 | 实际情况 | 分类 | 严重度 |
 |----|------|---------|------|--------|
 | **AUD-1** | `b79b92e:CLAUDE.md:273`（已随 #114 修）、**`README.md:214`（至今未修）** 直接 `bash init-minio.sh` | 脚本默认 `WEBHOOK_ENDPOINT=http://controlplane:8080/...`，dev compose 里**没有** `controlplane` 服务；MinIO 在 config-set 时**真的去拨号**，解析失败 → 脚本 `exit 1`，第 6/7 步（事件订阅 + 三项自检）全部未执行 | 文档撒谎 | 🔴 高 |
-| **AUD-2** | `b79b92e:CLAUDE.md:268-270` `migrate …`（已随 #114 修；根 `README.md:232` 仍在，但标注了「可选」） | D-023 起迁移已内嵌，启动自动应用（实测 `version:10`）。该步骤已无必要，且 `migrate` CLI 未必在机器上 | 文档撒谎 | 🟠 中 |
+| **AUD-2** | `b79b92e:CLAUDE.md:268-270` `migrate …`（已随 #114 修；根 `README.md:198-209` 仍在，但**标注了「可选」并说明迁移已内嵌**，故根 README 这一处不构成缺陷） | D-023 起迁移已内嵌，启动自动应用（实测 `version:10`）。该步骤已无必要，且 `migrate` CLI 未必在机器上 | 文档撒谎 | 🟠 中 |
 | **AUD-3** | `b79b92e:CLAUDE.md:266`（已随 #114 修）、**`README.md:225`（至今未修）** 用 `make build` | `make build` 产出**纯 API 二进制**，`GET /` = **404**，没有 Web UI。A 要求 Web UI，须 `make bundle` / `-tags webui`。dev 章节从未提及 | 文档撒谎 | 🔴 高 |
 | **AUD-4** | `docs/ops/deployment.md:12` 「任一依赖不可达即退出（无重试循环）」，依赖表含 MinIO | 对 PG/Redis/NATS 成立；**对 MinIO 不成立**——CP 照常启动且 `/healthz` 200 | 文档撒谎 | 🟠 中 |
 | **AUD-5** | `deploy/config/controlplane.env:2` 「由 `deploy/scripts/start-controlplane.sh` 加载」 | `deploy/scripts/` 下**只有** `init-minio.sh`，该脚本不存在 | 文档撒谎 | 🟢 低 |
@@ -131,8 +134,21 @@ MinIO 那一行与 `docs/ops/deployment.md` §0 的「任一依赖不可达即�
 | **AUD-10** ⚠️ 非新发现 | CI 绿 | `ci-cp.yml` / `ci-agent.yml` 跑 `go test ./...`，**不带 `-tags=integration`**，且**全仓库无一个 workflow 有 `services:` 块**。→ **11 个** `//go:build integration` 文件从未在 CI 跑过；另 **4 个**非 tag 但依赖 PG 的测试文件在 CI 里 **SKIP 成绿色**（实测：`TEST_DATABASE_URL` 指向不可达 DSN 时 `--- SKIP` 且包级结果仍是 `ok`）。**唯一的反例是好的**：`linux && overflow` 那个文件在 `ci-agent.yml` 里真跑，并用 grep 断言「没被静默跳过」 | **代码欠债**（`backlog.md:47` 已登记） | 🔴 高 |
 | **AUD-11** ⚠️ 非新发现 | `webui` 22 个 vitest 文件 + `pnpm test` | **没有任何 CI workflow 运行它们**（`build-webui.yml` 是 `workflow_dispatch` 且只 build） | **代码欠债**（`backlog.md:68` 的 T4-2 明写「webui / sdk-python 仍缺」） | 🟠 中 |
 | ~~**AUD-12**~~ | `CLAUDE.md` Node **24**（`>=24.0.0 <25.0.0`） | **推理不成立，本条撤回**。`webui/package.json` 声明的是**支持范围**，CI（`build-webui.yml` / `ci-smoke.yml`）都确实装 Node 24。审计在一个**不受支持的** Node 26 上碰巧构建成功，只说明本地未开 `engine-strict`，**既不能证伪该约束、也不能说明 Node 26 受支持** | ❌ 已撤回 | — |
-| ~~**AUD-13**~~（非漂移，属实证观察） | `WEBHOOK_QUEUE_DIR=/data/minio-webhook-queue` | `/data` 是 MinIO 的存储根，该队列目录被 **`mc ls` 当作 bucket 列出**（与 data-sensor 并列）。CP 的 bucket API 读 PG，故未污染 UI | 文档撒谎（副作用未记） | 🟢 低 |
+| ~~**AUD-13**~~（非漂移，属实证观察） | `WEBHOOK_QUEUE_DIR=/data/minio-webhook-queue` | `/data` 是 MinIO 的存储根，该队列目录被 **`mc ls` 当作 bucket 列出**（与 data-sensor 并列）。CP 的 bucket API 读 PG，故未污染 UI | ❌ 不适用（已移出漂移表，保留为实证观察） | 🟢 低 |
 | **AUD-14** | `docs/tasks/bugs/open.md:237` IC-BUG-7 的「后果」行：「在当前架构下（**webhook 是唯一写入路径**），通过 Web UI 创建的任何 bucket，其文件都**永远不会进入索引**」 | **前提已被 IC-2a 推翻**。实测：在 API 新建的桶上采集一个文件，`file_entries` 出现该行且 `source=agent`——agent 的 `UploadResult` 才是主写入路径，与 bucket 是否订阅 webhook 无关。卡片**标题仍成立**（确实没注册通知），但**后果与 🟠 P1 定级已不成立** | 文档撒谎（缺陷卡的事实断言过期） | 🟠 中 |
+
+> ⚠️ **引用形式说明**：本报告写于 #114 合并**之前**，故 `CLAUDE.md` 的行号钉在修复前的
+> `b79b92e`；直接打开**当前** `CLAUDE.md` 的同名行会看到**修好后的内容**，与表中所述相反。
+> 根 `README.md` 的引用则是**当前仍然成立**的。
+>
+> `b79b92e:CLAUDE.md:266` 里末尾的数字是**行号，不是 Git 语法的一部分**
+> ——`git show 'b79b92e:CLAUDE.md:266'` 会报 `path ... does not exist`。复核请用：
+>
+> ```bash
+> git show b79b92e:CLAUDE.md | sed -n '266p'    # make build
+> git show b79b92e:CLAUDE.md | sed -n '268,270p' # 手工 migrate
+> git show b79b92e:CLAUDE.md | sed -n '273p'     # init-minio.sh
+> ```
 
 ### 校准集复核（章程 §6）
 
@@ -175,8 +191,12 @@ A 是「一个**可运行**的版本」。照 `CLAUDE.md` 的 dev 章节逐条�
 建议的最小修复：
 1. `init-minio.sh` 的 `WEBHOOK_ENDPOINT` 默认值改为对 dev 可达的值，或在 dev 文档里写明必须覆盖，
    **并说明脚本必须在 CP 起来之后跑**（MinIO 会真的拨号校验）；
-2. 删掉 `CLAUDE.md` 的 `migrate` 步骤；
-3. dev 章节改用 `make bundle`，或写明 `make build` 不含 Web UI。
+2. 删掉手工 `migrate` 步骤（或像根 README 那样标注为可选并说明迁移已内嵌）；
+3. 改用 `make bundle`，或写明 `make build` 不含 Web UI。
+
+> ⚠️ **修复对象已经变了**：上面三条 #114 已经在 `CLAUDE.md` 上做完。
+> **仍然需要做的是把同样三条应用到仓库根目录的 `README.md`** —— 它才是最显眼的入口，
+> 且其 Quick Start 至今可稳定复现 AUD-1/AUD-3。
 
 **G-A2 — MinIO 镜像已从 Docker Hub 下架，任何全新环境都起不来** ✅ 已修（#114）
 
