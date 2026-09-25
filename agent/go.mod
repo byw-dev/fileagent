@@ -6,6 +6,10 @@ require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/byw-dev/fileagent/pkg/trollsift v0.0.0
+	// ⚠️ 升级前先读 watcher.go 的 stopAllRechecks：D-035 记录的「ok==false 分支生产不可达」
+	// 依据的是 v1.8.0 的**实现细节**（四个后端都只在 Close() 驱动 readEvents 退出时才
+	// close(Events/Errors)），而包文档对关闭时机不作承诺。若新版本改成读错误也关 channel，
+	// loopDebounced 会在 ctx 仍存活时返回，门闩关上，在途 flush 的兜底 recheck 会被静默丢弃。
 	github.com/fsnotify/fsnotify v1.8.0
 	github.com/google/uuid v1.6.0
 	github.com/mattn/go-sqlite3 v1.14.24

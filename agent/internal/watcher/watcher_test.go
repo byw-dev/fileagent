@@ -1520,10 +1520,12 @@ func TestWatcher_Start_Return_CleansUpRecheckTimers(t *testing.T) {
 	assert.Zero(t, n, "recheck timers must be stopped and cleared when Start returns")
 }
 
-// When the event loop exits because the fsnotify event channel closed (the
-// shutdown path that is NOT ctx cancellation), the per-file close_wait
-// debounce timers must be stopped too — a live timer would still flush into
-// the events channel after the loop is gone.
+// When the event loop exits because its event channel closed — the
+// injected-channel exit this test drives, NOT a production shutdown path
+// (fsnotify closes Events/Errors only during Close, which Start defers until
+// after the loop returns; see stopAllRechecks) — the per-file debounce timers
+// must be stopped too: a live timer would still flush into the events channel
+// after the loop is gone.
 func TestLoopDebounced_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "pending.log")
