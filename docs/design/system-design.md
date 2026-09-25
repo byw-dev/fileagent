@@ -959,9 +959,13 @@ Scheduled 模式执行流程：
 
 | 模式             | 行为                               | 适用场景                    |
 |----------------|----------------------------------|-------------------------|
-| **overwrite**  | 每次触发完整上传，覆盖存储端对象                 | 文件较小（< 200MB），追加不频繁     |
-| **close_wait** | 等待文件句柄关闭（CLOSE_WRITE 事件）后上传      | 日志轮转类文件，写完即关闭           |
-| **tail**       | 记录上次上传的文件 offset，仅上传新增字节，以追加分片存储 | 大文件持续追加（> 200MB），带宽敏感场景 |
+| **overwrite**  | **防抖**（D-035）：Write/Create 事件静默 500ms 后整文件上传一次，覆盖存储端对象 | 绝大多数采集场景（默认模式）     |
+| **close_wait** | **`overwrite` 的别名，保留兼容**（D-035）：防抖普适后两者行为完全相同 | 存量规则仍携带此值           |
+| **tail**       | 记录上次上传的文件 offset，仅上传新增字节，以追加分片存储 | 大文件持续追加（> 200MB），带宽敏感场景（⚠️ 当前 fail-closed 停用，IC-BUG-46 / IC-15） |
+
+> **防抖是普适的**（D-035，AUD-9）：除 `tail` 外的所有模式共用同一条防抖事件循环——
+> 审计实测 150MB 文件 `cp` 进监听目录在不防抖时产生 150 次完整上传（≈22GB），
+> 其中 3 次是写到一半的内容。防抖没有「每事件整传」的正当用途，故不做回退选项。
 
 ## 4.5 文件上传流程
 
@@ -2433,7 +2437,7 @@ controlplane/migrations/
 | **FileTypeRule**   | 文件类型匹配规则，定义存储路径的 glob 模式                 |
 | **Watch 模式**       | 持续监控目录的采集模式                              |
 | **Scheduled 模式**   | 按 cron 表达式触发的定时采集模式                      |
-| **append_mode**    | 追加写入文件处理策略：overwrite / close_wait / tail |
+| **append_mode**    | 追加写入文件处理策略：overwrite（防抖整传，默认）/ close_wait（= overwrite 的别名，D-035）/ tail（增量，当前停用） |
 | **MNMD**           | Multi-Node Multi-Drive，MinIO 分布式部署模式     |
 | **Presigned URL**  | 预签名 URL，带时限的对象访问链接                       |
 | **NATS JetStream** | NATS 消息系统的持久化消息流功能                       |
@@ -2570,7 +2574,7 @@ compress    = true
 | **多租户**              | 第一版仅单组织，org_id 已预留             |
 | **LDAP/OIDC**        | 仅内置账号，OIDC 接口返回 501            |
 | **Agent mTLS**       | 仅 Bearer Token，无双向证书认证         |
-| **tail 增量上传**        | 第一版建议使用 overwrite 或 close_wait |
+| **tail 增量上传**        | 已 fail-closed 停用（IC-BUG-46）；其余场景使用默认 overwrite（防抖整传，D-035） |
 | **批量下载 Safari**      | StreamSaver.js 不支持 Safari      |
 | **文件删除**             | 不支持通过管理后台删除 MinIO 对象           |
 | **Control Plane HA** | 第一版单实例                         |

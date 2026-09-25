@@ -174,6 +174,9 @@ Status         string
 // Append-mode values as persisted in upload_tasks.append_mode (schema default
 // "overwrite"). "tail" is currently fail-closed blocked upstream of storage
 // (IC-BUG-46); the constant stays because pre-existing rows can still carry it.
+// "close_wait" is now an alias of "overwrite" (D-035: the debounce is
+// universal, so both take the identical debounced path); the value is kept
+// for compatibility with pre-existing rules and rows.
 const (
 	AppendModeOverwrite = "overwrite"
 	AppendModeTail      = "tail"

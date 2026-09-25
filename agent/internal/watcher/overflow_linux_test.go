@@ -72,8 +72,11 @@ func TestInotifyOverflow_SafetyNetRescan_RecoversLostFiles(t *testing.T) {
 	// Observe the watcher's Warn logs so the test can PROVE the overflow
 	// error really surfaced on fw.Errors (and was not merely simulated by a
 	// big kernel queue with no overflow at all).
+	// Tail mode (D-035): the real-time wedge → kernel-queue overflow →
+	// safety-net rescan chain pinned here lives in loopFsnotify, which since
+	// the universal debounce only tail walks.
 	logCore, observed := observer.New(zap.WarnLevel)
-	w, err := New(dir, "*.dat", false, time.Hour, AppendModeOverwrite, zap.New(logCore))
+	w, err := New(dir, "*.dat", false, time.Hour, AppendModeTail, zap.New(logCore))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

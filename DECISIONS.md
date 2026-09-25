@@ -2019,6 +2019,233 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
 
 ---
 
+## D-035：采集防抖改为普适（overwrite 也防抖，close_wait 降为别名）
+
+**决策日期**：2026-09-25
+**影响范围**：`agent/internal/watcher/watcher.go`（三个分流点 + 命名中立化）、
+`agent/internal/watcher/watcher_test.go` / `fsnotify_burst_test.go` / `overflow_linux_test.go`（实时路径守卫改挂 tail）、
+`deploy/scripts/smoke.sh`（新增 16MB 分块写护栏）、
+`docs/design/contracts.md` V-3、`docs/design/system-design.md`（§4.4.3 / 附录 A / 附录 D）、
+`agent/internal/queue/queue.go`（`AppendModeCloseWait` 别名注释）、`webui/src/pages/Agents/RuleForm.tsx`（选项文案）
+**关联**：AUD-9（A 基线审计 §3「不挡 A 但强烈建议随 A 一起修」）、`docs/tasks/active.md`「下一步」第 1 条（2026-09-24 拍板）、
+IC-BUG-53（seen 语义的既有权衡）、IC-BUG-46 / IC-15（tail fail-closed 与正确实现）
+
+### 背景（实证）
+
+A 基线审计实测：把一个 150MB 文件 `cp` 进被监听目录（默认 `append_mode=overwrite`），
+`upload_logs` 150 行，其中 147 行是完整 157286400 字节，**3 行读到正在写入的半个文件**；
+MinIO `CompleteMultipartUpload` 事件 150 次，实际写入流量 ≈ 22GB。同一文件改用
+`close_wait`：`upload_logs` 1 行。
+
+根因：watcher 只有 `close_wait` 走 500ms 空闲防抖（`runCloseWait`）；默认的 `overwrite`
+走 `runFsnotify`，每个 Create/Write 事件直接触发一次整文件上传。
+
+### 决策
+
+1. **防抖普适，而不是只翻默认值**。新增谓词 `debounceEnabled()`（=「模式 ≠ tail」），
+   watcher 的三个分流点（`Start` 选事件循环、`pollScan` 跳过热文件、`recheckAfterDebounce`
+   静默判据）全部改用它。**「不防抖」没有任何正当用途**：只翻默认值等于把枪留在桌上，
+   显式选 `overwrite` 的人照样中招。
+2. **`close_wait` 降为 `overwrite` 的别名**。已验证 `close_wait` 严格等于
+   `overwrite` + 500ms 防抖，下游（executor/uploader/CP）从不按这两个模式分流；
+   防抖普适后 watcher 侧对两者也完全一致。**契约值域不变**（三个值保留、不改 proto、
+   不加迁移），存量规则与文档不破；等价性由可执行断言钉住
+   （`TestDebounced_CloseWaitAndOverwrite_EquivalentDelivery`）。
+3. **`tail` 明确排除，且是故意的**。tail 已被 IC-BUG-46 fail-closed 挡掉
+   （CP 建规则 422 + executor 拒任务），其事件语义（增量 + 断点续传）归 IC-15。
+   本刀不改 tail 的事件循环；`runFsnotify` / `loopFsnotify` 因此成为「只有 tail 才会走」
+   的路径——**保留不删**（IC-15 的地基 + 实时路径语义的守卫测试都在那里），并在注释里写明。
+4. **防抖窗口仍是代码常量 500ms**，不引入新的配置项/环境变量。
+
+### 权衡 / 已知副作用（review 必问，明写不藏）
+
+#### 其一：`seen` 语义——`overwrite` 失去「溢出重扫兜底重试」
+
+`overwrite` 从实时循环挪到防抖循环，**顺带改变了它的 `seen` 语义**：
+
+- 实时路径（`loopFsnotify`）**故意不写 `seen`**（PR #108 review F1→P1 的裁决）：
+  `seen` 意为「已交付」，而 emit 成功只证明事件进了内存 channel，下游 submit 仍可能静默失败
+  （IC-BUG-53）；不写 `seen` 给「溢出重扫」保留了**唯一一次重试机会**。
+- 防抖循环的 flush 走 `claimDelivery` / `completeDelivery`，**交付即记 `seen`**
+  （F3 恰一次仲裁依赖它）。
+
+所以 `overwrite` 从此**失去**「下游静默失败后由溢出重扫兜底重试」这一条路径，换来的是
+「不再有写放大、不再上传写了一半的文件」。这与 `close_wait` 早已接受的权衡完全相同
+（见 `docs/tasks/bugs/open.md` 的 IC-BUG-53）。该权衡已写在 `watcher.go` 的 flush 注释与
+`loopFsnotify` 注释里，两种语义各有可执行守卫
+（实时路径：`TestLoopFsnotify_RescanRetriesRealTimeDeliveredFiles`，挂 tail）。
+
+#### 其二：短命文件（最后写入后一个防抖窗口内被删除/改名）不再被采集
+
+**行为对照**：`loopDebounced` 收到 Remove/Rename 会取消该路径的 pending 防抖
+（`Stop` + 且回收条目）并只发一个 `remove` 事件，而 agent 对 `remove` 不上传任何内容。
+于是相对改动前的 `overwrite`：
+
+| 场景 | 改动前（实时逐事件整传） | 改动后（普适防抖） |
+|------|--------------------------|--------------------|
+| 写临时文件 → rename 成最终名 | **临时文件也被整份传上去**（写放大与截断上传的一部分），最终名文件再传一次 | 临时文件的 pending 被 rename 取消，**只有最终文件被采集** |
+| 最后一次写入后 `< 500ms` 文件被删除 | 与删除**竞态**，可能抢先把内容传上去 | **内容不再被采集**（只发 remove） |
+
+**裁决（协调者，2026-09-25）：可接受且符合预期，不改代码，但必须作为决定被记录**。理由：
+
+1. 真实世界最常见的写入模式是「写临时文件 → rename 成最终名」。对这个主流模式，
+   新行为**严格更好**：改动前临时文件本身会被整份上传（正是本刀要消灭的写放大与
+   截断上传的一部分），改动后只有最终文件被采集。
+2. 剩下的丢失场景是「文件最后一次写入后 500ms 内就被删除，而我们本来想采它」。此时文件
+   **已经不存在了**——改动前能传上去，纯属「抢在删除之前读到了」，本身是不可靠的竞态，
+   不是可依赖的语义；没有任何采集承诺建立在它之上。
+3. 因此这不是「多了 500ms 延迟」这么轻描淡写，而是一条**语义变化**：短命文件不再采集。
+   它是一个被记录的决定，不是一个事故。
+
+可执行守卫：`TestDebounced_RemoveWithinWindow_CancellesDelivery`（overwrite 模式下，
+Write 后窗口内 Remove ⇒ **只**收到 `remove`，窗口过后也没有内容事件）。将来有人改了这个
+行为，CI 会告诉他他改的是一个决定。
+
+#### 其三：防抖 pending 表的有界性（第三轮返工 T-1 定稿；前两版结论均被实测推翻）
+
+防抖事件循环为每个「出现过的唯一路径」持有条目（map key + timer + 闭包），必须回答
+「什么时候回收」：
+
+- **被否决的第一版**（第一轮返工 R-1）：flush 后经固定容量通道发回收消息，满了就丢——
+  被丢弃的路径若此后再无事件，就永远没有「下一次 firing」，条目**永久滞留**（codex 确定性
+  复现：256 路径残留 192 条）。总量无上界。
+- **被否决的第二版**（第二轮返工 S-1）：每次扫描后把阈值设为 `2×len+64`。**有界性声明
+  被第三轮复审实测推翻**：阈值记录的是「扫描那一刻」的 active，而这批条目随后全部转为
+  idle；阈值只会抬高、永不回落，于是「等 idle 归零 → 注入刚好跨阈值的突发」逐轮递推
+  `A_{k+1} = A_k + 65`，codex 五轮实测残留 66/131/196/261/326——idle 残留**无界**。
+  根因是阈值设计本身（协调者给出），不在实现。
+- **定稿机制（T-1）**：`fired` 标记保留（flush 完成后置位、Reset 时清除），触发条件换成
+  **按事件计费**——每处理一个 fsnotify 事件计数 +1，每 `sweepEvery`（64）个事件扫描一次
+  （删除全部 fired 条目）并把计数归零。**触发条件不含任何历史派生量，不存在自举**：
+  过去的 active 峰值不会放大未来的扫描预算。
+- **界（如实陈述，不是「不会泄漏」）**：一次扫描只保留它观察到的仍是 active 的条目——
+  扫描后 `len ≤ 扫描开始时观察到的 active 数`（**不是等号**：扫描逐项读 `fired` 期间，
+  某条目可能刚被观察为未 fired 而保留、其 timer 回调随即把它置为 idle，扫描返回时它
+  已 idle 但仍在表里）；到下一次扫描前最多再处理 `sweepEvery` 个事件（每个至多新增一个
+  条目），故恒有 `len ≤ max_active + sweepEvery`。
+- **摊还成本（如实陈述）**：每 `sweepEvery` 个事件做一次 O(len) 扫描，即每事件
+  `O(len/sweepEvery)`，而 len 本身被 `max_active + sweepEvery` 限住。早前「几何阈值
+  O(1) 摊还」的说法属于被推翻的第二版，不再成立为完整论证。
+- **突发后事件彻底停止 ⇒ 残留停在该突发水位**（没有事件就没有扫描）——这条依然成立，
+  是**被那次突发限住的有界残留**，与上面的无界自举是两回事。
+- **多轮守卫**（前两版都溜过去正是因为只有单轮测试）：
+  `TestDebounced_PendingSweep_MultiRound_ResidueConstant`——6 轮，每轮等全部保留者转为
+  idle 后注入恰好一个预算（8）的新突发，并确定性地让本轮第一条在 sweep 前已 fired；
+  断言每轮残留 `≤ 8` 且跨轮不增长（本场景实际为 7），而不是把上界误钉成等号。
+  变异「把 `LessOrEqual` 改回 `Equal`」稳定变红。
+
+#### 其四：初始扫描把未来 mtime 视为已静默
+
+普适防抖让默认 `overwrite` 的初始扫描也走「热文件跳过」判据；若文件 mtime 因跨机时钟
+偏差或 `rsync -t` 落在未来，把负 age 当成「仍在窗口内」会将首次采集推迟到该未来时刻。
+因此扫描只跳过 `0 ≤ age < debounceWindow` 的文件，负 age 视为已静默并立即交付。
+
+代价必须如实记录：未来 mtime 的文件现在会被采集一次，并把那个未来时间戳写进 `seen`；
+此后偏移窗口内发生的真实修改通常带着较早的“当前”mtime，会被 mtime 单调判重静默跳过，
+所以行为从修复前的「压根采不到」变为「先采一次，之后在时钟偏移窗口内盲」。不能把写入
+`seen` 的值钳到 `now`，否则同一个未来 mtime 会在后续扫描中反复被判为更新并重复交付，
+把漏采改造成写放大。
+
+#### 其五：recheck timer 以生命周期门闩收口
+
+`flush` 现在运行在防抖 timer goroutine 上；它可能越过 pending timer 的 `Stop()`，并在
+`Start` 的 `stopAllRechecks` 已经清空 timer 后才发现文件仍热、试图重新安装 recheck。
+若放行，这个过期 timer 会携带旧 `ctx` / `seen` 污染顺序复用后的新生命周期。因此调度有
+两道栅栏：`rechecksStopped` 在 `stopAllRechecks` 的同一把 `seenMu` 下先关门再清表；
+`ctx.Err()` 则在下一轮重新开门后继续拒绝上一轮已取消 context 的迟到 callback。
+
+`startRechecks` 与配对的 `stopAllRechecks` 放在 `Start` 最外层是**防御性加固，不产生当前可观察
+行为变化**：此前 fsnotify 成功路径已经在初始扫描前调用 `startRechecks`；而两个 polling
+fallback 虽然调用 `pollScan`，却丢弃返回的 skipped paths，只靠下一轮 ticker 重扫，从不安排
+recheck，`handleWatchError` 在该路径也不可达。真正承载顺序复用语义的不变量是“每个 fsnotify
+生命周期必须调用 `startRechecks`”，对应回归测试钉住调用存在；它不声称钉住调用的具体位置。
+
+同样不存在上一版记录的“ctx 仍存活但 fsnotify channel 先关闭，迟到 flush 因门闩漏采”代价：
+fsnotify v1.8.0 的生产后端只在 `Close()` 驱动 read loop 退出时关闭 `Events` / `Errors`，而
+`fw.Close()` 是 `Start` 在 loop 返回之后才执行的 defer。`loopDebounced` 的 `ok == false` 分支
+仅服务于包内测试注入 channel 的防御处理，生产中的 live loop 观察不到该关闭顺序。
+
+#### 其六：阻塞中的过期交付可被重武装取消——以及关不掉的残留（PR #118 第 7 轮返工，独立评审 P1）
+
+**缺陷**：flush 的静默复核只证明「stat 那一刻文件已静默」。`emitBlocking` 因 `events`
+背压阻塞期间，文件可以被原地重写、pending 被重武装成新一代；消费者腾出 channel 后，
+旧代把**复核时的旧快照**发给下游——flush 之后的 `gen == p.gen` 检查发生在发送之后，
+只能决定 `fired`，撤不回交付。下游 uploader 在**上传时**重新 `os.Stat` + 重算 sha256，
+于是存了旧快照 mtime 的事件会让上传器读到**当时的半成品内容**；又因每次上传的
+存储 key 带 `{submit_time}`，截断对象不会被后来的完整上传覆盖，而是永久留在存储里。
+
+**被否决的改法（设计陷阱）**：在 `emitBlocking` 之前再加一次「发送前校验」。
+阻塞发生在校验之后，这只把窗口从「静默复核 → 发送」缩到「校验 → 发送」，
+真正长的背压等待段原封不动。
+
+**定稿机制**：`debouncePending` 增加每代一个的 `cancel chan struct{}`。重武装
+（Write/Create）与移除（Remove/Rename）都会 close 掉旧代的 channel 并换新；
+timer 回调在 `p.mu` 下随 gen 校验一起捕获自己的 channel 交给 flush，flush 的发送改为
+`select { events <- fe, ctx.Done(), <-cancel }`（入口处另有一次非阻塞 cancel 预检，
+避免「cancel 已关 + 消费者已就绪」时 select 50/50 把过期快照送出）。收到 cancel 即放弃
+本次交付并回滚 claim，同时调度一次兜底 `scheduleDebounceRecheck`。
+
+**为什么放弃不会漏（验收 (b)）**：cancel 被关闭当且仅当下列三者之一——
+(1) Write/Create 重武装：新一代 timer 已武装，其 flush 会交付更新的版本；若该版本又被
+改写则链条继续，最终由找到静默版本的那一代交付；
+(2) Remove/Rename 移除了条目：文件已不存在，按「其二」的既录决定本就无内容可采，
+兜底 recheck stat 不到文件，自然终止；
+(3) 生命周期关闭：recheck 调度被 `rechecksStopped` / `ctx.Err()` 门闩挡住。
+所以放弃分支无条件调度 recheck 恒安全：情形 (1) 中它与已武装的新 timer 互为冗余，
+`claimDelivery`/`seen` 仲裁保证先到者交付、后到者跳过（恰一次，不双发）；情形 (2)(3)
+是 no-op。而若新一代 timer 事后被停掉或其 flush 因任何原因退出，这条 recheck 就是
+仍然交付最终静默版本的那条路径——**不漏的保证不依赖新 timer 存活**。
+既有不变量不受影响：`fired==true` 仍 ⇔ 无武装 timer 且无在跑的 flush（放弃的旧回调
+gen 不匹配、不置 `fired`）；sweep 触发条件仍是纯事件计费，未引入任何历史量。
+
+**残留（如实陈述，不声称「这样就不会交付半成品了」）**：
+
+1. **select 掷硬币的发丝级窗口**：若「代失效」与「消费者就绪」发生在同一瞬间，
+   Go 的 select 会在发送与 cancel 分支间均匀随机，过期快照仍可能送出。窗口是入口
+   预检与 select 驻留之间的几条指令（对比 select 覆盖的无限长背压窗口），且 channel
+   没有「原子地测了再发」，watcher 层关不掉它。
+2. **watcher → queue → uploader 的间隙**：即使发送瞬间文件完全静默，事件到 uploader
+   之间文件仍可能被改写，而 uploader 是**上传时**才读文件（重新 stat + sha256），
+   `{submit_time}` key 使截断对象永久留存。因此**关闭 watcher 侧的窗口并不等于关闭
+   截断上传问题**——它属于下游校验（上传时比对 mtime/size 与入队时是否一致），
+   不是 watcher 层能解决的，已另行记待办。
+
+可执行守卫：`TestDebounced_RearmDuringBlockedFlush_AbandonsStaleDelivery`（a：阻塞期间
+重武装 ⇒ 旧快照不得送达；修复前 10/10 红）、`TestDebounced_AbandonedDelivery_StillDeliversCompleteVersion`
+（b：放弃后停掉新 timer，兜底 recheck 独立交付完整版本），
+以及改造后的 `TestDebounced_RearmWhileFlushBlocked_SweepKeepsEntry`（原 sweep 存活断言
+不变，新增「放弃且不送达」断言）。
+
+### 理由（为什么不「只翻默认值」）
+
+- 默认值只是「新建规则不选时的兜底」；显式配了 `overwrite` 的存量规则在翻默认值后
+  **原样保留写放大**。防抖没有「用户想要每事件整传」的合理场景——那正是审计实测的
+  22GB 事故本身。
+- 普适之后模式语义收敛为二值：「tail（实时增量，当前停用）」与「其余一切（防抖整传）」，
+  `close_wait` 之名不再承载行为差异，只承载兼容。
+
+### 影响面
+
+- **行为**：`overwrite` 的用户可见行为 = 原 `close_wait`（防抖 500ms 后整文件上传一次）。
+  初扫对仍在写的文件改为跳过 + recheck 收走；轮询 fallback 下一个 tick 重查。
+- **不变**：契约值域三值不变；CP 侧 `append_mode` 校验（tail 422 fail-closed）不动；
+  executor / uploader 不动；防抖窗口常量 500ms 不动。
+- **测试归属调整**：实时路径守卫（溢出重扫重试、emitBlocking 背压、inotify overflow
+  真实内核测试、burst 不丢事件）全部改挂 `tail` 模式——防抖普适后只有 tail 还走实时循环，
+  这些守卫钉的是循环本身，不是某个模式。
+
+### 落地记录
+
+**PR #118**（落地进度另见 `docs/tasks/active.md`「下一步」第 1 条）。
+红→绿 live 证据（AUD-9 新护栏，16MB 文件 `cp` 直写监听目录，断言 `upload_logs` 恰好 1 行）：
+**master（未改 watcher）红：6 行 → 本分支绿：1 行，且 `file_entries.sha256` 与源文件一致**
+（12 环全绿，`SMOKE PASSED`）。master 上 6 行即写放大回归被护栏抓住——16MB 的 `cp`
+在本地盘上只产生 6 个合并后的 Write 事件，每个事件都触发了一次 16MB 完整上传
+（审计里 150MB 文件对应 150 次，同一机制、同一护栏）。6 条新增单测 + 5 条变异测试
+全部确认守卫有效；`agent` 覆盖率 75.4% → 75.5%（watcher 91.5% → 92.4%）。
+
+---
+
 ## D-036：MinIO 镜像改为自持私有镜像仓 + 按 digest 钉定（上游已无公共通路）
 
 **决策日期**：2026-09-25

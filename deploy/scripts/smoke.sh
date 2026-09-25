@@ -287,8 +287,9 @@ wait_for "④ STS 凭据已下发给 agent" 60 \
 step "⑦⑧⑨⑩ 落文件 → 采集 → 直传 MinIO → 索引"
 # 原子落盘：先写到监听目录之外，再 mv 进去。
 # 这样只产生一个 CREATE 事件，断言「上传恰好 1 次」才是确定性的；
-# 同时规则用的是**默认** append_mode（overwrite，无防抖），所以这条护栏
-# 守的是真正的默认路径，而不是 close_wait 自己。
+# 同时规则用的是**默认** append_mode（overwrite——自 D-035 起走普适防抖，
+# 原子 mv 只产生一个 CREATE 事件、防抖窗口过后恰好一次交付），所以这条
+# 护栏守的就是默认路径本身。
 mkdir -p "$WORK/stage"
 printf 'ts,sensor,value\n2026-01-01T00:00:00Z,s1,42.5\n' > "$WORK/stage/smoke.csv"
 mv "$WORK/stage/smoke.csv" "$WORK/watch/smoke.csv"
@@ -310,12 +311,41 @@ DB_SHA="$(fe sha256)"
 [ "$(fe rule_id)"  != "<null>" ] || fail "file_entries.rule_id 为空（归属信息丢失）"
 ok "索引行字段正确（source=agent / sha256 / agent_id / rule_id）"
 
-# 写放大护栏：规则用的是默认 append_mode（overwrite），文件是原子 mv 进来的，
-# 所以恰好 1 条是确定的。默认模式一旦再次出现重复上传（审计实测一个 150MB
-# 文件产生 150 次完整上传），这里就会红。
-UPLOADS="$(psql_q "select count(*) from upload_logs where storage_path like 'smoke/%'")"
-[ "$UPLOADS" = "1" ] || fail "upload_logs 有 $UPLOADS 条记录，期望 1 条（重复上传 / 写放大）"
+# 写放大护栏（原子落盘）：规则用的是默认 append_mode（overwrite），文件是原子 mv 进来的，
+# 所以恰好 1 条是确定的。默认模式一旦再次出现重复上传，这里就会红。
+# ⚠️ 按文件名收窄：下面 bulk.csv 护栏的 upload_logs 也落在 smoke/ 前缀下，
+#    用 'smoke/%' 一把数会把两个文件混在一起（AUD-9 护栏引入时踩过）。
+UPLOADS="$(psql_q "select count(*) from upload_logs where storage_path like 'smoke/%smoke.csv'")"
+[ "$UPLOADS" = "1" ] || fail "smoke.csv 的 upload_logs 有 $UPLOADS 条记录，期望 1 条（重复上传 / 写放大）"
 ok "上传次数为 1（无写放大）"
+
+# 写放大护栏（分块写，AUD-9 / D-035）：上一条护栏用的是原子 mv（只产生一个 CREATE 事件），
+# 抓不到「边写边传」——审计实测 150MB 文件 cp 进监听目录产生 150 次完整上传（≈22GB），
+# 其中 3 次是写到一半的内容。这里直接 cp 一个 16MB 文件进监听目录（一路 Write 事件），
+# 断言：恰好上传 1 次，且索引里的 sha256 与源文件一致（防「上传了写到一半的内容」）。
+# 防抖普适（D-035）后写入静默 500ms 才触发一次整文件上传，所以「恰好 1」是确定的。
+step "写放大护栏（分块写：cp 产生持续 Write 事件）"
+dd if=/dev/urandom of="$WORK/stage/bulk.csv" bs=1M count=16 2>/dev/null
+cp "$WORK/stage/bulk.csv" "$WORK/watch/bulk.csv"
+BULK_SHA="$(sha256_of "$WORK/stage/bulk.csv")"
+
+bulk_is_indexed() { psql_q "select 1 from file_entries where file_name='bulk.csv' and status='completed'" | grep -q 1; }
+wait_for "bulk.csv（16MB，cp 直写）进入索引" 120 bulk_is_indexed
+
+# 进入索引只证明第一次上传完成；晚到的第二次上传仍可能在路上。再跨过
+# 三个 1s 观察间隔，要求每轮终态计数都稳定为 1，才能排除延迟写放大。
+for BULK_STABLE_ROUND in 1 2 3; do
+  sleep 1
+  BULK_UPLOADS="$(psql_q "select count(*) from upload_logs where storage_path like 'smoke/%bulk.csv'")"
+  case "$BULK_UPLOADS" in
+    1) ;;
+    0) fail "bulk.csv 已进索引但 upload_logs 仍为 0（终态确认第 ${BULK_STABLE_ROUND}/3 轮）" ;;
+    *) fail "bulk.csv 多传了：upload_logs 已有 $BULK_UPLOADS 条，期望终态恰好 1 条（写放大回归，AUD-9）" ;;
+  esac
+done
+BULK_DB_SHA="$(psql_q "select coalesce(sha256::text,'<null>') from file_entries where file_name='bulk.csv' limit 1")"
+[ "$BULK_DB_SHA" = "$BULK_SHA" ] || fail "bulk.csv 索引的 sha256 与源文件不符：$BULK_DB_SHA != $BULK_SHA —— 上传了写到一半的内容（截断上传回归）"
+ok "16MB 分块写终态连续 3 轮均为 1 次上传，且 sha256 与源文件一致（无写放大、无截断上传）"
 
 # ── webhook 投递（配置契约护栏）────────────────────────────────────────────
 # 上面所有断言都要求 source='agent'，也就是**主路径**。这意味着 webhook 整条
