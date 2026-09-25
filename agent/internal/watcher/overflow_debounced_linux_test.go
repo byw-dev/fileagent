@@ -10,6 +10,17 @@
 // cover end to end: pollScan skipping files that are still hot (inside the
 // debounce window) and scheduleDebounceRechecks re-arming their delivery.
 //
+// The hot-skip / re-arm branches are OBSERVED, not inferred: the
+// rescanSkippedHot / rescanRecheckArmed hooks (per-watcher fields, nil in
+// production) fire only inside safetyNetRescan at exactly those two
+// branches, and the test asserts both counters > 0. No debounce-window
+// arrangement can substitute for this — a slow runner can let the rescan's
+// pollScan stat a file past any window and emit it directly, and a
+// surviving event's flush timer delivers files regardless; the widened
+// window below only biases the run toward the audited branch, the counters
+// are what pin it. (TestSafetyNetRescan_HotSkipAndRearmObserved pins the
+// same two branches platform-independently, without any overflow at all.)
+//
 // The file is deliberately double-gated, exactly like the tail sibling:
 //   - build tag `overflow` (plus `linux`): plain `go test ./...` never even
 //     compiles it, so it cannot accidentally run in the normal suite;
@@ -27,6 +38,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,14 +103,24 @@ func TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles(t *testing.
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	// Widen the debounce window so every burst file is still HOT when the
-	// safety-net rescan runs (the burst finishes seconds before the rescan
-	// starts; with the 500ms production default the early files would have
-	// gone quiet and taken the direct-emit branch instead). With this window
-	// the rescan MUST take the branch under audit here — pollScan skipping
-	// hot files and scheduleDebounceRechecks re-arming them — and delivery
-	// happens when the rechecks fire past the window.
+	// Widen the debounce window so every burst file is EXPECTED to be hot
+	// when the safety-net rescan runs — with margin for slow runners, so the
+	// hot-skip + re-arm branch is the normal path, not a lucky race. The
+	// window is only a bias, never the proof: what PINS the branch is the
+	// rescanSkippedHot / rescanRecheckArmed observation below, which fires
+	// at exactly those two production sites and is asserted unconditionally.
+	// (A wall-clock window alone cannot do this: a slow runner can let the
+	// rescan's pollScan stat a file past any window and emit it directly,
+	// and the test would pass without ever walking the branch under audit.)
 	w.debounce = 10 * time.Second
+
+	// Observe the rescan's hot-skip and re-arm branches directly. Without
+	// these counters the test could only infer the branch from deliveries —
+	// and a recheck-armed file is delivered through the same channel as a
+	// flush-delivered one, so the inference would be unsound.
+	var rescanSkips, rescanArms atomic.Int32
+	w.rescanSkippedHot = func(string) { rescanSkips.Add(1) }
+	w.rescanRecheckArmed = func(string) { rescanArms.Add(1) }
 
 	// Unbuffered channel: the parked consumer is what wedges the initial
 	// scan's first emission.
@@ -137,13 +159,16 @@ func TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles(t *testing.
 		}
 	}
 
-	// The kernel queue has long since overflowed (nothing drains it while
-	// the scan is parked). Release the consumer: the seeds get delivered,
-	// the scan finishes, the loop drains what survived of the burst, reads
-	// IN_Q_OVERFLOW from fw.Errors, and the safety-net rescan recovers the
-	// lost files — skipping the (hot) burst files and re-arming them via
-	// debounce rechecks, which deliver once the window has passed.
-	time.Sleep(2 * time.Second)
+	// The kernel queue has long since overflowed — deterministically, while
+	// the scan was parked: the burst created far more inotify events than
+	// fs.inotify.max_queued_events holds, and nothing drained fw.Events
+	// during the burst. No settle delay is needed (and none is wanted: it
+	// would only age the burst files toward the debounce window). Release
+	// the consumer: the seeds get delivered, the scan finishes, the loop
+	// drains what survived of the burst, reads IN_Q_OVERFLOW from
+	// fw.Errors, and the safety-net rescan recovers the lost files —
+	// skipping the (hot) burst files and re-arming them via debounce
+	// rechecks, which deliver once the window has passed.
 	close(consumeGate)
 
 	t.Log("consumer released; waiting for overflow error + safety-net rescan (hot-skip + rechecks) to collect everything")
@@ -165,12 +190,24 @@ func TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles(t *testing.
 			if !overflowSeen {
 				t.Fatal("all files collected but no overflow error ever surfaced on fw.Errors — the kernel queue did not overflow; the safety-net path was NOT exercised (check fs.inotify.max_queued_events)")
 			}
-			t.Logf("all %d burst files (+2 seeds) collected and the overflow error was observed on fw.Errors; the debounced safety-net rescan closed the gap (hot files skipped and re-armed via debounce rechecks)", numFiles)
+			// The branch under audit must be OBSERVED, not inferred: both
+			// rescan hooks fire only inside safetyNetRescan — one on
+			// pollScan's hot-skip, one per actually-armed recheck. Without
+			// this, a rescan whose recheck scheduling degraded (or whose
+			// pollScan emitted directly on a slow runner) would still pass
+			// on the collection + overflow assertions above.
+			if rescanSkips.Load() == 0 || rescanArms.Load() == 0 {
+				t.Fatalf("safety-net rescan branches not exercised: hot-skip=%d re-arms=%d — the recovery cannot be attributed to the rescan's hot-skip + recheck re-arm path",
+					rescanSkips.Load(), rescanArms.Load())
+			}
+			t.Logf("all %d burst files (+2 seeds) collected; overflow observed on fw.Errors; the rescan was observed skipping %d hot files and re-arming %d rechecks",
+				numFiles, rescanSkips.Load(), rescanArms.Load())
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("collected only %d of %d files", n, numFiles+2)
+			t.Fatalf("collected only %d of %d files (rescan hot-skips observed: %d, re-arms observed: %d)",
+				n, numFiles+2, rescanSkips.Load(), rescanArms.Load())
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
