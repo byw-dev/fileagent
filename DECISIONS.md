@@ -2127,11 +2127,25 @@ Error: Process completed with exit code 125.
    已核对：两个架构的 `minio` 二进制 sha256 与镜像内自带的 `.sha256sum` 一致，
    且两份签名携带的 key id 与该公钥一致。**完整验签见落地记录。**）
 
-3. **GHCR 的「关联仓库」不等于「授予 Actions 读权限」**（实测证伪，记在这里免得再踩）：
-   给镜像打 `org.opencontainers.image.source` **不会**让该仓库的 `GITHUB_TOKEN`
-   读到一个私有 package；必须到 package 设置页的 **Manage Actions access**
-   显式把仓库加进去（UI-only，无 REST API）。**症状极具误导性**：无权访问时
-   GHCR 返回的是 `manifest unknown` 而不是 `unauthorized`——看起来像镜像不存在。
+3. **GHCR 的三条行为，全部实测，记在这里免得再踩**：
+
+   ① **「关联仓库」不等于「授予 Actions 读权限」。** 给镜像打
+   `org.opencontainers.image.source` **不会**让该仓库的 `GITHUB_TOKEN` 读到一个私有 package；
+   必须到 package 设置页的 **Manage Actions access** 显式把仓库加进去（UI-only，无 REST API）。
+
+   ② **症状极具误导性**：无权访问私有 package 时，GHCR 返回的是 **`manifest unknown`**
+   而不是 `unauthorized`——看起来像镜像根本不存在。`ci-smoke.yml` 的预检步骤就是为这条存在的。
+
+   ③ **关联仓库只在「当前无关联」时才由标签建立；已有关联时，再推带新标签的版本搬不动它。**
+   正确做法是**先在 package 设置页删掉 Repository source，再重推**——下一次推送会重新读标签
+   并落到新仓库。本决策就是这么把关联从 `byw-dev/fileagent` 改到 `byw-dev/minio` 的：
+   删除后 API 读到 `repository: null`，重推后变为 `byw-dev/minio`，**digest 全程不变**
+   （内容与标签都没变，content-addressed）。
+   权威查法：`gh api /orgs/<org>/packages/container/<name> --jq .repository.full_name`
+   （需 `read:packages` scope）。
+
+   ④ 上述改关联的操作**不影响** Manage Actions access 授权：改完之后 CI 实跑仍能拉到镜像
+   （`byw-dev/fileagent` 的 `GITHUB_TOKEN` 依旧有效）。两套设置相互独立。
 4. **AGPL-3.0 的分发义务落在我们头上**。该 release 是 AGPL-3.0，再分发是允许的，
    但随交付**必须提供许可副本与对应源码的获取途径**。上游 GitHub 仓库已归档，
    **长期保有那份源码是我们的责任**——不要指望上游还在。本系统是私有化交付、
