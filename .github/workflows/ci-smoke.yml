@@ -124,6 +124,12 @@ jobs:
     needs: build-binaries
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # MinIO 镜像来自我们自己的**私有** GHCR package（D-036：上游已无公共通路），
+    # 所以这个 job 需要 packages:read 才能拉。contents:read 是 checkout 用的，
+    # 显式写出来是因为一旦声明 permissions，未列出的权限就全部变成 none。
+    permissions:
+      contents: read
+      packages: read
     steps:
       - uses: actions/checkout@v4
 
@@ -140,16 +146,50 @@ jobs:
           chmod +x bin/controlplane bin/agent
           ls -l bin/
 
+      # MinIO 镜像在我们自己的私有 GHCR package 里（D-036）。GITHUB_TOKEN 够用，
+      # 不需要额外 secret——前提是该 package 已把本仓库加入 Actions 读权限。
+      # ⚠️ 两件事相互独立，不要混淆（D-036 实测）：镜像的
+      # org.opencontainers.image.source 标签指向 byw-dev/minio（源码 fork），
+      # 「关联」≠「授予 Actions 读权限」；byw-dev/fileagent 能拉镜像是 package
+      # 设置页里 Manage Actions access 的**独立手工授权**。
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 预检：镜像拉不到的症状原本是 compose 启动阶段一个赤裸的
+      # `docker: Error response from daemon: unauthorized` + `exit code 125`，
+      # 看不出是 registry 权限还是网络。这里先显式拉一次并把原因说清楚。
+      - name: Preflight — pull the pinned MinIO image
+        run: |
+          IMAGE="$(grep -oE 'ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}' deploy/docker-compose.dev.yml | head -1)"
+          if [ -z "$IMAGE" ]; then
+            echo "::error::无法从 deploy/docker-compose.dev.yml 解析出钉定的 MinIO 镜像 digest（D-036 要求按 digest 钉，不是 tag）"
+            exit 1
+          fi
+          echo "pulling $IMAGE"
+          if ! docker pull "$IMAGE"; then
+            echo "::error::拉取 ${IMAGE} 失败。上游 MinIO 镜像已无公共通路（见 DECISIONS.md D-036），本项目改用自持的私有 GHCR package。若是权限问题：到该 package 的设置页把 ${{ github.repository }} 加入 Actions 访问（Read）。"
+            exit 1
+          fi
+
       # init-minio.sh 需要 mc + curl。⚠️ 不要从 dl.min.io 下载：MinIO 仓库已于
       # 2026-04 归档，该地址现在返回的是一段公告文本而不是二进制（首次 CI 实测，
       # 表现为 `/usr/local/bin/mc: line 1: 410: command not found`）。
-      # 改从 compose 里已经钉版本的 minio/minio 镜像里抽——无外部下载，
-      # 且客户端与服务端版本天然一致，不会各自漂移。
+      # 改从 compose 里已经钉 digest 的镜像里抽——无外部下载，且这个 `mc` 是
+      # 该服务端镜像**随附/配套**的客户端，随镜像 digest 一起被钉住，所以不会
+      # 各自漂移。⚠️ 但它**并非与服务端同一版本号**（实测：mc 是
+      # RELEASE.2025-04-16T18-13-26Z，服务端是 RELEASE.2025-04-22T22-12-26Z，
+      # 官方镜像本来就这样打）。
+      # ⚠️ 这里解析的是 digest 引用（D-036 起不再是 tag）：正则若还按
+      # `minio/minio:RELEASE.…` 匹配会一无所获，然后 ::error:: 退出。
       - name: Install mc (extract from the pinned MinIO image)
         run: |
-          IMAGE="$(grep -oE '[a-z0-9./]*minio/minio:RELEASE\.[0-9A-Za-z.:-]+' deploy/docker-compose.dev.yml | head -1)"
+          IMAGE="$(grep -oE 'ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}' deploy/docker-compose.dev.yml | head -1)"
           if [ -z "$IMAGE" ]; then
-            echo "::error::无法从 deploy/docker-compose.dev.yml 解析出钉定的 MinIO 镜像 tag"
+            echo "::error::无法从 deploy/docker-compose.dev.yml 解析出钉定的 MinIO 镜像 digest"
             exit 1
           fi
           echo "extracting mc from $IMAGE"

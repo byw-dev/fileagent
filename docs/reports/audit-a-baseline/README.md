@@ -227,6 +227,13 @@ repository does not exist or may require 'docker login'
 影响面：`docker-compose.dev.yml` / `prod.yml` / `test.yml` **三个都起不来**。
 修复：registry 换 `quay.io/minio/minio`（仍可拉，含钉的那个 tag，镜像内容一致）。
 
+> ⚠️ **上面这句「仍可拉」已于 2026-09-25 被推翻**（本节其余内容保留原样，它在写下时为真）：
+> `quay.io/minio/minio` 此后也**不再公开可读**（匿名 token 能签发，但取 manifest 返回 401），
+> `ghcr.io/minio/*` 403、`bitnami/minio` 404——**上游再无任何公共通路**。
+> 现已改为自持私有镜像仓并按 digest 钉定，见 `DECISIONS.md` **D-036**。
+> **这条对审计方法的印证**：G-A2 被本报告漏掉是因为「把缓存过镜像的机器误当干净环境」，
+> 而它第二次咬人（quay 也关）**同样是由 CI 实跑撞出的，不是静态检查捞到的**。
+
 > **⚠️ 这条对审计方法的教训比对代码的更重要。** 本报告 §0 曾自称在「全新 dev 环境」
 > 上实跑——**卷确实是全新的，镜像不是**。审计因此把一台「镜像早已缓存」的机器
 > 误当成了干净环境，于是整份报告的 ① 判定其实建立在一个不成立的前提上。

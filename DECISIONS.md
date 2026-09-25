@@ -2016,3 +2016,211 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
 > **这一刀最值得留给后人的一条**：`{time}` 这个保留字在代码里活了很久，
 > 三端契约只有 agent 一端知道它存在——**它不是被测试发现的，是在讨论 tail 设计时
 > 顺手读 `pkg/trollsift/parser_test.go` 撞见的**。隐性契约不会让任何用例变红。
+
+---
+
+## D-036：MinIO 镜像改为自持私有镜像仓 + 按 digest 钉定（上游已无公共通路）
+
+**决策日期**：2026-09-25
+**影响范围**：`deploy/docker-compose.{dev,test,prod}.yml`、`.github/workflows/ci-smoke.yml`、
+`docs/ops/deployment.md`（新增 §0.1 + A.3 引用）、`docs/ops/operations.md`、
+`README.md`（前置依赖）、`docs/tasks/active.md`（「下一步」第 4 条紧迫性）
+**关联**：G-A2（A 基线审计：MinIO 镜像从 Docker Hub 下架，PR #114 换 `quay.io`）、
+`active.md`「下一步」第 4 条（存储层替代调研）
+
+### 背景：最后一条公共通路也关了
+
+G-A2 当时的结论是「registry 必须是 quay.io，不是 Docker Hub」，`active.md` 也写着
+「**quay.io 是最后一条公共通路**」。**这句话已经过期**：2026-09-25 CI 实跑报
+
+```
+Unable to find image 'quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z' locally
+docker: Error response from daemon: unauthorized: access to the requested resource is not authorized
+Error: Process completed with exit code 125.
+```
+
+逐项实测（2026-09-25）：
+
+| 来源 | 结果 |
+|------|------|
+| `quay.io/minio/minio` | 匿名 token **能签发**，但取 manifest **401**；`quay.io/api/v1/repository/minio/minio` 返回 `{"detail":"Requires authentication"}` |
+| `docker.io/minio/minio`、`docker.io/minio/mc` | **401** |
+| `ghcr.io/minio/minio`、`ghcr.io/minio/mc` | **403** |
+| `docker.io/bitnami/minio` | **404**（Bitnami 也撤了 legacy 镜像） |
+| `dl.min.io` 的 `mc` 下载 | 早已只返回一段公告文本（PR #114 已记录） |
+
+即**没有任何公共通路**能拉到这个镜像。有本地缓存的机器察觉不到；任何全新环境、
+全新 worktree 或 CI runner 都直接起不来。这不是限流，是仓库不再公开可读。
+
+同时断掉的还有 **`mc`**：`ci-smoke.yml` 与 `docs/ops/deployment.md` 现在都靠
+「从服务端镜像里抠 `/usr/bin/mc`」拿它，而这个办法的前提正是能拉到镜像。
+
+### 决策
+
+1. **自持镜像**：把我们手上仅存的那一份推到**自己控制的镜像仓**
+   `ghcr.io/byw-dev/minio`，三个 compose 与 CI 全部改指这里。
+2. **按 digest 钉，不按 tag**。镜像仓是我们自己的，tag 可被重写，digest 不可以：
+
+   ```
+   ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee
+     ├─ linux/amd64  sha256:a2fe4b45cd4dfab1a1e4e55c0ee425b8c96c17e989c523447c71967444f1c36f
+     └─ linux/arm64  sha256:4bfdccb8f63715c3f770bbb4dbce51257ff2c48621f015df61072bbca779d1ad
+   ```
+
+3. **必须是多架构 manifest list**。这一条差点被漏掉：本机（Apple Silicon）缓存的
+   `quay.io/minio/minio` 是 **`linux/arm64`**，而 GitHub runner 是 **`linux/amd64`**。
+   只推 arm64 会让 CI 拉到一个跑不起来的镜像，且症状极难读。所幸两个架构本机都在
+   （amd64 那份来自 Docker Hub 的历史缓存），已分别验证**都带 `/usr/bin/mc`**
+   （amd64 是 x86-64 ELF、arm64 是 aarch64 ELF，`Created` 均为 `2025-04-22T22:35:01Z`）。
+4. **私有 package，不公开**。公开唯一换来的是「org 外的人能匿名 pull」，而本项目
+   完全私有化部署、当前无外部贡献者、CI 在同一 org 内（`GITHUB_TOKEN` 足够）——
+   收益近于零。代价则是实打实的：公开分发 MinIO 二进制是**最可能引来 takedown** 的做法，
+   而 takedown 会让 CI、三个 compose 与所有开发机**同时**断（与今天 quay 401 的症状一致），
+   等于把单点依赖换到另一个同样能被第三方摘掉的地方；此外还要承担被第三方当上游引用后的
+   兼容责任与出网流量。**否决公开**。
+   （相应地，「改名避开 MinIO 商标」这条建议也随之作废——商标风险主要来自公开分发，
+   私有包没有这个暴露面，而改名会牺牲运维可读性。包名就叫 `minio`。）
+5. **源码自持，且 package 关联到源码仓而不是本仓库**。
+   `byw-dev/minio` 是 MinIO 官方源码的 fork（已同步全部 tag，含我们钉定的
+   `RELEASE.2025-04-22T22-12-26Z`，commit `0d7408f`；该 tag 与 `master` 的 `LICENSE`
+   均为 AGPL-3.0）。**它是公开的**——fork 只能与上游保持一致的可见性。
+   **本项目把它选择为对外提供对应源码的途径**；该方案（以及下文的拆分方式）是否满足
+   AGPLv3 §6 的全部要求——§6 按 conveyance 方式列了 6(a)–(e) 多条路径，
+   且「Corresponding Source」的定义还包括控制生成、安装、运行所需的脚本——
+   **属法律判断，待法务确认，本决策只记录技术事实与选择，不构成合规结论**。
+   若把它改成私有（删 fork、本地 clone 后 push 进私有 repo），「公开 fork」这条途径
+   即不复存在，届时需要另行设计并落实对应的提供方式（例如逐客户随交付附源码归档包）；
+   不同方案的成本与充分性比较同样待法务确认。
+   **结论：二进制私有、源码公开，是本项目当前选择的拆分（充分性待法务确认）。**
+
+   相应地，镜像的 `org.opencontainers.image.source` 指向 **`byw-dev/minio`**，
+   **不是** `byw-dev/fileagent`。最初那版指向 fileagent 是**张冠李戴**：
+   在机器可读的元数据里声称「这个 MinIO 二进制的源码是 FileAgent」，
+   而这正是本项目反复吃过的那类「记录撒谎」。已纠正。
+   ⚠️ **源码提供途径的表述要钉在 tag 上而不是「这个 fork」**：我们的用途只涉及
+   `RELEASE.2025-04-22T22-12-26Z` 这一个 tag，不对该 fork 后续/其它 commit 的
+   许可状态作任何主张。
+
+6. **加 provenance 标签，不改内容**。用 LABEL-only 构建（`FROM` + `LABEL`，
+   **不新增层、不执行任何命令**——「文件系统与上游逐字节相同」说的作用域是
+   **我们的构建相对于它 `FROM` 的那个基础镜像**，不是「相对于官方发布的镜像」，
+   见下方「已知缺口」第 1 条）打上
+   `org.opencontainers.image.source`（→ `byw-dev/minio`）、
+   `org.opencontainers.image.revision`、`org.opencontainers.image.licenses=AGPL-3.0-only`、
+   `io.byw.mirror.upstream-ref`、`io.byw.mirror.source-offer`（钉到 tag 的 tree URL）、
+   `io.byw.mirror.consumer`（→ `byw-dev/fileagent`，即「谁在用」，与「源码在哪」分开表达）、
+   `io.byw.mirror.reason`。
+7. **CI 给出可读失败**。镜像拉不到原本的症状是 compose 启动阶段一个赤裸的
+   `unauthorized` + `exit code 125`，看不出是权限还是网络。现在 `ci-smoke.yml` 有
+   独立的预检步骤，失败时明确指向本决策并提示「到 package 设置页把本仓库加入
+   Actions 访问（Read）」。
+8. **离线交付路径成文**。私有 package 意味着客户现场 `docker compose up` 拉不到镜像，
+   所以 `docs/ops/deployment.md` §0.1 写明离线导入步骤与校验方法。这不是可选项——
+   **它是交付能力的一部分**。三个决定流程形状的 docker/compose 行为**已实测**
+   （2026-09-25，Apple Silicon + Docker Desktop）：`docker save` 按 list digest 引用
+   只存当前平台、同一 `name@digest` 引用不能切架构（第二个 `pull --platform` 报
+   `cannot overwrite digest`，经典 image store 复现；containerd snapshotter 下未验证）
+   ——所以导出用**两个子 manifest digest** 各自 pull/save
+   （**一个 tarball 一个架构**）；`docker load` 只恢复镜像内容（Image ID）、
+   **不恢复 RepoDigest**，load 后 `name@digest` 在本地解析不到——所以离线侧显式打 tag；
+   `export` 的变量只活在当前 shell——所以离线引用写进 **`deploy/.env`**（compose 自动
+   加载），配合 `${FA_MINIO_IMAGE:-digest}` 默认值（不设变量时三份 compose 与原样
+   逐字节等价）。§0.1 里对每条命令的实测范围做了精确限定，未实测的步骤已显式标出。
+
+### 已知缺口（如实记录，不含糊）
+
+1. **amd64 整体镜像缺少上游 manifest / layer 对照**。arm64 那份的 `repoDigests` 是
+   `sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e`
+   （quay 与 Docker Hub 同值），而 **amd64 那份的 `repoDigests` 为空**——它不是带
+   digest 记录从 registry 拉下来的，或记录早已丢失。判断依据只剩「`Created`
+   与该 release 一致、镜像内 `mc` 是同日期同版本的 x86-64 二进制」+ 下方
+   「镜像内二进制已验签」（见其作用域边界）。**这条缺口依然成立**：minisign 验签
+   只覆盖镜像内的 `minio` / `mc` 二进制及其 signed comment，**不能**证明该镜像的
+   config、entrypoint、其余 rootfs 文件与层就是官方发布的那个镜像；它**只有拿到
+   可验证的官方 manifest/config/layer digest 链之后**才能关闭。它是我们能拿到的
+   唯一 amd64 副本，而 CI 必须用它。
+2. **没有升级路径**。官方不再公开发布，**以后 MinIO 出安全补丁我们没有来源**。
+
+3. **GHCR 的三条行为，全部实测，记在这里免得再踩**：
+
+   ① **「关联仓库」不等于「授予 Actions 读权限」。** 给镜像打
+   `org.opencontainers.image.source` **不会**让该仓库的 `GITHUB_TOKEN` 读到一个私有 package；
+   必须到 package 设置页的 **Manage Actions access** 显式把仓库加进去（UI-only，无 REST API）。
+
+   ② **症状极具误导性**：无权访问私有 package 时，GHCR 返回的是 **`manifest unknown`**
+   而不是 `unauthorized`——看起来像镜像根本不存在。`ci-smoke.yml` 的预检步骤就是为这条存在的。
+
+   ③ **关联仓库只在「当前无关联」时才由标签建立；已有关联时，再推带新标签的版本搬不动它。**
+   正确做法是**先在 package 设置页删掉 Repository source，再重推**——下一次推送会重新读标签
+   并落到新仓库。本决策就是这么把关联从 `byw-dev/fileagent` 改到 `byw-dev/minio` 的：
+   删除后 API 读到 `repository: null`，重推后变为 `byw-dev/minio`，**digest 全程不变**
+   （内容与标签都没变，content-addressed）。
+   权威查法：`gh api /orgs/<org>/packages/container/<name> --jq .repository.full_name`
+   （需 `read:packages` scope）。
+
+   ④ 上述改关联的操作**不影响** Manage Actions access 授权：改完之后 CI 实跑仍能拉到镜像
+   （`byw-dev/fileagent` 的 `GITHUB_TOKEN` 依旧有效）。两套设置相互独立。
+4. **AGPL-3.0 的分发义务落在本项目头上**。该 release 是 AGPL-3.0，再分发是允许的，
+   随交付**应当提供许可副本与对应源码的获取途径**；具体提供什么才充分（§6 有多条
+   路径，Corresponding Source 还涵盖构建/安装脚本）**待法务确认**。本项目当前实际
+   提供的物项与待确认清单见 `docs/ops/deployment.md` §0.1 的 AGPL 段。上游 GitHub
+   仓库已归档，**长期保有那份源码是我们的责任**——不要指望上游还在。本系统是私有化
+   交付、交付物本身就含 MinIO，这条义务躲不掉，只是范围是客户而不是公众。
+
+### 镜像内二进制已验签通过（2026-09-25）——作用域边界：二进制 provenance，不是镜像 provenance
+
+**这条验签证明什么、不证明什么，边界如下（第三轮返工 E-2 收窄）：**
+
+- **可以说**：镜像内的 `minio`（linux/amd64 与 linux/arm64）与 `mc`（linux/amd64）
+  两个二进制**及其 signed trusted comment** 已用 MinIO 官方 minisign 公钥验证通过，
+  因此这几个文件**是该 release 的官方产物**。
+- **不可以说**：整个镜像 / 文件系统 / 所有层的 provenance 已关闭或已证明为官方——
+  验签没有覆盖镜像的 config、entrypoint、其余 rootfs 文件与层；那部分仍属于
+  「已知缺口」第 1 条（amd64 整体镜像缺上游 manifest/layer 对照），只有拿到可验证的
+  官方 manifest/config/layer digest 链之后才能关闭。
+
+背景：原先记的缺口是「amd64 那份 `repoDigests` 为空、无法与任何上游 digest 比对，
+证据链比 arm64 弱一档」。**验签把这条缺口里「镜像内两个二进制是不是官方产物」的
+部分关闭了——而且是密码学签名，比「digest 对得上」更强；但整镜像 provenance 的
+缺口仍然开放**，上段边界为准。
+
+关键在于 `byw-dev/minio` 这个源码 fork：它的 `Dockerfile.release` 里写着 MinIO 自己的
+minisign 公钥 `RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav`，
+而官方镜像**自带** `/usr/bin/minio.minisig`、`/usr/bin/minio.sha256sum`（`mc` 的也带）。
+用 `go run aead.dev/minisign/cmd/minisign@v0.2.1`（只写 Go module cache，不装进 PATH）验：
+
+| 文件 | 结果 | signed trusted comment |
+|------|------|------------------------|
+| `minio`（linux/amd64） | ✅ `Signature and comment signature verified` | `timestamp:1745360335`（2025-04-22T22:18:55Z）`filename:minio.RELEASE.2025-04-22T22-12-26Z` |
+| `minio`（linux/arm64） | ✅ 同上 | `timestamp:1745360609`（2025-04-22T22:23:29Z）同一 filename |
+| `mc`（linux/amd64，CI 抽的就是它） | ✅ 同上 | `timestamp:1745357500` `filename:mc.RELEASE.2025-04-16T18-13-26Z` |
+
+两点要注意：
+- **trusted comment 本身也在签名覆盖范围内**（`comment signature verified`），所以
+  `filename:minio.RELEASE.2025-04-22T22-12-26Z` 是**被密码学证实**的——不只是「某个被 MinIO 签过的二进制」，
+  而是「**就是那个 release 的二进制**」。这正是 digest 比对给不了的东西。
+- 顺带得到一个此前没人记过的事实：镜像内的 `mc` 是 **`RELEASE.2025-04-16T18-13-26Z`**，
+  与服务端的 `2025-04-22T22-12-26Z` **不同版本**（官方镜像本来就这样打的）。CI 与
+  `init-minio.sh` 用的就是这个 `mc`。
+
+**负向对照**（防止「验签恒真」这种假绿）：把 `minio` 副本第 1000 字节改成 `\x00` 后重验 →
+`Error: signature verification failed` / `exit status 1`。验签确实在起作用。
+
+> 复核方法（任何人都能重跑）：从镜像里 `docker cp` 出 `/usr/bin/minio{,.minisig}`，
+> 用上面那个公钥 `minisign -V -m minio -x minio.minisig -P <pubkey>`。
+
+### 这条决策抬高了另一件事的紧迫性
+
+`active.md`「下一步」第 4 条（存储层替代调研）原本的定性是「研究任务应在被逼之前开始」。
+**现在已经在被逼的那一侧**，而且问题比「CI 拉不到镜像」更大一层：
+我们交付的产品依赖一个**已无公开供给、且许可义务落在我们头上**的组件。
+判据不变且需要重申：**第一道筛子是 STS `AssumeRole`，不是「S3 兼容」四个字**——
+整条数据面（IC-2a）都建在 `AssumeRole` 上，而多数「S3 兼容」实现没有它。
+
+### 不在本刀范围
+
+- **把 `init-minio.sh` 的 `mc` 依赖拆掉**。`mc` 的分发通路同样已经没了，现在靠
+  「从服务端镜像里抠二进制」撐着——这是个能用的办法，不是长久之计。改成纯 S3 +
+  MinIO admin API over curl 是可行的（脚本本就刻意不用 grep/sed/awk），但**独立一刀**。
+  本决策只解决「镜像有来源」。
+- **存储层替代选型**本身（见上）。

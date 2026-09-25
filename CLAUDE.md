@@ -306,6 +306,10 @@ WEBHOOK_AUTH_TOKEN="$INTERNAL_WEBHOOK_SECRET" \
 ## 集成测试
 
 ```bash
+# 前置：MinIO 镜像是私有 GHCR package（D-036，按 digest 钉定），首次运行需先登录：
+#   docker login ghcr.io -u <github-user>    # PAT 需要 read:packages
+# 完全离线的环境走 docs/ops/deployment.md §0.1 的离线导入路径。
+
 # 启动集成测试专用环境
 docker compose -f deploy/docker-compose.test.yml up -d
 

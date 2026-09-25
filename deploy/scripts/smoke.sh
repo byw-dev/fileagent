@@ -42,6 +42,19 @@ export MC_CONFIG_DIR="$WORK/mc"
 CP_PID=""
 AGENT_PID=""
 
+# D-036 护栏：FA_MINIO_IMAGE 是离线交付的逃生舱（docs/ops/deployment.md §0.1②）。
+# compose 会自动加载 deploy/.env，所以除了 shell 环境还要查文件——开发机上一份
+# 遗留的 deploy/.env 会让冒烟跑另一个镜像，而预检与抽 mc 仍按 digest 校验，
+# 两者可能不一致。grep 不锚死行首：行首带空格的写法 compose 照样生效，不能漏检。
+# 只告警不 fail：排障脚本，有意用本地镜像跑冒烟是合理需求。
+if [ -n "${FA_MINIO_IMAGE:-}" ] || grep -qE '^[[:space:]]*FA_MINIO_IMAGE=' deploy/.env 2>/dev/null; then
+  EFFECTIVE="${FA_MINIO_IMAGE:-$(grep -E '^[[:space:]]*FA_MINIO_IMAGE=' deploy/.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')}"
+  echo "" >&2
+  echo "  ⚠️⚠️ 检测到 FA_MINIO_IMAGE=${EFFECTIVE}" >&2
+  echo "  ⚠️ 冒烟将使用该镜像，而不是 D-036 钉定的 digest；预检与 mc 抽取仍按 digest 校验（CI 里；本地跑本脚本没有这两步）。" >&2
+  echo "  ⚠️ 若非有意为之，请清空它（检查 shell 环境 与 deploy/.env）。" >&2
+fi
+
 ADMIN_USER="admin"
 ADMIN_PASS="SmokeAdmin@2026"
 WEBHOOK_SECRET="smoke-webhook-secret"
