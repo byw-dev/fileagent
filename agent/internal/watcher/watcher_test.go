@@ -60,6 +60,11 @@ func TestWatcher_PollingDetectsModifiedFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.log")
 	require.NoError(t, os.WriteFile(path, []byte("v1"), 0o644))
+	// D-035: the default-mode scan only delivers files whose writes have gone
+	// quiet, so age the fixture past the debounce window (create), then again
+	// after the modification (write).
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, past, past))
 
 	w, err := New(dir, "*.log", false, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
@@ -73,9 +78,10 @@ func TestWatcher_PollingDetectsModifiedFile(t *testing.T) {
 	w.pollScan(ctx, events, seen)
 	<-events // consume initial create
 
-	// Modify the file after a small delay to ensure mtime differs.
-	time.Sleep(20 * time.Millisecond)
+	// Modify the file; Chtimes gives it a strictly newer mtime without any
+	// wall-clock sleep.
 	require.NoError(t, os.WriteFile(path, []byte("v2"), 0o644))
+	require.NoError(t, os.Chtimes(path, time.Now().Add(-30*time.Minute), time.Now().Add(-30*time.Minute)))
 
 	w.pollScan(ctx, events, seen)
 	select {
@@ -91,6 +97,11 @@ func TestWatcher_GlobFiltering(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "file.txt"), []byte("a"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "file.log"), []byte("b"), 0o644))
+	// D-035: freshly written files are inside the debounce window, so age the
+	// fixtures past it — this test pins glob filtering, not debounce timing.
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(filepath.Join(dir, "file.txt"), past, past))
+	require.NoError(t, os.Chtimes(filepath.Join(dir, "file.log"), past, past))
 
 	w, err := New(dir, "*.txt", false, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
@@ -113,6 +124,9 @@ func TestWatcher_RecursiveMode(t *testing.T) {
 	subdir := filepath.Join(dir, "sub")
 	require.NoError(t, os.Mkdir(subdir, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(subdir, "deep.txt"), []byte("deep"), 0o644))
+	// D-035: age the fixture past the debounce window (pins recursion+glob).
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(filepath.Join(subdir, "deep.txt"), past, past))
 
 	w, err := New(dir, "*.txt", true, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
@@ -179,6 +193,10 @@ func TestWatcher_FsnotifyInitialScanEmitsExistingFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("already here"), 0o644))
 	w, err := New(dir, "*.txt", false, 10*time.Second, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
+	// D-035: the file was written just now, so the initial scan skips it as
+	// hot and the debounce recheck delivers it once the window passes. The
+	// short window keeps the test off wall-clock assumptions.
+	w.debounce = 30 * time.Millisecond
 
 	events := make(chan FileEvent, 10)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -189,7 +207,7 @@ func TestWatcher_FsnotifyInitialScanEmitsExistingFile(t *testing.T) {
 	case event := <-events:
 		assert.Equal(t, path, event.Path)
 		assert.Equal(t, "create", event.Op)
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		t.Fatal("fsnotify startup did not scan the existing file")
 	}
 }
@@ -198,6 +216,9 @@ func TestWatcher_FsnotifyDetectsNewFile(t *testing.T) {
 	dir := t.TempDir()
 	w, err := New(dir, "*.txt", false, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
+	// D-035: the Write/Create event is debounced; a short window keeps the
+	// delivery fast and deterministic.
+	w.debounce = 30 * time.Millisecond
 
 	events := make(chan FileEvent, 10)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -257,6 +278,8 @@ func TestWatcher_RecursiveFsnotify(t *testing.T) {
 
 	w, err := New(dir, "*.dat", true, 50*time.Millisecond, "", zap.NewNop())
 	require.NoError(t, err)
+	// D-035: the Create event is debounced; a short window keeps it fast.
+	w.debounce = 30 * time.Millisecond
 
 	events := make(chan FileEvent, 10)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -365,6 +388,10 @@ func TestWatcher_TailMode_FileOffset_IsTracked(t *testing.T) {
 // the fsnotify path never rescans — so any file beyond the 64-slot consumer
 // buffer was dropped forever. This test pins: many files (> buffer) + a slow
 // consumer => every single file is still delivered.
+//
+// Tail mode (D-035): the pinned property is the scan's blocking backpressure,
+// which for immediately-delivered files now only exists on the real-time
+// path; debounced modes deliver hot files via rechecks instead.
 func TestWatcher_InitialScan_BacklogBeyondBufferNoneDropped(t *testing.T) {
 	const numFiles = 200
 	dir := t.TempDir()
@@ -373,7 +400,7 @@ func TestWatcher_InitialScan_BacklogBeyondBufferNoneDropped(t *testing.T) {
 			filepath.Join(dir, fmt.Sprintf("file-%03d.txt", i)), []byte("data"), 0o644))
 	}
 
-	w, err := New(dir, "*.txt", false, time.Hour, "", zap.NewNop())
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeTail, zap.NewNop())
 	require.NoError(t, err)
 
 	// Far smaller than numFiles, mirroring the consumer buffer in main.go.
@@ -419,7 +446,7 @@ func TestWatcher_InitialScan_BacklogBeyondBufferNoneDropped(t *testing.T) {
 }
 
 // Regression for PR #100 review F2: the initial scan bypasses the close_wait
-// debounce in runCloseWait, so a file being written at agent startup was
+// debounce in loopDebounced, so a file being written at agent startup was
 // emitted immediately at its truncated size. Because buildStoragePath bakes
 // time.Now() into {time…} keys, that truncated object got its own key and the
 // later full upload never overwrote it — a permanently truncated object plus
@@ -577,9 +604,9 @@ func TestWatcher_AppendModeOverwrite_OffsetIsAlwaysZero(t *testing.T) {
 	assert.Equal(t, int64(0), fe.FileOffset, "overwrite mode: offset should always be 0")
 }
 
-// ── Direct runCloseWait / runFsnotify unit tests ──────────────────────────────
+// ── Direct runDebounced / runFsnotify unit tests ──────────────────────────────
 
-func TestRunCloseWait_ContextCancel_ReturnsError(t *testing.T) {
+func TestRunDebounced_ContextCancel_ReturnsError(t *testing.T) {
 	fw, err := fsnotify.NewWatcher()
 	require.NoError(t, err)
 	defer fw.Close()
@@ -594,11 +621,11 @@ func TestRunCloseWait_ContextCancel_ReturnsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	err = w.runCloseWait(ctx, events, fw, make(map[string]time.Time))
+	err = w.runDebounced(ctx, events, fw, make(map[string]time.Time))
 	require.Error(t, err)
 }
 
-func TestRunCloseWait_RemoveEvent_EmittedImmediately(t *testing.T) {
+func TestRunDebounced_RemoveEvent_EmittedImmediately(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")
 	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
@@ -619,7 +646,7 @@ func TestRunCloseWait_RemoveEvent_EmittedImmediately(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	go func() { _ = w.runCloseWait(ctx, events, fw, make(map[string]time.Time)) }()
+	go func() { _ = w.runDebounced(ctx, events, fw, make(map[string]time.Time)) }()
 
 	// Trigger Remove event.
 	require.NoError(t, os.Remove(path))
@@ -632,7 +659,7 @@ func TestRunCloseWait_RemoveEvent_EmittedImmediately(t *testing.T) {
 	}
 }
 
-func TestRunCloseWait_WriteEvent_DebounceEmits(t *testing.T) {
+func TestRunDebounced_WriteEvent_DebounceEmits(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "app.log")
 
@@ -652,7 +679,7 @@ func TestRunCloseWait_WriteEvent_DebounceEmits(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	go func() { _ = w.runCloseWait(ctx, events, fw, make(map[string]time.Time)) }()
+	go func() { _ = w.runDebounced(ctx, events, fw, make(map[string]time.Time)) }()
 
 	// Trigger a Create/Write event.
 	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
@@ -666,7 +693,7 @@ func TestRunCloseWait_WriteEvent_DebounceEmits(t *testing.T) {
 	}
 }
 
-func TestRunCloseWait_NonMatchingGlob_Ignored(t *testing.T) {
+func TestRunDebounced_NonMatchingGlob_Ignored(t *testing.T) {
 	dir := t.TempDir()
 
 	fw, err := fsnotify.NewWatcher()
@@ -685,7 +712,7 @@ func TestRunCloseWait_NonMatchingGlob_Ignored(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	go func() { _ = w.runCloseWait(ctx, events, fw, make(map[string]time.Time)) }()
+	go func() { _ = w.runDebounced(ctx, events, fw, make(map[string]time.Time)) }()
 
 	// Create a .log file (doesn't match *.txt)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "test.log"), []byte("x"), 0o644))
@@ -700,6 +727,7 @@ func TestRunFsnotify_EventsChannelClosed_ReturnsNil(t *testing.T) {
 
 	w := &Watcher{
 		fileGlob:    "*.txt",
+		appendMode:  AppendModeTail, // D-035: loopFsnotify is the tail-only path
 		tailOffsets: make(map[string]int64),
 		logger:      zap.NewNop(),
 	}
@@ -732,6 +760,7 @@ func TestRunFsnotify_RemoveEvent_Emitted(t *testing.T) {
 
 	w := &Watcher{
 		fileGlob:    "*.txt",
+		appendMode:  AppendModeTail, // D-035: loopFsnotify is the tail-only path
 		tailOffsets: make(map[string]int64),
 		logger:      zap.NewNop(),
 	}
@@ -803,7 +832,9 @@ func TestHandleWatchError_PlainError_DoesNotRescan(t *testing.T) {
 
 // The rescan must re-emit a file that changed after it was last seen, as
 // "write" (not "create") — proving seen state is shared between the initial
-// scan and the rescan (design point (a) of IC-BUG-44).
+// scan and the rescan (design point (a) of IC-BUG-44). Tail mode: this pins
+// the real-time path's rescan-retry semantics, which since D-035 only tail
+// has (debounced deliveries record seen and are not re-emitted).
 func TestHandleWatchError_RescanReEmitsChangedFileAsWrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "changed.log")
@@ -811,7 +842,7 @@ func TestHandleWatchError_RescanReEmitsChangedFileAsWrite(t *testing.T) {
 	stale := time.Now().Add(-2 * time.Hour)
 	require.NoError(t, os.Chtimes(path, stale, stale))
 
-	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeTail, zap.NewNop())
 	require.NoError(t, err)
 
 	// seen as of the initial scan: the file was already collected at v1.
@@ -844,6 +875,11 @@ func TestHandleWatchError_RescanSkipsUnchangedFiles(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "unchanged.log")
 	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+	// D-035: age the file past the debounce window so the rescan's skip is
+	// decided by the seen map (the thing this test pins), not by hot-file
+	// skipping.
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, past, past))
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 
@@ -875,7 +911,9 @@ func TestRunFsnotify_OverflowError_TriggersRescan(t *testing.T) {
 	path := filepath.Join(dir, "lost.txt")
 	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
 
-	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	// Tail mode: loopFsnotify is the real-time path, and since D-035 only
+	// tail walks it — the rescan must deliver the (hot) file immediately.
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeTail, zap.NewNop())
 	require.NoError(t, err)
 
 	evc := make(chan fsnotify.Event)
@@ -902,7 +940,7 @@ func TestRunFsnotify_PlainError_DoesNotRescan(t *testing.T) {
 	path := filepath.Join(dir, "a.txt")
 	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
 
-	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeTail, zap.NewNop())
 	require.NoError(t, err)
 
 	evc := make(chan fsnotify.Event)
@@ -922,9 +960,9 @@ func TestRunFsnotify_PlainError_DoesNotRescan(t *testing.T) {
 	}
 }
 
-// Branch coverage: runCloseWait's error branch must trigger the rescan too.
+// Branch coverage: runDebounced's error branch must trigger the rescan too.
 // The file's mtime is an hour old so the rescan is allowed to emit it.
-func TestRunCloseWait_OverflowError_TriggersRescan(t *testing.T) {
+func TestRunDebounced_OverflowError_TriggersRescan(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "lost.log")
 	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
@@ -942,13 +980,13 @@ func TestRunCloseWait_OverflowError_TriggersRescan(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	go func() { _ = w.loopCloseWait(ctx, events, make(map[string]time.Time), evc, erc) }()
+	go func() { _ = w.loopDebounced(ctx, events, make(map[string]time.Time), evc, erc) }()
 
 	select {
 	case fe := <-events:
 		assert.Equal(t, path, fe.Path)
 	case <-time.After(2 * time.Second):
-		t.Fatal("overflow error on the error channel did not trigger the safety-net rescan in loopCloseWait")
+		t.Fatal("overflow error on the error channel did not trigger the safety-net rescan in loopDebounced")
 	}
 }
 
@@ -1122,7 +1160,7 @@ func TestOverflowRescan_CloseWaitHotFile_CollectedAfterDebounce(t *testing.T) {
 // The close_wait debounce flush must record the delivered mtime in the shared
 // seen map: after the flush has emitted a file, the IC-BUG-44 safety-net
 // rescan must not re-emit it.
-func TestCloseWaitFlush_PreventsRescanReemit(t *testing.T) {
+func TestDebounceFlush_PreventsRescanReemit(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "flushed.log")
 
@@ -1136,7 +1174,7 @@ func TestCloseWaitFlush_PreventsRescanReemit(t *testing.T) {
 
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
-	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
 
 	// A write lands, the debounce window passes, the flush emits.
 	require.NoError(t, os.WriteFile(path, []byte("done"), 0o644))
@@ -1174,7 +1212,7 @@ func TestLoopFsnotify_RemoveEvent_DoesNotMarkSeen(t *testing.T) {
 	path := filepath.Join(dir, "gone.txt")
 	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
 
-	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeTail, zap.NewNop())
 	require.NoError(t, err)
 
 	seen := make(map[string]time.Time)
@@ -1246,7 +1284,7 @@ func TestWatcher_Start_Return_CleansUpRecheckTimers(t *testing.T) {
 // shutdown path that is NOT ctx cancellation), the per-file close_wait
 // debounce timers must be stopped too — a live timer would still flush into
 // the events channel after the loop is gone.
-func TestLoopCloseWait_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
+func TestLoopDebounced_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "pending.log")
 	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
@@ -1262,7 +1300,7 @@ func TestLoopCloseWait_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
 
 	// A write registers the pending debounce timer (fires ~w.debounce later).
 	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
@@ -1292,7 +1330,7 @@ func TestLoopCloseWait_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
 // therefore always complete, deterministically, no matter how the
 // goroutines interleave. After the fix the two sites arbitrate through a
 // per-path in-flight claim and exactly one delivery happens.
-func TestCloseWait_RecheckAndFlush_SameVersionDeliveredOnce(t *testing.T) {
+func TestDebounce_RecheckAndFlush_SameVersionDeliveredOnce(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "raced.log")
 	require.NoError(t, os.WriteFile(path, []byte("same version"), 0o644))
@@ -1313,7 +1351,7 @@ func TestCloseWait_RecheckAndFlush_SameVersionDeliveredOnce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
 
 	// A: the debounce flush path — a Write event registers the pending
 	// timer, which fires ~w.debounce later.
@@ -1436,7 +1474,7 @@ func TestFlushDelivery_SettlesClaimAndMarksSeen(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
 
 	// The (short) debounce timer fires after the Write event; with a
 	// buffered consumer the flush delivers immediately.
@@ -1481,7 +1519,7 @@ func TestFlushDelivery_ClaimReleasedOnAbortedDelivery(t *testing.T) {
 	events := make(chan FileEvent) // unbuffered, never read: emit parks
 	ctx, cancel := context.WithCancel(context.Background())
 
-	go func() { _ = w.loopCloseWait(ctx, events, seen, evc, erc) }()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
 
 	// The flush fires ~w.debounce (30ms here) later, claims and parks in
 	// emitBlocking. The eventual claim observation below is the sync point,
@@ -1634,6 +1672,307 @@ func TestRecheckTimer_ReplaceKeepsNewTimerTracked(t *testing.T) {
 	assert.Same(t, timerB, cur, "timer A must not delete the replacement's tracking entry")
 }
 
+// ── AUD-9 / D-035: 防抖普适（tail 以外的所有模式都防抖） ──────────────────────
+
+// AUD-9 / D-035: the debounced path is universal (every mode except tail).
+// overwrite's initial scan must not deliver a file that is still being
+// written: it is skipped, and afterwards collected by the debounce recheck —
+// exactly once. Before D-035 overwrite delivered hot files immediately,
+// which is the 150x write amplification (and truncated uploads) the A-baseline
+// audit measured on a plain cp into the watched directory.
+func TestDebounced_Overwrite_InitialScanSkipsHotFile_RecheckCollects(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "active.log")
+	require.NoError(t, os.WriteFile(path, []byte("still writing"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond
+
+	seen := make(map[string]time.Time)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	skipped := w.pollScan(ctx, events, seen)
+	require.Contains(t, skipped, path, "hot file must be skipped by the initial scan, not delivered")
+	require.Empty(t, events, "the initial scan must not emit a file that is still being written")
+
+	w.scheduleDebounceRechecks(ctx, events, seen, skipped)
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+		assert.Equal(t, "create", fe.Op)
+	case <-time.After(2 * time.Second):
+		t.Fatal("hot file skipped by the initial scan was never collected by the debounce recheck")
+	}
+
+	select {
+	case fe := <-events:
+		t.Fatalf("skipped file was delivered more than once: %s (op=%s)", fe.Path, fe.Op)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// Start-level guard for the same invariant (mutation M3): with the debounced
+// loop chosen for overwrite, neither Start's initial scan nor the live event
+// path may deliver a hot/fresh file. The absurd debounce window makes this
+// deterministic: the pending timer cannot fire within the test's lifetime,
+// so ANY delivery proves the real-time loop ran for a debounced mode.
+func TestDebounced_Overwrite_StartInitialScan_DoesNotDeliverHotFile(t *testing.T) {
+	dir := t.TempDir()
+	hot := filepath.Join(dir, "hot.log")
+	require.NoError(t, os.WriteFile(hot, []byte("still writing"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = time.Minute
+
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = w.Start(ctx, events) }()
+
+	// Live events too: a fresh file's Create event must be debounced, not
+	// emitted in real time (that would mean Start picked the real-time loop).
+	time.Sleep(100 * time.Millisecond) // let fsnotify register the watch
+	fresh := filepath.Join(dir, "fresh.log")
+	require.NoError(t, os.WriteFile(fresh, []byte("created after start"), 0o644))
+
+	select {
+	case fe := <-events:
+		t.Fatalf("a debounced mode delivered in real time (Start picked the real-time loop): %s (op=%s)", fe.Path, fe.Op)
+	case <-time.After(400 * time.Millisecond):
+	}
+}
+
+// The debounce recheck itself must refuse a file that is still hot when it
+// fires (mutation M5). A live writer keeps the mtime fresh, so at fire time
+// (≈ debounceWindow + grace after the scan) the file is still inside the
+// debounce window and the correct recheck emits nothing.
+func TestDebounced_Recheck_DoesNotDeliverStillHotFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "streaming.log")
+	require.NoError(t, os.WriteFile(path, []byte("start"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond
+
+	// Keep the file hot: appends every 10ms keep the mtime age well below
+	// the 30ms window (the existing close_wait hot-file test uses the same
+	// cadence pattern against the 500ms default window).
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+				if err != nil {
+					continue
+				}
+				_, _ = f.WriteString("x")
+				_ = f.Close()
+			}
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	time.Sleep(20 * time.Millisecond) // let the writer make the file hot
+
+	seen := make(map[string]time.Time)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	skipped := w.pollScan(ctx, events, seen)
+	require.Contains(t, skipped, path, "hot file must be skipped by the scan")
+	w.scheduleDebounceRechecks(ctx, events, seen, skipped)
+
+	select {
+	case fe := <-events:
+		t.Fatalf("recheck delivered a file that is still being written: %s", fe.Path)
+	case <-time.After(700 * time.Millisecond):
+		// The recheck fires ≈ debounceWindow+grace after the scan; the writer
+		// keeps the file hot across that whole window, so nothing may be
+		// delivered.
+	}
+}
+
+// AUD-9 / D-035 core regression: in overwrite mode a burst of Write events
+// for the same path is folded into exactly ONE delivery by the debounced
+// event loop. The audit measured 150 full uploads for a single cp of a
+// 150MB file; this pin makes that structurally impossible for any mode that
+// walks the debounced loop (i.e. every mode except tail).
+func TestDebounced_Overwrite_WriteBurst_FoldsIntoSingleDelivery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stream.log")
+	require.NoError(t, os.WriteFile(path, []byte("seed"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 64)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+	const burst = 12
+	for i := 0; i < burst; i++ {
+		evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	}
+
+	select {
+	case fe := <-events:
+		assert.Equal(t, path, fe.Path)
+		assert.Equal(t, "write", fe.Op)
+	case <-time.After(2 * time.Second):
+		t.Fatal("debounced flush never delivered the file")
+	}
+
+	// No second delivery may follow: the whole burst is one file version.
+	select {
+	case fe := <-events:
+		t.Fatalf("write burst was folded into more than one delivery: second event %s (op=%s)", fe.Path, fe.Op)
+	case <-time.After(w.debounce*3 + 300*time.Millisecond):
+	}
+}
+
+// AUD-9 / D-035: tail is deliberately excluded from the universal debounce.
+// Pins that exclusion so nobody "unifies" it back by accident:
+//   - debounceEnabled() is false for tail and only for tail;
+//   - pollScan does not skip hot files in tail mode;
+//   - Start drives the real-time loop for tail — delivery is immediate, not
+//     after the debounce window.
+func TestTailMode_NotDebounced(t *testing.T) {
+	t.Run("predicate", func(t *testing.T) {
+		assert.False(t, (&Watcher{appendMode: AppendModeTail}).debounceEnabled())
+		assert.True(t, (&Watcher{appendMode: AppendModeOverwrite}).debounceEnabled())
+		assert.True(t, (&Watcher{appendMode: AppendModeCloseWait}).debounceEnabled())
+		assert.True(t, (&Watcher{appendMode: ""}).debounceEnabled())
+	})
+
+	t.Run("pollScan does not skip hot files", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "hot.log")
+		require.NoError(t, os.WriteFile(path, []byte("hot"), 0o644))
+
+		w, err := New(dir, "*.log", false, time.Hour, AppendModeTail, zap.NewNop())
+		require.NoError(t, err)
+		w.debounce = time.Hour // even an absurd window must not matter in tail mode
+
+		events := make(chan FileEvent, 8)
+		skipped := w.pollScan(context.Background(), events, make(map[string]time.Time))
+		assert.Empty(t, skipped, "tail mode must not skip hot files")
+		require.Len(t, events, 1, "tail mode must deliver the hot file immediately")
+		assert.Equal(t, path, (<-events).Path)
+	})
+
+	t.Run("Start drives the real-time loop", func(t *testing.T) {
+		dir := t.TempDir()
+		w, err := New(dir, "*.log", false, time.Hour, AppendModeTail, zap.NewNop())
+		require.NoError(t, err)
+		// An absurd debounce window: if tail were (wrongly) routed through
+		// the debounced loop, delivery would wait for it and the deadline
+		// below would fire first.
+		w.debounce = time.Minute
+
+		events := make(chan FileEvent, 8)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		go func() { _ = w.Start(ctx, events) }()
+
+		// Give fsnotify time to register the watch.
+		time.Sleep(100 * time.Millisecond)
+		path := filepath.Join(dir, "live.log")
+		require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
+
+		select {
+		case fe := <-events:
+			assert.Equal(t, path, fe.Path)
+		case <-time.After(3 * time.Second):
+			t.Fatal("tail mode did not deliver the file in real time — is it walking the debounced loop?")
+		}
+	})
+}
+
+// AUD-9 / D-035: close_wait is now an alias of overwrite. The same scripted
+// input through the debounced loop must produce the same delivery sequence
+// under both modes — this turns the "alias" claim into an executable
+// assertion instead of prose.
+func TestDebounced_CloseWaitAndOverwrite_EquivalentDelivery(t *testing.T) {
+	type delivery struct {
+		name string
+		op   string
+	}
+	run := func(t *testing.T, mode string) []delivery {
+		t.Helper()
+		dir := t.TempDir()
+		pathA := filepath.Join(dir, "a.log")
+		pathB := filepath.Join(dir, "b.log")
+		require.NoError(t, os.WriteFile(pathA, []byte("a"), 0o644))
+		require.NoError(t, os.WriteFile(pathB, []byte("b"), 0o644))
+
+		w, err := New(dir, "*.log", false, time.Hour, mode, zap.NewNop())
+		require.NoError(t, err)
+		w.debounce = 30 * time.Millisecond
+
+		seen := make(map[string]time.Time)
+		evc := make(chan fsnotify.Event)
+		erc := make(chan error)
+		events := make(chan FileEvent, 8)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+		waitDelivery := func(wantPath string) delivery {
+			t.Helper()
+			for {
+				select {
+				case fe := <-events:
+					require.Equal(t, wantPath, fe.Path)
+					return delivery{name: filepath.Base(fe.Path), op: fe.Op}
+				case <-time.After(2 * time.Second):
+					t.Fatalf("mode %s: no delivery for %s", mode, wantPath)
+				}
+			}
+		}
+
+		var got []delivery
+		evc <- fsnotify.Event{Name: pathA, Op: fsnotify.Create}
+		got = append(got, waitDelivery(pathA)) // create
+		// A real Write event implies the file changed, so give it a fresh
+		// mtime: without a new version the exactly-once claim correctly
+		// rejects the write burst's flush as a re-delivery of the same
+		// version (that rejection is part of the behaviour under test).
+		require.NoError(t, os.WriteFile(pathA, []byte("a2"), 0o644))
+		for i := 0; i < 5; i++ {
+			evc <- fsnotify.Event{Name: pathA, Op: fsnotify.Write}
+		}
+		got = append(got, waitDelivery(pathA)) // write — burst folded into one
+		evc <- fsnotify.Event{Name: pathB, Op: fsnotify.Create}
+		got = append(got, waitDelivery(pathB)) // create
+		evc <- fsnotify.Event{Name: pathB, Op: fsnotify.Remove}
+		got = append(got, waitDelivery(pathB)) // remove — immediate, no debounce
+		return got
+	}
+
+	overwrite := run(t, AppendModeOverwrite)
+	closeWait := run(t, AppendModeCloseWait)
+	assert.Equal(t, overwrite, closeWait, "close_wait must be a behavioural alias of overwrite")
+}
+
 // ── PR #108 codex 复审 P1: seen 语义回退为「已交付」前的守卫（见卡片 IC-BUG-53） ─
 
 // The safety-net rescan is a RETRY OPPORTUNITY: real-time deliveries are not
@@ -1649,7 +1988,10 @@ func TestLoopFsnotify_RescanRetriesRealTimeDeliveredFiles(t *testing.T) {
 	path := filepath.Join(dir, "retryable.txt")
 	require.NoError(t, os.WriteFile(path, []byte("data"), 0o644))
 
-	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	// Tail mode: the real-time retry semantics pinned here belong to the
+	// real-time loop, which since D-035 only tail walks (debounced
+	// deliveries record seen and are deliberately NOT re-emitted).
+	w, err := New(dir, "*.txt", false, time.Hour, AppendModeTail, zap.NewNop())
 	require.NoError(t, err)
 
 	seen := make(map[string]time.Time)

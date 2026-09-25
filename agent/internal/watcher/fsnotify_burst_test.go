@@ -19,10 +19,14 @@ import (
 // events are dropped are never collected — their mtime/size never change
 // again and no further event fires. Events are delivered with backpressure
 // (emitBlocking), matching the F1 semantics already used by pollScan.
+//
+// Tail mode (D-035): the loop under guard here is loopFsnotify, the real-time
+// path — since the debounce became universal only tail walks it, so the
+// burst must drive tail to keep guarding the right loop.
 func TestWatcher_FsnotifyBurst_NoEventDropped(t *testing.T) {
 	const numFiles = 500
 	dir := t.TempDir()
-	w, err := New(dir, "*.txt", false, 0, AppendModeOverwrite, zap.NewNop())
+	w, err := New(dir, "*.txt", false, 0, AppendModeTail, zap.NewNop())
 	require.NoError(t, err)
 
 	events := make(chan FileEvent, 64) // production consumer buffer size
