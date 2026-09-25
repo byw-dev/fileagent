@@ -51,20 +51,21 @@
   `controlplane/internal/db/migrate_test.go` 的内嵌迁移断言、以及 `make generate` 的产物一致性。
 - **单独一刀，不要夹带进任何功能 PR。**
 
-### watcher 的 `seen` / `inflight` 无界增长（2026-09-25 立，PR #118 review 返工顺带记账）
+### watcher 的 `seen` 无界增长（2026-09-25 立，PR #118 review 返工顺带记账；同轮 S-3 修订）
 
-`agent/internal/watcher/watcher.go` 里 `seen`（每路径最后交付的 mtime）与 `inflight`
-（每路径在途交付声明）两个 map **只增不删**，内存按「该 watcher 生命周期内见过的唯一
-路径数」无界增长。R-1 返工已把防抖 `pending` map 的同类问题修掉（done 通道 + generation
-回收），但这两个**有意不修**：
+`agent/internal/watcher/watcher.go` 里 `seen`（每路径最后交付的 mtime）**只增不删**，
+内存按「该 watcher 生命周期内见过的唯一路径数」无界增长。防抖 `pending` 表的同类问题
+已在本 PR 内修掉（`fired` 标记 + 摊还扫描，D-035「其三」）；`seen` **有意不修**：
 
-- **现象**：`seen`（每路径最后交付的 mtime，`completeDelivery` 每次交付后写入）**只增不删**，
-  内存按「该 watcher 生命周期内见过的唯一路径数」无界增长，每键约几十字节，百万唯一路径
-  ≈ 几十 MB 量级。（`inflight` 的键会被 `completeDelivery` 在交付结算后删除，不是无界面；
-  `tailOffsets` 同为按路径增长，但 tail 当前 fail-closed，无实际增长面。）
+- **现象**：`seen` 每键约几十字节，百万唯一路径 ≈ 几十 MB 量级。增长单位是「**新的唯一
+  路径**」——重复路径只是覆盖原键，不会新增。
 - **为什么 D-035 放大了它**：改动前默认 `overwrite` 走实时路径、**故意不写 `seen`**
-  （PR #108 F1→P1 裁决），`seen` 只由初扫/溢出重扫（`scanFile`）增长；改动后 overwrite
-  也走防抖 flush，**每次交付都写 `seen`**——增长速率从「每次扫描的新增」变成「每次交付」。
+  （PR #108 F1→P1 裁决），`seen` 只由初扫/溢出重扫（`scanFile`）增长；改动后**所有新唯一
+  路径的防抖交付都会进入 `seen`**（此前实时 overwrite 路径不写）——增长来源变多了，
+  但增长单位仍是唯一路径数，不是交付次数。
+- **已核除的非问题**：`inflight`（在途交付声明）会被 `completeDelivery` 在交付结算后
+  **删除键**，不是无界面；`tailOffsets` 同为按路径增长，但 tail 当前 fail-closed，
+  无实际增长面。
 - **为什么本刀不修**：`seen` 不是缓存，是**恰一次仲裁的账本**——`claimDelivery` 靠它判断
   「该版本是否已交付」，溢出重扫靠它跳过已交付文件。给它加淘汰（LRU/TTL/按 mtime 清理）
   等于重新定义「已交付的记忆有多长」，直接改变恰一次语义与重扫行为，是设计问题不是内存优化；
