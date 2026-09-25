@@ -561,6 +561,32 @@ func TestWatcher_CloseWait_InitialScan_SkipsStillWriting(t *testing.T) {
 	}
 }
 
+// D-035 review follow-up: clock skew or rsync -t may leave a file's mtime in
+// the future. A negative age is not evidence that the file is actively being
+// written, so the default debounced mode must collect it on the initial scan
+// instead of scheduling an arbitrarily delayed recheck.
+func TestWatcher_OverwriteInitialScan_FutureMTimeIsSettled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "future.log")
+	require.NoError(t, os.WriteFile(path, []byte("complete"), 0o644))
+	future := time.Now().Add(time.Hour)
+	require.NoError(t, os.Chtimes(path, future, future))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	events := make(chan FileEvent, 1)
+
+	skipped := w.pollScan(context.Background(), events, make(map[string]time.Time))
+	require.Empty(t, skipped, "future mtime must not be classified as an actively written file")
+	select {
+	case fe := <-events:
+		require.Equal(t, path, fe.Path)
+		require.Equal(t, int64(len("complete")), fe.Size)
+	default:
+		t.Fatal("future-mtime file was not collected immediately by the initial scan")
+	}
+}
+
 // Regression for PR #100 review F3: after a restart the watcher's tailOffsets
 // map was empty, so the initial scan emitted FileOffset=0 for files that had
 // already been partially uploaded, and the uploader re-sent the whole file.
@@ -2142,10 +2168,11 @@ func TestDebounced_PendingRecycledAfterFlush(t *testing.T) {
 // This guard replays exactly that attack against the per-event-budget
 // trigger: N rounds, each waiting until every retained entry is idle
 // (active == 0) before injecting exactly one trigger-budget of new paths.
-// Exact expectation: the idle residue after every round is precisely the
-// burst size — it must NOT grow with the round count. (Under the old
-// threshold design this fails from round 4 on: the ratcheted threshold
-// stops firing mid-bursts and idle entries accumulate.)
+// The first entry of every round is deterministically allowed to fire before
+// the sweep, proving that residue may be strictly below the burst size. The
+// real expectations are an upper bound and no cross-round growth. (Under the
+// old threshold design the ratcheted threshold eventually stops firing
+// mid-bursts and idle entries accumulate.)
 func TestDebounced_PendingSweep_MultiRound_ResidueConstant(t *testing.T) {
 	const (
 		rounds = 6
@@ -2154,7 +2181,7 @@ func TestDebounced_PendingSweep_MultiRound_ResidueConstant(t *testing.T) {
 	dir := t.TempDir()
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
-	w.debounce = 20 * time.Millisecond
+	w.debounce = 100 * time.Millisecond
 	w.pendingSweepEvery = burst
 
 	seen := make(map[string]time.Time)
@@ -2182,6 +2209,7 @@ func TestDebounced_PendingSweep_MultiRound_ResidueConstant(t *testing.T) {
 		}, 2*time.Second, 5*time.Millisecond)
 	}
 
+	residueCeiling := burst
 	for round := 1; round <= rounds; round++ {
 		// Inject exactly one trigger-budget of NEW paths. The sweep fires
 		// on this burst's last event and must delete everything left idle
@@ -2190,8 +2218,27 @@ func TestDebounced_PendingSweep_MultiRound_ResidueConstant(t *testing.T) {
 			p := filepath.Join(dir, fmt.Sprintf("r%02d-%02d.log", round, i))
 			require.NoError(t, os.WriteFile(p, []byte("x"), 0o644))
 			evc <- fsnotify.Event{Name: p, Op: fsnotify.Create}
+			if i == 0 {
+				select {
+				case <-events:
+				case <-time.After(2 * time.Second):
+					t.Fatalf("round %d: first entry did not flush before the sweep", round)
+				}
+				require.Eventually(t, func() bool {
+					w.seenMu.Lock()
+					defer w.seenMu.Unlock()
+					pending := w.pending[p]
+					if pending == nil {
+						return false
+					}
+					pending.mu.Lock()
+					defer pending.mu.Unlock()
+					return pending.fired
+				}, time.Second, time.Millisecond,
+					"round %d: first entry must be fired before the remaining burst triggers sweep", round)
+			}
 		}
-		for i := 0; i < burst; i++ {
+		for i := 1; i < burst; i++ {
 			select {
 			case <-events:
 			case <-time.After(2 * time.Second):
@@ -2200,14 +2247,114 @@ func TestDebounced_PendingSweep_MultiRound_ResidueConstant(t *testing.T) {
 		}
 		waitAllFired()
 
-		// Exact expectation: the residue equals this round's burst — every
-		// earlier round's idle entries were swept, so the count is constant
-		// across rounds.
+		// A sweep can observe callbacks completing while it scans, so residue
+		// is bounded above by the active burst; equality is not guaranteed.
 		w.seenMu.Lock()
 		n := len(w.pending)
 		w.seenMu.Unlock()
-		assert.Equal(t, burst, n,
-			"round %d: idle residue must stay at the burst size, not grow with rounds", round)
+		assert.LessOrEqual(t, n, burst,
+			"round %d: residue must not exceed the current burst upper bound", round)
+		assert.LessOrEqual(t, n, residueCeiling,
+			"round %d: residue must not grow across fully-settled rounds", round)
+		residueCeiling = n
+	}
+}
+
+// AUD-9 review follow-up: a timer callback can pass its generation check,
+// release p.mu, and then lose to a new Write before flush stats the file. The
+// stale callback must not deliver that hot partial version, while the newly
+// armed timer must still deliver the later complete version.
+func TestDebounced_FlushRechecksQuietnessAndLaterDeliversCompleteVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "continued-write.log")
+	partial := []byte("partial")
+	complete := []byte("complete-version")
+	require.NoError(t, os.WriteFile(path, partial, 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 100 * time.Millisecond
+
+	beforeFlush := make(chan struct{}, 1)
+	releaseFlush := make(chan struct{})
+	callbackFinished := make(chan struct{}, 1)
+	w.debounceBeforeFlush = func(callbackPath string) {
+		if callbackPath != path {
+			return
+		}
+		select {
+		case beforeFlush <- struct{}{}:
+		default:
+		}
+		<-releaseFlush
+	}
+	w.debounceCallbackFinished = func(callbackPath string) {
+		if callbackPath == path {
+			select {
+			case callbackFinished <- struct{}{}:
+			default:
+			}
+		}
+	}
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	select {
+	case <-beforeFlush:
+	case <-time.After(time.Second):
+		t.Fatal("callback did not reach the before-flush synchronization point")
+	}
+
+	// The writer resumes while gen-1 is parked after its generation check.
+	// Refreshing the same partial bytes updates mtime; the injected Write then
+	// arms gen-2 before gen-1 is allowed to stat the file.
+	require.NoError(t, os.WriteFile(path, partial, 0o644))
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		p := w.pending[path]
+		w.seenMu.Unlock()
+		if p == nil {
+			return false
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.gen == 2 && !p.fired
+	}, time.Second, time.Millisecond, "continued Write did not arm generation 2")
+	close(releaseFlush)
+	select {
+	case <-callbackFinished:
+	case <-time.After(time.Second):
+		t.Fatal("generation-1 callback did not finish")
+	}
+	select {
+	case fe := <-events:
+		t.Fatalf("交付了写到一半的内容：size=%d want no delivery before writes settle", fe.Size)
+	default:
+	}
+
+	// Stop gen-2 to prove the hot-flush fallback is independently sufficient:
+	// even if the final filesystem event is coalesced, the recheck scheduled by
+	// gen-1 must rediscover and deliver the complete quiet version.
+	w.seenMu.Lock()
+	p := w.pending[path]
+	w.seenMu.Unlock()
+	require.NotNil(t, p)
+	require.True(t, p.timer.Stop(), "generation-2 timer must still be armed before testing the fallback recheck")
+	require.NoError(t, os.WriteFile(path, complete, 0o644))
+	select {
+	case fe := <-events:
+		require.Equal(t, int64(len(complete)), fe.Size,
+			"放弃热文件交付后，fallback recheck 必须交付完整版本")
+	case <-time.After(time.Second):
+		t.Fatal("flush 放弃热文件后，fallback recheck 没有交付完整版本")
 	}
 }
 

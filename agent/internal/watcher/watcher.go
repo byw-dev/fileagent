@@ -83,10 +83,12 @@ type Watcher struct {
 	// pattern as w.debounce). See sweepEvery.
 	pendingSweepEvery int
 
-	// debounceCallbackStarted and debounceCallbackFinished are per-watcher
-	// test synchronization hooks for the otherwise unobservable callback
-	// scheduling windows around p.mu. They are always nil in production.
+	// debounceCallbackStarted, debounceBeforeFlush and
+	// debounceCallbackFinished are per-watcher test synchronization hooks for
+	// otherwise unobservable callback scheduling windows around p.mu and
+	// flush. They are always nil in production.
 	debounceCallbackStarted  func(string)
+	debounceBeforeFlush      func(string)
 	debounceCallbackFinished func(string)
 
 	// running guards the single-active-Start invariant (see ErrAlreadyRunning
@@ -205,10 +207,12 @@ func (w *Watcher) sweepEvery() int {
 //
 // Deleting fired entries here is safe because debouncePending maintains this
 // invariant under p.mu: fired=true implies that the current generation has no
-// armed timer and no running flush. Re-arming first advances gen and clears
-// fired; an older callback checks its captured generation both before and
-// after flush, so it can neither flush after a newer arm nor publish fired
-// after a newer arm. Therefore an entry deleted here can never flush again.
+// armed timer and its flush has returned. Re-arming first advances gen and
+// clears fired; an older callback cannot publish fired after a newer arm. An
+// older callback that already passed its first generation check may overlap a
+// newer arm, so flush separately rechecks the file's quiet age before delivery
+// and schedules an independent recheck when it finds a hot file. Therefore an
+// entry deleted here has no timer that can later initiate another flush.
 //
 // Boundedness, honestly stated (D-035): a sweep retains only the entries it
 // observed as still active (unflushed); post-sweep len(pending) is AT MOST
@@ -385,6 +389,18 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 		if err != nil {
 			return
 		}
+		age := time.Since(fe.ModTime)
+		if w.debounceEnabled() && age >= 0 && age < w.debounceWindow() {
+			// A Write can re-arm this path after armTimer's generation check but
+			// before buildEvent stats it. Never deliver that hot intermediate
+			// version. Usually the Write event has already armed a newer pending
+			// timer; this independent recheck also closes the case where the
+			// fsnotify event is still queued (or was coalesced), so abandoning
+			// this callback cannot orphan the final quiet version. The normal
+			// claimDelivery gate arbitrates if both paths become ready together.
+			w.scheduleDebounceRecheck(ctx, events, seen, path)
+			return
+		}
 		// Exactly-once arbitration for the same file version (PR #108
 		// review F3): the debounce recheck and this flush can race on the
 		// same mtime; the claim makes exactly one of them deliver.
@@ -439,6 +455,9 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 			}
 			op := p.op
 			p.mu.Unlock()
+			if w.debounceBeforeFlush != nil {
+				w.debounceBeforeFlush(path)
+			}
 			flush(path, op)
 			p.mu.Lock()
 			if gen == p.gen {
@@ -508,12 +527,10 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 						p.mu.Unlock()
 						w.seenMu.Unlock()
 					} else {
-						w.seenMu.Unlock()
 						p := &debouncePending{op: op, gen: 1}
-						w.seenMu.Lock()
+						p.timer = armTimer(p, path, p.gen)
 						w.pending[path] = p
 						w.seenMu.Unlock()
-						p.timer = armTimer(p, path, p.gen)
 					}
 				}
 			}
@@ -689,7 +706,8 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 		// The path is returned to the caller: on the fsnotify path a one-shot
 		// recheck re-examines it once the debounce window has passed
 		// (IC-BUG-43); on the polling path the next tick does.
-		if w.debounceEnabled() && time.Since(info.ModTime()) < w.debounceWindow() {
+		age := time.Since(info.ModTime())
+		if w.debounceEnabled() && age >= 0 && age < w.debounceWindow() {
 			skipped = append(skipped, path)
 			return nil
 		}
