@@ -2062,9 +2062,9 @@ Error: Process completed with exit code 125.
 2. **按 digest 钉，不按 tag**。镜像仓是我们自己的，tag 可被重写，digest 不可以：
 
    ```
-   ghcr.io/byw-dev/minio@sha256:90677cc242e4b08afa68d7503c5880a1feb19cd0a1e0ce4702e06b2426e203ad
-     ├─ linux/amd64  sha256:8b88cac200d9d8cb0c08a4d37894690370f9ba13c8fe6d7704bc286e966131f0
-     └─ linux/arm64  sha256:dbdd1cafbeff49f3d979efb13f7e8e475ebfe090c4a3c76700f541edf0c5f8b1
+   ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee
+     ├─ linux/amd64  sha256:a2fe4b45cd4dfab1a1e4e55c0ee425b8c96c17e989c523447c71967444f1c36f
+     └─ linux/arm64  sha256:4bfdccb8f63715c3f770bbb4dbce51257ff2c48621f015df61072bbca779d1ad
    ```
 
 3. **必须是多架构 manifest list**。这一条差点被漏掉：本机（Apple Silicon）缓存的
@@ -2080,16 +2080,34 @@ Error: Process completed with exit code 125.
    兼容责任与出网流量。**否决公开**。
    （相应地，「改名避开 MinIO 商标」这条建议也随之作废——商标风险主要来自公开分发，
    私有包没有这个暴露面，而改名会牺牲运维可读性。包名就叫 `minio`。）
-5. **加 provenance 标签，不改内容**。用 LABEL-only 构建（`FROM` + `LABEL`，
+5. **源码自持，且 package 关联到源码仓而不是本仓库**。
+   `byw-dev/minio` 是 MinIO 官方源码的 fork（已同步全部 tag，含我们钉定的
+   `RELEASE.2025-04-22T22-12-26Z`，commit `0d7408f`；该 tag 与 `master` 的 `LICENSE`
+   均为 AGPL-3.0）。**它是公开的**——fork 只能与上游保持一致的可见性。这不是遗憾而是收益：
+   **它就是我们对外的 AGPL §6「对应源码」提供途径**，而且在我们自己手上。
+   如果把它改成私有（删 fork、本地 clone 后 push 进私有 repo），合规成本反而上升——
+   得逐个客户随交付附源码包。**结论：二进制私有、源码公开，这是正确的拆分。**
+
+   相应地，镜像的 `org.opencontainers.image.source` 指向 **`byw-dev/minio`**，
+   **不是** `byw-dev/fileagent`。最初那版指向 fileagent 是**张冠李戴**：
+   在机器可读的元数据里声称「这个 MinIO 二进制的源码是 FileAgent」，
+   而这正是本项目反复吃过的那类「记录撒谎」。已纠正。
+   ⚠️ **源码提供途径的表述要钉在 tag 上而不是「这个 fork」**：我们的用途只涉及
+   `RELEASE.2025-04-22T22-12-26Z` 这一个 tag，不对该 fork 后续/其它 commit 的
+   许可状态作任何主张。
+
+6. **加 provenance 标签，不改内容**。用 LABEL-only 构建（`FROM` + `LABEL`，
    **不新增层、不执行任何命令**，文件系统与上游逐字节相同）打上
-   `org.opencontainers.image.source`（指向本仓库，同时是 GHCR 关联 package 到 repo 的机制）、
-   `org.opencontainers.image.licenses=AGPL-3.0-only`、
-   `io.byw.mirror.upstream-ref`、`io.byw.mirror.reason`。
-6. **CI 给出可读失败**。镜像拉不到原本的症状是 compose 启动阶段一个赤裸的
+   `org.opencontainers.image.source`（→ `byw-dev/minio`）、
+   `org.opencontainers.image.revision`、`org.opencontainers.image.licenses=AGPL-3.0-only`、
+   `io.byw.mirror.upstream-ref`、`io.byw.mirror.source-offer`（钉到 tag 的 tree URL）、
+   `io.byw.mirror.consumer`（→ `byw-dev/fileagent`，即「谁在用」，与「源码在哪」分开表达）、
+   `io.byw.mirror.reason`。
+7. **CI 给出可读失败**。镜像拉不到原本的症状是 compose 启动阶段一个赤裸的
    `unauthorized` + `exit code 125`，看不出是权限还是网络。现在 `ci-smoke.yml` 有
    独立的预检步骤，失败时明确指向本决策并提示「到 package 设置页把本仓库加入
    Actions 访问（Read）」。
-7. **离线交付路径成文**。私有 package 意味着客户现场 `docker compose up` 拉不到镜像，
+8. **离线交付路径成文**。私有 package 意味着客户现场 `docker compose up` 拉不到镜像，
    所以 `docs/ops/deployment.md` §0.1 写明 `docker save` / `docker load` 的导入步骤
    与 digest 校验方法。这不是可选项——**它是交付能力的一部分**。
 
@@ -2101,10 +2119,20 @@ Error: Process completed with exit code 125.
    digest 记录从 registry 拉下来的，或记录早已丢失。判断依据只剩「`Created`
    与该 release 一致、镜像内 `mc` 是同日期同版本的 x86-64 二进制」。几乎确定是正品，
    但**证据链比 arm64 弱一档**。它是我们能拿到的唯一 amd64 副本，而 CI 必须用它。
-2. **没有上游签名可比对，也没有升级路径**。官方不再公开发布，所以无法证明
-   「我们这个镜像就是官方那个」，provenance 只能靠上面记录的 digest。
-   更重要的是：**以后 MinIO 出安全补丁，我们没有来源**。
-3. **AGPL-3.0 的分发义务落在我们头上**。该 release 是 AGPL-3.0，再分发是允许的，
+2. **没有升级路径**。官方不再公开发布，**以后 MinIO 出安全补丁我们没有来源**。
+   （「无法证明这个镜像就是官方那个」这条**已可消除**：官方镜像自带
+   `/usr/bin/minio.minisig` 与 `/usr/bin/minio.sha256sum`，而 MinIO 的 minisign
+   公钥就写在 `byw-dev/minio` 的 `Dockerfile.release` 里
+   ——`RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav`。
+   已核对：两个架构的 `minio` 二进制 sha256 与镜像内自带的 `.sha256sum` 一致，
+   且两份签名携带的 key id 与该公钥一致。**完整验签见落地记录。**）
+
+3. **GHCR 的「关联仓库」不等于「授予 Actions 读权限」**（实测证伪，记在这里免得再踩）：
+   给镜像打 `org.opencontainers.image.source` **不会**让该仓库的 `GITHUB_TOKEN`
+   读到一个私有 package；必须到 package 设置页的 **Manage Actions access**
+   显式把仓库加进去（UI-only，无 REST API）。**症状极具误导性**：无权访问时
+   GHCR 返回的是 `manifest unknown` 而不是 `unauthorized`——看起来像镜像不存在。
+4. **AGPL-3.0 的分发义务落在我们头上**。该 release 是 AGPL-3.0，再分发是允许的，
    但随交付**必须提供许可副本与对应源码的获取途径**。上游 GitHub 仓库已归档，
    **长期保有那份源码是我们的责任**——不要指望上游还在。本系统是私有化交付、
    交付物本身就含 MinIO，所以这条义务躲不掉，只是范围是客户而不是公众。

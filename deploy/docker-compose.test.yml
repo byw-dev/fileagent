@@ -53,7 +53,11 @@ services:
     #
     # ⚠️ 这是**私有** package：全新环境需要先 `docker login ghcr.io`；
     # 离线 / 客户现场用 `docker load` 导入交付的 tarball，见 docs/ops/deployment.md。
-    image: ghcr.io/byw-dev/minio@sha256:90677cc242e4b08afa68d7503c5880a1feb19cd0a1e0ce4702e06b2426e203ad
+    #
+    # 对应源码（AGPL-3.0 §6 的「对应源码」提供途径）在我们自己的 fork：
+    # github.com/byw-dev/minio 的 tag RELEASE.2025-04-22T22-12-26Z。
+    # 二进制私有、源码公开——见 DECISIONS.md D-036。
+    image: ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee
     container_name: fileagent-test-minio
     command: server /data --console-address ":9001"
     environment:

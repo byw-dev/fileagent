@@ -30,12 +30,14 @@ Control Plane 启动时会**快速失败**（fail-fast）——任一依赖不�
 所以三个 compose 现在钉的是**我们自持的私有镜像**，按 **digest** 而非 tag：
 
 ```
-ghcr.io/byw-dev/minio@sha256:90677cc242e4b08afa68d7503c5880a1feb19cd0a1e0ce4702e06b2426e203ad
+ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee
 ```
 
 它是一个多架构 manifest list（`linux/amd64` + `linux/arm64`），内容是上游
 `RELEASE.2025-04-22T22-12-26Z`（AGPL-3.0），只加了 provenance 标签，**没有新增层、
-没有执行任何命令**，文件系统与上游逐字节相同。
+没有执行任何命令**，文件系统与上游逐字节相同。镜像的 `org.opencontainers.image.source`
+指向 **`github.com/byw-dev/minio`**（源码，见下方 AGPL 说明），而不是本仓库——
+本仓库只是它的**消费方**（记在 `io.byw.mirror.consumer`）。
 
 **两条取得路径，按环境选一条：**
 
@@ -50,18 +52,25 @@ docker compose -f deploy/docker-compose.prod.yml pull minio
 
 ```bash
 # 在有网络的机器上导出（一次）
-docker pull ghcr.io/byw-dev/minio@sha256:90677cc2…
-docker save ghcr.io/byw-dev/minio@sha256:90677cc2… -o fileagent-minio.tar
+docker pull ghcr.io/byw-dev/minio@sha256:a66e1fd7…
+docker save ghcr.io/byw-dev/minio@sha256:a66e1fd7… -o fileagent-minio.tar
 
 # 在目标机器上导入
 docker load -i fileagent-minio.tar
 # 校验导入的正是钉定的那一份（digest 必须完全相同）
-docker image inspect ghcr.io/byw-dev/minio@sha256:90677cc2… --format '{{.Id}}'
+docker image inspect ghcr.io/byw-dev/minio@sha256:a66e1fd7… --format '{{.Id}}'
 ```
 
 > ⚠️ **AGPL-3.0 的分发义务**：本系统是私有化交付，交付物里包含 MinIO，因此
-> **随交付必须提供 AGPL-3.0 许可副本与对应源码的获取途径**。上游仓库已归档，
-> 源码的长期保有责任在我们这边——不要指望上游还在。详见 `DECISIONS.md` D-036。
+> **随交付必须提供 AGPL-3.0 许可副本与对应源码的获取途径**。
+>
+> **对应源码就在我们自己手上**：`github.com/byw-dev/minio`（MinIO 官方源码的 fork，
+> 已同步全部 tag）的 tag **`RELEASE.2025-04-22T22-12-26Z`**——与上面这个镜像一一对应。
+> 该仓库是**公开**的（fork 只能与上游保持一致的可见性），这正好使它成为可直接交给客户的
+> 源码获取途径。**二进制私有、源码公开**，是刻意的拆分。
+>
+> 上游 MinIO 仓库已归档，所以**长期保有那份源码的责任在我们这边**——不要指望上游还在。
+> 详见 `DECISIONS.md` D-036。
 
 ---
 
@@ -146,7 +155,7 @@ bash deploy/scripts/init-minio.sh
 >   -e MINIO_ROOT_USER=<同上> -e MINIO_ROOT_PASSWORD=<同上> \
 >   -e CP_ADMIN_ACCESS_KEY=<同 A.1> -e CP_ADMIN_SECRET_KEY=<同 A.1> \
 >   -e WEBHOOK_AUTH_TOKEN=<同 INTERNAL_WEBHOOK_SECRET> \
->   --entrypoint bash ghcr.io/byw-dev/minio@sha256:90677cc242e4b08afa68d7503c5880a1feb19cd0a1e0ce4702e06b2426e203ad /s/init-minio.sh
+>   --entrypoint bash ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee /s/init-minio.sh
 > ```
 >
 > 说明：镜像 digest 与 `docker-compose.prod.yml` 里钉的一致（见 §0.1；**没有「换新版」这个选项了**，
