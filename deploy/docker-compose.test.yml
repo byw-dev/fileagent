@@ -36,14 +36,24 @@ services:
       start_period: 3s
 
   minio:
-    # ⚠️ registry 必须是 quay.io，不是 Docker Hub：MinIO 已转向商用，2026 年彻底
-    # 移除了 Docker Hub 上的 minio/minio、minio/mc 镜像以及 dl.min.io 的 mc 下载，
-    # 实测 `docker manifest inspect minio/minio:*` 一律
-    # 「repository does not exist」（而 postgres/redis/nats 均正常）。
-    # 有本地缓存的机器察觉不到，任何全新环境或 CI runner 会直接起不来。
+    # ⚠️ 镜像来自**我们自己的私有镜像仓**，不是任何上游 registry（D-036）。
+    # MinIO 已转向商用：Docker Hub 上的 minio/minio、minio/mc 与 dl.min.io 的 mc
+    # 下载在 2026 年被移除，`quay.io/minio/minio` 此后也不再公开可读
+    # （匿名 token 能签发，但 manifest 返回 401），`ghcr.io/minio/minio` 返回 403。
+    # 也就是说**已经没有任何公共通路**能拉到这个镜像；有本地缓存的机器察觉不到，
+    # 任何全新环境或 CI runner 都会直接起不来（这正是 CI 实测撞到的）。
+    #
+    # 因此这里钉的是 **digest 而不是 tag**：镜像仓是我们自己的，tag 可被重写，
+    # digest 不可以。这个 digest 是一个**多架构 manifest list**（linux/amd64 +
+    # linux/arm64），所以 dev 用的 Apple Silicon 与 CI 用的 x86-64 runner
+    # 都能各自拉到正确的那一份。
+    #
     # 版本同时钉死：镜像内自带 mc（healthcheck 与 init-minio.sh 都依赖它），
-    # 新版已把 mc 拆走。
-    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    # 新版已把 mc 拆走——而现在**也没有新版可升**，见 D-036。
+    #
+    # ⚠️ 这是**私有** package：全新环境需要先 `docker login ghcr.io`；
+    # 离线 / 客户现场用 `docker load` 导入交付的 tarball，见 docs/ops/deployment.md。
+    image: ghcr.io/byw-dev/minio@sha256:90677cc242e4b08afa68d7503c5880a1feb19cd0a1e0ce4702e06b2426e203ad
     container_name: fileagent-test-minio
     command: server /data --console-address ":9001"
     environment:
