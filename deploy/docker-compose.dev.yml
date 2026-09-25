@@ -58,8 +58,8 @@ services:
     # 对应源码（AGPL-3.0 §6 的「对应源码」提供途径）在我们自己的 fork：
     # github.com/byw-dev/minio 的 tag RELEASE.2025-04-22T22-12-26Z。
     # 二进制私有、源码公开——见 DECISIONS.md D-036。
-    # FA_MINIO_IMAGE 是**离线交付的逃生舱**：docker load 不恢复 RepoDigest，
-    # 离线侧 load 后 export FA_MINIO_IMAGE=<本地 tag> 即可引用（见 docs/ops/deployment.md §0.1②）。
+    # 离线侧 load 后把 FA_MINIO_IMAGE=<本地 tag> 写进 deploy/.env（compose 自动加载；
+    # 不要用 export——只活当前 shell，宿主重启后会回落到拉不到的 digest。见 §0.1②）。
     # 不设该变量时就是下面这个 digest——CI 与 dev 仍按 digest 钉住，不是给人随便换镜像用的。
     image: ${FA_MINIO_IMAGE:-ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee}
     container_name: ${FA_CONTAINER_PREFIX:-fileagent-dev}-minio
