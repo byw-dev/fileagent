@@ -155,7 +155,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-52 | `dry_run_limit` 的**有效上限恒为 10**：CP 只在响应端按它裁剪（1–10 生效），**从不下发给 agent**，而 agent 硬编码上限 10——请求 11–50 被静默压成 10，且无截断标记 | 🟡 P2 | controlplane + agent + proto |
 | IC-BUG-53 | watcher 的 `seen` 语义是「**已交付**」而非「**已持久入队**」：下游 `submitFile` 提交/判重失败**只 Warn 不重试**，文件此后不再变化时**永不被采集**（初扫路径自 PR #100 F1 起即受影响，实时路径因 IC-BUG-44/43 的 P1 裁决而**保留重试机会**） | 🟡 P2 | agent |
 | IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 | 🟡 P2 | docs |
-| IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，而 `CreateUploadLog` 无条件执行，于是一字节未传的失败也记成「已传输整个文件」 | 🟡 P2 | agent + CP |
+| IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** | 🟠 P1 | agent + CP |
 
 ---
 
@@ -841,13 +841,13 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 ---
 
-## IC-BUG-55 — 失败上报把 `bytes_transferred` 记成整文件大小 🟡 P2
+## IC-BUG-55 — 失败上报把 `bytes_transferred` 记成整文件大小 🟠 P1
 
 | 字段 | 内容 |
 |------|------|
 | **⚠️ 立卡时的原始断言已被证伪（PR #121 评审，2026-09-25）** | 原卡称「`SizeBytes` 上报的是入队旧值，成功路径也不符」。**不成立**：`agent/internal/executor/reports.go:35` 确实先填 `task.FileSize`，但**紧接着 36-41 行**在 `result != nil` 时用 `result.SizeBytes` 覆盖，而 `uploader.go:238-239` 把上传时重新 `os.Stat` 得到的 `uploadSize` 写进该字段。**成功路径上报的就是实际上传的字节数**，`file_entries.size_bytes` 没有问题。立卡时只读了 `:35` 就下结论，漏读了下面 6 行。 |
-| **真正残留的根因** | 只有**失败路径**。`uploadErr != nil` 时 `result == nil`，覆盖不发生，`SizeBytes` 保留 `task.FileSize`；而 `controlplane/internal/indexer/indexer.go:266-280` 的 `CreateUploadLog` 在 `if result.GetSuccess()` 块**之外**无条件执行，把该值同时写进 `upload_logs.size_bytes` 与 `upload_logs.bytes_transferred`，`status='failed'`。 |
-| **后果** | 一次**一字节都没传成**的失败，在 `upload_logs` 里记作「已传输 <整个文件大小> 字节」。列名声称的语义与内容不符。今天没有消费方读 `bytes_transferred`，所以不产生错误结论；一旦做「实际传输量」类的统计或对账，该列会系统性偏高。 |
+| **真正残留的根因** | 只有**失败路径**。`uploadErr != nil` 时 `result == nil`，覆盖不发生，`SizeBytes` 保留 `task.FileSize`；而 `controlplane/internal/indexer/indexer.go:266-280` 的 `CreateUploadLog` 在 `if result.GetSuccess()` 块**之外**，把该值同时写进 `upload_logs.size_bytes` 与 `upload_logs.bytes_transferred`，`status='failed'`。⚠️ 「在 success 块之外」**不等于「无条件」**：bucket 查询或规则元数据查询硬错误时函数会在写日志前 return（探针实测 `err=indexer: get bucket "deleted-bucket": bucket gone` → `uploadLogCalls=0`），此时 agent 收不到 ack 会持续重报。**不要把 `upload_logs` 当作完整的失败审计。** |
+| **后果（⚠️ 立卡时低估了）** | 一次**一字节都没传成**的失败，在 `upload_logs` 里记作「已传输 <整个文件大小> 字节」。**该列今天就有消费方**：`GET /api/v1/upload-logs` 投影它（`events.go:545-549`），Web UI 的**失败行**展开渲染「已传输 X / Y」（`pages/Logs/index.tsx:105-115`，`rowExpandable` 只对 `status === 'FAILED'` 生效）。而 D-027 设计该字段的目的正是「失败行内嵌错误 + 重试轨迹」要**展示部分进度**——本缺陷让每次失败都显示「已传输整个文件」，**把该功能的意图完全反转**，操作员今天就在看错误数字。将来做「实际传输量」统计或对账时，该列还会系统性偏高。（立卡时写「今天没有消费方」是错的，由 PR #121 第 2 轮复审证伪。） |
 | **不影响的面（已核实）** | `file_entries.size_bytes` 只在成功时写入（`indexer.go:214-236` 在 `if result.GetSuccess()` 块内），值来自 uploader 的当前 `uploadSize`，**正确**。webhook 路径（`source='minio_event'`，`events.go:899-1007` → `indexer.go:564-587`）写的是事件里的对象真实大小，**也正确**。⚠️ Dashboard 的 `storage_bytes` 会对 `file_entries.size_bytes` 做 `SUM`（`read_queries.go:464-470`）——**它消费的是成功路径那一列，不受本条影响**（立卡时写的「read/list API 只是回显」不准确，一并订正）。 |
-| **建议处理** | 🟡 P2 可推。修法二选一：(a) 失败时把 `BytesTransferred` 显式置 0（或置为 uploader 实际传输量，若能拿到）；(b) 失败路径干脆不填该列。**随第 3 步「IC 账本按 A 的标尺重判」时定级**，不在发现时修。 |
+| **建议处理** | 🟠 P1，但**不挡目标 A**（采上去/查得到/下得来不受影响），故仍可推到第 3 步。⚠️ **推后的理由不再是「没有消费方」（那是错的），而是「不挡 A」。** 修法二选一：(a) 失败时把 `BytesTransferred` 显式置 0，或置为 uploader 实际传输量（若能拿到——这才符合 D-027 的原意）；(b) 失败路径干脆不填该列，由 UI 显示「未知」。**随第 3 步「IC 账本按 A 的标尺重判」时定级。** |
 | **发现与订正** | 2026-09-25 排查 PR #118 独立评审 P1 时立卡，**同日经 PR #121 的 codex 独立评审证伪核心断言并收窄至当前形态**。保留本卡而非撤销，是因为失败路径的语义问题真实存在（与 IC-BUG-49「前提被完全证伪」不同）。 |
