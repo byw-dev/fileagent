@@ -59,6 +59,9 @@ type Watcher struct {
 	rechecks    map[string]*time.Timer
 	recheckGens map[string]uint64
 	recheckGen  uint64
+	// rechecksStopped closes the current Start lifecycle's scheduling gate.
+	// A late debounce callback must not install a replacement after shutdown.
+	rechecksStopped bool
 
 	// seenMu guards rechecks, the debounced loop's pending map (w.pending),
 	// and every access to a scan's seen map while
@@ -295,6 +298,7 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 	// PR #108 review F2: drop every debounce recheck timer when the watcher
 	// shuts down, whatever path returns below.
 	defer w.stopAllRechecks()
+	w.startRechecks()
 
 	if err := w.addWatchPaths(fw); err != nil {
 		w.logger.Warn("watcher: cannot add watch paths, using polling", zap.Error(err))
@@ -869,17 +873,29 @@ func (w *Watcher) completeDelivery(seen map[string]time.Time, path string, modTi
 // stopAllRechecks stops and forgets every pending debounce recheck timer.
 // Called when Start returns (rule cancelled / hot reload): the timer
 // closures otherwise keep the watcher, the seen map, the context and the
-// events channel alive per skipped path — with a future mtime the wait can
-// be arbitrarily long. The events channel itself is never closed in
-// production, so the consequence is retention, not a send-after-close panic.
+// events channel alive per skipped path. The events channel itself is never
+// closed in production, so the consequence is retention, not a
+// send-after-close panic. It also closes the scheduling gate before draining,
+// preventing a callback that already crossed Timer.Stop from installing a
+// replacement behind the shutdown boundary.
 func (w *Watcher) stopAllRechecks() {
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()
+	w.rechecksStopped = true
 	for path, t := range w.rechecks {
 		t.Stop()
 		delete(w.rechecks, path)
 		delete(w.recheckGens, path)
 	}
+}
+
+// startRechecks opens the recheck scheduling gate for a new Start lifecycle.
+// A cancelled context is the second fence against callbacks from the previous
+// lifecycle after sequential Watcher reuse opens this gate again.
+func (w *Watcher) startRechecks() {
+	w.seenMu.Lock()
+	w.rechecksStopped = false
+	w.seenMu.Unlock()
 }
 
 // stopPendingTimers stops every live debounce timer in pending.
@@ -960,12 +976,19 @@ func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- Fil
 	if err != nil {
 		return // gone; nothing to collect
 	}
-	wait := w.debounceWindow() - time.Since(info.ModTime()) + debounceRecheckGrace
+	age := time.Since(info.ModTime())
+	if age < 0 {
+		age = 0
+	}
+	wait := w.debounceWindow() - age + debounceRecheckGrace
 	if wait < debounceRecheckGrace {
 		wait = debounceRecheckGrace
 	}
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()
+	if w.rechecksStopped || ctx.Err() != nil {
+		return
+	}
 	if w.rechecks == nil {
 		w.rechecks = make(map[string]*time.Timer)
 	}
@@ -1014,7 +1037,8 @@ func (w *Watcher) recheckAfterDebounce(ctx context.Context, events chan<- FileEv
 		return // gone; nothing to collect
 	}
 	// F2 invariant (PR #100): never emit a file that may still be written.
-	if w.debounceEnabled() && time.Since(info.ModTime()) < w.debounceWindow() {
+	age := time.Since(info.ModTime())
+	if w.debounceEnabled() && age >= 0 && age < w.debounceWindow() {
 		return
 	}
 	// errWalkAborted only means ctx was cancelled; the timer callback has

@@ -1255,6 +1255,71 @@ func TestOverflowRescan_CloseWaitHotFile_CollectedAfterDebounce(t *testing.T) {
 	}
 }
 
+// D-035 incremental review: a future mtime is settled, not hot. Scheduling a
+// recheck for it must clamp the negative age when choosing the deadline, and
+// the callback must not reject it forever when that prompt timer fires.
+func TestScheduleDebounceRecheck_FutureMTimeDeliveredPromptly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "future-recheck.log")
+	require.NoError(t, os.WriteFile(path, []byte("complete"), 0o644))
+	future := time.Now().Add(time.Hour)
+	require.NoError(t, os.Chtimes(path, future, future))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond
+	defer w.stopAllRechecks()
+
+	events := make(chan FileEvent, 1)
+	w.scheduleDebounceRecheck(context.Background(), events, make(map[string]time.Time), path)
+	select {
+	case fe := <-events:
+		require.Equal(t, path, fe.Path)
+		require.Equal(t, int64(len("complete")), fe.Size)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("future-mtime recheck was delayed by clock skew or rejected permanently")
+	}
+}
+
+// A callback that crosses stopPendingTimers may reach scheduling after
+// stopAllRechecks has already drained the map. The stop boundary is final:
+// no callback may install an untracked recheck behind it.
+func TestScheduleDebounceRecheck_AfterStopRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "after-stop.log")
+	require.NoError(t, os.WriteFile(path, []byte("complete"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.stopAllRechecks()
+	w.scheduleDebounceRecheck(context.Background(), make(chan FileEvent, 1), make(map[string]time.Time), path)
+
+	w.seenMu.Lock()
+	defer w.seenMu.Unlock()
+	assert.Empty(t, w.rechecks, "关停后仍装入了新的 recheck timer")
+}
+
+// Sequential Watcher reuse reopens the scheduling gate. A callback from the
+// previous lifecycle still carries its cancelled context, which must prevent
+// it from installing an old-ctx/old-seen timer into the new lifecycle.
+func TestScheduleDebounceRecheck_PreviousLifecycleContextRejectedAfterReuse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "previous-lifecycle.log")
+	require.NoError(t, os.WriteFile(path, []byte("complete"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	oldCtx, cancelOld := context.WithCancel(context.Background())
+	cancelOld()
+	w.stopAllRechecks()
+	w.startRechecks() // simulate the next sequential Start
+	w.scheduleDebounceRecheck(oldCtx, make(chan FileEvent, 1), make(map[string]time.Time), path)
+
+	w.seenMu.Lock()
+	defer w.seenMu.Unlock()
+	assert.Empty(t, w.rechecks, "上一轮已取消 ctx 的 callback 污染了顺序复用后的新生命周期")
+}
+
 // The close_wait debounce flush must record the delivered mtime in the shared
 // seen map: after the flush has emitted a file, the IC-BUG-44 safety-net
 // rescan must not re-emit it.
@@ -2355,6 +2420,48 @@ func TestDebounced_FlushRechecksQuietnessAndLaterDeliversCompleteVersion(t *test
 			"放弃热文件交付后，fallback recheck 必须交付完整版本")
 	case <-time.After(time.Second):
 		t.Fatal("flush 放弃热文件后，fallback recheck 没有交付完整版本")
+	}
+}
+
+// D-035 mutation guard for the flush-specific age >= 0 clamp. A future mtime
+// must pass through flush immediately; treating its negative age as hot would
+// abandon this callback and defer delivery to a recheck instead.
+func TestDebounced_FlushFutureMTimeDeliveredByCurrentCallback(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "future-flush.log")
+	require.NoError(t, os.WriteFile(path, []byte("complete"), 0o644))
+	future := time.Now().Add(time.Hour)
+	require.NoError(t, os.Chtimes(path, future, future))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond
+	callbackFinished := make(chan struct{}, 1)
+	w.debounceCallbackFinished = func(callbackPath string) {
+		if callbackPath == path {
+			callbackFinished <- struct{}{}
+		}
+	}
+	defer w.stopAllRechecks()
+
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.loopDebounced(ctx, events, make(map[string]time.Time), evc, erc) }()
+
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	select {
+	case <-callbackFinished:
+	case <-time.After(time.Second):
+		t.Fatal("future-mtime flush callback did not finish")
+	}
+	select {
+	case fe := <-events:
+		require.Equal(t, int64(len("complete")), fe.Size)
+	default:
+		t.Fatal("future mtime 被 flush 误判为热文件，当前 callback 未交付")
 	}
 }
 
