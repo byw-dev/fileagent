@@ -2896,6 +2896,63 @@ func TestDebounced_AbandonedDelivery_StillDeliversCompleteVersion(t *testing.T) 
 	}
 }
 
+// PR #118 round 8: the entry pre-check at the top of emitCancellable is the
+// only guard for the "generation ALREADY invalidated before the send is
+// reached" case. The loop-level wiring (cancel captured under p.mu, re-arm
+// and pending removal closing it) is pinned by the two round-7 tests above;
+// what they cannot pin — their deliveries are parked INSIDE the second
+// select when the cancel closes — is the entry branch itself:
+//
+//	cancel closed + events buffer has free space  ⇒  emitSuperseded,
+//	                                              and the send is never offered.
+//
+// Why "buffered events" is the consumer-ready case worth pinning: in
+// production the events channel is buffered (agent/cmd/agent/main.go:791,
+// cap 64), so a ready consumer is the NORM, not a rare scheduling accident.
+// Without the entry pre-check, Go's select picks UNIFORMLY between the two
+// ready cases (`events <- fe` and `<-cancel`), so the stale snapshot is
+// delivered with probability 1/2 per call.
+//
+// Why this test repeats the same deterministic setup N times in ONE test:
+// a single iteration is a coin flip under the mutation (deleted pre-check),
+// so a single pass/fail proves nothing in either direction. Repeating N=50
+// iterations and asserting ZERO stale deliveries across all of them makes
+// the mutation fail with theoretical escape probability
+//
+//	0.5^N = 0.5^50 = 2^-50 ≈ 8.9e-16
+//
+// i.e. deleting the pre-check turns this test red with near-certainty on
+// every run, while the guard's presence keeps every iteration green
+// deterministically (the entry check wins before any select race can form).
+func TestEmitCancellable_InvalidatedGenerationNeverDeliversToReadyConsumer(t *testing.T) {
+	w, err := New(t.TempDir(), "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	ctx := context.Background() // alive: only cancel and the send may be ready
+	staleEvent := FileEvent{Path: "/tmp/stale-generation.log", Op: "write"}
+
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		// The generation was invalidated BEFORE its flush reached the send:
+		// the re-arm / pending-removal path closed this exact channel, and
+		// only afterwards did the flush arrive at emitCancellable.
+		cancel := make(chan struct{})
+		close(cancel)
+
+		// Free buffer space = the consumer is ready: `events <- fe` would
+		// complete immediately. This is the 50/50 co-ready setup the entry
+		// pre-check exists to defuse.
+		events := make(chan FileEvent, 1)
+
+		outcome := w.emitCancellable(ctx, events, staleEvent, cancel)
+
+		require.Equal(t, emitSuperseded, outcome,
+			"iteration %d: an already-invalidated generation must be abandoned at the entry check", i)
+		require.Empty(t, events,
+			"iteration %d: the stale snapshot was delivered to a ready consumer — the entry pre-check is gone", i)
+	}
+}
+
 // AUD-9 review P1, second interleaving: Reset may win after AfterFunc has
 // scheduled its callback but before that callback takes p.mu. The callback
 // must still identify itself as the older firing and leave fired false after
