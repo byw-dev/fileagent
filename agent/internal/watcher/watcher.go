@@ -288,6 +288,11 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 		return ErrAlreadyRunning
 	}
 	defer w.running.Store(false)
+	// Open the per-lifecycle scheduling gate before either the fsnotify or
+	// polling path can return. Keep its matching close at the same scope so a
+	// sequential Start always begins from a fresh gate state.
+	w.startRechecks()
+	defer w.stopAllRechecks()
 
 	fw, err := newFSWatcher()
 	if err != nil {
@@ -295,10 +300,6 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 		return w.runPolling(ctx, events)
 	}
 	defer fw.Close()
-	// PR #108 review F2: drop every debounce recheck timer when the watcher
-	// shuts down, whatever path returns below.
-	defer w.stopAllRechecks()
-	w.startRechecks()
 
 	if err := w.addWatchPaths(fw); err != nil {
 		w.logger.Warn("watcher: cannot add watch paths, using polling", zap.Error(err))
@@ -399,9 +400,11 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 			// before buildEvent stats it. Never deliver that hot intermediate
 			// version. Usually the Write event has already armed a newer pending
 			// timer; this independent recheck also closes the case where the
-			// fsnotify event is still queued (or was coalesced), so abandoning
-			// this callback cannot orphan the final quiet version. The normal
+			// fsnotify event is still queued (or was coalesced). The normal
 			// claimDelivery gate arbitrates if both paths become ready together.
+			// Known narrow exception: if the event loop exits while ctx remains
+			// live, Start closes the recheck gate and a late flush cannot install
+			// this retry; see stopAllRechecks and D-035 for the accepted trade-off.
 			w.scheduleDebounceRecheck(ctx, events, seen, path)
 			return
 		}
@@ -878,6 +881,12 @@ func (w *Watcher) completeDelivery(seen map[string]time.Time, path string, modTi
 // send-after-close panic. It also closes the scheduling gate before draining,
 // preventing a callback that already crossed Timer.Stop from installing a
 // replacement behind the shutdown boundary.
+//
+// Known trade-off: loopDebounced may return because its fsnotify channel
+// closes while ctx is still live. A concurrent flush that discovers a hot
+// file after this gate closes cannot install its otherwise-recovering recheck,
+// so that final quiet version may be left uncollected. This narrow backend-
+// failure case is accepted here rather than weakening the shutdown fence.
 func (w *Watcher) stopAllRechecks() {
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()
@@ -977,12 +986,14 @@ func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- Fil
 		return // gone; nothing to collect
 	}
 	age := time.Since(info.ModTime())
-	if age < 0 {
-		age = 0
-	}
-	wait := w.debounceWindow() - age + debounceRecheckGrace
-	if wait < debounceRecheckGrace {
-		wait = debounceRecheckGrace
+	// Every delivery path treats a future mtime as already settled, so it
+	// needs only the grace that keeps the callback off the stat boundary.
+	wait := debounceRecheckGrace
+	if age >= 0 {
+		wait = w.debounceWindow() - age + debounceRecheckGrace
+		if wait < debounceRecheckGrace {
+			wait = debounceRecheckGrace
+		}
 	}
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()

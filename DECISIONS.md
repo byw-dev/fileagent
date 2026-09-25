@@ -2146,6 +2146,20 @@ Write 后窗口内 Remove ⇒ **只**收到 `remove`，窗口过后也没有内�
 `seen` 的值钳到 `now`，否则同一个未来 mtime 会在后续扫描中反复被判为更新并重复交付，
 把漏采改造成写放大。
 
+#### 其五：recheck timer 以生命周期门闩收口
+
+`flush` 现在运行在防抖 timer goroutine 上；它可能越过 pending timer 的 `Stop()`，并在
+`Start` 的 `stopAllRechecks` 已经清空 timer 后才发现文件仍热、试图重新安装 recheck。
+若放行，这个过期 timer 会携带旧 `ctx` / `seen` 污染顺序复用后的新生命周期。因此调度有
+两道栅栏：`rechecksStopped` 在 `stopAllRechecks` 的同一把 `seenMu` 下先关门再清表，每次
+`Start`（包括 fsnotify 创建失败的 polling fallback）在任何返回路径之前重新开门；
+`ctx.Err()` 则在下一轮重新开门后继续拒绝上一轮已取消 context 的迟到 callback。
+
+已知代价：`loopDebounced` 也可能因为 fsnotify 的 event/error channel 关闭而在 `ctx` 仍存活时
+返回；随后门闩关闭。若一个已经在跑的 `flush` 此时才发现文件仍热，它安排的恢复 recheck
+会被拒绝，最终静默版本可能不再被采集。本轮只如实记录这个窄的后端故障窗口，不为此放松
+关停栅栏或重构关停语义。
+
 ### 理由（为什么不「只翻默认值」）
 
 - 默认值只是「新建规则不选时的兜底」；显式配了 `overwrite` 的存量规则在翻默认值后

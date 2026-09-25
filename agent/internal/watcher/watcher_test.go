@@ -235,6 +235,56 @@ func TestWatcher_Start_SequentialReuse_AfterCancel(t *testing.T) {
 	}
 }
 
+// D-035 incremental review: sequential Start reuse must reopen the recheck
+// scheduling gate. The second lifecycle's initial scan skips this hot file;
+// with no writer left to produce another fsnotify event, only its recheck can
+// deliver the file.
+func TestWatcher_Start_SequentialReuse_ReopensRecheckGate(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = time.Second
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan error, 1)
+	go func() { done1 <- w.Start(ctx1, make(chan FileEvent, 1)) }()
+	require.Eventually(t, func() bool { return w.running.Load() },
+		time.Second, 5*time.Millisecond, "the first Start should be running")
+	cancel1()
+	select {
+	case err := <-done1:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Start did not return")
+	}
+	w.seenMu.Lock()
+	require.True(t, w.rechecksStopped, "first Start should close the recheck gate")
+	w.seenMu.Unlock()
+
+	path := filepath.Join(dir, "hot-on-reuse.log")
+	require.NoError(t, os.WriteFile(path, []byte("complete"), 0o644))
+	events := make(chan FileEvent, 1)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	done2 := make(chan error, 1)
+	go func() { done2 <- w.Start(ctx2, events) }()
+
+	select {
+	case event := <-events:
+		require.Equal(t, path, event.Path)
+		require.Equal(t, int64(len("complete")), event.Size)
+	case <-time.After(3 * time.Second):
+		t.Fatal("hot file never collected (recheck gate stayed closed)")
+	}
+	cancel2()
+	select {
+	case err := <-done2:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Start did not return")
+	}
+}
+
 func TestWatcher_FsnotifyUnavailableFallsBackToPolling(t *testing.T) {
 	dir := t.TempDir()
 	original := newFSWatcher
@@ -1278,6 +1328,31 @@ func TestScheduleDebounceRecheck_FutureMTimeDeliveredPromptly(t *testing.T) {
 		require.Equal(t, int64(len("complete")), fe.Size)
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("future-mtime recheck was delayed by clock skew or rejected permanently")
+	}
+}
+
+// All quietness checks treat a future mtime as already settled. Scheduling a
+// recheck for that same file must therefore wait only the race-padding grace,
+// not one otherwise contradictory debounce window plus the grace.
+func TestScheduleDebounceRecheck_FutureMTimeUsesGraceOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "future-recheck-grace.log")
+	require.NoError(t, os.WriteFile(path, []byte("complete"), 0o644))
+	future := time.Now().Add(time.Hour)
+	require.NoError(t, os.Chtimes(path, future, future))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = time.Second
+	defer w.stopAllRechecks()
+
+	events := make(chan FileEvent, 1)
+	w.scheduleDebounceRecheck(context.Background(), events, make(map[string]time.Time), path)
+	select {
+	case fe := <-events:
+		require.Equal(t, path, fe.Path)
+	case <-time.After(400 * time.Millisecond):
+		t.Fatal("future-mtime recheck waited a full debounce window instead of grace only")
 	}
 }
 
