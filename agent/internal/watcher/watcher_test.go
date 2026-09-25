@@ -163,6 +163,78 @@ func TestWatcher_FsnotifyStart_ContextCancel(t *testing.T) {
 	}
 }
 
+// Rework S-2: a Watcher supports exactly one live Start — pending / rechecks
+// / inflight / tailOffsets are instance-level state shared by whichever loop
+// runs, so a second concurrent Start must fail with ErrAlreadyRunning instead
+// of corrupting the first loop (whose timers the stopping loop would stop).
+func TestWatcher_Start_SecondConcurrentStart_ReturnsErrAlreadyRunning(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(dir, "", false, 50*time.Millisecond, "", zap.NewNop())
+	require.NoError(t, err)
+
+	events := make(chan FileEvent, 4)
+	// Bounded ctx: under the no-CAS mutation the second Start would block
+	// until it expires instead of failing fast — the red must be an
+	// assertion failure, not a hang.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx, events) }()
+
+	// Wait until the first Start is actually running (past the CAS).
+	require.Eventually(t, func() bool { return w.running.Load() },
+		2*time.Second, 5*time.Millisecond, "the first Start should be running")
+
+	err = w.Start(ctx, events)
+	require.ErrorIs(t, err, ErrAlreadyRunning)
+
+	// Explicit cancel: the first loop exits on ctx.Done, well before the
+	// ctx's own 3s timeout (which only exists to bound the mutation run).
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Start did not return after ctx cancel")
+	}
+}
+
+// Rework S-2: sequential reuse stays legal — after one Start returns (its ctx
+// cancelled), a fresh Start on the same Watcher runs normally (the rule
+// hot-reload pattern).
+func TestWatcher_Start_SequentialReuse_AfterCancel(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(dir, "", false, 50*time.Millisecond, "", zap.NewNop())
+	require.NoError(t, err)
+
+	events := make(chan FileEvent, 4)
+	ctx1, cancel1 := context.WithCancel(context.Background())
+
+	done1 := make(chan error, 1)
+	go func() { done1 <- w.Start(ctx1, events) }()
+	cancel1()
+	select {
+	case err := <-done1:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Start did not return")
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	done2 := make(chan error, 1)
+	go func() { done2 <- w.Start(ctx2, events) }()
+	require.Eventually(t, func() bool { return w.running.Load() },
+		2*time.Second, 5*time.Millisecond, "the second sequential Start should be running")
+	cancel2()
+	select {
+	case err := <-done2:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Start did not return")
+	}
+}
+
 func TestWatcher_FsnotifyUnavailableFallsBackToPolling(t *testing.T) {
 	dir := t.TempDir()
 	original := newFSWatcher
@@ -1973,30 +2045,37 @@ func TestDebounced_CloseWaitAndOverwrite_EquivalentDelivery(t *testing.T) {
 	assert.Equal(t, overwrite, closeWait, "close_wait must be a behavioural alias of overwrite")
 }
 
-// Rework R-1: a flushed pending entry must be recycled. Before the fix the
-// loop kept one map key + timer + closure per path EVER seen — unbounded
-// growth that D-035 spread to the default overwrite mode. 24 distinct paths
-// each flushed once must leave len(pending) back at 0; no further events are
-// fed, so only the recycling path can empty the map.
+// Rework S-1: flushed pending entries are collected by the amortized sweep —
+// len(pending) must fall back to the active-path count instead of growing
+// with the set of paths ever seen. (The first rework's done-channel design
+// could strand idle entries forever when its fixed-size send queue
+// overflowed — codex reproduced 256 paths stranding 192 entries.) The sweep
+// is triggered by event processing, so the test arms the threshold the way
+// ongoing churn would, feeds one event, and asserts the exact remainder:
+// the single re-armed (active) entry.
 func TestDebounced_PendingRecycledAfterFlush(t *testing.T) {
 	dir := t.TempDir()
-	const n = 24
+	const n = 256
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
 	w.debounce = 20 * time.Millisecond
+	// Small floor so the sweep dynamics are deterministic instead of keyed
+	// to the production constant (same pattern as w.debounce).
+	w.pendingSweepFloor = 8
 
 	seen := make(map[string]time.Time)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
-	events := make(chan FileEvent, 64)
+	events := make(chan FileEvent, 512)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
 
+	paths := make([]string, n)
 	for i := 0; i < n; i++ {
-		path := filepath.Join(dir, fmt.Sprintf("p-%02d.log", i))
-		require.NoError(t, os.WriteFile(path, []byte("x"), 0o644))
-		evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+		paths[i] = filepath.Join(dir, fmt.Sprintf("p-%03d.log", i))
+		require.NoError(t, os.WriteFile(paths[i], []byte("x"), 0o644))
+		evc <- fsnotify.Event{Name: paths[i], Op: fsnotify.Create}
 	}
 
 	for i := 0; i < n; i++ {
@@ -2007,23 +2086,61 @@ func TestDebounced_PendingRecycledAfterFlush(t *testing.T) {
 		}
 	}
 
+	// The sweep only deletes entries whose callback has fully completed
+	// (fired set after flush returns), so wait for all callbacks to settle
+	// before arming the threshold — otherwise the exact expectation below
+	// would race the last few callbacks.
 	require.Eventually(t, func() bool {
 		w.seenMu.Lock()
 		defer w.seenMu.Unlock()
-		return len(w.pending) == 0
+		for _, p := range w.pending {
+			p.mu.Lock()
+			fired := p.fired
+			p.mu.Unlock()
+			if !fired {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 5*time.Millisecond, "all 256 entries should have flushed and settled")
+
+	// In production the sweep now triggers as churn keeps raising len(pending)
+	// past the (geometrically raised) threshold; the burst alone leaves the
+	// threshold above len, exactly as documented. Arm the threshold the way
+	// churn would and feed one event: it re-arms paths[0] (fired cleared)
+	// and the sweep must collect every still-fired entry.
+	w.seenMu.Lock()
+	w.pendingSweepAt = len(w.pending) - 1
+	w.seenMu.Unlock()
+	evc <- fsnotify.Event{Name: paths[0], Op: fsnotify.Write}
+
+	// Exact expectation: 255 fired entries swept, the re-armed paths[0] stays.
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.pending) == 1
 	}, 2*time.Second, 5*time.Millisecond,
-		"flushed pending entries must be recycled — the map must not grow with the set of paths ever seen")
+		"the sweep must collect all 255 fired entries, leaving exactly the re-armed one")
+
+	// And the survivor must still be alive with an armed timer: bump the
+	// version and expect its flush to deliver.
+	require.NoError(t, os.WriteFile(paths[0], []byte("v2"), 0o644))
+	evc <- fsnotify.Event{Name: paths[0], Op: fsnotify.Write}
+	select {
+	case fe := <-events:
+		require.Equal(t, paths[0], fe.Path)
+		require.Equal(t, "write", fe.Op)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the surviving entry stopped delivering after the sweep")
+	}
 }
 
-// Rework R-1: a late recycling message from an older firing must not drop an
-// entry that was re-armed after its flush (gen mismatch) — the same property
-// as TestRecheckTimer_ReplaceKeepsNewTimerTracked, for the debounce pending
-// map. Deterministic by construction: firing #1 parks inside emitBlocking,
-// the loop (free while the callback is parked) re-arms the entry with gen++,
-// and only then does firing #1's recycling message (gen 0) come into
-// existence. While firing #2 is parked, no recycling message for the entry
-// is in flight, so the map state is frozen for observation.
-func TestDebounced_PendingRearmed_NotDroppedByLateRecycle(t *testing.T) {
+// Rework S-1: a re-armed entry (flush completed, then a new event Reset the
+// timer and cleared fired) must survive the amortized sweep — fired means
+// "flush fully completed", so a cleared flag means the entry is alive with an
+// armed timer. Mutation guards: sweeping without the fired check, or Reset
+// without clearing fired, must both turn this test red.
+func TestDebounced_PendingRearmed_SurvivesSweep(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rearmed.log")
 	require.NoError(t, os.WriteFile(path, []byte("v1"), 0o644))
@@ -2031,64 +2148,74 @@ func TestDebounced_PendingRearmed_NotDroppedByLateRecycle(t *testing.T) {
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
 	w.debounce = 30 * time.Millisecond
+	w.pendingSweepFloor = 4
 
 	seen := make(map[string]time.Time)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
-	events := make(chan FileEvent) // unbuffered: the park is the sequencing tool
+	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
 
-	// Firing #1 flushes and parks inside emitBlocking (no reader yet).
+	// One flush: the entry exists and its callback marks it fired.
 	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	select {
+	case fe := <-events:
+		require.Equal(t, "create", fe.Op)
+	case <-time.After(2 * time.Second):
+		t.Fatal("first flush never delivered")
+	}
 	require.Eventually(t, func() bool {
 		w.seenMu.Lock()
 		defer w.seenMu.Unlock()
-		_, busy := w.inflight[path]
-		return busy
-	}, 2*time.Second, 5*time.Millisecond, "flush #1 should hold the claim while parked")
+		p, ok := w.pending[path]
+		if !ok {
+			return false
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.fired
+	}, 1*time.Second, 5*time.Millisecond, "the flushed entry should be marked fired")
 
-	// While the callback is parked the loop is free in select: re-arm the
-	// same entry (Reset + gen++). This happens strictly BEFORE firing #1's
-	// recycling message exists, so the late message carries gen 0 while the
-	// live entry carries gen 1.
-	go func() { evc <- fsnotify.Event{Name: path, Op: fsnotify.Write} }()
-
-	// Unblock firing #1; its recycling message (gen 0) reaches the loop and
-	// is processed while the test prepares firing #2.
-	fe1 := <-events
-	require.Equal(t, "create", fe1.Op)
-
-	// Bump the version so firing #2 (the re-armed timer) delivers and parks
-	// too, freezing the map for observation.
+	// Re-arm with a new version: Reset + fired cleared.
 	require.NoError(t, os.WriteFile(path, []byte("v2"), 0o644))
-	require.Eventually(t, func() bool {
-		w.seenMu.Lock()
-		defer w.seenMu.Unlock()
-		cur, busy := w.inflight[path]
-		return busy && cur.After(fe1.ModTime)
-	}, 2*time.Second, 5*time.Millisecond, "firing #2 should hold the claim while parked")
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
 
-	// Firing #2 is parked; no recycling message for the entry is in flight
-	// and none can appear until it completes. The late gen-0 message has
-	// long since been processed — it must NOT have dropped the entry.
+	// Force the sweep to run via a DIFFERENT path's event and assert the
+	// exact post-sweep count: re-armed entry (spared) + the new path = 2.
+	// A bare len==1 check on the same path would race the sweep (len is 1
+	// both before the sweep runs and after a correct one); len==2 after the
+	// sweep is only reachable when the re-armed entry survived.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "other.log"), []byte("o"), 0o644))
 	w.seenMu.Lock()
-	n := len(w.pending)
+	w.pendingSweepAt = 0
 	w.seenMu.Unlock()
-	assert.Equal(t, 1, n,
-		"a late recycling message from the previous firing must not drop the re-armed entry")
+	evc <- fsnotify.Event{Name: filepath.Join(dir, "other.log"), Op: fsnotify.Create}
 
-	// Unpark firing #2 by reading its delivery; its own (gen-matching)
-	// recycling then cleans the entry up.
-	fe2 := <-events
-	require.True(t, fe2.ModTime.After(fe1.ModTime))
 	require.Eventually(t, func() bool {
 		w.seenMu.Lock()
 		defer w.seenMu.Unlock()
-		return len(w.pending) == 0
-	}, 1*time.Second, 5*time.Millisecond,
-		"the re-armed entry must still be recycled by its own firing")
+		return len(w.pending) == 2
+	}, 2*time.Second, 5*time.Millisecond,
+		"the re-armed entry must survive the sweep (fired was cleared by Reset)")
+
+	// The survivor still works: its armed timer delivers the new version.
+	// (The other path's flush also arrives; drain by path, and only the
+	// survivor's op is asserted — the other path arrived as "create".)
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case fe := <-events:
+			if fe.Path != path {
+				continue
+			}
+			require.Equal(t, "write", fe.Op)
+			return // survivor delivered
+		case <-deadline:
+			t.Fatal("re-armed entry stopped delivering after the sweep")
+		}
+	}
 }
 
 // Rework R-2 recorded decision: a file removed or renamed within the debounce
@@ -2096,7 +2223,7 @@ func TestDebounced_PendingRearmed_NotDroppedByLateRecycle(t *testing.T) {
 // cancelled and only a bare remove event goes out. Pins the decision so that
 // whoever changes it in the future is told they are changing a decision
 // (D-035, short-lived-files trade-off).
-func TestDebounced_RemoveWithinWindow_CancellesDelivery(t *testing.T) {
+func TestDebounced_RemoveWithinWindow_CancelsDelivery(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "shortlived.log")
 	require.NoError(t, os.WriteFile(path, []byte("written then removed"), 0o644))

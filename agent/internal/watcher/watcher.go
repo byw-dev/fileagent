@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -67,12 +68,24 @@ type Watcher struct {
 
 	// pending holds the per-file in-flight debounce state of the debounced
 	// event loop (loopDebounced). The loop goroutine owns the map; seenMu
-	// guards it so tests can read it and so the recycling handshake stays
-	// race-free. Rework R-1: entries are recycled through the loop's done
-	// channel after their flush ran — without that, the map (plus one timer
-	// and closure per entry) grows without bound with the set of paths ever
+	// guards it so tests can read it and the sweep stays race-free. Entries
+	// are collected by the amortized sweep (sweepPendingIfDue) — without
+	// recycling the map grows without bound with the set of paths ever
 	// seen, and D-035 spread that growth to the default overwrite mode.
 	pending map[string]*debouncePending
+
+	// pendingSweepAt is the amortized recycling threshold of the debounced
+	// loop (see sweepPendingIfDue). Guarded by seenMu.
+	pendingSweepAt int
+
+	// pendingSweepFloor overrides defaultPendingSweepFloor when > 0 (tests
+	// set a small value so sweep assertions are deterministic — same
+	// pattern as w.debounce). See sweepFloor.
+	pendingSweepFloor int
+
+	// running guards the single-active-Start invariant (see ErrAlreadyRunning
+	// and the Start godoc).
+	running atomic.Bool
 
 	// inflight tracks paths whose delivery is currently in progress, keyed
 	// by the mtime being delivered (PR #108 review F3). It is the exactly-
@@ -118,6 +131,10 @@ const (
 // waits before emitting Write/Create events (D-035).
 const defaultDebounceWindow = 500 * time.Millisecond
 
+// defaultPendingSweepFloor is the constant term of the debounced loop's
+// amortized recycling threshold (see sweepPendingIfDue).
+const defaultPendingSweepFloor = 64
+
 // New creates a Watcher for the given source directory.
 // fileGlob is matched against file base names (e.g. "*.log").
 // If recursive is true, subdirectories are watched as well.
@@ -157,6 +174,52 @@ func (w *Watcher) debounceWindow() time.Duration {
 // loopFsnotify stays the tail-only path.
 func (w *Watcher) debounceEnabled() bool { return w.appendMode != AppendModeTail }
 
+// sweepFloor returns the effective pending-sweep floor (tests may set a
+// smaller per-watcher value via w.pendingSweepFloor; zero means the
+// production default).
+func (w *Watcher) sweepFloor() int {
+	if w.pendingSweepFloor > 0 {
+		return w.pendingSweepFloor
+	}
+	return defaultPendingSweepFloor
+}
+
+// sweepPendingIfDue is the debounced loop's amortized recycling (rework S-1,
+// replacing the per-flush done-channel design whose fixed-size send queue
+// could permanently strand idle entries when it overflowed). It runs on the
+// loop goroutine after every processed fsnotify event: once len(pending)
+// grows past the current threshold, it deletes every fired entry and raises
+// the threshold GEOMETRICALLY to 2*len(pending)+sweepFloor — the geometric
+// raise keeps the sweep O(1) amortized per event (sweeping every event makes
+// one burst of N hot files cost O(N²)); do not "simplify" it back.
+//
+// Deleting fired entries here is safe: fired means the flush fully completed
+// (no live timer — a re-armed entry had fired cleared by Reset — and no flush
+// still running), and the timer closure captured only p and path, never the
+// map.
+//
+// Boundedness, honestly stated (D-035): steady state is ≈ 2 × active
+// (unflushed) paths + sweepFloor. After a burst whose events then stop, the
+// residue stays at that burst's watermark — bounded by the burst size, but
+// not drained until further events arrive (no event, no sweep). Bounded
+// residue, not unbounded growth.
+func (w *Watcher) sweepPendingIfDue() {
+	w.seenMu.Lock()
+	defer w.seenMu.Unlock()
+	if len(w.pending) <= w.pendingSweepAt {
+		return
+	}
+	for path, p := range w.pending {
+		p.mu.Lock()
+		fired := p.fired
+		p.mu.Unlock()
+		if fired {
+			delete(w.pending, path)
+		}
+	}
+	w.pendingSweepAt = 2*len(w.pending) + w.sweepFloor()
+}
+
 // SeedTailOffsets pre-loads per-file byte offsets recovered from persisted
 // state (processed_files) so that tail-mode events emitted after an agent
 // restart resume from where the last upload finished instead of re-sending
@@ -168,11 +231,29 @@ func (w *Watcher) SeedTailOffsets(offsets map[string]int64) {
 	}
 }
 
+// ErrAlreadyRunning is returned by Start when this Watcher already has a
+// live Start call. One Watcher supports exactly one running Start; sequential
+// reuse (Start → ctx cancelled → Start again) is allowed.
+var ErrAlreadyRunning = errors.New("watcher: already running")
+
 // Start begins watching the source directory and emits FileEvents on events.
 // It first attempts to use fsnotify; if adding the watch path fails, it
 // transparently falls back to periodic polling. Start blocks until ctx is
 // cancelled.
+//
+// A Watcher supports exactly ONE live Start: pending, rechecks, inflight and
+// tailOffsets are instance-level state shared by whichever loop is running,
+// so concurrent Starts would corrupt each other (a stopping loop's
+// stopPendingTimers would also kill the other loop's timers). A second
+// concurrent Start returns ErrAlreadyRunning. Sequential reuse — Start,
+// ctx cancelled, Start again (the rule hot-reload pattern) — is fine: each
+// run rebuilds its per-run state.
 func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
+	if !w.running.CompareAndSwap(false, true) {
+		return ErrAlreadyRunning
+	}
+	defer w.running.Store(false)
+
 	fw, err := newFSWatcher()
 	if err != nil {
 		w.logger.Warn("watcher: fsnotify unavailable, using polling", zap.Error(err))
@@ -244,28 +325,17 @@ func (w *Watcher) runDebounced(ctx context.Context, events chan<- FileEvent, fw 
 // debouncePending is one file's in-flight debounce state.
 type debouncePending struct {
 	timer *time.Timer
-	// mu guards op and gen: the loop goroutine updates them on every event
-	// while a firing timer goroutine reads them for the flush and the
-	// recycling message.
+	// mu guards op and fired: the loop goroutine updates them on every
+	// event while a firing timer goroutine reads op for the flush and
+	// writes fired after it.
 	mu sync.Mutex
 	op string
-	// gen is bumped by the loop goroutine on every timer Reset. A recycling
-	// message from an older firing carries the gen it fired with; the loop
-	// only drops the entry when the gen still matches — a late message must
-	// not drop an entry that was re-armed after the flush (same pattern as
-	// settleRecheck / recheckGens).
-	gen uint64
-}
-
-// debounceDone is one flush's recycling message: the timer goroutine tells
-// the loop that p's debounce window elapsed and the flush ran, so the loop
-// can drop the now-idle pending entry. The map itself stays owned by the
-// loop goroutine — a direct delete from the timer goroutine would be a data
-// race (rework R-1).
-type debounceDone struct {
-	path string
-	p    *debouncePending
-	gen  uint64
+	// fired is set (under mu) by the timer callback AFTER flush returns, so
+	// "fired" always means "this entry's flush has fully completed". The
+	// loop clears it on Reset (re-armed ⇒ alive again). The amortized sweep
+	// only deletes fired entries, so it can never drop an entry whose timer
+	// is armed or whose flush is still running.
+	fired bool
 }
 
 // loopDebounced is the debounced event loop proper. The event and error
@@ -279,11 +349,6 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 	w.seenMu.Lock()
 	w.pending = make(map[string]*debouncePending)
 	w.seenMu.Unlock()
-
-	// Recycling messages from firing timers. Buffered: a full channel only
-	// costs one idle entry its recycling — dropping the message must never
-	// block the timer goroutine.
-	done := make(chan debounceDone, 64)
 
 	flush := func(path, op string) {
 		fe, err := w.buildEvent(path, op)
@@ -338,21 +403,6 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 			stopPendingTimers(w.pending)
 			w.seenMu.Unlock()
 			return ctx.Err()
-		case d := <-done:
-			// Recycle the entry this firing belongs to — but only if the
-			// entry was not re-armed since: a newer event bumps gen, so a
-			// gen mismatch means the entry is alive and its own (next)
-			// firing will send the recycling message for it.
-			w.seenMu.Lock()
-			if cur, ok := w.pending[d.path]; ok && cur == d.p {
-				cur.mu.Lock()
-				gen := cur.gen
-				cur.mu.Unlock()
-				if gen == d.gen {
-					delete(w.pending, d.path)
-				}
-			}
-			w.seenMu.Unlock()
 		case ev, ok := <-evc:
 			if !ok {
 				w.seenMu.Lock()
@@ -360,7 +410,8 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 				w.seenMu.Unlock()
 				return nil
 			}
-			if ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename) {
+			switch {
+			case ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename):
 				if w.matchGlob(ev.Name) {
 					// Remove/Rename is immediate (no debounce) and CANCELS
 					// the pending flush: a file whose last write is less
@@ -381,50 +432,45 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 					// IC-BUG-47: blocking send — never drop.
 					w.emitBlocking(ctx, events, FileEvent{Path: ev.Name, Op: "remove"})
 				}
-				continue
-			}
-			if !ev.Has(fsnotify.Create) && !ev.Has(fsnotify.Write) {
-				continue
-			}
-			if !w.matchGlob(ev.Name) {
-				continue
-			}
-			op := opString(ev)
-			w.seenMu.Lock()
-			if p, ok := w.pending[ev.Name]; ok {
-				// Reset existing timer and bump the generation: a recycling
-				// message from the previous firing must not drop this still
-				// live entry.
-				p.timer.Reset(w.debounceWindow())
-				p.mu.Lock()
-				p.op = op
-				p.gen++
-				p.mu.Unlock()
-				w.seenMu.Unlock()
-			} else {
-				w.seenMu.Unlock()
-				path := ev.Name // capture for closure
-				p := &debouncePending{op: op}
-				w.seenMu.Lock()
-				w.pending[path] = p
-				w.seenMu.Unlock()
-				p.timer = time.AfterFunc(w.debounceWindow(), func() {
-					p.mu.Lock()
-					op := p.op
-					gen := p.gen
-					p.mu.Unlock()
-					flush(path, op)
-					// Non-blocking recycle notification (rework R-1): if the
-					// channel is full the entry misses this recycling round
-					// and is collected by its next firing — dropping the
-					// message is strictly better than blocking the timer
-					// goroutine.
-					select {
-					case done <- debounceDone{path: path, p: p, gen: gen}:
-					default:
+			case ev.Has(fsnotify.Create) || ev.Has(fsnotify.Write):
+				if w.matchGlob(ev.Name) {
+					op := opString(ev)
+					w.seenMu.Lock()
+					if p, ok := w.pending[ev.Name]; ok {
+						// Re-arm the existing entry: Reset extends the
+						// quiet window and clears fired — the entry is
+						// alive again, so the sweep must spare it.
+						p.timer.Reset(w.debounceWindow())
+						p.mu.Lock()
+						p.op = op
+						p.fired = false
+						p.mu.Unlock()
+						w.seenMu.Unlock()
+					} else {
+						w.seenMu.Unlock()
+						path := ev.Name // capture for closure
+						p := &debouncePending{op: op}
+						w.seenMu.Lock()
+						w.pending[path] = p
+						w.seenMu.Unlock()
+						p.timer = time.AfterFunc(w.debounceWindow(), func() {
+							p.mu.Lock()
+							op := p.op
+							p.mu.Unlock()
+							flush(path, op)
+							// Mark fired only AFTER flush returned: fired
+							// means "flush fully completed", which is what
+							// makes the sweep's delete safe (no live timer,
+							// no in-flight flush behind the entry).
+							p.mu.Lock()
+							p.fired = true
+							p.mu.Unlock()
+						})
 					}
-				})
+				}
 			}
+			// Amortized recycling (rework S-1) after every processed event.
+			w.sweepPendingIfDue()
 		case err, ok := <-erc:
 			if !ok {
 				w.seenMu.Lock()
