@@ -155,6 +155,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-52 | `dry_run_limit` 的**有效上限恒为 10**：CP 只在响应端按它裁剪（1–10 生效），**从不下发给 agent**，而 agent 硬编码上限 10——请求 11–50 被静默压成 10，且无截断标记 | 🟡 P2 | controlplane + agent + proto |
 | IC-BUG-53 | watcher 的 `seen` 语义是「**已交付**」而非「**已持久入队**」：下游 `submitFile` 提交/判重失败**只 Warn 不重试**，文件此后不再变化时**永不被采集**（初扫路径自 PR #100 F1 起即受影响，实时路径因 IC-BUG-44/43 的 P1 裁决而**保留重试机会**） | 🟡 P2 | agent |
 | IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 | 🟡 P2 | docs |
+| IC-BUG-55 | **`UploadResult.SizeBytes` 上报的是入队时的旧值**——与实际上传的字节数、与 webhook 路径写入同一列的值都可能不符；`upload_logs.bytes_transferred` 因此装的不是实际传输量 | 🟡 P2 | agent + CP |
 
 ---
 
@@ -201,7 +202,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 拆成两个 statement（前缀部分随 D-030 第八条改为整桶）：**桶级** `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`）；**对象级** `s3:PutObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/*`。**移除 `DeleteObject`、`GetObject`、`ListBucket`**——agent 全仓库从不调用 `GetObject` / `StatObject` / `ListObjects`（已 grep 确认），产品批准的是「写整桶」，读与列举不在其内，按最小权限一并砍掉 |
 | **验收** | 上传一个 >64MB 文件成功；中断后重试能走续传；`mc ls --incomplete` 可执行（不 403）且无残留；用签发的 STS 做 `GetObject` 与 `ListObjects` 均须 403（确认未超授） |
 
-## IC-BUG-5 — 断点续传状态从未落盘，重试永远从头重传 🟠 P1
+## IC-BUG-5 — 断点续传状态从未落盘，重试永远从头重传 🟠 P1 ✅ 已修（IC-3，PR #105）
 
 | 字段 | 内容 |
 |------|------|
@@ -297,7 +298,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 制造一个不可达的 MinIO，任务重试耗尽后 Web UI 的上传日志出现 failed 记录（上报半边）；worker 在超时后释放而非永久占用（超时半边） |
 | **上报半边已随 IC-2a ⑥ 关闭（2026-09-11）** | 重试耗尽以 `UploadResult{success=false, error_message}` 上报，CP 侧只写 `upload_logs`。**超时半边（per-upload timeout）仍开着，留在 IC-5 ③**，本卡片保持 open
 
-## IC-BUG-13 — `content_type` 两条索引路径都不赋值，且会被清空 🟡 P2
+## IC-BUG-13 — `content_type` 两条索引路径都不赋值，且会被清空 🟡 P2 ◐ 拆半（防清空 ✅ IC-2a / 填值 → 未排期）
 
 | 字段 | 内容 |
 |------|------|
@@ -837,3 +838,16 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **定级理由** | 🟡 P2 而非 P1：触发条件是「下游 `exec.Submit` 失败 + 文件此后不再变化」两个条件的交集——而 Submit 失败本身通常伴随基础设施异常（SQLite busy timeout、磁盘 I/O），这类异常同时会被其它链路暴露并留下可检索的 Warn 日志，且丢失范围限于当前 watcher 生命周期（重启/重建 watcher 用全新 seen map 的初扫即全量兜底）。⚠️ 降级理由**不是**「安全网重扫会兜住」——重扫复用同一个 seen，对本条覆盖的文件它恰恰一直跳过。后果仍属「静默漏采」族（仅剩日志、无持久重试状态），高于一般正确性缺陷，不宜 P3 |
 | **发现路径** | PR #108（IC-BUG-44/43 + 评审 F1/F2/F3/P1/P2）的 codex 复审：P1 指出 F1 的 markSeen 挡掉了溢出重扫的重试机会，协调者复核后裁决按 (b) 撤回实时路径 markSeen（保留有界重发放大），并把「seen ≠ 已持久」这个全局洞立卡为本条 |
 | **归属** | 未排期。修复归属就是上面 (a) 那条闭环的刀；与 IC-BUG-42（重复提交同源：都是交付/入队边界的状态语义）关联紧密。⚠️ IC-BUG-44 的安全网重扫对本条覆盖的文件**没有**兜底作用（同一 seen），唯一的运行期恢复手段是重启/重建 watcher |
+
+---
+
+## IC-BUG-55 — `UploadResult.SizeBytes` 上报入队旧值，与实际上传字节数不符 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 大小取值的两个时点不同。`agent/internal/executor/reports.go:35` 上报 `SizeBytes: task.FileSize`，而 `task.FileSize` 是 **submitFile 入队时 `stat` 的值**；真正上传时 `agent/internal/uploader/uploader.go:168-173` **重新 `os.Stat`** 并用当前 `info.Size()` 与当前 `fileSHA256` 上传。文件在「入队 → 上传」之间被改写（增长或截断），上报值与实际传输量就分叉。 |
+| **影响面** | CP `internal/indexer/indexer.go:273-274` 把这个旧值**同时**写进 `file_entries.size_bytes` 和 `upload_logs.bytes_transferred`——后者的列名声称「已传输字节数」，装的却不是实际传输量。而 webhook 路径（`source='minio_event'`）写的是**对象真实大小**：**同一个对象经两条入库路径会得到不一致的 size**。 |
+| **为什么现在只是 P2** | 目前没有任何对账判据消费 `size_bytes`（read/list API 只是回显），所以暂不产生错误结论；**但 D-030 的 MinIO↔PG 对账把 size 作为天然比对字段**，一旦接上，分歧会被归因到存储侧，而根因在上报侧。 |
+| **触发条件** | 文件在入队与上传之间被改写。防抖普适（D-035）后窗口已大幅收窄，但**未消除**：watcher 交付 → 队列 → uploader 之间仍有延迟，且 uploader 是在上传时才读文件（见 PR #118 第 7 轮 `emitCancellable` godoc 里明写的残留窗口）。 |
+| **建议处理** | **不在发现时修**：随第 3 步「IC 账本按 A 的标尺重判」一起定级。修法有两条路——(a) uploader 把实际 `fileSize` 回填进 `UploadResult`；(b) 上传前比对 `task.FileSize/FileMtime` 与当前 stat，不一致则拒绝并重新入队（顺带关掉上传半成品的残留窗口）。**(b) 同时解决 PR #118 留下的下游校验缺口**，但语义变更更大，需要拍板。 |
+| **发现** | 2026-09-25，查 PR #118 独立评审的 P1 时顺带发现。**不在 #118 范围内**（`agent/internal/executor` 与 `agent/internal/uploader` 在该 PR 的 diff 为空）。 |
