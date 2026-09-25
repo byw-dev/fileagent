@@ -2629,6 +2629,12 @@ func TestDebounced_PendingRearmed_SurvivesSweep(t *testing.T) {
 // re-arms the same timer. When the old callback returns it must not mark the
 // entry collectible: a sweep may only delete an entry with neither an armed
 // timer nor a running flush behind it.
+//
+// PR #118 round-7 update: the re-arm now also CANCELS the parked delivery,
+// so the old callback no longer needs `<-events` to unblock — it abandons on
+// its own and must NOT deliver the stale snapshot. The original `<-events`
+// release is replaced by an explicit "callback finished without delivering
+// anything" observation; the sweep-survival assertions are unchanged.
 func TestDebounced_RearmWhileFlushBlocked_SweepKeepsEntry(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "blocked-flush.log")
@@ -2638,6 +2644,7 @@ func TestDebounced_RearmWhileFlushBlocked_SweepKeepsEntry(t *testing.T) {
 	require.NoError(t, err)
 	w.debounce = 100 * time.Millisecond
 	w.pendingSweepEvery = 4
+	defer w.stopAllRechecks()
 
 	seen := make(map[string]time.Time)
 	evc := make(chan fsnotify.Event)
@@ -2678,11 +2685,22 @@ func TestDebounced_RearmWhileFlushBlocked_SweepKeepsEntry(t *testing.T) {
 		defer p.mu.Unlock()
 		return p.op == "write" && !p.fired
 	}, time.Second, time.Millisecond, "Reset did not finish before the blocked flush was released")
-	<-events // let the old callback return only after Reset has completed
+	// Round-7 behavior: the re-arm cancels the parked delivery, so the old
+	// callback must finish WITHOUT the test releasing it, and no stale event
+	// may surface. (Before the fix this waited `<-events`, which released —
+	// and thereby asserted — the stale delivery.)
 	select {
 	case <-callbackFinished:
 	case <-time.After(time.Second):
-		t.Fatal("old callback did not publish its completed state")
+		t.Fatal("re-armed callback did not abandon the parked stale delivery")
+	}
+	select {
+	case fe := <-events:
+		t.Fatalf("re-arm during a parked flush must cancel the stale delivery; consumer got size=%d", fe.Size)
+	default:
+		// No sender remains (old callback returned; gen-2's flush parks on
+		// this unbuffered channel until a reader appears), so this
+		// non-blocking check is race-free.
 	}
 	require.Eventually(t, func() bool {
 		w.seenMu.Lock()
@@ -2705,6 +2723,177 @@ func TestDebounced_RearmWhileFlushBlocked_SweepKeepsEntry(t *testing.T) {
 	w.seenMu.Unlock()
 	assert.True(t, stillPending,
 		"sweep removed the re-armed pending entry; its orphan timer can now upload an intermediate file version")
+}
+
+// PR #118 round-7 (independent review P1): the quiet recheck inside flush
+// goes stale while the delivery is parked in emitBlocking. A Write that
+// re-arms the pending entry DURING the park must cancel that delivery — the
+// post-flush `gen == p.gen` check runs after the send and cannot retract it —
+// and the complete quiet version must still reach the consumer afterwards,
+// even with the re-armed timer killed (the fallback recheck must stand on
+// its own).
+func TestDebounced_RearmDuringBlockedFlush_AbandonsStaleDelivery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stale-park.log")
+	stale := []byte("v1-stale")
+	complete := []byte("v2-complete")
+	require.NoError(t, os.WriteFile(path, stale, 0o644))
+	// Quiet mtime in the past: the stale version must pass flush's quiet
+	// recheck deterministically, independent of goroutine scheduling jitter.
+	quiet := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, quiet, quiet))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 100 * time.Millisecond
+	defer w.stopAllRechecks()
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent) // unbuffered: parks gen-1 inside emitBlocking
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		_, parked := w.inflight[path]
+		return parked
+	}, time.Second, time.Millisecond, "gen-1 flush never reached emitBlocking")
+
+	// Rewrite in place WHILE the stale delivery is parked, and push the new
+	// mtime into the past so every later quiet check passes deterministically.
+	require.NoError(t, os.WriteFile(path, complete, 0o644))
+	completeTime := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, completeTime, completeTime))
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		p := w.pending[path]
+		w.seenMu.Unlock()
+		if p == nil {
+			return false
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.gen == 2 && !p.fired
+	}, time.Second, time.Millisecond, "Write during the park did not re-arm generation 2")
+
+	// Kill gen-2's timer so the ONLY way the complete version can reach the
+	// consumer is the fallback recheck (or nothing, if an abandon without a
+	// safety net loses the file). This makes the first received event
+	// deterministic in both directions.
+	w.seenMu.Lock()
+	p := w.pending[path]
+	w.seenMu.Unlock()
+	require.NotNil(t, p)
+	require.True(t, p.timer.Stop(), "generation-2 timer must still be armed right after the re-arm")
+
+	select {
+	case fe := <-events:
+		require.Equal(t, int64(len(complete)), fe.Size,
+			"阻塞期间重武装后仍交付了旧快照（静默复核结论在 emitBlocking 阻塞中失效）；首个到达消费者的事件必须是重写后的完整版本")
+		require.True(t, fe.ModTime.Equal(completeTime),
+			"首个交付事件的 mtime 必须是重写后的版本")
+	case <-time.After(2 * time.Second):
+		t.Fatal("重武装后旧快照没有送达，但完整版本也没被兜底交付（漏采）")
+	}
+}
+
+// PR #118 round-7 acceptance (b): after the stale delivery is abandoned, the
+// complete quiet version must STILL be delivered — here with the abandon
+// positively observed first and the re-armed timer killed afterwards, proving
+// the fallback recheck stands on its own, not on the new generation's timer.
+func TestDebounced_AbandonedDelivery_StillDeliversCompleteVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "abandon-recheck.log")
+	stale := []byte("v1-stale")
+	complete := []byte("v2-complete")
+	require.NoError(t, os.WriteFile(path, stale, 0o644))
+	quiet := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, quiet, quiet))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 100 * time.Millisecond
+	defer w.stopAllRechecks()
+
+	callbackFinished := make(chan struct{}, 1)
+	w.debounceCallbackFinished = func(callbackPath string) {
+		if callbackPath == path {
+			select {
+			case callbackFinished <- struct{}{}:
+			default:
+			}
+		}
+	}
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent) // unbuffered: parks gen-1 inside emitBlocking
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		_, parked := w.inflight[path]
+		return parked
+	}, time.Second, time.Millisecond, "gen-1 flush never reached emitBlocking")
+
+	require.NoError(t, os.WriteFile(path, complete, 0o644))
+	completeTime := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(path, completeTime, completeTime))
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		p := w.pending[path]
+		w.seenMu.Unlock()
+		if p == nil {
+			return false
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.gen == 2 && !p.fired
+	}, time.Second, time.Millisecond, "Write during the park did not re-arm generation 2")
+
+	// The parked callback must finish WITHOUT any delivery (the abandon).
+	select {
+	case <-callbackFinished:
+	case <-time.After(time.Second):
+		t.Fatal("重武装后旧回调没有放弃阻塞中的过期交付（静默复核结论被阻塞作废后仍在发送）")
+	}
+	// With the callback returned and gen-2 not yet fired, no sender remains:
+	// this non-blocking check is race-free and must observe NO stale event.
+	select {
+	case fe := <-events:
+		t.Fatalf("旧回调放弃后仍向消费者送出了事件：size=%d", fe.Size)
+	default:
+	}
+
+	// Kill gen-2's timer: no armed fallback remains. The recheck scheduled by
+	// the abandon is now the only path that can deliver the complete version.
+	w.seenMu.Lock()
+	p := w.pending[path]
+	w.seenMu.Unlock()
+	require.NotNil(t, p)
+	require.True(t, p.timer.Stop(), "generation-2 timer must still be armed after the observed abandon")
+
+	select {
+	case fe := <-events:
+		require.Equal(t, int64(len(complete)), fe.Size,
+			"放弃过期交付后，兜底 recheck 必须独立交付完整静默版本")
+		require.True(t, fe.ModTime.Equal(completeTime),
+			"兜底交付的必须是重写后的完整版本")
+	case <-time.After(2 * time.Second):
+		t.Fatal("放弃交付且新 timer 被停掉后，完整版本没有被兜底 recheck 交付（漏采）")
+	}
 }
 
 // AUD-9 review P1, second interleaving: Reset may win after AfterFunc has

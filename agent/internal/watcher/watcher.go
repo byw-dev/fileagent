@@ -377,6 +377,21 @@ type debouncePending struct {
 	// fired=true implies there is neither an armed timer nor a running flush;
 	// sweepPendingIfDue may safely delete exactly those entries.
 	fired bool
+	// cancel is the current generation's delivery-cancellation channel. The
+	// timer callback captures it (under mu, together with its passing gen
+	// check) and hands it to flush, whose send selects on it. Whatever
+	// invalidates the generation — a re-arm (Write/Create) or the pending
+	// entry being removed (Remove/Rename) — closes the channel, so a
+	// delivery already parked in emitBlocking is abandoned instead of being
+	// released to the consumer with a snapshot the file has already moved
+	// past (PR #118 round 7, independent review P1: the quiet recheck's
+	// verdict goes stale under backpressure, and the post-flush
+	// `gen == p.gen` check runs after the send, when it is too late to
+	// retract anything).
+	//
+	// Guarded by mu; every generation change closes the old channel and
+	// installs a fresh one, so a channel is closed exactly once.
+	cancel chan struct{}
 }
 
 // loopDebounced is the debounced event loop proper. The event and error
@@ -391,7 +406,11 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 	w.pending = make(map[string]*debouncePending)
 	w.seenMu.Unlock()
 
-	flush := func(path, op string) {
+	// cancel is the generation's delivery-cancellation channel captured
+	// under p.mu together with the passing gen check (see armTimer). It is
+	// closed the moment this generation is invalidated, cancelling a send
+	// that is parked — or about to park — in emitBlocking.
+	flush := func(path, op string, cancel <-chan struct{}) {
 		fe, err := w.buildEvent(path, op)
 		if err != nil {
 			return
@@ -446,8 +465,46 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 		// IC-BUG-47: blocking send — a dropped event here means the file is
 		// never collected (mtime/size never change again). Backpressure
 		// delays the debounce-flush goroutine instead.
-		if w.emitBlocking(ctx, events, fe) {
+		//
+		// PR #118 round 7: the send is additionally cancellable by the
+		// generation's cancel channel. The quiet recheck above proved the
+		// file quiet at stat time, but that verdict goes stale while the
+		// send waits out backpressure: a Write parked here re-arms the
+		// entry and closes cancel, and this stale generation's snapshot
+		// must then be abandoned, not delivered (the post-flush
+		// `gen == p.gen` check cannot help — it runs after the send).
+		// emitCancellable documents the residual window that remains.
+		switch outcome := w.emitCancellable(ctx, events, fe, cancel); outcome {
+		case emitDelivered:
 			delivered = true
+		case emitSuperseded:
+			// The generation was invalidated mid-park (re-arm or pending
+			// removal). Roll the claim back (completeDelivery via defer)
+			// and re-arm a fallback recheck so the file cannot be lost:
+			//
+			// Why this cannot miss (acceptance (b)): a closed cancel means
+			// exactly one of
+			//   1. a Write/Create re-armed the entry — a newer generation's
+			//      timer is armed and its flush will deliver the newer
+			//      version; if that version is in turn rewritten, the chain
+			//      repeats, and whichever generation finally finds the file
+			//      quiet delivers it;
+			//   2. a Remove/Rename deleted the entry — the file is gone and
+			//      per the recorded R-2/D-035 decision there is nothing
+			//      left to collect; the recheck below stats the path,
+			//      finds nothing, and stops;
+			//   3. loop shutdown — recheck scheduling is gated by
+			//      rechecksStopped / ctx.Err() and stays closed.
+			// Scheduling the recheck unconditionally is therefore always
+			// safe: in case 1 it is redundant with the armed timer (the
+			// claimDelivery/seen arbitration makes whichever path stats
+			// first deliver and the other skip — no double delivery), and
+			// in cases 2–3 it is a no-op. But if the newer generation's
+			// timer is later stopped or its flush bails out for any
+			// reason, this recheck is what still delivers the final quiet
+			// version — the no-miss guarantee must not depend on the
+			// newer timer surviving.
+			w.scheduleDebounceRecheck(ctx, events, seen, path)
 		}
 	}
 	armTimer := func(p *debouncePending, path string, gen uint64) *time.Timer {
@@ -464,11 +521,15 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 				return
 			}
 			op := p.op
+			// Capture this generation's cancellation channel under the same
+			// lock as the gen check: whatever invalidates the generation
+			// later closes exactly this channel (re-arm installs a fresh one).
+			cancel := p.cancel
 			p.mu.Unlock()
 			if w.debounceBeforeFlush != nil {
 				w.debounceBeforeFlush(path)
 			}
-			flush(path, op)
+			flush(path, op, cancel)
 			p.mu.Lock()
 			if gen == p.gen {
 				p.fired = true
@@ -511,6 +572,19 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 					w.seenMu.Lock()
 					if p, ok := w.pending[ev.Name]; ok {
 						p.timer.Stop()
+						// Also invalidate a delivery this entry may still
+						// have parked in emitBlocking (PR #118 round 7):
+						// the file is gone, so releasing the stale snapshot
+						// would enqueue a version that no longer exists.
+						// This is the same recorded R-2/D-035 decision as
+						// the timer Stop — remove cancels the pending
+						// flush; nothing is re-armed and nothing needs a
+						// recheck (the recheck's stat would find no file).
+						p.mu.Lock()
+						if p.cancel != nil {
+							close(p.cancel)
+						}
+						p.mu.Unlock()
 						delete(w.pending, ev.Name)
 					}
 					w.seenMu.Unlock()
@@ -531,13 +605,24 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 						p.mu.Lock()
 						p.op = op
 						p.gen++
+						// Invalidate the superseded generation's delivery
+						// BEFORE going on: close wakes a flush parked in
+						// emitBlocking and makes it abandon the stale
+						// snapshot (PR #118 round 7); a flush that has not
+						// reached the send yet observes the closed channel
+						// in emitCancellable's entry check. The fresh
+						// channel belongs to the new generation.
+						if p.cancel != nil {
+							close(p.cancel)
+						}
+						p.cancel = make(chan struct{})
 						gen := p.gen
 						p.fired = false
 						p.timer = armTimer(p, path, gen)
 						p.mu.Unlock()
 						w.seenMu.Unlock()
 					} else {
-						p := &debouncePending{op: op, gen: 1}
+						p := &debouncePending{op: op, gen: 1, cancel: make(chan struct{})}
 						p.timer = armTimer(p, path, p.gen)
 						w.pending[path] = p
 						w.seenMu.Unlock()
@@ -1088,6 +1173,76 @@ func (w *Watcher) buildEvent(path, op string) (FileEvent, error) {
 		Op:         op,
 		FileOffset: offset,
 	}, nil
+}
+
+// emitOutcome is the result of a cancellable delivery attempt (see
+// emitCancellable).
+type emitOutcome int
+
+const (
+	// emitDelivered means the consumer accepted the event.
+	emitDelivered emitOutcome = iota
+	// emitAborted means ctx was cancelled (shutdown path): no delivery, and
+	// the file's retry story is the existing shutdown one (fresh seen map on
+	// the next Start; see completeDelivery).
+	emitAborted
+	// emitSuperseded means the sending generation was invalidated while the
+	// send was pending (re-arm or pending removal closed its cancel
+	// channel): the stale snapshot was abandoned on purpose.
+	emitSuperseded
+)
+
+// emitCancellable sends fe to the events channel, blocking until the consumer
+// takes it, ctx is cancelled, or cancel is closed (the sending generation was
+// invalidated — see debouncePending.cancel). It shares emitBlocking's
+// backpressure semantics (IC-BUG-47): the send itself is never dropped while
+// the generation stays valid.
+//
+// ⚠️ What this does and does not guarantee (PR #118 round 7, stated plainly
+// so no later comment can overclaim it):
+//
+//   - Guarantee: a delivery parked in emitBlocking when its generation is
+//     invalidated does NOT reach the consumer (once cancel is closed and no
+//     consumer is ready, the select deterministically takes the cancel
+//     branch), and the entry pre-check below abandons without even offering
+//     the send when invalidation already happened.
+//
+//   - Residual hairline that CANNOT be closed here: if the generation is
+//     invalidated at the exact moment a consumer is already ready, Go's
+//     select picks uniformly between the send and the cancel branch, so the
+//     stale snapshot can still go out. The window is the few instructions
+//     between the pre-check and the parked select (versus the unbounded
+//     backpressure window the select does cover), and Go offers no
+//     atomic test-and-send on channels. This is a deliberate residual risk,
+//     not a fix claim.
+//
+//   - Even a delivery that leaves the watcher at a perfectly quiet moment
+//     does NOT mean the uploader uploads those bytes: between
+//     watcher → queue → uploader the file can be rewritten again, and the
+//     uploader re-stats and hashes the file AT UPLOAD TIME (uploader.go
+//     UploadFile), with per-upload {submit_time} keys so a truncated object
+//     is never overwritten by the later complete upload. Closing the
+//     watcher-side window therefore does not close the truncated-upload
+//     problem; that belongs to downstream verification (comparing
+//     mtime/size at upload time against the enqueued values), which the
+//     watcher layer cannot provide. See D-035 round-7 addendum.
+func (w *Watcher) emitCancellable(ctx context.Context, events chan<- FileEvent, fe FileEvent, cancel <-chan struct{}) emitOutcome {
+	// Entry check: if the generation was already invalidated, abandon
+	// without offering the send — otherwise a ready consumer (buffered
+	// space) and the closed cancel would race 50/50 inside the select.
+	select {
+	case <-cancel:
+		return emitSuperseded
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return emitAborted
+	case <-cancel:
+		return emitSuperseded
+	case events <- fe:
+		return emitDelivered
+	}
 }
 
 // emitBlocking sends fe to the events channel, blocking until the consumer

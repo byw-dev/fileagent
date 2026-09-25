@@ -2165,6 +2165,57 @@ fsnotify v1.8.0 的生产后端只在 `Close()` 驱动 read loop 退出时关闭
 `fw.Close()` 是 `Start` 在 loop 返回之后才执行的 defer。`loopDebounced` 的 `ok == false` 分支
 仅服务于包内测试注入 channel 的防御处理，生产中的 live loop 观察不到该关闭顺序。
 
+#### 其六：阻塞中的过期交付可被重武装取消——以及关不掉的残留（PR #118 第 7 轮返工，独立评审 P1）
+
+**缺陷**：flush 的静默复核只证明「stat 那一刻文件已静默」。`emitBlocking` 因 `events`
+背压阻塞期间，文件可以被原地重写、pending 被重武装成新一代；消费者腾出 channel 后，
+旧代把**复核时的旧快照**发给下游——flush 之后的 `gen == p.gen` 检查发生在发送之后，
+只能决定 `fired`，撤不回交付。下游 uploader 在**上传时**重新 `os.Stat` + 重算 sha256，
+于是存了旧快照 mtime 的事件会让上传器读到**当时的半成品内容**；又因每次上传的
+存储 key 带 `{submit_time}`，截断对象不会被后来的完整上传覆盖，而是永久留在存储里。
+
+**被否决的改法（设计陷阱）**：在 `emitBlocking` 之前再加一次「发送前校验」。
+阻塞发生在校验之后，这只把窗口从「静默复核 → 发送」缩到「校验 → 发送」，
+真正长的背压等待段原封不动。
+
+**定稿机制**：`debouncePending` 增加每代一个的 `cancel chan struct{}`。重武装
+（Write/Create）与移除（Remove/Rename）都会 close 掉旧代的 channel 并换新；
+timer 回调在 `p.mu` 下随 gen 校验一起捕获自己的 channel 交给 flush，flush 的发送改为
+`select { events <- fe, ctx.Done(), <-cancel }`（入口处另有一次非阻塞 cancel 预检，
+避免「cancel 已关 + 消费者已就绪」时 select 50/50 把过期快照送出）。收到 cancel 即放弃
+本次交付并回滚 claim，同时调度一次兜底 `scheduleDebounceRecheck`。
+
+**为什么放弃不会漏（验收 (b)）**：cancel 被关闭当且仅当下列三者之一——
+(1) Write/Create 重武装：新一代 timer 已武装，其 flush 会交付更新的版本；若该版本又被
+改写则链条继续，最终由找到静默版本的那一代交付；
+(2) Remove/Rename 移除了条目：文件已不存在，按「其二」的既录决定本就无内容可采，
+兜底 recheck stat 不到文件，自然终止；
+(3) 生命周期关闭：recheck 调度被 `rechecksStopped` / `ctx.Err()` 门闩挡住。
+所以放弃分支无条件调度 recheck 恒安全：情形 (1) 中它与已武装的新 timer 互为冗余，
+`claimDelivery`/`seen` 仲裁保证先到者交付、后到者跳过（恰一次，不双发）；情形 (2)(3)
+是 no-op。而若新一代 timer 事后被停掉或其 flush 因任何原因退出，这条 recheck 就是
+仍然交付最终静默版本的那条路径——**不漏的保证不依赖新 timer 存活**。
+既有不变量不受影响：`fired==true` 仍 ⇔ 无武装 timer 且无在跑的 flush（放弃的旧回调
+gen 不匹配、不置 `fired`）；sweep 触发条件仍是纯事件计费，未引入任何历史量。
+
+**残留（如实陈述，不声称「这样就不会交付半成品了」）**：
+
+1. **select 掷硬币的发丝级窗口**：若「代失效」与「消费者就绪」发生在同一瞬间，
+   Go 的 select 会在发送与 cancel 分支间均匀随机，过期快照仍可能送出。窗口是入口
+   预检与 select 驻留之间的几条指令（对比 select 覆盖的无限长背压窗口），且 channel
+   没有「原子地测了再发」，watcher 层关不掉它。
+2. **watcher → queue → uploader 的间隙**：即使发送瞬间文件完全静默，事件到 uploader
+   之间文件仍可能被改写，而 uploader 是**上传时**才读文件（重新 stat + sha256），
+   `{submit_time}` key 使截断对象永久留存。因此**关闭 watcher 侧的窗口并不等于关闭
+   截断上传问题**——它属于下游校验（上传时比对 mtime/size 与入队时是否一致），
+   不是 watcher 层能解决的，已另行记待办。
+
+可执行守卫：`TestDebounced_RearmDuringBlockedFlush_AbandonsStaleDelivery`（a：阻塞期间
+重武装 ⇒ 旧快照不得送达；修复前 10/10 红）、`TestDebounced_AbandonedDelivery_StillDeliversCompleteVersion`
+（b：放弃后停掉新 timer，兜底 recheck 独立交付完整版本），
+以及改造后的 `TestDebounced_RearmWhileFlushBlocked_SweepKeepsEntry`（原 sweep 存活断言
+不变，新增「放弃且不送达」断言）。
+
 ### 理由（为什么不「只翻默认值」）
 
 - 默认值只是「新建规则不选时的兜底」；显式配了 `overwrite` 的存量规则在翻默认值后
