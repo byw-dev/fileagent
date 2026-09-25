@@ -235,10 +235,12 @@ func TestWatcher_Start_SequentialReuse_AfterCancel(t *testing.T) {
 	}
 }
 
-// D-035 incremental review: sequential Start reuse must reopen the recheck
-// scheduling gate. The second lifecycle's initial scan skips this hot file;
-// with no writer left to produce another fsnotify event, only its recheck can
-// deliver the file.
+// D-035 incremental review: sequential Start reuse must call startRechecks.
+// The second lifecycle's initial scan skips this hot file; with no writer left
+// to produce another fsnotify event, only its recheck can deliver the file.
+// This pins the call's existence, not its exact placement: moving the existing
+// fsnotify-path call to Start's outer scope is defensive and has no observable
+// behavior difference today because runPolling never schedules rechecks.
 func TestWatcher_Start_SequentialReuse_ReopensRecheckGate(t *testing.T) {
 	dir := t.TempDir()
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
@@ -1306,8 +1308,8 @@ func TestOverflowRescan_CloseWaitHotFile_CollectedAfterDebounce(t *testing.T) {
 }
 
 // D-035 incremental review: a future mtime is settled, not hot. Scheduling a
-// recheck for it must clamp the negative age when choosing the deadline, and
-// the callback must not reject it forever when that prompt timer fires.
+// recheck for it must use the grace-only deadline, and the callback must not
+// reject it when that prompt timer fires.
 func TestScheduleDebounceRecheck_FutureMTimeDeliveredPromptly(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "future-recheck.log")

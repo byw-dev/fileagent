@@ -288,9 +288,11 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 		return ErrAlreadyRunning
 	}
 	defer w.running.Store(false)
-	// Open the per-lifecycle scheduling gate before either the fsnotify or
-	// polling path can return. Keep its matching close at the same scope so a
-	// sequential Start always begins from a fresh gate state.
+	// Keep the lifecycle gate pair at the outer Start scope as a defensive
+	// invariant. The polling path currently ignores pollScan's skipped paths
+	// and never schedules rechecks, so this placement does not change its
+	// behavior; the observable requirement is that every fsnotify lifecycle
+	// calls startRechecks before its initial scan.
 	w.startRechecks()
 	defer w.stopAllRechecks()
 
@@ -402,9 +404,10 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 			// timer; this independent recheck also closes the case where the
 			// fsnotify event is still queued (or was coalesced). The normal
 			// claimDelivery gate arbitrates if both paths become ready together.
-			// Known narrow exception: if the event loop exits while ctx remains
-			// live, Start closes the recheck gate and a late flush cannot install
-			// this retry; see stopAllRechecks and D-035 for the accepted trade-off.
+			// In production the gate stays open while this loop is running:
+			// fsnotify closes Events/Errors only during Close, and Start defers
+			// Close until after the loop returns. The ok=false branches below are
+			// defensive support for tests that inject their own channels.
 			w.scheduleDebounceRecheck(ctx, events, seen, path)
 			return
 		}
@@ -880,13 +883,12 @@ func (w *Watcher) completeDelivery(seen map[string]time.Time, path string, modTi
 // closed in production, so the consequence is retention, not a
 // send-after-close panic. It also closes the scheduling gate before draining,
 // preventing a callback that already crossed Timer.Stop from installing a
-// replacement behind the shutdown boundary.
-//
-// Known trade-off: loopDebounced may return because its fsnotify channel
-// closes while ctx is still live. A concurrent flush that discovers a hot
-// file after this gate closes cannot install its otherwise-recovering recheck,
-// so that final quiet version may be left uncollected. This narrow backend-
-// failure case is accepted here rather than weakening the shutdown fence.
+// replacement behind the shutdown boundary. In production fsnotify closes
+// Events/Errors only while Close runs, and Start defers Close until after its
+// event loop returns; loopDebounced therefore cannot observe those channels
+// closing under a still-live Start. Its ok=false paths exist for defensive
+// handling of package tests' injected channels, not as a production shutdown
+// path or an accepted data-loss trade-off.
 func (w *Watcher) stopAllRechecks() {
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()

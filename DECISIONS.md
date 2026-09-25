@@ -2151,14 +2151,19 @@ Write 后窗口内 Remove ⇒ **只**收到 `remove`，窗口过后也没有内�
 `flush` 现在运行在防抖 timer goroutine 上；它可能越过 pending timer 的 `Stop()`，并在
 `Start` 的 `stopAllRechecks` 已经清空 timer 后才发现文件仍热、试图重新安装 recheck。
 若放行，这个过期 timer 会携带旧 `ctx` / `seen` 污染顺序复用后的新生命周期。因此调度有
-两道栅栏：`rechecksStopped` 在 `stopAllRechecks` 的同一把 `seenMu` 下先关门再清表，每次
-`Start`（包括 fsnotify 创建失败的 polling fallback）在任何返回路径之前重新开门；
+两道栅栏：`rechecksStopped` 在 `stopAllRechecks` 的同一把 `seenMu` 下先关门再清表；
 `ctx.Err()` 则在下一轮重新开门后继续拒绝上一轮已取消 context 的迟到 callback。
 
-已知代价：`loopDebounced` 也可能因为 fsnotify 的 event/error channel 关闭而在 `ctx` 仍存活时
-返回；随后门闩关闭。若一个已经在跑的 `flush` 此时才发现文件仍热，它安排的恢复 recheck
-会被拒绝，最终静默版本可能不再被采集。本轮只如实记录这个窄的后端故障窗口，不为此放松
-关停栅栏或重构关停语义。
+`startRechecks` 与配对的 `stopAllRechecks` 放在 `Start` 最外层是**防御性加固，不产生当前可观察
+行为变化**：此前 fsnotify 成功路径已经在初始扫描前调用 `startRechecks`；而两个 polling
+fallback 虽然调用 `pollScan`，却丢弃返回的 skipped paths，只靠下一轮 ticker 重扫，从不安排
+recheck，`handleWatchError` 在该路径也不可达。真正承载顺序复用语义的不变量是“每个 fsnotify
+生命周期必须调用 `startRechecks`”，对应回归测试钉住调用存在；它不声称钉住调用的具体位置。
+
+同样不存在上一版记录的“ctx 仍存活但 fsnotify channel 先关闭，迟到 flush 因门闩漏采”代价：
+fsnotify v1.8.0 的生产后端只在 `Close()` 驱动 read loop 退出时关闭 `Events` / `Errors`，而
+`fw.Close()` 是 `Start` 在 loop 返回之后才执行的 defer。`loopDebounced` 的 `ok == false` 分支
+仅服务于包内测试注入 channel 的防御处理，生产中的 live loop 观察不到该关闭顺序。
 
 ### 理由（为什么不「只翻默认值」）
 
