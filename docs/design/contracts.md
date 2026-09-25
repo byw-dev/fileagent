@@ -26,9 +26,9 @@
 | `REVOKED`  | `revoked`  | 已吊销 |
 
 - 翻译函数：`mapFrontendStatusToDB` / `mapDBStatusToFrontend`
-  — `controlplane/internal/api/handler/agents.go:146`
-- DB 枚举定义（权威）：`controlplane/internal/db/models.go:61`（`AgentStatus`）
-- 前端枚举定义：`webui/src/components/AgentStatusBadge.tsx:5`
+  — `controlplane/internal/api/handler/agents.go`（按符号搜，不写行号——行号会漂）
+- DB 枚举定义（权威）：`controlplane/internal/db/models.go` 的 `AgentStatus` 类型
+- 前端枚举定义：`webui/src/components/AgentStatusBadge.tsx` 的 `AgentStatus` 联合类型
 - 注：`CLAUDE.md` 生命周期里的 `INIT` 是 **Agent 本地注册前**的状态，不是 DB/API 枚举值——
   API 层可见的状态仅上表五个。
 
@@ -39,7 +39,7 @@
 | `active`   | 生效（agent 在线则热重载） |
 | `inactive` | 停用 |
 
-- 定义：`controlplane/internal/db/models.go:196`
+- 定义：`controlplane/internal/db/models.go` 的 `RuleStatus` 类型
 - 注：REST `PUT .../rules/:rid` 的 status-only 形态传的就是该小写值（CC-9 / D-020）。
 
 ### 上传模式（UploadMode）
@@ -49,10 +49,11 @@
 | `watch`     | 实时监听 |
 | `scheduled` | 定时（配 `cron_expr`） |
 
-- 定义：`controlplane/internal/db/models.go:238`
+- 定义：`controlplane/internal/db/models.go` 的 `UploadMode` 类型
 - **入参大小写宽容**：CP 在 create/update 规则时对 `mode` 做 `strings.ToLower` 后再校验，
   **落库统一小写**——前端传 `WATCH`/`Watch`/`watch` 皆可，非法值返回 `422`
-  （`controlplane/internal/api/handler/agents.go:757` 与 `:924`）。
+  （`controlplane/internal/api/handler/agents.go` 的 `AgentsHandler.CreateRule` 与
+  `AgentsHandler.UpdateRule`，按符号指路——行号会漂）。
 
 ### 追加模式（append_mode）
 
@@ -60,13 +61,16 @@
 |----|------|
 | `overwrite`  | 整文件上传（**默认**：空字符串会被补齐为 `overwrite`）。**防抖**（D-035）：Write/Create 事件静默 500ms 后整文件上传一次，不再每个事件传一次 |
 | `tail`       | 追踪字节偏移，仅上传新增部分（断点续传）。⚠️ 当前 fail-closed 停用（IC-BUG-46），正确实现见 IC-15 |
-| `close_wait` | **`overwrite` 的别名，保留兼容**（D-035）：防抖普适后两者下游行为完全相同，仅存量规则与已落库行仍携带此值 |
+| `close_wait` | **`overwrite` 的别名，保留兼容**（D-035）：防抖普适后两者下游行为完全相同。为兼容保留，**仍可正常选用**（Web UI 选项未禁用），CP 也照常接受——只是不再有任何独有行为 |
 
 - **值域权威在 Agent watcher**（非 CP：`append_mode` 是自由 TEXT，CP 不做枚举校验，仅默认补齐）：
   `agent/internal/watcher/watcher.go`（`AppendModeOverwrite` / `AppendModeTail` / `AppendModeCloseWait` 常量；
   防抖窗口常量 `defaultDebounceWindow`，谓词 `debounceEnabled`）
 - webui 选项清单镜像：`webui/src/pages/Agents/RuleForm.tsx`（须与 watcher 常量一致）
-- CP 默认补齐逻辑（空→`overwrite`）：`controlplane/internal/api/handler/agents.go:753` 与 `:937`
+- CP 默认补齐逻辑（空→`overwrite`）：`controlplane/internal/api/handler/agents.go` 的
+  `AgentsHandler.CreateRule` 与 `AgentsHandler.UpdateRule`（经 `updateRuleFull`）两处
+  `if appendMode == ""` 分支；tail 的 fail-closed 拒绝在同一对 handler 里调
+  `rejectTailAppendMode`（按符号指路，不写行号——行号会漂）
 
 ### 上传日志状态（upload-log status，前端）
 

@@ -287,8 +287,9 @@ wait_for "④ STS 凭据已下发给 agent" 60 \
 step "⑦⑧⑨⑩ 落文件 → 采集 → 直传 MinIO → 索引"
 # 原子落盘：先写到监听目录之外，再 mv 进去。
 # 这样只产生一个 CREATE 事件，断言「上传恰好 1 次」才是确定性的；
-# 同时规则用的是**默认** append_mode（overwrite，无防抖），所以这条护栏
-# 守的是真正的默认路径，而不是 close_wait 自己。
+# 同时规则用的是**默认** append_mode（overwrite——自 D-035 起走普适防抖，
+# 原子 mv 只产生一个 CREATE 事件、防抖窗口过后恰好一次交付），所以这条
+# 护栏守的就是默认路径本身。
 mkdir -p "$WORK/stage"
 printf 'ts,sensor,value\n2026-01-01T00:00:00Z,s1,42.5\n' > "$WORK/stage/smoke.csv"
 mv "$WORK/stage/smoke.csv" "$WORK/watch/smoke.csv"
