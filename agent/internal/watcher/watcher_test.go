@@ -1973,6 +1973,166 @@ func TestDebounced_CloseWaitAndOverwrite_EquivalentDelivery(t *testing.T) {
 	assert.Equal(t, overwrite, closeWait, "close_wait must be a behavioural alias of overwrite")
 }
 
+// Rework R-1: a flushed pending entry must be recycled. Before the fix the
+// loop kept one map key + timer + closure per path EVER seen — unbounded
+// growth that D-035 spread to the default overwrite mode. 24 distinct paths
+// each flushed once must leave len(pending) back at 0; no further events are
+// fed, so only the recycling path can empty the map.
+func TestDebounced_PendingRecycledAfterFlush(t *testing.T) {
+	dir := t.TempDir()
+	const n = 24
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 20 * time.Millisecond
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 64)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+	for i := 0; i < n; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("p-%02d.log", i))
+		require.NoError(t, os.WriteFile(path, []byte("x"), 0o644))
+		evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	}
+
+	for i := 0; i < n; i++ {
+		select {
+		case <-events:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of %d deliveries arrived", i, n)
+		}
+	}
+
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.pending) == 0
+	}, 2*time.Second, 5*time.Millisecond,
+		"flushed pending entries must be recycled — the map must not grow with the set of paths ever seen")
+}
+
+// Rework R-1: a late recycling message from an older firing must not drop an
+// entry that was re-armed after its flush (gen mismatch) — the same property
+// as TestRecheckTimer_ReplaceKeepsNewTimerTracked, for the debounce pending
+// map. Deterministic by construction: firing #1 parks inside emitBlocking,
+// the loop (free while the callback is parked) re-arms the entry with gen++,
+// and only then does firing #1's recycling message (gen 0) come into
+// existence. While firing #2 is parked, no recycling message for the entry
+// is in flight, so the map state is frozen for observation.
+func TestDebounced_PendingRearmed_NotDroppedByLateRecycle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rearmed.log")
+	require.NoError(t, os.WriteFile(path, []byte("v1"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent) // unbuffered: the park is the sequencing tool
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+	// Firing #1 flushes and parks inside emitBlocking (no reader yet).
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		_, busy := w.inflight[path]
+		return busy
+	}, 2*time.Second, 5*time.Millisecond, "flush #1 should hold the claim while parked")
+
+	// While the callback is parked the loop is free in select: re-arm the
+	// same entry (Reset + gen++). This happens strictly BEFORE firing #1's
+	// recycling message exists, so the late message carries gen 0 while the
+	// live entry carries gen 1.
+	go func() { evc <- fsnotify.Event{Name: path, Op: fsnotify.Write} }()
+
+	// Unblock firing #1; its recycling message (gen 0) reaches the loop and
+	// is processed while the test prepares firing #2.
+	fe1 := <-events
+	require.Equal(t, "create", fe1.Op)
+
+	// Bump the version so firing #2 (the re-armed timer) delivers and parks
+	// too, freezing the map for observation.
+	require.NoError(t, os.WriteFile(path, []byte("v2"), 0o644))
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		cur, busy := w.inflight[path]
+		return busy && cur.After(fe1.ModTime)
+	}, 2*time.Second, 5*time.Millisecond, "firing #2 should hold the claim while parked")
+
+	// Firing #2 is parked; no recycling message for the entry is in flight
+	// and none can appear until it completes. The late gen-0 message has
+	// long since been processed — it must NOT have dropped the entry.
+	w.seenMu.Lock()
+	n := len(w.pending)
+	w.seenMu.Unlock()
+	assert.Equal(t, 1, n,
+		"a late recycling message from the previous firing must not drop the re-armed entry")
+
+	// Unpark firing #2 by reading its delivery; its own (gen-matching)
+	// recycling then cleans the entry up.
+	fe2 := <-events
+	require.True(t, fe2.ModTime.After(fe1.ModTime))
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.pending) == 0
+	}, 1*time.Second, 5*time.Millisecond,
+		"the re-armed entry must still be recycled by its own firing")
+}
+
+// Rework R-2 recorded decision: a file removed or renamed within the debounce
+// window after its last write is NEVER collected — the pending flush is
+// cancelled and only a bare remove event goes out. Pins the decision so that
+// whoever changes it in the future is told they are changing a decision
+// (D-035, short-lived-files trade-off).
+func TestDebounced_RemoveWithinWindow_CancellesDelivery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shortlived.log")
+	require.NoError(t, os.WriteFile(path, []byte("written then removed"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 30 * time.Millisecond
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Remove}
+
+	// Exactly one event: the remove, immediate (not debounced).
+	select {
+	case fe := <-events:
+		require.Equal(t, "remove", fe.Op)
+		require.Equal(t, path, fe.Path)
+	case <-time.After(2 * time.Second):
+		t.Fatal("remove event was not delivered")
+	}
+
+	// Well past the debounce window: still no content event.
+	select {
+	case fe := <-events:
+		t.Fatalf("content event delivered for a file removed inside the debounce window: %s (op=%s)", fe.Path, fe.Op)
+	case <-time.After(w.debounce*3 + 300*time.Millisecond):
+	}
+}
+
 // ── PR #108 codex 复审 P1: seen 语义回退为「已交付」前的守卫（见卡片 IC-BUG-53） ─
 
 // The safety-net rescan is a RETRY OPPORTUNITY: real-time deliveries are not
