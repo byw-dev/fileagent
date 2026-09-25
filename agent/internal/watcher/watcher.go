@@ -202,8 +202,12 @@ func (w *Watcher) sweepEvery() int {
 // still running), and the timer closure captured only p and path, never the
 // map.
 //
-// Boundedness, honestly stated (D-035): right after a sweep,
-// len(pending) == the active (unflushed) count at that moment; before the
+// Boundedness, honestly stated (D-035): a sweep retains only the entries it
+// observed as still active (unflushed); post-sweep len(pending) is AT MOST
+// the active count observed at sweep start — an entry observed as unfired is
+// kept, but its timer callback may set fired immediately afterwards, so an
+// already-idle entry can still be present in the map at sweep return (the
+// inequality, not an equality, is what matters here). Before the
 // next sweep at most sweepEvery further events are processed, each adding at
 // most one entry, so len(pending) ≤ max_active + sweepEvery, ALWAYS. The
 // trigger contains no historically derived quantity, so there is no

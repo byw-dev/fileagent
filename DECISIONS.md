@@ -2118,9 +2118,11 @@ Write 后窗口内 Remove ⇒ **只**收到 `remove`，窗口过后也没有内�
   **按事件计费**——每处理一个 fsnotify 事件计数 +1，每 `sweepEvery`（64）个事件扫描一次
   （删除全部 fired 条目）并把计数归零。**触发条件不含任何历史派生量，不存在自举**：
   过去的 active 峰值不会放大未来的扫描预算。
-- **界（如实陈述，不是「不会泄漏」）**：一次扫描后 `len == 当时的 active 数`；到下一次
-  扫描前最多再处理 `sweepEvery` 个事件（每个至多新增一个条目），故恒有
-  `len ≤ max_active + sweepEvery`。
+- **界（如实陈述，不是「不会泄漏」）**：一次扫描只保留它观察到的仍是 active 的条目——
+  扫描后 `len ≤ 扫描开始时观察到的 active 数`（**不是等号**：扫描逐项读 `fired` 期间，
+  某条目可能刚被观察为未 fired 而保留、其 timer 回调随即把它置为 idle，扫描返回时它
+  已 idle 但仍在表里）；到下一次扫描前最多再处理 `sweepEvery` 个事件（每个至多新增一个
+  条目），故恒有 `len ≤ max_active + sweepEvery`。
 - **摊还成本（如实陈述）**：每 `sweepEvery` 个事件做一次 O(len) 扫描，即每事件
   `O(len/sweepEvery)`，而 len 本身被 `max_active + sweepEvery` 限住。早前「几何阈值
   O(1) 摊还」的说法属于被推翻的第二版，不再成立为完整论证。
