@@ -1075,17 +1075,8 @@ func (w *Watcher) safetyNetRescan(ctx context.Context, events chan<- FileEvent, 
 		}
 	}
 	for _, path := range skipped {
-		// TEMP CI MUTATION #2 (env-gated so ONLY the debounced overflow e2e
-		// step is affected; the normal suite keeps the re-arm and must stay
-		// green): the rescan keeps its pollScan — hot files are still
-		// skipped, rescanSkippedHot still fires — but never re-arms rechecks,
-		// so rescanRecheckArmed can never fire. Expected: the debounced
-		// overflow e2e fails on the hook assertion (re-arms == 0). Reverted
-		// immediately after the red run is recorded.
-		if os.Getenv("FILEAGENT_TEST_INOTIFY_OVERFLOW") != "1" {
-			if armed := w.scheduleDebounceRecheck(ctx, events, seen, path); armed && w.rescanRecheckArmed != nil {
-				w.rescanRecheckArmed(path)
-			}
+		if armed := w.scheduleDebounceRecheck(ctx, events, seen, path); armed && w.rescanRecheckArmed != nil {
+			w.rescanRecheckArmed(path)
 		}
 	}
 }
