@@ -2019,6 +2019,86 @@ dev 上「看起来能过」只是 bucket lookup 的 DB 往返偶然让了路。
 
 ---
 
+## D-035：采集防抖改为普适（overwrite 也防抖，close_wait 降为别名）
+
+**决策日期**：2026-09-25
+**影响范围**：`agent/internal/watcher/watcher.go`（三个分流点 + 命名中立化）、
+`agent/internal/watcher/watcher_test.go` / `fsnotify_burst_test.go` / `overflow_linux_test.go`（实时路径守卫改挂 tail）、
+`deploy/scripts/smoke.sh`（新增 16MB 分块写护栏）、
+`docs/design/contracts.md` V-3、`docs/design/system-design.md`（§4.4.3 / 附录 A / 附录 D）、
+`agent/internal/queue/queue.go`（`AppendModeCloseWait` 别名注释）、`webui/src/pages/Agents/RuleForm.tsx`（选项文案）
+**关联**：AUD-9（A 基线审计 §3「不挡 A 但强烈建议随 A 一起修」）、`docs/tasks/active.md`「下一步」第 1 条（2026-09-24 拍板）、
+IC-BUG-53（seen 语义的既有权衡）、IC-BUG-46 / IC-15（tail fail-closed 与正确实现）
+
+### 背景（实证）
+
+A 基线审计实测：把一个 150MB 文件 `cp` 进被监听目录（默认 `append_mode=overwrite`），
+`upload_logs` 150 行，其中 147 行是完整 157286400 字节，**3 行读到正在写入的半个文件**；
+MinIO `CompleteMultipartUpload` 事件 150 次，实际写入流量 ≈ 22GB。同一文件改用
+`close_wait`：`upload_logs` 1 行。
+
+根因：watcher 只有 `close_wait` 走 500ms 空闲防抖（`runCloseWait`）；默认的 `overwrite`
+走 `runFsnotify`，每个 Create/Write 事件直接触发一次整文件上传。
+
+### 决策
+
+1. **防抖普适，而不是只翻默认值**。新增谓词 `debounceEnabled()`（=「模式 ≠ tail」），
+   watcher 的三个分流点（`Start` 选事件循环、`pollScan` 跳过热文件、`recheckAfterDebounce`
+   静默判据）全部改用它。**「不防抖」没有任何正当用途**：只翻默认值等于把枪留在桌上，
+   显式选 `overwrite` 的人照样中招。
+2. **`close_wait` 降为 `overwrite` 的别名**。已验证 `close_wait` 严格等于
+   `overwrite` + 500ms 防抖，下游（executor/uploader/CP）从不按这两个模式分流；
+   防抖普适后 watcher 侧对两者也完全一致。**契约值域不变**（三个值保留、不改 proto、
+   不加迁移），存量规则与文档不破；等价性由可执行断言钉住
+   （`TestDebounced_CloseWaitAndOverwrite_EquivalentDelivery`）。
+3. **`tail` 明确排除，且是故意的**。tail 已被 IC-BUG-46 fail-closed 挡掉
+   （CP 建规则 422 + executor 拒任务），其事件语义（增量 + 断点续传）归 IC-15。
+   本刀不改 tail 的事件循环；`runFsnotify` / `loopFsnotify` 因此成为「只有 tail 才会走」
+   的路径——**保留不删**（IC-15 的地基 + 实时路径语义的守卫测试都在那里），并在注释里写明。
+4. **防抖窗口仍是代码常量 500ms**，不引入新的配置项/环境变量。
+
+### 权衡 / 已知副作用（review 必问，明写不藏）
+
+`overwrite` 从实时循环挪到防抖循环，**顺带改变了它的 `seen` 语义**：
+
+- 实时路径（`loopFsnotify`）**故意不写 `seen`**（PR #108 review F1→P1 的裁决）：
+  `seen` 意为「已交付」，而 emit 成功只证明事件进了内存 channel，下游 submit 仍可能静默失败
+  （IC-BUG-53）；不写 `seen` 给「溢出重扫」保留了**唯一一次重试机会**。
+- 防抖循环的 flush 走 `claimDelivery` / `completeDelivery`，**交付即记 `seen`**
+  （F3 恰一次仲裁依赖它）。
+
+所以 `overwrite` 从此**失去**「下游静默失败后由溢出重扫兜底重试」这一条路径，换来的是
+「不再有写放大、不再上传写了一半的文件」。这与 `close_wait` 早已接受的权衡完全相同
+（见 `docs/tasks/bugs/open.md` 的 IC-BUG-53）。该权衡已写在 `watcher.go` 的 flush 注释与
+`loopFsnotify` 注释里，两种语义各有可执行守卫
+（实时路径：`TestLoopFsnotify_RescanRetriesRealTimeDeliveredFiles`，挂 tail）。
+
+### 理由（为什么不「只翻默认值」）
+
+- 默认值只是「新建规则不选时的兜底」；显式配了 `overwrite` 的存量规则在翻默认值后
+  **原样保留写放大**。防抖没有「用户想要每事件整传」的合理场景——那正是审计实测的
+  22GB 事故本身。
+- 普适之后模式语义收敛为二值：「tail（实时增量，当前停用）」与「其余一切（防抖整传）」，
+  `close_wait` 之名不再承载行为差异，只承载兼容。
+
+### 影响面
+
+- **行为**：`overwrite` 的用户可见行为 = 原 `close_wait`（防抖 500ms 后整文件上传一次）。
+  初扫对仍在写的文件改为跳过 + recheck 收走；轮询 fallback 下一个 tick 重查。
+- **不变**：契约值域三值不变；CP 侧 `append_mode` 校验（tail 422 fail-closed）不动；
+  executor / uploader 不动；防抖窗口常量 500ms 不动。
+- **测试归属调整**：实时路径守卫（溢出重扫重试、emitBlocking 背压、inotify overflow
+  真实内核测试、burst 不丢事件）全部改挂 `tail` 模式——防抖普适后只有 tail 还走实时循环，
+  这些守卫钉的是循环本身，不是某个模式。
+
+### 落地记录
+
+**PR #118**（2026-09-25）。红→绿：新护栏在 master 上实测
+`upload_logs` 行数 **6 行 →** 分支 **1 行**（live 数字对见 PR 正文）；6 条新增单测 +
+5 条变异测试全部确认守卫有效；`agent` 覆盖率 75.4% → 75.5%（watcher 91.5% → 92.4%）。
+
+---
+
 ## D-036：MinIO 镜像改为自持私有镜像仓 + 按 digest 钉定（上游已无公共通路）
 
 **决策日期**：2026-09-25

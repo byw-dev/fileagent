@@ -47,7 +47,7 @@ type Watcher struct {
 	// tailOffsets tracks the last known byte offset per file for tail mode.
 	tailOffsets map[string]int64
 
-	// rechecks holds the one-shot close_wait debounce recheck timers keyed by
+	// rechecks holds the one-shot debounce recheck timers keyed by
 	// path (IC-BUG-43). At most one live timer per path: re-arming replaces
 	// the previous timer. recheckGens carries the per-path generation used
 	// by settleRecheck to tell "my own entry" from "a replacement's entry"
@@ -67,14 +67,15 @@ type Watcher struct {
 	// inflight tracks paths whose delivery is currently in progress, keyed
 	// by the mtime being delivered (PR #108 review F3). It is the exactly-
 	// once gate for a file version across the goroutines that all run
-	// "check seen → send → record seen": the close_wait debounce flush, the
+	// "check seen → send → record seen": the debounce flush, the
 	// debounce recheck and the overflow-rescan scan. Guarded by seenMu;
 	// lazily initialized so a Watcher built by struct literal works.
 	inflight map[string]time.Time
 
-	// debounce is the close_wait debounce window. Zero means the production
-	// default (closeWaitDebounce); tests may set a short value to avoid
-	// wall-clock timing assumptions. See debounceWindow.
+	// debounce is the write-quiet (debounce) window every mode except tail
+	// waits before emitting Write/Create events (D-035). Zero means the
+	// production default (defaultDebounceWindow); tests may set a short
+	// value to avoid wall-clock timing assumptions. See debounceWindow.
 	debounce time.Duration
 }
 
@@ -82,7 +83,10 @@ type Watcher struct {
 // are persisted in upload_tasks.append_mode); these aliases keep the watcher's
 // public API stable.
 const (
-	// AppendModeOverwrite means upload the full file on each change (default mode).
+	// AppendModeOverwrite means upload the full file once writes have gone
+	// quiet for the debounce window (D-035). It is the default mode; since
+	// D-035 the full-file upload happens once per write burst, never per
+	// Write event.
 	AppendModeOverwrite = queue.AppendModeOverwrite
 	// AppendModeTail tracks the byte offset of each file and uploads only the
 	// bytes added since the last successful upload.
@@ -92,13 +96,17 @@ const (
 	// silently losing previously collected data. The executor refuses tail
 	// tasks before any upload runs; the correct implementation is IC-15.
 	AppendModeTail = queue.AppendModeTail
-	// AppendModeCloseWait debounces Write/Create events by waiting a short idle
-	// period before emitting, approximating "file was closed after writing".
+	// AppendModeCloseWait waits a short idle period after Write/Create events
+	// before emitting. Since D-035 it is an exact alias of AppendModeOverwrite:
+	// both take the debounced path (the watcher's three debounce branch points
+	// treat them identically). The value is kept so pre-existing rules and
+	// persisted rows stay valid.
 	AppendModeCloseWait = queue.AppendModeCloseWait
 )
 
-// closeWaitDebounce is the idle period used in close_wait mode.
-const closeWaitDebounce = 500 * time.Millisecond
+// defaultDebounceWindow is the write-quiet period every mode except tail
+// waits before emitting Write/Create events (D-035).
+const defaultDebounceWindow = 500 * time.Millisecond
 
 // New creates a Watcher for the given source directory.
 // fileGlob is matched against file base names (e.g. "*.log").
@@ -120,15 +128,24 @@ func New(sourcePath, fileGlob string, recursive bool, pollInterval time.Duration
 	}, nil
 }
 
-// debounceWindow returns the effective close_wait debounce window. Tests may
-// shorten the window per-watcher (w.debounce) so timing-sensitive cases make
-// no wall-clock assumptions; zero means the production default.
+// debounceWindow returns the effective write-quiet (debounce) window. Tests
+// may shorten the window per-watcher (w.debounce) so timing-sensitive cases
+// make no wall-clock assumptions; zero means the production default.
 func (w *Watcher) debounceWindow() time.Duration {
 	if w.debounce > 0 {
 		return w.debounce
 	}
-	return closeWaitDebounce
+	return defaultDebounceWindow
 }
+
+// debounceEnabled reports whether this watcher debounces Write/Create events
+// before emitting them: every append mode except tail holds a write burst
+// quiet for debounceWindow and delivers the file once, after the burst
+// (D-035, AUD-9 — the universal debounce that removed overwrite's per-Write-
+// event full-file upload). tail is excluded on purpose: it is fail-closed
+// blocked (IC-BUG-46) and its real-time event semantics belong to IC-15, so
+// loopFsnotify stays the tail-only path.
+func (w *Watcher) debounceEnabled() bool { return w.appendMode != AppendModeTail }
 
 // SeedTailOffsets pre-loads per-file byte offsets recovered from persisted
 // state (processed_files) so that tail-mode events emitted after an agent
@@ -173,8 +190,10 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 	w.scheduleDebounceRechecks(ctx, events, seen, w.pollScan(ctx, events, seen))
 
 	w.logger.Info("watcher: fsnotify started", zap.String("path", w.sourcePath))
-	if w.appendMode == AppendModeCloseWait {
-		return w.runCloseWait(ctx, events, fw, seen)
+	// D-035: every mode except tail takes the debounced loop — overwrite
+	// included (close_wait is its alias). Only tail walks runFsnotify.
+	if w.debounceEnabled() {
+		return w.runDebounced(ctx, events, fw, seen)
 	}
 	return w.runFsnotify(ctx, events, fw, seen)
 }
@@ -196,21 +215,24 @@ func (w *Watcher) addWatchPaths(fw *fsnotify.Watcher) error {
 	})
 }
 
-// runCloseWait drives the fsnotify event loop in close_wait mode. Write and
-// Create events are debounced: a per-file timer is reset on every event, and
-// the FileEvent is emitted only once the timer fires (i.e., once writes stop
-// for at least closeWaitDebounce). This approximates "file closed after write"
-// on platforms that do not expose a native close-write notification.
+// runDebounced drives the fsnotify event loop in the debounced mode, i.e.
+// every append mode except tail (D-035). Write and Create events are
+// debounced: a per-file timer is reset on every event, and the FileEvent is
+// emitted only once the timer fires (i.e., once writes stop for at least
+// debounceWindow). This approximates "file closed after write" on platforms
+// that do not expose a native close-write notification, and it is what keeps
+// one cp into the watched directory from becoming one full-file upload per
+// Write event (AUD-9).
 //
 // Errors on fw.Errors (including watch-queue overflows) are handled by
 // handleWatchError, which triggers the IC-BUG-44 safety-net rescan on
 // overflow so files whose events were lost are recovered by mtime.
-func (w *Watcher) runCloseWait(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher, seen map[string]time.Time) error {
-	return w.loopCloseWait(ctx, events, seen, fw.Events, fw.Errors)
+func (w *Watcher) runDebounced(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher, seen map[string]time.Time) error {
+	return w.loopDebounced(ctx, events, seen, fw.Events, fw.Errors)
 }
 
-// closeWaitPending is one file's in-flight close_wait debounce state.
-type closeWaitPending struct {
+// debouncePending is one file's in-flight debounce state.
+type debouncePending struct {
 	timer *time.Timer
 	// mu guards op: the loop goroutine updates it on every event while a
 	// firing timer goroutine reads it for the flush.
@@ -218,12 +240,12 @@ type closeWaitPending struct {
 	op string
 }
 
-// loopCloseWait is the close_wait event loop proper. The event and error
+// loopDebounced is the debounced event loop proper. The event and error
 // channels are parameters so tests can drive the loop deterministically
 // without a live fsnotify backend (whose channel lifecycle would race with
 // test-side injections).
-func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, evc <-chan fsnotify.Event, erc <-chan error) error {
-	pending := make(map[string]*closeWaitPending)
+func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, evc <-chan fsnotify.Event, erc <-chan error) error {
+	pending := make(map[string]*debouncePending)
 
 	flush := func(path, op string) {
 		fe, err := w.buildEvent(path, op)
@@ -238,13 +260,25 @@ func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, se
 		// either delivers it (done) or rolls its claim back — and a
 		// rollback happens only when emitBlocking fails, which only happens
 		// on ctx cancellation, i.e. the shutdown path (agent stop / rule
-		// cancel / hot reload). There is no periodic scan in close_wait
-		// mode, so "the next scan retries" does not exist at runtime; the
+		// cancel / hot reload). Debounced modes have no periodic scan, so
+		// "the next scan retries" does not exist at runtime; the
 		// shutdown closes the loop instead: after a reload/restart the new
 		// Watcher starts with a fresh seen map and its initial scan
 		// re-discovers the file (scheduling a fresh recheck if it is still
 		// hot), and a cancelled rule leaves the file with no rule to belong
 		// to. See completeDelivery for the same reasoning.
+		//
+		// Seen semantics (AUD-9 / D-035, explicit and accepted): this flush
+		// records the delivered mtime in seen via completeDelivery — the
+		// exactly-once claim arbitration (PR #108 review F3) depends on it.
+		// That means a debounced delivery whose downstream submit later
+		// fails silently is NOT retried by an overflow rescan (the rescan
+		// skips files already in seen; IC-BUG-53). overwrite accepted the
+		// same trade-off the moment it joined the debounced path: what it
+		// gave up is the rescan's retry opportunity; what it got is no more
+		// per-Write-event full-file uploads and no more truncated uploads.
+		// The real-time loop (tail only) keeps the opposite choice — see
+		// loopFsnotify.
 		if !w.claimDelivery(seen, path, fe.ModTime) {
 			return
 		}
@@ -296,7 +330,7 @@ func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, se
 				p.mu.Unlock()
 			} else {
 				path := ev.Name // capture for closure
-				p := &closeWaitPending{op: op}
+				p := &debouncePending{op: op}
 				p.timer = time.AfterFunc(w.debounceWindow(), func() {
 					p.mu.Lock()
 					op := p.op
@@ -318,12 +352,21 @@ func (w *Watcher) loopCloseWait(ctx context.Context, events chan<- FileEvent, se
 // runFsnotify drives the fsnotify event loop, translating raw events into
 // FileEvents and emitting them on the events channel.
 //
+// ⚠️ D-035: since the debounce became universal, ONLY tail walks this loop
+// (see debounceEnabled). tail is fail-closed blocked upstream (IC-BUG-46:
+// CP rejects the rule with 422, the executor refuses tail tasks), so in
+// practice no production watcher reaches here today; the loop is kept
+// deliberately because it is the path IC-15 (the correct tail
+// implementation) will build on, and because the real-time semantics pinned
+// by its tests (emitBlocking backpressure, seen deliberately not written,
+// overflow rescan retry) live here.
+//
 // IC-BUG-47: both send sites below use emitBlocking. The earlier non-blocking
 // emit dropped events whenever the consumer channel (buffer 64) was full — a
 // dropped create/write event means that file is never collected, because its
 // mtime/size do not change again and no further event fires. Backpressure is
 // the correct semantics here, as it already is for pollScan (PR #100 F1) and
-// runCloseWait.
+// runDebounced.
 //
 // Known trade-off (IC-BUG-47 + IC-BUG-44, accepted): while the send blocks,
 // fw.Events is not drained, so fsnotify's backend stops reading the kernel
@@ -339,8 +382,9 @@ func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *
 	return w.loopFsnotify(ctx, events, seen, fw.Events, fw.Errors)
 }
 
-// loopFsnotify is the plain (non-close_wait) fsnotify event loop proper. The
-// event and error channels are parameters so tests can drive the loop
+// loopFsnotify is the real-time (non-debounced) fsnotify event loop proper.
+// Since D-035 only tail mode reaches it (see runFsnotify). The event and
+// error channels are parameters so tests can drive the loop
 // deterministically without a live fsnotify backend (whose channel lifecycle
 // would race with test-side injections).
 func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, evc <-chan fsnotify.Event, erc <-chan error) error {
@@ -373,18 +417,23 @@ func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, see
 					// would be UNBOUNDED silent loss. Trading unbounded for
 					// bounded is what this fix is for.
 					//
-					// Asymmetry vs. close_wait, on purpose: the close_wait
-					// flush/recheck/scan path keeps recording seen because
-					// (1) the exactly-once claim arbitration (F3) depends on
-					// the seen write, and (2) that path's "no retry after a
-					// downstream failure" behaviour predates this knife —
-					// it is not a regression introduced here. Only the
-					// real-time path's behaviour changed (F1 added markSeen,
-					// which P1 reverts).
+					// Asymmetry vs. the debounced path, on purpose: the
+					// debounce flush/recheck/scan path keeps recording seen
+					// because (1) the exactly-once claim arbitration (F3)
+					// depends on the seen write, and (2) that path's "no
+					// retry after a downstream failure" behaviour predates
+					// this reasoning — close_wait always accepted it, and
+					// since D-035 overwrite accepts it too (its explicitly
+					// documented cost: the overflow rescan no longer retries
+					// overwrite's silent downstream failures — see the flush
+					// comment in loopDebounced and D-035's 权衡 section).
+					// Only the real-time path's behaviour changed (F1 added
+					// markSeen, which P1 reverts).
 					//
 					// NOTE (PR #108 review F3): this loop deliberately does
 					// NOT participate in claimDelivery/completeDelivery. In
-					// non-close_wait mode there are no debounce rechecks and
+					// tail mode (the only mode left here) there are no
+					// debounce rechecks and
 					// no flush, and handleWatchError (→ safetyNetRescan →
 					// pollScan) is invoked from THIS select loop, so the
 					// real-time delivery and the rescan's scanFile run on
@@ -432,10 +481,10 @@ func (w *Watcher) runPolling(ctx context.Context, events chan<- FileEvent) error
 
 // pollScan walks the source directory and emits events for new/changed files.
 // It returns the paths that were skipped because they are still inside the
-// close_wait debounce window (empty outside close_wait mode). On the polling
-// path the caller ignores the result — the next tick re-checks those files
-// anyway; on the fsnotify path the caller arms one-shot recheck timers for
-// them so a file whose writer exited during the window is still collected
+// debounce window (empty in tail mode, the only non-debounced mode). On the
+// polling path the caller ignores the result — the next tick re-checks those
+// files anyway; on the fsnotify path the caller arms one-shot recheck timers
+// for them so a file whose writer exited during the window is still collected
 // (IC-BUG-43).
 func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time) []string {
 	var skipped []string
@@ -450,14 +499,15 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 		if err != nil {
 			return nil
 		}
-		// close_wait must never emit a file that is still being written: the
-		// scan path bypasses the debounce timer in runCloseWait, so emitting
-		// here would upload a truncated file under its own {time} storage key
+		// Debounced modes (tail 以外的所有模式, D-035) must never emit a file
+		// that is still being written: the scan path bypasses the debounce
+		// timer in loopDebounced, so emitting here would upload a truncated
+		// file under its own {time} storage key
 		// that the later full upload never overwrites (PR #100 review F2).
 		// The path is returned to the caller: on the fsnotify path a one-shot
 		// recheck re-examines it once the debounce window has passed
 		// (IC-BUG-43); on the polling path the next tick does.
-		if w.appendMode == AppendModeCloseWait && time.Since(info.ModTime()) < w.debounceWindow() {
+		if w.debounceEnabled() && time.Since(info.ModTime()) < w.debounceWindow() {
 			skipped = append(skipped, path)
 			return nil
 		}
@@ -554,7 +604,7 @@ func (w *Watcher) markSeen(seen map[string]time.Time, path string, modTime time.
 // claimDelivery atomically claims the right to deliver one version (mtime)
 // of path — PR #108 review F3. Several goroutines run the same non-atomic
 // "check seen → send → record seen" sequence for the same file: the
-// close_wait debounce flush (timer goroutine), the debounce recheck (timer
+// debounce flush (timer goroutine), the debounce recheck (timer
 // goroutine) and the overflow-rescan scan (event-loop goroutine). Without
 // arbitration two of them can deliver the same version twice. The claim
 // does the seen check and the placeholder insert in ONE locked section;
@@ -596,8 +646,8 @@ func (w *Watcher) claimDelivery(seen map[string]time.Time, path string, modTime 
 //
 // Rollback (delivered=false) happens only when emitBlocking fails, and
 // emitBlocking fails only on ctx cancellation — i.e. on the shutdown path
-// (agent stop / rule cancel / hot reload). There is no periodic scan in
-// close_wait mode, so "the next scan retries it" is NOT available at
+// (agent stop / rule cancel / hot reload). Debounced modes have no periodic
+// scan, so "the next scan retries it" is NOT available at
 // runtime; what actually closes the loop is the shutdown itself: after a
 // reload or restart the new Watcher starts with a fresh seen map and its
 // initial scan re-discovers the file (scheduling a fresh recheck if it is
@@ -632,16 +682,16 @@ func (w *Watcher) stopAllRechecks() {
 	}
 }
 
-// stopPendingTimers stops every live close_wait debounce timer in pending.
-// Called on every exit path of loopCloseWait.
-func stopPendingTimers(pending map[string]*closeWaitPending) {
+// stopPendingTimers stops every live debounce timer in pending.
+// Called on every exit path of loopDebounced.
+func stopPendingTimers(pending map[string]*debouncePending) {
 	for _, p := range pending {
 		p.timer.Stop()
 	}
 }
 
 // handleWatchError reacts to an error delivered on fw.Errors; it is shared by
-// the runFsnotify and runCloseWait event loops. Overflow errors mean the
+// the runFsnotify and runDebounced event loops. Overflow errors mean the
 // kernel/OS watch queue dropped queued events while no one was draining
 // fw.Events, so the only recovery is a safety-net rescan of the watched tree:
 // any file created or modified during the overflow window is re-discovered by
@@ -679,14 +729,14 @@ func (w *Watcher) handleWatchError(ctx context.Context, events chan<- FileEvent,
 // been recorded in seen — for the real-time path that is every file whose
 // downstream enqueue did not durably succeed, and the rescan is those
 // files' retry opportunity. It DOES skip files already in seen (initial
-// scan, close_wait deliveries, earlier rescan rounds) — see IC-BUG-53 for
+// scan, debounced deliveries, earlier rescan rounds) — see IC-BUG-53 for
 // the watcher-side residual gap that implies.
 func (w *Watcher) safetyNetRescan(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time) {
 	w.scheduleDebounceRechecks(ctx, events, seen, w.pollScan(ctx, events, seen))
 }
 
 // scheduleDebounceRechecks arms one-shot recheck timers for the paths the
-// scan skipped because they were still inside the close_wait debounce window
+// scan skipped because they were still inside the debounce window
 // (see pollScan).
 func (w *Watcher) scheduleDebounceRechecks(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, paths []string) {
 	for _, path := range paths {
@@ -694,14 +744,14 @@ func (w *Watcher) scheduleDebounceRechecks(ctx context.Context, events chan<- Fi
 	}
 }
 
-// debounceRecheckGrace pads the recheck deadline past the close_wait debounce
+// debounceRecheckGrace pads the recheck deadline past the debounce
 // window so the quiet check at fire time does not race the writer's final
 // flush.
 const debounceRecheckGrace = 100 * time.Millisecond
 
 // scheduleDebounceRecheck arms a one-shot timer that re-examines path once
-// the close_wait debounce window has passed (IC-BUG-43). Without it, a file
-// whose writer finished and exited within closeWaitDebounce of watcher
+// the debounce window has passed (IC-BUG-43). Without it, a file
+// whose writer finished and exited within defaultDebounceWindow of watcher
 // startup would never be collected: the scan skips it (PR #100 review F2),
 // no fsnotify event ever fires for it again, and nothing else looks at it.
 // Re-arming for a path that already has a live timer replaces the timer.
@@ -757,14 +807,14 @@ func (w *Watcher) settleRecheck(path string, gen uint64) {
 // recheckAfterDebounce is the timer callback for scheduleDebounceRecheck: it
 // re-examines a previously skipped path and emits it if it has gone quiet.
 // A file that is still hot is left alone — its live Write/Create events
-// drive the runCloseWait debounce flush instead.
+// drive the debounce flush in loopDebounced instead.
 func (w *Watcher) recheckAfterDebounce(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, path string) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return // gone; nothing to collect
 	}
 	// F2 invariant (PR #100): never emit a file that may still be written.
-	if w.appendMode == AppendModeCloseWait && time.Since(info.ModTime()) < w.debounceWindow() {
+	if w.debounceEnabled() && time.Since(info.ModTime()) < w.debounceWindow() {
 		return
 	}
 	// errWalkAborted only means ctx was cancelled; the timer callback has
@@ -807,7 +857,7 @@ func (w *Watcher) buildEvent(path, op string) (FileEvent, error) {
 // takes it or ctx is cancelled. It returns false only when the context was
 // cancelled before the event could be delivered. Backpressure is the correct
 // semantics for ALL event paths — the initial scan (PR #100 F1), the
-// close_wait debounce flush, and the real-time fsnotify loop (IC-BUG-47) —
+// debounce flush, and the real-time fsnotify loop (IC-BUG-47) —
 // because a dropped event means the file is never collected: the consumer
 // keeps draining, so blocking only delays delivery, it never loses it (this
 // holds at the watcher level; the OS layer below fsnotify has its own loss

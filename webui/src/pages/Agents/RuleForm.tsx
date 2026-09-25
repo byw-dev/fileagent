@@ -461,7 +461,7 @@ function AgentRuleFormPage() {
             label="上传模式"
             initialValue={initial.append_mode}
             options={[
-              { label: 'overwrite（全量）', value: 'overwrite' },
+              { label: 'overwrite（全量，写入静默 500ms 后上传）', value: 'overwrite' },
               {
                 // IC-BUG-46 fail-closed：tail 当前实现会静默丢数据（增量 PutObject 整体替换对象），
                 // 提交必然被 CP 422 拒绝。保留选项并说明原因，而非悄悄消失；正确实现见 IC-15。
@@ -469,7 +469,7 @@ function AgentRuleFormPage() {
                 value: 'tail',
                 disabled: true,
               },
-              { label: 'close_wait（写完后上传）', value: 'close_wait' },
+              { label: 'close_wait（= overwrite 的别名，保留兼容）', value: 'close_wait' },
             ]}
           />
 

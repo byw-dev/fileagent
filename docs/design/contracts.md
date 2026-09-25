@@ -58,13 +58,14 @@
 
 | 值 | 说明 |
 |----|------|
-| `overwrite`  | 每次变更上传整文件（**默认**：空字符串会被补齐为 `overwrite`） |
-| `tail`       | 追踪字节偏移，仅上传新增部分（断点续传） |
-| `close_wait` | 防抖：Write/Create 事件静默一段时间后再整文件上传（写完再传） |
+| `overwrite`  | 整文件上传（**默认**：空字符串会被补齐为 `overwrite`）。**防抖**（D-035）：Write/Create 事件静默 500ms 后整文件上传一次，不再每个事件传一次 |
+| `tail`       | 追踪字节偏移，仅上传新增部分（断点续传）。⚠️ 当前 fail-closed 停用（IC-BUG-46），正确实现见 IC-15 |
+| `close_wait` | **`overwrite` 的别名，保留兼容**（D-035）：防抖普适后两者下游行为完全相同，仅存量规则与已落库行仍携带此值 |
 
 - **值域权威在 Agent watcher**（非 CP：`append_mode` 是自由 TEXT，CP 不做枚举校验，仅默认补齐）：
-  `agent/internal/watcher/watcher.go:44`（`AppendModeOverwrite` / `AppendModeTail` / `AppendModeCloseWait` 常量）
-- webui 选项清单镜像：`webui/src/pages/Agents/RuleForm.tsx:390`（须与 watcher 常量一致）
+  `agent/internal/watcher/watcher.go`（`AppendModeOverwrite` / `AppendModeTail` / `AppendModeCloseWait` 常量；
+  防抖窗口常量 `defaultDebounceWindow`，谓词 `debounceEnabled`）
+- webui 选项清单镜像：`webui/src/pages/Agents/RuleForm.tsx`（须与 watcher 常量一致）
 - CP 默认补齐逻辑（空→`overwrite`）：`controlplane/internal/api/handler/agents.go:753` 与 `:937`
 
 ### 上传日志状态（upload-log status，前端）
