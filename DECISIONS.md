@@ -2119,7 +2119,8 @@ Error: Process completed with exit code 125.
    **它是交付能力的一部分**。三个决定流程形状的 docker/compose 行为**已实测**
    （2026-09-25，Apple Silicon + Docker Desktop）：`docker save` 按 list digest 引用
    只存当前平台、同一 `name@digest` 引用不能切架构（第二个 `pull --platform` 报
-   `cannot overwrite digest`）——所以导出用**两个子 manifest digest** 各自 pull/save
+   `cannot overwrite digest`，经典 image store 复现；containerd snapshotter 下未验证）
+   ——所以导出用**两个子 manifest digest** 各自 pull/save
    （**一个 tarball 一个架构**）；`docker load` 只恢复镜像内容（Image ID）、
    **不恢复 RepoDigest**，load 后 `name@digest` 在本地解析不到——所以离线侧显式打 tag；
    `export` 的变量只活在当前 shell——所以离线引用写进 **`deploy/.env`**（compose 自动

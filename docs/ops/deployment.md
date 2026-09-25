@@ -54,7 +54,8 @@ docker compose -f deploy/docker-compose.prod.yml pull minio
 
 三个 docker/compose 行为决定了流程形状：
 ① 同一个 `name@<list-digest>` 引用在本地**只能绑定一个架构**，第二个架构的
-`pull --platform` 会报 `cannot overwrite digest` 退出——**同一条命令序列在一台机器上
+`pull --platform` 会报 `cannot overwrite digest` 退出（经典 image store 复现；
+containerd snapshotter 下未验证）——**同一条命令序列在一台机器上
 产不出两份 tarball**，所以导出必须用**两个子 manifest digest** 各自 pull/save
 （不需要 `--platform`，因此也没有 Engine 28+ 的要求）；
 ② **`docker load` 只恢复镜像内容（Image ID），不恢复 RepoDigest**——load 后
@@ -74,7 +75,7 @@ for m in json.load(sys.stdin)["manifests"]:
 # arm64 sha256:4bfdccb8f63715c3f770bbb4dbce51257ff2c48621f015df61072bbca779d1ad
 ```
 
-**导出**（在有网络的机器上，每个架构一份；两个子 digest 各自 pull/save 可在同一台
+**导出**（在有网络的机器上、**仓库根目录**执行，每个架构一份；两个子 digest 各自 pull/save 可在同一台
 机器上共存）：
 
 ```bash
@@ -85,12 +86,16 @@ docker save ghcr.io/byw-dev/minio@sha256:4bfdccb8f63715c3f770bbb4dbce51257ff2c48
 
 # 交付单上记录每个 tarball 的 SHA-256（目标机要比对）：
 shasum -a 256 fileagent-minio-amd64.tar fileagent-minio-arm64.tar
+# 交付单上还要记录两个子 digest 的期望 Image ID（导入块的比较判据）：
+docker image inspect ghcr.io/byw-dev/minio@sha256:a2fe4b45cd4dfab1a1e4e55c0ee425b8c96c17e989c523447c71967444f1c36f --format '{{.Id}}'
+docker image inspect ghcr.io/byw-dev/minio@sha256:4bfdccb8f63715c3f770bbb4dbce51257ff2c48621f015df61072bbca779d1ad --format '{{.Id}}'
 ```
 
-**导入**（在目标机器上，整块可粘贴——两个期望 Image ID 已按架构内联；Image ID 是
-镜像 config 的 digest、与传输方式无关，由导出机 `docker image inspect <子digest>
+**导入**（在目标机器上、**仓库根目录**执行，整块可粘贴——两个期望 Image ID 已按架构内联；
+Image ID 是镜像 config 的 digest、与传输方式无关，由导出机 `docker image inspect <子digest>
 --format '{{.Id}}'` 得到并随交付单给出，amd64/a2c4bb0a… 与 arm64/adffe052… 即
-2026-09-25 实测值）：
+2026-09-25 实测值。块内含 `exit`：建议把这一段**存成脚本执行**，直接粘进交互式
+SSH 会话的话，比较失败的 `exit 1` 会把会话一起踢掉）：
 
 ```bash
 case "$(uname -m)" in
@@ -102,6 +107,10 @@ esac
 # （冗余保险）tarball SHA-256 与交付单人工核对；权威判据是下面的 Image ID 比较。
 shasum -a 256 "$TARBALL"
 
+# 下方 sed 的前提：我们的 tarball 按 digest 保存、**不带 tag**，所以 `docker load -q`
+# 的输出形如 `Loaded image ID: sha256:…`。若改按 tag 导出，输出会变成
+# `Loaded image: name:tag`，这个 sed 抓不到、下面的比较会失败（fail-closed，安全——
+# 但报错文案会让人以为镜像不符，其实是 tarball 形态不对）。
 LOADED_ID="$(docker load -q -i "$TARBALL" | sed -E 's/^Loaded image ID: //')"
 [ "$LOADED_ID" = "$EXPECTED_IMAGE_ID" ] || { echo "镜像与交付单不符：got $LOADED_ID, want $EXPECTED_IMAGE_ID" >&2; exit 1; }
 
@@ -110,17 +119,35 @@ docker tag "$LOADED_ID" fileagent-minio:RELEASE.2025-04-22T22-12-26Z
 # 让 compose 用这份本地镜像：写进 deploy/.env（compose 自动加载，新 shell / 宿主
 # 重启后依然生效）。⚠️ 只追加，不要覆盖整个 .env——里面还有 A.1 的其他变量。
 grep -q '^FA_MINIO_IMAGE=' deploy/.env 2>/dev/null || printf '\n# 离线镜像引用（离线交付才设；在线环境必须删除本行，见 docs/ops/deployment.md §0.1②）\nFA_MINIO_IMAGE=fileagent-minio:RELEASE.2025-04-22T22-12-26Z\n' >> deploy/.env
-
-docker compose -f deploy/docker-compose.prod.yml up -d minio
 ```
 
-> ⚠️ **实测范围，精确限定（2026-09-25，Apple Silicon + Docker Desktop）**：
-> 已实测——`docker manifest inspect` 推导子 digest（上方输出为真实输出）；
-> `docker load -q | sed` 抓 Image ID 的管道；`deploy/.env` 被 compose 自动加载
-> （从仓库根与 `deploy/` 两种 cwd 渲染均正确）；不设 `FA_MINIO_IMAGE` 时三份
-> compose 用钉定 digest、与改前逐字节等价。**未实测**——两个子 digest 的
-> `docker pull` / `docker save` 与端到端导入（其 pull 与共存由协调者在真镜像上
-> 实测通过；save 本体不在本机重跑）。
+镜像就位后，按 §A.1 填完 `deploy/.env`，再执行
+`docker compose -f deploy/docker-compose.prod.yml up -d minio`。这一条**不能**并进上面的块：
+`docker-compose.prod.yml` 的 `${MINIO_PUBLIC_ENDPOINT:?…}` 是**整文件插值**——即使只起 `minio`
+一个服务也会被拦，而 §0.1 排在 §A.1（建 `deploy/.env`、填该变量）之前，全新现场照顺序
+粘贴到这一行必然报
+`error while interpolating …: MINIO_PUBLIC_ENDPOINT: required variable … is missing a value`
+（失败响亮、不留错误状态，所以「整块可粘贴」以上面这个块为界，`up` 在 §A.1 之后）。
+
+> ⚠️ **实测范围，逐项记录（2026-09-25，Apple Silicon + Docker Desktop，经典 image
+> store / overlay2）**——下列每条都给出实际执行结果与证据，「未覆盖」单列，
+> 不做任何总括式的「都实测过」：
+>
+> - **已执行**：`docker manifest inspect` 推导两个子 digest——上方代码块的注释即真实输出。
+> - **已执行**：两个子 digest 的 `docker pull` + `docker save` 在同一台机器上成功共存：
+>   amd64 tarball **183788544 B**、arm64 tarball **175389184 B**（旧流程必失败的那一步现在通了）。
+> - **已执行**：导入块整块逐字执行（`uname -m`=`arm64`，走 arm64 分支）——
+>   `docker load -q | sed` 得 `sha256:adffe052fa1ad81a757cbb753d2208c9459989808c19539891be95eaaac1e5e4`，
+>   与内联期望值逐字符相等、比较通过；`docker tag` 成功；逐字执行「追加 `deploy/.env`」那条命令
+>   （未覆盖既有变量）；`docker compose config` 解析为
+>   `image: fileagent-minio:RELEASE.2025-04-22T22-12-26Z`（不再出现 ghcr 引用）；
+>   最后 `up -d minio` 达 **Healthy**，容器实际 `Image Id=sha256:adffe052…`，全程未访问 GHCR。
+> - **部分执行**：amd64 分支只核对到 tarball 内 `manifest.json` 的 config
+>   （`blobs/sha256/a2c4bb0a…`）——**未 load、未起容器**。
+> - **已执行**：不设 `FA_MINIO_IMAGE` 时三份 compose 渲染为钉定 digest（上一轮逐字节
+>   比对过与改前等价，本轮收尾以 `docker compose config` 复核渲染结果仍为该 digest）。
+> - **未覆盖**：Linux x86_64 宿主上的整块执行；**containerd image store** 下行为①
+>   是否仍成立；`shasum` 与交付单的人工核对（流程外动作）。
 >
 > ⚠️ **在线环境不要设 `FA_MINIO_IMAGE`**（shell 环境与 `deploy/.env` 都算）：
 > 不设时 compose 用本节开头的 digest（CI 与 dev 按 digest 钉住）；设了它会整体
