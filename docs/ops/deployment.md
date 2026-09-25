@@ -35,7 +35,9 @@ ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450
 
 它是一个多架构 manifest list（`linux/amd64` + `linux/arm64`），内容是上游
 `RELEASE.2025-04-22T22-12-26Z`（AGPL-3.0），只加了 provenance 标签，**没有新增层、
-没有执行任何命令**，文件系统与上游逐字节相同。镜像的 `org.opencontainers.image.source`
+没有执行任何命令**（「文件系统与上游逐字节相同」的作用域是我们的构建相对于
+它 `FROM` 的那个基础镜像；整个镜像是否为官方发布那份的对照缺口见
+`DECISIONS.md` D-036「已知缺口」）。镜像的 `org.opencontainers.image.source`
 指向 **`github.com/byw-dev/minio`**（源码，见下方 AGPL 说明），而不是本仓库——
 本仓库只是它的**消费方**（记在 `io.byw.mirror.consumer`）。
 
@@ -48,26 +50,63 @@ docker login ghcr.io -u <github-user>          # 需要 read:packages 的 PAT
 docker compose -f deploy/docker-compose.prod.yml pull minio
 ```
 
-**② 离线 / 客户现场** —— 用交付的 tarball 导入，全程不联网：
+**② 离线 / 客户现场** —— 用交付的 tarball 导入，全程不联网。
+⚠️ 以下每条命令都在 Apple Silicon + Docker Desktop 上实测过（2026-09-25）；
+实测结论决定了流程形状：**`docker save` 按 digest 引用只保存当前平台**（一个 tarball
+一个架构，amd64 与 arm64 要各导一份）；**`docker load` 只恢复镜像内容（Image ID），
+不恢复 RepoDigest**——load 后 `name@sha256:…` 引用在本地**解析不到**，compose 会转而
+访问 GHCR。所以离线侧必须显式打 tag，并用环境变量 `FA_MINIO_IMAGE` 指给 compose
+（这是离线交付的逃生舱，不是给人随便换镜像用的；不设该变量时三个 compose 仍按
+digest 钉住，行为与本节开头逐字节一致）：
 
 ```bash
-# 在有网络的机器上导出（一次）
-docker pull ghcr.io/byw-dev/minio@sha256:a66e1fd7…
-docker save ghcr.io/byw-dev/minio@sha256:a66e1fd7… -o fileagent-minio.tar
+# 在有网络的机器上导出（每个架构一份；--platform 必须显式给）：
+docker pull --platform linux/amd64 ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee
+docker save --platform linux/amd64 ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee -o fileagent-minio-amd64.tar
+docker pull --platform linux/arm64 ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee
+docker save --platform linux/arm64 ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee -o fileagent-minio-arm64.tar
 
-# 在目标机器上导入
-docker load -i fileagent-minio.tar
-# 校验导入的正是钉定的那一份（digest 必须完全相同）
-docker image inspect ghcr.io/byw-dev/minio@sha256:a66e1fd7… --format '{{.Id}}'
+# tarball 自身的完整性校验值随交付一起提供（交付单里记录，目标机上比对）：
+shasum -a 256 fileagent-minio-amd64.tar fileagent-minio-arm64.tar
 ```
 
+```bash
+# 在目标机器上导入（按机器架构选对应 tarball）：
+shasum -a 256 fileagent-minio-amd64.tar        # 与交付单记录的 SHA-256 比对，不一致即停止
+docker load -i fileagent-minio-amd64.tar
+# load 输出的是 Image ID（悬空镜像，无 tag、无 RepoDigest）——显式打 tag：
+docker tag <load 打出的 Image ID> fileagent-minio:RELEASE.2025-04-22T22-12-26Z
+export FA_MINIO_IMAGE=fileagent-minio:RELEASE.2025-04-22T22-12-26Z
+
+# 导入校验：Image ID 与交付单记录的期望值比较（不相等就退出，不要硬起）：
+#   linux/amd64 期望 sha256:a2c4bb0ac69eca344c26b8ceb07f1cf9eb2afdef55157ea5d045b56e150e0f9e
+#   linux/arm64 期望 sha256:adffe052fa1ad81a757cbb753d2208c9459989808c19539891be95eaaac1e5e4
+ACTUAL="$(docker image inspect fileagent-minio:RELEASE.2025-04-22T22-12-26Z --format '{{.Id}}')"
+EXPECTED="<见上，按架构取>"
+[ "$ACTUAL" = "$EXPECTED" ] || { echo "镜像与交付单不符：$ACTUAL" >&2; exit 1; }
+
+docker compose -f deploy/docker-compose.prod.yml up -d minio
+```
+
+> ⚠️ **在线环境不要设 `FA_MINIO_IMAGE`**：不设时 compose 用 §0.1 开头的 digest
+> （三个 compose 逐字节等价已用 `docker compose config` 前后对比验证过）；
+> 设了它会整体覆盖 digest 钉定，绕过「按 digest 钉」的意图。
+
 > ⚠️ **AGPL-3.0 的分发义务**：本系统是私有化交付，交付物里包含 MinIO，因此
-> **随交付必须提供 AGPL-3.0 许可副本与对应源码的获取途径**。
+> 随交付**应当提供 AGPL-3.0 许可副本与对应源码的获取途径**。如何满足 AGPLv3 §6
+> 取决于 conveyance 方式（该条列了 6(a)–(e) 多种路径，且「Corresponding Source」
+> 的定义还包含控制生成、安装、运行所需的脚本）——**这不是技术证据能单方下结论的事，
+> 本节描述的是本项目选择的合规方案，是否充分待法务确认**。
 >
-> **对应源码就在我们自己手上**：`github.com/byw-dev/minio`（MinIO 官方源码的 fork，
+> **本项目选择的方案**：`github.com/byw-dev/minio`（MinIO 官方源码的 fork，
 > 已同步全部 tag）的 tag **`RELEASE.2025-04-22T22-12-26Z`**——与上面这个镜像一一对应。
-> 该仓库是**公开**的（fork 只能与上游保持一致的可见性），这正好使它成为可直接交给客户的
-> 源码获取途径。**二进制私有、源码公开**，是刻意的拆分。
+> 该仓库是**公开**的（fork 只能与上游保持一致的可见性）。**二进制私有、源码公开**，
+> 是本项目当前选择的拆分。
+>
+> **实际随交付提供的物项（待法务逐项确认的清单，不是已达标的结论）**：
+> ① AGPL-3.0 许可副本；② 源码获取途径（上述公开 tag，及归档快照）；③
+> 交付 tarball 的构建方式说明；④ 源码的可获得期限。任一项若法务认定不充分，
+> 需另行补足（例如随交付附源码归档包）。
 >
 > 上游 MinIO 仓库已归档，所以**长期保有那份源码的责任在我们这边**——不要指望上游还在。
 > 详见 `DECISIONS.md` D-036。

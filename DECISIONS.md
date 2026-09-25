@@ -2083,10 +2083,15 @@ Error: Process completed with exit code 125.
 5. **源码自持，且 package 关联到源码仓而不是本仓库**。
    `byw-dev/minio` 是 MinIO 官方源码的 fork（已同步全部 tag，含我们钉定的
    `RELEASE.2025-04-22T22-12-26Z`，commit `0d7408f`；该 tag 与 `master` 的 `LICENSE`
-   均为 AGPL-3.0）。**它是公开的**——fork 只能与上游保持一致的可见性。这不是遗憾而是收益：
-   **它就是我们对外的 AGPL §6「对应源码」提供途径**，而且在我们自己手上。
-   如果把它改成私有（删 fork、本地 clone 后 push 进私有 repo），合规成本反而上升——
-   得逐个客户随交付附源码包。**结论：二进制私有、源码公开，这是正确的拆分。**
+   均为 AGPL-3.0）。**它是公开的**——fork 只能与上游保持一致的可见性。
+   **本项目把它选择为对外提供对应源码的途径**；该方案（以及下文的拆分方式）是否满足
+   AGPLv3 §6 的全部要求——§6 按 conveyance 方式列了 6(a)–(e) 多条路径，
+   且「Corresponding Source」的定义还包括控制生成、安装、运行所需的脚本——
+   **属法律判断，待法务确认，本决策只记录技术事实与选择，不构成合规结论**。
+   若把它改成私有（删 fork、本地 clone 后 push 进私有 repo），「公开 fork」这条途径
+   即不复存在，届时需要另行设计并落实对应的提供方式（例如逐客户随交付附源码归档包）；
+   不同方案的成本与充分性比较同样待法务确认。
+   **结论：二进制私有、源码公开，是本项目当前选择的拆分（充分性待法务确认）。**
 
    相应地，镜像的 `org.opencontainers.image.source` 指向 **`byw-dev/minio`**，
    **不是** `byw-dev/fileagent`。最初那版指向 fileagent 是**张冠李戴**：
@@ -2097,7 +2102,9 @@ Error: Process completed with exit code 125.
    许可状态作任何主张。
 
 6. **加 provenance 标签，不改内容**。用 LABEL-only 构建（`FROM` + `LABEL`，
-   **不新增层、不执行任何命令**，文件系统与上游逐字节相同）打上
+   **不新增层、不执行任何命令**——「文件系统与上游逐字节相同」说的作用域是
+   **我们的构建相对于它 `FROM` 的那个基础镜像**，不是「相对于官方发布的镜像」，
+   见下方「已知缺口」第 1 条）打上
    `org.opencontainers.image.source`（→ `byw-dev/minio`）、
    `org.opencontainers.image.revision`、`org.opencontainers.image.licenses=AGPL-3.0-only`、
    `io.byw.mirror.upstream-ref`、`io.byw.mirror.source-offer`（钉到 tag 的 tree URL）、
@@ -2108,20 +2115,27 @@ Error: Process completed with exit code 125.
    独立的预检步骤，失败时明确指向本决策并提示「到 package 设置页把本仓库加入
    Actions 访问（Read）」。
 8. **离线交付路径成文**。私有 package 意味着客户现场 `docker compose up` 拉不到镜像，
-   所以 `docs/ops/deployment.md` §0.1 写明 `docker save` / `docker load` 的导入步骤
-   与 digest 校验方法。这不是可选项——**它是交付能力的一部分**。
+   所以 `docs/ops/deployment.md` §0.1 写明离线导入步骤与校验方法。这不是可选项——
+   **它是交付能力的一部分**。§0.1 的每条命令都在 Apple Silicon + Docker Desktop 上
+   实测过（2026-09-25），实测结论决定了流程形状：`docker save` 按 digest 引用只存
+   当前平台（**一个 tarball 一个架构**）；`docker load` 只恢复镜像内容（Image ID）、
+   **不恢复 RepoDigest**，load 后 `name@digest` 在本地解析不到——所以离线侧显式打 tag
+   并用 `FA_MINIO_IMAGE` 环境变量指给 compose（三个 compose 的默认值仍是 digest，
+   不设变量时行为与原样逐字节等价）。
 
 ### 已知缺口（如实记录，不含糊）
 
-1. **amd64 那一份没有上游 digest 可比对**。arm64 那份的 `repoDigests` 是
+1. **amd64 整体镜像缺少上游 manifest / layer 对照**。arm64 那份的 `repoDigests` 是
    `sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e`
    （quay 与 Docker Hub 同值），而 **amd64 那份的 `repoDigests` 为空**——它不是带
    digest 记录从 registry 拉下来的，或记录早已丢失。判断依据只剩「`Created`
-   与该 release 一致、镜像内 `mc` 是同日期同版本的 x86-64 二进制」。几乎确定是正品，
-   但**证据链比 arm64 弱一档**。它是我们能拿到的唯一 amd64 副本，而 CI 必须用它。
+   与该 release 一致、镜像内 `mc` 是同日期同版本的 x86-64 二进制」+ 下方
+   「镜像内二进制已验签」（见其作用域边界）。**这条缺口依然成立**：minisign 验签
+   只覆盖镜像内的 `minio` / `mc` 二进制及其 signed comment，**不能**证明该镜像的
+   config、entrypoint、其余 rootfs 文件与层就是官方发布的那个镜像；它**只有拿到
+   可验证的官方 manifest/config/layer digest 链之后**才能关闭。它是我们能拿到的
+   唯一 amd64 副本，而 CI 必须用它。
 2. **没有升级路径**。官方不再公开发布，**以后 MinIO 出安全补丁我们没有来源**。
-   这是本条的全部内容——**「无法证明这个镜像就是官方那个」已经不再是缺口**，见下方「provenance 已验签」。
-
 3. **GHCR 的三条行为，全部实测，记在这里免得再踩**：
 
    ① **「关联仓库」不等于「授予 Actions 读权限」。** 给镜像打
@@ -2141,15 +2155,29 @@ Error: Process completed with exit code 125.
 
    ④ 上述改关联的操作**不影响** Manage Actions access 授权：改完之后 CI 实跑仍能拉到镜像
    （`byw-dev/fileagent` 的 `GITHUB_TOKEN` 依旧有效）。两套设置相互独立。
-4. **AGPL-3.0 的分发义务落在我们头上**。该 release 是 AGPL-3.0，再分发是允许的，
-   但随交付**必须提供许可副本与对应源码的获取途径**。上游 GitHub 仓库已归档，
-   **长期保有那份源码是我们的责任**——不要指望上游还在。本系统是私有化交付、
-   交付物本身就含 MinIO，所以这条义务躲不掉，只是范围是客户而不是公众。
+4. **AGPL-3.0 的分发义务落在本项目头上**。该 release 是 AGPL-3.0，再分发是允许的，
+   随交付**应当提供许可副本与对应源码的获取途径**；具体提供什么才充分（§6 有多条
+   路径，Corresponding Source 还涵盖构建/安装脚本）**待法务确认**。本项目当前实际
+   提供的物项与待确认清单见 `docs/ops/deployment.md` §0.1 的 AGPL 段。上游 GitHub
+   仓库已归档，**长期保有那份源码是我们的责任**——不要指望上游还在。本系统是私有化
+   交付、交付物本身就含 MinIO，这条义务躲不掉，只是范围是客户而不是公众。
 
-### provenance 已用上游公钥验签通过（2026-09-25）
+### 镜像内二进制已验签通过（2026-09-25）——作用域边界：二进制 provenance，不是镜像 provenance
 
-原先记的缺口是「amd64 那份 `repoDigests` 为空、无法与任何上游 digest 比对，证据链比 arm64 弱一档」。
-**这条已彻底关闭，而且得到的东西比 digest 比对更强**——是**密码学签名**而不是「digest 对得上」。
+**这条验签证明什么、不证明什么，边界如下（第三轮返工 E-2 收窄）：**
+
+- **可以说**：镜像内的 `minio`（linux/amd64 与 linux/arm64）与 `mc`（linux/amd64）
+  两个二进制**及其 signed trusted comment** 已用 MinIO 官方 minisign 公钥验证通过，
+  因此这几个文件**是该 release 的官方产物**。
+- **不可以说**：整个镜像 / 文件系统 / 所有层的 provenance 已关闭或已证明为官方——
+  验签没有覆盖镜像的 config、entrypoint、其余 rootfs 文件与层；那部分仍属于
+  「已知缺口」第 1 条（amd64 整体镜像缺上游 manifest/layer 对照），只有拿到可验证的
+  官方 manifest/config/layer digest 链之后才能关闭。
+
+背景：原先记的缺口是「amd64 那份 `repoDigests` 为空、无法与任何上游 digest 比对，
+证据链比 arm64 弱一档」。**验签把这条缺口里「镜像内两个二进制是不是官方产物」的
+部分关闭了——而且是密码学签名，比「digest 对得上」更强；但整镜像 provenance 的
+缺口仍然开放**，上段边界为准。
 
 关键在于 `byw-dev/minio` 这个源码 fork：它的 `Dockerfile.release` 里写着 MinIO 自己的
 minisign 公钥 `RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav`，
