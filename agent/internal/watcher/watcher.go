@@ -83,6 +83,12 @@ type Watcher struct {
 	// pattern as w.debounce). See sweepEvery.
 	pendingSweepEvery int
 
+	// debounceCallbackStarted and debounceCallbackFinished are per-watcher
+	// test synchronization hooks for the otherwise unobservable callback
+	// scheduling windows around p.mu. They are always nil in production.
+	debounceCallbackStarted  func(string)
+	debounceCallbackFinished func(string)
+
 	// running guards the single-active-Start invariant (see ErrAlreadyRunning
 	// and the Start godoc).
 	running atomic.Bool
@@ -197,10 +203,12 @@ func (w *Watcher) sweepEvery() int {
 // per-event budget with NO historically derived term, so nothing can
 // bootstrap.)
 //
-// Deleting fired entries here is safe: fired means the flush fully completed
-// (no live timer — a re-armed entry had fired cleared by Reset — and no flush
-// still running), and the timer closure captured only p and path, never the
-// map.
+// Deleting fired entries here is safe because debouncePending maintains this
+// invariant under p.mu: fired=true implies that the current generation has no
+// armed timer and no running flush. Re-arming first advances gen and clears
+// fired; an older callback checks its captured generation both before and
+// after flush, so it can neither flush after a newer arm nor publish fired
+// after a newer arm. Therefore an entry deleted here can never flush again.
 //
 // Boundedness, honestly stated (D-035): a sweep retains only the entries it
 // observed as still active (unflushed); post-sweep len(pending) is AT MOST
@@ -345,16 +353,18 @@ func (w *Watcher) runDebounced(ctx context.Context, events chan<- FileEvent, fw 
 // debouncePending is one file's in-flight debounce state.
 type debouncePending struct {
 	timer *time.Timer
-	// mu guards op and fired: the loop goroutine updates them on every
-	// event while a firing timer goroutine reads op for the flush and
-	// writes fired after it.
+	// mu guards op, gen and fired: the loop goroutine updates them on every
+	// event while timer goroutines validate their captured generation.
 	mu sync.Mutex
 	op string
-	// fired is set (under mu) by the timer callback AFTER flush returns, so
-	// "fired" always means "this entry's flush has fully completed". The
-	// loop clears it on Reset (re-armed ⇒ alive again). The amortized sweep
-	// only deletes fired entries, so it can never drop an entry whose timer
-	// is armed or whose flush is still running.
+	// gen identifies the one-shot timer that is currently armed. Every event
+	// stops the previous timer, advances gen and installs a new timer whose
+	// closure captures that generation. A callback checks gen before flush
+	// and again after flush, closing both Reset-vs-callback interleavings.
+	gen uint64
+	// fired is true only after the current generation's flush returns. Thus
+	// fired=true implies there is neither an armed timer nor a running flush;
+	// sweepPendingIfDue may safely delete exactly those entries.
 	fired bool
 }
 
@@ -414,6 +424,32 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 			delivered = true
 		}
 	}
+	armTimer := func(p *debouncePending, path string, gen uint64) *time.Timer {
+		return time.AfterFunc(w.debounceWindow(), func() {
+			if w.debounceCallbackStarted != nil {
+				w.debounceCallbackStarted(path)
+			}
+			p.mu.Lock()
+			if gen != p.gen {
+				p.mu.Unlock()
+				if w.debounceCallbackFinished != nil {
+					w.debounceCallbackFinished(path)
+				}
+				return
+			}
+			op := p.op
+			p.mu.Unlock()
+			flush(path, op)
+			p.mu.Lock()
+			if gen == p.gen {
+				p.fired = true
+			}
+			p.mu.Unlock()
+			if w.debounceCallbackFinished != nil {
+				w.debounceCallbackFinished(path)
+			}
+		})
+	}
 
 	for {
 		select {
@@ -454,38 +490,30 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 				}
 			case ev.Has(fsnotify.Create) || ev.Has(fsnotify.Write):
 				if w.matchGlob(ev.Name) {
+					path := ev.Name
 					op := opString(ev)
 					w.seenMu.Lock()
-					if p, ok := w.pending[ev.Name]; ok {
-						// Re-arm the existing entry: Reset extends the
-						// quiet window and clears fired — the entry is
-						// alive again, so the sweep must spare it.
-						p.timer.Reset(w.debounceWindow())
+					if p, ok := w.pending[path]; ok {
+						// Re-arm with a new one-shot timer and generation.
+						// Reusing Timer.Reset cannot tell an already-running
+						// callback from the newly armed firing; generation
+						// checks make that distinction explicit.
+						p.timer.Stop()
 						p.mu.Lock()
 						p.op = op
+						p.gen++
+						gen := p.gen
 						p.fired = false
+						p.timer = armTimer(p, path, gen)
 						p.mu.Unlock()
 						w.seenMu.Unlock()
 					} else {
 						w.seenMu.Unlock()
-						path := ev.Name // capture for closure
-						p := &debouncePending{op: op}
+						p := &debouncePending{op: op, gen: 1}
 						w.seenMu.Lock()
 						w.pending[path] = p
 						w.seenMu.Unlock()
-						p.timer = time.AfterFunc(w.debounceWindow(), func() {
-							p.mu.Lock()
-							op := p.op
-							p.mu.Unlock()
-							flush(path, op)
-							// Mark fired only AFTER flush returned: fired
-							// means "flush fully completed", which is what
-							// makes the sweep's delete safe (no live timer,
-							// no in-flight flush behind the entry).
-							p.mu.Lock()
-							p.fired = true
-							p.mu.Unlock()
-						})
+						p.timer = armTimer(p, path, p.gen)
 					}
 				}
 			}

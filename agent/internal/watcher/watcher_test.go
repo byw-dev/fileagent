@@ -2292,6 +2292,181 @@ func TestDebounced_PendingRearmed_SurvivesSweep(t *testing.T) {
 	}
 }
 
+// AUD-9 review P1: if a callback is blocked in emitBlocking, a later Write
+// re-arms the same timer. When the old callback returns it must not mark the
+// entry collectible: a sweep may only delete an entry with neither an armed
+// timer nor a running flush behind it.
+func TestDebounced_RearmWhileFlushBlocked_SweepKeepsEntry(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "blocked-flush.log")
+	require.NoError(t, os.WriteFile(path, []byte("v1"), 0o644))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 100 * time.Millisecond
+	w.pendingSweepEvery = 4
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent) // unbuffered: park the first flush in emitBlocking
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	callbackFinished := make(chan struct{}, 1)
+	w.debounceCallbackFinished = func(callbackPath string) {
+		if callbackPath == path {
+			select {
+			case callbackFinished <- struct{}{}:
+			default:
+			}
+		}
+	}
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		_, blocked := w.inflight[path]
+		return blocked
+	}, time.Second, time.Millisecond, "first flush never reached emitBlocking")
+
+	// Re-arm while the old callback is still blocked in flush.
+	require.NoError(t, os.WriteFile(path, []byte("version-two"), 0o644))
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		p := w.pending[path]
+		w.seenMu.Unlock()
+		if p == nil {
+			return false
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.op == "write" && !p.fired
+	}, time.Second, time.Millisecond, "Reset did not finish before the blocked flush was released")
+	<-events // let the old callback return only after Reset has completed
+	select {
+	case <-callbackFinished:
+	case <-time.After(time.Second):
+		t.Fatal("old callback did not publish its completed state")
+	}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return w.pendingSweepTick == 2
+	}, time.Second, time.Millisecond, "Create and re-arming Write were not both charged before the forced sweep")
+
+	// Finish the current sweep budget with unmatched events. They do not add
+	// pending entries, so the target must still be present after tick resets.
+	evc <- fsnotify.Event{Name: filepath.Join(dir, "ignored.tmp"), Op: fsnotify.Write}
+	evc <- fsnotify.Event{Name: filepath.Join(dir, "ignored-2.tmp"), Op: fsnotify.Write}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return w.pendingSweepTick == 0
+	}, time.Second, time.Millisecond, "sweep did not run")
+
+	w.seenMu.Lock()
+	_, stillPending := w.pending[path]
+	w.seenMu.Unlock()
+	assert.True(t, stillPending,
+		"sweep removed the re-armed pending entry; its orphan timer can now upload an intermediate file version")
+}
+
+// AUD-9 review P1, second interleaving: Reset may win after AfterFunc has
+// scheduled its callback but before that callback takes p.mu. The callback
+// must still identify itself as the older firing and leave fired false after
+// its flush, because Reset armed a newer firing in the meantime.
+func TestDebounced_RearmBeforeCallbackLock_SweepKeepsEntry(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "before-lock.log")
+	require.NoError(t, os.WriteFile(path, []byte("v1"), 0o644))
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+
+	callbackEntered := make(chan struct{}, 1)
+	releaseCallback := make(chan struct{})
+	callbackFinished := make(chan struct{}, 1)
+	w.debounceCallbackStarted = func(callbackPath string) {
+		if callbackPath != path {
+			return
+		}
+		select {
+		case callbackEntered <- struct{}{}:
+		default:
+		}
+		<-releaseCallback
+	}
+	w.debounceCallbackFinished = func(callbackPath string) {
+		if callbackPath == path {
+			select {
+			case callbackFinished <- struct{}{}:
+			default:
+			}
+		}
+	}
+	w.debounce = 100 * time.Millisecond
+	w.pendingSweepEvery = 3
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
+	select {
+	case <-callbackEntered:
+	case <-time.After(time.Second):
+		t.Fatal("timer callback did not reach the before-lock synchronization point")
+	}
+
+	// The callback is alive but has not read any pending state. Reset must
+	// record a newer arm that this older firing cannot later declare idle.
+	require.NoError(t, os.WriteFile(path, []byte("version-two"), 0o644))
+	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		p := w.pending[path]
+		w.seenMu.Unlock()
+		if p == nil {
+			return false
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.op == "write" && !p.fired
+	}, time.Second, time.Millisecond, "Reset did not finish while the callback was parked before p.mu")
+	close(releaseCallback)
+	select {
+	case <-callbackFinished:
+	case <-time.After(time.Second):
+		t.Fatal("stale callback did not return after its generation check")
+	}
+	select {
+	case fe := <-events:
+		t.Fatalf("stale callback uploaded an intermediate file version before the re-armed timer fired: size=%d", fe.Size)
+	default:
+	}
+
+	// The third processed event runs the sweep without creating another
+	// pending entry.
+	evc <- fsnotify.Event{Name: filepath.Join(dir, "ignored.tmp"), Op: fsnotify.Write}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return w.pendingSweepTick == 0
+	}, time.Second, time.Millisecond, "sweep did not run")
+
+	w.seenMu.Lock()
+	_, stillPending := w.pending[path]
+	w.seenMu.Unlock()
+	assert.True(t, stillPending,
+		"sweep removed an entry whose callback started before Reset took the lock; the orphan timer can upload an intermediate file version")
+}
+
 // Rework R-2 recorded decision: a file removed or renamed within the debounce
 // window after its last write is NEVER collected — the pending flush is
 // cancelled and only a bare remove event goes out. Pins the decision so that

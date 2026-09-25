@@ -332,11 +332,20 @@ BULK_SHA="$(sha256_of "$WORK/stage/bulk.csv")"
 bulk_is_indexed() { psql_q "select 1 from file_entries where file_name='bulk.csv' and status='completed'" | grep -q 1; }
 wait_for "bulk.csv（16MB，cp 直写）进入索引" 120 bulk_is_indexed
 
-BULK_UPLOADS="$(psql_q "select count(*) from upload_logs where storage_path like 'smoke/%bulk.csv'")"
-[ "$BULK_UPLOADS" = "1" ] || fail "bulk.csv 的 upload_logs 有 $BULK_UPLOADS 条，期望 1 条 —— 分块写被逐事件上传（写放大回归，AUD-9）"
+# 进入索引只证明第一次上传完成；晚到的第二次上传仍可能在路上。再跨过
+# 三个 1s 观察间隔，要求每轮终态计数都稳定为 1，才能排除延迟写放大。
+for BULK_STABLE_ROUND in 1 2 3; do
+  sleep 1
+  BULK_UPLOADS="$(psql_q "select count(*) from upload_logs where storage_path like 'smoke/%bulk.csv'")"
+  case "$BULK_UPLOADS" in
+    1) ;;
+    0) fail "bulk.csv 已进索引但 upload_logs 仍为 0（终态确认第 ${BULK_STABLE_ROUND}/3 轮）" ;;
+    *) fail "bulk.csv 多传了：upload_logs 已有 $BULK_UPLOADS 条，期望终态恰好 1 条（写放大回归，AUD-9）" ;;
+  esac
+done
 BULK_DB_SHA="$(psql_q "select coalesce(sha256::text,'<null>') from file_entries where file_name='bulk.csv' limit 1")"
 [ "$BULK_DB_SHA" = "$BULK_SHA" ] || fail "bulk.csv 索引的 sha256 与源文件不符：$BULK_DB_SHA != $BULK_SHA —— 上传了写到一半的内容（截断上传回归）"
-ok "16MB 分块写恰好上传 1 次且 sha256 与源文件一致（无写放大、无截断上传）"
+ok "16MB 分块写终态连续 3 轮均为 1 次上传，且 sha256 与源文件一致（无写放大、无截断上传）"
 
 # ── webhook 投递（配置契约护栏）────────────────────────────────────────────
 # 上面所有断言都要求 source='agent'，也就是**主路径**。这意味着 webhook 整条
