@@ -51,46 +51,81 @@ docker compose -f deploy/docker-compose.prod.yml pull minio
 ```
 
 **② 离线 / 客户现场** —— 用交付的 tarball 导入，全程不联网。
-⚠️ 以下每条命令都在 Apple Silicon + Docker Desktop 上实测过（2026-09-25）；
-实测结论决定了流程形状：**`docker save` 按 digest 引用只保存当前平台**（一个 tarball
-一个架构，amd64 与 arm64 要各导一份）；**`docker load` 只恢复镜像内容（Image ID），
-不恢复 RepoDigest**——load 后 `name@sha256:…` 引用在本地**解析不到**，compose 会转而
-访问 GHCR。所以离线侧必须显式打 tag，并用环境变量 `FA_MINIO_IMAGE` 指给 compose
-（这是离线交付的逃生舱，不是给人随便换镜像用的；不设该变量时三个 compose 仍按
-digest 钉住，行为与本节开头逐字节一致）：
+
+三个 docker/compose 行为决定了流程形状：
+① 同一个 `name@<list-digest>` 引用在本地**只能绑定一个架构**，第二个架构的
+`pull --platform` 会报 `cannot overwrite digest` 退出——**同一条命令序列在一台机器上
+产不出两份 tarball**，所以导出必须用**两个子 manifest digest** 各自 pull/save
+（不需要 `--platform`，因此也没有 Engine 28+ 的要求）；
+② **`docker load` 只恢复镜像内容（Image ID），不恢复 RepoDigest**——load 后
+`name@sha256:…` 引用在本地解析不到，compose 会转而访问 GHCR，所以导入后要显式打 tag；
+③ **`export` 的变量只活在当前 shell**，新 shell / 宿主重启后 compose 会回落到拉不到的
+digest——所以离线引用写进 **`deploy/.env`**（compose 自动加载，与 shell 生命周期无关），
+而不是 `export`。
+
+**子 digest 的推导方式**（交付方要能自证，不要只信交付单；命令已实测，输出如下）：
 
 ```bash
-# 在有网络的机器上导出（每个架构一份；--platform 必须显式给）：
-docker pull --platform linux/amd64 ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee
-docker save --platform linux/amd64 ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee -o fileagent-minio-amd64.tar
-docker pull --platform linux/arm64 ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee
-docker save --platform linux/arm64 ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee -o fileagent-minio-arm64.tar
+docker manifest inspect ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee \
+  | python3 -c 'import json,sys
+for m in json.load(sys.stdin)["manifests"]:
+    print(m["platform"]["architecture"], m["digest"])'
+# amd64 sha256:a2fe4b45cd4dfab1a1e4e55c0ee425b8c96c17e989c523447c71967444f1c36f
+# arm64 sha256:4bfdccb8f63715c3f770bbb4dbce51257ff2c48621f015df61072bbca779d1ad
+```
 
-# tarball 自身的完整性校验值随交付一起提供（交付单里记录，目标机上比对）：
+**导出**（在有网络的机器上，每个架构一份；两个子 digest 各自 pull/save 可在同一台
+机器上共存）：
+
+```bash
+docker pull ghcr.io/byw-dev/minio@sha256:a2fe4b45cd4dfab1a1e4e55c0ee425b8c96c17e989c523447c71967444f1c36f
+docker save ghcr.io/byw-dev/minio@sha256:a2fe4b45cd4dfab1a1e4e55c0ee425b8c96c17e989c523447c71967444f1c36f -o fileagent-minio-amd64.tar
+docker pull ghcr.io/byw-dev/minio@sha256:4bfdccb8f63715c3f770bbb4dbce51257ff2c48621f015df61072bbca779d1ad
+docker save ghcr.io/byw-dev/minio@sha256:4bfdccb8f63715c3f770bbb4dbce51257ff2c48621f015df61072bbca779d1ad -o fileagent-minio-arm64.tar
+
+# 交付单上记录每个 tarball 的 SHA-256（目标机要比对）：
 shasum -a 256 fileagent-minio-amd64.tar fileagent-minio-arm64.tar
 ```
 
-```bash
-# 在目标机器上导入（按机器架构选对应 tarball）：
-shasum -a 256 fileagent-minio-amd64.tar        # 与交付单记录的 SHA-256 比对，不一致即停止
-docker load -i fileagent-minio-amd64.tar
-# load 输出的是 Image ID（悬空镜像，无 tag、无 RepoDigest）——显式打 tag：
-docker tag <load 打出的 Image ID> fileagent-minio:RELEASE.2025-04-22T22-12-26Z
-export FA_MINIO_IMAGE=fileagent-minio:RELEASE.2025-04-22T22-12-26Z
+**导入**（在目标机器上，整块可粘贴——两个期望 Image ID 已按架构内联；Image ID 是
+镜像 config 的 digest、与传输方式无关，由导出机 `docker image inspect <子digest>
+--format '{{.Id}}'` 得到并随交付单给出，amd64/a2c4bb0a… 与 arm64/adffe052… 即
+2026-09-25 实测值）：
 
-# 导入校验：Image ID 与交付单记录的期望值比较（不相等就退出，不要硬起）：
-#   linux/amd64 期望 sha256:a2c4bb0ac69eca344c26b8ceb07f1cf9eb2afdef55157ea5d045b56e150e0f9e
-#   linux/arm64 期望 sha256:adffe052fa1ad81a757cbb753d2208c9459989808c19539891be95eaaac1e5e4
-ACTUAL="$(docker image inspect fileagent-minio:RELEASE.2025-04-22T22-12-26Z --format '{{.Id}}')"
-EXPECTED="<见上，按架构取>"
-[ "$ACTUAL" = "$EXPECTED" ] || { echo "镜像与交付单不符：$ACTUAL" >&2; exit 1; }
+```bash
+case "$(uname -m)" in
+  x86_64)        TARBALL=fileagent-minio-amd64.tar; EXPECTED_IMAGE_ID=sha256:a2c4bb0ac69eca344c26b8ceb07f1cf9eb2afdef55157ea5d045b56e150e0f9e ;;
+  aarch64|arm64) TARBALL=fileagent-minio-arm64.tar; EXPECTED_IMAGE_ID=sha256:adffe052fa1ad81a757cbb753d2208c9459989808c19539891be95eaaac1e5e4 ;;
+  *) echo "unsupported machine: $(uname -m)" >&2; exit 1 ;;
+esac
+
+# （冗余保险）tarball SHA-256 与交付单人工核对；权威判据是下面的 Image ID 比较。
+shasum -a 256 "$TARBALL"
+
+LOADED_ID="$(docker load -q -i "$TARBALL" | sed -E 's/^Loaded image ID: //')"
+[ "$LOADED_ID" = "$EXPECTED_IMAGE_ID" ] || { echo "镜像与交付单不符：got $LOADED_ID, want $EXPECTED_IMAGE_ID" >&2; exit 1; }
+
+docker tag "$LOADED_ID" fileagent-minio:RELEASE.2025-04-22T22-12-26Z
+
+# 让 compose 用这份本地镜像：写进 deploy/.env（compose 自动加载，新 shell / 宿主
+# 重启后依然生效）。⚠️ 只追加，不要覆盖整个 .env——里面还有 A.1 的其他变量。
+grep -q '^FA_MINIO_IMAGE=' deploy/.env 2>/dev/null || printf '\n# 离线镜像引用（离线交付才设；在线环境必须删除本行，见 docs/ops/deployment.md §0.1②）\nFA_MINIO_IMAGE=fileagent-minio:RELEASE.2025-04-22T22-12-26Z\n' >> deploy/.env
 
 docker compose -f deploy/docker-compose.prod.yml up -d minio
 ```
 
-> ⚠️ **在线环境不要设 `FA_MINIO_IMAGE`**：不设时 compose 用 §0.1 开头的 digest
-> （三个 compose 逐字节等价已用 `docker compose config` 前后对比验证过）；
-> 设了它会整体覆盖 digest 钉定，绕过「按 digest 钉」的意图。
+> ⚠️ **实测范围，精确限定（2026-09-25，Apple Silicon + Docker Desktop）**：
+> 已实测——`docker manifest inspect` 推导子 digest（上方输出为真实输出）；
+> `docker load -q | sed` 抓 Image ID 的管道；`deploy/.env` 被 compose 自动加载
+> （从仓库根与 `deploy/` 两种 cwd 渲染均正确）；不设 `FA_MINIO_IMAGE` 时三份
+> compose 用钉定 digest、与改前逐字节等价。**未实测**——两个子 digest 的
+> `docker pull` / `docker save` 与端到端导入（其 pull 与共存由协调者在真镜像上
+> 实测通过；save 本体不在本机重跑）。
+>
+> ⚠️ **在线环境不要设 `FA_MINIO_IMAGE`**（shell 环境与 `deploy/.env` 都算）：
+> 不设时 compose 用本节开头的 digest（CI 与 dev 按 digest 钉住）；设了它会整体
+> 覆盖 digest 钉定，绕过「按 digest 钉」的意图。`deploy/scripts/smoke.sh` 检测到
+> 该变量时会打印告警。
 
 > ⚠️ **AGPL-3.0 的分发义务**：本系统是私有化交付，交付物里包含 MinIO，因此
 > 随交付**应当提供 AGPL-3.0 许可副本与对应源码的获取途径**。如何满足 AGPLv3 §6
@@ -144,6 +179,10 @@ INTERNAL_WEBHOOK_SECRET=<强随机>
 MINIO_PUBLIC_ENDPOINT=192.168.1.10:9000
 # 可选：固定首个管理员口令（留空则 CP 随机生成并写入凭据文件）
 BOOTSTRAP_ADMIN_PASSWORD=<留空或指定>
+# 可选：仅**离线交付**环境设置（§0.1② 的 docker load 导入流程会写入这一行）。
+# ⚠️ 在线环境**不要设**（设了会整体覆盖 D-036 按 digest 钉定的镜像引用）；
+# 离线升级 / 重启后靠它让 compose 找到本地镜像，而不是回落到拉不到的 GHCR digest。
+# FA_MINIO_IMAGE=fileagent-minio:RELEASE.2025-04-22T22-12-26Z
 ```
 
 ### A.2 启动
@@ -151,6 +190,10 @@ BOOTSTRAP_ADMIN_PASSWORD=<留空或指定>
 ```bash
 docker compose -f deploy/docker-compose.prod.yml up -d --build
 ```
+
+> 离线交付环境：`up -d --build` / 宿主重启后 compose 仍会读取 `deploy/.env`——确认
+> 里面的 `FA_MINIO_IMAGE` 指向导入的本地 tag（§0.1②），否则会回落到气隙环境拉不到的
+> GHCR digest（症状是误导性的 `manifest unknown`）。
 
 CP 依赖各服务 healthcheck，会等其就绪后再启动；启动时自动应用内嵌迁移
 （日志出现 `db migrate: migrations applied successfully`）。

@@ -2116,12 +2116,15 @@ Error: Process completed with exit code 125.
    Actions 访问（Read）」。
 8. **离线交付路径成文**。私有 package 意味着客户现场 `docker compose up` 拉不到镜像，
    所以 `docs/ops/deployment.md` §0.1 写明离线导入步骤与校验方法。这不是可选项——
-   **它是交付能力的一部分**。§0.1 的每条命令都在 Apple Silicon + Docker Desktop 上
-   实测过（2026-09-25），实测结论决定了流程形状：`docker save` 按 digest 引用只存
-   当前平台（**一个 tarball 一个架构**）；`docker load` 只恢复镜像内容（Image ID）、
-   **不恢复 RepoDigest**，load 后 `name@digest` 在本地解析不到——所以离线侧显式打 tag
-   并用 `FA_MINIO_IMAGE` 环境变量指给 compose（三个 compose 的默认值仍是 digest，
-   不设变量时行为与原样逐字节等价）。
+   **它是交付能力的一部分**。三个决定流程形状的 docker/compose 行为**已实测**
+   （2026-09-25，Apple Silicon + Docker Desktop）：`docker save` 按 list digest 引用
+   只存当前平台、同一 `name@digest` 引用不能切架构（第二个 `pull --platform` 报
+   `cannot overwrite digest`）——所以导出用**两个子 manifest digest** 各自 pull/save
+   （**一个 tarball 一个架构**）；`docker load` 只恢复镜像内容（Image ID）、
+   **不恢复 RepoDigest**，load 后 `name@digest` 在本地解析不到——所以离线侧显式打 tag；
+   `export` 的变量只活在当前 shell——所以离线引用写进 **`deploy/.env`**（compose 自动
+   加载），配合 `${FA_MINIO_IMAGE:-digest}` 默认值（不设变量时三份 compose 与原样
+   逐字节等价）。§0.1 里对每条命令的实测范围做了精确限定，未实测的步骤已显式标出。
 
 ### 已知缺口（如实记录，不含糊）
 
@@ -2136,6 +2139,7 @@ Error: Process completed with exit code 125.
    可验证的官方 manifest/config/layer digest 链之后**才能关闭。它是我们能拿到的
    唯一 amd64 副本，而 CI 必须用它。
 2. **没有升级路径**。官方不再公开发布，**以后 MinIO 出安全补丁我们没有来源**。
+
 3. **GHCR 的三条行为，全部实测，记在这里免得再踩**：
 
    ① **「关联仓库」不等于「授予 Actions 读权限」。** 给镜像打
