@@ -78,3 +78,23 @@ jobs:
           # The test file double-gates on the build tag AND this env var; the
           # greps above fail the step if the test silently skipped.
           FILEAGENT_TEST_INOTIFY_OVERFLOW: "1"
+
+      # Same recovery chain as the step above, but on the DEFAULT production
+      # mode (append_mode=overwrite → the debounced loop). The tail-mode test
+      # exercises loopFsnotify, which is fail-closed blocked in production
+      # (IC-BUG-46) — without this step the overflow → safetyNetRescan chain
+      # (including the rescan's hot-file skip + debounce-recheck re-arm) has
+      # no end-to-end coverage on a mode any production watcher actually
+      # walks. Same double gate + greps: a silently skipped or
+      # not-really-overflowing run must fail the step, not pass it.
+      - name: test (real inotify overflow — debounced mode, Linux only)
+        if: runner.os == 'Linux'
+        working-directory: agent
+        run: |
+          sudo sysctl -w fs.inotify.max_queued_events=4096
+          go test -tags overflow -run TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles -v -count=1 -timeout 10m ./internal/watcher 2>&1 | tee overflow-debounced-test.log
+          grep -q "gate open" overflow-debounced-test.log || { echo "::error::debounced overflow test was skipped (gate closed) — not allowed to pass silently"; exit 1; }
+          grep -q "overflow is guaranteed" overflow-debounced-test.log || { echo "::error::kernel queue was not small enough to overflow — safety-net path not exercised"; exit 1; }
+          grep -q "^--- PASS" overflow-debounced-test.log || { echo "::error::debounced overflow test did not pass"; exit 1; }
+        env:
+          FILEAGENT_TEST_INOTIFY_OVERFLOW: "1"
