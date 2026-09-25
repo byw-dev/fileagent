@@ -1225,6 +1225,19 @@ CP `internal/indexer` 新增：在 `static_tags` 之后，用规则 `dest_path_t
 - 前端：`UploadLog` 加字段；日志页状态筛选改 chip（`CheckableTag`）、状态列 `StatusBadge domain=upload`、时间 `TimeText`、
   **failed 行 `expandable`** 展开 错误信息 / 重试次数 / 已传输 X/Y / 开始→结束。
 
+### ⚠️ 当前实现偏离本决策的意图（2026-09-25 记，IC-BUG-55）
+
+**本决策的意图是让失败行展示「部分进度」，而当前实现让它恒等于整文件大小，意图被反转。**
+根因在上报侧：`agent/internal/executor/reports.go:35` 先填入队时的 `task.FileSize`，成功时会被
+`result.SizeBytes`（uploader 上传时重新 stat 的实际字节数）覆盖，**但失败时 `result == nil`，覆盖不发生**；
+CP 的 `indexer.go:266-280` 照样把该值写进 `upload_logs.bytes_transferred`（`status='failed'`）。
+于是**每一次失败都显示「已传输 <整个文件> / <整个文件>」**。
+
+**本决策本身不改**（字段与语义的设计是对的，包括「0 也是有效值」）；
+缺陷与修法追踪见 [`docs/tasks/bugs/open.md`](docs/tasks/bugs/open.md) 的 **IC-BUG-55**（🟠 P1，不挡目标 A）。
+⚠️ **在 IC-BUG-55 关闭之前，不要把失败行的 `bytes_transferred` 当作可信的部分进度**
+用于 UI 之外的统计或对账。
+
 ---
 
 ## D-028：上传日志状态过滤补齐 + 修正状态取值（WR-6 后续）

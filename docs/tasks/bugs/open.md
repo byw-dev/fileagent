@@ -10,7 +10,7 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
-> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判；2026-09-24 IC-4a 关闭 6/9；**IC-BUG-6 的 (d) 只落了 `active=true` 标记位，无消费方，强制解封归 IC-12 的验收与依赖（PR #110 复审 B4）**）**：共 **54** 条 = **已关闭 37** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 16**（**2 条挡** 7/40 + **11 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
+> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判；2026-09-24 IC-4a 关闭 6/9；**IC-BUG-6 的 (d) 只落了 `active=true` 标记位，无消费方，强制解封归 IC-12 的验收与依赖（PR #110 复审 B4）**）**：共 **55** 条 = **已关闭 37** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 17**（**2 条挡** 7/40 + **12 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -155,6 +155,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-52 | `dry_run_limit` 的**有效上限恒为 10**：CP 只在响应端按它裁剪（1–10 生效），**从不下发给 agent**，而 agent 硬编码上限 10——请求 11–50 被静默压成 10，且无截断标记 | 🟡 P2 | controlplane + agent + proto |
 | IC-BUG-53 | watcher 的 `seen` 语义是「**已交付**」而非「**已持久入队**」：下游 `submitFile` 提交/判重失败**只 Warn 不重试**，文件此后不再变化时**永不被采集**（初扫路径自 PR #100 F1 起即受影响，实时路径因 IC-BUG-44/43 的 P1 裁决而**保留重试机会**） | 🟡 P2 | agent |
 | IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 | 🟡 P2 | docs |
+| IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** | 🟠 P1 | agent + CP |
 
 ---
 
@@ -201,7 +202,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 拆成两个 statement（前缀部分随 D-030 第八条改为整桶）：**桶级** `s3:ListBucketMultipartUploads` → `arn:aws:s3:::{bucket}`（不带 `/*`）；**对象级** `s3:PutObject` / `s3:AbortMultipartUpload` / `s3:ListMultipartUploadParts` → `arn:aws:s3:::{bucket}/*`。**移除 `DeleteObject`、`GetObject`、`ListBucket`**——agent 全仓库从不调用 `GetObject` / `StatObject` / `ListObjects`（已 grep 确认），产品批准的是「写整桶」，读与列举不在其内，按最小权限一并砍掉 |
 | **验收** | 上传一个 >64MB 文件成功；中断后重试能走续传；`mc ls --incomplete` 可执行（不 403）且无残留；用签发的 STS 做 `GetObject` 与 `ListObjects` 均须 403（确认未超授） |
 
-## IC-BUG-5 — 断点续传状态从未落盘，重试永远从头重传 🟠 P1
+## IC-BUG-5 — 断点续传状态从未落盘，重试永远从头重传 🟠 P1 ✅ 已修（IC-3，PR #105）
 
 | 字段 | 内容 |
 |------|------|
@@ -297,7 +298,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 制造一个不可达的 MinIO，任务重试耗尽后 Web UI 的上传日志出现 failed 记录（上报半边）；worker 在超时后释放而非永久占用（超时半边） |
 | **上报半边已随 IC-2a ⑥ 关闭（2026-09-11）** | 重试耗尽以 `UploadResult{success=false, error_message}` 上报，CP 侧只写 `upload_logs`。**超时半边（per-upload timeout）仍开着，留在 IC-5 ③**，本卡片保持 open
 
-## IC-BUG-13 — `content_type` 两条索引路径都不赋值，且会被清空 🟡 P2
+## IC-BUG-13 — `content_type` 两条索引路径都不赋值，且会被清空 🟡 P2 ◐ 拆半（防清空 ✅ IC-2a / 填值 → 未排期）
 
 | 字段 | 内容 |
 |------|------|
@@ -837,3 +838,18 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **定级理由** | 🟡 P2 而非 P1：触发条件是「下游 `exec.Submit` 失败 + 文件此后不再变化」两个条件的交集——而 Submit 失败本身通常伴随基础设施异常（SQLite busy timeout、磁盘 I/O），这类异常同时会被其它链路暴露并留下可检索的 Warn 日志，且丢失范围限于当前 watcher 生命周期（重启/重建 watcher 用全新 seen map 的初扫即全量兜底）。⚠️ 降级理由**不是**「安全网重扫会兜住」——重扫复用同一个 seen，对本条覆盖的文件它恰恰一直跳过。后果仍属「静默漏采」族（仅剩日志、无持久重试状态），高于一般正确性缺陷，不宜 P3 |
 | **发现路径** | PR #108（IC-BUG-44/43 + 评审 F1/F2/F3/P1/P2）的 codex 复审：P1 指出 F1 的 markSeen 挡掉了溢出重扫的重试机会，协调者复核后裁决按 (b) 撤回实时路径 markSeen（保留有界重发放大），并把「seen ≠ 已持久」这个全局洞立卡为本条 |
 | **归属** | 未排期。修复归属就是上面 (a) 那条闭环的刀；与 IC-BUG-42（重复提交同源：都是交付/入队边界的状态语义）关联紧密。⚠️ IC-BUG-44 的安全网重扫对本条覆盖的文件**没有**兜底作用（同一 seen），唯一的运行期恢复手段是重启/重建 watcher |
+
+---
+
+## IC-BUG-55 — 失败上报把 `bytes_transferred` 记成整文件大小 🟠 P1
+
+| 字段 | 内容 |
+|------|------|
+| **⚠️ 立卡时的原始断言已被证伪（PR #121 评审，2026-09-25）** | 原卡称「`SizeBytes` 上报的是入队旧值，成功路径也不符」。**不成立**：`agent/internal/executor/reports.go:35` 确实先填 `task.FileSize`，但**紧接着 36-41 行**在 `result != nil` 时用 `result.SizeBytes` 覆盖，而 `uploader.go:238-239` 把上传时重新 `os.Stat` 得到的 `uploadSize` 写进该字段。**成功路径上报的就是实际上传的字节数**，`file_entries.size_bytes` 没有问题。立卡时只读了 `:35` 就下结论，漏读了下面 6 行。 |
+| **真正残留的根因** | 只有**失败路径**。`uploadErr != nil` 时 `result == nil`，覆盖不发生，`SizeBytes` 保留 `task.FileSize`；而 `controlplane/internal/indexer/indexer.go:266-280` 的 `CreateUploadLog` 在 `if result.GetSuccess()` 块**之外**，把该值同时写进 `upload_logs.size_bytes` 与 `upload_logs.bytes_transferred`，`status='failed'`。⚠️ 「在 success 块之外」**不等于「无条件」**：bucket 查询或规则元数据查询硬错误时函数会在写日志前 return（探针实测 `err=indexer: get bucket "deleted-bucket": bucket gone` → `uploadLogCalls=0`），此时 agent 收不到 ack 会持续重报。**不要把 `upload_logs` 当作完整的失败审计。** |
+| **后果（⚠️ 立卡时低估了）** | 一次**一字节都没传成**的失败，在 `upload_logs` 里记作「已传输 <整个文件大小> 字节」。**该列今天就有消费方**：`GET /api/v1/upload-logs` 投影它（`events.go:545-549`），Web UI 的**失败行**展开渲染「已传输 X / Y」（`pages/Logs/index.tsx:105-115`，`rowExpandable` 只对 `status === 'FAILED'` 生效）。而 D-027 设计该字段的目的正是「失败行内嵌错误 + 重试轨迹」要**展示部分进度**——本缺陷让每次失败都显示「已传输整个文件」，**把该功能的意图完全反转**，操作员今天就在看错误数字。将来做「实际传输量」统计或对账时，该列还会系统性偏高。（立卡时写「今天没有消费方」是错的，由 PR #121 第 2 轮复审证伪。） |
+| **不影响的面（已核实）** | `file_entries.size_bytes` 只在成功时写入（`indexer.go:214-236` 在 `if result.GetSuccess()` 块内），值来自 uploader 的当前 `uploadSize`，**正确**。webhook 路径（`source='minio_event'`，`events.go:899-1007` → `indexer.go:564-587`）写的是事件里的对象真实大小，**也正确**。⚠️ Dashboard 的 `storage_bytes` 会对 `file_entries.size_bytes` 做 `SUM`（`read_queries.go:464-470`）——**它消费的是成功路径那一列，不受本条影响**（立卡时写的「read/list API 只是回显」不准确，一并订正）。 |
+| **建议处理** | 🟠 P1，但**不挡目标 A**（采上去/查得到/下得来不受影响），故仍可推到第 3 步。⚠️ **推后的理由不再是「没有消费方」（那是错的），而是「不挡 A」。** **修法只有一条实际可行**：(a) 失败时把 `BytesTransferred` 置为 uploader 实际传输量（拿不到就置 0）——这才符合 D-027 的原意。
+⚠️ **「不填该列、由 UI 显示未知」行不通**：该列契约是 `BIGINT NOT NULL DEFAULT 0`（迁移 000001:181）、Go `int64` 非指针（`models.go:539`）、JSON 无 `omitempty` 恒返回（`events.go:548-549`）——不赋值得到的是 `0`，UI 会显示「0 B / X」而不是未知；而 D-027 **明写「`bytes_transferred` 为 0 也是有效值、语义明确」**，把失败态的 0 一律解释成「未知」会抹掉「真实零进度」这个语义。若确实需要表达「未知」，那是**契约变更**（列可空 + `*int64` + `omitempty`，或加一个 presence 标志），得单独拍板，不是本卡的备选项。
+**随第 3 步「IC 账本按 A 的标尺重判」时定级。** |
+| **发现与订正** | 2026-09-25 排查 PR #118 独立评审 P1 时立卡，**同日经 PR #121 的 codex 独立评审证伪核心断言并收窄至当前形态**。保留本卡而非撤销，是因为失败路径的语义问题真实存在（与 IC-BUG-49「前提被完全证伪」不同）。 |
