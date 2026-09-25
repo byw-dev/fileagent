@@ -1075,10 +1075,9 @@ func (w *Watcher) safetyNetRescan(ctx context.Context, events chan<- FileEvent, 
 		}
 	}
 	for _, path := range skipped {
-		_ = path // TEMP CI MUTATION: rescan drops the re-arm branch (reviewer's M)
-		// if armed := w.scheduleDebounceRecheck(ctx, events, seen, path); armed && w.rescanRecheckArmed != nil {
-		// 	w.rescanRecheckArmed(path)
-		// }
+		if armed := w.scheduleDebounceRecheck(ctx, events, seen, path); armed && w.rescanRecheckArmed != nil {
+			w.rescanRecheckArmed(path)
+		}
 	}
 }
 
