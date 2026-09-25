@@ -2120,12 +2120,7 @@ Error: Process completed with exit code 125.
    与该 release 一致、镜像内 `mc` 是同日期同版本的 x86-64 二进制」。几乎确定是正品，
    但**证据链比 arm64 弱一档**。它是我们能拿到的唯一 amd64 副本，而 CI 必须用它。
 2. **没有升级路径**。官方不再公开发布，**以后 MinIO 出安全补丁我们没有来源**。
-   （「无法证明这个镜像就是官方那个」这条**已可消除**：官方镜像自带
-   `/usr/bin/minio.minisig` 与 `/usr/bin/minio.sha256sum`，而 MinIO 的 minisign
-   公钥就写在 `byw-dev/minio` 的 `Dockerfile.release` 里
-   ——`RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav`。
-   已核对：两个架构的 `minio` 二进制 sha256 与镜像内自带的 `.sha256sum` 一致，
-   且两份签名携带的 key id 与该公钥一致。**完整验签见落地记录。**）
+   这是本条的全部内容——**「无法证明这个镜像就是官方那个」已经不再是缺口**，见下方「provenance 已验签」。
 
 3. **GHCR 的三条行为，全部实测，记在这里免得再踩**：
 
@@ -2150,6 +2145,36 @@ Error: Process completed with exit code 125.
    但随交付**必须提供许可副本与对应源码的获取途径**。上游 GitHub 仓库已归档，
    **长期保有那份源码是我们的责任**——不要指望上游还在。本系统是私有化交付、
    交付物本身就含 MinIO，所以这条义务躲不掉，只是范围是客户而不是公众。
+
+### provenance 已用上游公钥验签通过（2026-09-25）
+
+原先记的缺口是「amd64 那份 `repoDigests` 为空、无法与任何上游 digest 比对，证据链比 arm64 弱一档」。
+**这条已彻底关闭，而且得到的东西比 digest 比对更强**——是**密码学签名**而不是「digest 对得上」。
+
+关键在于 `byw-dev/minio` 这个源码 fork：它的 `Dockerfile.release` 里写着 MinIO 自己的
+minisign 公钥 `RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav`，
+而官方镜像**自带** `/usr/bin/minio.minisig`、`/usr/bin/minio.sha256sum`（`mc` 的也带）。
+用 `go run aead.dev/minisign/cmd/minisign@v0.2.1`（只写 Go module cache，不装进 PATH）验：
+
+| 文件 | 结果 | signed trusted comment |
+|------|------|------------------------|
+| `minio`（linux/amd64） | ✅ `Signature and comment signature verified` | `timestamp:1745360335`（2025-04-22T22:18:55Z）`filename:minio.RELEASE.2025-04-22T22-12-26Z` |
+| `minio`（linux/arm64） | ✅ 同上 | `timestamp:1745360609`（2025-04-22T22:23:29Z）同一 filename |
+| `mc`（linux/amd64，CI 抽的就是它） | ✅ 同上 | `timestamp:1745357500` `filename:mc.RELEASE.2025-04-16T18-13-26Z` |
+
+两点要注意：
+- **trusted comment 本身也在签名覆盖范围内**（`comment signature verified`），所以
+  `filename:minio.RELEASE.2025-04-22T22-12-26Z` 是**被密码学证实**的——不只是「某个被 MinIO 签过的二进制」，
+  而是「**就是那个 release 的二进制**」。这正是 digest 比对给不了的东西。
+- 顺带得到一个此前没人记过的事实：镜像内的 `mc` 是 **`RELEASE.2025-04-16T18-13-26Z`**，
+  与服务端的 `2025-04-22T22-12-26Z` **不同版本**（官方镜像本来就这样打的）。CI 与
+  `init-minio.sh` 用的就是这个 `mc`。
+
+**负向对照**（防止「验签恒真」这种假绿）：把 `minio` 副本第 1000 字节改成 `\x00` 后重验 →
+`Error: signature verification failed` / `exit status 1`。验签确实在起作用。
+
+> 复核方法（任何人都能重跑）：从镜像里 `docker cp` 出 `/usr/bin/minio{,.minisig}`，
+> 用上面那个公钥 `minisign -V -m minio -x minio.minisig -P <pubkey>`。
 
 ### 这条决策抬高了另一件事的紧迫性
 
