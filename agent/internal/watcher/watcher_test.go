@@ -2045,23 +2045,24 @@ func TestDebounced_CloseWaitAndOverwrite_EquivalentDelivery(t *testing.T) {
 	assert.Equal(t, overwrite, closeWait, "close_wait must be a behavioural alias of overwrite")
 }
 
-// Rework S-1: flushed pending entries are collected by the amortized sweep —
-// len(pending) must fall back to the active-path count instead of growing
-// with the set of paths ever seen. (The first rework's done-channel design
-// could strand idle entries forever when its fixed-size send queue
-// overflowed — codex reproduced 256 paths stranding 192 entries.) The sweep
-// is triggered by event processing, so the test arms the threshold the way
-// ongoing churn would, feeds one event, and asserts the exact remainder:
-// the single re-armed (active) entry.
+// Rework S-1 + third-round rework: flushed pending entries are collected by
+// the amortized sweep — len(pending) must fall back to the active-path count
+// instead of growing with the set of paths ever seen. (History: the first
+// rework's done-channel design stranded 192 of 256 entries; the second
+// rework's threshold trigger was replaced by this per-event budget.) The
+// sweep fires every w.pendingSweepEvery processed events, so after the burst
+// has fully flushed, feeding exactly that many events re-arms one entry and
+// sweeps the rest — the exact remainder is the single re-armed entry.
 func TestDebounced_PendingRecycledAfterFlush(t *testing.T) {
 	dir := t.TempDir()
 	const n = 256
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
 	w.debounce = 20 * time.Millisecond
-	// Small floor so the sweep dynamics are deterministic instead of keyed
-	// to the production constant (same pattern as w.debounce).
-	w.pendingSweepFloor = 8
+	// Small per-sweep event budget so the sweep dynamics are deterministic
+	// instead of keyed to the production constant (same pattern as
+	// w.debounce).
+	w.pendingSweepEvery = 8
 
 	seen := make(map[string]time.Time)
 	evc := make(chan fsnotify.Event)
@@ -2088,7 +2089,7 @@ func TestDebounced_PendingRecycledAfterFlush(t *testing.T) {
 
 	// The sweep only deletes entries whose callback has fully completed
 	// (fired set after flush returns), so wait for all callbacks to settle
-	// before arming the threshold — otherwise the exact expectation below
+	// before triggering the sweep — otherwise the exact expectation below
 	// would race the last few callbacks.
 	require.Eventually(t, func() bool {
 		w.seenMu.Lock()
@@ -2104,15 +2105,12 @@ func TestDebounced_PendingRecycledAfterFlush(t *testing.T) {
 		return true
 	}, 2*time.Second, 5*time.Millisecond, "all 256 entries should have flushed and settled")
 
-	// In production the sweep now triggers as churn keeps raising len(pending)
-	// past the (geometrically raised) threshold; the burst alone leaves the
-	// threshold above len, exactly as documented. Arm the threshold the way
-	// churn would and feed one event: it re-arms paths[0] (fired cleared)
-	// and the sweep must collect every still-fired entry.
-	w.seenMu.Lock()
-	w.pendingSweepAt = len(w.pending) - 1
-	w.seenMu.Unlock()
-	evc <- fsnotify.Event{Name: paths[0], Op: fsnotify.Write}
+	// The sweep fires on every 8th processed event. Feed exactly 8: the
+	// first Write re-arms paths[0] (fired cleared), and the 8th event
+	// triggers the sweep, which must collect every still-fired entry.
+	for i := 0; i < 8; i++ {
+		evc <- fsnotify.Event{Name: paths[0], Op: fsnotify.Write}
+	}
 
 	// Exact expectation: 255 fired entries swept, the re-armed paths[0] stays.
 	require.Eventually(t, func() bool {
@@ -2135,6 +2133,84 @@ func TestDebounced_PendingRecycledAfterFlush(t *testing.T) {
 	}
 }
 
+// Third-round rework (P0 guard): the sweep trigger must not contain any
+// historically derived quantity. The previous design set a threshold
+// T = 2*len(pending) + floor AT EACH SWEEP — but the active entries it
+// measured all became idle (fired) afterwards, so repeating "wait until
+// everything is idle, then burst just past the threshold" ratcheted the
+// residue up every round (codex measured 66/131/196/261/326 — unbounded).
+// This guard replays exactly that attack against the per-event-budget
+// trigger: N rounds, each waiting until every retained entry is idle
+// (active == 0) before injecting exactly one trigger-budget of new paths.
+// Exact expectation: the idle residue after every round is precisely the
+// burst size — it must NOT grow with the round count. (Under the old
+// threshold design this fails from round 4 on: the ratcheted threshold
+// stops firing mid-bursts and idle entries accumulate.)
+func TestDebounced_PendingSweep_MultiRound_ResidueConstant(t *testing.T) {
+	const (
+		rounds = 6
+		burst  = 8 // == w.pendingSweepEvery: each round's burst exactly crosses the trigger
+	)
+	dir := t.TempDir()
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 20 * time.Millisecond
+	w.pendingSweepEvery = burst
+
+	seen := make(map[string]time.Time)
+	evc := make(chan fsnotify.Event)
+	erc := make(chan error)
+	events := make(chan FileEvent, 256)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.loopDebounced(ctx, events, seen, evc, erc) }()
+
+	waitAllFired := func() {
+		t.Helper()
+		require.Eventually(t, func() bool {
+			w.seenMu.Lock()
+			defer w.seenMu.Unlock()
+			for _, p := range w.pending {
+				p.mu.Lock()
+				fired := p.fired
+				p.mu.Unlock()
+				if !fired {
+					return false
+				}
+			}
+			return true
+		}, 2*time.Second, 5*time.Millisecond)
+	}
+
+	for round := 1; round <= rounds; round++ {
+		// Inject exactly one trigger-budget of NEW paths. The sweep fires
+		// on this burst's last event and must delete everything left idle
+		// by the previous rounds.
+		for i := 0; i < burst; i++ {
+			p := filepath.Join(dir, fmt.Sprintf("r%02d-%02d.log", round, i))
+			require.NoError(t, os.WriteFile(p, []byte("x"), 0o644))
+			evc <- fsnotify.Event{Name: p, Op: fsnotify.Create}
+		}
+		for i := 0; i < burst; i++ {
+			select {
+			case <-events:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("round %d: only %d of %d deliveries arrived", round, i, burst)
+			}
+		}
+		waitAllFired()
+
+		// Exact expectation: the residue equals this round's burst — every
+		// earlier round's idle entries were swept, so the count is constant
+		// across rounds.
+		w.seenMu.Lock()
+		n := len(w.pending)
+		w.seenMu.Unlock()
+		assert.Equal(t, burst, n,
+			"round %d: idle residue must stay at the burst size, not grow with rounds", round)
+	}
+}
+
 // Rework S-1: a re-armed entry (flush completed, then a new event Reset the
 // timer and cleared fired) must survive the amortized sweep — fired means
 // "flush fully completed", so a cleared flag means the entry is alive with an
@@ -2148,7 +2224,7 @@ func TestDebounced_PendingRearmed_SurvivesSweep(t *testing.T) {
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
 	w.debounce = 30 * time.Millisecond
-	w.pendingSweepFloor = 4
+	w.pendingSweepEvery = 4
 
 	seen := make(map[string]time.Time)
 	evc := make(chan fsnotify.Event)
@@ -2182,21 +2258,19 @@ func TestDebounced_PendingRearmed_SurvivesSweep(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("v2"), 0o644))
 	evc <- fsnotify.Event{Name: path, Op: fsnotify.Write}
 
-	// Force the sweep to run via a DIFFERENT path's event and assert the
-	// exact post-sweep count: re-armed entry (spared) + the new path = 2.
-	// A bare len==1 check on the same path would race the sweep (len is 1
-	// both before the sweep runs and after a correct one); len==2 after the
-	// sweep is only reachable when the re-armed entry survived.
+	// Force the sweep to run: two more processed events (other path's
+	// Create + Write) complete the every=4 budget, and the sweep must spare
+	// the re-armed entry (fired was cleared by Reset). The gate is
+	// tick==0 && len==2 — tick==0 holds ONLY after the sweep ran, so the
+	// assertion cannot pass on a pre-sweep sample of the same len.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "other.log"), []byte("o"), 0o644))
-	w.seenMu.Lock()
-	w.pendingSweepAt = 0
-	w.seenMu.Unlock()
 	evc <- fsnotify.Event{Name: filepath.Join(dir, "other.log"), Op: fsnotify.Create}
+	evc <- fsnotify.Event{Name: filepath.Join(dir, "other.log"), Op: fsnotify.Write}
 
 	require.Eventually(t, func() bool {
 		w.seenMu.Lock()
 		defer w.seenMu.Unlock()
-		return len(w.pending) == 2
+		return w.pendingSweepTick == 0 && len(w.pending) == 2
 	}, 2*time.Second, 5*time.Millisecond,
 		"the re-armed entry must survive the sweep (fired was cleared by Reset)")
 

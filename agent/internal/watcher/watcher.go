@@ -74,14 +74,14 @@ type Watcher struct {
 	// seen, and D-035 spread that growth to the default overwrite mode.
 	pending map[string]*debouncePending
 
-	// pendingSweepAt is the amortized recycling threshold of the debounced
-	// loop (see sweepPendingIfDue). Guarded by seenMu.
-	pendingSweepAt int
+	// pendingSweepTick counts fsnotify events processed by the debounced
+	// loop since the last sweep (see sweepPendingIfDue). Guarded by seenMu.
+	pendingSweepTick int
 
-	// pendingSweepFloor overrides defaultPendingSweepFloor when > 0 (tests
+	// pendingSweepEvery overrides defaultPendingSweepEvery when > 0 (tests
 	// set a small value so sweep assertions are deterministic — same
-	// pattern as w.debounce). See sweepFloor.
-	pendingSweepFloor int
+	// pattern as w.debounce). See sweepEvery.
+	pendingSweepEvery int
 
 	// running guards the single-active-Start invariant (see ErrAlreadyRunning
 	// and the Start godoc).
@@ -131,9 +131,9 @@ const (
 // waits before emitting Write/Create events (D-035).
 const defaultDebounceWindow = 500 * time.Millisecond
 
-// defaultPendingSweepFloor is the constant term of the debounced loop's
-// amortized recycling threshold (see sweepPendingIfDue).
-const defaultPendingSweepFloor = 64
+// defaultPendingSweepEvery is how many fsnotify events the debounced loop
+// processes between two sweeps (see sweepPendingIfDue).
+const defaultPendingSweepEvery = 64
 
 // New creates a Watcher for the given source directory.
 // fileGlob is matched against file base names (e.g. "*.log").
@@ -174,41 +174,58 @@ func (w *Watcher) debounceWindow() time.Duration {
 // loopFsnotify stays the tail-only path.
 func (w *Watcher) debounceEnabled() bool { return w.appendMode != AppendModeTail }
 
-// sweepFloor returns the effective pending-sweep floor (tests may set a
-// smaller per-watcher value via w.pendingSweepFloor; zero means the
+// sweepEvery returns the effective events-per-sweep budget (tests may set a
+// smaller per-watcher value via w.pendingSweepEvery; zero means the
 // production default).
-func (w *Watcher) sweepFloor() int {
-	if w.pendingSweepFloor > 0 {
-		return w.pendingSweepFloor
+func (w *Watcher) sweepEvery() int {
+	if w.pendingSweepEvery > 0 {
+		return w.pendingSweepEvery
 	}
-	return defaultPendingSweepFloor
+	return defaultPendingSweepEvery
 }
 
-// sweepPendingIfDue is the debounced loop's amortized recycling (rework S-1,
-// replacing the per-flush done-channel design whose fixed-size send queue
-// could permanently strand idle entries when it overflowed). It runs on the
-// loop goroutine after every processed fsnotify event: once len(pending)
-// grows past the current threshold, it deletes every fired entry and raises
-// the threshold GEOMETRICALLY to 2*len(pending)+sweepFloor — the geometric
-// raise keeps the sweep O(1) amortized per event (sweeping every event makes
-// one burst of N hot files cost O(N²)); do not "simplify" it back.
+// sweepPendingIfDue is the debounced loop's amortized recycling. It runs on
+// the loop goroutine after every processed fsnotify event and charges one
+// tick per event; every sweepEvery events it deletes all fired entries and
+// resets the tick. (History: rework S-1 replaced the per-flush done-channel
+// design, whose fixed-size send queue permanently stranded idle entries;
+// S-1's own trigger — a threshold set to 2*len(pending)+floor at each sweep —
+// was replaced in turn (third-round rework) because the threshold only ever
+// ratcheted UP: the active count it recorded at sweep time all became idle
+// afterwards, so rounds of "wait for idle, then burst just past the
+// threshold" grew the residue without bound. The trigger is now a plain
+// per-event budget with NO historically derived term, so nothing can
+// bootstrap.)
 //
 // Deleting fired entries here is safe: fired means the flush fully completed
 // (no live timer — a re-armed entry had fired cleared by Reset — and no flush
 // still running), and the timer closure captured only p and path, never the
 // map.
 //
-// Boundedness, honestly stated (D-035): steady state is ≈ 2 × active
-// (unflushed) paths + sweepFloor. After a burst whose events then stop, the
-// residue stays at that burst's watermark — bounded by the burst size, but
-// not drained until further events arrive (no event, no sweep). Bounded
-// residue, not unbounded growth.
+// Boundedness, honestly stated (D-035): right after a sweep,
+// len(pending) == the active (unflushed) count at that moment; before the
+// next sweep at most sweepEvery further events are processed, each adding at
+// most one entry, so len(pending) ≤ max_active + sweepEvery, ALWAYS. The
+// trigger contains no historically derived quantity, so there is no
+// bootstrap: past peaks never enlarge future budgets.
+//
+// Amortized cost, honestly stated: one O(len) sweep per sweepEvery events,
+// i.e. O(len/sweepEvery) per event, with len itself bounded by
+// max_active + sweepEvery. (The earlier "geometric threshold" claim of O(1)
+// amortized was the same design whose boundedness turned out to be wrong.)
+//
+// After a burst whose events then stop entirely, the residue stays at that
+// burst's watermark — bounded by the burst size, but not drained until
+// further events arrive (no event, no sweep). That is bounded residue, a
+// different property from the unbounded bootstrap above.
 func (w *Watcher) sweepPendingIfDue() {
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()
-	if len(w.pending) <= w.pendingSweepAt {
+	w.pendingSweepTick++
+	if w.pendingSweepTick < w.sweepEvery() {
 		return
 	}
+	w.pendingSweepTick = 0
 	for path, p := range w.pending {
 		p.mu.Lock()
 		fired := p.fired
@@ -217,7 +234,6 @@ func (w *Watcher) sweepPendingIfDue() {
 			delete(w.pending, path)
 		}
 	}
-	w.pendingSweepAt = 2*len(w.pending) + w.sweepFloor()
 }
 
 // SeedTailOffsets pre-loads per-file byte offsets recovered from persisted
