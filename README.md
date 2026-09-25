@@ -174,6 +174,9 @@ fileagent/
 - Python 3.10+ + Poetry（仅 SDK 开发）
 - [golang-migrate](https://github.com/golang-migrate/migrate) CLI —— **可选**，仅用于手工提前迁移或排查；
   正常启动**不需要**它（迁移已嵌入二进制，见第 2 步）
+- **`docker login ghcr.io`** —— MinIO 镜像来自本项目自持的**私有** GHCR package
+  （上游已无公共通路，见 [`DECISIONS.md`](DECISIONS.md) D-036）。离线环境见
+  [`docs/ops/deployment.md`](docs/ops/deployment.md) §0.1 的 `docker load` 路径
 
 > **⚡ 想直接确认整条链路是通的**：`bash deploy/scripts/smoke.sh`
 > 一条命令跑完下面全部步骤并验证「文件采上去 / 索引查得到 / 能下载」（约 1 分钟）。
@@ -181,6 +184,18 @@ fileagent/
 > CI 跑的就是它，所以下面这套步骤不会再悄悄过期。
 
 ### 1. 启动基础服务
+
+> ⚠️ **首次需要先登录 GHCR**（只这一次）。MinIO 上游已无任何公共镜像通路
+> （Docker Hub / quay.io / ghcr.io 的 `minio/*` 全部不可匿名拉取），本项目改用
+> **自持的私有镜像**并按 digest 钉定，见 [`DECISIONS.md`](DECISIONS.md) **D-036**。
+> 不登录的话 compose 会以 `unauthorized` + `exit code 125` 失败。
+>
+> ```bash
+> docker login ghcr.io -u <github-user>     # 需要带 read:packages 的 PAT
+> ```
+>
+> 离线 / 无 GitHub 访问的环境用 `docker load` 导入交付的 tarball，
+> 见 [`docs/ops/deployment.md`](docs/ops/deployment.md) §0.1。
 
 ```bash
 docker compose -f deploy/docker-compose.dev.yml up -d --wait   # --wait 等 healthcheck 通过

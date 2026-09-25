@@ -22,6 +22,47 @@ Control Plane 启动时会**快速失败**（fail-fast）——任一依赖不�
 > **网络可达性**：文件上传/下载走**浏览器/agent ↔ MinIO 直连**（CP 只签发 presigned URL），
 > 因此 MinIO 的对外地址必须对客户端可达，而不仅仅对 CP 可达。
 
+### 0.1 MinIO 镜像从哪来（D-036，必读）
+
+上游已经**没有任何公共通路**能拉到 MinIO 镜像：Docker Hub 的 `minio/minio` / `minio/mc`
+与 `dl.min.io` 的 `mc` 下载在 2026 年被移除，`quay.io/minio/minio` 此后也不再公开可读
+（匿名 token 能签发，但取 manifest 返回 401），`ghcr.io/minio/minio` 返回 403。
+所以三个 compose 现在钉的是**我们自持的私有镜像**，按 **digest** 而非 tag：
+
+```
+ghcr.io/byw-dev/minio@sha256:90677cc242e4b08afa68d7503c5880a1feb19cd0a1e0ce4702e06b2426e203ad
+```
+
+它是一个多架构 manifest list（`linux/amd64` + `linux/arm64`），内容是上游
+`RELEASE.2025-04-22T22-12-26Z`（AGPL-3.0），只加了 provenance 标签，**没有新增层、
+没有执行任何命令**，文件系统与上游逐字节相同。
+
+**两条取得路径，按环境选一条：**
+
+**① 能访问 GitHub 的环境** —— 私有 package，先登录：
+
+```bash
+docker login ghcr.io -u <github-user>          # 需要 read:packages 的 PAT
+docker compose -f deploy/docker-compose.prod.yml pull minio
+```
+
+**② 离线 / 客户现场** —— 用交付的 tarball 导入，全程不联网：
+
+```bash
+# 在有网络的机器上导出（一次）
+docker pull ghcr.io/byw-dev/minio@sha256:90677cc2…
+docker save ghcr.io/byw-dev/minio@sha256:90677cc2… -o fileagent-minio.tar
+
+# 在目标机器上导入
+docker load -i fileagent-minio.tar
+# 校验导入的正是钉定的那一份（digest 必须完全相同）
+docker image inspect ghcr.io/byw-dev/minio@sha256:90677cc2… --format '{{.Id}}'
+```
+
+> ⚠️ **AGPL-3.0 的分发义务**：本系统是私有化交付，交付物里包含 MinIO，因此
+> **随交付必须提供 AGPL-3.0 许可副本与对应源码的获取途径**。上游仓库已归档，
+> 源码的长期保有责任在我们这边——不要指望上游还在。详见 `DECISIONS.md` D-036。
+
 ---
 
 ## 路径 A — 容器 all-in-one（`docker-compose.prod.yml`）
@@ -94,8 +135,9 @@ bash deploy/scripts/init-minio.sh
 > 由 `MINIO_USE_SSL` 决定协议）。别把两者的取值互相照搬。
 
 > 执行环境需同时具备 **`mc`** 与 **`curl`**（≥7.75，自检要用 `--aws-sigv4`）。宿主机没装 `mc` 时，
-> 用 compose 已 pin 的 **`minio/minio`** 镜像执行——它同时自带 mc 和 curl。
-> **不要用 `minio/mc` 镜像：它没有 curl**，脚本会在建任何资源之前就报错退出。
+> 用 compose 已钉 digest 的 **MinIO 镜像**执行——它同时自带 mc 和 curl。
+> **不要用 `minio/mc` 镜像：它没有 curl**，脚本会在建任何资源之前就报错退出——
+> 何况 `minio/mc` 也已经拉不到了（D-036）。`mc` 现在**只能**从这个服务端镜像里取。
 >
 > ```bash
 > docker run --rm --network <compose 网络> \
@@ -104,11 +146,11 @@ bash deploy/scripts/init-minio.sh
 >   -e MINIO_ROOT_USER=<同上> -e MINIO_ROOT_PASSWORD=<同上> \
 >   -e CP_ADMIN_ACCESS_KEY=<同 A.1> -e CP_ADMIN_SECRET_KEY=<同 A.1> \
 >   -e WEBHOOK_AUTH_TOKEN=<同 INTERNAL_WEBHOOK_SECRET> \
->   --entrypoint bash quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z /s/init-minio.sh
+>   --entrypoint bash ghcr.io/byw-dev/minio@sha256:90677cc242e4b08afa68d7503c5880a1feb19cd0a1e0ce4702e06b2426e203ad /s/init-minio.sh
 > ```
 >
-> 说明：镜像 tag 与 `docker-compose.prod.yml` 里 pin 的一致（换 tag 前先确认镜像里仍有 `mc` 与
-> `curl`）；`--entrypoint bash` 是必须的，镜像默认 entrypoint 是 MinIO 自己的启动脚本。容器内用
+> 说明：镜像 digest 与 `docker-compose.prod.yml` 里钉的一致（见 §0.1；**没有「换新版」这个选项了**，
+> 上游已无供给）；`--entrypoint bash` 是必须的，镜像默认 entrypoint 是 MinIO 自己的启动脚本。容器内用
 > compose 网络里的服务名 `minio:9000`，不是宿主的 `localhost:9000`。脚本刻意不依赖 grep/sed/awk，
 > 正是为了能在这个只带 mc + curl 的镜像里跑完。
 

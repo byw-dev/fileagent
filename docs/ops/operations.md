@@ -112,7 +112,7 @@ K8s livenessProbe / LB 心跳。**Readiness**（依赖是否 OK）通过实际�
 | Agent 一直不采集 | 处于 PENDING，未在 Web UI 审批 |
 | 下载文件名变成哈希/UUID | 浏览器对跨域 `a.download` 忽略；presign 需带 `response-content-disposition`（已知项） |
 | Agent 显示离线但进程在跑 | 心跳/Redis TTL；CP 有 TTL 驱动的离线兜底扫描（CC-6） |
-| prod compose 里 MinIO 永不 healthy | healthcheck 用镜像内 `mc ready local`；**新版 `minio/minio` 已不再随镜像带 `mc`**（移到 `minio/mc`）。compose 因此 pin 了内置 mc 的版本；若升级镜像，改用 `minio/mc` sidecar 或 mc-free 健康检查（如探 `/minio/health/live`） |
+| prod compose 里 MinIO 永不 healthy | healthcheck 用镜像内 `mc ready local`；**新版 `minio/minio` 已不再随镜像带 `mc`**（移到 `minio/mc`）。compose 因此钉了内置 mc 的那个版本（**按 digest**，来自我们自持的私有镜像仓——上游已无公共通路，见 D-036）。⚠️ 「升级镜像」现在**不是一个可选项**：没有新版可拉；真要换实现（见 active.md 第 4 条存储层调研）时，healthcheck 需同步改成 mc-free 探针（如探 `/minio/health/live`） |
 | 浏览器/agent 无法下载或上传 | presign/STS 里的 MinIO host 不可达：`MINIO_PUBLIC_ENDPOINT` 须为对客户端可达的地址（非内网 `minio:9000`）。CP 自身走 `MINIO_ENDPOINT`（内网），两者已拆分（D-024）；生产应经 TLS 网关暴露 MinIO 并把 `MINIO_PUBLIC_ENDPOINT` 指向网关地址 |
 
 ---
