@@ -254,8 +254,8 @@ M1/M2/M3/M12 只改 workflow/conf 可直接在 CI 验；M4–M11 本地 `make te
 | W4 把 `.nvmrc` 改成与 `engines` 冲突的版本（如 `22`） | RED（`engine-strict` 拒绝安装） | `.nvmrc` 真的在驱动 Actions 的 Node 选择 |
 | W5 把 `packageManager` 改成与 `engines.pnpm` 冲突的版本 | RED（`engine-strict` 拒绝安装） | `packageManager` 真的在驱动 pnpm 版本 |
 | W6 **注入一个确定的 ESLint 错误** | RED | lint step 真的在判结果。⚠️ **不要用「删掉 lint step」**——test/build 不会自动跑 ESLint，也没有别的 job 检查该 step 存在，删了会 GREEN |
-| W7 在任一 workflow 里写回硬编码 `node-version: '24'` | RED（**source-of-truth 静态门**） | 单一真相源**有人持续守着**，而不是只在合并那天人工看过一眼 |
-| W8 在任一 workflow 里写回 `pnpm/action-setup` 的 `version:` | RED（同上） | 同上 |
+| W7 在**任一** workflow 里写回硬编码 `node-version: '24'` | RED（**source-of-truth 静态门**） | 单一真相源**有人持续守着**，而不是只在合并那天人工看过一眼。⚠️ 请**分别**在 `ci-webui.yml` 和 `ci-cp.yml` 各试一次——后者能红才证明**触发范围**也够（见 QG-5 的触发范围警示） |
+| W8 把 `version: '11'` 写在 `pnpm/action-setup` 的 `with:` **末尾**（即命中行之后第 3 行） | RED（同上） | 门是按 **YAML step 边界**判定的，不是固定行窗口。⚠️ **必须用这个「写在末尾」的形状试**——写在第 2 行的话，连有 bug 的 `grep -A2` 都能抓到，等于没测 |
 
 > ⚠️ **W7/W8 依赖一个新增的持久静态门（见 QG-5）。** 上一版把 W4/W5 写成「换回硬编码 →
 > 期望 RED」是**错的**：换回硬编码后运行时仍是 Node 24 / pnpm 11，workflow 照样 GREEN——
@@ -469,11 +469,29 @@ bash 3.2 兼容——用 `/bin/bash scripts/ci/test-gate.sh controlplane` 显式
 1. `pnpm lint`（`webui/package.json:14` 已存在但**从来没人跑过**，只补 test 会让 lint 错误在绿灯下通过）
 2. `pnpm test`
 3. `pnpm build`
-4. **source-of-truth 静态门**（新增，**这是「单一真相源」唯一的持久守卫**）：
-   - `grep -rn "node-version:" .github/workflows/` 必须**零命中**（全部应为 `node-version-file`）
-   - `grep -rn -A2 "pnpm/action-setup" .github/workflows/ | grep -q "version:"` 必须**零命中**
-     （pnpm 版本只能来自 `packageManager`）
-   命中即 `::error::` 并指向 `webui/.nvmrc` / `packageManager`。
+4. **source-of-truth 静态门**（新增，**这是「单一真相源」唯一的持久守卫**）。
+   两条断言，命中即 `::error::` 并指向 `webui/.nvmrc` / `packageManager`：
+   - **Node**：`grep -rn "node-version:" .github/workflows/` 必须**零命中**
+     （全部应为 `node-version-file`；`node-version-file` 不会被误伤——冒号必须紧跟 `node-version`）
+   - **pnpm**：`pnpm/action-setup` 的 step 内不得出现 `version:`。
+     ⚠️ **不要用 `grep -A2` 之类的固定行窗口**——已实测反证：
+     ```sh
+     printf '%s\n' '- uses: pnpm/action-setup@v4' '  with:' \
+       '    package_json_file: webui/package.json' "    version: '11'" |
+       grep -A2 'pnpm/action-setup' | grep -q 'version:'   # exit 1：漏报
+     ```
+     `version:` 落在命中行之后**第 3 行**就逃出窗口了，加注释或多一个 `with` 键同样能绕过。
+     必须按 **YAML step 边界**判定（如 awk 状态机：遇 `uses:.*pnpm/action-setup` 置位，
+     遇下一个同级 `- ` 开头的 step 复位，置位期间命中 `^\s*version:` 即报错）。
+     **实现后必须用上面那个形状（`package_json_file` 在前、`version` 在后）做一次机械反证**，
+     确认门真能抓到。
+
+   ⚠️ **触发范围必须覆盖扫描范围**（P1-1）：本门扫描**整个** `.github/workflows/`，
+   所以承载它的 workflow 的 `paths` **必须包含 `.github/workflows/**`**，
+   否则「只改 `ci-cp.yml`/`ci-agent.yml`/`ci-smoke.yml`/`build-webui.yml` 的 PR」根本不会触发它，
+   门形同不存在。**扫描范围覆盖 ≠ 触发范围覆盖**——这是上一版的实质漏洞。
+   （若不愿让 `ci-webui.yml` 被所有 workflow 改动触发，就把这道门单独拆成一条
+   `ci-workflows-guard.yml`，paths 只含 `.github/workflows/**`。两种做法都行，但**必须选一种**。）
    ⚠️ **没有这道门，QG-5/QG-6 的成果会在下一个 PR 里被硬编码悄悄改回去**——
    一次性的人工 Acceptance 守不住它（这正是变异 W7/W8 要证明的）。
 ⚠️ **正向计数断言（22 文件 / 176 用例）必须放在独立且必跑的 step 里**，
