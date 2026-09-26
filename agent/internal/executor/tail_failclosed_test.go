@@ -55,18 +55,67 @@ func TestExecutor_TailModeTask_FailsTerminal_NoUpload(t *testing.T) {
 // one) must first durably record the abort intent (MarkFailedAbandoned's
 // transactional outbox write) and only then abort — and after a successful
 // abort the durable record must be gone again.
+//
+// The test is deliberately DETERMINISTIC: e.Start is never called, so the
+// durable-abort worker (runAbortWorker) never runs. That matters — the abort
+// worker performs an immediate initial drainAbortOutbox at startup (before
+// its first ticker tick), so with Start a deleted direct fast path could
+// still be masked whenever the initial drain happens to land after the
+// outbox commit: the poller would run the hook, delete the record and
+// satisfy every end-state assertion within the test window, wrongly
+// approving a regression that turns the usually-instant cleanup into a
+// worst-case 30s delay. Instead the test drives the exact production
+// sequence synchronously on the test goroutine — processTask → tail gate →
+// handleFailure (terminal) → MarkFailedAbandoned → abandonTaskUpload — so
+// the ONLY possible abort caller is the direct fast path.
+//
+// What the assertions pin (and what they deliberately exclude):
+//
+//   - PINNED: the direct fast path aborted exactly once (hookCalls == 1).
+//     Deterministic because no abort worker exists in this test to add a
+//     legal second attempt.
+//
+//   - PINNED: the durable abort intent existed while that abort ran
+//     (hookSawRecords == 1) — the order law. Enforced from inside the
+//     abandon hook, synchronously on the test goroutine. The pre-rewrite
+//     test was blind to the most damaging regression here: with only
+//     end-state assertions, dropping the outbox write leaves everything
+//     green, because "record drained at the end" is trivially true for a
+//     record that never existed.
+//
+//   - PINNED: after the successful direct abort the durable record is gone
+//     (CountMultipartAborts == 0 — stronger than a due-only check: a second
+//     persistent record for ANY upload would keep the count above 0).
+//
+//   - EXCLUDED: the abort worker entirely. The production system as a whole
+//     only guarantees AT-LEAST-ONCE abort (direct fast path racing the
+//     outbox drain), so a second Abort call is legal and benign for data
+//     correctness — AbandonUpload treats MinIO's NoSuchUpload (an
+//     already-aborted/completed upload) as success (uploader.go). Note the
+//     duplicate count is NOT structurally bounded: the outbox's unique key
+//     caps record ROWS, not abort CALLS — if DeleteMultipartAbort fails
+//     after a successful abort, the record stays and EVERY subsequent drain
+//     round aborts again (TestExecutor_AbortRecordDeleteFailureWarns pins
+//     that path's warning). Benign either way; just not "at most twice".
+//     Those worker-side behaviours are covered by the abort-worker tests
+//     (aborts_test.go), not by this one.
 func TestExecutor_TailModeTask_WithUploadID_RecordsIntentThenAborts(t *testing.T) {
 	q := newTestQueue(t)
 	e := New(1, q, successUploader, zap.NewNop(), 0)
 
-	var abandoned atomic.Int32
-	abandonedUploadID := make(chan string, 1)
+	var hookCalls int
+	hookSawRecords := -1
+	var gotUploadID string
 	require.NoError(t, e.ConfigureAbandon(func(_ context.Context, task *queue.UploadTask) error {
-		abandoned.Add(1)
-		select {
-		case abandonedUploadID <- task.UploadID:
-		default:
+		hookCalls++
+		n, err := q.CountMultipartAborts(context.Background())
+		if err != nil {
+			return err
 		}
+		if hookCalls == 1 {
+			hookSawRecords = n
+		}
+		gotUploadID = task.UploadID
 		return nil
 	}))
 
@@ -77,22 +126,21 @@ func TestExecutor_TailModeTask_WithUploadID_RecordsIntentThenAborts(t *testing.T
 	task.StoragePath = "bucket/key"
 	require.NoError(t, e.Submit(context.Background(), task))
 
-	e.Start(context.Background())
-	defer e.Stop()
+	// The exact production sequence, synchronously: the tail gate refuses
+	// the upload and handleFailure's terminal branch records the durable
+	// abort intent (MarkFailedAbandoned, one transaction) BEFORE the direct
+	// abort runs (abandonTaskUpload), which removes the record again on
+	// success.
+	e.processTask(context.Background(), task)
 
-	select {
-	case got := <-abandonedUploadID:
-		assert.Equal(t, "in-flight-upload-id", got)
-	case <-time.After(2 * time.Second):
-		t.Fatal("the in-flight multipart upload was never abandoned")
-	}
-	// The durable intent must have been recorded BEFORE the abort (the abandon
-	// hook only runs after MarkFailedAbandoned committed its outbox write) and
-	// removed again after the successful direct abort.
-	require.Eventually(t, func() bool {
-		due, err := q.DueMultipartAborts(context.Background(), time.Now(), 100)
-		return err == nil && len(due) == 0
-	}, 2*time.Second, 20*time.Millisecond,
-		"the abort record must be drained after the successful abort")
-	assert.Equal(t, int32(1), abandoned.Load(), "exactly one abort attempt is expected")
+	assert.Equal(t, 1, hookCalls,
+		"the direct fast path must have aborted exactly once (no abort worker is running to add a legal second attempt)")
+	assert.Equal(t, "in-flight-upload-id", gotUploadID,
+		"the abort must target the task's in-flight upload")
+	assert.Equal(t, 1, hookSawRecords,
+		"the abort must run under exactly one durable abort record (order law: intent committed before abort)")
+	n, err := q.CountMultipartAborts(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 0, n,
+		"the durable record must be drained by the successful direct abort")
 }

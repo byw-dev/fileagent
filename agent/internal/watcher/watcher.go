@@ -94,6 +94,27 @@ type Watcher struct {
 	debounceBeforeFlush      func(string)
 	debounceCallbackFinished func(string)
 
+	// rescanSkippedHot and rescanRecheckArmed are per-watcher test
+	// observation hooks for the IC-BUG-44 safety-net rescan's debounced
+	// branches (AUD-10 round 2): rescanSkippedHot fires for every path the
+	// rescan's pollScan skipped because the file was still inside the
+	// debounce window; rescanRecheckArmed fires for every skipped path for
+	// which the rescan actually installed a recheck timer.
+	//
+	// Why hooks are the only way to pin those branches: neither branch has
+	// an externally distinguishable effect. A rescan that finds a file gone
+	// QUIET emits it directly (pollScan), and a recheck-armed file is
+	// delivered through the same channel as a flush-delivered one — so no
+	// delivery pattern and no wall-clock arrangement can attribute a
+	// collection to the hot-skip + re-arm path: on a slow runner the
+	// rescan's pollScan stats the file past the window and emits directly,
+	// and a surviving event's flush timer delivers the file anyway. Tests
+	// that must PROVE the branches ran — rather than assume them from
+	// timing — observe them here. Always nil in production, zero cost;
+	// same shape as the debounce* hooks above.
+	rescanSkippedHot   func(string)
+	rescanRecheckArmed func(string)
+
 	// running guards the single-active-Start invariant (see ErrAlreadyRunning
 	// and the Start godoc).
 	running atomic.Bool
@@ -145,6 +166,27 @@ const defaultDebounceWindow = 500 * time.Millisecond
 // defaultPendingSweepEvery is how many fsnotify events the debounced loop
 // processes between two sweeps (see sweepPendingIfDue).
 const defaultPendingSweepEvery = 64
+
+// Degradation WARN messages: what Start logs when it falls back from fsnotify
+// to polling (newFSWatcher failure, addWatchPaths failure). These are a
+// CONTRACT, not free-form log text: the inotify overflow E2E
+// (overflow_debounced_linux_test.go) matches them to refuse a run whose
+// watcher silently degraded — on the polling path there is no kernel watch
+// queue to overflow, so that test would otherwise only fail much later as a
+// misleading "files not collected" timeout — and
+// TestWatcher_FsnotifyUnavailableFallsBackToPolling /
+// TestWatcher_AddPathFailureFallsBackToPolling pin that each one is really
+// logged at Warn level. Reword or delete a message here ONLY in lockstep with
+// those tests: dropping a WARN on its own would make the guards match nothing
+// and pass trivially.
+const (
+	// msgFallbackFsnotifyUnavailable is logged when fsnotify itself cannot be
+	// initialized (see Start).
+	msgFallbackFsnotifyUnavailable = "watcher: fsnotify unavailable, using polling"
+	// msgFallbackAddWatchFailed is logged when the watch paths cannot be
+	// registered with fsnotify (see Start).
+	msgFallbackAddWatchFailed = "watcher: cannot add watch paths, using polling"
+)
 
 // New creates a Watcher for the given source directory.
 // fileGlob is matched against file base names (e.g. "*.log").
@@ -298,13 +340,13 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 
 	fw, err := newFSWatcher()
 	if err != nil {
-		w.logger.Warn("watcher: fsnotify unavailable, using polling", zap.Error(err))
+		w.logger.Warn(msgFallbackFsnotifyUnavailable, zap.Error(err))
 		return w.runPolling(ctx, events)
 	}
 	defer fw.Close()
 
 	if err := w.addWatchPaths(fw); err != nil {
-		w.logger.Warn("watcher: cannot add watch paths, using polling", zap.Error(err))
+		w.logger.Warn(msgFallbackAddWatchFailed, zap.Error(err))
 		return w.runPolling(ctx, events)
 	}
 
@@ -1044,7 +1086,20 @@ func (w *Watcher) handleWatchError(ctx context.Context, events chan<- FileEvent,
 // scan, debounced deliveries, earlier rescan rounds) — see IC-BUG-53 for
 // the watcher-side residual gap that implies.
 func (w *Watcher) safetyNetRescan(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time) {
-	w.scheduleDebounceRechecks(ctx, events, seen, w.pollScan(ctx, events, seen))
+	skipped := w.pollScan(ctx, events, seen)
+	// Test observation for the two debounced branches below (see the field
+	// comments on rescanSkippedHot / rescanRecheckArmed for why no delivery
+	// pattern can substitute for this). Nil hooks cost nothing in production.
+	if w.rescanSkippedHot != nil {
+		for _, path := range skipped {
+			w.rescanSkippedHot(path)
+		}
+	}
+	for _, path := range skipped {
+		if armed := w.scheduleDebounceRecheck(ctx, events, seen, path); armed && w.rescanRecheckArmed != nil {
+			w.rescanRecheckArmed(path)
+		}
+	}
 }
 
 // scheduleDebounceRechecks arms one-shot recheck timers for the paths the
@@ -1067,10 +1122,14 @@ const debounceRecheckGrace = 100 * time.Millisecond
 // startup would never be collected: the scan skips it (PR #100 review F2),
 // no fsnotify event ever fires for it again, and nothing else looks at it.
 // Re-arming for a path that already has a live timer replaces the timer.
-func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, path string) {
+// It reports whether a recheck timer was actually installed: the file had
+// to exist, the loop still had to be running, and the scheduling gate had
+// to be open. The safety-net rescan uses the return value to observe its
+// re-arm branch (see rescanRecheckArmed).
+func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- FileEvent, seen map[string]time.Time, path string) bool {
 	info, err := os.Stat(path)
 	if err != nil {
-		return // gone; nothing to collect
+		return false // gone; nothing to collect
 	}
 	age := time.Since(info.ModTime())
 	// Every delivery path treats a future mtime as already settled, so it
@@ -1085,7 +1144,7 @@ func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- Fil
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()
 	if w.rechecksStopped || ctx.Err() != nil {
-		return
+		return false
 	}
 	if w.rechecks == nil {
 		w.rechecks = make(map[string]*time.Timer)
@@ -1107,6 +1166,7 @@ func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- Fil
 		w.settleRecheck(path, gen)
 		w.recheckAfterDebounce(ctx, events, seen, path)
 	})
+	return true
 }
 
 // settleRecheck removes the recheck tracking entry for path only if this

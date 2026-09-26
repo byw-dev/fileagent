@@ -151,12 +151,17 @@ func TestExecutor_DurableAbortRespectsTimeout(t *testing.T) {
 	require.Eventually(t, func() bool { return calls.Load() >= 1 }, 3*time.Second, 20*time.Millisecond)
 	// The timed-out attempt must be durably recorded (retryDelays=1h, so the
 	// next attempt sits beyond now+1h; the query window is widened to see it).
+	// The WARN log ("...scheduled for retry") is checked in the SAME
+	// Eventually: in drainAbortOutbox the DB write (RecordMultipartAbortAttempt)
+	// lands a few instructions BEFORE the log line on the abort-worker
+	// goroutine, so the replaced immediate assert.NotZero raced that window
+	// (the original flake at this site, ~5-10% red).
 	require.Eventually(t, func() bool {
 		entries, err := q.DueMultipartAborts(ctx, time.Now().Add(2*time.Hour), 10)
 		return err == nil && len(entries) == 1 && entries[0].Attempts >= 1 &&
-			strings.Contains(entries[0].LastError, "context deadline exceeded")
-	}, 3*time.Second, 20*time.Millisecond, "the timed-out attempt must be recorded")
-	assert.NotZero(t, logs.FilterMessage("executor: durable multipart abort failed, scheduled for retry").Len())
+			strings.Contains(entries[0].LastError, "context deadline exceeded") &&
+			logs.FilterMessage("executor: durable multipart abort failed, scheduled for retry").Len() > 0
+	}, 3*time.Second, 20*time.Millisecond, "the timed-out attempt must be recorded and logged")
 	e.Stop()
 }
 
