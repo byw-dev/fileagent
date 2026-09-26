@@ -294,9 +294,21 @@ func TestWatcher_FsnotifyUnavailableFallsBackToPolling(t *testing.T) {
 	newFSWatcher = func() (*fsnotify.Watcher, error) { return nil, errors.New("unavailable") }
 	t.Cleanup(func() { newFSWatcher = original })
 	// Observe at Warn level: this test must go red if the degradation WARN is
-	// ever removed, reworded, or demoted below Warn — otherwise the overflow
-	// E2E's degradation guard (which matches the same constant) would match
-	// nothing and pass trivially on a degraded run.
+	// ever REMOVED, demoted below Warn, or logged without the shared constant
+	// — otherwise the overflow E2E's degradation guard (which matches the same
+	// constant) would match nothing and pass trivially on a degraded run.
+	//
+	// REWORDING is explicitly NOT a failure, and must not be: edit
+	// msgFallbackFsnotifyUnavailable and the product call site, the E2E guard
+	// and this assertion all move together. That is the whole point of the
+	// shared constant, and it is what the mutation matrix verified — changing
+	// the constant's TEXT keeps every one of them green, while deleting or
+	// demoting the WARN turns this test red.
+	//
+	// "At Warn level" is a FLOOR, not an exact level: observer.New(WarnLevel)
+	// collects Warn AND above, so promoting the WARN to Error keeps this green
+	// and the E2E guard still sees it. Pinning the level exactly would need
+	// FilterLevelExact; at-least-Warn is what the guard's contract requires.
 	logCore, observed := observer.New(zap.WarnLevel)
 	w, err := New(dir, "*.txt", false, time.Hour, AppendModeOverwrite, zap.New(logCore))
 	require.NoError(t, err)
@@ -314,11 +326,12 @@ func TestWatcher_FsnotifyUnavailableFallsBackToPolling(t *testing.T) {
 			logged = true
 		}
 	}
-	require.True(t, logged, "WARN %q was not logged at Warn level on fsnotify failure — the polling fallback contract is broken", msgFallbackFsnotifyUnavailable)
+	require.True(t, logged, "WARN %q was not logged at Warn level or above on fsnotify failure — the polling fallback contract is broken", msgFallbackFsnotifyUnavailable)
 }
 
 func TestWatcher_AddPathFailureFallsBackToPolling(t *testing.T) {
-	// Observe at Warn level for the same reason as
+	// Observe at Warn level for the same reason (and with the same
+	// reword-is-fine / at-least-Warn semantics) as
 	// TestWatcher_FsnotifyUnavailableFallsBackToPolling: the overflow E2E
 	// guard matches msgFallbackAddWatchFailed, so this WARN must not silently
 	// disappear.
@@ -337,7 +350,7 @@ func TestWatcher_AddPathFailureFallsBackToPolling(t *testing.T) {
 			logged = true
 		}
 	}
-	require.True(t, logged, "WARN %q was not logged at Warn level on addWatchPaths failure — the polling fallback contract is broken", msgFallbackAddWatchFailed)
+	require.True(t, logged, "WARN %q was not logged at Warn level or above on addWatchPaths failure — the polling fallback contract is broken", msgFallbackAddWatchFailed)
 }
 
 func TestWatcher_FsnotifyInitialScanEmitsExistingFile(t *testing.T) {
