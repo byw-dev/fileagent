@@ -201,6 +201,7 @@
 ### vitest PR 门
 - **新建 `.github/workflows/ci-webui.yml`**，不塞进 `ci-smoke.yml` 的 `build-webui`：与
   `ci-cp`/`ci-agent`/`ci-proto` 一个模块一条的模式一致，且 paths 只过滤 `webui/**` + self
+  （**source-of-truth 静态门不放这里**——它需要对**任何** workflow 变更都生效，见 QG-5b）
   （`ci-smoke.yml` 的 paths 宽到 `agent/** controlplane/** api/** …`，改 Go 代码会白跑前端测试）。
   `build-webui` 的职责是产出 dist artifact，不动它的职责（只改 Node 钉法）。
 - 跑 `pnpm test`；另加 `pnpm test:coverage` **只打印不判阈**。
@@ -254,8 +255,8 @@ M1/M2/M3/M12 只改 workflow/conf 可直接在 CI 验；M4–M11 本地 `make te
 | W4 把 `.nvmrc` 改成与 `engines` 冲突的版本（如 `22`） | RED（`engine-strict` 拒绝安装） | `.nvmrc` 真的在驱动 Actions 的 Node 选择 |
 | W5 把 `packageManager` 改成与 `engines.pnpm` 冲突的版本 | RED（`engine-strict` 拒绝安装） | `packageManager` 真的在驱动 pnpm 版本 |
 | W6 **注入一个确定的 ESLint 错误** | RED | lint step 真的在判结果。⚠️ **不要用「删掉 lint step」**——test/build 不会自动跑 ESLint，也没有别的 job 检查该 step 存在，删了会 GREEN |
-| W7 在**任一** workflow 里写回硬编码 `node-version: '24'` | RED（**source-of-truth 静态门**） | 单一真相源**有人持续守着**，而不是只在合并那天人工看过一眼。⚠️ 请**分别**在 `ci-webui.yml` 和 `ci-cp.yml` 各试一次——后者能红才证明**触发范围**也够（见 QG-5 的触发范围警示） |
-| W8 把 `version: '11'` 写在 `pnpm/action-setup` 的 `with:` **末尾**（即命中行之后第 3 行） | RED（同上） | 门是按 **YAML step 边界**判定的，不是固定行窗口。⚠️ **必须用这个「写在末尾」的形状试**——写在第 2 行的话，连有 bug 的 `grep -A2` 都能抓到，等于没测 |
+| W7 **S1–S6 六个反例样本逐个跑**（见 QG-5b 的 Acceptance 表） | 每个都 RED | 静态门对**所有已知绕过写法**都非哑。这六个样本已被验证为合法 YAML——不是假想 |
+| W8 在 **`ci-cp.yml`**（而非承载门的那个 workflow）里写回 `node-version: '24'` | RED | **触发范围**也够：门对「改别的 workflow」的 PR 同样会跑。⚠️ 只在承载门的 workflow 里试是不够的——那证明不了跨 workflow 覆盖 |
 
 > ⚠️ **W7/W8 依赖一个新增的持久静态门（见 QG-5）。** 上一版把 W4/W5 写成「换回硬编码 →
 > 期望 RED」是**错的**：换回硬编码后运行时仍是 Node 24 / pnpm 11，workflow 照样 GREEN——
@@ -361,7 +362,7 @@ QG-0  docs-only PR（落地本文件 + active.md 指针）     ← ✅ 已完成
         │                │
         │        协调者：步骤 0 量基线 → 步骤 5 定门槛 → 变异矩阵 M1–M12
         │
-        └─ PR 2（webui）：QG-5 ─→ QG-6           与 PR 1 完全并行
+        └─ PR 2（webui）：QG-5 ─→ QG-5b ─→ QG-6      与 PR 1 完全并行
                 │
         协调者：cherry-pick / 推送 / PR 描述 / 每轮 codex 复审
                 │
@@ -376,6 +377,7 @@ QG-7  用户：开 master 分支保护 + 设 required check      ← 最后一�
 | **QG-3** | `scripts/ci/test-gate.sh` + `ci/gate-controlplane.conf` + **`Makefile` target** | opencode |
 | **QG-4** | `ci-cp.yml` + `.gitignore`（**不含 `Makefile`**，那归 QG-3） | opencode |
 | **QG-5** | webui Node 钉法 + `ci-webui.yml` | opencode |
+| **QG-5b** | `ci-workflows-guard.yml` —— source-of-truth 静态门（**不设 `paths`，每次都跑**） | opencode |
 | **QG-6** | 修正 Corepack 表述 + Node 版本收敛为指向（3 处文档改指向；Dockerfile 等 5 处保留） | opencode |
 | **QG-7** | `master` 分支保护 + required check | **用户** |
 
@@ -463,37 +465,14 @@ bash 3.2 兼容——用 `/bin/bash scripts/ci/test-gate.sh controlplane` 显式
 
 ### QG-5 webui Node 钉法 + `ci-webui.yml`（与 CP 完全独立，可并行）
 **Change**：新增 `webui/.nvmrc`(=`24`)、`webui/.npmrc`(=`engine-strict=true`)、
-`.github/workflows/ci-webui.yml`（paths 只 `webui/**` + self）；改 `ci-smoke.yml` 与
+`.github/workflows/ci-webui.yml`（paths 只 `webui/**` + self；**静态门归 QG-5b，不在本文件**）；改 `ci-smoke.yml` 与
 `build-webui.yml` 的 Node/pnpm 钉法（`node-version-file` + `packageManager`，删掉硬编码与浮动版本）。
 **`ci-webui.yml` 要跑四件事**：
 1. `pnpm lint`（`webui/package.json:14` 已存在但**从来没人跑过**，只补 test 会让 lint 错误在绿灯下通过）
 2. `pnpm test`
 3. `pnpm build`
-4. **source-of-truth 静态门**（新增，**这是「单一真相源」唯一的持久守卫**）。
-   两条断言，命中即 `::error::` 并指向 `webui/.nvmrc` / `packageManager`：
-   - **Node**：`grep -rn "node-version:" .github/workflows/` 必须**零命中**
-     （全部应为 `node-version-file`；`node-version-file` 不会被误伤——冒号必须紧跟 `node-version`）
-   - **pnpm**：`pnpm/action-setup` 的 step 内不得出现 `version:`。
-     ⚠️ **不要用 `grep -A2` 之类的固定行窗口**——已实测反证：
-     ```sh
-     printf '%s\n' '- uses: pnpm/action-setup@v4' '  with:' \
-       '    package_json_file: webui/package.json' "    version: '11'" |
-       grep -A2 'pnpm/action-setup' | grep -q 'version:'   # exit 1：漏报
-     ```
-     `version:` 落在命中行之后**第 3 行**就逃出窗口了，加注释或多一个 `with` 键同样能绕过。
-     必须按 **YAML step 边界**判定（如 awk 状态机：遇 `uses:.*pnpm/action-setup` 置位，
-     遇下一个同级 `- ` 开头的 step 复位，置位期间命中 `^\s*version:` 即报错）。
-     **实现后必须用上面那个形状（`package_json_file` 在前、`version` 在后）做一次机械反证**，
-     确认门真能抓到。
+4. **source-of-truth 静态门** —— 见下面「QG-5b」，它**不放在 `ci-webui.yml` 里**。
 
-   ⚠️ **触发范围必须覆盖扫描范围**（P1-1）：本门扫描**整个** `.github/workflows/`，
-   所以承载它的 workflow 的 `paths` **必须包含 `.github/workflows/**`**，
-   否则「只改 `ci-cp.yml`/`ci-agent.yml`/`ci-smoke.yml`/`build-webui.yml` 的 PR」根本不会触发它，
-   门形同不存在。**扫描范围覆盖 ≠ 触发范围覆盖**——这是上一版的实质漏洞。
-   （若不愿让 `ci-webui.yml` 被所有 workflow 改动触发，就把这道门单独拆成一条
-   `ci-workflows-guard.yml`，paths 只含 `.github/workflows/**`。两种做法都行，但**必须选一种**。）
-   ⚠️ **没有这道门，QG-5/QG-6 的成果会在下一个 PR 里被硬编码悄悄改回去**——
-   一次性的人工 Acceptance 守不住它（这正是变异 W7/W8 要证明的）。
 ⚠️ **正向计数断言（22 文件 / 176 用例）必须放在独立且必跑的 step 里**，
 不要和 `pnpm test` 同 step——否则删掉 test step 时断言会一起消失（变异 W1 的教训）。
 ⚠️ **`pnpm/action-setup` 必须在 `setup-node` 之前**。
@@ -501,6 +480,50 @@ bash 3.2 兼容——用 `/bin/bash scripts/ci/test-gate.sh controlplane` 显式
 `pnpm test:coverage` **只打印不判阈**。
 **Acceptance**：本机 `cd webui && pnpm test` 在 Node 24 下 22 文件/176 用例全绿；
 故意切到 Node 26 时 `pnpm install` 因 `engine-strict` **拒绝**（这是 `engine-strict` 生效的证据）。
+
+### QG-5b `ci-workflows-guard.yml` —— source-of-truth 静态门（依赖 QG-5）
+
+**这是「单一真相源」唯一的持久守卫。** 没有它，QG-5/QG-6 的成果会在下一个 PR 里被硬编码悄悄改回去
+（一次性的人工 Acceptance 守不住）。
+
+**Change**：新建 `.github/workflows/ci-workflows-guard.yml`。
+
+**触发**：`pull_request` 与 `push: branches: [master]` 两个事件，**都不设 `paths`**——每次都跑。
+⚠️ **不要用 path filter 决定这道门是否出现**，三个理由：
+① 它极便宜（几秒），省不出什么；
+② GitHub 的 path filter **只评估 PR diff 的前 300 个文件**——超过 300 文件且同时改 workflow 的 PR
+会绕过任何 glob，无论 glob 写在哪个 workflow 里；
+③ `paths` 与 `paths-ignore` **不能在同一事件上同时使用**，别想靠叠一层补救。
+
+**契约（这道门要守的两件事）**：
+- workflows 里 **Node 版本只能来自 `webui/.nvmrc`**（即只允许 `node-version-file`，不允许 `node-version:`）
+- workflows 里 **pnpm 版本只能来自 `packageManager`**（即 `pnpm/action-setup` 的 step 内不得有 `version`）
+
+**实现手段自选，但必须是 YAML 感知的**（遍历 `jobs.*.steps[]`、解析并展开 alias 后检查
+`with.version` 是否存在），**不得用文本行窗口**（`grep -A2` 之类）。
+runner 上可用 `yq`/`python3 -c 'import yaml'` 等预装工具；**不要为此新增仓库依赖**。
+> 若确实只想用零依赖 awk，那就必须**把允许语法收窄为 canonical form**并在门里显式拒绝其它写法
+> （flow mapping、anchor/alias、引号化 key、`with` 在 `uses` 前一律 RED），
+> 且正则用 POSIX `[[:space:]]` 而非 `\s`（**POSIX awk 不支持 `\s`**，实测四空格开头的
+> `version:` 不命中）。这条路更长，不推荐。
+
+**Acceptance —— 必须对下面每个反例样本都报错（逐个跑，逐个必须 RED）**。
+这组样本已被第 4 轮评审用标准 YAML parser 验证为**合法 YAML**，也就是说它们都是能真实写出来的：
+
+| # | 样本 | 为什么能绕过朴素实现 |
+|---|---|---|
+| S1 | `version: '11'` 写在 `with:` **末尾**（`package_json_file` 在前） | 落在命中行之后第 3 行，逃出 `-A2` 窗口 |
+| S2 | 键顺序颠倒：`- with:` 块在前、`uses: pnpm/action-setup@v4` 在后 | 状态机读到 `version:` 时还没被 `uses` 置位 |
+| S3 | 流式 mapping：`with: { version: '11' }` | 行首断言匹配不到 |
+| S4 | 锚点/别名：`with: *pnpm_opts`（`version` 定义在别处） | step 内的文本扫描看不见它 |
+| S5 | **连续两个** `pnpm/action-setup` step，`version` 在第二个里 | 需要正确结算 step 边界（含 EOF 那次） |
+| S6 | 任一 workflow 里写回 `node-version: '24'` | Node 那半边的契约 |
+
+并核对：`node-version-file` **不被误伤**（`node-version:` 的冒号必须紧跟，实测成立）。
+
+**已知平台限制（必须写进 workflow 注释，不要假装没有）**：即使不设 `paths`，
+GitHub 仍有 required-check 的其它边界（如 fork PR 需批准时 check 会等待而非静默变绿）。
+本门选择「每次都跑」就是为了不把守卫的存在性交给 path filter 决定。
 
 ### QG-6 修正 Corepack 表述 + Node 版本收敛为指向（依赖 QG-5）
 **Change**：把三条版本路径**如实**写清，而不是「拆除 Corepack」——
