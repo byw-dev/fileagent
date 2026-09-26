@@ -16,6 +16,7 @@
 | [`docs/tasks/active.md`](docs/tasks/active.md) | 当前 sprint 活跃任务 | **Agent 主要输入** |
 | [`docs/tasks/phases/phase-3.md`](docs/tasks/phases/phase-3.md) | 当前 Phase 主线（依赖与验收） | Agent / 人工 |
 | [`docs/tasks/consistency-ingest.md`](docs/tasks/consistency-ingest.md) | **当前 track**：写入准入与索引一致性（IC-0…IC-14） | **Agent 主要输入** |
+| [`docs/tasks/quality-gates.md`](docs/tasks/quality-gates.md) | **当前 track**：质量闸门 / 让 CI 的绿灯可信（QG-0…QG-7） | **Agent 主要输入** |
 | [`docs/tasks/bugs/open.md`](docs/tasks/bugs/open.md) | 未解决 Bug（含完整修复规格） | Agent |
 | [`docs/tasks/bugs/closed.md`](docs/tasks/bugs/closed.md) | 已关闭 Bug 归档 | 人工查阅 |
 | [`docs/tasks/backlog.md`](docs/tasks/backlog.md) | 待规划任务（Phase 4 等） | 人工规划 |

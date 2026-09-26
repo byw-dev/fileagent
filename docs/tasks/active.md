@@ -109,7 +109,7 @@ IC 残留项在 **CI 绿灯可信 + 账本重判**之前都不动。
 | # | 事项 | 体量 | 说明 |
 |---|------|------|------|
 | **1** | **采集写放大：防抖改为普适** ✅（PR #118） | 半天 | 见下 |
-| **2** | **让 CI 的绿灯可信** | 一天 | `ci-cp.yml` 加 `services:` + 跑 `-tags=integration`；webui 补 PR 门（22 个 vitest 文件至今无人运行）。照抄 `ci-agent.yml` 里 inotify overflow 那段的 **grep 防静默跳过**写法。已有账：[`backlog.md`](backlog.md)「**CI 与门槛的执行力缺口**」一节 |
+| **2** | **让 CI 的绿灯可信**（**QG track**） | ~~一天~~ **跨会话**（2026-09-26 调研后重估） | **追踪：[`quality-gates.md`](quality-gates.md)** —— QG-0…QG-7，含派工 spec、12 条变异矩阵、落地顺序。内容：CP 侧起 PG 真跑 `-tags=integration` + 覆盖率闸（**生成代码不计入**）+ 收 `pkg/trollsift`；webui 补 vitest 门 + **Node 版本单一真相源**；收尾开 `master` 分支保护。仍照抄 `ci-agent.yml` 里 inotify overflow 那段的 **grep 防静默跳过**写法。<br>⚠️ **调研推翻了本条原先的两处设想**：① PG **用 compose 起而非 `services:`**（`services:` 会在 workflow 里造第二份 PG 配置，且不吃 `docker/login-action` 凭据、将来接 MinIO 更贵）；② **`master` 目前无任何分支保护**（`protection` 404、`rulesets` 空）——闸门不是 required check 就只是建议，故 QG-7 把它纳入收尾。已有账：[`backlog.md`](backlog.md)「**CI 与门槛的执行力缺口**」一节 |
 | **3** | **IC 账本按 A 的标尺重判** | 半天，纯判断 | 恢复 IC 之前必须做：17 条未关缺陷的定级多在 IC-2a 之前给出，世界观已变（IC-BUG-7 是实证） |
 | **4** | **存储层替代调研** | 并行，另开会话 | ⚠️ **2026-09-25 紧迫性上调**：`quay.io/minio/minio` 也已不再公开可读，**上游再无任何公共通路**（D-036）。已改用自持私有镜像仓顶住，但问题比「CI 拉不到镜像」大一层——我们交付的产品依赖一个**已无公开供给、且 AGPL 分发与源码保有义务落在我们头上**的组件，且**没有升级路径**（出安全补丁也拿不到）。「研究任务应在被逼之前开始」——**现在已经在被逼的那一侧**。第一道筛子是 **STS AssumeRole**，不是「S3 兼容」四个字 |
 
