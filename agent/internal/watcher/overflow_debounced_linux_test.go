@@ -2,13 +2,18 @@
 
 // Debounced-mode sibling of TestInotifyOverflow_SafetyNetRescan_
 // RecoversLostFiles (AUD-10 / D-035). The tail-mode test pins the overflow →
-// handleWatchError → safetyNetRescan chain on loopFsnotify — a mode that is
-// fail-closed BLOCKED in production (IC-BUG-46), so the only end-to-end
-// coverage of the recovery chain ran on a mode no production watcher walks.
-// This file pins the same chain on the DEFAULT mode (append_mode=overwrite,
-// debounced), including the rescan leg the injected-erc unit tests cannot
-// cover end to end: pollScan skipping files that are still hot (inside the
-// debounce window) and scheduleDebounceRechecks re-arming their delivery.
+// handleWatchError → safetyNetRescan chain on loopFsnotify. Tail is not a
+// default-available production mode (IC-BUG-46): the control plane rejects
+// new and updated tail rules (fail-closed), and the executor rejects tail
+// uploads. The watcher layer itself has no tail interception — runWatcher
+// (agent/cmd/agent/main.go) builds the watcher directly from
+// rule.AppendMode — so an active tail rule created before that fail-closed
+// landed is still dispatched by the snapshot and starts a tail watcher
+// (loopFsnotify); only its uploads are rejected. This file pins the same
+// chain on the DEFAULT mode (append_mode=overwrite, debounced), including
+// the rescan leg the injected-erc unit tests cannot cover end to end:
+// pollScan skipping files that are still hot (inside the debounce window)
+// and scheduleDebounceRecheck re-arming their delivery.
 //
 // The hot-skip / re-arm branches are OBSERVED, not inferred: the
 // rescanSkippedHot / rescanRecheckArmed hooks (per-watcher fields, nil in
@@ -152,17 +157,23 @@ func TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles(t *testing.
 
 	// STRUCTURAL barrier, not a timing guess: receive seed #1 ourselves. On
 	// an UNBUFFERED channel a receive is a rendezvous, so completing it
-	// establishes happens-before with the scan's send — which proves BOTH
-	// preconditions of the burst below, with nothing to tune:
+	// establishes happens-before with the scan's send. What the rendezvous
+	// ALONE proves is exactly this:
 	//
-	//   - addWatchPaths(fw) has already returned. Start registers watches
-	//     BEFORE the initial pollScan, so a scan emission cannot be observed
-	//     unless the watch is live.
-	//   - the scan is NOT finished: seed #2 is emitted next and parks there,
-	//     because the consumer is still gated and we never receive again.
-	//     pollScan runs synchronously on Start's goroutine before the event
-	//     loop exists, so while it is parked NOTHING drains fw.Events and
-	//     the burst is guaranteed to overflow the kernel queue.
+	//   - some initial pollScan has reached a send point (seed #1 was
+	//     emitted through the events channel), and that scan CANNOT be
+	//     finished: seed #2 is emitted next and parks there, because the
+	//     consumer is still gated and we never receive again. pollScan runs
+	//     synchronously on Start's goroutine before the event loop exists,
+	//     so while it is parked NOTHING drains fw.Events and the burst
+	//     below is guaranteed to overflow the kernel queue.
+	//
+	// What the rendezvous alone does NOT prove is that a kernel watch is
+	// live: if Start degraded to its polling fallback, that fallback's
+	// initial pollScan emits the same seed on the same channel and parks
+	// identically. The watch-is-live half of the proof is machine-enforced
+	// by the no-degradation WARN assertion immediately below; only the two
+	// assertions together are complete.
 	//
 	// A fixed sleep could only guess at this, and a loaded runner breaks the
 	// guess: the burst lands before the watch is registered, the queue never
@@ -175,6 +186,22 @@ func TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles(t *testing.
 		mu.Unlock()
 	case <-time.After(60 * time.Second):
 		t.Fatal("initial scan never emitted seed #1 within 60s: the scan is not parked on a seed emission, so the burst below could not deterministically overflow the kernel queue")
+	}
+
+	// The watch-is-live half of the barrier's proof (see above): the
+	// rendezvous cannot distinguish the fsnotify path from the polling
+	// fallback — on degradation Start logs one of the WARNs below and then
+	// runs the same pollScan through the same channel, so the barrier would
+	// "pass" with NO kernel watch queue to overflow, the burst would be
+	// pointless, and the test would only die much later as a misleading
+	// "collected only N of M files" timeout. Both WARNs are logged before
+	// the fallback's scan sends, so the rendezvous guarantees they are
+	// already recorded here. Fail at the barrier point with the real
+	// reason instead.
+	for _, e := range observed.All() {
+		if strings.Contains(e.Message, "fsnotify unavailable") || strings.Contains(e.Message, "cannot add watch paths") {
+			t.Fatalf("watcher degraded to polling (WARN %q): fsnotify is not usable on this runner, so there is no kernel watch queue to overflow and this test cannot exercise the overflow recovery chain at all. Check the runner's inotify instance/watch limits (fs.inotify.max_user_instances / fs.inotify.max_user_watches)", e.Message)
+		}
 	}
 
 	t.Logf("burst: creating %d files while the initial scan is parked on the seed emission", numFiles)
