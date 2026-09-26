@@ -167,6 +167,27 @@ const defaultDebounceWindow = 500 * time.Millisecond
 // processes between two sweeps (see sweepPendingIfDue).
 const defaultPendingSweepEvery = 64
 
+// Degradation WARN messages: what Start logs when it falls back from fsnotify
+// to polling (newFSWatcher failure, addWatchPaths failure). These are a
+// CONTRACT, not free-form log text: the inotify overflow E2E
+// (overflow_debounced_linux_test.go) matches them to refuse a run whose
+// watcher silently degraded — on the polling path there is no kernel watch
+// queue to overflow, so that test would otherwise only fail much later as a
+// misleading "files not collected" timeout — and
+// TestWatcher_FsnotifyUnavailableFallsBackToPolling /
+// TestWatcher_AddPathFailureFallsBackToPolling pin that each one is really
+// logged at Warn level. Reword or delete a message here ONLY in lockstep with
+// those tests: dropping a WARN on its own would make the guards match nothing
+// and pass trivially.
+const (
+	// msgFallbackFsnotifyUnavailable is logged when fsnotify itself cannot be
+	// initialized (see Start).
+	msgFallbackFsnotifyUnavailable = "watcher: fsnotify unavailable, using polling"
+	// msgFallbackAddWatchFailed is logged when the watch paths cannot be
+	// registered with fsnotify (see Start).
+	msgFallbackAddWatchFailed = "watcher: cannot add watch paths, using polling"
+)
+
 // New creates a Watcher for the given source directory.
 // fileGlob is matched against file base names (e.g. "*.log").
 // If recursive is true, subdirectories are watched as well.
@@ -319,13 +340,13 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 
 	fw, err := newFSWatcher()
 	if err != nil {
-		w.logger.Warn("watcher: fsnotify unavailable, using polling", zap.Error(err))
+		w.logger.Warn(msgFallbackFsnotifyUnavailable, zap.Error(err))
 		return w.runPolling(ctx, events)
 	}
 	defer fw.Close()
 
 	if err := w.addWatchPaths(fw); err != nil {
-		w.logger.Warn("watcher: cannot add watch paths, using polling", zap.Error(err))
+		w.logger.Warn(msgFallbackAddWatchFailed, zap.Error(err))
 		return w.runPolling(ctx, events)
 	}
 

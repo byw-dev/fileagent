@@ -102,8 +102,13 @@ func TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles(t *testing.
 	// error really surfaced on fw.Errors (and was not merely simulated).
 	logCore, observed := observer.New(zap.WarnLevel)
 	// Default production mode: append_mode=overwrite → the debounced loop
-	// (runDebounced → loopDebounced), NOT loopFsnotify (that is tail-only
-	// since D-035 and fail-closed blocked in production, IC-BUG-46).
+	// (runDebounced → loopDebounced), NOT loopFsnotify. loopFsnotify is
+	// tail-only since D-035: tail is not a default-available production mode
+	// (IC-BUG-46) — new/updated tail rules are rejected by the control plane
+	// and tail uploads are rejected by the executor — but the watcher layer
+	// has no tail interception, so a legacy active tail rule created before
+	// that fail-closed landed still starts a tail watcher; only its uploads
+	// are rejected.
 	w, err := New(dir, "*.dat", false, time.Hour, AppendModeOverwrite, zap.New(logCore))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -198,8 +203,16 @@ func TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles(t *testing.
 	// the fallback's scan sends, so the rendezvous guarantees they are
 	// already recorded here. Fail at the barrier point with the real
 	// reason instead.
+	//
+	// The messages are matched via the shared contract constants (see
+	// msgFallbackFsnotifyUnavailable / msgFallbackAddWatchFailed in
+	// watcher.go), NOT hardcoded substrings: if the product ever changes the
+	// wording, this guard follows automatically. That the WARNs are still
+	// LOGGED at all — the way this guard could otherwise go silent — is
+	// pinned positively by TestWatcher_FsnotifyUnavailableFallsBackToPolling
+	// and TestWatcher_AddPathFailureFallsBackToPolling.
 	for _, e := range observed.All() {
-		if strings.Contains(e.Message, "fsnotify unavailable") || strings.Contains(e.Message, "cannot add watch paths") {
+		if e.Message == msgFallbackFsnotifyUnavailable || e.Message == msgFallbackAddWatchFailed {
 			t.Fatalf("watcher degraded to polling (WARN %q): fsnotify is not usable on this runner, so there is no kernel watch queue to overflow and this test cannot exercise the overflow recovery chain at all. Check the runner's inotify instance/watch limits (fs.inotify.max_user_instances / fs.inotify.max_user_watches)", e.Message)
 		}
 	}
