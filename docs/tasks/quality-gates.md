@@ -37,7 +37,7 @@
 | 2 | 覆盖率门槛写明却无人执行 | CLAUDE.md 要求整体 ≥ 80%，实测 79.9%；`ci-cp.yml` 中 `coverage` 零命中 | 🟠 P1 |
 | 3 | webui PR 门缺失 | 22 个 vitest 文件（176 用例）在 CI 里**从未执行** | AUD-11 |
 | 4 | `pkg/trollsift` 无人跑 | 3 个测试文件、零 workflow；它是路径模板核心（D-034 三端对齐） | 本轮新发现 |
-| 5 | Node 版本**本地**不被强制，且版本源重复 | 「Node 24」写在 **8 个** tracked 位置；CI **有 2 个执行点**（`ci-smoke.yml:72`、`build-webui.yml:20` 的 `setup-node`），但**本地无任何强制**（无 `.nvmrc`/`engine-strict`，pnpm 只警告不拒绝）→ 本机默认跑在 Node 26；且 CI 的 `pnpm/action-setup version: '11'` **绕过** `packageManager: pnpm@11.0.4`；文档声称的 Corepack 机制是空的 | 本轮新发现 |
+| 5 | Node 版本**本地**不被强制，且版本源重复 | 「Node 24」写在 **8 个** tracked 位置；CI **有 2 个执行点**（`ci-smoke.yml:72`、`build-webui.yml:20` 的 `setup-node`），但**本地无任何强制**（无 `.nvmrc`/`engine-strict`，pnpm 只警告不拒绝）→ 本机默认跑在 Node 26；且 CI 的 `pnpm/action-setup version: '11'` **绕过** `packageManager: pnpm@11.0.4`；文档把 Corepack 说成全局机制，实际只有 Docker 构建阶段启用（详见关键事实 10） | 本轮新发现 |
 | 6 | **`master` 无分支保护** | `branches/master/protection` → **404**，`rulesets` → **`[]`**。没有任何东西**要求** CI 绿 | 🔴 **前提** |
 
 缺口 6 是前提：闸门不是 required check，就只是建议——这刀会退化成「让红灯有内容」而非「让绿灯可信」。
@@ -74,10 +74,15 @@
 9. **webui 22 文件 176 用例在 Node 24 下全绿**；本机默认 Node 26 下 2 文件 15 用例**假红**
    （Node 26 自带实验性 `localStorage` 遮蔽 jsdom）。`pnpm test` 已是 `vitest run`；
    coverage provider 已配 `v8`，只缺 `thresholds`。
-10. **Corepack 叙事是空的** —— `corepack` 在 `.github/`/`Makefile`/`deploy/` **零命中**；CI 实际用
-    `pnpm/action-setup@v4` + **浮动 `version: '11'`**，绕过 `packageManager: pnpm@11.0.4`。
-    且 Corepack 只管包管理器、**管不了 Node 自身**，而 `webui/README.md:25` 声称它锁「Node.js 和 pnpm 版本」。
-    ~~AUD-12~~ 撤回时说过「只说明本地未开 `engine-strict`」——方向对，但没看出叙事本身是空的。
+10. **Corepack 只在 Docker 构建阶段启用，而文档把它说成了全局机制** ——
+    `corepack` 在 `.github/`/`Makefile`/`deploy/` **零命中**，CI 实际用 `pnpm/action-setup@v4` +
+    **浮动 `version: '11'`**（绕过 `packageManager: pnpm@11.0.4`）；本地也没启用。
+    **但 `controlplane/Dockerfile:18` 确实 `RUN corepack enable`**，且注释明写它从 `packageManager`
+    钉 pnpm——**那是 Corepack 的正确用法**。
+    所以文档真正错的只有两点：① `webui/README.md:25` 声称 Corepack 锁「Node.js **和** pnpm 版本」——
+    Corepack **管不了 Node 自身**；② 把它说成本地/CI 的既有机制，而那两处并未启用。
+    ⚠️ **不要写成「Corepack 叙事是空的」或「未启用」**——那会误导人去删 Dockerfile 里正确的用法。
+    ~~AUD-12~~ 撤回时说过「只说明本地未开 `engine-strict`」——方向对，但也没看出这层分布差异。
 
 ## 已拍板的决策
 
@@ -90,7 +95,7 @@
 | webui 覆盖率 | **只测量不判阈**（CLAUDE.md 的「核心 store/service 层」无定义，定阈值只会再造执行不了的门） |
 | `pkg/trollsift` | 纳入 CP 那一刀 |
 | Node 钉法 | `.nvmrc` 写 `24` + `engine-strict=true` |
-| Corepack | **向 CI 现状对齐，拆除 Corepack 叙事** |
+| Corepack | **如实分述三条路径**（本地 `.nvmrc`+`engine-strict` / Actions `node-version-file`+`packageManager` / Docker `corepack enable`）。**不拆除** Dockerfile 里正确的用法 |
 | PG 起法 | **`docker compose … up -d --wait postgres`**，不用 `services:`（偏离 `active.md` 字面，理由见下） |
 | 分支保护 | 纳入本刀收尾，**由用户操作** |
 
@@ -164,17 +169,34 @@
    `node-version-file: webui/.nvmrc`；`pnpm/action-setup` 删掉 `version: '11'`、改从 `packageManager` 读
    （`package_json_file: webui/package.json`）。⚠️ **`pnpm/action-setup` 必须在 `setup-node` 之前**，
    否则 `cache: pnpm` 找不到 pnpm。
-4. **拆除 Corepack 叙事**：重写 `webui/README.md`「版本管理」节与「启用 Corepack」步骤；
-   `README.md:173` 去掉「通过 Corepack 管理」；`CLAUDE.md:119-120` 改成**指向**而不自带数字；
-   `DECISIONS.md` 保留原决策与理由，但加一条「落地记录」说明实际机制是
-   `.nvmrc` + `engine-strict` + `packageManager`、**Corepack 未启用**。
-5. 收敛结果：**8 个** tracked 位置 → **2 个真相源** + **3 处允许保留**：
-   - 真相源：`webui/.nvmrc`（Node 的**可执行**版本选择）、`packageManager`（pnpm 版本）
-   - 允许继续出现 24、只需与 `.nvmrc` 同 major：`webui/package.json` 的 `engines`（兼容**范围**语义）、
-     `controlplane/Dockerfile:16` 的 `FROM node:24-alpine`（容器基础镜像）、
-     `DECISIONS.md` 的历史决策（记的是当初为何选 24.15.0）
-   - 其余（`README.md`、`webui/README.md`、`CLAUDE.md`）一律改成**指向**，不自带数字
-   ⚠️ **不要试图把数字压到「只剩一处」**——那与保留 engines / Dockerfile / 历史决策直接冲突。
+4. **修正 Corepack 的表述（不是「拆除」——它在一处是真在用的）**：
+   ⚠️ **`controlplane/Dockerfile:18` 确实 `RUN corepack enable`**，注释还明写它从
+   `packageManager` 钉 pnpm——**那是 Corepack 的正确用法，不要动它**。
+   准确事实是：**Corepack 在 Docker 构建阶段启用并正常工作；本地与 GitHub Actions 未启用**
+   （`.github/`/`Makefile`/`deploy/` 零命中，CI 用 `pnpm/action-setup`）。
+   文档真正错的只有两点：① `webui/README.md:25` 声称 Corepack 锁「Node.js **和** pnpm 版本」——
+   Corepack **管不了 Node 自身**；② 它把 Corepack 说成本地/CI 的既有机制，而那两处并未启用。
+   改法：重写 `webui/README.md`「版本管理」节与「启用 Corepack」步骤（改为如实描述三条路径：
+   本地 `.nvmrc`+`engine-strict`、Actions `node-version-file`+`packageManager`、
+   Docker `corepack enable`）；`README.md:173` 的「通过 Corepack 管理」收窄为容器构建阶段；
+   `CLAUDE.md:119-120` 改成指向；`DECISIONS.md` 保留原决策 + 加「落地记录」写清这三条路径。
+   **绝不要写全局「Corepack 未启用」**。
+5. 收敛结果：**8 个** tracked 位置的**闭合**归类（8 = 3 改指向 + 5 允许保留；缺一不可）：
+
+| 位置 | 处置 | 理由 |
+|---|---|---|
+| `CLAUDE.md` | **改成指向** | 技术栈约定，不该自带数字 |
+| `README.md` | **改成指向** | 同上 |
+| `webui/README.md` | **改成指向** | 同上（另需拆除 Corepack 锁 Node 的错误声称） |
+| `webui/package.json` | **保留** | `engines` 是兼容**范围**语义；`packageManager` 本身就是 pnpm 的真相源 |
+| `controlplane/Dockerfile` | **保留** | `FROM node:24-alpine` 是**容器构建阶段自己的**版本选择点 |
+| `DECISIONS.md` | **保留** | 历史决策（记的是当初为何选 24.15.0） |
+| `Makefile` | **保留** | `:11`/`:61` 是帮助文本「需 Node 24 / pnpm 11」，改成指向反而更难读 |
+| `docs/reports/audit-a-baseline/README.md` | **保留** | 历史审计记录（~~AUD-12~~ 那行），**不得改写历史** |
+
+   **新增的真相源**：`webui/.nvmrc` —— 管**GitHub Actions 的** Node 版本选择。
+   ⚠️ **不要试图把数字压到「只剩一处」**，也不要漏掉 `Makefile` 与审计报告——
+   上一版的归类只列了 3+3、不闭合。
 
 ### vitest PR 门
 - **新建 `.github/workflows/ci-webui.yml`**，不塞进 `ci-smoke.yml` 的 `build-webui`：与
@@ -214,7 +236,7 @@
 | M6 新加一个只有 `t.Skip` 的测试 | RED（`undeclared skip`） | 账本真的在管新 skip |
 | M7 改掉 `t.Log` 的标记文案 | RED | 语义标记断言非哑（对文案漂移敏感是**有意的**） |
 | M8 把 `mutants` slice 截成 1 项（**不能用 `-run`**——8 个 mutant 是普通 slice 循环、不是子测试，`-run` 选不到） | RED（`REQUIRED_LOG_COUNT` 只 1 次 < 8） | 8×6 矩阵真跑完了 |
-| M9 注释掉**一个经实测能把百分比压到门槛以下**的手写测试（执行时先量出它的独占覆盖贡献，并把变异前后数字记进 PR；**不要随手挑一个**——余量足够时它不会红） | RED（coverage < 门槛） | 覆盖率闸真在比，不是打印 |
+| M9 注释掉**一个经实测能把百分比压到门槛以下**的手写测试。⚠️ 这是**带前置的探索步骤，不是拿来即跑**：先用 `go -C controlplane test ./<pkg> -coverprofile` 逐包量出候选的独占贡献（挑覆盖语句数 > `(实测值−门槛)×总语句数` 的那个），把变异前后数字记进 PR；**若不存在单个够大的候选**，改为注释掉一组，或新造一段固定的未覆盖手写语句 | RED（coverage < 门槛） | 覆盖率闸真在比，不是打印 |
 | M10 新建假生成文件（头部写 `// Code generated`）塞 200 行未覆盖语句 | RED（`EXPECT_GENERATED_FILES` 15≠14）**且百分比不动** | 排除按头部注释生效；没人能靠「声明自己是生成代码」偷偷放水 |
 | M11 删掉 `deadletter.sql.go` 的头部注释 | RED（14→13）**且百分比下降** | 判据不是文件名 glob |
 | M12 `COVERAGE_MIN` 设为**本次实测值 + 0.1**（**不要写死 `80.0+0.5`**——若实测 ≥80.5 它不会红） | RED | 门槛值承重 |
@@ -226,12 +248,19 @@ M1/M2/M3/M12 只改 workflow/conf 可直接在 CI 验；M4–M11 本地 `make te
 | 变异 | 期望 | 证明什么 |
 |---|---|---|
 | W0 基线 | GREEN | 对照 |
-| W1 删掉 `pnpm test` step | RED | 测试步骤是承重的（不是只 build） |
-| W2 让某个测试文件不被收集（改 include 或改名） | RED（文件数 < 22） | 正向下界抓得住「少跑一个文件」 |
-| W3 跳过若干用例（`it.skip`） | RED（用例数 < 176） | 下界粒度到用例，不只到文件 |
-| W4 把 `node-version-file` 换回硬编码 `'24'` | RED | `.nvmrc` 真的被 workflow 消费（否则单一真相源是假的） |
-| W5 把 pnpm 版本重新写死 `version: '11'` | RED | `packageManager` 真的在驱动 pnpm 版本 |
-| W6 删掉 `pnpm lint` step | RED | lint 门是承重的 |
+| W1 **注入一个确定失败的断言**（改某个测试的期望值）| RED | test step 真的在判结果。⚠️ **不要用「删掉 `pnpm test` step」**——`pnpm test:coverage` 本身就是 `vitest run --coverage`，照样跑全部测试，删了也 GREEN |
+| W2 让某个测试文件不被收集（改 include 或改名） | RED（文件数 < 22） | 正向下界抓得住「少跑一个文件」。**前提：计数断言必须在独立且必跑的 step 里**，否则它会跟着被删的 step 一起消失 |
+| W3 `it.skip` 掉若干用例 | RED（用例数 < 176） | 下界粒度到用例，不只到文件 |
+| W4 把 `.nvmrc` 改成与 `engines` 冲突的版本（如 `22`） | RED（`engine-strict` 拒绝安装） | `.nvmrc` 真的在驱动 Actions 的 Node 选择 |
+| W5 把 `packageManager` 改成与 `engines.pnpm` 冲突的版本 | RED（`engine-strict` 拒绝安装） | `packageManager` 真的在驱动 pnpm 版本 |
+| W6 **注入一个确定的 ESLint 错误** | RED | lint step 真的在判结果。⚠️ **不要用「删掉 lint step」**——test/build 不会自动跑 ESLint，也没有别的 job 检查该 step 存在，删了会 GREEN |
+| W7 在任一 workflow 里写回硬编码 `node-version: '24'` | RED（**source-of-truth 静态门**） | 单一真相源**有人持续守着**，而不是只在合并那天人工看过一眼 |
+| W8 在任一 workflow 里写回 `pnpm/action-setup` 的 `version:` | RED（同上） | 同上 |
+
+> ⚠️ **W7/W8 依赖一个新增的持久静态门（见 QG-5）。** 上一版把 W4/W5 写成「换回硬编码 →
+> 期望 RED」是**错的**：换回硬编码后运行时仍是 Node 24 / pnpm 11，workflow 照样 GREEN——
+> 因为**计划里当时没有任何持久断言禁止硬编码**，QG-6 的一次性人工 Acceptance 不是 PR 门。
+> 这暴露的不只是变异写错，而是**「单一真相源」合并后会漂移回去且无人守**。故补静态门。
 
 
 ### 落地顺序（每步可独立验证）
@@ -243,11 +272,12 @@ M1/M2/M3/M12 只改 workflow/conf 可直接在 CI 验；M4–M11 本地 `make te
 1. `cover-percent.sh` → 拿步骤 0 的 profile 验：应打印 4 个数、清单正好 14 行且含 `models.go`/`db.go`。
 2. `sts` 加门控 → 无 MinIO 时 `go test -tags=integration ./internal/storage` 从**红**变**skip**。
 3. `test-gate.sh` + conf（`COVERAGE_MIN` 先填 0）→ PG 起着时全绿；停掉 PG 应在 setup 步就明确报错。
-4. `.gitignore` + Makefile → 跑完闸门后 `git status --porcelain` 为空（drift guard 不误报的前提）。
+4. `.gitignore`（`Makefile` target 已随 QG-3 落地）→ 跑完闸门后 `git status --porcelain` 为空
+   （drift guard 不误报的前提）。
 5. **定门槛**：读步骤 3 的数 → ≥80 填 `80.0`；<80 填实测值并在 conf 注释+PR 写清差多少。
 6. 改 `ci-cp.yml` → draft PR 看 CI 日志。
 7. 跑变异矩阵，表贴进 PR。
-8. 记账：backlog 勾掉第 1、2 条；新立三条（见下）。
+8. 记账：backlog 勾掉第 1、2 条；新立**五条**（见下节，数量以该节实际条目为准，不要写死）。
 9. **用户操作**：开分支保护 + 设 required check。
 
 ## 必须在 PR 描述里写明的三件事（否则等于用「已落地」掩盖「没落地」）
@@ -343,10 +373,10 @@ QG-7  用户：开 master 分支保护 + 设 required check      ← 最后一�
 | ~~**QG-0**~~ | 落地本文件 + `active.md` 指针（docs-only PR） | ✅ 已完成 |
 | **QG-1** | `scripts/ci/cover-percent.sh` | opencode |
 | **QG-2** | `sts` 门控 + 删空壳测试 | opencode |
-| **QG-3** | `scripts/ci/test-gate.sh` + `ci/gate-controlplane.conf` | opencode |
-| **QG-4** | `ci-cp.yml` + `Makefile` + `.gitignore` | opencode |
+| **QG-3** | `scripts/ci/test-gate.sh` + `ci/gate-controlplane.conf` + **`Makefile` target** | opencode |
+| **QG-4** | `ci-cp.yml` + `.gitignore`（**不含 `Makefile`**，那归 QG-3） | opencode |
 | **QG-5** | webui Node 钉法 + `ci-webui.yml` | opencode |
-| **QG-6** | 拆除 Corepack 叙事（4 处文档） | opencode |
+| **QG-6** | 修正 Corepack 表述 + Node 版本收敛为指向（3 处文档改指向；Dockerfile 等 5 处保留） | opencode |
 | **QG-7** | `master` 分支保护 + required check | **用户** |
 
 ## 不可外包（协调者必须自己做）
@@ -378,9 +408,10 @@ profile 行 `<import-path>/<file>.go:<s>.<c>,<e>.<c> <numStmts> <count>`，
 **以 `file:range` 整体为 key 去重**（go test 拼接各包 fragment，同一块可能多行，naive 累加会算重分母）；
 模块路径读 `go.mod` 的 `module` 行（**不要 `go list -m`**，go.work 下会打印所有 workspace 模块）；
 awk 先 `sub(/\r$/,"")`（CRLF）；`END` 里**重读** genlist 取总数（零语句的 `models.go` 也要算）。
-**Acceptance**：① **自己先生成 profile**（不要假设已有一份）：
-`cd controlplane && go test ./... -covermode=atomic -coverprofile=../bin/cov.out`（无需 PG，
-不带 tag 也能验排除逻辑），再 `scripts/ci/cover-percent.sh controlplane bin/cov.out bin/gen.txt`
+**Acceptance**：① **自己先生成 profile**（不要假设已有一份），⚠️ **用 `go -C` 而不是 `cd`**
+——`cd controlplane && …` 会把后续命令留在错误的 cwd，导致下一条相对路径失败：
+`go -C controlplane test ./... -covermode=atomic -coverprofile=../bin/cov.out`（无需 PG，
+不带 tag 也能验排除逻辑），再在**仓库根**跑 `scripts/ci/cover-percent.sh controlplane bin/cov.out bin/gen.txt`
 → `genfiles` = **14**，`bin/gen.txt` 全在 `controlplane/internal/db/` 且**含 `models.go` 与 `db.go`**；
 ② 临时删掉 `deadletter.sql.go` 的头部注释 → `genfiles` 变 **13** 且百分比**下降**
 （证明判据认注释不认文件名），**改回后 `git diff` 必须为空**；
@@ -416,7 +447,10 @@ bash 3.2 兼容——用 `/bin/bash scripts/ci/test-gate.sh controlplane` 显式
 ⚠️ **`.gitignore` 加 `/.ci-out/`，且 drift guard 步骤必须排在测试之前**——否则
 `git status --porcelain` 把 coverage.out 当漂移报红。
 **Acceptance（worker 本地，必须能自证）**：
-① `actionlint` 或 `python3 -c "import yaml,sys;yaml.safe_load(open('.github/workflows/ci-cp.yml'))"` 通过；
+① `docker compose -f deploy/docker-compose.test.yml config -q` 通过（compose 文件可解析）；
+⚠️ **不要用 `actionlint` 或 PyYAML 校验 workflow**——两者在干净 worker 环境里都不存在
+（实测 `import yaml` → `ModuleNotFoundError`），仓库也没钉定 actionlint。
+**workflow 的语法/schema 校验属协调者的集成验收**（推上去 CI 立刻会报）。
 ② 本地 `docker compose -f deploy/docker-compose.test.yml up -d --wait postgres` +
 `make test-gate-controlplane` 全绿，**跑完后 `git status --porcelain` 为空**
 （这是 drift guard 不误报的前提，也是 `/.ci-out/` 真被忽略的证据）；
@@ -431,25 +465,46 @@ bash 3.2 兼容——用 `/bin/bash scripts/ci/test-gate.sh controlplane` 显式
 **Change**：新增 `webui/.nvmrc`(=`24`)、`webui/.npmrc`(=`engine-strict=true`)、
 `.github/workflows/ci-webui.yml`（paths 只 `webui/**` + self）；改 `ci-smoke.yml` 与
 `build-webui.yml` 的 Node/pnpm 钉法（`node-version-file` + `packageManager`，删掉硬编码与浮动版本）。
-**`ci-webui.yml` 三步都要跑：`pnpm lint` + `pnpm test` + `pnpm build`**——
-`pnpm lint`（`webui/package.json:14`）已存在但**从来没人跑过**，只补 test 会让 lint 错误在绿灯下通过。
+**`ci-webui.yml` 要跑四件事**：
+1. `pnpm lint`（`webui/package.json:14` 已存在但**从来没人跑过**，只补 test 会让 lint 错误在绿灯下通过）
+2. `pnpm test`
+3. `pnpm build`
+4. **source-of-truth 静态门**（新增，**这是「单一真相源」唯一的持久守卫**）：
+   - `grep -rn "node-version:" .github/workflows/` 必须**零命中**（全部应为 `node-version-file`）
+   - `grep -rn -A2 "pnpm/action-setup" .github/workflows/ | grep -q "version:"` 必须**零命中**
+     （pnpm 版本只能来自 `packageManager`）
+   命中即 `::error::` 并指向 `webui/.nvmrc` / `packageManager`。
+   ⚠️ **没有这道门，QG-5/QG-6 的成果会在下一个 PR 里被硬编码悄悄改回去**——
+   一次性的人工 Acceptance 守不住它（这正是变异 W7/W8 要证明的）。
+⚠️ **正向计数断言（22 文件 / 176 用例）必须放在独立且必跑的 step 里**，
+不要和 `pnpm test` 同 step——否则删掉 test step 时断言会一起消失（变异 W1 的教训）。
 ⚠️ **`pnpm/action-setup` 必须在 `setup-node` 之前**。
 防静默跳过用正向下界：grep `Test Files  <N> passed` / `Tests  <M> passed`，断言 N ≥ 22 且 M ≥ 176。
 `pnpm test:coverage` **只打印不判阈**。
 **Acceptance**：本机 `cd webui && pnpm test` 在 Node 24 下 22 文件/176 用例全绿；
 故意切到 Node 26 时 `pnpm install` 因 `engine-strict` **拒绝**（这是 `engine-strict` 生效的证据）。
 
-### QG-6 拆除 Corepack 叙事（依赖 QG-5）
-**Change**：`webui/README.md`「版本管理」节 + 「启用 Corepack」步骤重写；`README.md:173` 去掉
-「通过 Corepack 管理」；`CLAUDE.md:119-120` 改成指向 `webui/.nvmrc` 与 `packageManager`、
-不再自带数字；`DECISIONS.md` 对应决策**保留原决策与理由**，加一条「落地记录」说明实际机制是
-`.nvmrc` + `engine-strict` + `packageManager`、**Corepack 未启用**。
-**Acceptance**（机械可验，**不要用「每一处都一致」这种人工判据**）：
+### QG-6 修正 Corepack 表述 + Node 版本收敛为指向（依赖 QG-5）
+**Change**：把三条版本路径**如实**写清，而不是「拆除 Corepack」——
+⚠️ **`controlplane/Dockerfile:18` 确实 `RUN corepack enable` 且用法正确，不要动它。**
+- `webui/README.md`「版本管理」节 + 「启用 Corepack」步骤重写为三条路径：
+  **本地** = `.nvmrc` + `engine-strict`；**GitHub Actions** = `node-version-file` + `packageManager`；
+  **Docker 构建** = `FROM node:24-alpine` + `corepack enable`（从 `packageManager` 钉 pnpm）。
+  并删掉「Corepack 锁 **Node.js** 版本」这个错误声称（Corepack 管不了 Node 自身）。
+- `README.md:173` 的「通过 Corepack 管理」**收窄为容器构建阶段**，不要整句删掉。
+- `CLAUDE.md:119-120` 改成指向 `webui/.nvmrc` 与 `packageManager`，不再自带数字。
+- `DECISIONS.md` **保留原决策与理由**，加一条「落地记录」写清上述**三条路径**。
+  ⚠️ **不要写全局「Corepack 未启用」**——那是错的。
+- `Makefile:11`/`:61` 与 `docs/reports/audit-a-baseline/README.md:138` **不动**（见上文归类表）。
+**Acceptance**（尽量机械化；①③ 仍含人工判断的部分已注明）：
 ① `git ls-files -z | xargs -0 grep -il corepack` 的结果里，**不得**再出现声称 Corepack 锁 **Node** 版本
 的句子——逐个文件贴出命中行供核对；
 ② **可执行版本选择**只从 `webui/.nvmrc` 读：`grep -rn "node-version:" .github/workflows/` 必须**零命中**
 （全部改成 `node-version-file`）；
-③ 以下三处**允许并应当继续出现 24**，只需与 `.nvmrc` 的 major 一致：
+③ 「允许保留」的各处必须与 `.nvmrc` 的 major 一致——用命令比对，不要目测：
+`test "$(cat webui/.nvmrc)" = "$(grep -oE 'node:([0-9]+)' controlplane/Dockerfile | head -1 | cut -d: -f2)"`
+且 `grep -q ">=$(cat webui/.nvmrc)\.0\.0" webui/package.json`。
+以下各处**允许并应当继续出现 24**：
 `webui/package.json` 的 `engines`（兼容**范围**语义）、`controlplane/Dockerfile:16` 的
 `FROM node:24-alpine`（容器基础镜像）、`DECISIONS.md` 的历史决策（记的是当初为何选 24.15.0）。
 ⚠️ **上一版把验收写成「只剩 .nvmrc 一处」，那是不可达的**——它与保留 engines/Dockerfile/历史决策直接冲突。
