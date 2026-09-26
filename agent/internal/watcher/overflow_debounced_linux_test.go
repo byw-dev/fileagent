@@ -72,7 +72,7 @@ func TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles(t *testing.
 	dir := t.TempDir()
 
 	// Seed files with a BACKDATED mtime: the debounced initial scan must
-	// EMIT them (not skip them as hot), so the scan parks on the first
+	// EMIT them (not skip them as hot), so the scan parks on a seed
 	// emission below. This is the debounced analogue of the tail sibling's
 	// parked-consumer wedge: in debounced mode a parked consumer does NOT
 	// stop the event loop from draining fw.Events (flushes run on timer
@@ -122,8 +122,9 @@ func TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles(t *testing.
 	w.rescanSkippedHot = func(string) { rescanSkips.Add(1) }
 	w.rescanRecheckArmed = func(string) { rescanArms.Add(1) }
 
-	// Unbuffered channel: the parked consumer is what wedges the initial
-	// scan's first emission.
+	// Unbuffered channel: the rendezvous on seed #1 is the burst's
+	// structural barrier (see below), and with the consumer still gated the
+	// scan then parks on seed #2 — which is what wedges fw.Events.
 	events := make(chan FileEvent)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -149,8 +150,32 @@ func TestInotifyOverflow_Debounced_SafetyNetRescan_RecoversLostFiles(t *testing.
 
 	go func() { _ = w.Start(ctx, events) }()
 
-	// Let Start register the watch and wedge the initial scan on seed #1.
-	time.Sleep(500 * time.Millisecond)
+	// STRUCTURAL barrier, not a timing guess: receive seed #1 ourselves. On
+	// an UNBUFFERED channel a receive is a rendezvous, so completing it
+	// establishes happens-before with the scan's send — which proves BOTH
+	// preconditions of the burst below, with nothing to tune:
+	//
+	//   - addWatchPaths(fw) has already returned. Start registers watches
+	//     BEFORE the initial pollScan, so a scan emission cannot be observed
+	//     unless the watch is live.
+	//   - the scan is NOT finished: seed #2 is emitted next and parks there,
+	//     because the consumer is still gated and we never receive again.
+	//     pollScan runs synchronously on Start's goroutine before the event
+	//     loop exists, so while it is parked NOTHING drains fw.Events and
+	//     the burst is guaranteed to overflow the kernel queue.
+	//
+	// A fixed sleep could only guess at this, and a loaded runner breaks the
+	// guess: the burst lands before the watch is registered, the queue never
+	// overflows, and this CI-gating step goes red for reasons unrelated to
+	// any product regression.
+	select {
+	case fe := <-events:
+		mu.Lock()
+		got[fe.Path] = true
+		mu.Unlock()
+	case <-time.After(60 * time.Second):
+		t.Fatal("initial scan never emitted seed #1 within 60s: the scan is not parked on a seed emission, so the burst below could not deterministically overflow the kernel queue")
+	}
 
 	t.Logf("burst: creating %d files while the initial scan is parked on the seed emission", numFiles)
 	for i := 0; i < numFiles; i++ {
