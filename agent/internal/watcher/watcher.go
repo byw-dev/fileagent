@@ -324,7 +324,7 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 	}
 	defer fw.Close()
 
-	if err := w.addWatchPaths(fw); err != nil || os.Getenv("FILEAGENT_TEMP_MUTATION_FORCE_DEGRADE") == "1" {
+	if err := w.addWatchPaths(fw); err != nil {
 		w.logger.Warn("watcher: cannot add watch paths, using polling", zap.Error(err))
 		return w.runPolling(ctx, events)
 	}

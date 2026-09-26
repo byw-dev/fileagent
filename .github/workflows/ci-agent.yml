@@ -98,4 +98,3 @@ jobs:
           grep -q "^--- PASS" overflow-debounced-test.log || { echo "::error::debounced overflow test did not pass"; exit 1; }
         env:
           FILEAGENT_TEST_INOTIFY_OVERFLOW: "1"
-          FILEAGENT_TEMP_MUTATION_FORCE_DEGRADE: "1"
