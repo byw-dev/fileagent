@@ -33,11 +33,11 @@
 
 | # | 缺口 | 实测证据 | 定级 |
 |---|------|---------|------|
-| 1 | CI 无 PostgreSQL，PG 关键测试静默 skip | `webhook_r3_red*_test.go` 全部 `t.Skipf("no PostgreSQL")`；**IC-4a 的 PG 权威单调计数在 CI 里一次都没跑过**；`ci-cp.yml` 中 `postgres`/`services:` 零命中 | 🟠 P1 |
+| 1 | CI 无 PostgreSQL，PG 关键测试静默 skip | `webhook_r3_red*_test.go` 两文件共 7 个顶层测试，其中 **4 个 PG-dependent 的**会 `t.Skipf("no PostgreSQL")`（`webhook_r3_red_test.go` 的 3 个 B2 测试不依赖 PG，**不要写成「全部 skip」**）；**IC-4a 的 PG 权威单调计数在 CI 里一次都没跑过**；`ci-cp.yml` 中 `postgres`/`services:` 零命中 | 🟠 P1 |
 | 2 | 覆盖率门槛写明却无人执行 | CLAUDE.md 要求整体 ≥ 80%，实测 79.9%；`ci-cp.yml` 中 `coverage` 零命中 | 🟠 P1 |
 | 3 | webui PR 门缺失 | 22 个 vitest 文件（176 用例）在 CI 里**从未执行** | AUD-11 |
 | 4 | `pkg/trollsift` 无人跑 | 3 个测试文件、零 workflow；它是路径模板核心（D-034 三端对齐） | 本轮新发现 |
-| 5 | Node 版本约束无人执行 | 「Node 24」写在 7 处、执行 0 处；且文档声称的 Corepack 机制是空的 | 本轮新发现 |
+| 5 | Node 版本**本地**不被强制，且版本源重复 | 「Node 24」写在 **8 个** tracked 位置；CI **有 2 个执行点**（`ci-smoke.yml:72`、`build-webui.yml:20` 的 `setup-node`），但**本地无任何强制**（无 `.nvmrc`/`engine-strict`，pnpm 只警告不拒绝）→ 本机默认跑在 Node 26；且 CI 的 `pnpm/action-setup version: '11'` **绕过** `packageManager: pnpm@11.0.4`；文档声称的 Corepack 机制是空的 | 本轮新发现 |
 | 6 | **`master` 无分支保护** | `branches/master/protection` → **404**，`rulesets` → **`[]`**。没有任何东西**要求** CI 绿 | 🔴 **前提** |
 
 缺口 6 是前提：闸门不是 required check，就只是建议——这刀会退化成「让红灯有内容」而非「让绿灯可信」。
@@ -50,7 +50,10 @@
 
 1. **不能直接 `go test -tags=integration ./...`** —— `controlplane/internal/storage/sts_integration_test.go`
    **无 env 门控**、硬编码 `localhost:9000`，无 MinIO 时 `require.NoError` **硬失败而非 skip**。
-   它是 9 个 integration 文件里唯一没门控的，也是 `-tags=integration` 在 CI 里从未能跑的那块石头。
+   它是 9 个 integration 文件里**唯一「需要本轮不会启动的外部服务、却没有前置 skip 门控」**的那个，
+   也是 `-tags=integration` 在 CI 里从未能跑的那块石头。
+   ⚠️ **不要写成「唯一没 env 门控」**——`auth`/`batchtag`/`db`/`t3_e2e` 也没有 `*_LIVE` 式门控，
+   但前三者依赖的 PG 本轮会启动、`t3_e2e` 自足，所以都不构成阻塞。
 2. **`*.sql.go` glob 是错的** —— 漏 `internal/db/models.go`(584) 与 `db.go`(31)。判据必须是文件头
    `^// Code generated .* DO NOT EDIT\.$`（package 子句之前），即 Go 官方那条正则。生成文件共 **16** 个
    （controlplane 14 + 根 module `api/v1/` 2）。
@@ -134,7 +137,8 @@
 > 否决 `psql -f migrations/*.up.sql`：不写 `schema_migrations` 记账，之后任何 `Migrate()` 都会从 0 重放 → 红。
 
 ### 三层防静默跳过（机制在脚本，名单在 conf）
-1. **正向点名**：`grep -qE "^--- PASS: ${t} \("`，覆盖 14 个 PG 测试 + 1 个 tag-only 测试。
+1. **正向点名**：`grep -qE "^--- PASS: ${t} \("`，共 **15 条**＝14 个 PG 测试 + 1 个 tag-only 测试
+   （`TestControlPlaneAgent_EndToEnd_Integration`，自足但只在 tag 下编译，必须点名否则它被删/改名无人知）。
    用 `-v` 文本输出而非 `-json`（与 `ci-agent.yml` 同构、本地无 jq 依赖，且顶层 `--- PASS:` 在第 0 列、
    子测试缩进 4 空格，天然就是「只管顶层」的粒度）。
 2. **语义标记**：`REQUIRED_LOG` 断言 `MUTATION | A1 | …` 那行存在；`REQUIRED_LOG_COUNT` 要求 8 行 mutant
@@ -164,7 +168,13 @@
    `README.md:173` 去掉「通过 Corepack 管理」；`CLAUDE.md:119-120` 改成**指向**而不自带数字；
    `DECISIONS.md` 保留原决策与理由，但加一条「落地记录」说明实际机制是
    `.nvmrc` + `engine-strict` + `packageManager`、**Corepack 未启用**。
-5. 收敛结果：7 处 → **2 个真相源**（`.nvmrc` 管 Node、`packageManager` 管 pnpm）。
+5. 收敛结果：**8 个** tracked 位置 → **2 个真相源** + **3 处允许保留**：
+   - 真相源：`webui/.nvmrc`（Node 的**可执行**版本选择）、`packageManager`（pnpm 版本）
+   - 允许继续出现 24、只需与 `.nvmrc` 同 major：`webui/package.json` 的 `engines`（兼容**范围**语义）、
+     `controlplane/Dockerfile:16` 的 `FROM node:24-alpine`（容器基础镜像）、
+     `DECISIONS.md` 的历史决策（记的是当初为何选 24.15.0）
+   - 其余（`README.md`、`webui/README.md`、`CLAUDE.md`）一律改成**指向**，不自带数字
+   ⚠️ **不要试图把数字压到「只剩一处」**——那与保留 engines / Dockerfile / 历史决策直接冲突。
 
 ### vitest PR 门
 - **新建 `.github/workflows/ci-webui.yml`**，不塞进 `ci-smoke.yml` 的 `build-webui`：与
@@ -190,7 +200,7 @@
 闸门每次**同时打印两个数**：排除生成代码的闸门数 + `go tool cover -func | tail -1` 的含生成代码对照数。
 后者与 AUD-8 同量纲：若 CI 打出的对照数落回 79.x，说明 PG 或 `TEST_DATABASE_URL` 掉了。
 带 tag + PG + 设变量应 **> 80.1%**。这不是「CI 绿了所以没问题」，而是**每次都把可判别的数字打出来**，
-且与 14 条 `REQUIRED_PASS` 构成两个独立信号。
+且与 **15** 条 `REQUIRED_PASS` 构成两个独立信号。
 
 ### 变异矩阵（照 PR #122 的做法，逐条跑并把 RED/GREEN 表贴进 PR）
 | 变异 | 期望 | 证明什么 |
@@ -203,16 +213,33 @@
 | M5 把某个 required 测试改名（不改 conf） | RED | **正向断言能抓「改名/删除」，负向断言抓不到** |
 | M6 新加一个只有 `t.Skip` 的测试 | RED（`undeclared skip`） | 账本真的在管新 skip |
 | M7 改掉 `t.Log` 的标记文案 | RED | 语义标记断言非哑（对文案漂移敏感是**有意的**） |
-| M8 `-run` 只跑一个 mutant | RED（`REQUIRED_LOG_COUNT`） | 8×6 矩阵真跑完了 |
-| M9 注释掉一个有覆盖的手写测试 | RED（coverage < 门槛） | 覆盖率闸真在比，不是打印 |
+| M8 把 `mutants` slice 截成 1 项（**不能用 `-run`**——8 个 mutant 是普通 slice 循环、不是子测试，`-run` 选不到） | RED（`REQUIRED_LOG_COUNT` 只 1 次 < 8） | 8×6 矩阵真跑完了 |
+| M9 注释掉**一个经实测能把百分比压到门槛以下**的手写测试（执行时先量出它的独占覆盖贡献，并把变异前后数字记进 PR；**不要随手挑一个**——余量足够时它不会红） | RED（coverage < 门槛） | 覆盖率闸真在比，不是打印 |
 | M10 新建假生成文件（头部写 `// Code generated`）塞 200 行未覆盖语句 | RED（`EXPECT_GENERATED_FILES` 15≠14）**且百分比不动** | 排除按头部注释生效；没人能靠「声明自己是生成代码」偷偷放水 |
 | M11 删掉 `deadletter.sql.go` 的头部注释 | RED（14→13）**且百分比下降** | 判据不是文件名 glob |
-| M12 `COVERAGE_MIN` +0.5 | RED | 门槛值承重 |
+| M12 `COVERAGE_MIN` 设为**本次实测值 + 0.1**（**不要写死 `80.0+0.5`**——若实测 ≥80.5 它不会红） | RED | 门槛值承重 |
 
 M1/M2/M3/M12 只改 workflow/conf 可直接在 CI 验；M4–M11 本地 `make test-gate-controlplane` 即可。
 
+**webui 侧变异（PR 2 用，同样逐条跑并贴表）** —— 上一版矩阵只覆盖 CP，PR 2 的核心主张完全没被变异：
+
+| 变异 | 期望 | 证明什么 |
+|---|---|---|
+| W0 基线 | GREEN | 对照 |
+| W1 删掉 `pnpm test` step | RED | 测试步骤是承重的（不是只 build） |
+| W2 让某个测试文件不被收集（改 include 或改名） | RED（文件数 < 22） | 正向下界抓得住「少跑一个文件」 |
+| W3 跳过若干用例（`it.skip`） | RED（用例数 < 176） | 下界粒度到用例，不只到文件 |
+| W4 把 `node-version-file` 换回硬编码 `'24'` | RED | `.nvmrc` 真的被 workflow 消费（否则单一真相源是假的） |
+| W5 把 pnpm 版本重新写死 `version: '11'` | RED | `packageManager` 真的在驱动 pnpm 版本 |
+| W6 删掉 `pnpm lint` step | RED | lint 门是承重的 |
+
+
 ### 落地顺序（每步可独立验证）
-0. **先量基线**（不改文件）：四种配置各跑一次，前三个应复现 AUD-8 的 79.4/79.9/80.1；对不上先查环境。
+0. **先量基线**（不改文件），四种配置各跑一次：
+   ① 无 PG、不带 tag → 期望 **79.4%**；② PG 在线、**不设** `TEST_DATABASE_URL`、不带 tag → **79.9%**；
+   ③ PG 在线、**设** `TEST_DATABASE_URL`、不带 tag → **80.1%**（以上三个是 AUD-8 的尺子，对不上先查环境）；
+   ④ PG 在线、设变量、**带 `-tags=integration`** → **无既有基准，本步就是为了量出它**——
+   它是门槛数字的来源，期望 > 80.1%（若落回 79.x 说明 PG 或变量没生效）。
 1. `cover-percent.sh` → 拿步骤 0 的 profile 验：应打印 4 个数、清单正好 14 行且含 `models.go`/`db.go`。
 2. `sts` 加门控 → 无 MinIO 时 `go test -tags=integration ./internal/storage` 从**红**变**skip**。
 3. `test-gate.sh` + conf（`COVERAGE_MIN` 先填 0）→ PG 起着时全绿；停掉 PG 应在 setup 步就明确报错。
@@ -232,10 +259,24 @@ M1/M2/M3/M12 只改 workflow/conf 可直接在 CI 验；M4–M11 本地 `make te
    给将来定清单的人用。
 3. **绿灯何时开始被要求**：步骤 9 完成前，以上全部只是「跑了」不是「挡住了」。
 
-## 新立 backlog 三条
-- 需要一份「核心业务逻辑」包清单，才能执行 CLAUDE.md 的 ≥ 90%
-- CI 接 MinIO（解封 `STS_LIVE` 两个测试 + agent 的 `uploader_integration_test.go`）
-- 棘轮的机械保障：CI 比对 `git show master:ci/gate-*.conf`，只允许 `>=`（对 agent/webui 同样适用）
+## 新立 backlog（本 track 明确不做，但必须立卡）
+
+1. 需要一份「核心业务逻辑」包清单，才能执行 CLAUDE.md 的 ≥ 90%
+2. CI 接 MinIO —— 解封 `STS_LIVE` 两个测试 + agent 的 `uploader_integration_test.go`
+3. 棘轮的机械保障：CI 比对 `git show master:ci/gate-*.conf`，只允许 `>=`（对 agent/webui 同样适用）
+4. **Python SDK PR 门** —— `sdk/python/` 有 6 个 pytest 文件、`CLAUDE.md` 定了整体 ≥ 80%，
+   但**没有任何 workflow 触发或执行它**；`backlog.md:110` 的 **T4-2** 明写应有
+   controlplane/agent/webui/sdk-python 四条流水线，webui 由 QG-5 补上后只剩 sdk-python。
+   **产品决定（2026-09-27）：不纳入 QG track** —— SDK 暂无消费方、T3-3 已推后。
+   ⚠️ 但立卡理由要写清：**「SDK 功能被推后」≠「已有单测可以永远不跑」**，它与本 track 是同一个病。
+5. **Agent 的 integration 测试仍不跑** —— 全仓 11 个 build-tag integration 文件里 agent 占 2 个：
+   `uploader_integration_test.go`（要 MinIO，已含在第 2 条）与
+   `grpcclient/e2e_tls_integration_test.go`（**无外部依赖、进程内自签证书，本可以直接跑**）。
+   后者应单独归属，不要被「等 MinIO」连带拖住。
+
+> ⚠️ **本文件的 6 条缺口不是穷尽的。** 已知另有账在别处：`backlog.md:268-289` 的
+> deploy shell lint / 行为矩阵（已有独立任务，不在此重复设计）。新会话若又发现缺口，
+> 照上面的样式追加，**不要改写「6 条」这个数字去假装穷尽**。
 
 ## 风险（按翻车概率排序）
 1. **`git status --porcelain` 误报漂移** —— 产物必须全进 `/.ci-out/`，且 drift guard 排在测试之前。
@@ -269,9 +310,12 @@ M1/M2/M3/M12 只改 workflow/conf 可直接在 CI 验；M4–M11 本地 `make te
 选 `QG-`，否决其它候选的理由：
 - ❌ `CI-` —— 已稳定表示 Continuous Integration（本仓 `.github/workflows/ci-*.yml` 与
   CLAUDE.md 多处），不可作任务前缀
-- ❌ `GATE-` —— ID 形式虽 0 占用，但 `GATE` 作为**普通词**在仓库出现 **88 处**
-  （`gate open`、`双闸`、`fail-closed gate`…），`grep GATE` 会淹在噪声里 → **失去定位性**，
-  与 `CI-` 同型的坑
+- ❌ `GATE-` —— ID 形式虽 0 占用，但 `GATE` 作为**普通词**在仓库里广泛出现
+  （`gate open`、`双闸`、`fail-closed gate`、`gate closed`…），`grep GATE` 会淹在噪声里
+  → **失去定位性**，与 `CI-` 同型的坑。
+  ⚠️ **不要在此写一个精确计数**：同一问题按不同口径量到过 88 / 95 / 115 三个数
+  （限定扩展名 vs 全 tracked、是否大小写不敏感、是否含隐藏路径），写死任何一个都会误导。
+  要复核就跑：`git ls-files -z | xargs -0 grep -ioE '\bgate\b' | wc -l`
 - ❌ 裸 `W1/W2/…` —— 无前缀、项目内无唯一性无法定位，且与已占用的 `WR-x`（Web UI 重做）视觉混淆
 - ✅ `QG-` —— ID 形式 0 占用，作为独立词 **0 处**，2 字母与 `IC`/`CC`/`MT`/`WR` 风格一致，
   语义覆盖全部单元（测试真跑、覆盖率、前端门、版本钉、分支保护都是质量闸门）
@@ -334,9 +378,14 @@ profile 行 `<import-path>/<file>.go:<s>.<c>,<e>.<c> <numStmts> <count>`，
 **以 `file:range` 整体为 key 去重**（go test 拼接各包 fragment，同一块可能多行，naive 累加会算重分母）；
 模块路径读 `go.mod` 的 `module` 行（**不要 `go list -m`**，go.work 下会打印所有 workspace 模块）；
 awk 先 `sub(/\r$/,"")`（CRLF）；`END` 里**重读** genlist 取总数（零语句的 `models.go` 也要算）。
-**Acceptance**：① 拿一份现成 profile 跑，`genfiles` = **14**，清单全在 `controlplane/internal/db/`
-且**含 `models.go` 与 `db.go`**；② 临时删掉 `deadletter.sql.go` 的头部注释 → `genfiles` 变 **13**
-且百分比**下降**（证明判据认注释不认文件名），改回后恢复；③ bash 3.2 兼容（macOS 自带）。
+**Acceptance**：① **自己先生成 profile**（不要假设已有一份）：
+`cd controlplane && go test ./... -covermode=atomic -coverprofile=../bin/cov.out`（无需 PG，
+不带 tag 也能验排除逻辑），再 `scripts/ci/cover-percent.sh controlplane bin/cov.out bin/gen.txt`
+→ `genfiles` = **14**，`bin/gen.txt` 全在 `controlplane/internal/db/` 且**含 `models.go` 与 `db.go`**；
+② 临时删掉 `deadletter.sql.go` 的头部注释 → `genfiles` 变 **13** 且百分比**下降**
+（证明判据认注释不认文件名），**改回后 `git diff` 必须为空**；
+③ 用 `/bin/bash scripts/ci/cover-percent.sh …` 显式跑一遍（macOS 自带 bash 3.2），
+输出与默认解释器逐字相同、退出码 0。
 
 ### QG-2 `sts` 门控（无依赖，可与 QG-1 并行）
 **Change**：`controlplane/internal/storage/sts_integration_test.go` 加
@@ -348,29 +397,42 @@ awk 先 `sub(/\r$/,"")`（CRLF）；`END` 里**重读** genlist 取总数（零�
 **Acceptance**：无 MinIO 时 `go test -tags=integration ./internal/storage` 从**红**变**skip**；
 `GOOS` 不变、`go vet -tags=integration ./internal/storage` 通过。
 
-### QG-3 `scripts/ci/test-gate.sh` + `ci/gate-controlplane.conf`（依赖 QG-1）
+### QG-3 `scripts/ci/test-gate.sh` + `ci/gate-controlplane.conf` + `Makefile` target（依赖 QG-1）
 **Change**：驱动脚本 + 策略 conf。顺序：`go vet`（含 tag 再 vet 一遍）→ `SETUP_TEST` 先行迁移
 → 全量 `go test -v -covermode=atomic -coverprofile` → 三层断言 → 覆盖率闸。
 **机制在脚本、策略在 conf，不要互串。**
 三层断言与 conf 字段见上文「三层防静默跳过」。`COVERAGE_MIN` **先填 0**（数字由协调者定）。
 产物落 `.ci-out/<module>/`。尽量把所有问题一次报完（「红了看不出为什么」等于没红）。
-**Acceptance**：PG 起着时 `make test-gate-controlplane` 全绿且打印 14 条 `ok` + 5 条
-`ok(declared)`；**停掉 PG 应在 setup 步就明确报「PG 没起来，先跑 compose」**，而不是刷 14 条红；
-bash 3.2 兼容（空数组先判 `${#arr[@]}`、条件一律 `if/then`）。
+**Acceptance**（⚠️ **本单元自带 Make target，不要依赖 QG-4**——否则你跑不了自己的验收）：
+PG 起着时 `make test-gate-controlplane` 全绿且打印 **15 条 `ok`** + 5 条 `ok(declared)`；
+**停掉 PG 应在 setup 步就明确报「PG 没起来，先跑 compose」**，而不是刷 15 条红；
+bash 3.2 兼容——用 `/bin/bash scripts/ci/test-gate.sh controlplane` 显式跑一遍（macOS 自带 3.2），
+退出码与 `bash` 默认解释器一致。
 
-### QG-4 `ci-cp.yml` + `Makefile` + `.gitignore`（依赖 QG-3）
+### QG-4 `ci-cp.yml` + `.gitignore`（依赖 QG-3）
 **Change**：见上文「新增/修改文件」表对应三行。用 compose 起 PG（**不用 `services:`**），
 只点名 `postgres`；`permissions: contents: read`（不需要 `packages: read`）。
 ⚠️ **job `name:` 保持原样不改**（分支保护开启后按名字登记 required check）。
 ⚠️ **`.gitignore` 加 `/.ci-out/`，且 drift guard 步骤必须排在测试之前**——否则
 `git status --porcelain` 把 coverage.out 当漂移报红。
-**Acceptance**：跑完闸门后 `git status --porcelain` 为空；draft PR 的 CI 日志含
-14 条 `ok`、`MUTATION | A1 …` 那张表、两个覆盖率数字。
+**Acceptance（worker 本地，必须能自证）**：
+① `actionlint` 或 `python3 -c "import yaml,sys;yaml.safe_load(open('.github/workflows/ci-cp.yml'))"` 通过；
+② 本地 `docker compose -f deploy/docker-compose.test.yml up -d --wait postgres` +
+`make test-gate-controlplane` 全绿，**跑完后 `git status --porcelain` 为空**
+（这是 drift guard 不误报的前提，也是 `/.ci-out/` 真被忽略的证据）；
+③ `grep -c "name: codegen-drift + vet + test" .github/workflows/ci-cp.yml` = 1（job 名未被改动）。
+
+**协调者集成验收（不属于 worker）**：draft PR 的 CI 日志含 **15 条** `ok`、
+`MUTATION | A1 …` 那张表、两个覆盖率数字。
+⚠️ **上一版把这条写成 worker 的 Acceptance 是错的**——公共约束禁止 worker push / 碰 PR，
+它拿不到 CI 日志。
 
 ### QG-5 webui Node 钉法 + `ci-webui.yml`（与 CP 完全独立，可并行）
 **Change**：新增 `webui/.nvmrc`(=`24`)、`webui/.npmrc`(=`engine-strict=true`)、
 `.github/workflows/ci-webui.yml`（paths 只 `webui/**` + self）；改 `ci-smoke.yml` 与
 `build-webui.yml` 的 Node/pnpm 钉法（`node-version-file` + `packageManager`，删掉硬编码与浮动版本）。
+**`ci-webui.yml` 三步都要跑：`pnpm lint` + `pnpm test` + `pnpm build`**——
+`pnpm lint`（`webui/package.json:14`）已存在但**从来没人跑过**，只补 test 会让 lint 错误在绿灯下通过。
 ⚠️ **`pnpm/action-setup` 必须在 `setup-node` 之前**。
 防静默跳过用正向下界：grep `Test Files  <N> passed` / `Tests  <M> passed`，断言 N ≥ 22 且 M ≥ 176。
 `pnpm test:coverage` **只打印不判阈**。
@@ -382,8 +444,15 @@ bash 3.2 兼容（空数组先判 `${#arr[@]}`、条件一律 `if/then`）。
 「通过 Corepack 管理」；`CLAUDE.md:119-120` 改成指向 `webui/.nvmrc` 与 `packageManager`、
 不再自带数字；`DECISIONS.md` 对应决策**保留原决策与理由**，加一条「落地记录」说明实际机制是
 `.nvmrc` + `engine-strict` + `packageManager`、**Corepack 未启用**。
-**Acceptance**：全仓库 `grep -rn corepack --include='*.md'` 的每一处都与实际机制一致；
-「Node 24」的数字只剩 `webui/.nvmrc` 一处真相源（其余全是指向）。
+**Acceptance**（机械可验，**不要用「每一处都一致」这种人工判据**）：
+① `git ls-files -z | xargs -0 grep -il corepack` 的结果里，**不得**再出现声称 Corepack 锁 **Node** 版本
+的句子——逐个文件贴出命中行供核对；
+② **可执行版本选择**只从 `webui/.nvmrc` 读：`grep -rn "node-version:" .github/workflows/` 必须**零命中**
+（全部改成 `node-version-file`）；
+③ 以下三处**允许并应当继续出现 24**，只需与 `.nvmrc` 的 major 一致：
+`webui/package.json` 的 `engines`（兼容**范围**语义）、`controlplane/Dockerfile:16` 的
+`FROM node:24-alpine`（容器基础镜像）、`DECISIONS.md` 的历史决策（记的是当初为何选 24.15.0）。
+⚠️ **上一版把验收写成「只剩 .nvmrc 一处」，那是不可达的**——它与保留 engines/Dockerfile/历史决策直接冲突。
 
 ## 编排踩坑（2026-09-26 实测，供派工时参考）
 
