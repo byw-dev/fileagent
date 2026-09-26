@@ -199,7 +199,8 @@
    上一版的归类只列了 3+3、不闭合。
 
 ### vitest PR 门
-- **新建 `.github/workflows/ci-webui.yml`**，不塞进 `ci-smoke.yml` 的 `build-webui`：与
+- **新建 `.github/workflows/ci-webui.yml`**，job `name:` 固定为 **`lint + test + build`**
+  （⚠️ QG-7 要把它登记为 required context，**写定后不要改名**）。不塞进 `ci-smoke.yml` 的 `build-webui`：与
   `ci-cp`/`ci-agent`/`ci-proto` 一个模块一条的模式一致，且 paths 只过滤 `webui/**` + self
   （**source-of-truth 静态门不放这里**——它需要对**任何** workflow 变更都生效，见 QG-5b）
   （`ci-smoke.yml` 的 paths 宽到 `agent/** controlplane/** api/** …`，改 Go 代码会白跑前端测试）。
@@ -208,14 +209,30 @@
 - **防静默跳过用正向下界**：从输出 grep `Test Files  <N> passed` / `Tests  <M> passed`，
   断言 N ≥ 22 且 M ≥ 176（当前实测），低于即 `::error::`。理由同 CP 侧。
 
-## 收尾（缺口 6，用户操作）
+## 收尾（缺口 6 = QG-7，用户操作）
 
-本刀最后一步由用户开启 `master` 分支保护并把闸门登记为 required check
-（至少 `codegen-drift + vet + test`、新 `ci-webui`）。
-⚠️ **现在改 job `name:` 是免费的**（没有 required check 按名字登记），开保护之后就不免费——
-所以 `ci-cp.yml` 的 job 名保持原样，尽管它已名不副实。
-验证：`gh api repos/:owner/:repo/branches/master/protection` 不再 404，
-且 `required_status_checks.contexts` 含该 job 名。
+本刀最后一步由用户开启 `master` 分支保护，并把**三个** context 全部登记为 required check：
+
+| # | required context（job `name:`） | 来自 |
+|---|---|---|
+| 1 | `codegen-drift + vet + test` | `ci-cp.yml`（既有，**不要改名**） |
+| 2 | `lint + test + build` | `ci-webui.yml`（QG-5 新建） |
+| 3 | `workflows source-of-truth guard` | `ci-workflows-guard.yml`（QG-5b 新建） |
+
+⚠️ **第 3 个必须登记，否则整条守卫链不闭合**——guard 每次都跑、S1–S6 都能把它打红，
+但只要它不是 required check，**它的红灯就不阻止合并**，「单一真相源」照样能被改回去。
+这是「守卫存在性」的**第四种绕过**（前三种是自相矛盾的 paths、未逐事件写清、300-file 平台边界）。
+它也正是本文件开头风险模型说的那句：**闸门不是 required check 就只是建议。**
+
+⚠️ **job `name:` 一旦登记就不可随意改名**（改名会让 required check 静默失效）。
+现在改是免费的（还没有保护），开保护之后就不免费——所以 `ci-cp.yml` 的 job 名保持原样，
+尽管它已名不副实；QG-5/QG-5b 的两个 job 名一旦写定，也**不要再动**。
+
+**机械验收**：
+```sh
+gh api repos/:owner/:repo/branches/master/protection --jq '.required_status_checks.contexts'
+```
+不再 404，且输出**同时包含上表三个 context**（缺一即未闭合）。
 
 ## 验证
 
@@ -486,7 +503,10 @@ bash 3.2 兼容——用 `/bin/bash scripts/ci/test-gate.sh controlplane` 显式
 **这是「单一真相源」唯一的持久守卫。** 没有它，QG-5/QG-6 的成果会在下一个 PR 里被硬编码悄悄改回去
 （一次性的人工 Acceptance 守不住）。
 
-**Change**：新建 `.github/workflows/ci-workflows-guard.yml`。
+**Change**：新建 `.github/workflows/ci-workflows-guard.yml`，
+job `name:` 固定为 **`workflows source-of-truth guard`**。
+⚠️ **这个名字是 QG-7 要登记进 `required_status_checks.contexts` 的 context，写定后不要改**
+（改名会让 required check 静默失效）。
 
 **触发**：`pull_request` 与 `push: branches: [master]` 两个事件，**都不设 `paths`**——每次都跑。
 ⚠️ **不要用 path filter 决定这道门是否出现**，三个理由：
