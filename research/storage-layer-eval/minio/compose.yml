@@ -1,0 +1,17 @@
+# Storage-eval baseline: self-hosted MinIO, same digest as D-036.
+name: se-minio
+services:
+  minio:
+    image: ghcr.io/byw-dev/minio@sha256:a66e1fd7e5cc10cbbc4d5a24bb4b81ae3a17b4000db6535e450c0efbdc447fee
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["19100:9000"]
+    volumes: [data:/data, queue:/queue]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      retries: 20
+volumes: {data: {}, queue: {}}

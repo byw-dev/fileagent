@@ -1,0 +1,27 @@
+# Storage-eval variant: JuiceFS CE gateway, REDIS metadata (AOF everysec), local-dir data backend.
+name: se-juicefs-redis
+services:
+  meta:
+    # redis:7-alpine, pinned to the digest used for the published run
+    image: redis@sha256:286bd4264adb303147270bb2d735352497e950f7b73b2ca42364d63d7daf61ee
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes: [meta:/data]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 2s, retries: 30}
+  jfs:
+    image: juicedata/mount@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673
+    depends_on: {meta: {condition: service_healthy}}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        juicefs status "$$META" >/dev/null 2>&1 ||
+        juicefs format --storage file --bucket /jfsdata/ --trash-days 0 "$$META" jfs &&
+        exec juicefs gateway --multi-buckets --keep-etag --object-meta --no-usage-report
+        --log /dev/stdout "$$META" 0.0.0.0:9000
+    environment:
+      META: redis://meta:6379/1
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["19500:9000"]
+    volumes: [data:/jfsdata]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+volumes: {meta: {}, data: {}}

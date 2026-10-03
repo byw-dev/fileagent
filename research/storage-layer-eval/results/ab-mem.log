@@ -1,0 +1,8 @@
+== seaweedfs start: VmHWM: 146544 kB VmRSS: 146544 kB
+{"failed":0,"from":0,"obj_per_s":5314.7514210873005,"objects":200000,"op":"load","put_p50_ms":4.796,"put_p99_m
+   after 200k: VmHWM: 5041328 kB VmRSS: 5041328 kB
+   +30s idle:  VmHWM: 5068624 kB VmRSS: 5068624 kB
+== seaweedfs-nowh start: VmHWM: 153328 kB VmRSS: 153328 kB
+{"failed":0,"from":0,"obj_per_s":8727.516399657552,"objects":200000,"op":"load","put_p50_ms":3.101,"put_p99_ms
+   after 200k: VmHWM: 689308 kB VmRSS: 666468 kB
+   +30s idle:  VmHWM: 689308 kB VmRSS: 666736 kB

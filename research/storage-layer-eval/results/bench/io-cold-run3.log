@@ -1,0 +1,9 @@
+{"target": "minio", "step": "list", "objects": 1000000, "secs": 16.2, "disk_reads": 1058353, "read_MB": 4972.5, "reads_per_1k_obj": 1058.4, "KB_read_per_obj": 5.09}
+{"target": "minio", "step": "leaf", "objects": 10000, "secs": 0, "disk_reads": 10859, "read_MB": 56.8, "reads_per_1k_obj": 1085.9, "KB_read_per_obj": 5.82}
+{"target": "seaweedfs-nowh", "step": "list", "objects": 1000000, "secs": 16.06, "disk_reads": 5645, "read_MB": 174.8, "reads_per_1k_obj": 5.6, "KB_read_per_obj": 0.18}
+{"target": "seaweedfs-nowh", "step": "leaf", "objects": 10000, "secs": 0, "disk_reads": 402, "read_MB": 18.6, "reads_per_1k_obj": 40.2, "KB_read_per_obj": 1.9}
+{"target": "seaweedfs-nowh", "step": "filer", "objects": 1000000, "secs": 2.57, "disk_reads": 3698, "read_MB": 137.1, "reads_per_1k_obj": 3.7, "KB_read_per_obj": 0.14}
+./io-cold.sh: line 31: unexpected EOF while looking for matching `"'
+./io-cold.sh: line 33: syntax error: unexpected end of file
+{"target": "juicefs", "step": "list", "objects": 1000000, "secs": 51.94, "disk_reads": 28062, "read_MB": 1120.3, "reads_per_1k_obj": 28.1, "KB_read_per_obj": 1.15}
+{"target": "juicefs", "step": "leaf", "objects": 10000, "secs": 0, "disk_reads": 2970, "read_MB": 66.5, "reads_per_1k_obj": 297.0, "KB_read_per_obj": 6.81}

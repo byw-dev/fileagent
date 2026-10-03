@@ -159,6 +159,8 @@ fileagent/
 │   ├── docker-compose.test.yml
 │   └── scripts/init-minio.sh
 │
+├── research/storage-layer-eval/  # 存储层替代调研的测试工具与原始结果（研究工具，不进 CI）
+│
 └── docs/design/system-design.md # 完整系统设计文档（权威来源）
 ```
 

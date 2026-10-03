@@ -1,0 +1,18 @@
+### minio / graceful
+H1     PASS  issue STS credential and PUT before restart —
+H2     PASS  same STS credential still works after storage restart — expires in 59m54s
+### minio / sigkill
+H1     PASS  issue STS credential and PUT before restart —
+H2     PASS  same STS credential still works after storage restart — expires in 59m53s
+### seaweedfs / graceful
+H1     PASS  issue STS credential and PUT before restart —
+H2     PASS  same STS credential still works after storage restart — expires in 59m25s
+### seaweedfs / sigkill
+H1     PASS  issue STS credential and PUT before restart —
+H2     PASS  same STS credential still works after storage restart — expires in 59m39s
+### juicefs / graceful
+H1     PASS  issue STS credential and PUT before restart —
+H2     PASS  same STS credential still works after storage restart — expires in 59m54s
+### juicefs / sigkill
+H1     PASS  issue STS credential and PUT before restart —
+H2     PASS  same STS credential still works after storage restart — expires in 59m53s

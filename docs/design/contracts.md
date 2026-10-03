@@ -5,7 +5,8 @@
 > 集中成表并**指向权威代码位置**，供跨模块开发（CP ↔ webui ↔ SDK）快速对齐。
 > **发现本文件与代码不符，一律以代码为准，并回来订正本文件。**
 >
-> 来源：`docs/reports/design-gap-analysis/05-contracts.md` §4「无文档的口头契约」（V-1…V-4）。
+> 来源：`docs/reports/design-gap-analysis/05-contracts.md` §4「无文档的口头契约」（V-1…V-4）；
+> V-5 来自存储层替代调研（`docs/reports/storage-layer-eval.md`）。
 > 这些约定在 CC-8 / CC-9 开发期间被反复踩到（`mode` 大小写、status 枚举映射），故成文防复发。
 
 ---
@@ -323,6 +324,31 @@ agent 侧继续按 deprecated 别名渲染，见上方系统变量表），**经
 | `NOT_IMPLEMENTED` | 501 | 端点未实现（占位） |
 
 > 完整、最新的错误码以各 handler 代码为准；上表为跨模块对接时的速查。
+
+---
+
+## V-5 数据集 / run / 前缀只经 CP 选择（2026-10-03 产品确认）
+
+**不变量：处理哪个数据集 / 哪个 run / 哪个前缀，只能由 CP 决定。** 客户端不得在 CP 未选择、未授权的范围内
+列举对象存储来决定数据集、run 或前缀。CP 的 `file_entries`（PostgreSQL）是目录，对象存储只按 key 存取。
+（CP 已授权的前缀**之内**如何确定成员，见下方「待定」。）
+
+- **现行实现**：
+  - 查询：`GET /api/v1/files`（cursor 分页，V-2），`controlplane/internal/api/router.go:198` → `handler/files.go:127`
+  - 取 key / 下载：`GET /api/v1/files/:id/download-url`、`POST /api/v1/files/batch-download-urls`
+    （`router.go:200`–`201` → `files.go:322`、`files.go:360`），按 ID 查到 object key 后由 CP 签发预签名 URL
+  - 截至 2026-10-03，agent / webui / SDK 中**没有任何**直接调用 `ListObjects` 的代码；
+    现有读路径拿到的都是 CP 返回的**精确文件列表**
+- **待定（2026-10-04 产品决定：等有真实 ETL 接入时再定）**：在 CP 给出的前缀**之内**，数据集包含哪些文件——
+  以 CP 的注册清单为准，还是以前缀列举的结果为准；前缀内未注册的对象（孤儿）算不算成员；前缀提交后是否不可变。
+  背景：pyarrow / DuckDB 读取分区数据集的原生方式是展开前缀（报告 Tier 5 的 X3 即一次 `list_objects_v2`），
+  而 ETL 写入方也可能靠列举自己的 run 前缀来决定注册哪些文件。**在定下来之前，新代码不要依赖其中任何一种语义。**
+- **CP 自身**为对账 / 灾难恢复列举存储（L2，未实现）不受本条约束。
+- **为什么**：列举成本随对象总量线性增长，在单机机械盘上每个对象约一次随机读
+  （[`docs/reports/storage-layer-eval.md`](../reports/storage-layer-eval.md) Tier 4）；
+  把列举挪出用户读路径，存储层的列举效率就只影响对账与恢复的代价，不影响用户体验。
+- **新增读路径时**（SDK、ETL、新页面）**先问 CP 拿文件清单或数据集前缀**；
+  需要原生 `s3://` 访问时，由 CP 发放前缀受限的 STS 凭据（`credential_process` 桥接，见报告 Tier 5）。
 
 ---
 

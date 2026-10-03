@@ -1,0 +1,1 @@
+{"Rules":[{"ID":"expire","Status":"Enabled","Filter":{"Prefix":"tmp/"},"Expiration":{"Days":7}}]}

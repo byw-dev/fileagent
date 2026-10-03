@@ -1,0 +1,107 @@
+{
+ "sts": {
+  "issuer": "seaweedfs-sts",
+  "signingKey": "ZmlsZWFnZW50LXN0b3JhZ2UtZXZhbC1zaWduaW5nLWtleQ==",
+  "tokenDuration": "1h",
+  "maxSessionLength": "12h"
+ },
+ "policy": {
+  "defaultEffect": "Deny",
+  "storeType": "memory"
+ },
+ "roles": [
+  {
+   "roleName": "agent-role",
+   "roleArn": "arn:aws:iam::000000000000:role/agent-role",
+   "trustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+     {
+      "Effect": "Allow",
+      "Principal": {
+       "AWS": "arn:aws:iam::000000000000:user/cpadmin"
+      },
+      "Action": [
+       "sts:AssumeRole"
+      ]
+     }
+    ]
+   },
+   "attachedPolicies": [
+    "AgentRolePolicy"
+   ]
+  },
+  {
+   "roleName": "etl-role",
+   "roleArn": "arn:aws:iam::000000000000:role/etl-role",
+   "trustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+     {
+      "Effect": "Allow",
+      "Principal": {
+       "AWS": "arn:aws:iam::000000000000:user/etladmin"
+      },
+      "Action": [
+       "sts:AssumeRole"
+      ]
+     }
+    ]
+   },
+   "attachedPolicies": [
+    "EtlRolePolicy"
+   ]
+  }
+ ],
+ "policies": [
+  {
+   "name": "AgentRolePolicy",
+   "document": {
+    "version": "2012-10-17",
+    "statement": [
+     {
+      "effect": "Allow",
+      "action": [
+       "s3:CreateBucket",
+       "s3:ListBucketMultipartUploads"
+      ],
+      "resource": [
+       "arn:aws:s3:::*"
+      ]
+     },
+     {
+      "effect": "Allow",
+      "action": [
+       "s3:GetObject",
+       "s3:PutObject",
+       "s3:AbortMultipartUpload",
+       "s3:ListMultipartUploadParts"
+      ],
+      "resource": [
+       "arn:aws:s3:::*/*"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "EtlRolePolicy",
+   "document": {
+    "version": "2012-10-17",
+    "statement": [
+     {
+      "effect": "Allow",
+      "action": [
+       "s3:*"
+      ],
+      "resource": [
+       "arn:aws:s3:::eco",
+       "arn:aws:s3:::eco/*"
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "providers": []
+}

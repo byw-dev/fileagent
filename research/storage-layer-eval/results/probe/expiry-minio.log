@@ -1,0 +1,7 @@
+E1     PASS  AssumeRole DurationSeconds=900 — reported expiry in 15m0s
+E2     PASS  PUT at +5s succeeds —
+E3     PASS  PUT at +840s (60s before expiry) succeeds —
+E4     PASS  PUT at +930s (30s after expiry) is rejected — rejected: InvalidAccessKeyId (HTTP 403): The Access Key Id you provided does not exist in our records.
+E5     PASS  re-issued credential works after expiry —
+
+== minio/expiry: PASS 5  FAIL 0  INFO 0  SKIP 0

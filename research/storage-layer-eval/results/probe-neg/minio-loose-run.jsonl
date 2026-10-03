@@ -1,0 +1,39 @@
+{"ID":"S0","Name":"admin creates buckets","Status":"PASS","Detail":"probe-grant, probe-other"}
+{"ID":"G1.1","Name":"AssumeRole (CP IAM user, session policy, 3600s)","Status":"PASS","Detail":"AK <redacted>…"}
+{"ID":"G1.2","Name":"Expiration honours DurationSeconds=3600","Status":"PASS","Detail":"expires in 1h0m0s"}
+{"ID":"G1.3","Name":"STS creds PutObject into granted bucket","Status":"PASS","Detail":""}
+{"ID":"G1.4","Name":"STS creds PutObject into NON-granted bucket is denied","Status":"FAIL","Detail":"expected rejection, request SUCCEEDED"}
+{"ID":"G1.5","Name":"STS creds GetObject denied (session policy narrows user policy)","Status":"FAIL","Detail":"expected rejection, request SUCCEEDED"}
+{"ID":"G1.6","Name":"STS creds RemoveObject denied","Status":"PASS","Detail":"rejected: AccessDenied (HTTP 403): Access Denied."}
+{"ID":"G1.7","Name":"STS creds ListObjectsV2 denied","Status":"PASS","Detail":"rejected: AccessDenied (HTTP 403): Access Denied."}
+{"ID":"G1.8","Name":"tampered session token denied","Status":"PASS","Detail":"rejected: InvalidTokenId (HTTP 403): The security token included in the request is invalid"}
+{"ID":"G1.9","Name":"STS AK/SK without session token denied","Status":"PASS","Detail":"rejected: InvalidTokenId (HTTP 403): The security token included in the request is invalid"}
+{"ID":"G1.10","Name":"AssumeRole with wrong secret rejected","Status":"PASS","Detail":"The request signature we calculated does not match the signature you provided. Check your key and signing method."}
+{"ID":"G1.11","Name":"AssumeRole without session policy","Status":"INFO","Detail":"issued; GetObject (inherits user policy): \u003cnil\u003e"}
+{"ID":"G1.12","Name":"expired STS creds denied","Status":"SKIP","Detail":"EXPIRY_TEST!=1 (takes 15 min)"}
+{"ID":"G2.1","Name":"multipart 70MB / 64MB parts (STS creds), sha256 round-trip","Status":"PASS","Detail":"ETag b4db9ee46d2f303577b8696b9ed91b90-2"}
+{"ID":"G2.2","Name":"resume: ListMultipartUploads + ListObjectParts rediscover, finish, sha256","Status":"PASS","Detail":""}
+{"ID":"G2.3","Name":"abort: parts gone (NoSuchUpload) and upload no longer listed","Status":"PASS","Detail":""}
+{"ID":"G2.4","Name":"complete with wrong part ETag is rejected","Status":"PASS","Detail":""}
+{"ID":"G2.5","Name":"agent PutObject 10MB default opts (STS), sha256","Status":"PASS","Detail":""}
+{"ID":"G2.5","Name":"agent PutObject 64MB default opts (STS), sha256","Status":"PASS","Detail":""}
+{"ID":"T2.1","Name":"PutObject SendContentMd5 (STS)","Status":"PASS","Detail":""}
+{"ID":"T2.2","Name":"PutObject DisableContentSha256 (UNSIGNED-PAYLOAD) (STS)","Status":"PASS","Detail":""}
+{"ID":"T2.3","Name":"PutObject Checksum CRC32C (trailing headers) (STS)","Status":"PASS","Detail":""}
+{"ID":"T2.4","Name":"PutObject Checksum SHA256 (trailing headers) (STS)","Status":"PASS","Detail":""}
+{"ID":"T2.5","Name":"PutObject unknown size (-1) streaming (STS)","Status":"PASS","Detail":""}
+{"ID":"G3.1","Name":"presigned GET (CP creds, unicode key, content-disposition)","Status":"PASS","Detail":"sha256 ok"}
+{"ID":"G3.2","Name":"presigned URL fetched via a different Host (D-024 context)","Status":"INFO","Detail":"HTTP 403 err=\u003cnil\u003e (403 = signature binds Host)"}
+{"ID":"G3.3","Name":"tampered presign signature rejected","Status":"PASS","Detail":"HTTP 403"}
+{"ID":"G3.4","Name":"expired presigned URL rejected","Status":"PASS","Detail":"HTTP 403"}
+{"ID":"T1.1","Name":"objects \"x/a\" and \"x/a/b\" coexist","Status":"PASS","Detail":""}
+{"ID":"T1.2","Name":"object \"x/c\" created after \"x/c/d\" exists","Status":"PASS","Detail":""}
+{"ID":"T1.3","Name":"zero-byte key with trailing slash","Status":"INFO","Detail":"err=\u003cnil\u003e"}
+{"ID":"T1.4","Name":"special-character keys put/get/list exact","Status":"PASS","Detail":"8 keys"}
+{"ID":"T1.5","Name":"Content-Type + x-amz-meta-* round-trip","Status":"PASS","Detail":""}
+{"ID":"T1.6","Name":"overwrite then read-after-write returns new content","Status":"PASS","Detail":""}
+{"ID":"T1.7","Name":"ListObjectsV2 pagination (maxKeys=2 over 5)","Status":"PASS","Detail":"3 pages"}
+{"ID":"T1.8","Name":"delimiter listing returns CommonPrefixes","Status":"PASS","Detail":"sem/dir/,sem/k/,sem/page/"}
+{"ID":"T1.9","Name":"StatObject on missing key → NoSuchKey","Status":"PASS","Detail":"NoSuchKey (HTTP 404): The specified key does not exist."}
+{"ID":"T1.10","Name":"DeleteObject on missing key is idempotent (no error)","Status":"PASS","Detail":""}
+{"ID":"G4","Name":"bucket notifications","Status":"SKIP","Detail":"EVENTS=none"}

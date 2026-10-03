@@ -1,0 +1,50 @@
+{
+ "identities": [
+  {
+   "name": "admin",
+   "credentials": [
+    {
+     "accessKey": "minioadmin",
+     "secretKey": "minioadmin"
+    }
+   ],
+   "actions": [
+    "Admin"
+   ]
+  },
+  {
+   "name": "cpadmin",
+   "credentials": [
+    {
+     "accessKey": "cpadmin",
+     "secretKey": "cpadmin-secret"
+    }
+   ],
+   "policyNames": [
+    "fileagent-cp"
+   ]
+  },
+  {
+   "name": "etladmin",
+   "credentials": [
+    {
+     "accessKey": "etladmin",
+     "secretKey": "etladmin-secret"
+    }
+   ],
+   "policyNames": [
+    "fileagent-etl"
+   ]
+  }
+ ],
+ "policies": [
+  {
+   "name": "fileagent-cp",
+   "content": "{\"Version\": \"2012-10-17\", \"Statement\": [{\"Effect\": \"Allow\", \"Action\": [\"s3:CreateBucket\", \"s3:ListBucketMultipartUploads\"], \"Resource\": [\"arn:aws:s3:::*\"]}, {\"Effect\": \"Allow\", \"Action\": [\"s3:GetObject\", \"s3:PutObject\", \"s3:AbortMultipartUpload\", \"s3:ListMultipartUploadParts\"], \"Resource\": [\"arn:aws:s3:::*/*\"]}]}"
+  },
+  {
+   "name": "fileagent-etl",
+   "content": "{\"Version\": \"2012-10-17\", \"Statement\": [{\"Effect\": \"Allow\", \"Action\": [\"s3:*\"], \"Resource\": [\"arn:aws:s3:::eco\", \"arn:aws:s3:::eco/*\"]}]}"
+  }
+ ]
+}
