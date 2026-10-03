@@ -1,0 +1,5 @@
+{"ID":"E1","Name":"AssumeRole DurationSeconds=900","Status":"PASS","Detail":"reported expiry in 15m0s"}
+{"ID":"E2","Name":"PUT at +5s succeeds","Status":"PASS","Detail":""}
+{"ID":"E3","Name":"PUT at +840s (60s before expiry) succeeds","Status":"PASS","Detail":""}
+{"ID":"E4","Name":"PUT at +930s (30s after expiry) is rejected","Status":"PASS","Detail":"rejected: InvalidAccessKeyId (HTTP 403): The access key ID you provided does not exist in our records."}
+{"ID":"E5","Name":"re-issued credential works after expiry","Status":"PASS","Detail":""}

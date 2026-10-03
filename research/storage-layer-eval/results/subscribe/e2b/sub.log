@@ -1,0 +1,20 @@
+[sub] subscribed since_ns=1790968524938315000 (2026-10-02T19:15:24.938315Z)
+[sub] stream ended after 5.059s: rpc error: code = Unavailable desc = error reading from server: EOF — reconnecting from 1790968529986633963
+[sub] stream ended after 14ms: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp 127.0.0.1:19288: connect: connection refused" — reconnecting from 1790968529986633963
+[sub] stream ended after 15ms: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp 127.0.0.1:19288: connect: connection refused" — reconnecting from 1790968529986633963
+[sub] stream ended after 24ms: rpc error: code = Unavailable desc = write tcp 127.0.0.1:50594->127.0.0.1:19288: write: broken pipe — reconnecting from 1790968529986633963
+[sub] stream ended after 29ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50598->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 25ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50601->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 22ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50609->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 25ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50614->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 20ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50619->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 19ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50623->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 18ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50632->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 27ms: rpc error: code = Unavailable desc = write tcp 127.0.0.1:50635->127.0.0.1:19288: write: broken pipe — reconnecting from 1790968529986633963
+[sub] stream ended after 16ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50640->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 27ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50643->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 27ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50649->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 29ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50652->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] stream ended after 19ms: rpc error: code = Unavailable desc = connection error: desc = "error reading server preface: read tcp 127.0.0.1:50658->127.0.0.1:19288: read: connection reset by peer" — reconnecting from 1790968529986633963
+[sub] subscribed since_ns=1790968529986633963 (2026-10-02T19:15:29.986633963Z)
+[sub] exit: received=601 kept=600 dropped_as_replay=0 cursor=1790968564211690970

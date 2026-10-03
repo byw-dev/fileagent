@@ -1,0 +1,57 @@
+{"failed": 0, "from": 0, "obj_per_s": 3978.6958277841713, "objects": 100000, "op": "load", "put_p50_ms": 7.489, "put_p99_ms": 18.76, "secs": 25.133864042, "target": "minio", "to": 100000}
+{"target": "minio", "op": "footprint", "total": 100000, "mem": "450.2MiB", "data_kb": 400028, "meta_kb": 0}
+{"complete": true, "err": "<nil>", "first_1000_ms": 25.193, "listed": 100000, "obj_per_s": 61246.24938839955, "op": "list_recursive", "secs": 1.632753042, "target": "minio", "total": 100000}
+{"entries": 200, "max_ms": 28.777, "op": "list_delimiter_one_level", "p50_ms": 2.894, "target": "minio", "total": 100000}
+{"avg_objects": 200, "leaves": 50, "op": "list_leaf", "p50_ms": 6.005, "p99_ms": 17.589, "target": "minio", "total": 100000}
+{"failed": 0, "n": 4000, "op": "stat_random", "ops_per_s": 16858.970125049345, "p50_ms": 0.842, "p99_ms": 2.821, "target": "minio", "total": 100000}
+{"failed": 0, "from": 100000, "obj_per_s": 3140.6384749799186, "objects": 400000, "op": "load", "put_p50_ms": 7.899, "put_p99_ms": 29.459, "secs": 127.362637625, "target": "minio", "to": 500000}
+{"target": "minio", "op": "footprint", "total": 500000, "mem": "457.7MiB", "data_kb": 2005844, "meta_kb": 0}
+{"complete": true, "err": "<nil>", "first_1000_ms": 38.248, "listed": 500000, "obj_per_s": 61563.17899192116, "op": "list_recursive", "secs": 8.121737834, "target": "minio", "total": 500000}
+{"entries": 200, "max_ms": 2.847, "op": "list_delimiter_one_level", "p50_ms": 2.237, "target": "minio", "total": 500000}
+{"avg_objects": 200, "leaves": 50, "op": "list_leaf", "p50_ms": 4.52, "p99_ms": 10.293, "target": "minio", "total": 500000}
+{"failed": 0, "n": 4000, "op": "stat_random", "ops_per_s": 17245.845687035602, "p50_ms": 0.817, "p99_ms": 2.54, "target": "minio", "total": 500000}
+{"failed": 0, "from": 500000, "obj_per_s": 2895.280997100284, "objects": 500000, "op": "load", "put_p50_ms": 8.25, "put_p99_ms": 33.369, "secs": 172.694809416, "target": "minio", "to": 1000000}
+{"target": "minio", "op": "footprint", "total": 1000000, "mem": "471MiB", "data_kb": 4035400, "meta_kb": 0}
+{"complete": true, "err": "<nil>", "first_1000_ms": 34.492, "listed": 1000000, "obj_per_s": 63238.97209161398, "op": "list_recursive", "secs": 15.81303375, "target": "minio", "total": 1000000}
+{"entries": 200, "max_ms": 3.175, "op": "list_delimiter_one_level", "p50_ms": 2.657, "target": "minio", "total": 1000000}
+{"avg_objects": 200, "leaves": 50, "op": "list_leaf", "p50_ms": 4.765, "p99_ms": 5.426, "target": "minio", "total": 1000000}
+{"failed": 0, "n": 4000, "op": "stat_random", "ops_per_s": 15837.852070502198, "p50_ms": 0.882, "p99_ms": 3.793, "target": "minio", "total": 1000000}
+{"failed": 0, "from": 0, "obj_per_s": 7253.114521374453, "objects": 100000, "op": "load", "put_p50_ms": 3.265, "put_p99_ms": 9.086, "secs": 13.787180625, "target": "seaweedfs-nowh", "to": 100000}
+{"target": "seaweedfs-nowh", "op": "footprint", "total": 100000, "mem": "536.3MiB", "data_kb": 263904, "meta_kb": 24756}
+{"complete": true, "err": "<nil>", "first_1000_ms": 29.426, "listed": 100000, "obj_per_s": 62958.49028688217, "op": "list_recursive", "secs": 1.588348125, "target": "seaweedfs-nowh", "total": 100000}
+{"entries": 200, "max_ms": 2.15, "op": "list_delimiter_one_level", "p50_ms": 1.809, "target": "seaweedfs-nowh", "total": 100000}
+{"avg_objects": 200, "leaves": 50, "op": "list_leaf", "p50_ms": 3.643, "p99_ms": 7.611, "target": "seaweedfs-nowh", "total": 100000}
+{"failed": 0, "n": 4000, "op": "stat_random", "ops_per_s": 15409.68332403481, "p50_ms": 0.986, "p99_ms": 2.608, "target": "seaweedfs-nowh", "total": 100000}
+{"dirs": 700, "err": "<nil>", "listed": 100000, "obj_per_s": 368154.9637873573, "op": "filer_grpc_walk", "secs": 0.27162475, "target": "seaweedfs-nowh", "total": 100000}
+{"failed": 0, "from": 100000, "obj_per_s": 7750.978450466509, "objects": 400000, "op": "load", "put_p50_ms": 3.335, "put_p99_ms": 8.76, "secs": 51.606387833, "target": "seaweedfs-nowh", "to": 500000}
+{"target": "seaweedfs-nowh", "op": "footprint", "total": 500000, "mem": "893.2MiB", "data_kb": 1333960, "meta_kb": 123044}
+{"complete": true, "err": "<nil>", "first_1000_ms": 22.868, "listed": 500000, "obj_per_s": 63846.896506967554, "op": "list_recursive", "secs": 7.831234208, "target": "seaweedfs-nowh", "total": 500000}
+{"entries": 200, "max_ms": 2.499, "op": "list_delimiter_one_level", "p50_ms": 2.073, "target": "seaweedfs-nowh", "total": 500000}
+{"avg_objects": 200, "leaves": 50, "op": "list_leaf", "p50_ms": 3.612, "p99_ms": 4.485, "target": "seaweedfs-nowh", "total": 500000}
+{"failed": 0, "n": 4000, "op": "stat_random", "ops_per_s": 14913.188892064862, "p50_ms": 1.033, "p99_ms": 2.343, "target": "seaweedfs-nowh", "total": 500000}
+{"dirs": 2700, "err": "<nil>", "listed": 500000, "obj_per_s": 390959.14789671794, "op": "filer_grpc_walk", "secs": 1.278906, "target": "seaweedfs-nowh", "total": 500000}
+{"failed": 0, "from": 500000, "obj_per_s": 7528.6315694064915, "objects": 500000, "op": "load", "put_p50_ms": 3.441, "put_p99_ms": 9.1, "secs": 66.413131708, "target": "seaweedfs-nowh", "to": 1000000}
+{"target": "seaweedfs-nowh", "op": "footprint", "total": 1000000, "mem": "1009MiB", "data_kb": 2566572, "meta_kb": 143920}
+{"complete": true, "err": "<nil>", "first_1000_ms": 22.44, "listed": 1000000, "obj_per_s": 62498.5566739568, "op": "list_recursive", "secs": 16.0003695, "target": "seaweedfs-nowh", "total": 1000000}
+{"entries": 200, "max_ms": 2.247, "op": "list_delimiter_one_level", "p50_ms": 1.99, "target": "seaweedfs-nowh", "total": 1000000}
+{"avg_objects": 200, "leaves": 50, "op": "list_leaf", "p50_ms": 3.712, "p99_ms": 4.18, "target": "seaweedfs-nowh", "total": 1000000}
+{"failed": 0, "n": 4000, "op": "stat_random", "ops_per_s": 15006.471578384357, "p50_ms": 1.007, "p99_ms": 2.477, "target": "seaweedfs-nowh", "total": 1000000}
+{"dirs": 5200, "err": "<nil>", "listed": 1000000, "obj_per_s": 415565.0801723653, "op": "filer_grpc_walk", "secs": 2.406361958, "target": "seaweedfs-nowh", "total": 1000000}
+{"failed":0,"from":0,"obj_per_s":358.16849565528366,"objects":100000,"op":"load","put_p50_ms":70.175,"put_p99_ms":500.776,"secs":279.198202,"target":"juicefs","to":100000}
+{"target":"juicefs","op":"footprint","total":100000,"mem":"119.6MiB","data_kb":400020,"meta_kb":97863}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":245.381,"listed":100000,"obj_per_s":19259.819613011,"op":"list_recursive","secs":5.192156625,"target":"juicefs","total":100000}
+{"entries":200,"max_ms":5.003,"op":"list_delimiter_one_level","p50_ms":4.364,"target":"juicefs","total":100000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":16.425,"p99_ms":22.971,"target":"juicefs","total":100000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":6399.580187539698,"p50_ms":2.107,"p99_ms":8.575,"target":"juicefs","total":100000}
+{"failed":0,"from":100000,"obj_per_s":343.1096232472714,"objects":400000,"op":"load","put_p50_ms":71.863,"put_p99_ms":501.746,"secs":1165.808164208,"target":"juicefs","to":500000}
+{"target":"juicefs","op":"footprint","total":500000,"mem":"203.7MiB","data_kb":2005048,"meta_kb":441047}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":249.78,"listed":500000,"obj_per_s":19082.61802298696,"op":"list_recursive","secs":26.2018555,"target":"juicefs","total":500000}
+{"entries":200,"max_ms":5.58,"op":"list_delimiter_one_level","p50_ms":4.587,"target":"juicefs","total":500000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":16.981,"p99_ms":24.594,"target":"juicefs","total":500000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":6241.798695884458,"p50_ms":2.26,"p99_ms":7.575,"target":"juicefs","total":500000}
+{"failed":0,"from":500000,"obj_per_s":325.1304835303366,"objects":500000,"op":"load","put_p50_ms":73.046,"put_p99_ms":520.169,"secs":1537.844112834,"target":"juicefs","to":1000000}
+{"target":"juicefs","op":"footprint","total":1000000,"mem":"241.3MiB","data_kb":4005048,"meta_kb":871671}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":257.185,"listed":1000000,"obj_per_s":19265.968479368006,"op":"list_recursive","secs":51.904995125,"target":"juicefs","total":1000000}
+{"entries":200,"max_ms":5.739,"op":"list_delimiter_one_level","p50_ms":4.487,"target":"juicefs","total":1000000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":17.292,"p99_ms":27.92,"target":"juicefs","total":1000000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":5988.9010661047905,"p50_ms":2.365,"p99_ms":8.222,"target":"juicefs","total":1000000}

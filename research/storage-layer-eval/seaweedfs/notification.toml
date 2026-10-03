@@ -1,0 +1,7 @@
+[notification.webhook]
+enabled = true
+endpoint = "http://host.docker.internal:18990/"
+bearer_token = "probe-token"
+max_retries = 3
+backoff_seconds = 3
+max_backoff_seconds = 30

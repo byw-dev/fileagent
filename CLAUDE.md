@@ -71,6 +71,9 @@ fileagent/                        # Monorepo 根目录
 │   └── scripts/
 │       └── init-minio.sh
 │
+├── research/
+│   └── storage-layer-eval/       # 存储层替代调研的测试工具与原始结果（研究工具，不进 CI；报告见 docs/reports/）
+│
 └── .github/
     └── workflows/                # CI 配置
 ```

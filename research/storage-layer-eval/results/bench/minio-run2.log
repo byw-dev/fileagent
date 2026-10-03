@@ -1,0 +1,19 @@
+{"failed":0,"from":0,"obj_per_s":3993.9982654563987,"objects":100000,"op":"load","put_p50_ms":7.43,"put_p99_ms":19.258,"secs":25.037567208,"target":"minio","to":100000}
+{"target":"minio","op":"footprint","total":100000,"mem":"493.5MiB","data_kb":400028,"meta_kb":0}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":24.864,"listed":100000,"obj_per_s":62944.14137550242,"op":"list_recursive","secs":1.588710209,"target":"minio","total":100000}
+{"entries":200,"max_ms":2.653,"op":"list_delimiter_one_level","p50_ms":1.871,"target":"minio","total":100000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":4.268,"p99_ms":4.996,"target":"minio","total":100000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":17784.664395046304,"p50_ms":0.782,"p99_ms":3.812,"target":"minio","total":100000}
+{"failed":0,"from":100000,"obj_per_s":3130.26894775661,"objects":400000,"op":"load","put_p50_ms":7.738,"put_p99_ms":30.613,"secs":127.784547167,"target":"minio","to":500000}
+{"target":"minio","op":"footprint","total":500000,"mem":"459MiB","data_kb":2005848,"meta_kb":0}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":35.285,"listed":500000,"obj_per_s":63938.62164853721,"op":"list_recursive","secs":7.819999667,"target":"minio","total":500000}
+{"entries":200,"max_ms":2.864,"op":"list_delimiter_one_level","p50_ms":2.029,"target":"minio","total":500000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":4.539,"p99_ms":10.355,"target":"minio","total":500000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":17889.21430512632,"p50_ms":0.779,"p99_ms":2.754,"target":"minio","total":500000}
+{"failed":0,"from":500000,"obj_per_s":2799.1080985505732,"objects":500000,"op":"load","put_p50_ms":8.104,"put_p99_ms":31.693,"secs":178.628328166,"target":"minio","to":1000000}
+{"target":"minio","op":"footprint","total":1000000,"mem":"475.4MiB","data_kb":4035424,"meta_kb":0}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":29.82,"listed":1000000,"obj_per_s":64692.218642846696,"op":"list_recursive","secs":15.457809625,"target":"minio","total":1000000}
+{"entries":200,"max_ms":4.322,"op":"list_delimiter_one_level","p50_ms":2.64,"target":"minio","total":1000000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":4.559,"p99_ms":5.224,"target":"minio","total":1000000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":17408.766779020963,"p50_ms":0.782,"p99_ms":3.39,"target":"minio","total":1000000}
+DONE minio

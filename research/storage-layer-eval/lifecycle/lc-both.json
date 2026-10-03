@@ -1,0 +1,1 @@
+{"Rules":[{"ID":"both","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":30},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":2}}]}

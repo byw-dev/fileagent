@@ -1,0 +1,7 @@
+{"target": "minio", "step": "list", "objects": 1000000, "secs": 15.53, "disk_reads": 1057387, "read_MB": 4910.4, "reads_per_1k_obj": 1057.4, "KB_read_per_obj": 5.03}
+{"target": "minio", "step": "leaf", "objects": 10000, "secs": 0, "disk_reads": 10862, "read_MB": 56.8, "reads_per_1k_obj": 1086.2, "KB_read_per_obj": 5.82}
+{"target": "seaweedfs-nowh", "step": "list", "objects": 1000000, "secs": 15.48, "disk_reads": 6156, "read_MB": 196.7, "reads_per_1k_obj": 6.2, "KB_read_per_obj": 0.2}
+{"target": "seaweedfs-nowh", "step": "leaf", "objects": 10000, "secs": 0, "disk_reads": 533, "read_MB": 36.3, "reads_per_1k_obj": 53.3, "KB_read_per_obj": 3.72}
+{"target": "seaweedfs-nowh", "step": "filer", "objects": 1000000, "secs": 2.67, "disk_reads": 3551, "read_MB": 124.2, "reads_per_1k_obj": 3.6, "KB_read_per_obj": 0.13}
+{"target": "juicefs", "step": "list", "objects": 1000000, "secs": 52.99, "disk_reads": 27949, "read_MB": 1165.2, "reads_per_1k_obj": 27.9, "KB_read_per_obj": 1.19}
+{"target": "juicefs", "step": "leaf", "objects": 10000, "secs": 0, "disk_reads": 2954, "read_MB": 80.0, "reads_per_1k_obj": 295.4, "KB_read_per_obj": 8.19}

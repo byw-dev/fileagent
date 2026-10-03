@@ -1,0 +1,17 @@
+# Storage-eval candidate: SeaweedFS single-node (master+volume+filer+s3 in one process).
+name: se-seaweed-nowh
+services:
+  seaweed:
+    image: chrislusf/seaweedfs@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    command: >
+      server -dir=/data -ip.bind=0.0.0.0 -volume.max=0 -master.volumeSizeLimitMB=1024
+      -s3 -s3.port=8333 -s3.config=/etc/sw/s3.json
+      -s3.iam.config=/etc/sw/iam.json -s3.iam.readOnly=false
+    ports: ["19200:8333", "19288:18888"]
+    volumes:
+      - data:/data
+      - ../seaweedfs/s3.json:/etc/sw/s3.json:ro
+      - ../seaweedfs/iam.json:/etc/sw/iam.json:ro
+
+    extra_hosts: ["host.docker.internal:host-gateway"]
+volumes: {data: {}}

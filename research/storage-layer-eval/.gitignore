@@ -1,0 +1,13 @@
+# Build outputs, scratch and machine-local state (see README「复现」).
+bin/
+tmp/
+pyenv/
+src/
+subexp/
+eco/work-*/
+**/.mc/
+minio/cp-policy.json
+results/probe/*-stscred.json
+results/probe/*-mpstate.json
+# Raw evidence: re-include logs the repo-root *.log rule would drop.
+!results/**/*.log

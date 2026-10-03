@@ -1,0 +1,10 @@
+  minio B1 [write] 200 ok, 0 failed in 130ms (1542 obj/s)
+  minio B1 (sink down during writes, then storage SIGKILL): 200/200 after 4s
+  minio B2 [write] 300 ok, 0 failed in 279ms (1074 obj/s)
+  minio B2 delivered before kill: 18/300
+  minio B2 (sink up, storage SIGKILL right after writes): 300/300 after 1s
+  juicefs B1 [write] 200 ok, 0 failed in 683ms (293 obj/s)
+  juicefs B1 (sink down during writes, then storage SIGKILL): 200/200 after 4s
+  juicefs B2 [write] 300 ok, 0 failed in 946ms (317 obj/s)
+  juicefs B2 delivered before kill: 0/300
+  juicefs B2 (sink up, storage SIGKILL right after writes): 300/300 after 0s

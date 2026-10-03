@@ -1,0 +1,19 @@
+{"failed":0,"from":0,"obj_per_s":294.91643092260637,"objects":100000,"op":"load","put_p50_ms":82.369,"put_p99_ms":526.596,"secs":339.079106875,"target":"juicefs","to":100000}
+{"target":"juicefs","op":"footprint","total":100000,"mem":"107.9MiB","data_kb":400020,"meta_kb":98071}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":317.806,"listed":100000,"obj_per_s":18011.958454427167,"op":"list_recursive","secs":5.551867125,"target":"juicefs","total":100000}
+{"entries":200,"max_ms":5.317,"op":"list_delimiter_one_level","p50_ms":4.97,"target":"juicefs","total":100000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":16.699,"p99_ms":26.251,"target":"juicefs","total":100000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":5971.980583860894,"p50_ms":2.33,"p99_ms":8.342,"target":"juicefs","total":100000}
+{"failed":0,"from":100000,"obj_per_s":317.6775004778205,"objects":400000,"op":"load","put_p50_ms":75.388,"put_p99_ms":541.671,"secs":1259.138589917,"target":"juicefs","to":500000}
+{"target":"juicefs","op":"footprint","total":500000,"mem":"195.3MiB","data_kb":2004016,"meta_kb":442031}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":310.976,"listed":500000,"obj_per_s":16380.452320063998,"op":"list_recursive","secs":30.524187625,"target":"juicefs","total":500000}
+{"entries":200,"max_ms":8.621,"op":"list_delimiter_one_level","p50_ms":4.748,"target":"juicefs","total":500000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":18.403,"p99_ms":28.846,"target":"juicefs","total":500000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":5414.334792194711,"p50_ms":2.586,"p99_ms":8.626,"target":"juicefs","total":500000}
+{"failed":0,"from":500000,"obj_per_s":329.86756828274525,"objects":500000,"op":"load","put_p50_ms":75.022,"put_p99_ms":510.646,"secs":1515.759802041,"target":"juicefs","to":1000000}
+{"target":"juicefs","op":"footprint","total":1000000,"mem":"223.3MiB","data_kb":4004016,"meta_kb":870631}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":310.157,"listed":1000000,"obj_per_s":19336.34700213173,"op":"list_recursive","secs":51.716076459,"target":"juicefs","total":1000000}
+{"entries":200,"max_ms":6.989,"op":"list_delimiter_one_level","p50_ms":4.646,"target":"juicefs","total":1000000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":16.604,"p99_ms":24.351,"target":"juicefs","total":1000000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":5314.441966016052,"p50_ms":2.63,"p99_ms":8.618,"target":"juicefs","total":1000000}
+DONE juicefs

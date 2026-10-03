@@ -2463,4 +2463,4 @@ minisign 公钥 `RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav`，
   「从服务端镜像里抠二进制」撐着——这是个能用的办法，不是长久之计。改成纯 S3 +
   MinIO admin API over curl 是可行的（脚本本就刻意不用 grep/sed/awk），但**独立一刀**。
   本决策只解决「镜像有来源」。
-- **存储层替代选型**本身（见上）。
+- **存储层替代选型**本身（见上）。→ **2026-10-03 调研已完成**，报告见 [`docs/reports/storage-layer-eval.md`](docs/reports/storage-layer-eval.md)，待产品拍板；若决定更换，另立新决策。

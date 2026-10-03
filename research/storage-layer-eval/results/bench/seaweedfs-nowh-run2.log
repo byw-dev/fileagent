@@ -1,0 +1,22 @@
+{"failed":0,"from":0,"obj_per_s":8271.060404442693,"objects":100000,"op":"load","put_p50_ms":3.234,"put_p99_ms":8.13,"secs":12.090348167,"target":"seaweedfs-nowh","to":100000}
+{"target":"seaweedfs-nowh","op":"footprint","total":100000,"mem":"546MiB","data_kb":263896,"meta_kb":24740}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":27.336,"listed":100000,"obj_per_s":64410.10862215401,"op":"list_recursive","secs":1.552551333,"target":"seaweedfs-nowh","total":100000}
+{"entries":200,"max_ms":2.074,"op":"list_delimiter_one_level","p50_ms":1.701,"target":"seaweedfs-nowh","total":100000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":3.538,"p99_ms":4.483,"target":"seaweedfs-nowh","total":100000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":15900.194479253723,"p50_ms":0.926,"p99_ms":3.884,"target":"seaweedfs-nowh","total":100000}
+{"dirs":700,"err":"\u003cnil\u003e","listed":100000,"obj_per_s":379358.2338337067,"op":"filer_grpc_walk","secs":0.263603083,"target":"seaweedfs-nowh","total":100000}
+{"failed":0,"from":100000,"obj_per_s":8860.677083765984,"objects":400000,"op":"load","put_p50_ms":3.313,"put_p99_ms":8.141,"secs":45.143277,"target":"seaweedfs-nowh","to":500000}
+{"target":"seaweedfs-nowh","op":"footprint","total":500000,"mem":"909.4MiB","data_kb":1333556,"meta_kb":122984}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":18.847,"listed":500000,"obj_per_s":66170.65219013795,"op":"list_recursive","secs":7.556219917,"target":"seaweedfs-nowh","total":500000}
+{"entries":200,"max_ms":1.959,"op":"list_delimiter_one_level","p50_ms":1.624,"target":"seaweedfs-nowh","total":500000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":3.437,"p99_ms":4,"target":"seaweedfs-nowh","total":500000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":15080.013609712283,"p50_ms":0.96,"p99_ms":3.356,"target":"seaweedfs-nowh","total":500000}
+{"dirs":2700,"err":"\u003cnil\u003e","listed":500000,"obj_per_s":425810.156282138,"op":"filer_grpc_walk","secs":1.174232208,"target":"seaweedfs-nowh","total":500000}
+{"failed":0,"from":500000,"obj_per_s":8609.576769736388,"objects":500000,"op":"load","put_p50_ms":3.409,"put_p99_ms":8.312,"secs":58.074864,"target":"seaweedfs-nowh","to":1000000}
+{"target":"seaweedfs-nowh","op":"footprint","total":1000000,"mem":"1.025GiB","data_kb":2572984,"meta_kb":143864}
+{"complete":true,"err":"\u003cnil\u003e","first_1000_ms":20.786,"listed":1000000,"obj_per_s":63481.83703969576,"op":"list_recursive","secs":15.752537208,"target":"seaweedfs-nowh","total":1000000}
+{"entries":200,"max_ms":2.273,"op":"list_delimiter_one_level","p50_ms":1.494,"target":"seaweedfs-nowh","total":1000000}
+{"avg_objects":200,"leaves":50,"op":"list_leaf","p50_ms":3.592,"p99_ms":4.232,"target":"seaweedfs-nowh","total":1000000}
+{"failed":0,"n":4000,"op":"stat_random","ops_per_s":16040.861463877949,"p50_ms":0.95,"p99_ms":2.192,"target":"seaweedfs-nowh","total":1000000}
+{"dirs":5200,"err":"\u003cnil\u003e","listed":1000000,"obj_per_s":418048.73858341505,"op":"filer_grpc_walk","secs":2.392065584,"target":"seaweedfs-nowh","total":1000000}
+DONE seaweedfs-nowh

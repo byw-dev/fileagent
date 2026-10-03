@@ -1,0 +1,27 @@
+# Storage-eval candidate: JuiceFS CE gateway, PostgreSQL metadata, local-dir data backend.
+name: se-juicefs
+services:
+  meta:
+    # postgres:15-alpine, pinned to the digest used for the published run
+    image: postgres@sha256:09e4f20b14ddb3dfe3a0c825b206032aaf8f28300ba2070c0b60fc1c10c6abc7
+    environment: {POSTGRES_USER: jfs, POSTGRES_PASSWORD: jfs, POSTGRES_DB: jfs}
+    volumes: [meta:/var/lib/postgresql/data]
+    healthcheck: {test: ["CMD", "pg_isready", "-U", "jfs"], interval: 2s, retries: 30}
+  jfs:
+    image: juicedata/mount@sha256:ab99388a397fe52575fdeb84a9e017c3c594a6b07d63966cd4805bbf6f172673
+    depends_on: {meta: {condition: service_healthy}}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        juicefs status "$$META" >/dev/null 2>&1 ||
+        juicefs format --storage file --bucket /jfsdata/ --trash-days 0 "$$META" jfs &&
+        exec juicefs gateway --multi-buckets --keep-etag --object-meta --no-usage-report
+        --log /dev/stdout "$$META" 0.0.0.0:9000
+    environment:
+      META: postgres://jfs:jfs@meta:5432/jfs?sslmode=disable
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["19400:9000"]
+    volumes: [data:/jfsdata]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+volumes: {meta: {}, data: {}}
