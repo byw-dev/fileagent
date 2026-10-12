@@ -7,8 +7,8 @@ bash research/capacity-baseline/run.sh
 ```
 
 > **Cost warning — read before running.** A full run (1M + 5M, all variants) takes roughly 1.5–2.5 hours and, with
-> PostgreSQL's default `max_wal_size=1GB`, writes on the order of **800 GB** to disk (checkpoint-driven full-page
-> writes dominate; the 5M seven-index variants alone are ~80 GB of WAL each). The database peaks around 20 GB.
+> PostgreSQL's default `max_wal_size=1GB`, writes on the order of **800 GB** to disk — an order-of-magnitude estimate, not a measured counter (checkpoint-driven
+> full-page writes dominate; the 5M seven-index variants alone generate about 63–81 GB of WAL each). The database peaks around 20 GB.
 > Do not re-run casually on a laptop SSD; for a quick sanity check, drop `5000000` from the two `for scale in …` lists in `run.sh`.
 
 The script uses only `postgres:15-alpine`, container `fileagent-b4-pg`, host port
