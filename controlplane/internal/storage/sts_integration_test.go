@@ -6,7 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"strings"
+	"os"
 	"testing"
 	"time"
 
@@ -23,6 +23,14 @@ const (
 	itMinIOPassword = "minioadmin"
 	itRoleARN       = "arn:aws:iam:::role/test"
 )
+
+// requireLiveMinIO skips STS integration tests unless live object storage is explicitly enabled.
+func requireLiveMinIO(t *testing.T) {
+	t.Helper()
+	if os.Getenv("STS_LIVE") != "1" {
+		t.Skip("live MinIO STS test disabled; set STS_LIVE=1 when a D-036 test object store with STS is available")
+	}
+}
 
 // newRootClient creates a MinIO client with the test-environment root credentials.
 func newRootClient(t *testing.T) *miniogo.Client {
@@ -55,6 +63,7 @@ func uniqueBucket(t *testing.T, root *miniogo.Client, prefix string) string {
 // TestIssueCredentials_Integration verifies that STSManager.IssueCredentials
 // returns usable temporary credentials that can actually write to MinIO.
 func TestIssueCredentials_Integration(t *testing.T) {
+	requireLiveMinIO(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -68,11 +77,7 @@ func TestIssueCredentials_Integration(t *testing.T) {
 		{BucketName: bucket},
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "not supported") ||
-			strings.Contains(err.Error(), "not configured") ||
-			strings.Contains(err.Error(), "AccessDenied") {
-			t.Skipf("STS AssumeRole not available on test MinIO: %v", err)
-		}
+		// STS_LIVE=1 asserts a working STS endpoint, so any failure is a real failure, never a skip.
 		t.Fatalf("IssueCredentials failed: %v", err)
 	}
 
@@ -123,6 +128,7 @@ func TestIssueCredentials_Integration(t *testing.T) {
 // TestIssueCredentials_ScopingDeniesOtherBuckets verifies that STS credentials
 // scoped to one bucket cannot write to a different bucket.
 func TestIssueCredentials_ScopingDeniesOtherBuckets(t *testing.T) {
+	requireLiveMinIO(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -137,11 +143,7 @@ func TestIssueCredentials_ScopingDeniesOtherBuckets(t *testing.T) {
 		{BucketName: allowedBucket},
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "not supported") ||
-			strings.Contains(err.Error(), "not configured") ||
-			strings.Contains(err.Error(), "AccessDenied") {
-			t.Skipf("STS AssumeRole not available on test MinIO: %v", err)
-		}
+		// STS_LIVE=1 asserts a working STS endpoint, so any failure is a real failure, never a skip.
 		t.Fatalf("IssueCredentials failed: %v", err)
 	}
 

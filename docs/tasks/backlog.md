@@ -51,6 +51,14 @@
   `controlplane/internal/db/migrate_test.go` 的内嵌迁移断言、以及 `make generate` 的产物一致性。
 - **单独一刀，不要夹带进任何功能 PR。**
 
+### QG 瘦身后剩余单元（2026-10-12 立，里程碑 B 期间不做）
+
+[`quality-gates.md`](quality-gates.md) 按里程碑 B 瘦身后留下的单元，设计、派工 spec、变异矩阵都已写好，恢复时直接照用：
+- **QG-1**：排除生成代码的覆盖率计算 + `COVERAGE_MIN` 门槛（棘轮，只准上调）。B1 只打印覆盖率，不设闸。
+- **QG-5 / QG-5b / QG-6**：webui 的 vitest + lint PR 门（22 文件 / 176 用例从没在 CI 跑过）、Node 版本钉法（`.nvmrc` + `engine-strict`）、workflow source-of-truth 静态守卫、Corepack 表述修正。
+- 恢复后，QG-7 再补登记 `lint + test + build` 与 `workflows source-of-truth guard` 两个 required context。
+- **恢复信号**：有实质性前端改动（如检索 DSL 的 UI）或多人协作时。
+
 ### CP 发布的领域事件可能丢失：core NATS 无持久化、提交与发布之间无 outbox（2026-10-12 立，随 D-037）
 
 `events.file.uploaded` / `events.file.deleted`（`controlplane/internal/indexer/indexer.go` 的 `Publish`）与

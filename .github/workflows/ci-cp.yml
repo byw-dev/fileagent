@@ -5,24 +5,37 @@ name: CI — Control Plane
 # Release-artifact builds stay in build-cp.yml (manual workflow_dispatch).
 
 on:
+  # No paths filter on pull_request: this job is a required check, and GitHub leaves a
+  # required check that was filtered out "pending" forever, blocking e.g. docs-only PRs.
   pull_request:
-    paths:
-      - 'controlplane/**'
-      - 'tools/**'
-      - 'Makefile'
-      - '.github/workflows/ci-cp.yml'
   push:
     branches: [master]
     paths:
       - 'controlplane/**'
+      - 'pkg/**'
+      - 'api/**'
       - 'tools/**'
       - 'Makefile'
+      - 'go.work'
+      - 'go.work.sum'
+      - 'deploy/docker-compose.test.yml'
+      - 'scripts/ci/**'
+      - 'ci/**'
       - '.github/workflows/ci-cp.yml'
+
+concurrency:
+  group: ci-cp-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
     name: codegen-drift + vet + test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      TEST_DATABASE_URL: postgres://fileagent:fileagent@localhost:5432/fileagent_test?sslmode=disable
 
     steps:
       - uses: actions/checkout@v4
@@ -52,8 +65,20 @@ jobs:
             exit 1
           fi
 
-      - name: vet + test
-        run: |
-          cd controlplane
-          go vet ./...
-          go test ./...
+      - name: start PostgreSQL
+        run: docker compose -f deploy/docker-compose.test.yml up -d --wait postgres
+
+      - name: vet + integration test gate
+        run: make test-gate-controlplane
+
+      - name: dump PostgreSQL logs on failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.test.yml logs postgres
+
+      - name: upload Control Plane gate artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: controlplane-gate-output
+          path: .ci-out/
+          if-no-files-found: ignore

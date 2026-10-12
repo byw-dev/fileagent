@@ -154,6 +154,7 @@ root/
 
 # Go compiled binaries (output of make build)
 /bin/
+/.ci-out/
 
 # Legacy binary paths (before Makefile was introduced)
 /agent/agent

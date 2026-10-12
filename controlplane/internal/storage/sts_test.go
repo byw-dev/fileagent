@@ -102,10 +102,6 @@ func TestBuildSessionPolicy_MultipleBuckets(t *testing.T) {
 		strSlice(t, objectStmt["Resource"]))
 }
 
-func TestSTSManager_IssueCredentials_NoMinIO(t *testing.T) {
-	t.Skip("requires live MinIO with STS configuration")
-}
-
 func TestNewSTSManager_ReturnsManager(t *testing.T) {
 	mgr := NewSTSManager("localhost:9000", "access", "secret", "arn:minio:sts:::role", false, zapNoopLogger())
 	require.NotNil(t, mgr)
