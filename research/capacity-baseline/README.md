@@ -6,6 +6,11 @@ Run from the repository root with Docker available:
 bash research/capacity-baseline/run.sh
 ```
 
+> **Cost warning — read before running.** A full run (1M + 5M, all variants) takes roughly 1.5–2.5 hours and, with
+> PostgreSQL's default `max_wal_size=1GB`, writes on the order of **800 GB** to disk (checkpoint-driven full-page
+> writes dominate; the 5M seven-index variants alone are ~80 GB of WAL each). The database peaks around 20 GB.
+> Do not re-run casually on a laptop SSD; for a quick sanity check, drop `5000000` from the two `for scale in …` lists in `run.sh`.
+
 The script uses only `postgres:15-alpine`, container `fileagent-b4-pg`, host port
 15432, and named volume `fileagent-b4-pg-data`. It refuses to reuse an existing
 container/volume, captures SQL/CSV/JSON outputs under `research/capacity-baseline/results/`,
