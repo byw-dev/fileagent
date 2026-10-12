@@ -10,7 +10,7 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
-> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判；2026-09-24 IC-4a 关闭 6/9；**IC-BUG-6 的 (d) 只落了 `active=true` 标记位，无消费方，强制解封归 IC-12 的验收与依赖（PR #110 复审 B4）**）**：共 **55** 条 = **已关闭 37** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 17**（**2 条挡** 7/40 + **12 条可推** + **3 条拆半** 13、46 与 32）。**口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
+> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判；2026-09-24 IC-4a 关闭 6/9；**IC-BUG-6 的 (d) 只落了 `active=true` 标记位，无消费方，强制解封归 IC-12 的验收与依赖（PR #110 复审 B4）**）**：共 **56** 条 = **已关闭 37** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 18**（**2 条挡** 7/40 + **13 条可推** + **3 条拆半** 13、46 与 32）。**2026-10-12：IC-BUG-56 随 D-037 文档 PR 立卡（判可推），来自存储层调研。****口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -156,6 +156,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-53 | watcher 的 `seen` 语义是「**已交付**」而非「**已持久入队**」：下游 `submitFile` 提交/判重失败**只 Warn 不重试**，文件此后不再变化时**永不被采集**（初扫路径自 PR #100 F1 起即受影响，实时路径因 IC-BUG-44/43 的 P1 裁决而**保留重试机会**） | 🟡 P2 | agent |
 | IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 | 🟡 P2 | docs |
 | IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** | 🟠 P1 | agent + CP |
+| IC-BUG-56 | **过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」只认 `AccessDenied`**——不会卡住（后台每分钟检查一次，唤醒后约 1 分钟内恢复），但期间开始的上传各失败一次、推迟一个退避档并白耗一次重试 | 🟡 P2 | agent |
 
 ---
 
@@ -853,3 +854,15 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 ⚠️ **「不填该列、由 UI 显示未知」行不通**：该列契约是 `BIGINT NOT NULL DEFAULT 0`（迁移 000001:181）、Go `int64` 非指针（`models.go:539`）、JSON 无 `omitempty` 恒返回（`events.go:548-549`）——不赋值得到的是 `0`，UI 会显示「0 B / X」而不是未知；而 D-027 **明写「`bytes_transferred` 为 0 也是有效值、语义明确」**，把失败态的 0 一律解释成「未知」会抹掉「真实零进度」这个语义。若确实需要表达「未知」，那是**契约变更**（列可空 + `*int64` + `omitempty`，或加一个 presence 标志），得单独拍板，不是本卡的备选项。
 **随第 3 步「IC 账本按 A 的标尺重判」时定级。** |
 | **发现与订正** | 2026-09-25 排查 PR #118 独立评审 P1 时立卡，**同日经 PR #121 的 codex 独立评审证伪核心断言并收窄至当前形态**。保留本卡而非撤销，是因为失败路径的语义问题真实存在（与 IC-BUG-49「前提被完全证伪」不同）。 |
+
+## IC-BUG-56 — 过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」不触发 🟡 P2
+
+| 字段 | 内容 |
+|------|------|
+| **现象** | STS 凭据真正过期后，存储返回 `InvalidAccessKeyId`（HTTP 403），而 agent 的「作废凭据 → 刷新一次 → 立即重试」兜底只认 `AccessDenied`（`agent/cmd/agent/main.go:617` `isAccessDenied`）。过期凭据的上传因此走普通失败路径：进入退避（`agent/internal/executor/executor.go` `defaultRetryDelays`，首档 1 分钟），每次耗掉一次重试次数。 |
+| **来源** | 存储层调研（PR #124）报告 §4 末尾「附」：三家（含 MinIO）对过期 STS 凭据都返回 `InvalidAccessKeyId`。⚠️ 该结论是**现场记录**——`research/storage-layer-eval/results/probe*/` 里「expired STS creds denied」一项均为 `SKIP`（`EXPIRY_TEST!=1`，需等 15 分钟），原始输出未留存；可用 `EXPIRY_TEST=1` 重跑探针复核。已留存的同类证据：篡改 session token、缺 session token 两种情形，SeaweedFS 返回的也是 `InvalidAccessKeyId`（`results/probe-neg/seaweedfs-loose-run.jsonl` G1.8 / G1.9）。 |
+| **后果（立卡时核实，比报告措辞轻）** | 报告写「这条兜底路径不会触发」，属实；但**不会卡住**：主路径是后台每分钟一次的检查（`main.go:405` 起的 ticker），凭据剩余不足 10 分钟（含已过期）即刷新。所以机器休眠唤醒后，最多约 1 分钟内凭据会恢复。真实代价：①唤醒后这一分钟内开始的上传各失败一次，推迟至少一个退避档；②每个这样的任务白耗一次重试次数；③CP 长时间不可达时，无论错误码是什么都刷新不了——这种情形与本卡无关，属于重试预算问题。 |
+| **建议处理** | `isAccessDenied` 同时识别 `InvalidAccessKeyId`（以及可能的 `ExpiredToken`），走同一条「刷新一次 → 重试」路径；第二次仍失败照旧终止（`ErrTerminalUpload`）。注意不要把「凭据从未有效」（配置错误）误判成可无限刷新的情形——现有路径只刷新一次，已经有界。 |
+| **定级** | 🟡 P2，不挡目标 A，可推；随第 3 步账本重判时复核。 |
+| **附带事实** | minio-go v7.0.91 会把 `AssumeRole` 的 `DurationSeconds < 3600` 钳成 3600（`pkg/credentials/assume_role.go`），CP 想缩短凭据有效期时须绕开它。 |
+| **发现** | 2026-10-03 存储层调研时撞见，2026-10-12 随 D-037 文档 PR 立卡（此前只记在会话笔记里）。 |
