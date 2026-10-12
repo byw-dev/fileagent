@@ -1,0 +1,12 @@
+{"end_ns":1791814212024311000,"ok":true,"op":"make_bucket","start_ns":1791814212013480000}
+{"end_ns":1791814213733154000,"ok":true,"op":"put_new a/b/c.txt","start_ns":1791814213525623000}
+{"end_ns":1791814215237280000,"ok":true,"op":"overwrite a/b/c.txt","start_ns":1791814215234358000}
+{"end_ns":1791814216744942000,"ok":true,"op":"put_empty_dir_marker d/","start_ns":1791814216740644000}
+{"end_ns":1791814218337784000,"ok":true,"op":"multipart big.bin","start_ns":1791814218246377000}
+{"end_ns":1791814219899809000,"ok":true,"op":"multipart_aborted aborted.bin","start_ns":1791814219842512000}
+{"end_ns":1791814221403676000,"ok":true,"op":"copy a/b/c.txt -\u003e copy/c.txt","start_ns":1791814221400611000}
+{"end_ns":1791814222907412000,"ok":true,"op":"delete a/b/c.txt","start_ns":1791814222905017000}
+{"end_ns":1791814224410562000,"ok":true,"op":"delete_missing nope.txt","start_ns":1791814224408857000}
+{"end_ns":1791814225912466000,"err":"The bucket you tried to delete is not empty","ok":false,"op":"delete_bucket_nonempty","start_ns":1791814225911477000}
+{"end_ns":1791814227419477000,"ok":true,"op":"delete remaining objects","start_ns":1791814227414283000}
+{"end_ns":1791814228995958000,"ok":true,"op":"delete_bucket_empty","start_ns":1791814228920221000}

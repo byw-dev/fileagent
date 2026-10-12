@@ -1,0 +1,6 @@
+{
+ "writes_ok": 6386,
+ "first_done_ns": 1791814619130106000,
+ "last_done_ns": 1791814621923807000,
+ "note": "subscriber offline during writes; container killed (SIGKILL) ~2s after last write, then restarted; crash-watch.jsonl subscribed from 2s before the first write"
+}

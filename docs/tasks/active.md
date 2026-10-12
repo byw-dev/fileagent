@@ -107,8 +107,8 @@ IC 残留项在 **CI 绿灯可信 + 账本重判**之前都不动。
 
 | # | 事项 | 说明 |
 |---|------|------|
-| **B1** | **QG 瘦身版**（[`quality-gates.md`](quality-gates.md) 顶部「瘦身」注记） | 只做 CP 侧：CI 起 PG，`-tags=integration` 真跑，三层防静默跳过（点名 15 个测试 / 语义标记 / skip 账本），覆盖率只打印不设闸；用户开 `master` 分支保护并登记 `codegen-drift + vet + test`。换存储要重写的入站与索引链路，正是这批测试守着的 |
-| **B2** | **存储事件源调研** | D-037 第五条四项待查，结论回填 D-037 |
+| **B1** ✅ | **QG 瘦身版**（PR #126；master 分支保护已开，必过检查 `codegen-drift + vet + test`）（[`quality-gates.md`](quality-gates.md) 顶部「瘦身」注记） | 只做 CP 侧：CI 起 PG，`-tags=integration` 真跑，三层防静默跳过（点名 15 个测试 / 语义标记 / skip 账本），覆盖率只打印不设闸；用户开 `master` 分支保护并登记 `codegen-drift + vet + test`。换存储要重写的入站与索引链路，正是这批测试守着的 |
+| **B2** ✅ | **存储事件源调研** | 结论已回填 D-037 第五条；报告 [`storage-event-source.md`](../reports/storage-event-source.md) |
 | **B3** | **SeaweedFS spike** | CP 内「存储事件源」接口 + 两个适配器 + 声明式 IAM；验收 = `smoke.sh` 在 SeaweedFS 上十二环全绿。**顺带完成 IC 账本重判**（原第 3 条）：未关缺陷里有一批与 MinIO 绑定（IC-BUG-7 / 40 / 41），换存储后再判可少判一轮 |
 | **B4** | **容量基线（只测不改）** | 与 B2、B3 并行。对照项见 [`tag-search-at-scale.md`](../reports/tag-search-at-scale.md) §6 |
 | **B5** | **检索模型决策** | 基线出数后立决策：检索模型 + 数据时间一等列（agent 在 `UploadResult` 上报，proto 只增字段）+ IC-6 分区 + IC-7 计数契约 + UUIDv7（需修订 CLAUDE.md「统一 UUID v4」） |

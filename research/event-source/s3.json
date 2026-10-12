@@ -1,0 +1,1 @@
+{"identities": [{"name": "admin", "credentials": [{"accessKey": "b2admin", "secretKey": "b2admin-secret"}], "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}

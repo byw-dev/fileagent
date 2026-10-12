@@ -1,0 +1,5 @@
+[leveldb2]
+enabled = false
+[leveldb3]
+enabled = true
+dir = "/data/filerldb3"
