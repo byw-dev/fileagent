@@ -1,7 +1,7 @@
 # 存储层替代调研：MinIO / SeaweedFS / JuiceFS 评估矩阵与建议
 
 > 2026-10-03 · 本机实测（macOS + OrbStack，SSD）· 对应 [`active.md`](../tasks/active.md)「下一步」第 4 条
-> 产出是**矩阵 + 建议**；换不换由产品拍板。D-030「不换存储层」的前提（MinIO 稳定可得）已失效（D-036）。
+> 产出是**矩阵 + 建议**；换不换由产品拍板。**→ 2026-10-12 已拍板：[`DECISIONS.md`](../../DECISIONS.md) D-037（换 SeaweedFS CE）。**D-030「不换存储层」的前提（MinIO 稳定可得）已失效（D-036）。
 > 测试工具与原始结果在 [`research/storage-layer-eval/`](../../research/storage-layer-eval/)
 > （能力探针、元数据订阅器、压测与冷缓存脚本、Python 生态测试、各候选 compose、`results/`）。
 > **证据分三类**：①**仓内可复算**——数字出自 `results/` 的原始数据，或由 `aggregate.py`、`subscribe_summary.py`、
@@ -257,6 +257,7 @@ boto3 1.43（均为当前版本、默认配置）。造数据：`raw/` 下 3 个
 **附：与选型无关、但本轮暴露的 FileAgent 缺口**：三家（包括 MinIO）对过期 STS 凭据都返回 `InvalidAccessKeyId`，
 而 agent 的兜底刷新只认 `AccessDenied`（`agent/cmd/agent/main.go:617`）。主路径是按时间提前 10 分钟刷新
 （`credential.go:233`），正常情况下不受影响；但机器休眠或 CP 长时间不可达之后，凭据会真正过期，这条兜底路径不会触发。
+（2026-10-12 立卡 **IC-BUG-56** 时核实：后台每分钟检查一次，唤醒后约 1 分钟内即恢复，**不会卡住**；代价是这期间的上传各失败一次、推迟一个退避档。）
 另外，minio-go 会把有效期请求小于 3600 秒的值钳成 3600 秒，CP 想缩短凭据有效期时，需要绕开 minio-go 自己签名。
 
 ## 5. 本机未能验证

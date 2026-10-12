@@ -51,6 +51,17 @@
   `controlplane/internal/db/migrate_test.go` 的内嵌迁移断言、以及 `make generate` 的产物一致性。
 - **单独一刀，不要夹带进任何功能 PR。**
 
+### CP 发布的领域事件可能丢失：core NATS 无持久化、提交与发布之间无 outbox（2026-10-12 立，随 D-037）
+
+`events.file.uploaded` / `events.file.deleted`（`controlplane/internal/indexer/indexer.go` 的 `Publish`）与
+`events.agent.*`（grpcserver、agent manager、离线扫描）都在数据库提交**之后**用 core NATS `conn.Publish` 直接发出。
+唯一订阅方是 CP 自己的事件引擎（`controlplane/internal/event/engine.go`），用 core NATS `Subscribe`，没有 ack。
+
+- **会丢的情形**：NATS 不可用；CP 在提交与发布之间崩溃；事件引擎的订阅还没建好时发出的事件。丢了就丢了，用户配置的事件动作不会执行，也没有任何记录。
+- **方向**（不在此拍板，见 D-037 第三条）：事务性 outbox（事件与业务行同一事务写进 PG，发布循环带 `Nats-Msg-Id` 投进 JetStream）
+  + 事件引擎改为 JetStream durable consumer（ack / 重投 / 死信，D-031 的消费侧设计可直接搬用）。
+- **为什么现在不做**：不挡目标 A；产品前提是「没有任何外部对接」。出现第一个外部订阅方、或对事件动作有送达要求时排期。
+
 ### watcher 的 `seen` 无界增长（2026-09-25 立，PR #118 review 返工顺带记账；同轮 S-3 修订）
 
 `agent/internal/watcher/watcher.go` 里 `seen`（每路径最后交付的 mtime）**只增不删**，

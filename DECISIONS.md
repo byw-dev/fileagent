@@ -1325,6 +1325,7 @@ CP 的 `indexer.go:266-280` 照样把该值写进 `upload_logs.bytes_transferred
 ### 决策
 
 **一、不更换存储层。** 四项需求中只有一项与存储实现有关，且对象存储在该项上无差别。
+> ⚠️ **本条已被 D-037 取代**（2026-10-12）：前提「MinIO 稳定可得」已失效（D-036），替换目标定为 SeaweedFS CE。
 详细评估见设计文档 §2（lakeFS / Iceberg-Delta / S3 Object Tagging / 换 PG 均被否决）。
 
 **二、事实来源改为「写入方的持久化意图 + CP 的授权记录」**，MinIO 事件降级为低延迟提示：
@@ -1491,6 +1492,9 @@ D-014 只讨论「webhook 端点如何鉴权」，把 webhook 视作既成事实
 ### 决策
 
 **MinIO → Control Plane 的对象事件通道改用 `notify_nats` + JetStream（`jetstream=on`），排期在 D-030 的对账阶段（IC-11）。**
+
+> ⚠️ **2026-10-12 由 D-037 第三条部分修订**：「MinIO 以 `notify_nats` 作为生产者」随 MinIO 降为过渡而失效；
+> 入站改由 CP 内的「存储事件源」接口承接。JetStream 本身仍启用，本条关于解耦、重放、链路自证的论证仍成立。
 
 选它而非 webhook 的理由，三条都直接服务于 D-030 的对账模型：
 
@@ -2463,4 +2467,114 @@ minisign 公钥 `RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav`，
   「从服务端镜像里抠二进制」撐着——这是个能用的办法，不是长久之计。改成纯 S3 +
   MinIO admin API over curl 是可行的（脚本本就刻意不用 grep/sed/awk），但**独立一刀**。
   本决策只解决「镜像有来源」。
-- **存储层替代选型**本身（见上）。→ **2026-10-03 调研已完成**，报告见 [`docs/reports/storage-layer-eval.md`](docs/reports/storage-layer-eval.md)，待产品拍板；若决定更换，另立新决策。
+- **存储层替代选型**本身（见上）。→ **2026-10-03 调研已完成**，报告见 [`docs/reports/storage-layer-eval.md`](docs/reports/storage-layer-eval.md)。→ **2026-10-12 已拍板：D-037**，本条降为过渡方案。
+
+---
+
+## D-037：对象存储目标改为 SeaweedFS CE；运行时只抽象「存储事件源」；删桶只允许空桶
+
+**决策日期**：2026-10-12
+**影响范围**：本条落地时仅改文档。后续实现会碰到 `deploy/`（compose、初始化脚本）、
+`controlplane/internal/api/handler/events.go`（webhook 入库）、`controlplane/internal/indexer`、
+`controlplane/internal/event`、桶管理 API、`docs/ops/`、`system-design.md` §1.4/§2.1/§6.5
+**关联**：**D-030** 第一条（被本条取代）、**D-031**（部分修订，见第三条）、**D-036**（降为过渡方案）、
+调研报告 [`docs/reports/storage-layer-eval.md`](docs/reports/storage-layer-eval.md)（PR #124）、
+检索方案草稿 [`docs/reports/tag-search-at-scale.md`](docs/reports/tag-search-at-scale.md)
+
+### 背景
+
+- D-030 第一条「不更换存储层」的前提是 MinIO 稳定可得。D-036 记录了这个前提的失效：上游镜像已没有任何公共通路，
+  只能自持一份不再有补丁来源的 AGPL 二进制。
+- 存储层调研（PR #124）在本机对 MinIO / SeaweedFS CE / JuiceFS 做了同一套探针与压测，结论与理由见报告 §4。
+  简述：离开 MinIO 的首要理由是断供与 AGPL；列举成本（冷缓存下每千对象读盘次数 MinIO 1057、SeaweedFS 6.2）
+  决定对账与灾难恢复的代价，是选 SeaweedFS 的重要加分项。
+- 报告写的是「待产品拍板」。本条即该拍板。
+
+### 决策
+
+**一、对象存储的替换目标是 SeaweedFS CE（Apache-2.0）。取代 D-030 第一条。**
+MinIO 只作过渡，沿用 D-036 的自持镜像；D-036 相应降为过渡方案。任何时候只正式支持一家后端：
+同时支持多家的真实成本是每家各一套测试矩阵、部署文档和排障经验。JuiceFS 不采用（报告 §4 第 3 条）；
+同架构的 RustFS、`pgsty/silo` 已排除（报告 §6）。
+
+**二、不做通用存储抽象，运行时只加一个「存储事件源」接口。**
+
+- 数据面直接复用 S3：CP 的 `STSManagerClient` / `MinIOPresigner` / `MinioBucketMaker`、agent 的 `ObjectStore`
+  这些窄接口已经覆盖，三家用同一份 minio-go 客户端代码全部通过探针，换后端不需要新抽象。
+- 「存储事件源」在 **CP 进程内**，下挂适配器：MinIO S3 Records（过渡期保留）、SeaweedFS filer 元数据订阅。
+  两者都统一成「对象新建 / 删除」事件交给索引。
+- **只有 SeaweedFS 适配器可以导入 SeaweedFS 的客户端**；索引与业务代码只认事件源接口。实现时用导入边界测试守住。
+  否决「CP 业务代码直接读 filer」：存储协议会渗进业务代码，换存储时改动面最大。
+- **不另起一个转发服务**：适配器就在 CP 进程里，同一份配置、同一次发布。
+- **事件只是低延迟提示，对账才是事实来源**（D-030 第二条不变）。CP 收到事件后经 **S3 API** 回读对象当前状态再写索引——
+  filer 的 `ts_ns` 不能用来判断同一对象哪个版本更新（见下「已知约束」）。回读走 S3 而不走 filer，
+  让全系统只有一个适配器讲 filer 协议。
+- 否决 SeaweedFS 原生的 `notification.toml` 推送：投递出错即丢弃事件，不可靠；filer webhook 在目标不可达时内存无界增长（报告 §3）。
+
+**三、D-031 的修订：JetStream 照常启用；NATS 的使用方向不在本条预先限定。**
+
+- D-031 中「MinIO 以 `notify_nats` 作为 JetStream 生产者」这一部分随 MinIO 降为过渡而失效。
+- **JetStream 本身仍然需要**，D-031 关于投递与处理解耦、可重放、链路自证的论证依然成立。
+  SeaweedFS 适配器是否经 JetStream 转一手、出站领域事件如何走 JetStream，**不在本条定**：
+  前者在事件源调研（第五条）后定，后者在出现第一个外部订阅方、或做 outbox 时定。
+- 现状事实（2026-10-12 核实）：CP 只用 core NATS（`cmd/server/main.go` 的 `conn.Publish` / `conn.Subscribe`），
+  没有任何 JetStream 消费代码。`events.file.*` / `events.agent.*` 在数据库提交后直接发布、没有 outbox，
+  唯一订阅方是 CP 自己的事件引擎（`internal/event/engine.go`）；NATS 不可用或 CP 在提交与发布之间崩溃时，事件丢失。
+  已记入 `backlog.md`。
+
+**四、删桶：桶里有生产数据就不能删（产品决策，2026-10-12）。**
+只有文件已全部搬走或删除之后，才能在 CP 侧删桶。删桶因此不涉及批量删行，成本落在逐个删 / 搬文件上（本来就是逐对象事件）。
+
+- **数据库外键替产品规则把关**：`file_entries.bucket_id`、`collection_rules.bucket_id` 都是无级联外键，
+  桶里还有文件行或采集规则时删 `buckets` 行会被拒绝。**保持无级联，不加 CASCADE。**
+- **流程**：CP 冻结桶（停用相关采集规则、不再签发该桶的 STS）→ 等已签发的 STS 过期（最长 1h）→
+  调存储 `DeleteBucket`，**由存储原子判空**（SeaweedFS 须显式设 `-s3.allowDeleteBucketNotEmpty=false`，**默认是 true，即递归删除**）→
+  成功后删 CP 的 `buckets` 行。账本与存储任一不空就解除冻结并告知原因。
+- **同名重建**：旧行已删，`buckets.name` 全局唯一不冲突，不需要「代次」；迟到的旧事件按「回读当前状态」原则丢弃。
+- **运维绕过 CP 直接删非空桶 = 事故**：适配器看到桶目录删除而账本还有行时，告警并标记对账缺失，**不要静默跟着删账本**。
+  注意 SeaweedFS 的 leveldb3 / postgres2 / mysql2 删桶是整库删除，**不发逐对象删除事件**，只有一条桶目录删除。
+- **遗留问题**：血缘（IC-14）的墓碑若留在 `file_entries` 并挂着 `bucket_id` 外键，桶会永远删不掉。
+  墓碑要么不挂桶外键，要么另存；在 IC-14 设计时解决。
+
+**五、实现前先做「存储事件源」调研，再做 spike。** 待查（结论回填本条）：
+
+1. SeaweedFS 4.48 新增的在途水位（`claimThrough` / `LocalDeliveredThroughTsNs`）：空闲心跳带的时间戳对外部订阅方是否也意味着
+   「此前事件均已送达」？读 `weed/server/filer_grpc_server_sub_meta.go`。是，则游标可直接取水位；否，则用「回退窗口 + 按身份去重」。
+2. 负载下的 `ts_ns` 乱序上界（报告 e7 只在本机测得约 0.1ms），决定回退窗口取多大。
+3. 硬崩溃丢 ≤60s 事件、日志清理后游标越界静默跳过：适配器如何自检，丢失的事件由谁补（IC-9 注册端点 / IC-13 L2 对账）。
+4. 事件翻译：桶目录删除（见第四条）、`.uploads/` 分片上传中间对象、目录事件的过滤。
+
+spike 的验收：`deploy/scripts/smoke.sh` 在 SeaweedFS 上十二环全绿；初始化改为声明式 IAM 配置，取代 `init-minio.sh` 的 `mc` 流程。
+
+### 已知约束（报告 §3 与 SeaweedFS 4.48 源码）
+
+- **`ts_ns` 不严格有序**：filer 先给事件盖时间戳，再做通知等工作，最后追加进日志缓冲；并发时日志顺序与时间戳顺序可能相反。
+  严格的「≤ 游标即丢」实测会丢事件（报告 e7）。同理，**同一路径并发写入时，存储的提交顺序与盖戳顺序可能相反**，
+  所以不能用 `ts_ns` 做 IC-BUG-8 那类「排序键 upsert」，只能回读。
+- **硬崩溃最多丢 ≤60s 元数据日志**（`LogFlushInterval` 为常量）。agent 写入由 `UploadResult` 兜底；
+  **SDK/ETL 等非 agent 写入方上线前，必须先有 IC-9 注册端点或 IC-13 L2 对账**（报告 §4 前置条件 2）。
+- **元数据日志默认永久保留**；`fs.log.purge` 以整天为粒度，游标落在已清理范围时订阅**静默跳过**。
+  只能清理已消费完的整天，启动时自检「游标是否早于最早可用日志」，越界即告警并触发对账。
+- **filer gRPC 只能用 mTLS 鉴权**（没有令牌方式），且是全权限：只开在内网，并配 mTLS。JWT 只保护 HTTP 写入。
+
+### 部署实测补充（SeaweedFS 4.48，本机 compose，2026-10-12）
+
+报告之外，按多主机拓扑（master / filer+S3 / volume 分离）在本机 compose 上补测得出，供 spike 与 `docs/ops/` 直接使用：
+
+- filer 内嵌的 S3 网关按 `-ip:port.grpc` 回连 filer：filer 端口不映射宿主时，`-ip` 必须是 compose 服务名，写宿主 IP 会连不上。
+- 镜像自带 `/etc/seaweedfs/filer.toml`（leveldb2），`-defaultStoreDir` 实际不生效；换元数据后端要挂载覆盖该文件。
+  **有数据后不要直接改 `filer.toml` 换后端**：新库为空，旧数据会「消失」（已复现）；迁移走 `fs.meta.save` / `fs.meta.load`。
+- 配置可用 `WEED_` 前缀环境变量注入（如 `WEED_JWT_SIGNING_KEY`、`WEED_JWT_FILER_SIGNING_KEY`）。
+  不设 filer 签名密钥时 S3 启动报 `no signing key found for STS service`。
+- 停机顺序 filer → volume → master；先停 volume 时 filer 的优雅关闭从约 15s 拖到约 90s。`stop_grace_period` ≥ 60s。
+- 默认值要显式改：`-s3.allowDeleteBucketNotEmpty` 默认 true；master 的 `-telemetry` 默认 true。
+- **删桶后卷的删除是尽力而为**：元数据先删，再向 master 发删除 collection 的请求（15s 超时，失败只记日志）。
+  删桶时 volume 或 master 不在线，卷会成为孤儿：S3 看不见，但照占磁盘。核对与回收：`collection.list`、`collection.delete`、`volume.fsck`。
+- **不要用 `fs.configure` 让多个桶或路径共用 collection**：共用后删桶既不删 collection 也不逐个删 chunk，数据全部成为孤儿。
+- 反向代理后的 SigV4：代理须保留客户端 Host，并设 `-s3.externalUrl`；大文件要关闭代理的请求 / 响应缓冲。
+
+### 不在本条决定
+
+- **元数据后端选型**（leveldb3 / postgres2 等）：影响删桶代价、备份方式与容量，在 spike 中定。
+- **ETL 前缀级 STS policy**：报告 Tier 5 验证可行，但须改写 D-030 第八条「policy 写整桶」，等真实 ETL 接入时另立决策。
+- **检索模型 / 分区 / 计数契约 / UUIDv7**：见检索方案草稿，待容量基线出数后合并为一条决策。

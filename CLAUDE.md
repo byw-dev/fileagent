@@ -362,6 +362,7 @@ docker compose -f deploy/docker-compose.test.yml down -v
 | Agent 本地持久化 | SQLite，不用其他嵌入式 DB |
 | 多租户 | 第一版单组织，org_id 字段已预留 |
 | Control Plane HA | 第一版单实例，无状态设计为 HA 预留 |
+| 对象存储 | 替换目标 SeaweedFS CE；MinIO 只作过渡（自持镜像，D-036）；运行时只抽象「存储事件源」（见 D-037）。代码与本文其余部分仍以 MinIO 描述现状 |
 | 二进制构建与输出 | `make build` → `bin/`（纯 Go）；`make bundle` 产出含 Web UI 的单文件 CP（见 D-022）；禁止提交编译产物（见 D-003） |
 
 ---
@@ -387,9 +388,9 @@ docker compose -f deploy/docker-compose.test.yml down -v
 追踪 `docs/tasks/metadata-phase1.md`，落地 `DECISIONS.md` D-025 各「落地记录」，架构回填 `system-design.md` §3.3.8/§5.8。
 **当前 track（2026-09-08 拍板）**：**写入准入与索引一致性（IC-0…IC-15）**——2026-09-08 审计发现
 **Agent 数据面从未端到端跑通过**（拿不到 STS 凭据 / 从不上报 `UploadResult` / policy 前缀不匹配 / 缺 multipart 权限），
-且不存在任何 MinIO↔PostgreSQL 对账机制。决策 **D-030**（不换存储层；STS grant + 注册 outbox + 分片对账）、
+且不存在任何 MinIO↔PostgreSQL 对账机制。决策 **D-030**（不换存储层——**该条已被 D-037 取代，目标改为 SeaweedFS CE**；STS grant + 注册 outbox + 分片对账）、
 **D-031**（事件传输 webhook → NATS JetStream）。设计 `docs/design/consistency-and-ingest.md`，
-追踪 `docs/tasks/consistency-ingest.md`，缺陷 `docs/tasks/bugs/open.md`（IC-BUG-1…IC-BUG-55，已关 37 条、撤销 1 条、未关 17 条：2 挡（7/40）/ 12 可推 / 3 拆半（IC-4a 关 6/9））。
+追踪 `docs/tasks/consistency-ingest.md`，缺陷 `docs/tasks/bugs/open.md`（IC-BUG-1…IC-BUG-56，已关 37 条、撤销 1 条、未关 18 条：2 挡（7/40）/ 13 可推 / 3 拆半（IC-4a 关 6/9））。
 顺序：IC-0 文档基线 → 止血 IC-1 ✅ → **IC-2c** ✅（webhook 键解码，PR #96）→ **IC-2a** ✅（上报主路径，原子刀，PR #98；
 开工前先修掉挡路的 IC-BUG-36/35——CP 凭据被建成 root 的 service account，而 MinIO 不允许 service account 调 `AssumeRole`，
 **全新环境从来签不出 STS**，PR #97）→ **IC-5** ✅（采集正确性，PR #100）→ **IC-2b** ✅（下发链路鲁棒性，PR #103）→
