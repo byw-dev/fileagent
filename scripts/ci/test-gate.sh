@@ -49,7 +49,7 @@ if ! go -C pkg/trollsift vet ./...; then
 fi
 
 printf '\n== setup migration test: %s ==\n' "$SETUP_TEST"
-if ! go -C controlplane test -v -tags=integration -p 1 ./internal/db -run "^${SETUP_TEST}$"; then
+if ! go -C controlplane test -count=1 -v -tags=integration -p 1 ./internal/db -run "^${SETUP_TEST}$"; then
 	printf 'PostgreSQL migration setup failed; verify TEST_DATABASE_URL and the PostgreSQL service.\n' >&2
 	exit 1
 fi
@@ -58,9 +58,13 @@ TEST_LOG="$OUT_DIR/test.log"
 COVER_PROFILE="$OUT_DIR/coverage.out"
 printf '\n== full Control Plane integration suite ==\n'
 test_status=0
-go -C controlplane test -v -tags=integration -p 1 -covermode=atomic -coverprofile="$COVER_PROFILE" ./... 2>&1 | tee "$TEST_LOG" || test_status=$?
+go -C controlplane test -count=1 -v -tags=integration -p 1 -covermode=atomic -coverprofile="$COVER_PROFILE" ./... 2>&1 | tee "$TEST_LOG" || test_status=$?
 if [ "$test_status" -ne 0 ]; then
 	add_problem "full integration go test failed (exit $test_status)"
+fi
+# Cached results never touched the database: setup-go restores GOCACHE (test cache included) across CI runs.
+if grep -Eq '^ok[[:space:]].*\(cached\)' "$TEST_LOG"; then
+	add_problem 'some packages reported (cached) results; the gate must execute tests (-count=1)'
 fi
 
 printf '\n== required top-level PASS checks ==\n'
@@ -119,7 +123,7 @@ EOF
 printf 'ALLOWED_SKIP: %s declared entries\n' "$allowed_skip_count"
 
 printf '\n== pkg/trollsift tests ==\n'
-if ! go -C pkg/trollsift test ./...; then
+if ! go -C pkg/trollsift test -count=1 ./...; then
 	add_problem 'pkg/trollsift tests failed'
 fi
 
