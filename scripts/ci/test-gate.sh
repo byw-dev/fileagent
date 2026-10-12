@@ -31,10 +31,16 @@ add_problem() {
 }
 : > "$OUT_DIR/problems.log"
 
-printf 'Preflight PostgreSQL reachability...\n'
-if ! docker compose -f deploy/docker-compose.test.yml exec -T postgres pg_isready -U fileagent -d fileagent_test >/dev/null 2>&1; then
-	printf 'PG not up — run docker compose -f deploy/docker-compose.test.yml up -d --wait postgres\n' >&2
-	exit 1
+# The compose probe only describes the default DSN. With an overridden TEST_DATABASE_URL the
+# setup migration step below is the reachability check (it fails fast with a clear message).
+if [ "$TEST_DATABASE_URL" = "$TEST_DATABASE_URL_DEFAULT" ]; then
+	printf 'Preflight PostgreSQL reachability (compose service)...\n'
+	if ! docker compose -f deploy/docker-compose.test.yml exec -T postgres pg_isready -U fileagent -d fileagent_test >/dev/null 2>&1; then
+		printf 'PG not up — run docker compose -f deploy/docker-compose.test.yml up -d --wait postgres\n' >&2
+		exit 1
+	fi
+else
+	printf 'TEST_DATABASE_URL overridden; skipping compose preflight, setup migration will verify reachability.\n'
 fi
 
 printf '\n== go vet ==\n'

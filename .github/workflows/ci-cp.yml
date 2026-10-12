@@ -5,19 +5,9 @@ name: CI — Control Plane
 # Release-artifact builds stay in build-cp.yml (manual workflow_dispatch).
 
 on:
+  # No paths filter on pull_request: this job is a required check, and GitHub leaves a
+  # required check that was filtered out "pending" forever, blocking e.g. docs-only PRs.
   pull_request:
-    paths:
-      - 'controlplane/**'
-      - 'pkg/**'
-      - 'api/**'
-      - 'tools/**'
-      - 'Makefile'
-      - 'go.work'
-      - 'go.work.sum'
-      - 'deploy/docker-compose.test.yml'
-      - 'scripts/ci/**'
-      - 'ci/**'
-      - '.github/workflows/ci-cp.yml'
   push:
     branches: [master]
     paths:

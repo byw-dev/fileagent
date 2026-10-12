@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -78,11 +77,7 @@ func TestIssueCredentials_Integration(t *testing.T) {
 		{BucketName: bucket},
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "not supported") ||
-			strings.Contains(err.Error(), "not configured") ||
-			strings.Contains(err.Error(), "AccessDenied") {
-			t.Skipf("STS AssumeRole not available on test MinIO: %v", err)
-		}
+		// STS_LIVE=1 asserts a working STS endpoint, so any failure is a real failure, never a skip.
 		t.Fatalf("IssueCredentials failed: %v", err)
 	}
 
@@ -148,11 +143,7 @@ func TestIssueCredentials_ScopingDeniesOtherBuckets(t *testing.T) {
 		{BucketName: allowedBucket},
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "not supported") ||
-			strings.Contains(err.Error(), "not configured") ||
-			strings.Contains(err.Error(), "AccessDenied") {
-			t.Skipf("STS AssumeRole not available on test MinIO: %v", err)
-		}
+		// STS_LIVE=1 asserts a working STS endpoint, so any failure is a real failure, never a skip.
 		t.Fatalf("IssueCredentials failed: %v", err)
 	}
 
