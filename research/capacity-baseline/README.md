@@ -23,15 +23,22 @@ full matching UUID sets for every predicate. Raw results include server version,
 relevant settings, relation/index sizes, WAL LSN deltas, and `EXPLAIN (ANALYZE,
 BUFFERS)` output. All wall-clock values are labeled local-only.
 
-The seven-versus-five `file_entries` index comparison is run separately by
-`index-set.sql` using UUID-typed bucket/org/type/agent columns. The compact
-int4-key proxy in `benchmark.sql` is auxiliary and is not used for the report's
-index-set figures.
+The current seven-index `file_entries` shape is run separately by `index-set.sql`
+using UUID-typed bucket/org/type/agent columns. It repeats UUIDv4, chronological
+UUIDv7, and random-arrival UUIDv7 with identical non-PK values and reports the
+same bulk and post-load WAL, FPI, PK size, leaf-density, and fragmentation
+metrics. The compact int4-key proxy in `benchmark.sql` remains auxiliary.
 
 The PK comparison builds UUIDv4 with explicit version/variant bits from a seeded
 MD5 stream and builds UUIDv7 in SQL from a 2023 epoch-millisecond prefix plus
-seeded random bits. Both sets use the same deterministic `ORDER BY md5(g::text)` row
-arrival order after `CHECKPOINT`; this measures randomized arrival, not the
-chronological-arrival best case for UUIDv7.
+seeded random bits. UUIDv4 and the primary UUIDv7 run arrive in the same ascending
+generator sequence, so UUIDv7's timestamp component increases by one millisecond
+per row; a third v7
+table uses deterministic random arrival as a control. Every bulk and every set of
+100 one-row post-load inserts begins after an explicit `CHECKPOINT`.
+
+The time-query matrix records the GIN-only unpartitioned table, the same table
+after adding `(created_at DESC, id DESC)`, the partition parent, and newest-first
+chunked partition scans. Raw plans are preceded by `QUERY_CASE` labels.
 
 The script is intentionally a measurement harness, not a production migration.

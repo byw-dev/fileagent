@@ -1,9 +1,13 @@
 Output format is csv.
 section,version,shared_buffers,work_mem,maintenance_work_mem,effective_cache_size,full_page_writes,wal_compression,checkpoint_timeout,max_wal_size
 environment,"PostgreSQL 15.19 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",128MB,4MB,64MB,4GB,on,off,5min,1GB
+psql:<stdin>:6: NOTICE:  extension "pg_trgm" already exists, skipping
 CREATE EXTENSION
-psql:<stdin>:16: NOTICE:  table "index_current_uuid" does not exist, skipping
-psql:<stdin>:16: NOTICE:  table "index_reduced_uuid" does not exist, skipping
+psql:<stdin>:7: NOTICE:  extension "pgstattuple" already exists, skipping
+CREATE EXTENSION
+psql:<stdin>:8: NOTICE:  table "index_v4_uuid" does not exist, skipping
+psql:<stdin>:8: NOTICE:  table "index_v7_ordered_uuid" does not exist, skipping
+psql:<stdin>:8: NOTICE:  table "index_v7_random_uuid" does not exist, skipping
 DROP TABLE
 CREATE TABLE
 CREATE INDEX
@@ -12,32 +16,60 @@ CREATE INDEX
 CREATE INDEX
 CREATE INDEX
 CREATE TABLE
-ALTER TABLE
-ALTER TABLE
-CREATE INDEX
-CREATE INDEX
-CREATE INDEX
+CREATE TABLE
 CHECKPOINT
 INSERT 0 1000000
 metric,wal_bytes_per_row,full_page_images
-current_7_indexes,2046.2992800000000000,89994
+current_7_v4,2064.0924800000000000,89654
 CHECKPOINT
 INSERT 0 1000000
 metric,wal_bytes_per_row,full_page_images
-reduced_5_indexes,810.7282400000000000,27482
+current_7_v7_ordered,2013.7322000000000000,87844
+CHECKPOINT
+INSERT 0 1000000
+metric,wal_bytes_per_row,full_page_images
+current_7_v7_random,2055.4360640000000000,93569
 metric,relname,heap_bytes,indexes_bytes,total_bytes
-index_profile,index_current_uuid,160022528,400039936,560128000
-index_profile,index_reduced_uuid,160022528,262488064,422576128
+index_profile,index_v4_uuid,160022528,397524992,557621248
+index_profile,index_v7_ordered_uuid,160022528,389464064,549560320
+index_profile,index_v7_random_uuid,160063488,411844608,571973632
+metric,relname,pk_bytes,avg_leaf_density,leaf_fragmentation
+pk_profile,index_v4_uuid,39624704,71.77,49.81
+pk_profile,index_v7_ordered_uuid,31563776,90.03,0
+pk_profile,index_v7_random_uuid,39256064,72.43,50.02
 metric,relname,indexrelname,bytes
-index_sizes,index_current_uuid,idx_current_uuid_agent,54231040
-index_sizes,index_current_uuid,idx_current_uuid_bucket,85729280
-index_sizes,index_current_uuid,idx_current_uuid_org_type,80044032
-index_sizes,index_current_uuid,idx_current_uuid_path_trgm,51798016
-index_sizes,index_current_uuid,idx_current_uuid_status,344064
-index_sizes,index_current_uuid,index_current_uuid_bucket_id_storage_path_key,85729280
-index_sizes,index_current_uuid,index_current_uuid_pkey,42139648
-index_sizes,index_reduced_uuid,idx_reduced_uuid_agent,54231040
-index_sizes,index_reduced_uuid,idx_reduced_uuid_org_type,80044032
-index_sizes,index_reduced_uuid,idx_reduced_uuid_status,344064
-index_sizes,index_reduced_uuid,index_reduced_uuid_bucket_id_storage_path_key,85729280
-index_sizes,index_reduced_uuid,index_reduced_uuid_pkey,42139648
+index_sizes,index_v4_uuid,idx_v4_uuid_agent,54231040
+index_sizes,index_v4_uuid,idx_v4_uuid_bucket,85729280
+index_sizes,index_v4_uuid,idx_v4_uuid_org_type,80044032
+index_sizes,index_v4_uuid,idx_v4_uuid_path_trgm,51798016
+index_sizes,index_v4_uuid,idx_v4_uuid_status,344064
+index_sizes,index_v4_uuid,index_v4_uuid_bucket_id_storage_path_key,85729280
+index_sizes,index_v4_uuid,index_v4_uuid_pkey,39624704
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_agent_id_uploaded_at_idx,54231040
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_bucket_id_storage_path_idx,85729280
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_bucket_id_storage_path_key,85729280
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_org_id_file_type_id_uploaded_at_idx,80044032
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_pkey,31563776
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_status_idx,344064
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_storage_path_idx,51798016
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_agent_id_uploaded_at_idx,51920896
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_bucket_id_storage_path_idx,88547328
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_bucket_id_storage_path_key,88547328
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_org_id_file_type_id_uploaded_at_idx,75456512
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_pkey,39256064
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_status_idx,344064
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_storage_path_idx,67747840
+set_config
+1000000
+CHECKPOINT
+DO
+metric,wal_bytes_per_row,full_page_images
+current_7_v4_single_wal,7590.2400000000000000,0
+CHECKPOINT
+DO
+metric,wal_bytes_per_row,full_page_images
+current_7_v7_ordered_single_wal,1657.0400000000000000,0
+CHECKPOINT
+DO
+metric,wal_bytes_per_row,full_page_images
+current_7_v7_random_single_wal,16107.360000000000,0

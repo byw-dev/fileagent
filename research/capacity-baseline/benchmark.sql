@@ -129,15 +129,33 @@ SELECT format('EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_eav WHERE
 UNION ALL SELECT 'EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_eav WHERE id IN (SELECT file_entry_id FROM ft_eav WHERE key=''product'' AND value=''P01'' GROUP BY file_entry_id HAVING count(*)=1) AND NOT EXISTS (SELECT 1 FROM ft_eav t WHERE t.file_entry_id=fe_eav.id AND t.key=''qc'' AND t.value=''Q1'') ORDER BY created_at DESC,id DESC LIMIT 50'
 \gexec
 \echo UNPARTITIONED_TIME_FILTER_QUERY_PLANS
+\echo QUERY_CASE unpartitioned_no_time_index high with_time_range
 EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_arr WHERE created_at >= timestamptz '2025-07-01 00:00:00+00' AND tag_ids @> ARRAY[2001] ORDER BY created_at DESC,id DESC LIMIT 50;
+\echo QUERY_CASE unpartitioned_no_time_index low with_time_range
 EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_arr WHERE created_at >= timestamptz '2025-07-01 00:00:00+00' AND tag_ids @> ARRAY[1001] ORDER BY created_at DESC,id DESC LIMIT 50;
-SELECT format('EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_arr WHERE %s ORDER BY created_at DESC,id DESC LIMIT 50',arr) FROM pred
+\echo QUERY_CASE unpartitioned_no_time_index high without_time_range
+EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_arr WHERE tag_ids @> ARRAY[2001] ORDER BY created_at DESC,id DESC LIMIT 50;
+\echo QUERY_CASE unpartitioned_no_time_index low without_time_range
+EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_arr WHERE tag_ids @> ARRAY[1001] ORDER BY created_at DESC,id DESC LIMIT 50;
+SELECT format('EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_arr WHERE %s ORDER BY created_at DESC,id DESC LIMIT 50',arr) FROM pred WHERE name NOT IN ('high','low')
 \gexec
 SELECT format('EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT count(*) FROM fe_eav WHERE id IN (SELECT file_entry_id FROM ft_eav WHERE %s)',eav_count) FROM pred WHERE name<>'and_not'
 UNION ALL SELECT 'EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT count(*) FROM fe_eav WHERE id IN (SELECT file_entry_id FROM ft_eav WHERE key=''product'' AND value=''P01'' GROUP BY file_entry_id HAVING count(*)=1) AND NOT EXISTS (SELECT 1 FROM ft_eav t WHERE t.file_entry_id=fe_eav.id AND t.key=''qc'' AND t.value=''Q1'')'
 \gexec
 SELECT format('EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT count(*) FROM fe_arr WHERE %s',arr) FROM pred
 \gexec
+
+-- Fair unpartitioned newest-page baseline: ordered scan can stop after 50 matches.
+CREATE INDEX fe_arr_created_id ON fe_arr(created_at DESC,id DESC);
+ANALYZE fe_arr;
+\echo QUERY_CASE unpartitioned_time_index high without_time_range
+EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_arr WHERE tag_ids @> ARRAY[2001] ORDER BY created_at DESC,id DESC LIMIT 50;
+\echo QUERY_CASE unpartitioned_time_index low without_time_range
+EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_arr WHERE tag_ids @> ARRAY[1001] ORDER BY created_at DESC,id DESC LIMIT 50;
+\echo QUERY_CASE unpartitioned_time_index high with_time_range
+EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_arr WHERE created_at >= timestamptz '2025-07-01 00:00:00+00' AND tag_ids @> ARRAY[2001] ORDER BY created_at DESC,id DESC LIMIT 50;
+\echo QUERY_CASE unpartitioned_time_index low with_time_range
+EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_arr WHERE created_at >= timestamptz '2025-07-01 00:00:00+00' AND tag_ids @> ARRAY[1001] ORDER BY created_at DESC,id DESC LIMIT 50;
 
 -- Post-load single-row statements (100 files per model, after an explicit checkpoint).
 CHECKPOINT;
@@ -161,27 +179,55 @@ END LOOP; END $$;
 SELECT 'single_array_wal_per_file' metric,pg_wal_lsn_diff(pg_current_wal_lsn(),:'single_arr_start')/100::numeric wal_bytes_per_file,
        (SELECT wal_fpi-:'single_arr_fpi_start'::bigint FROM pg_stat_wal) AS full_page_images;
 
--- UUID v4 vs v7 index experiment, random insertion order after a checkpoint.
-DROP TABLE IF EXISTS uuid4_idx,uuid7_idx;
+-- UUID v4 vs chronological and random-arrival v7, each after a checkpoint.
+DROP TABLE IF EXISTS uuid4_idx,uuid7_ordered_idx,uuid7_random_idx;
 CREATE TABLE uuid4_idx(id uuid PRIMARY KEY, payload int NOT NULL);
-CREATE TABLE uuid7_idx(id uuid PRIMARY KEY, payload int NOT NULL);
+CREATE TABLE uuid7_ordered_idx(id uuid PRIMARY KEY, payload int NOT NULL);
+CREATE TABLE uuid7_random_idx(id uuid PRIMARY KEY, payload int NOT NULL);
 CHECKPOINT;
 SELECT wal_fpi AS uuid4_fpi_start FROM pg_stat_wal \gset
 SELECT pg_current_wal_lsn() AS uuid4_start \gset
 INSERT INTO uuid4_idx SELECT (substr(h,1,8)||'-'||substr(h,9,4)||'-4'||substr(h,14,3)||'-8'||substr(h,18,3)||'-'||substr(h,21,12))::uuid,g
-FROM (SELECT g,md5('v4:'||g) h FROM generate_series(1,:scale) g) s ORDER BY md5(g::text);
+FROM (SELECT g,md5('v4:'||g) h FROM generate_series(1,:scale) g) s ORDER BY g;
 SELECT 'uuid4_bulk_wal' metric, pg_wal_lsn_diff(pg_current_wal_lsn(),:'uuid4_start')/:scale::numeric wal_bytes_per_row,
        (SELECT wal_fpi-:'uuid4_fpi_start'::bigint FROM pg_stat_wal) AS full_page_images;
 CHECKPOINT;
-SELECT wal_fpi AS uuid7_fpi_start FROM pg_stat_wal \gset
-SELECT pg_current_wal_lsn() AS uuid7_start \gset
-INSERT INTO uuid7_idx SELECT (substr(ts,1,8)||'-'||substr(ts,9,4)||'-7'||substr(md5(g::text),6,3)||'-8'||substr(md5(g::text),10,3)||'-'||substr(md5(g::text),13,12))::uuid,g
-FROM (SELECT g,lpad(to_hex((extract(epoch FROM timestamptz '2023-01-01 00:00:00+00')*1000)::bigint + g/1000),12,'0') ts FROM generate_series(1,:scale) g) s ORDER BY md5(g::text);
-SELECT 'uuid7_bulk_wal' metric, pg_wal_lsn_diff(pg_current_wal_lsn(),:'uuid7_start')/:scale::numeric wal_bytes_per_row,
-       (SELECT wal_fpi-:'uuid7_fpi_start'::bigint FROM pg_stat_wal) AS full_page_images;
-SELECT 'uuid_index_size' metric, c.relname,pg_relation_size(i.indexrelid) bytes FROM pg_class c JOIN pg_index i ON i.indrelid=c.oid WHERE c.relname IN ('uuid4_idx','uuid7_idx');
-SELECT * FROM pgstatindex('uuid4_idx_pkey');
-SELECT * FROM pgstatindex('uuid7_idx_pkey');
+SELECT wal_fpi AS uuid7_ordered_fpi_start FROM pg_stat_wal \gset
+SELECT pg_current_wal_lsn() AS uuid7_ordered_start \gset
+INSERT INTO uuid7_ordered_idx SELECT (substr(ts,1,8)||'-'||substr(ts,9,4)||'-7'||substr(md5(g::text),6,3)||'-8'||substr(md5(g::text),10,3)||'-'||substr(md5(g::text),13,12))::uuid,g
+FROM (SELECT g,lpad(to_hex((extract(epoch FROM timestamptz '2023-01-01 00:00:00+00')*1000)::bigint + g),12,'0') ts FROM generate_series(1,:scale) g) s ORDER BY g;
+SELECT 'uuid7_ordered_bulk_wal' metric, pg_wal_lsn_diff(pg_current_wal_lsn(),:'uuid7_ordered_start')/:scale::numeric wal_bytes_per_row,
+       (SELECT wal_fpi-:'uuid7_ordered_fpi_start'::bigint FROM pg_stat_wal) AS full_page_images;
+CHECKPOINT;
+SELECT wal_fpi AS uuid7_random_fpi_start FROM pg_stat_wal \gset
+SELECT pg_current_wal_lsn() AS uuid7_random_start \gset
+INSERT INTO uuid7_random_idx SELECT (substr(ts,1,8)||'-'||substr(ts,9,4)||'-7'||substr(md5(g::text),6,3)||'-8'||substr(md5(g::text),10,3)||'-'||substr(md5(g::text),13,12))::uuid,g
+FROM (SELECT g,lpad(to_hex((extract(epoch FROM timestamptz '2023-01-01 00:00:00+00')*1000)::bigint + g),12,'0') ts FROM generate_series(1,:scale) g) s ORDER BY md5(g::text);
+SELECT 'uuid7_random_bulk_wal' metric, pg_wal_lsn_diff(pg_current_wal_lsn(),:'uuid7_random_start')/:scale::numeric wal_bytes_per_row,
+       (SELECT wal_fpi-:'uuid7_random_fpi_start'::bigint FROM pg_stat_wal) AS full_page_images;
+SELECT 'uuid_pk_profile' metric,c.relname,pg_relation_size(i.indexrelid) pk_bytes,
+       s.avg_leaf_density,s.leaf_fragmentation
+FROM pg_class c JOIN pg_index i ON i.indrelid=c.oid AND i.indisprimary
+CROSS JOIN LATERAL pgstatindex(i.indexrelid::regclass) s
+WHERE c.relname IN ('uuid4_idx','uuid7_ordered_idx','uuid7_random_idx') ORDER BY c.relname;
+
+-- One statement per row after load; each variant starts immediately after CHECKPOINT.
+SELECT set_config('capacity.scale',:scale::text,false);
+CHECKPOINT;
+SELECT wal_fpi AS uuid4_single_fpi_start FROM pg_stat_wal \gset
+SELECT pg_current_wal_lsn() AS uuid4_single_start \gset
+DO $$ DECLARE i int; h text; n int:=current_setting('capacity.scale')::int; BEGIN FOR i IN 1..100 LOOP h:=md5('v4-single:'||i); INSERT INTO uuid4_idx VALUES ((substr(h,1,8)||'-'||substr(h,9,4)||'-4'||substr(h,14,3)||'-8'||substr(h,18,3)||'-'||substr(h,21,12))::uuid,n+i); END LOOP; END $$;
+SELECT 'uuid4_single_wal' metric,pg_wal_lsn_diff(pg_current_wal_lsn(),:'uuid4_single_start')/100::numeric wal_bytes_per_row,(SELECT wal_fpi-:'uuid4_single_fpi_start'::bigint FROM pg_stat_wal) full_page_images;
+CHECKPOINT;
+SELECT wal_fpi AS uuid7_ordered_single_fpi_start FROM pg_stat_wal \gset
+SELECT pg_current_wal_lsn() AS uuid7_ordered_single_start \gset
+DO $$ DECLARE i int; g bigint; ts text; n bigint:=current_setting('capacity.scale')::bigint; BEGIN FOR i IN 1..100 LOOP g:=n+i; ts:=lpad(to_hex((extract(epoch FROM timestamptz '2023-01-01 00:00:00+00')*1000)::bigint+g),12,'0'); INSERT INTO uuid7_ordered_idx VALUES ((substr(ts,1,8)||'-'||substr(ts,9,4)||'-7'||substr(md5(g::text),6,3)||'-8'||substr(md5(g::text),10,3)||'-'||substr(md5(g::text),13,12))::uuid,g); END LOOP; END $$;
+SELECT 'uuid7_ordered_single_wal' metric,pg_wal_lsn_diff(pg_current_wal_lsn(),:'uuid7_ordered_single_start')/100::numeric wal_bytes_per_row,(SELECT wal_fpi-:'uuid7_ordered_single_fpi_start'::bigint FROM pg_stat_wal) full_page_images;
+CHECKPOINT;
+SELECT wal_fpi AS uuid7_random_single_fpi_start FROM pg_stat_wal \gset
+SELECT pg_current_wal_lsn() AS uuid7_random_single_start \gset
+DO $$ DECLARE i int; g bigint; ts text; n bigint:=current_setting('capacity.scale')::bigint; BEGIN FOR i IN 1..100 LOOP g:=((i::bigint*7919)%n)+100000000; ts:=lpad(to_hex((extract(epoch FROM timestamptz '2023-01-01 00:00:00+00')*1000)::bigint+(g%n)),12,'0'); INSERT INTO uuid7_random_idx VALUES ((substr(ts,1,8)||'-'||substr(ts,9,4)||'-7'||substr(md5(g::text),6,3)||'-8'||substr(md5(g::text),10,3)||'-'||substr(md5(g::text),13,12))::uuid,g); END LOOP; END $$;
+SELECT 'uuid7_random_single_wal' metric,pg_wal_lsn_diff(pg_current_wal_lsn(),:'uuid7_random_single_start')/100::numeric wal_bytes_per_row,(SELECT wal_fpi-:'uuid7_random_single_fpi_start'::bigint FROM pg_stat_wal) full_page_images;
 
 -- Compact int4-key proxy only. Authoritative file_entries-sized UUID index set
 -- comparison is repeated in index-set.sql with production UUID column types.
@@ -219,26 +265,32 @@ DO $$ DECLARE d date; BEGIN FOR i IN 0..35 LOOP d:=date '2023-01-01'+(i||' month
 CREATE INDEX fe_part_tags ON fe_part USING gin(tag_ids gin__int_ops);
 INSERT INTO fe_part SELECT a.id,a.created_at,a.tag_ids FROM fe_arr a WHERE a.created_at < timestamptz '2026-01-01 00:00:00+00';
 ANALYZE fe_part;
+\echo QUERY_CASE partition_parent high without_time_range
 EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_part WHERE tag_ids @> ARRAY[2001] ORDER BY created_at DESC,id DESC LIMIT 50;
+\echo QUERY_CASE partition_parent low without_time_range
 EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_part WHERE tag_ids @> ARRAY[1001] ORDER BY created_at DESC,id DESC LIMIT 50;
+\echo QUERY_CASE partition_parent high with_time_range
 EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_part WHERE created_at >= timestamptz '2025-07-01 00:00:00+00' AND tag_ids @> ARRAY[2001] ORDER BY created_at DESC,id DESC LIMIT 50;
+\echo QUERY_CASE partition_parent low with_time_range
 EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM fe_part WHERE created_at >= timestamptz '2025-07-01 00:00:00+00' AND tag_ids @> ARRAY[1001] ORDER BY created_at DESC,id DESC LIMIT 50;
-DO $$ DECLARE q record; part record; plan jsonb; stmt text; total_rows int; parts int; hits int; reads int; with_range boolean;
+DO $$ DECLARE q record; part record; plan jsonb; stmt text; total_rows int; parts int; hits int; reads int; with_range boolean; shape text; shapes text[];
 BEGIN
  FOR q IN SELECT * FROM (VALUES ('high','tag_ids @> ARRAY[2001]'),('low','tag_ids @> ARRAY[1001]')) x(name,predicate) LOOP
   FOR with_range IN SELECT false UNION ALL SELECT true LOOP
-   total_rows:=0; parts:=0; hits:=0; reads:=0;
+   total_rows:=0; parts:=0; hits:=0; reads:=0; shapes:=ARRAY[]::text[];
    FOR part IN SELECT inhrelid::regclass AS rel FROM pg_inherits WHERE inhparent='fe_part'::regclass ORDER BY inhrelid::regclass::text DESC LOOP
     stmt:=format('EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM %s WHERE %s %s ORDER BY created_at DESC,id DESC LIMIT %s',part.rel,q.predicate,CASE WHEN with_range THEN 'AND created_at >= timestamptz ''2025-07-01 00:00:00+00''' ELSE '' END,50-total_rows);
     EXECUTE stmt INTO plan;
     plan:=plan->0->'Plan';
+    shape:=concat_ws(' > ',plan->>'Node Type',plan#>>'{Plans,0,Node Type}',plan#>>'{Plans,0,Plans,0,Node Type}');
+    IF NOT shape=ANY(shapes) THEN shapes:=array_append(shapes,shape); END IF;
     total_rows:=total_rows+coalesce((plan->>'Actual Rows')::int,0);
     hits:=hits+coalesce((plan->>'Shared Hit Blocks')::int,0);
     reads:=reads+coalesce((plan->>'Shared Read Blocks')::int,0);
     parts:=parts+1;
     EXIT WHEN total_rows>=50;
    END LOOP;
-   RAISE NOTICE 'chunked_scan predicate=% time_range=% partitions=% returned_rows=% shared_hit_blocks=% shared_read_blocks=%',q.name,with_range,parts,total_rows,hits,reads;
+   RAISE NOTICE 'chunked_scan predicate=% time_range=% partitions=% returned_rows=% shared_hit_blocks=% shared_read_blocks=% plan_shapes=%',q.name,with_range,parts,total_rows,hits,reads,array_to_string(shapes,'; ');
   END LOOP;
  END LOOP;
 END $$;
