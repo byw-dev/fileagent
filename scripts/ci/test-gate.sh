@@ -109,7 +109,7 @@ $ALLOWED_SKIP
 EOF
 while IFS= read -r skipped_test; do
 	[ -n "$skipped_test" ] || continue
-	if ! printf '%s\n' "$ALLOWED_SKIP" | grep -Fq "${skipped_test}|"; then
+	if ! printf '%s\n' "$ALLOWED_SKIP" | cut -d'|' -f1 | grep -Fxq "$skipped_test"; then
 		printf 'FAIL undeclared top-level skip: %s\n' "$skipped_test"
 		add_problem "undeclared top-level skip: $skipped_test"
 	fi
