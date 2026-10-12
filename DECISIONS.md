@@ -2476,7 +2476,7 @@ minisign 公钥 `RWTx5Zr1tiHQLwG9keckT0c45M3AGeHD6IvimQHpyRywVWGbP1aVSGav`，
 **决策日期**：2026-10-12
 **影响范围**：本条落地时仅改文档。后续实现会碰到 `deploy/`（compose、初始化脚本）、
 `controlplane/internal/api/handler/events.go`（webhook 入库）、`controlplane/internal/indexer`、
-`controlplane/internal/event`、桶管理 API、`docs/ops/`、`system-design.md` §1.4/§2.1/§6.5
+`controlplane/internal/event`、桶管理 API、`controlplane/migrations/`（`buckets` 增加生命周期状态列，见第四条）、`docs/ops/`、`system-design.md` §1.4/§2.1/§6.5
 **关联**：**D-030** 第一条（被本条取代）、**D-031**（部分修订，见第三条）、**D-036**（降为过渡方案）、
 调研报告 [`docs/reports/storage-layer-eval.md`](docs/reports/storage-layer-eval.md)（PR #124）、
 检索方案草稿 [`docs/reports/tag-search-at-scale.md`](docs/reports/tag-search-at-scale.md)
@@ -2536,12 +2536,13 @@ MinIO 只作过渡，沿用 D-036 的自持镜像；D-036 相应降为过渡方�
   - 因此实现删桶前必须先定：桶内 `status='deleted'` 的行怎么处理（清除，还是把墓碑与桶解绑另存）。
     这与下面 IC-14 的墓碑问题是同一个问题，**今天就已存在**，不是将来才出现。
 - **流程（实现时以此为准）**：
-  1. CP 冻结桶：标记为「删除中」，不再签发该桶的 STS，不再接受指向它的新规则。
+  1. CP 冻结桶：把 `buckets` 的生命周期状态**持久化**为「删除中」（现有 `buckets` 表没有状态列，实现时由迁移新增；只放内存的标记扛不住 CP 重启），不再签发该桶的 STS，不再接受指向它的新规则。
   2. CP 侧判空：该桶已无采集规则（须已删除，不是停用），且没有 `status <> 'deleted'` 的文件行；软删除行按上一条定下的方式处理掉。不满足就解除冻结并告知原因。
   3. 等已签发的 STS 过期（最长 1h；凭据在有效期内仍可写）。
   4. 调存储 `DeleteBucket`，**由存储原子判空**（SeaweedFS 须显式设 `-s3.allowDeleteBucketNotEmpty=false`，**默认是 true，即递归删除**）。
-     非空（冻结期间仍有写入，或账本与存储不一致）就解除冻结、告知原因，并触发对账。
+     **明确被拒绝**（非空：冻结期间仍有写入，或账本与存储不一致）才解除冻结、告知原因，并触发对账；**结果不确定**（超时、连接中断）则保持「删除中」，由重试确认存储侧的真实状态。
   5. 存储删除成功后删 `buckets` 行。这一步若失败（跨系统无法原子），桶保持「删除中」状态并告警，由运维或重试补完；不得回到可用状态。
+  6. CP 启动时扫描处于「删除中」的桶，从中断的那一步续做（先查存储里桶是否还在，再决定重试第 4 步还是直接做第 5 步）。
 - **同名重建**：旧行已删，`buckets.name` 全局唯一不冲突，不需要「代次」；迟到的旧事件按「回读当前状态」原则丢弃。
 - **运维绕过 CP 直接删非空桶 = 事故**：适配器看到桶目录删除而账本还有行时，告警并标记对账缺失，**不要静默跟着删账本**。
   注意 SeaweedFS 的 leveldb3 / postgres2 / mysql2 删桶是整库删除，**不发逐对象删除事件**，只有一条桶目录删除。
