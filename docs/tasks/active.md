@@ -98,6 +98,25 @@ IC 残留项在 **CI 绿灯可信 + 账本重判**之前都不动。
 
 ---
 
+## ▶️ 当前里程碑 B：换存储 + schema 定型 → 可试点（2026-10-12 产品拍板）
+
+> **本节取代下面「下一步」表的第 2、3 条及「D-037 之后」第 5–8 条**——两套顺序不并存，以本节为准。
+
+目标 A 达成后，下一个产品目标是：**在真实环境试点部署之前，完成 SeaweedFS 切换（D-037），并让检索与数据时间的 schema 定型。**
+两件事都有时间窗口：第一批生产数据落地后，换存储与改 schema 都要迁移存量（锁表或双写）。
+
+| # | 事项 | 说明 |
+|---|------|------|
+| **B1** | **QG 瘦身版**（[`quality-gates.md`](quality-gates.md) 顶部「瘦身」注记） | 只做 CP 侧：CI 起 PG，`-tags=integration` 真跑，三层防静默跳过（点名 15 个测试 / 语义标记 / skip 账本），覆盖率只打印不设闸；用户开 `master` 分支保护并登记 `codegen-drift + vet + test`。换存储要重写的入站与索引链路，正是这批测试守着的 |
+| **B2** | **存储事件源调研** | D-037 第五条四项待查，结论回填 D-037 |
+| **B3** | **SeaweedFS spike** | CP 内「存储事件源」接口 + 两个适配器 + 声明式 IAM；验收 = `smoke.sh` 在 SeaweedFS 上十二环全绿。**顺带完成 IC 账本重判**（原第 3 条）：未关缺陷里有一批与 MinIO 绑定（IC-BUG-7 / 40 / 41），换存储后再判可少判一轮 |
+| **B4** | **容量基线（只测不改）** | 与 B2、B3 并行。对照项见 [`tag-search-at-scale.md`](../reports/tag-search-at-scale.md) §6 |
+| **B5** | **检索模型决策** | 基线出数后立决策：检索模型 + 数据时间一等列（agent 在 `UploadResult` 上报，proto 只增字段）+ IC-6 分区 + IC-7 计数契约 + UUIDv7（需修订 CLAUDE.md「统一 UUID v4」） |
+| **B6** | **schema 落地** | 按 B5 实现；系统未发布，可借此执行 backlog「合并迁移文件」（需提前通知重建本地库） |
+| **B7** | **试点就绪清单** | SeaweedFS 部署与运维文档（元数据备份、日志清理、停机顺序、删桶流程），smoke 与 CI 切到 SeaweedFS |
+
+---
+
 ## ⏭️ 下一步：A 达成之后的执行顺序（2026-09-24 拍板）
 
 > **原则**：先让 A **真能用** → 再让 CI 的**绿灯可信** → 再**重判账本** → 才谈下一个里程碑。
@@ -109,22 +128,13 @@ IC 残留项在 **CI 绿灯可信 + 账本重判**之前都不动。
 | # | 事项 | 体量 | 说明 |
 |---|------|------|------|
 | **1** | **采集写放大：防抖改为普适** ✅（PR #118） | 半天 | 见下 |
-| **2** | **让 CI 的绿灯可信**（**QG track**） | ~~一天~~ **跨会话**（2026-09-26 调研后重估） | **追踪：[`quality-gates.md`](quality-gates.md)** —— QG-0…QG-7，含派工 spec、12 条变异矩阵、落地顺序。内容：CP 侧起 PG 真跑 `-tags=integration` + 覆盖率闸（**生成代码不计入**）+ 收 `pkg/trollsift`；webui 补 vitest 门 + **Node 版本单一真相源**；收尾开 `master` 分支保护。仍照抄 `ci-agent.yml` 里 inotify overflow 那段的 **grep 防静默跳过**写法。<br>⚠️ **调研推翻了本条原先的两处设想**：① PG **用 compose 起而非 `services:`**（`services:` 会在 workflow 里造第二份 PG 配置，且不吃 `docker/login-action` 凭据、将来接 MinIO 更贵）；② **`master` 目前无任何分支保护**（`protection` 404、`rulesets` 空）——闸门不是 required check 就只是建议，故 QG-7 把它纳入收尾。已有账：[`backlog.md`](backlog.md)「**CI 与门槛的执行力缺口**」一节 |
-| **3** | **IC 账本按 A 的标尺重判** | 半天，纯判断 | 恢复 IC 之前必须做：18 条未关缺陷的定级多在 IC-2a 之前给出，世界观已变（IC-BUG-7 是实证） |
+| **2** | ⚠️ **2026-10-12 已被里程碑 B 的 B1（瘦身版）取代**。**让 CI 的绿灯可信**（**QG track**） | ~~一天~~ **跨会话**（2026-09-26 调研后重估） | **追踪：[`quality-gates.md`](quality-gates.md)** —— QG-0…QG-7，含派工 spec、12 条变异矩阵、落地顺序。内容：CP 侧起 PG 真跑 `-tags=integration` + 覆盖率闸（**生成代码不计入**）+ 收 `pkg/trollsift`；webui 补 vitest 门 + **Node 版本单一真相源**；收尾开 `master` 分支保护。仍照抄 `ci-agent.yml` 里 inotify overflow 那段的 **grep 防静默跳过**写法。<br>⚠️ **调研推翻了本条原先的两处设想**：① PG **用 compose 起而非 `services:`**（`services:` 会在 workflow 里造第二份 PG 配置，且不吃 `docker/login-action` 凭据、将来接 MinIO 更贵）；② **`master` 目前无任何分支保护**（`protection` 404、`rulesets` 空）——闸门不是 required check 就只是建议，故 QG-7 把它纳入收尾。已有账：[`backlog.md`](backlog.md)「**CI 与门槛的执行力缺口**」一节 |
+| **3** | ⚠️ **2026-10-12 并入里程碑 B 的 B3**。**IC 账本按 A 的标尺重判** | 半天，纯判断 | 恢复 IC 之前必须做：18 条未关缺陷的定级多在 IC-2a 之前给出，世界观已变（IC-BUG-7 是实证） |
 | **4** | **存储层替代调研** ✅ **调研完成；2026-10-12 已拍板 → [`DECISIONS.md`](../../DECISIONS.md) D-037（换 SeaweedFS CE）**，后续见下「D-037 之后」 | 一天 | **报告：[`docs/reports/storage-layer-eval.md`](../reports/storage-layer-eval.md)**（矩阵 + 建议），测试工具与原始结果：[`research/storage-layer-eval/`](../../research/storage-layer-eval/)。实测 MinIO（对照组）/ SeaweedFS CE / JuiceFS，三家都过了 STS `AssumeRole` + session policy 这道筛子。**离开 MinIO 的首要理由是断供 + AGPL；列举成本是选 SeaweedFS 的重要加分项**（不在用户读路径上，决定对账与灾难恢复的代价）：冷缓存下每千对象读盘次数 MinIO 1057、SeaweedFS 6.2、JuiceFS 27.9；以 minio-inventory 生产实测为标定做模型外推，1 亿对象全扫分别约 13.5 天、1.9 小时、8.6 小时。**建议**：SeaweedFS CE 作为替换目标（五个前置条件，§4），JuiceFS 不推荐，MinIO 只作过渡（沿用 D-036 自持镜像；同架构的 RustFS、`pgsty/silo` 已排除）。设计原则：**不做通用存储抽象，只加一个「存储事件源」接口**。**Python 生态**（xarray / pandas / pyarrow / DuckDB，前缀受限 STS + `credential_process`）两家均 31/31，ETL 不绕过 CP 可行，但需改写 D-030 第八条为前缀级 policy。下一步若拍板，先做 spike：订阅适配器原型 + `smoke.sh` 在 SeaweedFS 上十二环全绿 |
 
 ### D-037 之后（2026-10-12 立）
 
-D-037 拍板换 SeaweedFS CE 后新增的事项。**与上表第 2、3 条的先后尚未拍板**；建议 QG（第 2 条）先做——
-换存储要大改 CP 入站链路，而现在有 11 个集成测试文件从没在 CI 跑过。第 3 条账本重判建议与换存储合做：
-未关缺陷里有一批与 MinIO 绑定（IC-BUG-7 / 40 / 41），先定下换存储再判，可少判一轮。
-
-| # | 事项 | 说明 |
-|---|------|------|
-| **5** | **存储事件源调研** | D-037 第五条的四项待查（在途水位、负载下乱序上界、崩溃窗口与游标越界自检、事件翻译）。结论回填 D-037。在 6 之前 |
-| **6** | **SeaweedFS spike** | CP 内「存储事件源」接口 + filer 订阅适配器 + 声明式 IAM 初始化；验收 = `smoke.sh` 在 SeaweedFS 上十二环全绿 |
-| **7** | **容量基线（只测不改）** | 可随时并行。对照项见 [`tag-search-at-scale.md`](../reports/tag-search-at-scale.md) §6：EAV 对比 `int4[]` + GIN、单 / 多标签 × 高 / 低选择性、分区分块扫描对比全表、UUIDv4 对比 v7、有 / 无 trgm 与重复索引；只测与硬件无关的量 |
-| **8** | **检索模型决策**（发布前置门槛） | 基线出数后合并为一条决策：检索模型 + 数据时间一等列（agent 在 `UploadResult` 上报，proto 只增字段）+ IC-6 分区 + IC-7 计数契约 + UUIDv7（需修订 CLAUDE.md「统一 UUID v4」）。**不急，但必须在第一批生产数据落地前完成**：之后每一步 schema 变更都要锁表或双写迁移 |
+⚠️ 本节原列的第 5–8 条（事件源调研 / spike / 容量基线 / 检索模型决策）已整理进上方「**当前里程碑 B**」（B2–B5），以那里为准。
 
 ### 第 1 条的具体拍板
 

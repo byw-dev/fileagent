@@ -3,6 +3,17 @@
 > **这是 `docs/tasks/active.md`「下一步」第 2 条的完整追踪文件**（该条原文只有一行摘要）。
 > 规划于 2026-09-26，**跨会话执行**：苦力活派 worker，判断与验证归协调者。
 
+## ✂️ 2026-10-12 按里程碑 B 瘦身（先读这一节）
+
+产品定下里程碑 B（换存储 + schema 定型 → 可试点，见 [`active.md`](active.md)）后，本 track 只做直接守护换存储的那一块，即 **B1**：
+- **做**：QG-2（`sts` 门控）+ QG-3 去掉覆盖率闸的部分（`test-gate.sh` + conf + Makefile，三层防静默跳过）+ QG-4（`ci-cp.yml` 起 PG + `.gitignore`）；
+  另修一个开测才发现的腐烂测试（`TestBatchTagQueries_Integration`：迁移 000006 去掉 `observed_at`/`source` 默认值后它就一直红着，因为 CI 从没跑过它）。
+  覆盖率**只打印**，不设门槛。QG-7 缩小为只登记 `codegen-drift + vet + test`。
+- **不做（进 backlog「QG 瘦身后剩余单元」）**：QG-1（排除生成代码的覆盖率与棘轮）、QG-5 / QG-5b / QG-6（webui vitest 门、Node 钉法、workflow 守卫、Corepack 表述）。
+- 开测前已核实：`go vet -tags=integration ./...` **能编译通过**（下文「未验证的推断」已验证）；带 tag + PG 的含生成代码覆盖率为 **81.2%**。
+
+下文保留为完整设计，恢复剩余单元时照用。
+
 ## 🚚 开工摘要（新会话从这里读）
 
 **当前状态**：规划完毕，**QG-1…QG-7 全部未开工**，零代码改动。
