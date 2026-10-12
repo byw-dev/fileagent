@@ -1,0 +1,43 @@
+Output format is csv.
+section,version,shared_buffers,work_mem,maintenance_work_mem,effective_cache_size,full_page_writes,wal_compression,checkpoint_timeout,max_wal_size
+environment,"PostgreSQL 15.19 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",128MB,4MB,64MB,4GB,on,off,5min,1GB
+CREATE EXTENSION
+psql:<stdin>:16: NOTICE:  table "index_current_uuid" does not exist, skipping
+psql:<stdin>:16: NOTICE:  table "index_reduced_uuid" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE TABLE
+ALTER TABLE
+ALTER TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CHECKPOINT
+INSERT 0 1000000
+metric,wal_bytes_per_row,full_page_images
+current_7_indexes,2046.2992800000000000,89994
+CHECKPOINT
+INSERT 0 1000000
+metric,wal_bytes_per_row,full_page_images
+reduced_5_indexes,810.7282400000000000,27482
+metric,relname,heap_bytes,indexes_bytes,total_bytes
+index_profile,index_current_uuid,160022528,400039936,560128000
+index_profile,index_reduced_uuid,160022528,262488064,422576128
+metric,relname,indexrelname,bytes
+index_sizes,index_current_uuid,idx_current_uuid_agent,54231040
+index_sizes,index_current_uuid,idx_current_uuid_bucket,85729280
+index_sizes,index_current_uuid,idx_current_uuid_org_type,80044032
+index_sizes,index_current_uuid,idx_current_uuid_path_trgm,51798016
+index_sizes,index_current_uuid,idx_current_uuid_status,344064
+index_sizes,index_current_uuid,index_current_uuid_bucket_id_storage_path_key,85729280
+index_sizes,index_current_uuid,index_current_uuid_pkey,42139648
+index_sizes,index_reduced_uuid,idx_reduced_uuid_agent,54231040
+index_sizes,index_reduced_uuid,idx_reduced_uuid_org_type,80044032
+index_sizes,index_reduced_uuid,idx_reduced_uuid_status,344064
+index_sizes,index_reduced_uuid,index_reduced_uuid_bucket_id_storage_path_key,85729280
+index_sizes,index_reduced_uuid,index_reduced_uuid_pkey,42139648
