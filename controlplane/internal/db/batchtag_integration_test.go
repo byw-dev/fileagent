@@ -24,16 +24,29 @@ func TestBatchTagQueries_Integration(t *testing.T) {
 	ctx := context.Background()
 	raw, err := sql.Open("postgres", testDSN(t))
 	require.NoError(t, err)
-	defer raw.Close()
+	t.Cleanup(func() { _ = raw.Close() })
 	require.NoError(t, raw.Ping())
 
 	q := New(raw)
 	org := uuid.New()
 	_, err = raw.ExecContext(ctx, `INSERT INTO organizations (id, name) VALUES ($1, $2)`, org, "batch-it-"+org.String()[:8])
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		for _, statement := range []string{
+			`DELETE FROM tag_audit WHERE org_id=$1`,
+			`DELETE FROM file_entries WHERE org_id=$1`,
+			`DELETE FROM tag_keys WHERE org_id=$1`,
+			`DELETE FROM buckets WHERE org_id=$1`,
+			`DELETE FROM organizations WHERE id=$1`,
+		} {
+			if _, cleanupErr := raw.ExecContext(context.Background(), statement, org); cleanupErr != nil {
+				t.Errorf("cleanup batch tag integration data: %v", cleanupErr)
+			}
+		}
+	})
 	var bucket uuid.UUID
 	require.NoError(t, raw.QueryRowContext(ctx,
-		`INSERT INTO buckets (org_id, name) VALUES ($1, 'b') RETURNING id`, org).Scan(&bucket))
+		`INSERT INTO buckets (org_id, name) VALUES ($1, $2) RETURNING id`, org, "batch-it-"+org.String()).Scan(&bucket))
 
 	var siteKey uuid.UUID
 	require.NoError(t, raw.QueryRowContext(ctx,
@@ -43,8 +56,8 @@ func TestBatchTagQueries_Integration(t *testing.T) {
 	mkFile := func(path, site string) uuid.UUID {
 		var id uuid.UUID
 		require.NoError(t, raw.QueryRowContext(ctx,
-			`INSERT INTO file_entries (org_id, bucket_id, storage_path, file_name, status)
-			 VALUES ($1,$2,$3,$4,'completed') RETURNING id`, org, bucket, path, path).Scan(&id))
+			`INSERT INTO file_entries (org_id, bucket_id, storage_path, file_name, status, observed_at, source)
+			 VALUES ($1,$2,$3,$4,'completed',NOW(),'agent') RETURNING id`, org, bucket, path, path).Scan(&id))
 		_, err := raw.ExecContext(ctx,
 			`INSERT INTO file_tags (file_entry_id, key, value, source) VALUES ($1,'site',$2,'path_var')`, id, site)
 		require.NoError(t, err)
@@ -112,15 +125,4 @@ func TestBatchTagQueries_Integration(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), n)
 
-	// Cleanup (cascades to file_tags/tag_values; tag_audit file_entry_id → SET NULL).
-	_, err = raw.ExecContext(ctx, `DELETE FROM tag_audit WHERE org_id=$1`, org)
-	require.NoError(t, err)
-	_, err = raw.ExecContext(ctx, `DELETE FROM file_entries WHERE org_id=$1`, org)
-	require.NoError(t, err)
-	_, err = raw.ExecContext(ctx, `DELETE FROM tag_keys WHERE org_id=$1`, org)
-	require.NoError(t, err)
-	_, err = raw.ExecContext(ctx, `DELETE FROM buckets WHERE org_id=$1`, org)
-	require.NoError(t, err)
-	_, err = raw.ExecContext(ctx, `DELETE FROM organizations WHERE id=$1`, org)
-	require.NoError(t, err)
 }

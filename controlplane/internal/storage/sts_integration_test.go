@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,14 @@ const (
 	itMinIOPassword = "minioadmin"
 	itRoleARN       = "arn:aws:iam:::role/test"
 )
+
+// requireLiveMinIO skips STS integration tests unless live object storage is explicitly enabled.
+func requireLiveMinIO(t *testing.T) {
+	t.Helper()
+	if os.Getenv("STS_LIVE") != "1" {
+		t.Skip("live MinIO STS test disabled; set STS_LIVE=1 when a D-036 test object store with STS is available")
+	}
+}
 
 // newRootClient creates a MinIO client with the test-environment root credentials.
 func newRootClient(t *testing.T) *miniogo.Client {
@@ -55,6 +64,7 @@ func uniqueBucket(t *testing.T, root *miniogo.Client, prefix string) string {
 // TestIssueCredentials_Integration verifies that STSManager.IssueCredentials
 // returns usable temporary credentials that can actually write to MinIO.
 func TestIssueCredentials_Integration(t *testing.T) {
+	requireLiveMinIO(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -123,6 +133,7 @@ func TestIssueCredentials_Integration(t *testing.T) {
 // TestIssueCredentials_ScopingDeniesOtherBuckets verifies that STS credentials
 // scoped to one bucket cannot write to a different bucket.
 func TestIssueCredentials_ScopingDeniesOtherBuckets(t *testing.T) {
+	requireLiveMinIO(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 

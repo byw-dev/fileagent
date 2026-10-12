@@ -28,7 +28,7 @@ WEBUI_EMBED_DIR := controlplane/internal/webui/dist
 PROTO_TOOLS_DIR := .tmp-proto-tools
 PROTO_OUT_DIR := .tmp-proto-gen
 
-.PHONY: build build-controlplane build-agent build-agent-windows bundle build-webui build-controlplane-bundle generate generate-sqlc generate-proto test tidy clean
+.PHONY: build build-controlplane build-agent build-agent-windows bundle build-webui build-controlplane-bundle generate generate-sqlc generate-proto test test-gate-controlplane tidy clean
 
 ## build: 构建全部二进制（纯 Go，不含前端）
 build: build-controlplane build-agent
@@ -74,6 +74,10 @@ build-controlplane-bundle: build-webui
 
 ## generate: 重新生成所有代码生成产物（工具版本由 tools/ 子模块钉定）
 generate: generate-sqlc generate-proto
+
+## test-gate-controlplane: run Control Plane PostgreSQL integration gate
+test-gate-controlplane:
+	export TMPDIR="$(CURDIR)/bin" && bash scripts/ci/test-gate.sh controlplane
 
 ## generate-sqlc: 用 tools/ 钉定的 sqlc 重新生成 controlplane DB 代码
 #  GOWORK=off 让 tools/ 独立解析（不并入 go.work），保持依赖隔离。
