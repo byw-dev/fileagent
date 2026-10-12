@@ -1,0 +1,16 @@
+# B2 event-source experiments: SeaweedFS 4.48 single node (master+volume+filer+S3 in one process),
+# filer metadata store leveldb3 (the per-bucket store assumed by D-037 for whole-bucket deletion).
+name: b2-sw
+services:
+  seaweed:
+    image: chrislusf/seaweedfs@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    command: >
+      server -dir=/data -ip.bind=0.0.0.0 -volume.max=0 -master.volumeSizeLimitMB=1024
+      -s3 -s3.port=8333 -s3.config=/etc/sw/s3.json -s3.allowDeleteBucketNotEmpty=false
+    ports: ["19400:8333", "19488:18888"]
+    stop_grace_period: 60s
+    volumes:
+      - data:/data
+      - ./s3.json:/etc/sw/s3.json:ro
+      - ./filer.toml:/etc/seaweedfs/filer.toml:ro
+volumes: {data: {}}
