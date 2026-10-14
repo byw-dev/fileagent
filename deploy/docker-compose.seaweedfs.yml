@@ -1,0 +1,162 @@
+# SeaweedFS topology (D-037 replacement backend) — separate master / volume /
+# filer(+embedded S3) services.
+#
+# Usage (standalone or alongside docker-compose.dev.yml under the same
+# COMPOSE_PROJECT_NAME — the default network is shared):
+#   bash deploy/scripts/render-seaweedfs-configs.sh   # MUST run first (see below)
+#   docker compose -f deploy/docker-compose.seaweedfs.yml up -d --wait
+#
+# ⚠️ The filer mounts the RENDERED files deploy/config/seaweedfs/{s3,iam}.json
+#    (gitignored, produced by render-seaweedfs-configs.sh from the templates in
+#    deploy/seaweedfs/). If they do not exist yet, Docker silently creates
+#    empty DIRECTORIES at those paths and weed fails with a confusing error —
+#    always render before `up`.
+#
+# Port/host conventions:
+#   - Every host port is an FA_* variable so parallel environments (smoke runs,
+#     other workers) can isolate; defaults live in the 3xxxx band to stay clear
+#     of the dev compose (5432/6379/9000/4222) and smoke defaults (1xxxx).
+#   - The filer gRPC port (18888 in-container) is published because B3-PR3b's
+#     storage-event-source adapter (filer metadata subscription) runs INSIDE the
+#     Control Plane on the host. Plaintext is accepted for dev only: filer gRPC
+#     has no token auth, only mTLS (D-037 "已知约束") — production must put this
+#     behind an mTLS sidecar/DMZ and NOT publish it verbatim.
+services:
+  seaweed-master:
+    # chrislusf/seaweedfs digest-pinned to 4.48 (live-verified via
+    # `weed version` => "4.48 530be3e37"). Tag would drift; digest cannot.
+    image: chrislusf/seaweedfs@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    container_name: ${FA_CONTAINER_PREFIX:-fileagent-dev}-seaweed-master
+    # -telemetry=false is REQUIRED: it defaults to true and would report
+    # anonymous cluster statistics to telemetry.seaweedfs.com (D-037).
+    # -peers=none: single-master dev topology — skips Raft quorum wait so a
+    # lone master becomes leader immediately instead of waiting to time out.
+    # -mdir is the master's metadata dir (default /tmp — must hit the volume).
+    command: >
+      master -mdir=/data -ip.bind=0.0.0.0 -port=9333
+      -peers=none
+      -telemetry=false
+      -volumeSizeLimitMB=1024
+    environment:
+      # Volume/master admin JWT. Dev default only — override for anything
+      # shared; SeaweedFS reads WEED_-prefixed env vars over flags.
+      WEED_JWT_SIGNING_KEY: ${FA_SEAWEEDFS_JWT_SIGNING_KEY:-fileagent-dev-jwt-not-for-production}
+    ports:
+      # Master HTTP admin API (status page, `weed shell` fallback). Not required
+      # by FileAgent itself; handy for collection.* / volume.fsck ops (D-037).
+      - "${FA_SEAWEEDFS_MASTER_PORT:-39333}:9333"
+    volumes:
+      - seaweed_master_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9333/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+  seaweed-volume:
+    image: chrislusf/seaweedfs@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    container_name: ${FA_CONTAINER_PREFIX:-fileagent-dev}-seaweed-volume
+    # -ip MUST be the compose service name: volume servers advertise this
+    # address to the master and filers/volumes dial each other with it; a
+    # container-internal auto-detected IP also works but is not stable across
+    # recreation. -max=0 (default 8) lets the volume count follow free disk
+    # space divided by the master's volumeSizeLimitMB.
+    command: >
+      volume -dir=/data -ip.bind=0.0.0.0 -ip=seaweed-volume -port=8080
+      -max=0
+      -master=seaweed-master:9333
+    environment:
+      WEED_JWT_SIGNING_KEY: ${FA_SEAWEEDFS_JWT_SIGNING_KEY:-fileagent-dev-jwt-not-for-production}
+    volumes:
+      - seaweed_volume_data:/data
+    depends_on:
+      seaweed-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+  seaweed-filer:
+    image: chrislusf/seaweedfs@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    container_name: ${FA_CONTAINER_PREFIX:-fileagent-dev}-seaweed-filer
+    # -ip MUST be the compose service name: the embedded S3 gateway dials the
+    # filer back at "<-ip>:<port+10000>" (gRPC). With 18888 unpublished, a host
+    # IP here would make the S3 gate dial itself on an unreachable address
+    # (live-verified, D-037 "部署实测补充").
+    # -s3.allowDeleteBucketNotEmpty=false is REQUIRED (default true = recursive
+    # delete): D-037 §四 mandates the store atomically refuse to delete
+    # non-empty buckets.
+    # -s3.autoCreateBucket=false keeps bucket lifecycle explicit (init script /
+    # CP API only) instead of silently materialising buckets on admin uploads.
+    command: >
+      filer -ip.bind=0.0.0.0 -ip=seaweed-filer -port=8888
+      -master=seaweed-master:9333
+      -s3 -s3.port=8333
+      -s3.config=/etc/seaweedfs/s3.json
+      -s3.iam.config=/etc/seaweedfs/iam.json
+      -s3.iam.readOnly=false
+      -s3.allowDeleteBucketNotEmpty=false
+      -s3.autoCreateBucket=false
+    environment:
+      WEED_JWT_SIGNING_KEY: ${FA_SEAWEEDFS_JWT_SIGNING_KEY:-fileagent-dev-jwt-not-for-production}
+      # Filer HTTP-write JWT; the STS signing key itself lives in iam.json
+      # (rendered). Without a filer signing key the S3 STS service fails to
+      # start when iam.json lacks sts.signingKey (D-037).
+      WEED_JWT_FILER_SIGNING_KEY: ${FA_SEAWEEDFS_FILER_JWT_SIGNING_KEY:-fileagent-dev-filer-jwt-not-for-production}
+    ports:
+      # S3 API — this is the endpoint agents upload to and CP presigns for
+      # (MINIO_ENDPOINT / MINIO_PUBLIC_ENDPOINT in seaweedfs mode).
+      - "${FA_SEAWEEDFS_S3_PORT:-38333}:8333"
+      # Filer HTTP (browse/admin). Optional but useful for debugging.
+      - "${FA_SEAWEEDFS_FILER_HTTP_PORT:-38888}:8888"
+      # Filer gRPC — B3-PR3b metadata-subscription adapter (CP process on the
+      # host) connects here. Dev-only plaintext: no token auth exists for filer
+      # gRPC, only mTLS (D-037 "已知约束").
+      - "${FA_SEAWEEDFS_FILER_GRPC_PORT:-38889}:18888"
+    volumes:
+      - seaweed_filer_data:/data
+      # Metadata backend: mounted OVER the image's /etc/seaweedfs/filer.toml
+      # (leveldb2) — -defaultStoreDir does not switch backends (D-037).
+      - ./seaweedfs/filer.toml:/etc/seaweedfs/filer.toml:ro
+      # Rendered by deploy/scripts/render-seaweedfs-configs.sh (never commit).
+      - ./config/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+      - ./config/seaweedfs/iam.json:/etc/seaweedfs/iam.json:ro
+    depends_on:
+      seaweed-master:
+        condition: service_healthy
+      seaweed-volume:
+        condition: service_healthy
+    healthcheck:
+      # Two clauses (rework P2-4):
+      #  1. filer HTTP liveness (/healthz).
+      #  2. STS readiness probe: an UNSIGNED POST / with Action=AssumeRole
+      #     returns 400 while the STS service is loaded, but 405 Method Not
+      #     Allowed when the S3 gate started WITHOUT IAM/STS (e.g. a too-short
+      #     or non-base64 SW_STS_SIGNING_KEY — the filer stays HTTP-alive and
+      #     /healthz stays green in that state, live-verified on 4.48).
+      #     Fail ONLY on the definitive 405 so future variations of the
+      #     unsigned-request response never produce a false red. This is a
+      #     cheap tripwire, not a functional check: the authoritative STS
+      #     validation remains init-seaweedfs.sh's signed AssumeRole
+      #     self-check. busybox wget prints response headers with -S, which
+      #     is how the status code is inspected.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8888/healthz && ! wget -S --post-data 'Action=AssumeRole&Version=2011-06-15' -O /dev/null http://localhost:8333/ 2>&1 | grep -q ' 405 '"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+volumes:
+  seaweed_master_data:
+  seaweed_volume_data:
+  seaweed_filer_data:

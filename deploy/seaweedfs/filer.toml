@@ -1,0 +1,20 @@
+# SeaweedFS filer store configuration (mounted over the image's built-in
+# /etc/seaweedfs/filer.toml).
+#
+# Why a mounted override: the stock image ships filer.toml with leveldb2
+# enabled, and the `-defaultStoreDir` flag does NOT change the active store
+# (live-verified, DECISIONS.md D-037 "部署实测补充"). Switching the metadata
+# backend therefore requires replacing this file.
+#
+# leveldb3 (not leveldb2) per D-037: each bucket gets its own meta store, so
+# deleting a bucket drops exactly that bucket's DB instead of scanning a
+# shared one. This is what makes `-s3.allowDeleteBucketNotEmpty=false` +
+# empty-check-before-delete cheap.
+#
+# ⚠️ Do NOT switch this backend on an existing deployment that already has
+# data: the new store starts empty and old objects "disappear" from S3
+# (already reproduced once; migration goes via `fs.meta.save`/`fs.meta.load`,
+# see D-037).
+[leveldb3]
+enabled = true
+dir = "/data/filerldb3"

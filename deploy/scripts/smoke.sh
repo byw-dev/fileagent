@@ -7,6 +7,11 @@
 #
 # 用法：
 #   bash deploy/scripts/smoke.sh              # 本地：自建二进制，隔离环境，结束即清理
+#   FA_STORAGE=seaweedfs bash deploy/scripts/smoke.sh
+#                                            # 同上，但对象存储用 SeaweedFS 拓扑
+#                                              （deploy/docker-compose.seaweedfs.yml +
+#                                              init-seaweedfs.sh；webhook 环为 PENDING，
+#                                              见下方「webhook 投递」一节）
 #   FA_BIN_DIR=bin bash deploy/scripts/smoke.sh   # CI：用上游 job 构建好的二进制
 #   KEEP=1 bash deploy/scripts/smoke.sh        # 失败排查：保留环境不清理
 #
@@ -28,10 +33,26 @@ export FA_MINIO_CONSOLE_PORT="${FA_MINIO_CONSOLE_PORT:-19001}"
 export FA_NATS_PORT="${FA_NATS_PORT:-14222}"
 export FA_NATS_MONITOR_PORT="${FA_NATS_MONITOR_PORT:-18222}"
 
+# 后端选择：minio（默认，行为与历史版本完全一致）或 seaweedfs（D-037 目标
+# 后端）。seaweedfs 分支下 MinIO 不启动，对象存储由 SeaweedFS 拓扑提供
+#（deploy/docker-compose.seaweedfs.yml），初始化走 init-seaweedfs.sh。
+FA_STORAGE="${FA_STORAGE:-minio}"
+case "$FA_STORAGE" in
+  minio|seaweedfs) ;;
+  *) echo "✗ FA_STORAGE 必须是 minio 或 seaweedfs，得到：$FA_STORAGE" >&2; exit 1 ;;
+esac
+
+# SeaweedFS 拓扑的宿主端口（默认放 3xxxx 段，避开 dev 与本脚本的 1xxxx 段）。
+export FA_SEAWEEDFS_MASTER_PORT="${FA_SEAWEEDFS_MASTER_PORT:-39333}"
+export FA_SEAWEEDFS_S3_PORT="${FA_SEAWEEDFS_S3_PORT:-38333}"
+export FA_SEAWEEDFS_FILER_HTTP_PORT="${FA_SEAWEEDFS_FILER_HTTP_PORT:-38888}"
+export FA_SEAWEEDFS_FILER_GRPC_PORT="${FA_SEAWEEDFS_FILER_GRPC_PORT:-38889}"
+
 CP_HTTP_PORT="${CP_HTTP_PORT:-18080}"
 CP_GRPC_PORT="${CP_GRPC_PORT:-19090}"
 
 COMPOSE="docker compose -f deploy/docker-compose.dev.yml"
+SW_COMPOSE="docker compose -f deploy/docker-compose.seaweedfs.yml"
 BIN_DIR="${FA_BIN_DIR:-}"
 WORK="${FA_WORK_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/fileagent-smoke.XXXXXX")}"
 mkdir -p "$WORK"
@@ -66,6 +87,9 @@ cleanup() {
     echo ""
     echo "KEEP=1 — 保留环境供排查：项目 ${COMPOSE_PROJECT_NAME}，工作目录 ${WORK}"
     echo "  清理容器：docker compose -p ${COMPOSE_PROJECT_NAME} -f deploy/docker-compose.dev.yml down -v"
+    if [ "$FA_STORAGE" = "seaweedfs" ]; then
+      echo "  清理 SeaweedFS：docker compose -p ${COMPOSE_PROJECT_NAME} -f deploy/docker-compose.seaweedfs.yml down -v"
+    fi
     # CP / agent 是宿主进程，KEEP=1 不杀它们；本地忘了收会占住端口，
     # 下一次运行只会表现为「CP /healthz 就绪 超时」，很难联想到是上一次的残留。
     echo "  清理进程：kill ${CP_PID} ${AGENT_PID}   # controlplane / agent"
@@ -75,7 +99,12 @@ cleanup() {
   echo "── 清理 ──"
   [ -n "$CP_PID" ] && kill "$CP_PID" 2>/dev/null || true
   [ -n "$AGENT_PID" ] && kill "$AGENT_PID" 2>/dev/null || true
-  # -v 连卷一起删：下次必须是全新环境，否则「首次运行路径」就没被验过
+  # -v 连卷一起删：下次必须是全新环境，否则「首次运行路径」就没被验过。
+  # SeaweedFS 先停（filer→volume→master 的优雅停机由 compose 反向依赖保证），
+  # 否则它还挂在共享网络上，基础 compose 的网络删除会被拖住。
+  if [ "$FA_STORAGE" = "seaweedfs" ]; then
+    $SW_COMPOSE down -v --remove-orphans >/dev/null 2>&1 || true
+  fi
   $COMPOSE down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$WORK"
   return $rc
@@ -118,10 +147,21 @@ probe_is_indexed() { psql_q "select 1 from file_entries where storage_path='prob
 # ── 前置检查：端口冲突要立刻说清楚 ─────────────────────────────────────────
 # 否则症状是 60 秒后的「CP /healthz 就绪 超时」，看不出是端口被占
 # （最常见来源：上一次 KEEP=1 运行遗留的 CP 进程）。
+# 存储端口按后端选择：minio 查 FA_MINIO_PORT，seaweedfs 查四个拓扑端口。
+if [ "$FA_STORAGE" = "seaweedfs" ]; then
+  STORAGE_PORT_SPECS=(
+    "${FA_SEAWEEDFS_S3_PORT}:SeaweedFS S3"
+    "${FA_SEAWEEDFS_FILER_HTTP_PORT}:SeaweedFS filer HTTP"
+    "${FA_SEAWEEDFS_FILER_GRPC_PORT}:SeaweedFS filer gRPC"
+    "${FA_SEAWEEDFS_MASTER_PORT}:SeaweedFS master"
+  )
+else
+  STORAGE_PORT_SPECS=("${FA_MINIO_PORT}:MinIO")
+fi
 if command -v lsof >/dev/null 2>&1; then
 for port_spec in "${CP_HTTP_PORT}:Control Plane HTTP" "${CP_GRPC_PORT}:Control Plane gRPC" \
                  "${FA_POSTGRES_PORT}:PostgreSQL" "${FA_REDIS_PORT}:Redis" \
-                 "${FA_MINIO_PORT}:MinIO" "${FA_NATS_PORT}:NATS"; do
+                 "${STORAGE_PORT_SPECS[@]}" "${FA_NATS_PORT}:NATS"; do
   port="${port_spec%%:*}"; what="${port_spec#*:}"
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "  ✗ 端口 ${port}（${what}）已被占用：" >&2
@@ -133,8 +173,18 @@ fi  # 无 lsof 则跳过（不是所有环境都装了；CI 上端口本来就�
 
 # ── ① 基础设施 ─────────────────────────────────────────────────────────────
 step "① 拉起基础设施（独立项目 ${COMPOSE_PROJECT_NAME}）"
-$COMPOSE up -d --wait
-ok "PostgreSQL / Redis / MinIO / NATS 全部 healthy"
+if [ "$FA_STORAGE" = "seaweedfs" ]; then
+  # MinIO 不启动（过渡期两套后端并存，但一次冒烟只验一套）。
+  $COMPOSE up -d --wait postgres redis nats
+  # 先渲染 s3/iam 配置再起拓扑：docker 对不存在的 bind mount 会静默建出空目录。
+  bash deploy/scripts/render-seaweedfs-configs.sh > "$WORK/render-seaweedfs.log" 2>&1 \
+    || { cat "$WORK/render-seaweedfs.log" >&2; fail "render-seaweedfs-configs.sh 失败"; }
+  $SW_COMPOSE up -d --wait
+  ok "PostgreSQL / Redis / NATS + SeaweedFS（master/volume/filer+S3）全部 healthy"
+else
+  $COMPOSE up -d --wait
+  ok "PostgreSQL / Redis / MinIO / NATS 全部 healthy"
+fi
 
 # ── 二进制 ─────────────────────────────────────────────────────────────────
 step "构建/获取二进制"
@@ -150,14 +200,31 @@ fi
 
 # ── ① CP 启动 ──────────────────────────────────────────────────────────────
 step "① 启动 Control Plane"
+# 对象存储端点按后端切换：env 变量名不变（MINIO_*，改名不在本刀，spec 第 4 条）。
+if [ "$FA_STORAGE" = "seaweedfs" ]; then
+  CP_S3_ENDPOINT="127.0.0.1:${FA_SEAWEEDFS_S3_PORT}"
+  # CP 凭据与 role ARN 必须与 renderer / init 同一来源（返工 P2-2）：默认值只在
+  # deploy/seaweedfs/env-defaults.sh 定义一处；覆盖只需 export SW_CP_ACCESS_KEY /
+  # SW_CP_SECRET_KEY / SW_AGENT_ROLE_ARN，三者（渲染/自检/CP）自动一致。
+  # 注意 role ARN 账号段是 12 个零（MinIO 默认是空段）。
+  # shellcheck source=/dev/null
+  source deploy/seaweedfs/env-defaults.sh
+  CP_ACCESS_KEY="$SW_CP_ACCESS_KEY"
+  CP_SECRET_KEY="$SW_CP_SECRET_KEY"
+  export MINIO_ROLE_ARN="$SW_AGENT_ROLE_ARN"
+else
+  CP_S3_ENDPOINT="127.0.0.1:${FA_MINIO_PORT}"
+  CP_ACCESS_KEY="cpAdminIAM000000000"
+  CP_SECRET_KEY="cpAdminSecret00000000"
+fi
 DATABASE_URL="postgres://fileagent:fileagent@127.0.0.1:${FA_POSTGRES_PORT}/fileagent?sslmode=disable" \
 REDIS_URL="redis://127.0.0.1:${FA_REDIS_PORT}/0" \
 NATS_URL="nats://127.0.0.1:${FA_NATS_PORT}" \
-MINIO_ENDPOINT="127.0.0.1:${FA_MINIO_PORT}" \
-MINIO_PUBLIC_ENDPOINT="127.0.0.1:${FA_MINIO_PORT}" \
+MINIO_ENDPOINT="$CP_S3_ENDPOINT" \
+MINIO_PUBLIC_ENDPOINT="$CP_S3_ENDPOINT" \
 MINIO_USE_SSL=false \
-MINIO_ACCESS_KEY=cpAdminIAM000000000 \
-MINIO_SECRET_KEY=cpAdminSecret00000000 \
+MINIO_ACCESS_KEY="$CP_ACCESS_KEY" \
+MINIO_SECRET_KEY="$CP_SECRET_KEY" \
 JWT_SECRET=smoke-jwt-secret-not-for-production-use \
 INTERNAL_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
 HTTP_PORT="$CP_HTTP_PORT" \
@@ -175,17 +242,28 @@ grep -q "migrations applied successfully\|schema already up to date" "$WORK/cp.l
   || fail "迁移未在启动时自动应用（D-023 声称内嵌自动迁移）"
 ok "内嵌迁移已自动应用"
 
-# ── MinIO 初始化 ───────────────────────────────────────────────────────────
-# ⚠️ 硬顺序：必须在 CP 起来之后跑。MinIO 在 `mc admin config set` 时会**真的去
-#    拨** webhook 端点，CP 没起来就直接失败。deployment.md 路线 A 的 A.2→A.3
-#    顺序是对的，dev 文档以前没写。
-step "初始化 MinIO（buckets / IAM / webhook）"
-MINIO_ENDPOINT="http://localhost:${FA_MINIO_PORT}" \
-WEBHOOK_ENDPOINT="http://host.docker.internal:${CP_HTTP_PORT}/internal/minio-event" \
-WEBHOOK_AUTH_TOKEN="$WEBHOOK_SECRET" \
-  bash deploy/scripts/init-minio.sh > "$WORK/init-minio.log" 2>&1 \
-  || { sed -n '$p;/ERROR/p' "$WORK/init-minio.log" >&2; fail "init-minio.sh 失败（完整日志：$WORK/init-minio.log）"; }
-ok "buckets + IAM + webhook 就绪，三项自检通过"
+# ── 存储初始化 ─────────────────────────────────────────────────────────────
+# ⚠️ 硬顺序：必须在 CP 起来之后跑（minio 分支）。MinIO 在 `mc admin config set`
+#    时会**真的去拨** webhook 端点，CP 没起来就直接失败。deployment.md 路线 A
+#    的 A.2→A.3 顺序是对的，dev 文档以前没写。
+#    seaweedfs 分支本身没有回拨 CP 的配置（事件源归 PR3b），保持同一顺序只是
+#    让两条分支的步骤排列一致。
+if [ "$FA_STORAGE" = "seaweedfs" ]; then
+  step "初始化 SeaweedFS（buckets / 生命周期 / 三项自检）"
+  SW_S3_ENDPOINT="http://localhost:${FA_SEAWEEDFS_S3_PORT}" \
+  MC_CONFIG_DIR="$WORK/mc" \
+    bash deploy/scripts/init-seaweedfs.sh > "$WORK/init-seaweedfs.log" 2>&1 \
+    || { tail -n 5 "$WORK/init-seaweedfs.log" >&2; fail "init-seaweedfs.sh 失败（完整日志：$WORK/init-seaweedfs.log）"; }
+  ok "buckets + 生命周期就绪，CP 身份自检（AssumeRole / 建桶 / 预签名 GET）通过"
+else
+  step "初始化 MinIO（buckets / IAM / webhook）"
+  MINIO_ENDPOINT="http://localhost:${FA_MINIO_PORT}" \
+  WEBHOOK_ENDPOINT="http://host.docker.internal:${CP_HTTP_PORT}/internal/minio-event" \
+  WEBHOOK_AUTH_TOKEN="$WEBHOOK_SECRET" \
+    bash deploy/scripts/init-minio.sh > "$WORK/init-minio.log" 2>&1 \
+    || { sed -n '$p;/ERROR/p' "$WORK/init-minio.log" >&2; fail "init-minio.sh 失败（完整日志：$WORK/init-minio.log）"; }
+  ok "buckets + IAM + webhook 就绪，三项自检通过"
+fi
 
 # ── ② 登录 + Web UI ────────────────────────────────────────────────────────
 step "② 管理员登录 / Web UI"
@@ -354,11 +432,18 @@ ok "16MB 分块写终态连续 3 轮均为 1 次上传，且 sha256 与源文件
 # CP 会 401 拒绝所有事件，而没有任何断言会红（评审实测：故意写错 token 仍全绿）。
 # 所以这里绕开 agent 直接往 bucket 里放一个对象，断言它以 source='minio_event'
 # 进索引——这是对账兜底能力的唯一探针。
-step "webhook 投递（绕过 agent 的对账兜底路径）"
-printf 'webhook probe\n' > "$WORK/probe.txt"
-mc cp --quiet "$WORK/probe.txt" "myminio/data-sensor/probe/webhook-probe.txt" >/dev/null \
-  || fail "mc cp 失败（无法投放 webhook 探针对象）"
-wait_for "MinIO 事件经 webhook 进索引（source=minio_event）" 90 probe_is_indexed
+# seaweedfs 分支下没有存储事件源（D-037：事件源走 filer 订阅适配器，归
+# B3-PR3b），这一环不执行、不算通过；结尾横幅同步如实标注。
+if [ "$FA_STORAGE" = "seaweedfs" ]; then
+  step "webhook 投递（seaweedfs 下不执行）"
+  echo "  PENDING(B3-PR3b): 存储事件源尚未接入 SeaweedFS"
+else
+  step "webhook 投递（绕过 agent 的对账兜底路径）"
+  printf 'webhook probe\n' > "$WORK/probe.txt"
+  mc cp --quiet "$WORK/probe.txt" "myminio/data-sensor/probe/webhook-probe.txt" >/dev/null \
+    || fail "mc cp 失败（无法投放 webhook 探针对象）"
+  wait_for "MinIO 事件经 webhook 进索引（source=minio_event）" 90 probe_is_indexed
+fi
 
 # ── ⑪ 列表查询 ─────────────────────────────────────────────────────────────
 step "⑪ 文件列表 / 查询"
@@ -382,5 +467,10 @@ ok "下载内容与源文件逐字节一致（${SRC_SHA}）"
 
 echo ""
 echo "════════════════════════════════════════════════════════"
-echo " SMOKE PASSED — 目标 A 的十二环全部通过"
+if [ "$FA_STORAGE" = "seaweedfs" ]; then
+  # 不打印「十二环全部通过」：webhook 环在 seaweedfs 下是 PENDING，不是通过。
+  echo " SMOKE PASSED (seaweedfs, 事件环 PENDING)"
+else
+  echo " SMOKE PASSED — 目标 A 的十二环全部通过"
+fi
 echo "════════════════════════════════════════════════════════"
