@@ -40,6 +40,7 @@
 | 5M | 522.03 | 6,118.71 | **6,640.75** | **1,119.83** | 3,870,973 / 71 | [5M log](../../research/capacity-baseline/results/scale-5000000.log) |
 
 bulk WAL 按各 `INSERT` 前后 `pg_current_wal_lsn()` 差计算；EAV 标签行的每文件数为 8 × 每标签 WAL。默认 checkpoint/WAL 阈值使较大 scale 有更多 FPI，故跨 scale 的 WAL/文件上升不是单纯行宽差。
+⚠️ 「Bulk FPI / requested checkpoint」列的计数起点在建表/建索引 DDL **之前**（`benchmark.sql:20-32`），所以它是「本 scale 建表 + bulk 装载」整个区间的计数，含 DDL 对系统目录页的少量 FPI，不是严格的「只有 INSERT」的 FPI。
 ⚠️ 三段 INSERT 依次执行（EAV 文件行 → 数组 → EAV 标签行），只在最前面有一次 `CHECKPOINT`，FPI 与 checkpoint 计数也只对整段记录一次；各段的 WAL 取决于它在序列中的位置和前面留下的检查点历史。**本表是描述性观测，不是两个模型的受控对比。** 受控对比需要每个模型完整装载前各自检查点、各自记录 FPI、交替顺序并重复。
 
 在数据已加载后，每个模型各执行 100 次单文件 INSERT（EAV 每文件再插 8 条标签）：
@@ -113,7 +114,8 @@ UUIDv4 与递增 v7 使用相同的 `g=1..N` 到达序列；v7 的 48-bit 毫秒
 > 而约 6.5 KB/行的单 PK 随机写入 WAL，恰好接近「每行一份去掉空洞的 8 KB 页」。
 > **推断原因（未实测验证）**：PostgreSQL 15 的后端 WAL 统计先在本进程累积，最快约 1 秒才刷新到 `pg_stat_wal`；100 次插入的 `DO` 块不到 1 秒就结束，紧接着在同一会话读取，读到的是刷新前的值。
 > bulk 段耗时长，受影响小，但末尾不足 1 秒的部分可能同样漏计。
-> **复测时的改法**：读取前调用 `pg_stat_force_next_flush()`（PG 15+），或用 `pg_waldump --stats` 直接统计 LSN 区间内的记录与 FPI。
+> **复测时的改法**：以独立语句先执行 `SELECT pg_stat_force_next_flush();`（PG 15+），该语句结束、会话回到 idle 时统计即刷新，再读取 `pg_stat_wal`；bulk 段同理，并把建表/建索引移到计数起点之前。
+> 也可用 `pg_waldump --stats` 按起止 LSN 统计记录与 FPI，但官方文档提示对运行中的实例可能给出错误结果——须停库后（或对完整复制出的 WAL 段）分析；`run.sh` 退出时会删掉容器与 volume，走这条路要先保留 WAL 段。
 
 ## 6. 规模外推（模型，不是测量）
 
