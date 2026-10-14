@@ -135,7 +135,20 @@ services:
       seaweed-volume:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8888/healthz || exit 1"]
+      # Two clauses (rework P2-4):
+      #  1. filer HTTP liveness (/healthz).
+      #  2. STS readiness probe: an UNSIGNED POST / with Action=AssumeRole
+      #     returns 400 while the STS service is loaded, but 405 Method Not
+      #     Allowed when the S3 gate started WITHOUT IAM/STS (e.g. a too-short
+      #     or non-base64 SW_STS_SIGNING_KEY — the filer stays HTTP-alive and
+      #     /healthz stays green in that state, live-verified on 4.48).
+      #     Fail ONLY on the definitive 405 so future variations of the
+      #     unsigned-request response never produce a false red. This is a
+      #     cheap tripwire, not a functional check: the authoritative STS
+      #     validation remains init-seaweedfs.sh's signed AssumeRole
+      #     self-check. busybox wget prints response headers with -S, which
+      #     is how the status code is inspected.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8888/healthz && ! wget -S --post-data 'Action=AssumeRole&Version=2011-06-15' -O /dev/null http://localhost:8333/ 2>&1 | grep -q ' 405 '"]
       interval: 10s
       timeout: 5s
       retries: 6

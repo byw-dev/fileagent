@@ -203,10 +203,19 @@ step "① 启动 Control Plane"
 # 对象存储端点按后端切换：env 变量名不变（MINIO_*，改名不在本刀，spec 第 4 条）。
 if [ "$FA_STORAGE" = "seaweedfs" ]; then
   CP_S3_ENDPOINT="127.0.0.1:${FA_SEAWEEDFS_S3_PORT}"
-  # SeaweedFS iam.json 里的 role ARN 账号段是 12 个零（MinIO 默认是空段）。
-  export MINIO_ROLE_ARN="arn:aws:iam::000000000000:role/agent-role"
+  # CP 凭据与 role ARN 必须与 renderer / init 同一来源（返工 P2-2）：默认值只在
+  # deploy/seaweedfs/env-defaults.sh 定义一处；覆盖只需 export SW_CP_ACCESS_KEY /
+  # SW_CP_SECRET_KEY / SW_AGENT_ROLE_ARN，三者（渲染/自检/CP）自动一致。
+  # 注意 role ARN 账号段是 12 个零（MinIO 默认是空段）。
+  # shellcheck source=/dev/null
+  source deploy/seaweedfs/env-defaults.sh
+  CP_ACCESS_KEY="$SW_CP_ACCESS_KEY"
+  CP_SECRET_KEY="$SW_CP_SECRET_KEY"
+  export MINIO_ROLE_ARN="$SW_AGENT_ROLE_ARN"
 else
   CP_S3_ENDPOINT="127.0.0.1:${FA_MINIO_PORT}"
+  CP_ACCESS_KEY="cpAdminIAM000000000"
+  CP_SECRET_KEY="cpAdminSecret00000000"
 fi
 DATABASE_URL="postgres://fileagent:fileagent@127.0.0.1:${FA_POSTGRES_PORT}/fileagent?sslmode=disable" \
 REDIS_URL="redis://127.0.0.1:${FA_REDIS_PORT}/0" \
@@ -214,8 +223,8 @@ NATS_URL="nats://127.0.0.1:${FA_NATS_PORT}" \
 MINIO_ENDPOINT="$CP_S3_ENDPOINT" \
 MINIO_PUBLIC_ENDPOINT="$CP_S3_ENDPOINT" \
 MINIO_USE_SSL=false \
-MINIO_ACCESS_KEY=cpAdminIAM000000000 \
-MINIO_SECRET_KEY=cpAdminSecret00000000 \
+MINIO_ACCESS_KEY="$CP_ACCESS_KEY" \
+MINIO_SECRET_KEY="$CP_SECRET_KEY" \
 JWT_SECRET=smoke-jwt-secret-not-for-production-use \
 INTERNAL_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
 HTTP_PORT="$CP_HTTP_PORT" \

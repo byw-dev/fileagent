@@ -46,12 +46,12 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# Credential/role defaults live in exactly one place, shared with the renderer
+# and smoke.sh (rework P2-2: smoke previously hardcoded them and drifted from
+# SW_* overrides used by render/init).
+# shellcheck source=/dev/null
+source "${REPO_ROOT}/deploy/seaweedfs/env-defaults.sh"
 SW_S3_ENDPOINT="${SW_S3_ENDPOINT:-http://localhost:38333}"
-SW_ADMIN_ACCESS_KEY="${SW_ADMIN_ACCESS_KEY:-swAdmin00000000000}"
-SW_ADMIN_SECRET_KEY="${SW_ADMIN_SECRET_KEY:-swAdminSecret0000000}"
-SW_CP_ACCESS_KEY="${SW_CP_ACCESS_KEY:-cpAdminIAM000000000}"
-SW_CP_SECRET_KEY="${SW_CP_SECRET_KEY:-cpAdminSecret00000000}"
-SW_AGENT_ROLE_ARN="${SW_AGENT_ROLE_ARN:-arn:aws:iam::000000000000:role/agent-role}"
 SW_BUCKET_DATA="${SW_BUCKET_DATA:-data-sensor}"
 SW_BUCKET_TMP="${SW_BUCKET_TMP:-tmp-uploads}"
 SW_LIFECYCLE_DAYS="${SW_LIFECYCLE_DAYS:-7}"
@@ -81,20 +81,44 @@ esac
 # mc config isolation (mc's config is GLOBAL at ~/.mc/config.json; never
 # touch the developer's aliases). smoke.sh exports MC_CONFIG_DIR already.
 # bash 3.2 (macOS) safe array expansion is used throughout.
+#
+# Cleanup ordering (rework P2-3): probe object/bucket are removed FIRST —
+# those mc calls need the admin alias to still exist — and only then are the
+# aliases and the temporary mc config dir torn down. Every cleanup step that
+# can leak state warns loudly instead of failing silently: a leftover probe
+# object is never cleaned up by the (currently non-executing) lifecycle rules.
 # ---------------------------------------------------------------------------
 OWN_MC_DIR=""
+LC_DIR=""
+CHECK_OBJECT=""
+CHECK_BUCKET=""
+ADMIN_ALIAS_SET=0
+CP_ALIAS_SET=0
 if [ -z "${MC_CONFIG_DIR:-}" ]; then
   OWN_MC_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fileagent-swinit-mc.XXXXXX")"
   export MC_CONFIG_DIR="${OWN_MC_DIR}"
 fi
 cleanup() {
-  mc alias remove "${SW_ALIAS}" >/dev/null 2>&1 || true
-  mc alias remove "${SW_ALIAS}-cp" >/dev/null 2>&1 || true
-  [ -n "${CHECK_OBJECT:-}" ] && mc rm --force "${SW_ALIAS}/${CHECK_OBJECT}" >/dev/null 2>&1 || true
-  [ -n "${CHECK_BUCKET:-}" ] && mc rb --force "${SW_ALIAS}/${CHECK_BUCKET}" >/dev/null 2>&1 || true
+  if [ -n "${CHECK_OBJECT:-}" ]; then
+    mc rm --force "${SW_ALIAS}/${CHECK_OBJECT}" >/dev/null 2>&1 \
+      || echo "WARNING: failed to remove probe object '${SW_ALIAS}/${CHECK_OBJECT}' — remove it manually (lifecycle rules are NOT executed by SeaweedFS)." >&2
+  fi
+  if [ -n "${CHECK_BUCKET:-}" ]; then
+    mc rb "${SW_ALIAS}/${CHECK_BUCKET}" >/dev/null 2>&1 \
+      || echo "WARNING: failed to remove probe bucket '${SW_ALIAS}/${CHECK_BUCKET}' — remove it manually." >&2
+  fi
+  # `if` 形式（而非 `|| { [ ] && echo; }`）：flag=0 时后者整体返回 1，set -e
+  # 会在 trap 里中途中断 cleanup（LC_DIR/OWN_MC_DIR 泄漏 + rc 漂移）。
+  if [ "${ADMIN_ALIAS_SET}" = "1" ] && ! mc alias remove "${SW_ALIAS}" >/dev/null 2>&1; then
+    echo "WARNING: failed to remove mc alias '${SW_ALIAS}' from MC_CONFIG_DIR '${MC_CONFIG_DIR}'." >&2
+  fi
+  if [ "${CP_ALIAS_SET}" = "1" ] && ! mc alias remove "${SW_ALIAS}-cp" >/dev/null 2>&1; then
+    echo "WARNING: failed to remove mc alias '${SW_ALIAS}-cp' from MC_CONFIG_DIR '${MC_CONFIG_DIR}'." >&2
+  fi
+  [ -n "${LC_DIR}" ] && rm -rf "${LC_DIR}"
   [ -n "${OWN_MC_DIR}" ] && rm -rf "${OWN_MC_DIR}"
-  # trap 的返回值会成为脚本的退出码（bash 在 set -e 下的行为）：这里失败过
-  # 一次（OWN_MC_DIR 为空时 `[ -n ]` 求值为假），把成功跑完的脚本变成了 rc=1。
+  # trap 的返回值会成为脚本的退出码（bash 在 set -e 下的行为）：
+  # `[ -n "" ] && ...` 求值为假曾把成功跑完的脚本变成 rc=1。
   return 0
 }
 trap cleanup EXIT
@@ -154,6 +178,7 @@ fi
 echo "==> Configuring mc alias '${SW_ALIAS}' -> ${SW_S3_ENDPOINT}"
 mc alias set "${SW_ALIAS}" "${SW_S3_ENDPOINT}" \
   "${SW_ADMIN_ACCESS_KEY}" "${SW_ADMIN_SECRET_KEY}" --api S3v4 --quiet
+ADMIN_ALIAS_SET=1
 
 echo "==> Creating bucket: ${SW_BUCKET_DATA}"
 mc mb --ignore-existing "${SW_ALIAS}/${SW_BUCKET_DATA}"
@@ -171,7 +196,6 @@ mc mb --ignore-existing "${SW_ALIAS}/${SW_BUCKET_TMP}"
 #    silent pass (same contract as init-minio.sh).
 # ---------------------------------------------------------------------------
 LC_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fileagent-swinit-lc.XXXXXX")"
-trap 'rm -rf "${LC_DIR}"; cleanup' EXIT
 
 echo "==> Setting ${SW_LIFECYCLE_DAYS}-day expiry on ${SW_BUCKET_TMP}"
 cat >"${LC_DIR}/tmp-expire.json" <<EOF
@@ -229,6 +253,7 @@ echo "    Self-check AssumeRole: OK (temporary access key prefix: ${STS_ACCESS_K
 # The CP identity's own alias for 3b/3c.
 mc alias set "${SW_ALIAS}-cp" "${SW_S3_ENDPOINT}" \
   "${SW_CP_ACCESS_KEY}" "${SW_CP_SECRET_KEY}" --api S3v4 --quiet
+CP_ALIAS_SET=1
 
 # 3b. CreateBucket (POST /api/v1/buckets at runtime).
 echo "==> Self-checking CP identity CreateBucket"
