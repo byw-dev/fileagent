@@ -12,6 +12,7 @@ import (
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -743,7 +744,8 @@ func TestEventRulesHandler_Delete_DBError(t *testing.T) {
 
 // ── MinioEventHandler tests ───────────────────────────────────────────────────
 
-// mockIndexerClient is a test double for handler.IndexerClient.
+// mockIndexerClient is a test double for storageevent.IndexWriter (the former
+// handler.IndexerClient surface).
 type mockIndexerClient struct {
 	err        error
 	called     bool
@@ -787,7 +789,7 @@ func testMinioEventRouter(h *handler.MinioEventHandler) *gin.Engine {
 
 func TestMinioEventHandler_Handle_Success_WithRecords(t *testing.T) {
 	ix := &mockIndexerClient{}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	body := `{
 "EventName": "s3:ObjectCreated:Put",
 "Key": "data-sensor/file.csv",
@@ -811,7 +813,7 @@ func TestMinioEventHandler_Handle_Success_WithRecords(t *testing.T) {
 
 func TestMinioEventHandler_Handle_EmptyRecords(t *testing.T) {
 	ix := &mockIndexerClient{}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	body := `{"EventName":"s3:ObjectCreated:Put","Key":"","Records":[]}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
@@ -823,7 +825,7 @@ func TestMinioEventHandler_Handle_EmptyRecords(t *testing.T) {
 
 func TestMinioEventHandler_Handle_InvalidJSON(t *testing.T) {
 	ix := &mockIndexerClient{}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString("not-json"))
 	req.Header.Set("Content-Type", "application/json")
@@ -850,7 +852,7 @@ func TestMinioEventHandler_Handle_NilIndexer(t *testing.T) {
 // plain retry.
 func TestMinioEventHandler_Handle_IndexerError_Returns5xx(t *testing.T) {
 	ix := &mockIndexerClient{err: assert.AnError}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	body := `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1}}}]}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
@@ -865,7 +867,7 @@ func TestMinioEventHandler_Handle_IndexerError_Returns5xx(t *testing.T) {
 // upload. Previously every event was treated as an upload (CC-1).
 func TestMinioEventHandler_RoutesRemovedToDeletion(t *testing.T) {
 	ix := &mockIndexerClient{}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	body := `{"Records":[{"eventName":"s3:ObjectRemoved:Delete","s3":{"bucket":{"name":"data-sensor"},"object":{"key":"uploads/gone.csv"}}}]}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
@@ -879,7 +881,7 @@ func TestMinioEventHandler_RoutesRemovedToDeletion(t *testing.T) {
 
 func TestMinioEventHandler_RoutesCreatedToUpload(t *testing.T) {
 	ix := &mockIndexerClient{}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	body := `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"data-sensor"},"object":{"key":"uploads/new.csv","size":10}}}]}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
@@ -911,7 +913,7 @@ func minioEventBody(t *testing.T, eventName, bucket, rawKey string) string {
 // postMinioEvent posts one notification through the authenticated test router.
 func postMinioEvent(t *testing.T, ix *mockIndexerClient, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	w := httptest.NewRecorder()
 	req, err := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(body))
 	require.NoError(t, err)
@@ -998,7 +1000,7 @@ func plainMinioRouter(h *handler.MinioEventHandler) *gin.Engine {
 
 func TestMinioEventHandler_RejectsMissingAuthHeader(t *testing.T) {
 	ix := &mockIndexerClient{}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -1011,7 +1013,7 @@ func TestMinioEventHandler_RejectsMissingAuthHeader(t *testing.T) {
 // matched per RFC 7235 (case-insensitive) and tolerates extra whitespace.
 func TestMinioEventHandler_AcceptsCaseInsensitiveScheme(t *testing.T) {
 	ix := &mockIndexerClient{}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -1023,7 +1025,7 @@ func TestMinioEventHandler_AcceptsCaseInsensitiveScheme(t *testing.T) {
 
 func TestMinioEventHandler_RejectsWrongSecret(t *testing.T) {
 	ix := &mockIndexerClient{}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -1037,7 +1039,7 @@ func TestMinioEventHandler_RejectsWrongSecret(t *testing.T) {
 // versions that send auth_token without a "Bearer " prefix.
 func TestMinioEventHandler_AcceptsRawToken(t *testing.T) {
 	ix := &mockIndexerClient{}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
 	req.Header.Set("Content-Type", "application/json")
@@ -1052,7 +1054,7 @@ func TestMinioEventHandler_AcceptsRawToken(t *testing.T) {
 // accepting unauthenticated input.
 func TestMinioEventHandler_NoSecretConfigured_FailsClosed(t *testing.T) {
 	ix := &mockIndexerClient{}
-	h := handler.NewMinioEventHandler(ix, "", newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), "", newTestLogger())
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/internal/minio-event", bytes.NewBufferString(validMinioBody))
 	req.Header.Set("Content-Type", "application/json")

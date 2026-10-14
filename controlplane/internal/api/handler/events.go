@@ -18,6 +18,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/event"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -679,32 +680,25 @@ func (h *UploadLogsHandler) Get(c *gin.Context) {
 
 // ── MinioEventHandler ────────────────────────────────────────────────────────
 
-// IndexerClient is the minimal interface needed by MinioEventHandler to reflect
-// MinIO object events in the file index.
-type IndexerClient interface {
-	// IndexUpload records an ObjectCreated event in the file index.
-	// A returned error is a PROCESSING failure: the handler counts it under
-	// the event's identity and answers 5xx (under the cap) so MinIO redelivers,
-	// or dead-letters the event past the cap — see webhook_policy.go. This is
-	// the core IC-4a semantic; errors are NOT "logged only".
-	IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string) error
-	// IndexDeletion records an ObjectRemoved event: it soft-deletes the matching
-	// file entry and publishes events.file.deleted. Errors follow the same
-	// counted failure path as IndexUpload.
-	IndexDeletion(ctx context.Context, bucketName, objectKey string, observedAt time.Time, eventSeq string) error
-}
-
 // MinioEventHandler handles POST /internal/minio-event — the MinIO S3 event
 // webhook endpoint. This serves as an alternate indexing path for file events
 // that arrive directly from MinIO rather than through an agent.
+//
+// The handler is the MinIO HALF of the storage event source (D-037): it owns
+// the transport — shared-secret authentication, the body parse cap, the
+// IC-4a failure counting / dead-letter / poison-pill machinery and the HTTP
+// status codes — and translates each S3 record into a storageevent.Event
+// (translateRecord) that it applies to a storageevent.Sink. The indexer is
+// reached only through that interface; no MinIO payload shape leaks past this
+// file.
 //
 // The endpoint writes to the file index from an external source, so it is
 // authenticated with a shared secret (MinIO's notify_webhook auth_token, see
 // system-design.md §6.1.2 / §6.5). The secret is compared in constant time.
 type MinioEventHandler struct {
-	logger  *zap.Logger
-	indexer IndexerClient // optional; nil disables indexing
-	secret  string        // shared webhook secret; empty disables the endpoint
+	logger *zap.Logger
+	sink   storageevent.Sink // optional; nil disables indexing
+	secret string            // shared webhook secret; empty disables the endpoint
 	// fails is the persistent failure-counter backend (nil disables counting
 	// and the poison pill; used only by tests that exercise parsing routes).
 	fails WebhookFailStore
@@ -722,16 +716,18 @@ type MinioEventHandler struct {
 
 // NewMinioEventHandler returns a new MinioEventHandler.
 //
-// indexer may be nil, in which case upload events are only logged. secret is the
+// sink may be nil, in which case upload events are only logged (the
+// storageevent.Sink the production wiring builds via
+// storageevent.NewIndexSink(indexer) is the indexed path). secret is the
 // shared webhook token; when empty the endpoint fails closed (rejects every
 // request), because an endpoint that mutates the index from external input must
 // be authenticated and without a secret it cannot be.
-func NewMinioEventHandler(indexer IndexerClient, secret string, logger *zap.Logger) *MinioEventHandler {
+func NewMinioEventHandler(sink storageevent.Sink, secret string, logger *zap.Logger) *MinioEventHandler {
 	if secret == "" {
 		logger.Warn("minio event webhook: INTERNAL_WEBHOOK_SECRET is not set; " +
 			"the /internal/minio-event endpoint will reject all requests until it is configured")
 	}
-	return &MinioEventHandler{logger: logger, indexer: indexer, secret: secret, parseCap: DefaultWebhookParseCap()}
+	return &MinioEventHandler{logger: logger, sink: sink, secret: secret, parseCap: DefaultWebhookParseCap()}
 }
 
 // NewMinioEventHandlerWithPolicy returns a MinioEventHandler wired with the
@@ -739,8 +735,8 @@ func NewMinioEventHandler(indexer IndexerClient, secret string, logger *zap.Logg
 // dead-letter sink and the poison-pill retry cap. Production wiring uses this
 // constructor; NewMinioEventHandler (counters nil) remains for tests that
 // exercise only parsing/auth routing.
-func NewMinioEventHandlerWithPolicy(indexer IndexerClient, secret string, fails WebhookFailStore, dead DeadLetterSink, failLimit int64, logger *zap.Logger) *MinioEventHandler {
-	return NewMinioEventHandlerWithPolicyParseCap(indexer, secret, fails, dead, failLimit, DefaultWebhookParseCap(), logger)
+func NewMinioEventHandlerWithPolicy(sink storageevent.Sink, secret string, fails WebhookFailStore, dead DeadLetterSink, failLimit int64, logger *zap.Logger) *MinioEventHandler {
+	return NewMinioEventHandlerWithPolicyParseCap(sink, secret, fails, dead, failLimit, DefaultWebhookParseCap(), logger)
 }
 
 // DefaultWebhookParseCap returns the default parse cap (used by the
@@ -750,7 +746,7 @@ func DefaultWebhookParseCap() int64 { return maxWebhookParseBytes }
 // NewMinioEventHandlerWithPolicyParseCap is the full constructor (round-3
 // B-2-3): the parse cap is injected so WEBHOOK_MAX_PARSE_BYTES is a real,
 // testable knob.
-func NewMinioEventHandlerWithPolicyParseCap(indexer IndexerClient, secret string, fails WebhookFailStore, dead DeadLetterSink, failLimit int64, parseCap int64, logger *zap.Logger) *MinioEventHandler {
+func NewMinioEventHandlerWithPolicyParseCap(sink storageevent.Sink, secret string, fails WebhookFailStore, dead DeadLetterSink, failLimit int64, parseCap int64, logger *zap.Logger) *MinioEventHandler {
 	if failLimit < MinWebhookFailLimit {
 		// S1: never silently replace the configured value. Below the floor the
 		// cap is dangerously short (limit=1 tolerates ~3s), so this logs a
@@ -779,7 +775,7 @@ func NewMinioEventHandlerWithPolicyParseCap(indexer IndexerClient, secret string
 		zap.Bool("counter_store", fails != nil),
 		zap.Bool("dead_letter_sink", dead != nil),
 	)
-	h := NewMinioEventHandler(indexer, secret, logger)
+	h := NewMinioEventHandler(sink, secret, logger)
 	h.fails = fails
 	h.dead = dead
 	h.failLimit = failLimit
@@ -875,6 +871,50 @@ func decodeObjectKey(raw string) (string, error) {
 	return decoded, nil
 }
 
+// translateRecord translates one parsed MinIO S3 event record into a storage
+// event (the adapter half of the D-037 storage event source). It is a pure
+// function: no I/O, no clocks, no sink — which is what keeps the MinIO payload
+// shapes out of everything downstream of it.
+//
+// Outcomes:
+//   - decodeErr != nil: the object key is not valid URL encoding. The record
+//     must NOT be applied; the caller routes it through the counted failure
+//     state machine under the RAW key identity (see Handle).
+//   - handled == false: the event type is neither s3:ObjectCreated:* nor
+//     s3:ObjectRemoved:* — the caller ignores it (the index only consumes
+//     object create/remove). ev still carries the decoded key and fields so
+//     the transport layer can log the received event before dropping it.
+//   - otherwise: ev is ready for storageevent.Sink.Apply (Created →
+//     IndexUpload, Removed → IndexDeletion via storageevent.NewIndexSink).
+//
+// The decode deliberately runs BEFORE the type check, matching the pre-B3
+// handler: an undecodable key is a payload defect even on an event type the
+// index would ignore, and it keeps the failure counter identity independent
+// of the routing decision.
+func translateRecord(rec minioEventRecord) (ev storageevent.Event, decodeErr error, handled bool) {
+	key, err := decodeObjectKey(rec.S3.Object.Key)
+	if err != nil {
+		return storageevent.Event{}, err, false
+	}
+	ev = storageevent.Event{
+		Bucket:     rec.S3.Bucket.Name,
+		Key:        key,
+		Size:       rec.S3.Object.Size,
+		ETag:       rec.S3.Object.ETag,
+		ObservedAt: rec.EventTime,
+		Seq:        rec.S3.Object.Sequencer,
+	}
+	switch {
+	case strings.HasPrefix(rec.EventName, "s3:ObjectRemoved:"):
+		ev.Kind = storageevent.KindObjectRemoved
+	case strings.HasPrefix(rec.EventName, "s3:ObjectCreated:"):
+		ev.Kind = storageevent.KindObjectCreated
+	default:
+		return ev, nil, false
+	}
+	return ev, nil, true
+}
+
 // Handle handles POST /internal/minio-event.
 //
 // Response contract (IC-4a ① / IC-BUG-6) — one path for every failure kind:
@@ -963,10 +1003,10 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 	failed := false
 	for _, rec := range payload.Records {
 		bucket := rec.S3.Bucket.Name
-		// The key is URL-encoded by MinIO; decode it before it reaches the index
-		// or anything else, since storage_path must hold the real object key.
-		key, err := decodeObjectKey(rec.S3.Object.Key)
-		if err != nil {
+		// Translate the S3 record into the storage event (decode + routing)
+		// in one pure step; everything below is transport policy.
+		ev, decodeErr, handled := translateRecord(rec)
+		if decodeErr != nil {
 			// IC-2c used to fall back to indexing the raw key here. Indexing it
 			// would write a storage_path no real object matches. From MinIO this
 			// path is unreachable (QueryEscape output is always valid escaping);
@@ -979,8 +1019,8 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 			h.logger.Error("minio event: object key is not valid URL encoding",
 				zap.String("bucket", bucket),
 				zap.String("raw_key", rec.S3.Object.Key),
-				zap.Error(err))
-			if h.handleIndexFailure(c.Request.Context(), bucket, rec.S3.Object.Key, rec, err) {
+				zap.Error(decodeErr))
+			if h.handleIndexFailure(c.Request.Context(), bucket, rec.S3.Object.Key, rec, decodeErr) {
 				failed = true
 			}
 			continue
@@ -988,36 +1028,32 @@ func (h *MinioEventHandler) Handle(c *gin.Context) {
 		h.logger.Info("minio event received",
 			zap.String("event", rec.EventName),
 			zap.String("bucket", bucket),
-			zap.String("key", key),
+			zap.String("key", ev.Key),
 			zap.Int64("size", rec.S3.Object.Size),
 		)
-		if h.indexer == nil {
+		if h.sink == nil {
 			continue
 		}
-		// Route by S3 event type: ObjectCreated:* indexes an upload, while
-		// ObjectRemoved:* soft-deletes the entry and emits events.file.deleted.
-		// Previously every event was indexed as an upload, so deletions were
-		// mis-recorded and file_deleted event rules never fired.
-		var indexErr error
-		removed := strings.HasPrefix(rec.EventName, "s3:ObjectRemoved:")
-		switch {
-		case removed:
-			indexErr = h.indexer.IndexDeletion(c.Request.Context(), bucket, key, rec.EventTime, rec.S3.Object.Sequencer)
-		case strings.HasPrefix(rec.EventName, "s3:ObjectCreated:"):
-			indexErr = h.indexer.IndexUpload(c.Request.Context(), bucket, key, rec.S3.Object.Size, rec.S3.Object.ETag, rec.EventTime, rec.S3.Object.Sequencer)
-		default:
+		if !handled {
+			// Unhandled event types (not ObjectCreated:*/ObjectRemoved:*) are
+			// ignored: the index only consumes object create/remove. Like the
+			// pre-B3 switch, falling through still clears the (normally
+			// nonexistent) failure counter for this identity.
 			h.logger.Debug("minio event: ignoring unhandled event type",
 				zap.String("event", rec.EventName))
-		}
-		if indexErr != nil {
+		} else if applyErr := h.sink.Apply(c.Request.Context(), ev); applyErr != nil {
+			// The event is applied through the storage-event-source Sink; a
+			// returned error is a processing failure and follows the single
+			// counted path (retry under the cap, dead letter past it).
+			//
 			// The single failure path: count under the event's identity, then
 			// either 5xx (retry) or dead-letter + 200 (free the queue).
-			if h.handleIndexFailure(c.Request.Context(), bucket, key, rec, indexErr) {
+			if h.handleIndexFailure(c.Request.Context(), bucket, ev.Key, rec, applyErr) {
 				failed = true
 			}
 			continue
 		}
-		h.clearFailCount(c.Request.Context(), bucket, key, rec)
+		h.clearFailCount(c.Request.Context(), bucket, ev.Key, rec)
 	}
 	if failed {
 		// Any record needing a retry fails the whole request with 5xx; MinIO

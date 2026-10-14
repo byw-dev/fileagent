@@ -13,6 +13,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/api/middleware"
 	"github.com/byw-dev/fileagent/controlplane/internal/auth"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 )
@@ -43,8 +44,12 @@ type RouterConfig struct {
 	AgentCache    handler.AgentCacheClient // nil → is_online always false
 	DirStore      handler.DirListingStore  // nil → list-dir returns 202 (legacy)
 	DryRunStore   handler.DryRunStore      // nil → test-rule returns 501
-	MinioIndexer  handler.IndexerClient    // nil → minio webhook events are only logged
-	WebhookSecret string                   // shared secret for /internal/minio-event; empty → endpoint rejects all
+	// MinioEventSink is the storage-event-source sink the MinIO webhook
+	// handler applies events to (main.go builds it with
+	// storageevent.NewIndexSink(indexer)). nil → minio webhook events are
+	// only logged.
+	MinioEventSink storageevent.Sink
+	WebhookSecret  string // shared secret for /internal/minio-event; empty → endpoint rejects all
 
 	// WebhookFailCounters backs the IC-4a poison-pill failure counters. When
 	// nil, failures are still answered 5xx but never dead-lettered (testing
@@ -113,13 +118,13 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// failing, instead of letting one bad event block the feed forever.
 	var minioH *handler.MinioEventHandler
 	if cfg.WebhookFailCounters != nil && cfg.WebhookDeadLetters != nil {
-		minioH = handler.NewMinioEventHandlerWithPolicyParseCap(cfg.MinioIndexer, cfg.WebhookSecret, cfg.WebhookFailCounters, cfg.WebhookDeadLetters, cfg.WebhookFailLimit, cfg.WebhookMaxParseBytes, cfg.Logger)
+		minioH = handler.NewMinioEventHandlerWithPolicyParseCap(cfg.MinioEventSink, cfg.WebhookSecret, cfg.WebhookFailCounters, cfg.WebhookDeadLetters, cfg.WebhookFailLimit, cfg.WebhookMaxParseBytes, cfg.Logger)
 	} else {
 		if cfg.WebhookFailCounters == nil || cfg.WebhookDeadLetters == nil {
 			cfg.Logger.Warn("minio event webhook: failure policy incompletely wired (counters/dead-letters nil); " +
 				"failed events will retry but never dead-letter — the poison-pill guard is DISABLED")
 		}
-		minioH = handler.NewMinioEventHandler(cfg.MinioIndexer, cfg.WebhookSecret, cfg.Logger)
+		minioH = handler.NewMinioEventHandler(cfg.MinioEventSink, cfg.WebhookSecret, cfg.Logger)
 	}
 	r.POST("/internal/minio-event", minioH.Handle)
 

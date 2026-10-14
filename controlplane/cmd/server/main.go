@@ -29,6 +29,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/grpcserver"
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/byw-dev/fileagent/controlplane/internal/webui"
 	"github.com/byw-dev/fileagent/controlplane/internal/worker"
 	"github.com/byw-dev/fileagent/controlplane/migrations"
@@ -365,7 +366,7 @@ func main() {
 		AgentCache:             redisClient,
 		DirStore:               dirStore,
 		DryRunStore:            dryRunStore,
-		MinioIndexer:           ix,
+		MinioEventSink:         storageevent.NewIndexSink(ix),
 		WebhookSecret:          cfg.InternalWebhookSecret,
 		WebhookFailCounters:    webhookFails,
 		WebhookDeadLetters:     webhookDeadLetters,

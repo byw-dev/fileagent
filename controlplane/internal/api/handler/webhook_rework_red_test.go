@@ -12,6 +12,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -171,7 +172,7 @@ func TestCounterSeries_MonotonicAcrossRedisLoss(t *testing.T) {
 
 	ix := &mockIndexerClient{err: assert.AnError}
 	dead := &recordingSink{}
-	h := handler.NewMinioEventHandlerWithPolicy(ix, testWebhookSecret, store, dead, 2, newTestLogger())
+	h := handler.NewMinioEventHandlerWithPolicy(storageevent.NewIndexSink(ix), testWebhookSecret, store, dead, 2, newTestLogger())
 
 	// Two failed deliveries with Redis up: the authoritative count is 2.
 	code1 := postIC4A(t, h, eventWithSequencer("s3:ObjectCreated:Put", "b", "k", "redisloss", 1)).Code

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -106,7 +107,7 @@ func (s *recordingSink) last() handler.DeadLetter {
 // ic4aHandlerDead wires a MinioEventHandler with the full failure machinery
 // and a caller-provided dead-letter sink (so tests can inject flaky sinks).
 func ic4aHandlerDead(ix *mockIndexerClient, fails *countingFailStore, dead handler.DeadLetterSink, limit int64) *handler.MinioEventHandler {
-	return handler.NewMinioEventHandlerWithPolicy(ix, testWebhookSecret, fails, dead, limit, newTestLogger())
+	return handler.NewMinioEventHandlerWithPolicy(storageevent.NewIndexSink(ix), testWebhookSecret, fails, dead, limit, newTestLogger())
 }
 
 // ic4aHandler wires a MinioEventHandler with the full failure machinery.
