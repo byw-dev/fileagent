@@ -27,6 +27,12 @@ lint:
     - PACKAGE_DIRECTORY_MATCH
     - RPC_REQUEST_STANDARD_NAME
     - RPC_RESPONSE_STANDARD_NAME
+  # proto/third_party/ 是逐字节复制的第三方契约（SeaweedFS filer.proto，D-038），
+  # 不归我们改、也不过我们的 lint 规矩。豁免只作用于这个目录，proto/v1 不受影响。
+  # 注意 breaking 检查**不**豁免该目录：上游协议删字段/改编号会（有意地）被
+  # buf breaking 拦下来提醒适配器核对，见 proto/third_party/seaweedfs/README.md。
+  ignore:
+    - proto/third_party
 breaking:
   # 契约规矩「只增字段，不改字段编号，不删除字段」由 CI 的 buf breaking（对 master 比对）机器强制。
   use:

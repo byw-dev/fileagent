@@ -11,6 +11,28 @@ version: v2
 # 生成落点是既有位置 api/v1/（go_package 不变）：先输出到 scratch 目录（out 字段）
 # .tmp-proto-gen，再由 make generate-proto 移回 api/v1/，保证文件头
 # `// source: proto/v1/agent.proto` 与生成物落点都不变。
+#
+# managed mode（D-038）：只为 vendored 的 SeaweedFS filer.proto 改写 go_package。
+# v2 的 managed mode 对没有默认值的选项（go_package）不做任何事，但对 Java / ObjC /
+# PHP / Ruby 等 file option 自带默认值，开了就会给 proto/v1/agent.proto 也注入一堆
+# 无关语言的 option（改变生成物 rawDesc）。因此对这些选项显式 disable，唯一保留的
+# 行为就是下面按路径精确命中的 go_package override：把它指到 CP 内部的 filerpb 包，
+# 生成物由 make generate-proto 移到 controlplane/internal/storage/seaweedfs/filerpb/。
+managed:
+  enabled: true
+  disable:
+    - file_option: csharp_namespace
+    - file_option: java_multiple_files
+    - file_option: java_outer_classname
+    - file_option: java_package
+    - file_option: objc_class_prefix
+    - file_option: php_metadata_namespace
+    - file_option: php_namespace
+    - file_option: ruby_package
+  override:
+    - file_option: go_package
+      path: proto/third_party/seaweedfs/filer.proto
+      value: github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs/filerpb
 plugins:
   - local: protoc-gen-go
     out: .tmp-proto-gen
