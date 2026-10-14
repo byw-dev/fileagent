@@ -560,7 +560,8 @@ func (ix *Indexer) publishFileUploaded(fe *db.FileEntry, agentID uuid.UUID, resu
 // NOT publish events.file.uploaded: agent uploads already emit that event via
 // HandleUploadResult, and a MinIO ObjectCreated webhook fires for the same
 // object, so publishing here would double-emit. This method implements
-// handler.IndexerClient.
+// storageevent.IndexWriter (via the former handler.IndexerClient, removed in
+// B3-PR1).
 func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string) error {
 	bucket, err := ix.store.GetBucketByName(ctx, bootstrap.DefaultOrgID, bucketName)
 	if err != nil {

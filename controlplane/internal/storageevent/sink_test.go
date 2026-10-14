@@ -10,18 +10,22 @@ import (
 
 // fakeIndexWriter records the calls NewIndexSink routes to the index writer.
 type fakeIndexWriter struct {
-	uploads   []string // one "bucket|key|size|etag|observedAt|seq" per IndexUpload
-	deletions []string // one "bucket|key|observedAt|seq" per IndexDeletion
-	err       error    // when set, every call fails with this error
+	uploads         []string // one "bucket|key|size|etag|observedAt|seq" per IndexUpload
+	deletions       []string // one "bucket|key|observedAt|seq" per IndexDeletion
+	lastUploadCtx   context.Context
+	lastDeletionCtx context.Context
+	err             error // when set, every call fails with this error
 }
 
-func (f *fakeIndexWriter) IndexUpload(_ context.Context, bucket, key string, size int64, etag string, observedAt time.Time, seq string) error {
+func (f *fakeIndexWriter) IndexUpload(ctx context.Context, bucket, key string, size int64, etag string, observedAt time.Time, seq string) error {
 	f.uploads = append(f.uploads, bucket+"|"+key+"|"+strconv.FormatInt(size, 10)+"|"+etag+"|"+observedAt.UTC().Format(time.RFC3339Nano)+"|"+seq)
+	f.lastUploadCtx = ctx
 	return f.err
 }
 
-func (f *fakeIndexWriter) IndexDeletion(_ context.Context, bucket, key string, observedAt time.Time, seq string) error {
+func (f *fakeIndexWriter) IndexDeletion(ctx context.Context, bucket, key string, observedAt time.Time, seq string) error {
 	f.deletions = append(f.deletions, bucket+"|"+key+"|"+observedAt.UTC().Format(time.RFC3339Nano)+"|"+seq)
+	f.lastDeletionCtx = ctx
 	return f.err
 }
 
@@ -136,18 +140,39 @@ func TestIndexSink_ErrorPropagates(t *testing.T) {
 	}
 }
 
-// TestIndexSink_ContextThreadsThrough: the Apply context is the one handed to
-// the writer, so cancellation reaches the indexer.
+// b3rw1CtxKey is a private context key type for the threading test below.
+type b3rw1CtxKey struct{}
+
+// TestIndexSink_ContextThreadsThrough pins the rework P2-3 finding: Apply
+// must hand THE CALLER'S context to the writer on both routes, so that
+// cancellation and request-scoped values reach the indexer. The previous
+// version only asserted call counts — mutating both writer calls to
+// context.Background() left the whole package green (see bin/review-r1.md).
 func TestIndexSink_ContextThreadsThrough(t *testing.T) {
 	fake := &fakeIndexWriter{}
 	sink := NewIndexSink(fake)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_ = sink.Apply(ctx, Event{Kind: KindObjectCreated, Bucket: "b", Key: "k"})
-	// The fake ignores ctx; the assertion is compile- plus call-level plumbing
-	// (signature takes ctx and reaches IndexUpload). Deep cancellation is the
-	// indexer's own tested behavior.
-	if len(fake.uploads) != 1 {
-		t.Fatalf("IndexUpload called %d times, want 1", len(fake.uploads))
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), b3rw1CtxKey{}, "b3-rw1"))
+	cancel() // cancelled up front: Err() is observable without racing the call
+
+	if err := sink.Apply(ctx, Event{Kind: KindObjectCreated, Bucket: "b", Key: "k"}); err != nil {
+		t.Fatalf("Apply(Created) = %v, want nil", err)
+	}
+	if err := sink.Apply(ctx, Event{Kind: KindObjectRemoved, Bucket: "b", Key: "k"}); err != nil {
+		t.Fatalf("Apply(Removed) = %v, want nil", err)
+	}
+	for name, got := range map[string]context.Context{
+		"IndexUpload":   fake.lastUploadCtx,
+		"IndexDeletion": fake.lastDeletionCtx,
+	} {
+		if got == nil {
+			t.Errorf("%s was not called", name)
+			continue
+		}
+		if got.Err() != context.Canceled {
+			t.Errorf("%s received ctx.Err() = %v, want context.Canceled", name, got.Err())
+		}
+		if v, _ := got.Value(b3rw1CtxKey{}).(string); v != "b3-rw1" {
+			t.Errorf("%s received ctx.Value(b3rw1CtxKey) = %q, want %q", name, v, "b3-rw1")
+		}
 	}
 }

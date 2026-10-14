@@ -17,7 +17,11 @@ var ErrUnsupportedKind = errors.New("storageevent: event kind not supported by t
 // Sink is the only entry point the index side knows. Apply returns a non-nil
 // error when processing FAILED — the caller decides retry / dead-letter
 // policy (the MinIO webhook handler counts failures under the event identity,
-// IC-4a). A nil error means the event is durably reflected in the index.
+// IC-4a). A nil error means the event is PROCESSED and needs no retry; it is
+// deliberately not a durability promise — the writer's own semantics decide
+// what "processed" persists (e.g. an upload that lost a last-writer race and
+// was suppressed, or a deletion matching no existing row, both return nil,
+// and a future alerting sink's nil would only mean "alert accepted").
 type Sink interface {
 	Apply(ctx context.Context, ev Event) error
 }

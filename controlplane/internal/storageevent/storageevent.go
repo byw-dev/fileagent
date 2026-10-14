@@ -67,9 +67,19 @@ type Event struct {
 	ETag string
 	// ObservedAt is the event time as observed at the source (payload
 	// eventTime / notification timestamp), not the local processing time.
+	// Ordering caveat (db/queries/ingest.sql): when Seq is empty the index
+	// still evicts stale writes by ObservedAt alone — a delayed event
+	// carrying an old source timestamp can be applied (nil error) yet
+	// suppressed by the upsert. Sources that re-read current object state
+	// before applying (the PR3b read-back adapter) must therefore define
+	// what ObservedAt means for that read-back fact; they cannot reuse a
+	// source event timestamp blindly.
 	ObservedAt time.Time
 	// Seq is the source-side ordering key (MinIO sequencer). Sources without
 	// a trustworthy ordering key leave it empty — D-037: a source timestamp
 	// that is not strictly ordered (SeaweedFS ts_ns) must NOT be used as one.
+	// An empty Seq does NOT disable time-based eviction: with Seq empty the
+	// index orders solely by ObservedAt (see the caveat above), so the
+	// empty-string case is "no source-side tie-break", not "no ordering".
 	Seq string
 }
