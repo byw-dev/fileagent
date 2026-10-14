@@ -20,8 +20,27 @@ package storageevent
 // imports of packages that do not exist. Effectiveness is proven by mutation:
 // temporarily add a violating import to a handler file and watch this test go
 // red (see the B3-PR1 report for the recorded runs).
+//
+// ── Scan boundary (stated honestly) ──────────────────────────────────────
+//
+//   - scanned: every .go file under the controlplane module root — including
+//     _test.go files, build-tagged and generated files, and testdata/
+//     directories (business code can explicitly import testdata packages, so
+//     they are compilation-reachable);
+//   - skipped: the .git/ and vendor/ subtrees (not our source), and any
+//     directory carrying its own go.mod — a different Go module whose imports
+//     are that module's boundary, not ours (controlplane's go.mod has no
+//     replace pointing into its own subdirectories, so no reachable code is
+//     hidden behind this skip);
+//   - refused, fail-closed (the test goes RED): any symlink met on the walk
+//     (directory or file — the scanner does not follow links while the
+//     compiler follows imported ones), any file that cannot be parsed, and
+//     any import literal that does not decode. A green run therefore means
+//     "every scanned file was readable and both rules ran over its imports",
+//     never "the unreadable parts were skipped".
 
 import (
+	"fmt"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -156,29 +175,58 @@ func violationsForFile(moduleRoot, path, modulePath string) []string {
 	return append(problems, classifyFile(relSlash, imports, modulePath)...)
 }
 
-// TestImportBoundary is the scan: every .go file under the controlplane module
-// is parsed (imports only) and checked against both rules.
-func TestImportBoundary(t *testing.T) {
-	root := moduleRoot(t)
-	modulePath := modulePathOf(t, root)
+// scanSkipDirs are the only subtrees the boundary scan excludes: `.git` is
+// not source, and `vendor/` is third-party code that is not OUR source tree —
+// the D-037 rules govern what we write, not what we vendor. Everything else
+// under the module root is scanned, INCLUDING testdata: `go list ./...` does
+// not enumerate testdata packages, but business code can still import them
+// explicitly, which compiles the forbidden dependency right into the module
+// (the review's skip_testdata mutation proved this compiles). Scanning them
+// closes that hole at zero cost (parse-only).
+var scanSkipDirs = map[string]bool{".git": true, "vendor": true}
 
-	// Skip set is deliberately minimal (rework P2-2): `.git` is not source,
-	// and `vendor/` is third-party code that is not OUR source tree — the
-	// D-037 rules govern what we write, not what we vendor. Everything else
-	// under the module root is scanned, INCLUDING testdata: `go list ./...`
-	// does not enumerate testdata packages, but business code can still
-	// import them explicitly, which compiles the forbidden dependency right
-	// into the module (the review's skip_testdata mutation proved this
-	// compiles). Scanning them closes that hole at zero cost (parse-only).
-	skipDirs := map[string]bool{".git": true, "vendor": true}
+// scanTree walks every .go file under the module rooted at root and returns
+// the boundary violations found (root is the module root in production and a
+// synthetic tree in the regression tests below).
+//
+// A non-nil error means the scan itself refused to complete — a filesystem
+// failure or a deliberate fail-closed refusal (a symlink on the walk, see the
+// header). Callers must fail the test on it; an error is never "clean".
+func scanTree(root, modulePath string) ([]string, error) {
 	var problems []string
 	scanned := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+		if path == root {
+			return nil
+		}
+		// Symlinks (directory or file) are refused fail-closed: WalkDir does
+		// not follow them, but the compiler DOES follow explicitly imported
+		// symlinked directories — a violating package behind a link would
+		// compile while never being scanned (review R2). Following instead
+		// would need cycle detection and cross-module logic the scanner does
+		// not have; refusing keeps "green" meaningful.
+		if d.Type()&fs.ModeSymlink != 0 {
+			rel, rerr := filepath.Rel(root, path)
+			if rerr != nil {
+				rel = path
+			}
+			return fmt.Errorf("%s: boundary scan does not follow symlinks; replace it with a real directory/file (fail-closed)", filepath.ToSlash(rel))
+		}
 		if d.IsDir() {
-			if skipDirs[d.Name()] && path != root {
+			if scanSkipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			// A nested go.mod marks the root of a DIFFERENT Go module: the
+			// toolchain does not treat its sources as part of this module
+			// (`go list ./...` skips them; importing them needs a replace or
+			// workspace entry), so its imports are that module's boundary,
+			// not ours. Verified: controlplane's only replace points OUTSIDE
+			// the module (../pkg/trollsift); if a replace ever points into a
+			// controlplane subdirectory, this blanket skip must be revisited.
+			if _, gerr := os.Lstat(filepath.Join(path, "go.mod")); gerr == nil {
 				return filepath.SkipDir
 			}
 			return nil
@@ -191,10 +239,23 @@ func TestImportBoundary(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("walk %s: %v", root, err)
+		return nil, fmt.Errorf("walk %s: %w", root, err)
 	}
 	if scanned == 0 {
-		t.Fatal("scanned 0 Go files — the boundary scan is broken, not clean")
+		return nil, fmt.Errorf("walk %s: scanned 0 Go files — the boundary scan is broken, not clean", root)
+	}
+	return problems, nil
+}
+
+// TestImportBoundary is the scan: every .go file under the controlplane module
+// is parsed (imports only) and checked against both rules.
+func TestImportBoundary(t *testing.T) {
+	root := moduleRoot(t)
+	modulePath := modulePathOf(t, root)
+
+	problems, err := scanTree(root, modulePath)
+	if err != nil {
+		t.Fatalf("boundary scan refused: %v", err)
 	}
 	for _, p := range problems {
 		t.Error(p)
@@ -237,6 +298,77 @@ func TestImportBoundary_LiteralDecoding(t *testing.T) {
 		if msg := strings.Join(v, "\n"); !strings.Contains(msg, "filerpb") {
 			t.Errorf("%s: violations do not mention the decoded path:\n%s", name, msg)
 		}
+	}
+}
+
+// TestImportBoundary_NestedModuleSkipped pins the R2 rework: a directory
+// under the module root that carries its own go.mod is a DIFFERENT Go module.
+// The Go toolchain does not treat its sources as part of the controlplane
+// module, so its imports are that module's boundary, not ours — the scan must
+// skip the whole subtree instead of misreporting its files as CP violations.
+// (Safe today: controlplane's go.mod has no replace pointing into its own
+// subdirectories; if one ever appears, revisit — see the header.)
+func TestImportBoundary_NestedModuleSkipped(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, rel), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module example.com/rw2root\n\ngo 1.22\n")
+	write("own/ok.go", "package own\n\nimport _ \"fmt\"\n")
+	// An independent nested module with a rule-A violating import.
+	write("review_nested/go.mod", "module example.com/review-nested\n\ngo 1.22\n")
+	write("review_nested/fixture.go", "package nested\n\nimport _ \"github.com/seaweedfs/seaweedfs-client-go/filer\"\n")
+
+	problems, err := scanTree(root, modulePathOf(t, root))
+	if err != nil {
+		t.Fatalf("boundary scan refused: %v", err)
+	}
+	for _, p := range problems {
+		t.Errorf("nested-module file must not be reported as a controlplane violation: %s", p)
+	}
+}
+
+// TestImportBoundary_SymlinkRefused pins the R2 rework: the scanner does not
+// follow symlinks while the compiler DOES follow explicitly imported symlinked
+// directories — a violating package hidden behind a link would compile but
+// never be scanned. The scan therefore refuses (fail-closed) on ANY symlink
+// it meets, directory or file, instead of silently walking past it.
+func TestImportBoundary_SymlinkRefused(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/rw2root\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "own.go"), []byte("package root\n\nimport _ \"fmt\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A real directory outside the walked tree, plus a dir symlink into the
+	// tree and a .go file symlink at top level.
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "linked.go"), []byte("package linked\n\nimport _ \"fmt\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "review_link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "linked.go"), filepath.Join(root, "linked_file.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := scanTree(root, modulePathOf(t, root))
+	if err == nil {
+		t.Fatal("scan over a symlink returned no error — symlinks must be refused fail-closed, not walked past")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "symlink") || !(strings.Contains(msg, "review_link") || strings.Contains(msg, "linked_file.go")) {
+		// Walk order hits one of the two links first; the message must name
+		// the path it refused and say why.
+		t.Errorf("refusal message must name a symlink path and the reason, got: %s", msg)
 	}
 }
 
