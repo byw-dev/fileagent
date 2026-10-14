@@ -319,8 +319,14 @@ func fileSize(e *filerpb.Entry) int64 {
 // path: a non-directory entry (the common case), or a directory entry
 // carrying the prefix-object marker — S3's flat key space allows key "a"
 // beside key "a/b", and 4.48 stores such objects as marker-carrying
-// directories. Zero-byte prefix objects leave no chunks, content, or mime,
-// so the marker is the only signal (measured live; see D-038).
+// directories.
+//
+// Why the marker and not size or mime: a zero-byte object carries no size
+// (measured live), and an entry promoted from an empty file can carry
+// neither size nor mime; a mime alone does not identify an object either,
+// because `PUT d/` directory markers carry one. The prefix-object marker is
+// the only signal that distinguishes a key without a trailing slash from a
+// plain directory (see D-038's measured findings).
 //
 // Plain directories — including `PUT d/` directory markers, which 4.48
 // writes with a mime and ETag but no marker — do not represent objects and

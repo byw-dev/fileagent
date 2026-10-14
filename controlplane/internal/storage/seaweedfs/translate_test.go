@@ -40,6 +40,19 @@ func prefixObjectEntry(name string, size uint64) *filerpb.Entry {
 	}
 }
 
+// promotedPrefixObjectEntry builds the promotion-shape entry (measured raw
+// events.jsonl: a file promoted to a directory keeps its size and gains the
+// marker, but carries NO mime — unlike the put-retry shape above).
+func promotedPrefixObjectEntry(name string, size uint64) *filerpb.Entry {
+	e := dirEntry(name)
+	e.Attributes = &filerpb.FuseAttributes{FileSize: size}
+	e.Extended = map[string][]byte{
+		"x-seaweedfs-prefix-object": []byte("true"),
+		"Seaweed-X-Amz-Owner":       []byte("admin"),
+	}
+	return e
+}
+
 // implicitDirCreateResp fakes the implicit parent-directory creation event the
 // filer emits before the first object below that directory (measured: plain
 // directory, old=nil).
@@ -467,11 +480,12 @@ func TestTranslatePrefixObjectPutOntoChildPath(t *testing.T) {
 func TestTranslatePrefixObjectPromotion(t *testing.T) {
 	// Measured seq ②: PUT a/b after PUT a promotes the existing file to a
 	// directory keeping its data. The promotion event has old=nil and a
-	// marker-carrying directory as new.
+	// marker-carrying directory as new (raw shape: no mime on the promoted
+	// entry).
 	got := Translate(&filerpb.SubscribeMetadataResponse{
 		Directory:         "/buckets/b",
 		TsNs:              11,
-		EventNotification: &filerpb.EventNotification{NewEntry: prefixObjectEntry("a", 12)},
+		EventNotification: &filerpb.EventNotification{NewEntry: promotedPrefixObjectEntry("a", 12)},
 	})
 	require.Equal(t, []Change{{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 12, TsNs: 11}}, got)
 }
@@ -486,8 +500,10 @@ func TestTranslatePrefixObjectDeleteDemotes(t *testing.T) {
 }
 
 func TestTranslateZeroBytePrefixObject(t *testing.T) {
-	// Measured seq ④: a zero-byte PUT a (with a/b present) leaves no size on
-	// the entry; only the marker identifies it as an object.
+	// Measured seq ④: a zero-byte PUT a (with a/b present) carries no
+	// FileSize on the entry (mime/md5/ETag are present per raw events, but a
+	// mime alone would not distinguish it from a `PUT d/` directory marker) —
+	// the marker is what identifies it as an object.
 	got := Translate(prefixUpdateResp("b", "a", dirEntry("a"), prefixObjectEntry("a", 0), 13))
 	require.Equal(t, []Change{{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 0, TsNs: 13}}, got)
 }
@@ -502,6 +518,50 @@ func TestTranslateDeletePrefixObjectWithoutChildren(t *testing.T) {
 		EventNotification: &filerpb.EventNotification{OldEntry: prefixObjectEntry("a", 5)},
 	})
 	require.Equal(t, []Change{{Kind: ChangeRemoved, Bucket: "b", Key: "a", TsNs: 14}}, got)
+}
+
+func TestPrefixObjectMarkerPresenceOnly(t *testing.T) {
+	// The upstream judgment is presence-only (4.48
+	// weed/pb/filer_pb/filer_pb_helper.go Entry.IsPrefixObject:
+	// "_, marked := entry.Extended[key]; return marked"). The wire format
+	// writes "true", but any present key — empty value, nil value, "false" —
+	// must still mark an object; a regression to comparing the value would
+	// silently drop those entries.
+	marked := func(value []byte) *filerpb.Entry {
+		e := dirEntry("a")
+		e.Extended = map[string][]byte{"x-seaweedfs-prefix-object": value}
+		return e
+	}
+	for name, value := range map[string][]byte{
+		`"true"`:          []byte("true"),
+		"empty value":     {},
+		"nil value":       nil,
+		`"false" value`:   []byte("false"),
+		"arbitrary value": []byte("0xdeadbeef"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.True(t, isPrefixObject(marked(value)), "marker with %s must hit", name)
+			assert.True(t, representsObject(marked(value)), "entry with marker %s represents an object", name)
+		})
+	}
+
+	// Misses: no marker at all, nil entry, and a non-directory entry carrying
+	// the key (the marker only ever applies to directory entries).
+	assert.False(t, isPrefixObject(dirEntry("a")), "plain directory")
+	assert.False(t, isPrefixObject(nil), "nil entry")
+	withKey := fileEntry("a", 1)
+	withKey.Extended = map[string][]byte{"x-seaweedfs-prefix-object": []byte("true")}
+	assert.False(t, isPrefixObject(withKey), "non-directory entry is never a prefix object")
+	assert.True(t, representsObject(withKey), "non-directory entry still represents an object")
+}
+
+func TestTranslatePrefixObjectMarkerValueIrrelevant(t *testing.T) {
+	// End-to-end: a marker with an empty-string value still translates the
+	// entry as an object (presence-only, not value comparison).
+	neu := dirEntry("a")
+	neu.Extended = map[string][]byte{"x-seaweedfs-prefix-object": {}}
+	got := Translate(prefixUpdateResp("b", "a", dirEntry("a"), neu, 20))
+	require.Equal(t, []Change{{Kind: ChangeCreated, Bucket: "b", Key: "a", TsNs: 20}}, got)
 }
 
 func TestTranslateRenamePrefixObject(t *testing.T) {
@@ -600,7 +660,7 @@ func TestTranslateMeasuredSequencePromotion(t *testing.T) {
 		&filerpb.SubscribeMetadataResponse{
 			Directory:         "/buckets/b",
 			TsNs:              2,
-			EventNotification: &filerpb.EventNotification{NewEntry: prefixObjectEntry("a", 12)},
+			EventNotification: &filerpb.EventNotification{NewEntry: promotedPrefixObjectEntry("a", 12)},
 		},
 		createdResp("b", "a/b", 12, 3),
 	)
