@@ -24,6 +24,34 @@ func dirEntry(name string) *filerpb.Entry {
 	return &filerpb.Entry{Name: name, IsDirectory: true}
 }
 
+// prefixObjectEntry builds a directory entry that also carries the object
+// named by its path (the S3 "prefix object" representation, measured live on
+// 4.48: IsDirectory=true, marker in Extended, object size in attributes).
+// Zero-byte objects leave FileSize unset.
+func prefixObjectEntry(name string, size uint64) *filerpb.Entry {
+	return &filerpb.Entry{
+		Name:        name,
+		IsDirectory: true,
+		Attributes:  &filerpb.FuseAttributes{FileSize: size, Mime: "application/octet-stream"},
+		Extended: map[string][]byte{
+			"x-seaweedfs-prefix-object": []byte("true"),
+			"Seaweed-X-Amz-Owner":       []byte("admin"),
+		},
+	}
+}
+
+// implicitDirCreateResp fakes the implicit parent-directory creation event the
+// filer emits before the first object below that directory (measured: plain
+// directory, old=nil).
+func implicitDirCreateResp(bucket, dir string, ts int64) *filerpb.SubscribeMetadataResponse {
+	d, name := eventPaths(bucket + "/" + dir)
+	return &filerpb.SubscribeMetadataResponse{
+		Directory:         d,
+		TsNs:              ts,
+		EventNotification: &filerpb.EventNotification{NewEntry: dirEntry(name)},
+	}
+}
+
 // eventPaths splits "bucket/key" into the filer event fields: the directory
 // containing the entry and the entry name.
 func eventPaths(obj string) (dir, name string) {
@@ -229,8 +257,10 @@ func TestTranslateRenameCrossBucket(t *testing.T) {
 }
 
 func TestTranslateRenameOutOfUploadsStaging(t *testing.T) {
-	// Multipart finalize / FUSE move out of the staging area: only the final
-	// object survives the filters.
+	// A move out of the staging area via filer rename (filer HTTP / FUSE; the
+	// S3 multipart-complete path does NOT rename — see the measured sequence
+	// in TestTranslateMultipartNormalKey448). Only the final object survives
+	// the filters.
 	got := Translate(renamedResp("b", ".uploads/abc123/2", "mp/big.bin", 1<<20, 11))
 	require.Len(t, got, 1)
 	assert.Equal(t, ChangeCreated, got[0].Kind)
@@ -276,14 +306,19 @@ func TestTranslateFileAndDirectorySameName(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Equal(t, ChangeCreated, got[0].Kind)
 
-	// File replaced by a directory on the same path: the resulting entry is a
-	// directory, and directory entries never produce object changes.
+	// File replaced by a plain directory on the same path: the object the
+	// file represented is gone, so a Removed is emitted (entry no longer
+	// represents an object; reachable via filer-level UpdateEntry, not via a
+	// single S3 operation).
 	resp2 := &filerpb.SubscribeMetadataResponse{
 		Directory:         "/buckets/b",
 		TsNs:              7,
 		EventNotification: &filerpb.EventNotification{OldEntry: fileEntry("y", 3), NewEntry: dirEntry("y")},
 	}
-	assert.Empty(t, Translate(resp2))
+	got2 := Translate(resp2)
+	require.Len(t, got2, 1)
+	assert.Equal(t, ChangeRemoved, got2[0].Kind)
+	assert.Equal(t, "y", got2[0].Key)
 }
 
 func TestTranslateBucketRemoved(t *testing.T) {
@@ -387,12 +422,262 @@ func TestTranslateNilAndEmpty(t *testing.T) {
 func TestTranslateNestedBatchNotExpanded(t *testing.T) {
 	// A batch member that itself carries Events: only depth-one expansion is
 	// guaranteed by the wire format; nested batches are not produced by the
-	// server and not expanded here.
+	// server and not expanded here. The child below must never surface.
+	child := createdResp("b", "nested.txt", 1, 30)
 	inner := createdResp("b", "k", 1, 10)
+	inner.Events = []*filerpb.SubscribeMetadataResponse{child}
 	resp := &filerpb.SubscribeMetadataResponse{Events: []*filerpb.SubscribeMetadataResponse{inner}}
 	got := Translate(resp)
 	require.Len(t, got, 1)
 	assert.Equal(t, "k", got[0].Key)
+	for _, c := range got {
+		assert.NotEqual(t, "nested.txt", c.Key, "nested batch child must not be expanded")
+	}
+}
+
+// ---------------------------------------------------------------- prefix objects
+//
+// The fixtures below reproduce raw event shapes MEASURED against a live
+// one-shot SeaweedFS 4.48 (compose project b3-3a-probe, SubscribeLocalMetadata
+// with idle heartbeats + batching; raw JSONL in bin/probe/events.jsonl and
+// bin/probe/events-extra.jsonl, excerpted in bin/report-rework1.md). S3's flat
+// key space lets key "a" and "a/b" coexist: "a" is then represented as a
+// directory entry carrying the x-seaweedfs-prefix-object marker (4.48
+// weed/pb/filer_pb/filer_pb_helper.go Entry.IsPrefixObject / MarkPrefixObject).
+
+// prefixUpdateResp builds a same-path old→new event on /buckets/<bucket>/<key>
+// with explicit old/new entries (the shape of prefix-object puts and demotions).
+func prefixUpdateResp(bucket, key string, old, neu *filerpb.Entry, ts int64) *filerpb.SubscribeMetadataResponse {
+	dir, _ := eventPaths(bucket + "/" + key)
+	return &filerpb.SubscribeMetadataResponse{
+		Directory:         dir,
+		TsNs:              ts,
+		EventNotification: &filerpb.EventNotification{OldEntry: old, NewEntry: neu},
+	}
+}
+
+func TestTranslatePrefixObjectPutOntoChildPath(t *testing.T) {
+	// Measured seq ① step "put a (12B)" after "put a/b": the plain directory
+	// (auto-created for a/b) is replaced by a marker-carrying directory with
+	// the object's size.
+	got := Translate(prefixUpdateResp("b", "a", dirEntry("a"), prefixObjectEntry("a", 12), 10))
+	require.Equal(t, []Change{{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 12, TsNs: 10}}, got)
+}
+
+func TestTranslatePrefixObjectPromotion(t *testing.T) {
+	// Measured seq ②: PUT a/b after PUT a promotes the existing file to a
+	// directory keeping its data. The promotion event has old=nil and a
+	// marker-carrying directory as new.
+	got := Translate(&filerpb.SubscribeMetadataResponse{
+		Directory:         "/buckets/b",
+		TsNs:              11,
+		EventNotification: &filerpb.EventNotification{NewEntry: prefixObjectEntry("a", 12)},
+	})
+	require.Equal(t, []Change{{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 12, TsNs: 11}}, got)
+}
+
+func TestTranslatePrefixObjectDeleteDemotes(t *testing.T) {
+	// Measured seq ③ step "delete a (a/b remains)": deleting the object while
+	// children remain demotes the entry back to a plain directory (4.48
+	// weed/s3api/filer_util.go demoteDirectoryMarkerToImplicitDirectory) —
+	// old carries the marker, new is a plain directory, same path.
+	got := Translate(prefixUpdateResp("b", "a", prefixObjectEntry("a", 34), dirEntry("a"), 12))
+	require.Equal(t, []Change{{Kind: ChangeRemoved, Bucket: "b", Key: "a", TsNs: 12}}, got)
+}
+
+func TestTranslateZeroBytePrefixObject(t *testing.T) {
+	// Measured seq ④: a zero-byte PUT a (with a/b present) leaves no size on
+	// the entry; only the marker identifies it as an object.
+	got := Translate(prefixUpdateResp("b", "a", dirEntry("a"), prefixObjectEntry("a", 0), 13))
+	require.Equal(t, []Change{{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 0, TsNs: 13}}, got)
+}
+
+func TestTranslateDeletePrefixObjectWithoutChildren(t *testing.T) {
+	// Not part of the measured sequences (needs a filer-level delete of a
+	// marker-carrying directory with no children): a plain delete event whose
+	// old entry carries the marker must surface as Removed.
+	got := Translate(&filerpb.SubscribeMetadataResponse{
+		Directory:         "/buckets/b",
+		TsNs:              14,
+		EventNotification: &filerpb.EventNotification{OldEntry: prefixObjectEntry("a", 5)},
+	})
+	require.Equal(t, []Change{{Kind: ChangeRemoved, Bucket: "b", Key: "a", TsNs: 14}}, got)
+}
+
+func TestTranslateRenamePrefixObject(t *testing.T) {
+	// Rename where both sides are prefix objects: each side judged as an
+	// object on its own.
+	resp := &filerpb.SubscribeMetadataResponse{
+		Directory: "/buckets/b",
+		TsNs:      15,
+		EventNotification: &filerpb.EventNotification{
+			OldEntry:      prefixObjectEntry("a", 7),
+			NewEntry:      prefixObjectEntry("c", 7),
+			NewParentPath: "/buckets/b",
+		},
+	}
+	got := Translate(resp)
+	require.Len(t, got, 2)
+	assert.Equal(t, Change{Kind: ChangeRemoved, Bucket: "b", Key: "a", TsNs: 15}, got[0])
+	assert.Equal(t, Change{Kind: ChangeCreated, Bucket: "b", Key: "c", Size: 7, TsNs: 15}, got[1])
+}
+
+func TestTranslateRenamePlainDirToPrefixObject(t *testing.T) {
+	// Rename where only the new side is an object: Created only.
+	resp := &filerpb.SubscribeMetadataResponse{
+		Directory: "/buckets/b",
+		TsNs:      16,
+		EventNotification: &filerpb.EventNotification{
+			OldEntry:      dirEntry("a"),
+			NewEntry:      prefixObjectEntry("c", 3),
+			NewParentPath: "/buckets/b",
+		},
+	}
+	got := Translate(resp)
+	require.Equal(t, []Change{{Kind: ChangeCreated, Bucket: "b", Key: "c", Size: 3, TsNs: 16}}, got)
+}
+
+func TestTranslatePrefixObjectOverwriteKeepsCreated(t *testing.T) {
+	// Same-path overwrite between two prefix objects (PUT a twice while a/b
+	// exists): one Created with the new state.
+	got := Translate(prefixUpdateResp("b", "a", prefixObjectEntry("a", 1), prefixObjectEntry("a", 2), 17))
+	require.Equal(t, []Change{{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 2, TsNs: 17}}, got)
+}
+
+func TestTranslateDirectoryMarkerIsNotAnObject(t *testing.T) {
+	// Measured seq ⑥ (contrast): `PUT d/` writes a plain directory with a
+	// mime and ETag but NO prefix-object marker — the "directory marker"
+	// (4.48 weed/pb/filer_pb/filer_pb_helper.go IsDirectoryKeyObject via
+	// mime). Per D-037 it stays ignored, on put and on delete.
+	marker := dirEntry("d")
+	marker.Attributes = &filerpb.FuseAttributes{Mime: "application/octet-stream"}
+	marker.Extended = map[string][]byte{
+		"Seaweed-X-Amz-ETag":  []byte("etag"),
+		"Seaweed-X-Amz-Owner": []byte("admin"),
+	}
+	assert.Empty(t, Translate(&filerpb.SubscribeMetadataResponse{
+		Directory:         "/buckets/b",
+		TsNs:              18,
+		EventNotification: &filerpb.EventNotification{NewEntry: marker},
+	}), "directory-marker put")
+	assert.Empty(t, Translate(&filerpb.SubscribeMetadataResponse{
+		Directory:         "/buckets/b",
+		TsNs:              19,
+		EventNotification: &filerpb.EventNotification{OldEntry: marker},
+	}), "directory-marker delete")
+}
+
+// translateAll replays a raw event sequence the way the PR3b loop will
+// (envelope + batch members in order).
+func translateAll(events ...*filerpb.SubscribeMetadataResponse) (got []Change) {
+	for _, e := range events {
+		got = append(got, Translate(e)...)
+	}
+	return got
+}
+
+func TestTranslateMeasuredSequencePutSubThenPrefix(t *testing.T) {
+	// Measured seq ① (bucket probe1): implicit dir a, file a/b, then prefix
+	// object a onto the existing directory.
+	got := translateAll(
+		implicitDirCreateResp("b", "a", 1),
+		createdResp("b", "a/b", 12, 2),
+		prefixUpdateResp("b", "a", dirEntry("a"), prefixObjectEntry("a", 12), 3),
+	)
+	assert.Equal(t, []Change{
+		{Kind: ChangeCreated, Bucket: "b", Key: "a/b", Size: 12, TsNs: 2},
+		{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 12, TsNs: 3},
+	}, got)
+}
+
+func TestTranslateMeasuredSequencePromotion(t *testing.T) {
+	// Measured seq ② (bucket probe2): file a, then a/b promoting a to a
+	// marker-carrying directory, then file a/b. The promotion re-hints "a"
+	// (a duplicate Created for the same object is fine: events are hints and
+	// consumers re-read).
+	got := translateAll(
+		createdResp("b", "a", 12, 1),
+		&filerpb.SubscribeMetadataResponse{
+			Directory:         "/buckets/b",
+			TsNs:              2,
+			EventNotification: &filerpb.EventNotification{NewEntry: prefixObjectEntry("a", 12)},
+		},
+		createdResp("b", "a/b", 12, 3),
+	)
+	assert.Equal(t, []Change{
+		{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 12, TsNs: 1},
+		{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 12, TsNs: 2},
+		{Kind: ChangeCreated, Bucket: "b", Key: "a/b", Size: 12, TsNs: 3},
+	}, got)
+}
+
+func TestTranslateMeasuredSequenceDeleteDemotes(t *testing.T) {
+	// Measured seq ③ (bucket probe3): full lifecycle of a prefix object.
+	got := translateAll(
+		implicitDirCreateResp("b", "a", 1),
+		createdResp("b", "a/b", 12, 2),
+		prefixUpdateResp("b", "a", dirEntry("a"), prefixObjectEntry("a", 34), 3),
+		prefixUpdateResp("b", "a", prefixObjectEntry("a", 34), dirEntry("a"), 4),
+	)
+	assert.Equal(t, []Change{
+		{Kind: ChangeCreated, Bucket: "b", Key: "a/b", Size: 12, TsNs: 2},
+		{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 34, TsNs: 3},
+		{Kind: ChangeRemoved, Bucket: "b", Key: "a", TsNs: 4},
+	}, got)
+}
+
+func TestTranslateMeasuredSequenceZeroBytePrefix(t *testing.T) {
+	// Measured seq ④ (bucket probe4).
+	got := translateAll(
+		implicitDirCreateResp("b", "a", 1),
+		createdResp("b", "a/b", 7, 2),
+		prefixUpdateResp("b", "a", dirEntry("a"), prefixObjectEntry("a", 0), 3),
+	)
+	assert.Equal(t, []Change{
+		{Kind: ChangeCreated, Bucket: "b", Key: "a/b", Size: 7, TsNs: 2},
+		{Kind: ChangeCreated, Bucket: "b", Key: "a", Size: 0, TsNs: 3},
+	}, got)
+}
+
+func TestTranslateMeasuredSequenceMultipartOntoPrefix(t *testing.T) {
+	// Measured seq ⑤ (bucket probe5): multipart complete onto key a while
+	// a/b exists. On 4.48 the owner-routed commit fails ("existing entry is a
+	// directory", retried until the client gives up), so NO final-object
+	// event exists — only staging events, all filtered. (The no-owner code
+	// path would retry with MarkPrefixObject and emit the same marked-dir
+	// update shape as seq ①; source-verified, not measured.)
+	got := translateAll(
+		implicitDirCreateResp("b", "a", 1),
+		createdResp("b", "a/b", 9, 2),
+		mkdirResp("b", ".uploads", 3),
+		mkdirResp("b", ".uploads/86f7..1843", 4),
+		createdResp("b", ".uploads/86f7..1843/0001_xx.part", 5242880, 5),
+		createdResp("b", ".uploads/86f7..1843/0002_yy.part", 11, 6),
+	)
+	assert.Equal(t, []Change{
+		{Kind: ChangeCreated, Bucket: "b", Key: "a/b", Size: 9, TsNs: 2},
+	}, got)
+}
+
+func TestTranslateMultipartNormalKey448(t *testing.T) {
+	// Measured seq ⑦ (bucket probe7): non-versioned multipart complete to a
+	// key without children. Real 4.48 path (no rename involved): staging
+	// directory and parts, final parent dir, ONE create of the final object
+	// (size = sum of parts), then staging cleanup. .uploads root persists.
+	got := translateAll(
+		mkdirResp("b", ".uploads", 1),
+		mkdirResp("b", ".uploads/1b59..ecca", 2),
+		createdResp("b", ".uploads/1b59..ecca/0001_xx.part", 5242880, 3),
+		createdResp("b", ".uploads/1b59..ecca/0002_yy.part", 11, 4),
+		implicitDirCreateResp("b", "mp", 5),
+		createdResp("b", "mp/big.bin", 5242891, 6),
+		deletedResp("b", ".uploads/1b59..ecca/0001_xx.part", 7),
+		deletedResp("b", ".uploads/1b59..ecca/0002_yy.part", 8),
+		rmdirResp("b", ".uploads/1b59..ecca", 9),
+	)
+	assert.Equal(t, []Change{
+		{Kind: ChangeCreated, Bucket: "b", Key: "mp/big.bin", Size: 5242891, TsNs: 6},
+	}, got)
 }
 
 // ---------------------------------------------------------------- IsIdleHeartbeat

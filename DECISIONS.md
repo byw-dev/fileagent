@@ -2577,6 +2577,11 @@ MinIO 只作过渡，沿用 D-036 的自持镜像；D-036 相应降为过渡方�
    `/topics/.system/log/` 下最早的日志文件，游标早于它即告警并触发对账。filer 签名存在元数据库里，重启不变，不能用来发现重启。
 4. **事件翻译**：只认 `/buckets/<桶>/` 下的非目录条目；过滤 `/buckets/.system/` 与 `/.uploads/`；分片上传完成时只有一条最终对象的新建事件；
    删非空桶 409 且无事件；删空桶只有一条桶目录删除。
+   **修订（2026-10-15，PR #130 评审 F1）**：「只认非目录条目」改为「**只认代表对象的条目——非目录条目，或带
+   `x-seaweedfs-prefix-object` 标记的目录条目（prefix object）**」。S3 平面 key 空间允许 `a` 与 `a/b` 共存，
+   4.48 把这种 `a` 表示为带标记的目录（含零字节对象，标记是唯一信号）；删除这类对象而子 key 仍在时，上游把它降级回纯目录
+   （old 带标记 → new 纯目录），须产出 Removed。`PUT d/` 目录标记（只有 mime、无标记）仍过滤。
+   落地与实测见 D-038 及 `controlplane/internal/storage/seaweedfs`。
 
 spike 的验收：`deploy/scripts/smoke.sh` 在 SeaweedFS 上十二环全绿；初始化改为声明式 IAM 配置，取代 `init-minio.sh` 的 `mc` 流程。
 
@@ -2655,3 +2660,17 @@ pingcap/tidb parser 等），任何一个都会把 controlplane 的 `go` 指令�
 见 `proto/third_party/seaweedfs/README.md`（换版本 = 覆盖文件 + 更新 sha256 +
 `make generate-proto` + 过 `buf lint`/`buf breaking` + 核对
 `internal/storage/seaweedfs` 翻译逻辑所依据的上游源码行为无漂移）。
+
+### 实测补充（2026-10-15，PR #130 返工第 1 轮，live 探针）
+
+一次性 compose（`b3-3a-probe`，同 digest 4.48）+ `SubscribeLocalMetadata` 实测 prefix object 序列，结论：
+
+- `PUT a/b` 后 `PUT a`：old=纯目录 → new=带标记目录（FileSize=对象大小，mime/octet-stream）→ 翻译为 Created。
+- `PUT a` 后 `PUT a/b`（文件提升为目录）：事件为 **old=nil**、new=带标记目录（保留原大小）→ Created（与先前的文件 Created 构成重复提示，无害）。
+- 删除 `a`（`a/b` 仍在）：old=带标记目录 → new=纯目录（mime/大小/标记清空）→ Removed。
+- 零字节 `PUT a`：新条目无 FileSize，仅标记可识别 → Created(size 0)。
+- **分片完成到 `a`（`a/b` 已存在）在 4.48 单机 owner 路由下失败**（`routed mkfile … existing entry is a directory`，S3 客户端拿到
+  internal error 重试到放弃，最终对象不存在、无事件）；源码里无 owner 路径（`mkFile`）会带标记重试成功，事件形态同第 1 条（源码核对，未实测到）。
+- 对照：`PUT d/` 目录标记 = 纯目录 + mime + ETag、**无标记** → 仍按纯目录过滤；正常 key 的非版本化分片完成 =
+  staging 事件（全过滤）+ **一条最终对象 old=nil Created**（无 rename）。
+原始事件 JSONL 与探针代码在 `bin/probe/`（不提交）。

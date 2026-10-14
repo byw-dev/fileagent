@@ -10,6 +10,16 @@ import (
 // object data (bucket directories are /buckets/<bucket>).
 const bucketsPrefix = "/buckets/"
 
+// prefixObjectExtKey marks a directory entry that also carries the object
+// named by its path without a trailing slash: S3's flat key space allows key
+// "a" and key "a/b" to coexist, and "a" is then stored as a directory entry
+// (SeaweedFS 4.48, weed/s3api/s3_constants/header.go
+// SeaweedFSPrefixObject; the marker is written by
+// weed/pb/filer_pb/filer_pb_helper.go Entry.MarkPrefixObject on every path
+// that lands an object on a directory — mkFile retry, file→directory
+// promotion in weed/filer/filer.go, putToFiler retry).
+const prefixObjectExtKey = "x-seaweedfs-prefix-object"
+
 // ChangeKind classifies the effect a filer metadata event has on the object
 // namespace the control plane cares about.
 type ChangeKind int
@@ -74,20 +84,27 @@ type Change struct {
 // weed/server/filer_grpc_server_sub_meta.go pipelinedSender). Translate
 // expands one such response into [envelope] + Events, in order.
 //
-// Translation rules (D-037 第五条第 4 项, verified against SeaweedFS 4.48 in
-// docs/reports/storage-event-source.md §4):
+// Translation rules (D-037 第五条第 4 项, 2026-10-15 修订 per PR #130 评审;
+// verified against SeaweedFS 4.48 source and a live probe, see
+// docs/reports/storage-event-source.md §4 and D-038):
 //
-//   - Only non-directory entries below /buckets/<bucket>/ produce changes;
-//     /buckets/.system/ bookkeeping and <bucket>/.uploads/ multipart staging
-//     are filtered. Bucket names starting with "." are internal to the S3
-//     gateway and filtered as well (S3 bucket names cannot start with a dot,
-//     so no real bucket is lost).
+//   - Only entries that represent an object below /buckets/<bucket>/ produce
+//     changes: non-directory entries, or directory entries carrying the
+//     x-seaweedfs-prefix-object marker (S3 key "a" beside "a/b"). Plain
+//     directories — including `PUT d/` directory markers, which carry only a
+//     mime — stay filtered, as do /buckets/.system/ bookkeeping and
+//     <bucket>/.uploads/ multipart staging. Bucket names starting with "."
+//     are internal to the S3 gateway and filtered as well (S3 bucket names
+//     cannot start with a dot, so no real bucket is lost).
 //   - Create and overwrite both map to ChangeCreated; delete maps to
-//     ChangeRemoved.
+//     ChangeRemoved. An old entry that represented an object but whose new
+//     entry is a plain directory (the S3 gateway demotes a prefix object to
+//     a plain directory when the object is deleted while children remain)
+//     maps to ChangeRemoved.
 //   - Rename (old and new entry present with different full paths) maps to
 //     ChangeRemoved for the old path plus ChangeCreated for the new path,
-//     each filtered independently (so a move out of .uploads/ yields only the
-//     Created, as multipart finalize does when implemented via rename).
+//     each judged and filtered independently (so a move out of .uploads/
+//     yields only the Created).
 //   - Deletion of the /buckets/<bucket> directory itself maps to
 //     ChangeBucketRemoved; deleting /buckets or any deeper directory does
 //     not.
@@ -131,8 +148,8 @@ func appendOne(changes *[]Change, resp *filerpb.SubscribeMetadataResponse) {
 		return // idle heartbeat or flush report: no change
 	}
 	switch old, neu := n.GetOldEntry(), n.GetNewEntry(); {
-	case old == nil && neu != nil: // create
-		if neu.GetIsDirectory() {
+	case old == nil && neu != nil: // create (or promotion of a file to a prefix object)
+		if !representsObject(neu) {
 			return
 		}
 		if b, k, ok := splitObjectPath(joinPath(newDir(resp, n), neu.GetName())); ok {
@@ -146,51 +163,63 @@ func appendOne(changes *[]Change, resp *filerpb.SubscribeMetadataResponse) {
 		}
 	case old != nil && neu == nil: // delete
 		full := joinPath(resp.GetDirectory(), old.GetName())
-		if old.GetIsDirectory() {
-			// Only deletion of the bucket directory itself is meaningful:
-			// leveldb3 bucket deletion is a whole-store delete with a single
-			// directory event and no per-object events (D-037).
-			if b, ok := bucketRoot(full); ok {
+		if representsObject(old) {
+			if b, k, ok := splitObjectPath(full); ok {
 				*changes = append(*changes, Change{
-					Kind:        ChangeBucketRemoved,
-					Bucket:      b,
-					TsNs:        resp.GetTsNs(),
-					IsDirectory: true,
-				})
-			}
-			return
-		}
-		if b, k, ok := splitObjectPath(full); ok {
-			*changes = append(*changes, Change{
-				Kind:   ChangeRemoved,
-				Bucket: b,
-				Key:    k,
-				TsNs:   resp.GetTsNs(),
-			})
-		}
-	default: // old != nil && neu != nil: overwrite or rename
-		if neu.GetIsDirectory() {
-			return
-		}
-		oldFull := joinPath(resp.GetDirectory(), old.GetName())
-		newFull := joinPath(newDir(resp, n), neu.GetName())
-		if oldFull == newFull {
-			// Overwrite of the same path: one Created with the new state.
-			if b, k, ok := splitObjectPath(newFull); ok {
-				*changes = append(*changes, Change{
-					Kind:   ChangeCreated,
+					Kind:   ChangeRemoved,
 					Bucket: b,
 					Key:    k,
-					Size:   fileSize(neu),
 					TsNs:   resp.GetTsNs(),
 				})
 			}
 			return
 		}
-		// Rename: removal of the old path plus creation of the new path.
-		// A directory old entry never yields a Removed (only non-directory
-		// entries are object changes).
-		if !old.GetIsDirectory() {
+		// Plain directory: only deletion of the bucket directory itself is
+		// meaningful — leveldb3 bucket deletion is a whole-store delete with
+		// a single directory event and no per-object events (D-037).
+		if b, ok := bucketRoot(full); ok {
+			*changes = append(*changes, Change{
+				Kind:        ChangeBucketRemoved,
+				Bucket:      b,
+				TsNs:        resp.GetTsNs(),
+				IsDirectory: true,
+			})
+		}
+	default: // old != nil && neu != nil: overwrite, demotion, or rename
+		oldObj, newObj := representsObject(old), representsObject(neu)
+		if !oldObj && !newObj {
+			return // plain-directory transition (create/move of directories)
+		}
+		oldFull := joinPath(resp.GetDirectory(), old.GetName())
+		newFull := joinPath(newDir(resp, n), neu.GetName())
+		if oldFull == newFull {
+			// Same path: an object still represented there is Created with
+			// its new state; an old object whose new entry is a plain
+			// directory (prefix object deleted while children remain) is
+			// Removed.
+			if b, k, ok := splitObjectPath(newFull); ok {
+				if newObj {
+					*changes = append(*changes, Change{
+						Kind:   ChangeCreated,
+						Bucket: b,
+						Key:    k,
+						Size:   fileSize(neu),
+						TsNs:   resp.GetTsNs(),
+					})
+				} else {
+					*changes = append(*changes, Change{
+						Kind:   ChangeRemoved,
+						Bucket: b,
+						Key:    k,
+						TsNs:   resp.GetTsNs(),
+					})
+				}
+			}
+			return
+		}
+		// Rename: removal of the old path plus creation of the new path,
+		// each judged independently.
+		if oldObj {
 			if b, k, ok := splitObjectPath(oldFull); ok {
 				*changes = append(*changes, Change{
 					Kind:   ChangeRemoved,
@@ -200,14 +229,16 @@ func appendOne(changes *[]Change, resp *filerpb.SubscribeMetadataResponse) {
 				})
 			}
 		}
-		if b, k, ok := splitObjectPath(newFull); ok {
-			*changes = append(*changes, Change{
-				Kind:   ChangeCreated,
-				Bucket: b,
-				Key:    k,
-				Size:   fileSize(neu),
-				TsNs:   resp.GetTsNs(),
-			})
+		if newObj {
+			if b, k, ok := splitObjectPath(newFull); ok {
+				*changes = append(*changes, Change{
+					Kind:   ChangeCreated,
+					Bucket: b,
+					Key:    k,
+					Size:   fileSize(neu),
+					TsNs:   resp.GetTsNs(),
+				})
+			}
 		}
 	}
 }
@@ -282,4 +313,31 @@ func isUploadsStaging(key string) bool {
 // entry carries no attributes.
 func fileSize(e *filerpb.Entry) int64 {
 	return int64(e.GetAttributes().GetFileSize())
+}
+
+// representsObject reports whether an entry represents an object at its own
+// path: a non-directory entry (the common case), or a directory entry
+// carrying the prefix-object marker — S3's flat key space allows key "a"
+// beside key "a/b", and 4.48 stores such objects as marker-carrying
+// directories. Zero-byte prefix objects leave no chunks, content, or mime,
+// so the marker is the only signal (measured live; see D-038).
+//
+// Plain directories — including `PUT d/` directory markers, which 4.48
+// writes with a mime and ETag but no marker — do not represent objects and
+// stay filtered per D-037.
+func representsObject(e *filerpb.Entry) bool {
+	return !e.GetIsDirectory() || isPrefixObject(e)
+}
+
+// isPrefixObject reports whether a directory entry carries the
+// x-seaweedfs-prefix-object marker, replicating the exact judgment of
+// SeaweedFS 4.48 weed/pb/filer_pb/filer_pb_helper.go Entry.IsPrefixObject:
+// marker PRESENCE in Extended decides, the value is irrelevant, and entries
+// that are not directories never qualify.
+func isPrefixObject(e *filerpb.Entry) bool {
+	if e == nil || !e.GetIsDirectory() {
+		return false
+	}
+	_, marked := e.GetExtended()[prefixObjectExtKey]
+	return marked
 }
