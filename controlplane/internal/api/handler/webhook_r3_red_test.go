@@ -13,6 +13,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/cache"
 	"github.com/byw-dev/fileagent/controlplane/internal/config"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -190,7 +191,7 @@ func TestRED_B2_3_WebhookMaxParseBytesKnobWorks(t *testing.T) {
 	ix := &mockIndexerClient{}
 	fails := newCountingFailStore()
 	dead := &recordingSink{}
-	h := handler.NewMinioEventHandlerWithPolicyParseCap(ix, testWebhookSecret, fails, dead, 5, cfg.WebhookMaxParseBytes, newTestLogger())
+	h := handler.NewMinioEventHandlerWithPolicyParseCap(storageevent.NewIndexSink(ix), testWebhookSecret, fails, dead, 5, cfg.WebhookMaxParseBytes, newTestLogger())
 
 	filler := strings.Repeat("z", 9<<20) // > 8MiB default, < 16MiB raised
 	body := `{"filler":"` + filler + `","Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"data-sensor"},"object":{"key":"big-but-allowed.csv","size":1,"sequencer":"17KNOB0000000001"}}}]}`

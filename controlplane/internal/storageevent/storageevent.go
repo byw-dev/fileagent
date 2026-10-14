@@ -1,0 +1,75 @@
+// Package storageevent defines the Control Plane's「storage event source」
+// contract (DECISIONS.md D-037 rule 2): the single interface the index side
+// knows about object-storage change events, independent of which storage
+// backend produced them.
+//
+// Adapters translate their transport-specific payloads (MinIO S3 event
+// records today; the SeaweedFS filer subscription in PR3a/PR3b) into Event
+// values and hand them to a Sink. Business and index code never see a storage
+// client — that boundary is enforced by an import-boundary test in this
+// package (boundary_test.go).
+//
+// Events are a low-latency hint, not the source of truth: D-037 keeps
+// reconciliation (L2) authoritative, and consumers re-read object state via
+// the S3 API before writing the index.
+package storageevent
+
+import (
+	"strconv"
+	"time"
+)
+
+// Kind classifies a storage event. The numeric values are pinned by the
+// contract (KindObjectCreated = 1, ascending); do not renumber.
+type Kind int
+
+const (
+	// KindObjectCreated reports that an object was written (S3
+	// ObjectCreated:*, a filer CreateEntry notification).
+	KindObjectCreated Kind = iota + 1
+	// KindObjectRemoved reports that one object was deleted (S3
+	// ObjectRemoved:*, a filer DeleteEntry notification).
+	KindObjectRemoved
+	// KindBucketRemoved reports that a bucket directory was removed (only
+	// some backends emit it — SeaweedFS leveldb3/postgres2 delete a bucket as
+	// one directory event without per-object events). The index sink does not
+	// implement its semantics yet; see ErrUnsupportedKind.
+	KindBucketRemoved
+)
+
+// String returns a stable, log-friendly name for the kind.
+func (k Kind) String() string {
+	switch k {
+	case KindObjectCreated:
+		return "object_created"
+	case KindObjectRemoved:
+		return "object_removed"
+	case KindBucketRemoved:
+		return "bucket_removed"
+	default:
+		return "Kind(" + strconv.Itoa(int(k)) + ")"
+	}
+}
+
+// Event is one object-storage change, normalized across backends.
+type Event struct {
+	// Kind selects the routing semantics (see the Kind constants).
+	Kind Kind
+	// Bucket is the bucket name the event happened in.
+	Bucket string
+	// Key is the DECODED object key; empty for KindBucketRemoved. Producers
+	// that URL-encode keys in their payload (MinIO) must decode before
+	// filling this field — storage_path holds the real object key.
+	Key string
+	// Size is the object size in bytes; only meaningful for KindObjectCreated.
+	Size int64
+	// ETag is the object ETag; only meaningful for KindObjectCreated.
+	ETag string
+	// ObservedAt is the event time as observed at the source (payload
+	// eventTime / notification timestamp), not the local processing time.
+	ObservedAt time.Time
+	// Seq is the source-side ordering key (MinIO sequencer). Sources without
+	// a trustworthy ordering key leave it empty — D-037: a source timestamp
+	// that is not strictly ordered (SeaweedFS ts_ns) must NOT be used as one.
+	Seq string
+}

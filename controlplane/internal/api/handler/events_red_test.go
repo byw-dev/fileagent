@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -37,7 +38,7 @@ func postIC4A(t *testing.T, h *handler.MinioEventHandler, body string) *httptest
 // TestRED_HandlerReturns5xxWhenIndexingFails: IndexUpload error → 5xx (was 200).
 func TestRED_HandlerReturns5xxWhenIndexingFails(t *testing.T) {
 	ix := &mockIndexerClient{err: assert.AnError}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	w := postIC4A(t, h, `{"Records":[{"eventName":"s3:ObjectCreated:Put","s3":{"bucket":{"name":"b"},"object":{"key":"k","size":1,"sequencer":"17d2f3a1"}}}]}`)
 	assert.Equal(t, http.StatusInternalServerError, w.Code, "indexing failure must return 5xx so MinIO retries, got 200 (IC-BUG-6)")
 }
@@ -45,7 +46,7 @@ func TestRED_HandlerReturns5xxWhenIndexingFails(t *testing.T) {
 // TestRED_HandlerReturns5xxWhenDeletionFails: IndexDeletion error → 5xx (was 200).
 func TestRED_HandlerReturns5xxWhenDeletionFails(t *testing.T) {
 	ix := &mockIndexerClient{err: assert.AnError}
-	h := handler.NewMinioEventHandler(ix, testWebhookSecret, newTestLogger())
+	h := handler.NewMinioEventHandler(storageevent.NewIndexSink(ix), testWebhookSecret, newTestLogger())
 	w := postIC4A(t, h, `{"Records":[{"eventName":"s3:ObjectRemoved:Delete","s3":{"bucket":{"name":"b"},"object":{"key":"k","sequencer":"17d2f3a2"}}}]}`)
 	assert.Equal(t, http.StatusInternalServerError, w.Code, "deletion failure must return 5xx so MinIO retries, got 200 (IC-BUG-6)")
 }

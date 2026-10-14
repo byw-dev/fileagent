@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -44,7 +45,7 @@ func TestParseCap_ExactBoundary(t *testing.T) {
 		fails := newCountingFailStore()
 		dead := &recordingSink{}
 		h := handler.NewMinioEventHandlerWithPolicyParseCap(
-			ix, testWebhookSecret, fails, dead, 5, cap, newTestLogger())
+			storageevent.NewIndexSink(ix), testWebhookSecret, fails, dead, 5, cap, newTestLogger())
 
 		body := bodyOfExactly(t, cap)
 		require.Equal(t, cap, int64(len(body)), "test payload must be exactly the cap")
@@ -59,7 +60,7 @@ func TestParseCap_ExactBoundary(t *testing.T) {
 		fails := newCountingFailStore()
 		dead := &recordingSink{}
 		h := handler.NewMinioEventHandlerWithPolicyParseCap(
-			ix, testWebhookSecret, fails, dead, 5, cap, newTestLogger())
+			storageevent.NewIndexSink(ix), testWebhookSecret, fails, dead, 5, cap, newTestLogger())
 
 		body := bodyOfExactly(t, cap+1)
 		require.Equal(t, cap+1, int64(len(body)))
