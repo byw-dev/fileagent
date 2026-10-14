@@ -2510,6 +2510,7 @@ MinIO 只作过渡，沿用 D-036 的自持镜像；D-036 相应降为过渡方�
   filer 的 `ts_ns` 不能用来判断同一对象哪个版本更新（见下「已知约束」）。回读走 S3 而不走 filer，
   让全系统只有一个适配器讲 filer 协议。
 - 否决 SeaweedFS 原生的 `notification.toml` 推送：投递出错即丢弃事件，不可靠；filer webhook 在目标不可达时内存无界增长（报告 §3）。
+  （适配器消费 filer 协议的方式——vendored `filer.proto` 而非导入 seaweedfs Go 模块——见 **D-038**。）
 
 **三、D-031 的修订：JetStream 照常启用；NATS 的使用方向不在本条预先限定。**
 
@@ -2576,6 +2577,11 @@ MinIO 只作过渡，沿用 D-036 的自持镜像；D-036 相应降为过渡方�
    `/topics/.system/log/` 下最早的日志文件，游标早于它即告警并触发对账。filer 签名存在元数据库里，重启不变，不能用来发现重启。
 4. **事件翻译**：只认 `/buckets/<桶>/` 下的非目录条目；过滤 `/buckets/.system/` 与 `/.uploads/`；分片上传完成时只有一条最终对象的新建事件；
    删非空桶 409 且无事件；删空桶只有一条桶目录删除。
+   **修订（2026-10-15，PR #130 评审 F1）**：「只认非目录条目」改为「**只认代表对象的条目——非目录条目，或带
+   `x-seaweedfs-prefix-object` 标记的目录条目（prefix object）**」。S3 平面 key 空间允许 `a` 与 `a/b` 共存，
+   4.48 把这种 `a` 表示为带标记的目录（含零字节对象，标记是唯一信号）；删除这类对象而子 key 仍在时，上游把它降级回纯目录
+   （old 带标记 → new 纯目录），须产出 Removed。`PUT d/` 目录标记（只有 mime、无标记）仍过滤。
+   落地与实测见 D-038 及 `controlplane/internal/storage/seaweedfs`。
 
 spike 的验收：`deploy/scripts/smoke.sh` 在 SeaweedFS 上十二环全绿；初始化改为声明式 IAM 配置，取代 `init-minio.sh` 的 `mc` 流程。
 
@@ -2611,3 +2617,60 @@ spike 的验收：`deploy/scripts/smoke.sh` 在 SeaweedFS 上十二环全绿；�
 - **元数据后端选型**（leveldb3 / postgres2 等）：影响删桶代价、备份方式与容量，在 spike 中定。
 - **ETL 前缀级 STS policy**：报告 Tier 5 验证可行，但须改写 D-030 第八条「policy 写整桶」，等真实 ETL 接入时另立决策。
 - **检索模型 / 分区 / 计数契约 / UUIDv7**：见检索方案草稿，待容量基线出数后合并为一条决策。
+
+## D-038：vendored `filer.proto`，不导入 seaweedfs Go 模块
+
+**决策日期**：2026-10-15
+**影响范围**：`proto/third_party/seaweedfs/`、`buf.yaml`、`buf.gen.yaml`、`Makefile`
+（`generate-proto`）、`.github/workflows/ci-proto.yml`、
+`controlplane/internal/storage/seaweedfs/filerpb/`（生成物）
+**关联**：**D-037** 第二条（存储事件源 / 只有 SeaweedFS 适配器碰 filer 协议）、
+**D-032**（buf 管线，local 插件）、[`docs/reports/storage-event-source.md`](docs/reports/storage-event-source.md)
+
+### 背景
+
+SeaweedFS 适配器（B3）需要 `filer_pb.SubscribeMetadataResponse` 等消息类型。研究期原型
+（`research/storage-layer-eval/sub/`）直接 `import "github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"`，
+但那只能活在 research 工具里：上游 `go.mod` 声明 `go 1.26.6`、依赖
+`google.golang.org/grpc v1.85.0-dev.0.…`（dev 预发布），依赖面巨大（cloud.google.com、
+pingcap/tidb parser 等），任何一个都会把 controlplane 的 `go` 指令顶到 1.24.0 之上或拖入
+我们不接受的传递依赖。CP 实际只需要 wire 格式，不需要上游实现。
+
+### 决策
+
+1. **vendor 协议，不 vendor 实现**：把与部署镜像同版本的
+   `weed/pb/filer.proto`（tag `4.48`，commit `530be3e37…`）逐字节复制进
+   `proto/third_party/seaweedfs/filer.proto`，sha256 与升级步骤见同目录 README。
+   文件内容永不手改（保持与上游 tag 的可信映射）。
+2. **生成走既有 buf 管线（D-032）**：`buf.gen.yaml` 用 managed mode 的按路径
+   `go_package` override 把它指到
+   `controlplane/internal/storage/seaweedfs/filerpb`（managed 对 Java/ObjC/PHP/Ruby
+   默认值的注入显式 disable，保证 `api/v1` 生成物零 diff）；`make generate-proto`
+   把生成物移进 filerpb/，CI 漂移检查照旧覆盖。
+3. **lint 只豁免 `proto/third_party/`**（第三方文件不过我们的规矩，`proto/v1`
+   不放宽）；**breaking 不豁免**——上游升级若删字段/改编号会被 `buf breaking`
+   拦下来，这是给适配器的有意信号，不是需要绕过的误报。
+4. **任何 go.mod 不得引入 `github.com/seaweedfs/seaweedfs`**；filerpb 生成代码
+   只依赖 protobuf / grpc 运行时（controlplane 已有 v1.36.10 / v1.79.3，零新增）。
+   导入边界（只有 SeaweedFS 适配器碰 filer 协议）由 D-037 第二条约束，随适配器
+   落地时用导入边界测试守住（PR3b）。
+
+### 升级方法
+
+见 `proto/third_party/seaweedfs/README.md`（换版本 = 覆盖文件 + 更新 sha256 +
+`make generate-proto` + 过 `buf lint`/`buf breaking` + 核对
+`internal/storage/seaweedfs` 翻译逻辑所依据的上游源码行为无漂移）。
+
+### 实测补充（2026-10-15，PR #130 返工第 1 轮，live 探针）
+
+一次性 compose（`b3-3a-probe`，同 digest 4.48）+ `SubscribeLocalMetadata` 实测 prefix object 序列，结论：
+
+- `PUT a/b` 后 `PUT a`：old=纯目录 → new=带标记目录（FileSize=对象大小，mime/octet-stream）→ 翻译为 Created。
+- `PUT a` 后 `PUT a/b`（文件提升为目录）：事件为 **old=nil**、new=带标记目录（保留原大小）→ Created（与先前的文件 Created 构成重复提示，无害）。
+- 删除 `a`（`a/b` 仍在）：old=带标记目录 → new=纯目录（mime/大小/标记清空）→ Removed。
+- 零字节 `PUT a`：新条目无 FileSize，仅标记可识别 → Created(size 0)。
+- **分片完成到 `a`（`a/b` 已存在）在 4.48 单机 owner 路由下失败**（`routed mkfile … existing entry is a directory`，S3 客户端拿到
+  internal error 重试到放弃，最终对象不存在、无事件）；源码里无 owner 路径（`mkFile`）会带标记重试成功，事件形态同第 1 条（源码核对，未实测到）。
+- 对照：`PUT d/` 目录标记 = 纯目录 + mime + ETag、**无标记** → 仍按纯目录过滤；正常 key 的非版本化分片完成 =
+  staging 事件（全过滤）+ **一条最终对象 old=nil Created**（无 rename）。
+原始事件 JSONL 与探针代码在 `bin/probe/`（不提交）。

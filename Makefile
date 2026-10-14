@@ -91,6 +91,9 @@ generate-sqlc:
 #  同模块的其他工具加进 PATH，所以先把三个工具构建到 scratch 目录再注入 PATH 后运行 buf
 #  （buf 输出与插件版本只由 PATH 决定，因此 scratch 目录只是构建缓存，不影响产物内容）。
 #  生成先落到 scratch 目录再 mv 回既有位置 api/v1/，保持生成物路径与 source 署名不变。
+#  SeaweedFS filer.proto（vendored，D-038）走同一条管线：buf.gen.yaml 的 managed override
+#  把它的 go_package 改写到 CP 内部，生成物从 scratch 目录移到
+#  controlplane/internal/storage/seaweedfs/filerpb/（生成物随仓库提交，受 CI 漂移检查保护）。
 generate-proto:
 	@rm -rf $(PROTO_TOOLS_DIR) $(PROTO_OUT_DIR)
 	GOWORK=off go -C tools build -o ../$(PROTO_TOOLS_DIR)/ \
@@ -99,6 +102,10 @@ generate-proto:
 		google.golang.org/grpc/cmd/protoc-gen-go-grpc
 	PATH=$$PWD/$(PROTO_TOOLS_DIR):$$PATH $(PROTO_TOOLS_DIR)/buf generate
 	@mv $(PROTO_OUT_DIR)/proto/v1/agent.pb.go $(PROTO_OUT_DIR)/proto/v1/agent_grpc.pb.go api/v1/
+	@mkdir -p controlplane/internal/storage/seaweedfs/filerpb
+	@mv $(PROTO_OUT_DIR)/proto/third_party/seaweedfs/filer.pb.go \
+		$(PROTO_OUT_DIR)/proto/third_party/seaweedfs/filer_grpc.pb.go \
+		controlplane/internal/storage/seaweedfs/filerpb/
 	@rm -rf $(PROTO_TOOLS_DIR) $(PROTO_OUT_DIR)
 
 ## test: 运行全部单元测试

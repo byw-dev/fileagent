@@ -9,6 +9,9 @@ name: CI — Proto
 #   2. buf lint.
 #   3. buf breaking against master — machine-enforces the contract rule "only add
 #      fields, never renumber or delete fields" (previously human-enforced only).
+# Also covers the vendored SeaweedFS filer.proto (D-038): its generated code lives
+# in controlplane/internal/storage/seaweedfs/filerpb/ (not api/), so that path is
+# listed here too — direct edits there trigger the drift guard.
 # proto affects both controlplane and agent, and ci-cp.yml's paths don't include
 # proto/**, so this is a separate workflow.
 
@@ -17,6 +20,7 @@ on:
     paths:
       - 'proto/**'
       - 'api/**'
+      - 'controlplane/internal/storage/seaweedfs/filerpb/**'
       - 'tools/**'
       - 'buf.yaml'
       - 'buf.gen.yaml'
@@ -27,6 +31,7 @@ on:
     paths:
       - 'proto/**'
       - 'api/**'
+      - 'controlplane/internal/storage/seaweedfs/filerpb/**'
       - 'tools/**'
       - 'buf.yaml'
       - 'buf.gen.yaml'
