@@ -110,9 +110,9 @@ IC 残留项在 **CI 绿灯可信 + 账本重判**之前都不动。
 | **B1** ✅ | **QG 瘦身版**（PR #126；master 分支保护已开，必过检查 `codegen-drift + vet + test`）（[`quality-gates.md`](quality-gates.md) 顶部「瘦身」注记） | 只做 CP 侧：CI 起 PG，`-tags=integration` 真跑，三层防静默跳过（点名 15 个测试 / 语义标记 / skip 账本），覆盖率只打印不设闸；用户开 `master` 分支保护并登记 `codegen-drift + vet + test`。换存储要重写的入站与索引链路，正是这批测试守着的 |
 | **B2** ✅ | **存储事件源调研** | 结论已回填 D-037 第五条；报告 [`storage-event-source.md`](../reports/storage-event-source.md) |
 | **B3** | **SeaweedFS spike** | CP 内「存储事件源」接口 + 两个适配器 + 声明式 IAM；验收 = `smoke.sh` 在 SeaweedFS 上十二环全绿。**顺带完成 IC 账本重判**（原第 3 条）：未关缺陷里有一批与 MinIO 绑定（IC-BUG-7 / 40 / 41），换存储后再判可少判一轮 |
-| **B4** | **容量基线（只测不改）** | 与 B2、B3 并行。对照项见 [`tag-search-at-scale.md`](../reports/tag-search-at-scale.md) §6 |
-| **B5** | **检索模型决策** | 基线出数后立决策：检索模型 + 数据时间一等列（agent 在 `UploadResult` 上报，proto 只增字段）+ IC-6 分区 + IC-7 计数契约 + UUIDv7（需修订 CLAUDE.md「统一 UUID v4」） |
-| **B6** | **schema 落地** | 按 B5 实现；系统未发布，可借此执行 backlog「合并迁移文件」（需提前通知重建本地库） |
+| **B4** ✅ | **容量基线（只测不改）**（PR #128） | 报告 [`capacity-baseline.md`](../reports/capacity-baseline.md)。产品判断（2026-10-14）：UUIDv7 与精简索引方向已明确，**不再为补数字做正式环境复测**；单行写入的 FPI 计数有测量缺陷，见报告 §5 末尾注 |
+| **B5** | **检索模型决策** | **草案**：[`tag-search-at-scale.md`](../reports/tag-search-at-scale.md)（2026-10-14 修订：使用场景、数据时间选取规则、不引入外部搜索引擎、§3.7 只锁定以后改不动的部分；2026-10-15 按评审修订：身份表与检索表分离、计数只作提示、续扫令牌）。立决策：检索模型 + 数据时间一等列（agent 在 `UploadResult` 上报，proto 只增字段）+ IC-6 分区 + IC-7 计数契约 + UUIDv7（需修订 CLAUDE.md「统一 UUID v4」） |
+| **B6** | **schema 落地** | 只做 B5 草案 §3.7 的「B6 必做」一栏（`data_time` 列、按数据时间分区的检索表 + `tag_ids`、agent 上报 `data_time`、时间字段个数校验）；系统未发布，可借此执行 backlog「合并迁移文件」（需提前通知重建本地库） |
 | **B7** | **试点就绪清单** | SeaweedFS 部署与运维文档（元数据备份、日志清理、停机顺序、删桶流程），smoke 与 CI 切到 SeaweedFS |
 
 ---
