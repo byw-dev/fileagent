@@ -15,12 +15,16 @@
 # values are inserted as JSON string nodes by python's json module, so ANY
 # characters in credentials (quotes, backslashes, &, unicode) survive
 # byte-faithfully; the previous sed-based renderer corrupted them (rework
-# P2-1). python3 is already a hard dependency of smoke.sh (token parsing) and
-# of the CI runners that execute it, so this adds no new environment demand.
+# P2-1). smoke.sh and the CI runners already hard-depend on python3 (token
+# parsing), so THOSE hosts see no new demand; a standalone deployment host
+# running this renderer outside smoke must preinstall python3 — the standard
+# library alone suffices, no pip packages (rework R2 nit).
 #
-# Writes are ATOMIC per pair: both files are rendered to temporary files,
-# validated (legal JSON + no unreplaced placeholder), and only then renamed
-# into place — a failed render never overwrites the previous good configs.
+# Publish semantics (rework R2 P2, narrowed to the truth): each file is
+# replaced by an atomic same-directory rename, and a failure of the SECOND
+# rename rolls the first file back to its previous bytes. A process killed
+# BETWEEN the two renames can still leave a mixed generation (new s3.json +
+# old iam.json) — re-running the renderer converges, it is idempotent.
 #
 # The DEFAULTS below are development placeholders shared with
 # init-seaweedfs.sh and the seaweedfs branch of smoke.sh via
@@ -146,16 +150,42 @@ src, dst = sys.argv[1], sys.argv[2]
 with open(src, "r", encoding="utf-8") as f:
     doc = substitute(json.load(f))
 
-# SeaweedFS resolves an AssumeRole RoleArn by its trailing role-name segment
-# and looks that name up in iam.json's roles[].roleName (live-verified on
-# 4.48: a roleArn suffix that does not match roleName fails with "user ...
-# is not authorized to assume role ..."). The template keeps roleName fixed
-# while roleArn is a placeholder, so derive roleName from the substituted
-# ARN here — one source of truth, no drift.
+# roleName must mirror SeaweedFS 4.48's ExtractRoleNameFromArn
+# (weed/iam/utils/arn_utils.go): the ARN must start with "arn:aws:iam::",
+# the resource part must start with "role/", and the role name is the
+# COMPLETE remainder after "role/" — it may itself contain "/" (a path-style
+# ARN like ...:role/team/agent yields roleName "team/agent"). AssumeRole
+# resolves the role by exactly this name (iam_manager.go ->
+# roleStore.GetRole), so a derived name that disagrees with this rule fails
+# with "user ... is not authorized to assume role ...".
+IAM_ARN_PREFIX = "arn:aws:iam::"
+ROLE_MARKER = "role/"
+
+def extract_role_name(arn):
+    # Returns the role name per 4.48 semantics, or None when the ARN is
+    # invalid (wrong prefix, wrong resource type, or empty name).
+    if not arn.startswith(IAM_ARN_PREFIX):
+        return None
+    remainder = arn[len(IAM_ARN_PREFIX):]
+    resource = remainder
+    colon = remainder.find(":")
+    if colon != -1:
+        resource = remainder[colon + 1:]
+    if not resource.startswith(ROLE_MARKER):
+        return None
+    name = resource[len(ROLE_MARKER):]
+    return name or None
+
 for role in doc.get("roles", []):
     arn = role.get("roleArn", "")
-    if arn:
-        role["roleName"] = arn.rsplit("/", 1)[-1]
+    name = extract_role_name(arn)
+    if name is None:
+        sys.exit(
+            f"SW_AGENT_ROLE_ARN is not a valid IAM role ARN: {arn!r}\n"
+            f"Expected arn:aws:iam::[<account>:]role/<name> with a non-empty"
+            f" <name> (it may contain '/' path segments)."
+        )
+    role["roleName"] = name
 
 with open(dst, "w", encoding="utf-8") as f:
     json.dump(doc, f, indent=2, ensure_ascii=False)
@@ -165,8 +195,10 @@ PYEOF
 
 mkdir -p "${SW_CONFIG_DIR}"
 # Stage BOTH files as temporaries in the destination directory (same
-# filesystem => rename(2) is atomic); only after both validate do we move them
-# into place, so a failure never leaves a half-rendered pair behind.
+# filesystem => each rename(2) is atomic). Only after both validate are they
+# published; if the SECOND publish fails, the first is rolled back from an
+# in-place backup (see publish block below for the exact, narrowed
+# semantics — this is per-file atomicity plus rollback, not a transaction).
 TMP_S3="$(mktemp "${SW_CONFIG_DIR}/.s3.json.XXXXXX")"
 TMP_IAM="$(mktemp "${SW_CONFIG_DIR}/.iam.json.XXXXXX")"
 trap 'rm -f "${TMP_S3}" "${TMP_IAM}"' EXIT
@@ -183,9 +215,41 @@ python3 -m json.tool "${TMP_S3}" >/dev/null
 python3 -m json.tool "${TMP_IAM}" >/dev/null
 
 chmod 600 "${TMP_S3}" "${TMP_IAM}"
-mv -f "${TMP_S3}" "${SW_CONFIG_DIR}/s3.json"
-mv -f "${TMP_IAM}" "${SW_CONFIG_DIR}/iam.json"
+
+# --- Publish (rework R2 P2) -------------------------------------------------
+# Back up the currently published s3.json so a failure of the SECOND rename
+# can restore it; on a first run (no previous file) the rollback deletes the
+# half-published one instead, returning the directory to its pre-run state.
+# A process killed BETWEEN the two renames is NOT covered: that window can
+# leave a mixed generation (new s3 + old iam). Re-running the renderer
+# converges — it is idempotent and re-renders both files from the same env.
+PUBLISHED_S3="${SW_CONFIG_DIR}/s3.json"
+PUBLISHED_IAM="${SW_CONFIG_DIR}/iam.json"
+HAD_OLD_S3=0
+[ -f "${PUBLISHED_S3}" ] && HAD_OLD_S3=1
+BK_S3="$(mktemp "${SW_CONFIG_DIR}/.s3.json.bak.XXXXXX")"
+[ "${HAD_OLD_S3}" = "1" ] && cp -p "${PUBLISHED_S3}" "${BK_S3}"
+trap 'rm -f "${TMP_S3}" "${TMP_IAM}" "${BK_S3}"' EXIT
+
+mv -f "${TMP_S3}" "${PUBLISHED_S3}"
+if ! mv -f "${TMP_IAM}" "${PUBLISHED_IAM}"; then
+  echo "ERROR: publishing ${PUBLISHED_IAM} failed — rolling back ${PUBLISHED_S3} to its previous content." >&2
+  ROLLED_BACK=0
+  if [ "${HAD_OLD_S3}" = "1" ]; then
+    if cat "${BK_S3}" > "${PUBLISHED_S3}" 2>/dev/null; then
+      ROLLED_BACK=1
+    fi
+  else
+    rm -f "${PUBLISHED_S3}" && ROLLED_BACK=1
+  fi
+  if [ "${ROLLED_BACK}" != "1" ]; then
+    echo "ERROR: rollback of ${PUBLISHED_S3} ALSO failed — the published pair may now be a MIXED generation." >&2
+    echo "       Re-run the renderer with the same SW_* environment before starting the filer." >&2
+  fi
+  exit 1
+fi
 trap - EXIT
+rm -f "${BK_S3}"
 
 echo "Rendered SeaweedFS configs:"
 echo "  ${SW_CONFIG_DIR}/s3.json  (identities: admin, fileagent-controlplane)"
