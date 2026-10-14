@@ -1,0 +1,72 @@
+Output format is csv.
+section,version,shared_buffers,work_mem,maintenance_work_mem,effective_cache_size,full_page_writes,wal_compression,checkpoint_timeout,max_wal_size
+environment,"PostgreSQL 15.19 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",128MB,4MB,64MB,4GB,on,off,5min,1GB
+psql:<stdin>:6: NOTICE:  extension "pg_trgm" already exists, skipping
+psql:<stdin>:7: NOTICE:  extension "pgstattuple" already exists, skipping
+CREATE EXTENSION
+CREATE EXTENSION
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE TABLE
+CREATE TABLE
+CHECKPOINT
+INSERT 0 5000000
+metric,wal_bytes_per_row,full_page_images
+current_7_v4,16227.417936000000,12663910
+CHECKPOINT
+INSERT 0 5000000
+metric,wal_bytes_per_row,full_page_images
+current_7_v7_ordered,12693.814921600000,9684943
+CHECKPOINT
+INSERT 0 5000000
+metric,wal_bytes_per_row,full_page_images
+current_7_v7_random,12708.252670400000,9668151
+metric,relname,heap_bytes,indexes_bytes,total_bytes
+index_profile,index_v4_uuid,814735360,1918590976,2733588480
+index_profile,index_v7_ordered_uuid,814735360,1873879040,2688876544
+index_profile,index_v7_random_uuid,812556288,1994407936,2807193600
+metric,relname,pk_bytes,avg_leaf_density,leaf_fragmentation
+pk_profile,index_v4_uuid,202432512,70.21,49.84
+pk_profile,index_v7_ordered_uuid,157720576,90.04,0
+pk_profile,index_v7_random_uuid,205447168,69.18,49.66
+metric,relname,indexrelname,bytes
+index_sizes,index_v4_uuid,idx_v4_uuid_agent,227950592
+index_sizes,index_v4_uuid,idx_v4_uuid_bucket,440745984
+index_sizes,index_v4_uuid,idx_v4_uuid_org_type,363708416
+index_sizes,index_v4_uuid,idx_v4_uuid_path_trgm,241360896
+index_sizes,index_v4_uuid,idx_v4_uuid_status,1622016
+index_sizes,index_v4_uuid,index_v4_uuid_bucket_id_storage_path_key,440745984
+index_sizes,index_v4_uuid,index_v4_uuid_pkey,202432512
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_agent_id_uploaded_at_idx,227950592
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_bucket_id_storage_path_idx,440745984
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_bucket_id_storage_path_key,440745984
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_org_id_file_type_id_uploaded_at_idx,363708416
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_pkey,157720576
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_status_idx,1622016
+index_sizes,index_v7_ordered_uuid,index_v7_ordered_uuid_storage_path_idx,241360896
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_agent_id_uploaded_at_idx,265240576
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_bucket_id_storage_path_idx,440393728
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_bucket_id_storage_path_key,440393728
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_org_id_file_type_id_uploaded_at_idx,380002304
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_pkey,205447168
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_status_idx,1622016
+index_sizes,index_v7_random_uuid,index_v7_random_uuid_storage_path_idx,261283840
+set_config
+5000000
+CHECKPOINT
+DO
+metric,wal_bytes_per_row,full_page_images
+current_7_v4_single_wal,15791.040000000000,0
+CHECKPOINT
+DO
+metric,wal_bytes_per_row,full_page_images
+current_7_v7_ordered_single_wal,9986.6400000000000000,0
+CHECKPOINT
+DO
+metric,wal_bytes_per_row,full_page_images
+current_7_v7_random_single_wal,11653.840000000000,0
