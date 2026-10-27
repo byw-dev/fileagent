@@ -122,6 +122,7 @@ type fakeStore struct {
 	activeCount    int64
 	saveErr        error
 	markErr        error
+	markErrs       []error // consumed per RecordMark call; exhausted = ok
 }
 
 func (s *fakeStore) DeclaredCursor(_ context.Context, _ string) (int64, bool, error) {
@@ -144,6 +145,11 @@ func (s *fakeStore) SaveCursor(_ context.Context, _ string, declared int64) erro
 }
 
 func (s *fakeStore) RecordMark(_ context.Context, mark Mark) error {
+	if len(s.markErrs) > 0 {
+		err := s.markErrs[0]
+		s.markErrs = s.markErrs[1:]
+		return err
+	}
 	if s.markErr != nil {
 		return s.markErr
 	}
@@ -172,6 +178,9 @@ func (f *fakeSink) Apply(_ context.Context, ev storageevent.Event) error {
 }
 
 func (f *fakeSink) applyCount() int { return len(f.events) }
+
+// appliedCount is an alias used by the F0 loop-edge tests.
+func (f *fakeSink) appliedCount() int { return len(f.events) }
 
 // newLoopAdapter wires a fully-fake adapter for loop tests. reader is the
 // scripted S3 read-back the loop's HEAD calls hit.
@@ -407,32 +416,47 @@ func TestRunStream_HeartbeatPersistsCursor_AfterEventsApplied(t *testing.T) {
 	}
 }
 
-// A change that keeps failing must not advance the cursor: in-place retries
-// (1+ApplyMaxRetries attempts), then the stream is abandoned — and the NEXT
-// subscription resumes from ResumeFrom(persisted cursor, M), NOT from the
-// declared value (mutation ⑤) and NOT past the failing change (mutation ③).
+// errInjected marks the scripted failure whose propagation the F0 tests
+// verify — a bare "stream ended" (EOF/exhaustion) must NOT satisfy them.
+var errInjected = errors.New("injected failure")
+
+// A change that keeps failing must not advance the cursor NOR let the loop
+// consume anything beyond it: the stream carries a heartbeat and a later
+// identifiable event AFTER the failing one, and the test asserts they were
+// never reached (review F0 — the previous version stopped at the failure and
+// stayed green even when the failure was mutated into a skip). In-place
+// retries run (1+ApplyMaxRetries), then the stream is abandoned — and the
+// NEXT subscription resumes from ResumeFrom(persisted cursor, M), NOT from
+// the declared value (mutation ⑤) and NOT past the failing change (mutation ③).
 func TestRunStream_ApplyFailure_RetriesThenResubscribeFromRewoundCursor(t *testing.T) {
 	event := respCreated("/buckets/data-sensor", "stuck.csv", 3, 1_100)
+	after := respCreated("/buckets/data-sensor", "after.csv", 9, 1_500)
 	filer := &scriptedFiler{streams: []*scriptedStream{
-		{resps: []*filerpb.SubscribeMetadataResponse{event}},
+		{resps: []*filerpb.SubscribeMetadataResponse{event, respHeartbeat(2_000), after}},
 		{resps: []*filerpb.SubscribeMetadataResponse{event}},
 	}}
 	store := &fakeStore{cursorFound: true, cursorDeclared: 1_000}
-	sink := &fakeSink{errs: []error{errors.New("db down"), errors.New("db down"), errors.New("db down")}}
+	sink := &fakeSink{errs: []error{errInjected, errInjected, errInjected}}
 	reader := &fakeReader{outcome: map[string]any{"data-sensor/stuck.csv": ObjectInfo{Size: 3, ETag: "e"}}}
 	cfg := loopConfig()
 	cfg.ApplyMaxRetries = 2 // 1 attempt + 2 retries per stream
 	a := newLoopAdapter(t, cfg, filer, reader, store, sink, zap.NewNop())
 	last := store.cursorDeclared
 
-	if err := a.runStream(context.Background(), &last); err == nil {
-		t.Fatal("runStream = nil, want the apply-cap failure")
+	err := a.runStream(context.Background(), &last)
+	if !errors.Is(err, errInjected) {
+		t.Fatalf("runStream = %v, want the INJECTED error (EOF/exhaustion would mean the loop ran past the failure)", err)
 	}
 	if got := sink.applyCount(); got != 3 {
-		t.Errorf("Apply attempts = %d, want 3 (1 + ApplyMaxRetries 2)", got)
+		t.Errorf("Apply attempts = %d, want 3 (1 + ApplyMaxRetries 2, all on the failing change)", got)
+	}
+	for _, ev := range sink.events {
+		if ev.Key == "after.csv" {
+			t.Error("the event AFTER the failing one must never be applied (the loop must stop at the failure)")
+		}
 	}
 	if len(store.saves) != 0 {
-		t.Errorf("cursor saves = %v, want none — a failing change must not advance the cursor (mutation ③)", store.saves)
+		t.Errorf("cursor saves = %v, want none — a failing change must not advance the cursor, and the following heartbeat must not be persisted (mutation ③)", store.saves)
 	}
 	if last != 1_000 {
 		t.Errorf("lastDeclared = %d, want unchanged 1000", last)

@@ -120,16 +120,31 @@ func TestRunStream_GapMarkFailure_EndsStream(t *testing.T) {
 var errMarkInjected = errors.New("pg down")
 
 // A bucket-removed mark write failure is a stream failure: the incident must
-// not be forgotten.
+// not be forgotten, the following heartbeat must not persist a cursor, and the
+// later event must not be applied (review F0 — the previous version asserted
+// only a non-nil error and stayed green when the failure was mutated away).
 func TestRunStream_BucketRemovedMarkFailure_EndsStream(t *testing.T) {
 	filer := &scriptedFiler{streams: []*scriptedStream{{resps: []*filerpb.SubscribeMetadataResponse{
 		respBucketRemoved("doomed", 1_200),
+		respHeartbeat(2_000),
+		respCreated("/buckets/data-sensor", "after.csv", 3, 2_100),
 	}}}}
-	store := &fakeStore{cursorFound: true, cursorDeclared: 1_000, markErr: errMarkInjected}
-	a := newLoopAdapter(t, loopConfig(), filer, &fakeReader{outcome: map[string]any{}}, store, &fakeSink{}, zap.NewNop())
+	store := &fakeStore{cursorFound: true, cursorDeclared: 1_000, markErrs: []error{errMarkInjected}}
+	sink := &fakeSink{}
+	a := newLoopAdapter(t, loopConfig(), filer, &fakeReader{outcome: map[string]any{}}, store, sink, zap.NewNop())
 	last := store.cursorDeclared
-	if err := a.runStream(context.Background(), &last); err == nil {
-		t.Fatal("runStream = nil, want the bucket-removed mark failure")
+	err := a.runStream(context.Background(), &last)
+	if !errors.Is(err, errMarkInjected) {
+		t.Fatalf("runStream = %v, want the INJECTED mark error (EOF/exhaustion would mean the loop ran past the failure)", err)
+	}
+	if len(store.saves) != 0 {
+		t.Errorf("cursor saves = %v, want none — the heartbeat after the failed mark must not be persisted", store.saves)
+	}
+	if sink.appliedCount() != 0 {
+		t.Errorf("applied events = %d, want 0 — the event after the failed mark must never be applied", sink.appliedCount())
+	}
+	if last != 1_000 {
+		t.Errorf("lastDeclared = %d, want unchanged 1000", last)
 	}
 }
 
@@ -138,22 +153,38 @@ func TestRunStream_BucketRemovedMarkFailure_EndsStream(t *testing.T) {
 func TestRunStream_BucketRemovedCountFailure_EndsStream(t *testing.T) {
 	filer := &scriptedFiler{streams: []*scriptedStream{{resps: []*filerpb.SubscribeMetadataResponse{
 		respBucketRemoved("doomed", 1_200),
+		respHeartbeat(2_000),
+		respCreated("/buckets/data-sensor", "after.csv", 3, 2_100),
 	}}}}
 	store := &failingCountStore{fakeStore: fakeStore{cursorFound: true, cursorDeclared: 1_000}}
-	a := newLoopAdapter(t, loopConfig(), filer, &fakeReader{outcome: map[string]any{}}, &store.fakeStore, &fakeSink{}, zap.NewNop())
+	sink := &fakeSink{}
+	a := newLoopAdapter(t, loopConfig(), filer, &fakeReader{outcome: map[string]any{}}, &store.fakeStore, sink, zap.NewNop())
 	// Swap the store behind the adapter: CountActiveEntries fails, marks fine.
 	a.store = store
 	cursor := int64(1_000)
-	if err := a.runStream(context.Background(), &cursor); err == nil {
-		t.Fatal("runStream = nil, want the count failure")
+	err := a.runStream(context.Background(), &cursor)
+	if !errors.Is(err, errCountInjected) {
+		t.Fatalf("runStream = %v, want the INJECTED count error", err)
+	}
+	if len(store.fakeStore.saves) != 0 {
+		t.Errorf("cursor saves = %v, want none — the heartbeat after the failed count must not be persisted", store.fakeStore.saves)
+	}
+	if sink.appliedCount() != 0 {
+		t.Errorf("applied events = %d, want 0 — the event after the failed count must never be applied", sink.appliedCount())
+	}
+	if cursor != 1_000 {
+		t.Errorf("cursor = %d, want unchanged 1000", cursor)
 	}
 }
+
+// errCountInjected is the shared injected count failure.
+var errCountInjected = errors.New("count pg down")
 
 // failingCountStore fails only CountActiveEntries.
 type failingCountStore struct{ fakeStore }
 
 func (s *failingCountStore) CountActiveEntries(context.Context, string) (int64, error) {
-	return 0, errors.New("pg down")
+	return 0, errCountInjected
 }
 
 // ── selfCheck branch coverage ────────────────────────────────────────────────
