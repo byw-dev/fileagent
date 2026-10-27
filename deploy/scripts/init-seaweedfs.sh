@@ -20,8 +20,11 @@
 #      runtime: STS AssumeRole (with a session policy), CreateBucket, and a
 #      presigned GET round-trip
 #
-# Deliberately NOT done here: webhook / event subscription (B3-PR3b; D-037
-# rejected SeaweedFS notification.toml).
+# Deliberately NOT done here: webhook / event subscription configuration.
+# D-037 rejected SeaweedFS notification.toml; the event source is the CP's
+# in-process filer metadata subscription, wired since B3-PR3b (CP env
+# STORAGE_EVENT_SOURCE=seaweedfs_filer + SEAWEEDFS_FILER_GRPC_ADDR; nothing to
+# configure on the storage side).
 #
 # Requirements: `mc` AND `curl` (>= 7.75, for --aws-sigv4) on PATH.
 #
@@ -341,4 +344,4 @@ fi
 echo "  ⚠️  SeaweedFS stores lifecycle rules but does NOT execute them by itself;"
 echo "      a lifecycle worker is still an open gap (see PR description)."
 echo "  IAM       : declarative s3.json / iam.json (CP identity '${SW_CP_ACCESS_KEY}', role ${SW_AGENT_ROLE_ARN})"
-echo "  Events    : none configured by design (B3-PR3b will wire the filer subscription)"
+echo "  Events    : CP-side filer subscription (STORAGE_EVENT_SOURCE=seaweedfs_filer; wired in B3-PR3b, nothing to configure here)"
