@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"os"
@@ -29,6 +30,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/grpcserver"
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
+	"github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs"
 	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/byw-dev/fileagent/controlplane/internal/webui"
 	"github.com/byw-dev/fileagent/controlplane/internal/worker"
@@ -36,6 +38,7 @@ import (
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	natsgo "github.com/nats-io/nats.go"
+	"github.com/sqlc-dev/pqtype"
 	"go.uber.org/zap"
 )
 
@@ -84,6 +87,101 @@ func (n *natsListener) Subscribe(subject string, cb func(data []byte)) (func(), 
 		return nil, err
 	}
 	return func() { _ = sub.Unsubscribe() }, nil
+}
+
+// minioObjectReader adapts the minio-go client to the SeaweedFS adapter's
+// ObjectReader (the S3 HEAD of the D1 read-back). It owns the ONE nontrivial
+// mapping in the read-back path: a DEFINITIVE absence (NoSuchKey / any HTTP
+// 404, SeaweedFS S3 answers NoSuchBucket with 404 too) becomes
+// seaweedfs.ErrObjectAbsent; EVERY other error is returned verbatim so the
+// adapter treats it as a processing failure — a timeout/5xx/403 must never be
+// misread as "the object is gone" or CP would write wrongful deletions on a
+// storage hiccup (D1; see the adapter's mutation ① test).
+type minioObjectReader struct {
+	client *miniogo.Client
+}
+
+// StatObject implements seaweedfs.ObjectReader.
+func (r *minioObjectReader) StatObject(ctx context.Context, bucket, key string) (seaweedfs.ObjectInfo, error) {
+	info, err := r.client.StatObject(ctx, bucket, key, miniogo.StatObjectOptions{})
+	if err == nil {
+		return seaweedfs.ObjectInfo{Size: info.Size, ETag: info.ETag}, nil
+	}
+	if resp := miniogo.ToErrorResponse(err); resp.Code == "NoSuchKey" || resp.StatusCode == 404 {
+		return seaweedfs.ObjectInfo{}, seaweedfs.ErrObjectAbsent
+	}
+	return seaweedfs.ObjectInfo{}, err
+}
+
+// storageEventStore adapts the sqlc Queries to the SeaweedFS adapter's
+// CursorMarkStore (durable cursor + reconciliation marks, migration 000011).
+// Stateless: the source identity travels with each call.
+type storageEventStore struct {
+	q *db.Queries
+}
+
+// DeclaredCursor implements seaweedfs.CursorMarkStore (found=false on the
+// no-row fresh-deployment case).
+func (s *storageEventStore) DeclaredCursor(ctx context.Context, sourceID string) (int64, bool, error) {
+	declared, err := s.q.GetStorageEventCursor(ctx, sourceID)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return declared, true, nil
+}
+
+// SaveCursor implements seaweedfs.CursorMarkStore. The upsert's GREATEST guard
+// keeps the persisted value monotonic (a completeness claim never regresses).
+func (s *storageEventStore) SaveCursor(ctx context.Context, sourceID string, declaredTsNs int64) error {
+	return s.q.UpsertStorageEventCursor(ctx, sourceID, declaredTsNs)
+}
+
+// RecordMark implements seaweedfs.CursorMarkStore.
+func (s *storageEventStore) RecordMark(ctx context.Context, mark seaweedfs.Mark) error {
+	return s.q.InsertStorageEventMark(ctx, db.InsertStorageEventMarkParams{
+		SourceID: mark.SourceID,
+		Reason:   mark.Reason,
+		Bucket:   sql.NullString{String: derefOrEmpty(mark.Bucket), Valid: mark.Bucket != nil},
+		FromTsNs: nullInt64(mark.FromTsNs),
+		ToTsNs:   nullInt64(mark.ToTsNs),
+		Detail:   pqtype.NullRawMessage{RawMessage: mark.Detail, Valid: mark.Detail != nil},
+	})
+}
+
+// CountActiveEntries implements seaweedfs.CursorMarkStore.
+func (s *storageEventStore) CountActiveEntries(ctx context.Context, bucket string) (int64, error) {
+	return s.q.CountActiveFileEntriesByBucketName(ctx, bucket)
+}
+
+// dbClock adapts the sqlc Queries to the SeaweedFS adapter's DBClock (D2: the
+// read-back fact's ObservedAt is a DB clock_timestamp() reading taken before
+// the S3 HEAD — the same clock domain the index's eviction compares against).
+type dbClock struct {
+	q *db.Queries
+}
+
+// Now implements seaweedfs.DBClock.
+func (c *dbClock) Now(ctx context.Context) (time.Time, error) {
+	return c.q.SelectDBClockTimestamp(ctx)
+}
+
+// derefOrEmpty is a small helper for nullable-string mapping.
+func derefOrEmpty(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// nullInt64 maps *int64 to sql.NullInt64.
+func nullInt64(p *int64) sql.NullInt64 {
+	if p == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: *p, Valid: true}
 }
 
 func main() {
@@ -340,6 +438,41 @@ func main() {
 		}
 	}()
 
+	// ── Storage event source (B3-PR3b D6) ────────────────────────────────────
+	// minio_webhook (default): nothing to start — the webhook route below
+	// feeds the index as always. seaweedfs_filer: run the filer
+	// metadata-subscription adapter as a background worker on the same ctx as
+	// every other worker (clean shutdown, no half-written cursor on exit).
+	// The webhook route stays registered in BOTH modes (harmless, and it
+	// keeps the two sources symmetric during the transition).
+	// adapterDone is closed when the storage-event-source goroutine returns
+	// (nil when the adapter is disabled) — the shutdown path joins it.
+	var adapterDone <-chan struct{}
+	if cfg.StorageEventSource == config.StorageEventSourceSeaweedFSFiler {
+		// N2：必须「赋值」给外层声明的 adapterDone——用 := 会声明新的局部变量
+		// 遮蔽外层，退出时的 join 引用的还是 nil channel，永远不会等待。
+		done, err := startSeaweedfsEventSource(ctx, seaweedfsSourceConfig{
+			SourceID:     cfg.SeaweedfsSourceID(),
+			FilerAddr:    cfg.SeaweedfsFilerGRPCAddr,
+			ClientName:   cfg.SeaweedfsClientName,
+			ClientID:     cfg.SeaweedfsClientID,
+			ResumeMargin: cfg.SeaweedfsResumeMargin,
+			MaxRetries:   cfg.SeaweedfsApplyMaxRetries,
+			RetryBackoff: cfg.SeaweedfsApplyRetryBackoff,
+			MinioClient:  minioAdminClient,
+			Indexer:      ix,
+			Queries:      queries,
+			Logger:       logger,
+		})
+		if err != nil {
+			logger.Fatal("storage event source adapter init failed", zap.Error(err))
+		}
+		adapterDone = done
+	} else {
+		logger.Info("storage event source: minio webhook (default; SeaweedFS filer subscription disabled)",
+			zap.String("source", cfg.StorageEventSource))
+	}
+
 	// ── Build HTTP router ────────────────────────────────────────────────────
 	router := api.NewRouter(api.RouterConfig{
 		JWTSecret:              cfg.JWTSecret,
@@ -402,6 +535,13 @@ func main() {
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("HTTP server shutdown error", zap.Error(err))
+	}
+	// Lifecycle (review P2): wait for the storage-event-source adapter to
+	// return so a Recv/Apply in flight at cancellation is not cut off
+	// mid-write. Run exits on ctx cancellation; the bound only guards a wedged
+	// final DB call from delaying process exit forever.
+	if !awaitEventSourceStop(adapterDone, 10*time.Second) {
+		logger.Error("storage event source adapter did not stop within 10s of shutdown")
 	}
 	logger.Info("control plane stopped")
 }

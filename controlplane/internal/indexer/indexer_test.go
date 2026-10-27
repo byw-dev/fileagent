@@ -74,7 +74,7 @@ type mockIndexerStore struct {
 	insertTagErr   error
 	tagKeys        map[string]TagKeyInfo // key → controlled key info
 	tagKeyErr      error
-	existingValues map[string]bool       // "value" → registered in tag_values
+	existingValues map[string]bool // "value" → registered in tag_values
 	tagValueErr    error
 	similarValue   string
 	similarErr     error
@@ -90,6 +90,10 @@ func (m *mockIndexerStore) UpsertFileEntry(_ context.Context, params UpsertFileE
 	m.upsertCalls++
 	m.lastUpsert = params
 	return m.fileEntry, m.suppressed, m.upsertErr
+}
+
+func (m *mockIndexerStore) GetIndexedFileByKey(_ context.Context, _ uuid.UUID, _ string) (*db.FileEntry, error) {
+	return nil, sql.ErrNoRows
 }
 
 func (m *mockIndexerStore) MarkFileEntryDeleted(_ context.Context, _ db.DeleteIndexedFileParams) (*db.FileEntry, bool, bool, error) {
@@ -550,14 +554,14 @@ func TestIndexUpload_Success(t *testing.T) {
 		fileEntry: newSampleFileEntry(),
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.IndexUpload(context.Background(), "data-sensor", "uploads/file.csv", 1024, "abc123", time.Now().UTC(), "seq")
+	err := ix.IndexUpload(context.Background(), "data-sensor", "uploads/file.csv", 1024, "abc123", time.Now().UTC(), "seq", "minio_event")
 	require.NoError(t, err)
 }
 
 func TestIndexUpload_BucketNotFound(t *testing.T) {
 	store := &mockIndexerStore{bucketErr: assert.AnError}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.IndexUpload(context.Background(), "missing-bucket", "key.csv", 0, "", time.Now().UTC(), "seq")
+	err := ix.IndexUpload(context.Background(), "missing-bucket", "key.csv", 0, "", time.Now().UTC(), "seq", "minio_event")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "get bucket")
 }
@@ -568,7 +572,7 @@ func TestIndexUpload_UpsertError(t *testing.T) {
 		upsertErr: assert.AnError,
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.IndexUpload(context.Background(), "data-sensor", "key.csv", 100, "", time.Now().UTC(), "seq")
+	err := ix.IndexUpload(context.Background(), "data-sensor", "key.csv", 100, "", time.Now().UTC(), "seq", "minio_event")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "upsert file entry")
 }
@@ -585,7 +589,7 @@ func TestIndexDeletion_Found_MarksDeletedAndPublishes(t *testing.T) {
 	nats := newMockNATS()
 	ix := NewIndexerWithStore(store, nats, newTestLogger())
 
-	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv", time.Now().UTC(), "seq")
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv", time.Now().UTC(), "seq", "minio_event")
 	require.NoError(t, err)
 	published := nats.published["events.file.deleted"]
 	require.Len(t, published, 1, "events.file.deleted must be published")
@@ -600,7 +604,7 @@ func TestIndexDeletion_NotFound_NoOp(t *testing.T) {
 	nats := newMockNATS()
 	ix := NewIndexerWithStore(store, nats, newTestLogger())
 
-	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/never-indexed.csv", time.Now().UTC(), "seq")
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/never-indexed.csv", time.Now().UTC(), "seq", "minio_event")
 	require.NoError(t, err, "deleting an unindexed object is a no-op")
 	assert.Empty(t, nats.published["events.file.deleted"], "no event for a no-op delete")
 }
@@ -608,8 +612,38 @@ func TestIndexDeletion_NotFound_NoOp(t *testing.T) {
 func TestIndexDeletion_BucketError(t *testing.T) {
 	store := &mockIndexerStore{bucketErr: assert.AnError}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
-	err := ix.IndexDeletion(context.Background(), "data-sensor", "k", time.Now().UTC(), "seq")
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "k", time.Now().UTC(), "seq", "minio_event")
 	require.Error(t, err)
+}
+
+// TestIndexUpload_UnknownBucketSentinel pins the PR3b D5 contract: a bucket
+// with no ledger row is a DISTINCT, detectable outcome (errors.Is), not a
+// generic DB failure — the SeaweedFS read-back adapter must be able to tell
+// "unknown bucket, keep the stream moving" from "DB down, retry".
+func TestIndexUpload_UnknownBucketSentinel(t *testing.T) {
+	store := &mockIndexerStore{bucketErr: sql.ErrNoRows}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.IndexUpload(context.Background(), "ghost-bucket", "k", 1, "", time.Now().UTC(), "", "storage_readback")
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrUnknownBucket, "ErrNoRows from GetBucketByName must surface as ErrUnknownBucket")
+}
+
+func TestIndexDeletion_UnknownBucketSentinel(t *testing.T) {
+	store := &mockIndexerStore{bucketErr: sql.ErrNoRows}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.IndexDeletion(context.Background(), "ghost-bucket", "k", time.Now().UTC(), "", "storage_readback")
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrUnknownBucket)
+}
+
+// A REAL DB failure must not masquerade as the unknown-bucket sentinel — the
+// adapter retries the latter-class away but must not swallow genuine outages.
+func TestIndexUpload_DBErrorNotUnknownBucket(t *testing.T) {
+	store := &mockIndexerStore{bucketErr: context.DeadlineExceeded}
+	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
+	err := ix.IndexUpload(context.Background(), "data-sensor", "k", 1, "", time.Now().UTC(), "", "storage_readback")
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrUnknownBucket)
 }
 
 // ── MT-2: tagging engine ───────────────────────────────────────────────────────

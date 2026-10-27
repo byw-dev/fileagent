@@ -286,7 +286,7 @@ func TestIndexDeletion_PublishError_LoggedOnly(t *testing.T) {
 	core, logs := observer.New(zap.InfoLevel)
 	ix := NewIndexerWithStore(store, nats, zap.New(core))
 
-	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv", time.Now().UTC(), "seq")
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv", time.Now().UTC(), "seq", "minio_event")
 	require.NoError(t, err)
 	assert.NotZero(t, logs.FilterMessage("indexer: publish file deleted event").Len())
 }
@@ -301,7 +301,7 @@ func TestIndexDeletion_NilPublisher_NoPanic(t *testing.T) {
 	ix := NewIndexerWithStore(store, nil, zap.NewNop())
 
 	require.NotPanics(t, func() {
-		err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv", time.Now().UTC(), "seq")
+		err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv", time.Now().UTC(), "seq", "minio_event")
 		require.NoError(t, err)
 	})
 }
@@ -318,7 +318,7 @@ func TestIndexUpload_ClassifyError_StillIndexes(t *testing.T) {
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.IndexUpload(context.Background(), "data-sensor", "uploads/file.csv", 1024, "abc123", time.Now().UTC(), "seq")
+	err := ix.IndexUpload(context.Background(), "data-sensor", "uploads/file.csv", 1024, "abc123", time.Now().UTC(), "seq", "minio_event")
 	require.NoError(t, err)
 	assert.False(t, store.lastUpsert.FileTypeID.Valid, "classify failure must degrade to no file type")
 }
@@ -332,7 +332,7 @@ func TestIndexDeletion_MarkError_ReturnsError(t *testing.T) {
 	}
 	ix := NewIndexerWithStore(store, newMockNATS(), newTestLogger())
 
-	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv", time.Now().UTC(), "seq")
+	err := ix.IndexDeletion(context.Background(), "data-sensor", "uploads/gone.csv", time.Now().UTC(), "seq", "minio_event")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "mark file entry deleted")
 }

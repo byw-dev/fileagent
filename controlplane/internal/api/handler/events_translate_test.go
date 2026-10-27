@@ -45,6 +45,7 @@ func TestTranslateRecord_Created_HappyPath(t *testing.T) {
 		ETag:       "etag-1",
 		ObservedAt: translateRefTime,
 		Seq:        "17KNOB0000000001",
+		Source:     storageevent.SourceMinioEvent,
 	}
 	if ev != want {
 		t.Errorf("translateRecord(created) = %+v, want %+v", ev, want)

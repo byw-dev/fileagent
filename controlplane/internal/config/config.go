@@ -111,6 +111,70 @@ type Config struct {
 	// BootstrapAdminCredentialsFile is the file path where first-start generated
 	// admin credentials are written with 0600 permissions.
 	BootstrapAdminCredentialsFile string
+
+	// StorageEventSource selects which adapter feeds the file index (D-037
+	// rule 2 / PR3b D6): "minio_webhook" (default, the transitional MinIO
+	// S3-event webhook, unchanged behavior) or "seaweedfs_filer" (the
+	// SeaweedFS filer metadata subscription). Only seaweedfs_filer starts the
+	// subscription worker; the webhook route stays registered either way
+	// (registering it is harmless and keeps the two paths symmetrical).
+	StorageEventSource string
+
+	// SeaweedfsFilerGRPCAddr is the filer gRPC address (host:port) the
+	// subscription dials. REQUIRED when StorageEventSource is
+	// seaweedfs_filer (Validate rejects the combination without it).
+	SeaweedfsFilerGRPCAddr string
+
+	// SeaweedfsFilerInsecure is the explicit plaintext opt-in. Filer gRPC has
+	// NO token auth — only mTLS (D-037 known constraint) — and mTLS lands in
+	// B7; until then plaintext must be enabled deliberately per deployment,
+	// never by a silent default. Validate refuses seaweedfs_filer without
+	// SEAWEEDFS_FILER_INSECURE=true.
+	SeaweedfsFilerInsecure bool
+
+	// SeaweedfsResumeMargin is M, the rewind applied on every (re)subscribe to
+	// ride out filer clock rollback across restarts (D5; default 60s). The
+	// safety assumption: total clock rollback < M (filer host runs NTP slew).
+	SeaweedfsResumeMargin time.Duration
+
+	// SeaweedfsClientName/SeaweedfsClientID identify the subscriber to the
+	// filer. Both must be STABLE across CP restarts (the filer re-attaches a
+	// returning client to its backlog), hence the fixed defaults and the
+	// expectation that overrides never change across restarts.
+	SeaweedfsClientName string
+	SeaweedfsClientID   int32
+
+	// SeaweedfsApplyMaxRetries caps the in-place retries of one change's
+	// read-back+Apply before the subscription stream is abandoned and
+	// resubscribed from ResumeFrom(cursor, M). The change is never skipped.
+	SeaweedfsApplyMaxRetries int
+	// SeaweedfsApplyRetryBackoff is the wait between those in-place retries.
+	SeaweedfsApplyRetryBackoff time.Duration
+
+	// SeaweedfsSourceIDOverride optionally replaces the derived cursor/mark
+	// identity ("seaweedfs:<addr>") in storage_event_cursors/marks. Keep it
+	// stable: changing it orphans the old cursor (a full replay follows).
+	SeaweedfsSourceIDOverride string
+}
+
+// Storage-event-source selector values (D6).
+const (
+	// StorageEventSourceMinioWebhook keeps the transitional MinIO webhook as
+	// the only storage event source (the historical default).
+	StorageEventSourceMinioWebhook = "minio_webhook"
+	// StorageEventSourceSeaweedFSFiler enables the SeaweedFS filer
+	// metadata-subscription adapter (D-037 target backend).
+	StorageEventSourceSeaweedFSFiler = "seaweedfs_filer"
+)
+
+// SeaweedfsSourceID returns the storage_event_cursors/marks identity for this
+// deployment: the SEAWEEDFS_SOURCE_ID override when set, else
+// "seaweedfs:<filer addr>".
+func (c *Config) SeaweedfsSourceID() string {
+	if c.SeaweedfsSourceIDOverride != "" {
+		return c.SeaweedfsSourceIDOverride
+	}
+	return "seaweedfs:" + c.SeaweedfsFilerGRPCAddr
 }
 
 // Load reads configuration from environment variables and returns a validated
@@ -185,6 +249,21 @@ func Load() (*Config, error) {
 	cfg.BootstrapAdminForceReset = envBool("BOOTSTRAP_ADMIN_FORCE_RESET", false)
 	cfg.BootstrapAdminCredentialsFile = envString("BOOTSTRAP_ADMIN_CREDENTIALS_FILE", "bootstrap_admin_credentials.txt")
 
+	// ── storage event source (PR3b D6) ──────────────────────────────────────
+	// The raw value is loaded here and JUDGED in Validate: an unknown value
+	// must fail startup loudly, not silently fall back to the webhook.
+	cfg.StorageEventSource = envString("STORAGE_EVENT_SOURCE", StorageEventSourceMinioWebhook)
+	cfg.SeaweedfsFilerGRPCAddr = os.Getenv("SEAWEEDFS_FILER_GRPC_ADDR")
+	cfg.SeaweedfsFilerInsecure = envBool("SEAWEEDFS_FILER_INSECURE", false)
+	cfg.SeaweedfsResumeMargin = envDuration("SEAWEEDFS_RESUME_MARGIN", 60*time.Second)
+	cfg.SeaweedfsClientName = envString("SEAWEEDFS_CLIENT_NAME", "fileagent-controlplane")
+	// Stable numeric identity; env override for deployments that need to run
+	// several CP instances against one filer.
+	cfg.SeaweedfsClientID = int32(envInt("SEAWEEDFS_CLIENT_ID", 1))
+	cfg.SeaweedfsApplyMaxRetries = envInt("SEAWEEDFS_APPLY_MAX_RETRIES", 8)
+	cfg.SeaweedfsApplyRetryBackoff = envDuration("SEAWEEDFS_APPLY_RETRY_BACKOFF", time.Second)
+	cfg.SeaweedfsSourceIDOverride = os.Getenv("SEAWEEDFS_SOURCE_ID")
+
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required environment variables: %s",
 			strings.Join(missing, ", "))
@@ -236,6 +315,35 @@ func (c *Config) Validate() error {
 	if c.WebhookMaxParseBytes < handler.MinWebhookParseCap {
 		return fmt.Errorf("WEBHOOK_MAX_PARSE_BYTES=%d is below the safety floor %d — a near-zero parse cap turns every normal notification into a permanent 5xx",
 			c.WebhookMaxParseBytes, handler.MinWebhookParseCap)
+	}
+	// ── storage event source (PR3b D6) ──────────────────────────────────────
+	switch c.StorageEventSource {
+	case StorageEventSourceMinioWebhook:
+		// nothing more to check; the SeaweedFS variables are irrelevant here
+	case StorageEventSourceSeaweedFSFiler:
+		if c.SeaweedfsFilerGRPCAddr == "" {
+			return errors.New("STORAGE_EVENT_SOURCE=seaweedfs_filer requires SEAWEEDFS_FILER_GRPC_ADDR (the filer gRPC address to subscribe to)")
+		}
+		// Fail-closed (PR3b D6): filer gRPC has no token auth — only mTLS
+		// (D-037 known constraint) — and mTLS lands in B7. Until then,
+		// plaintext is an explicit per-deployment opt-in; a deployment that
+		// forgets the variable must fail at startup rather than dial an
+		// unauthenticated, all-powerful filer port in the clear.
+		if !c.SeaweedfsFilerInsecure {
+			return errors.New("STORAGE_EVENT_SOURCE=seaweedfs_filer requires SEAWEEDFS_FILER_INSECURE=true: this PR supports plaintext only (mTLS arrives in B7) and plaintext must be opted into explicitly — refusing to start rather than dial the filer unauthenticated")
+		}
+		if c.SeaweedfsResumeMargin <= 0 {
+			return errors.New("SEAWEEDFS_RESUME_MARGIN must be positive (it rewinds every resubscribe to cover filer clock rollback)")
+		}
+		if c.SeaweedfsApplyMaxRetries < 0 {
+			return errors.New("SEAWEEDFS_APPLY_MAX_RETRIES must not be negative")
+		}
+		if c.SeaweedfsApplyRetryBackoff < 0 {
+			return errors.New("SEAWEEDFS_APPLY_RETRY_BACKOFF must not be negative")
+		}
+	default:
+		return fmt.Errorf("STORAGE_EVENT_SOURCE must be %q or %q, got %q",
+			StorageEventSourceMinioWebhook, StorageEventSourceSeaweedFSFiler, c.StorageEventSource)
 	}
 	return nil
 }

@@ -1422,7 +1422,12 @@ func (s *STSManager) IssueCredentials(agentID string,
 >    否则删除事件重投会把刚重建的活对象再标成 `deleted`。修 IC-BUG-8 / IC-BUG-13 的防清空半边。
 > 2. **`observed_at` 按来源取各自最可信、且客户端左右不了的时刻**：`minio_event` ← 载荷的 `eventTime`
 >    （MinIO 生成）；`agent` / `api` ← **PostgreSQL 的 `now()`**（不是 CP 进程时钟——dev 实测进程时钟
->    比 PG/MinIO 慢约 16ms，用它会让每一次合法上报都被守卫拦掉）；`audit` ← 列举那一刻。
+>    比 PG/MinIO 慢约 16ms，用它会让每一次合法上报都被守卫拦掉）；`audit` ← 列举那一刻；
+>    `storage_readback`（B3-PR3b，SeaweedFS 事件源）← **HEAD 发出之前的 DB `clock_timestamp()`**——
+>    与 agent 行同一时钟域才可比，且取「HEAD 之前」使更晚的回读必带更晚的时间戳。
+>    ⚠️ 该「更晚必赢」只成立于**回读之间**（订阅流内严格顺序处理）；迟到的 agent 上报若插在回读取钟与
+>    HEAD 之间，适配器会收到 suppressed 并重新取时钟/HEAD/Apply（PR #135 返工 1，F1a）；但迟到上报落在
+>    回读落账**之后**仍会复活旧状态（agent 写入协议问题，与 MinIO 路径同源，靠 L2 对账兜底）。
 >    **绝不采信 `UploadResult.uploaded_at`**（由 agent 提供，报 `2099` 即可永久冻结该行）。
 > 3. **失败上报不写 `file_entries`，只写 `upload_logs`**（`file_entry_id` 置空）。原实现无论成败都 upsert，
 >    而 `DO UPDATE` 会无条件覆盖 `status`，能把「已成功上传、后来重传失败」的**活对象标成 `failed`**（IC-BUG-33）。
@@ -1839,6 +1844,30 @@ mc event add myminio/data-sensor arn:minio:sqs::primary:webhook \
 `file_entries`，故必须鉴权。CP 用配置项 `INTERNAL_WEBHOOK_SECRET` 校验 MinIO 发来的
 `auth_token`（`Authorization` 头，兼容 `Bearer <token>` 与裸 token，常量时间比较）。
 **未配置密钥时端点失败即拒（fail-closed）**，拒绝一切请求而非放行，避免未鉴权写入。
+
+> ✅ **存储事件源双形态（D-037 / B3-PR3b 落地；返工 2 补充边界）**：运行时的事件入口由
+> `STORAGE_EVENT_SOURCE` 选择——`minio_webhook`（默认，即本节的 webhook 链路，
+> 过渡期保留）或 `seaweedfs_filer`：CP 进程内订阅 SeaweedFS filer 元数据日志
+> （`SubscribeLocalMetadata` + 空闲心跳声明值持久游标），对每个事件按 (bucket, key)
+> 走 **S3 HEAD 回读当前状态再写索引**（事件只是提示；`observed_at` 取 HEAD 之前
+> 的 DB `clock_timestamp()`，与 agent 行同一时钟域），`source='storage_readback'`。
+> 断流按「声明值 − 余量 M」重订、绝不跳过事件；每次（重）订阅后的缺口窗口与
+> 游标越界、桶目录删除（D-037 第四条的事故信号）都只**落
+> `storage_event_marks` 待核对标记**（只写不消费，消费方是 L2 对账 IC-13）。
+> filer gRPC 无令牌鉴权（仅 mTLS，D-037 已知约束），本刀仅支持明文且必须显式
+> `SEAWEEDFS_FILER_INSECURE=true` 才启动（fail-closed）；mTLS 归 B7。
+> **suppress 的处理（返工 3，N1 同状态确认）**：回读写入被更新的观察压制
+> （`ErrSuppressed`）时，若账本当前状态已与回读事实一致（Created：completed 且
+> size/etag 相同；Removed：无行或 deleted）则视为**已处理**；状态不同才重取
+> 时钟 + 重新 HEAD + 重新 Apply（计入重试，超上限断流重订）。
+> **边界**：① 账本后建桶（先写对象后建 buckets 行）的旧事件若已越过 `声明值−M`，
+> 不会自动补账——需该 key 新事件 / 全量重放 / L2 补上；② 迁移 000011 down 不可在
+> 有 `storage_readback` 行时直接回滚（guard 拒绝）。精确回退流程：核实 schema 仍为
+> 000011 形态且 go-migrate 元数据为 **version=10, dirty=true**（实测：guard 拒绝时
+> dirty 位已先于 down SQL 置位、失败不清除）→ 处理 `storage_readback` 行（归档 /
+> 改写 / 确认丢弃，force 前后均可、最终 down 前必须完成）→ `migrate force 11` 清
+> dirty → `migrate down 1`（同见 `000011_*.down.sql` 头部注释与
+> `TestMigration000011_DirtyRecoveryAfterRefusedDown`）。
 
 ### 6.5.1 失败语义与死信（IC-4a ①，IC-BUG-6）
 

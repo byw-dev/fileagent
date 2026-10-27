@@ -24,6 +24,11 @@ func UpsertFileEntry(ctx context.Context, dbtx db.DBTX, arg UpsertFileEntryParam
 	return db.New(dbtx).UpsertObservedFile(ctx, arg)
 }
 
+// GetIndexedFileByKey returns the current row for one bucket/key.
+func GetIndexedFileByKey(ctx context.Context, dbtx db.DBTX, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error) {
+	return db.New(dbtx).GetIndexedFileByKey(ctx, bucketID, storagePath)
+}
+
 // ── CreateUploadLog ──────────────────────────────────────────────────────────
 
 // CreateUploadLogParams holds the parameters for CreateUploadLog.

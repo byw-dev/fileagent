@@ -10,8 +10,9 @@
 #   FA_STORAGE=seaweedfs bash deploy/scripts/smoke.sh
 #                                            # 同上，但对象存储用 SeaweedFS 拓扑
 #                                              （deploy/docker-compose.seaweedfs.yml +
-#                                              init-seaweedfs.sh；webhook 环为 PENDING，
-#                                              见下方「webhook 投递」一节）
+#                                              init-seaweedfs.sh；存储事件环断言
+#                                              filer 订阅 → S3 回读 → 索引，见
+#                                              下方「存储事件回读」一节）
 #   FA_BIN_DIR=bin bash deploy/scripts/smoke.sh   # CI：用上游 job 构建好的二进制
 #   KEEP=1 bash deploy/scripts/smoke.sh        # 失败排查：保留环境不清理
 #
@@ -143,6 +144,9 @@ sha256_of() {
 agent_is_pending() { psql_q "select 1 from agents where status='pending'" | grep -q 1; }
 file_is_indexed()  { psql_q "select 1 from file_entries where file_name='smoke.csv' and status='completed'" | grep -q 1; }
 probe_is_indexed() { psql_q "select 1 from file_entries where storage_path='probe/webhook-probe.txt' and source='minio_event'" | grep -q 1; }
+# 存储事件回读环（seaweedfs 分支）：建与删两向都断言（D1 的两个产出方向）。
+readback_is_indexed() { psql_q "select 1 from file_entries where storage_path='probe/readback-probe.txt' and source='storage_readback' and status='completed'" | grep -q 1; }
+readback_is_deleted() { psql_q "select 1 from file_entries where storage_path='probe/readback-probe.txt' and source='storage_readback' and status='deleted'" | grep -q 1; }
 
 # ── 前置检查：端口冲突要立刻说清楚 ─────────────────────────────────────────
 # 否则症状是 60 秒后的「CP /healthz 就绪 超时」，看不出是端口被占
@@ -217,6 +221,19 @@ else
   CP_ACCESS_KEY="cpAdminIAM000000000"
   CP_SECRET_KEY="cpAdminSecret00000000"
 fi
+# 存储事件源按后端切换（B3-PR3b D6）：seaweedfs 分支起 filer 订阅适配器
+# （明文 filer gRPC 必须显式 INSECURE=true，CP 才肯启动；dev/隔离环境专用）。
+# minio 分支显式走默认值 minio_webhook（现状行为；显式写出以避免空数组在
+# bash 3.2 + set -u 下的展开问题）。
+if [ "$FA_STORAGE" = "seaweedfs" ]; then
+  STORAGE_EVENT_ENV=(
+    STORAGE_EVENT_SOURCE=seaweedfs_filer
+    SEAWEEDFS_FILER_GRPC_ADDR="127.0.0.1:${FA_SEAWEEDFS_FILER_GRPC_PORT}"
+    SEAWEEDFS_FILER_INSECURE=true
+  )
+else
+  STORAGE_EVENT_ENV=(STORAGE_EVENT_SOURCE=minio_webhook)
+fi
 DATABASE_URL="postgres://fileagent:fileagent@127.0.0.1:${FA_POSTGRES_PORT}/fileagent?sslmode=disable" \
 REDIS_URL="redis://127.0.0.1:${FA_REDIS_PORT}/0" \
 NATS_URL="nats://127.0.0.1:${FA_NATS_PORT}" \
@@ -233,6 +250,7 @@ BOOTSTRAP_ADMIN_USERNAME="$ADMIN_USER" \
 BOOTSTRAP_ADMIN_PASSWORD="$ADMIN_PASS" \
 BOOTSTRAP_ADMIN_FORCE_RESET=true \
 BOOTSTRAP_ADMIN_CREDENTIALS_FILE="$WORK/bootstrap.txt" \
+  env "${STORAGE_EVENT_ENV[@]}" \
   "$BIN_DIR/controlplane" > "$WORK/cp.log" 2>&1 &
 CP_PID=$!
 
@@ -246,8 +264,8 @@ ok "内嵌迁移已自动应用"
 # ⚠️ 硬顺序：必须在 CP 起来之后跑（minio 分支）。MinIO 在 `mc admin config set`
 #    时会**真的去拨** webhook 端点，CP 没起来就直接失败。deployment.md 路线 A
 #    的 A.2→A.3 顺序是对的，dev 文档以前没写。
-#    seaweedfs 分支本身没有回拨 CP 的配置（事件源归 PR3b），保持同一顺序只是
-#    让两条分支的步骤排列一致。
+#    seaweedfs 分支的存储事件源已随 PR3b 接线（CP 启动即订阅 filer），保持
+#    同一顺序只是让两条分支的步骤排列一致。
 if [ "$FA_STORAGE" = "seaweedfs" ]; then
   step "初始化 SeaweedFS（buckets / 生命周期 / 三项自检）"
   SW_S3_ENDPOINT="http://localhost:${FA_SEAWEEDFS_S3_PORT}" \
@@ -381,13 +399,33 @@ fe() { psql_q "select coalesce(${1}::text,'<null>') from file_entries where file
 
 # source 放在最前面断言：agent 不上报时 webhook 兜底路径**仍会建出行**，
 # 所以「有没有行」挡不住 IC-2a 回归，「行是谁写的」才挡得住。
-DB_SOURCE="$(fe source)"
-[ "$DB_SOURCE" = "agent" ] || fail "source='${DB_SOURCE}'，期望 'agent' —— 索引行不是 agent 上报写的（IC-2a 主路径回归，退化成了 webhook 兜底）"
+# seaweedfs 分支（PR #135 返工 1 修正）：filer 订阅开启后，S3 回读也会为同一
+# 对象建行/刷新行（D-037：事件只是提示，回读才是事实），且回读行的
+# observed_at（HEAD 前的 DB 时钟）**可能晚于** agent 行的 now()——尤其在高负载
+# 下——此时行的 source 合法地变为 'storage_readback'（upsert 的 COALESCE 保留
+# agent 写入的 sha256/agent_id/rule_id）。因此 seaweedfs 分支改用「agent 专属
+# 字段」断言 agent 主路径（upload_logs 只有 agent 写；agent_id/rule_id 只有
+# agent 上报填），source 允许两者；minio 分支维持严格 source='agent'。
+if [ "$FA_STORAGE" = "seaweedfs" ]; then
+  agent_row_is_source_of_truth() {
+    [ "$(psql_q "select count(*) from file_entries where file_name='smoke.csv' and agent_id is not null and rule_id is not null")" -ge 1 ]
+  }
+  wait_for "file_entries 出现 agent 上报写入的索引行（agent_id/rule_id 已填）" 120 agent_row_is_source_of_truth
+  DB_SOURCE="$(fe source)"
+  case "$DB_SOURCE" in
+    agent|storage_readback) ;;
+    *) fail "source='${DB_SOURCE}'，期望 'agent' 或 'storage_readback'（seaweedfs：回读行可能后到并以更晚时钟覆盖）" ;;
+  esac
+fi
+if [ "$FA_STORAGE" != "seaweedfs" ]; then
+  DB_SOURCE="$(fe source)"
+  [ "$DB_SOURCE" = "agent" ] || fail "source='${DB_SOURCE}'，期望 'agent' —— 索引行不是 agent 上报写的（IC-2a 主路径回归，退化成了 webhook 兜底）"
+fi
 DB_SHA="$(fe sha256)"
 [ "$DB_SHA" = "$SRC_SHA" ] || fail "索引的 sha256 与源文件不符：${DB_SHA} != ${SRC_SHA}"
 [ "$(fe agent_id)" != "<null>" ] || fail "file_entries.agent_id 为空（归属信息丢失）"
 [ "$(fe rule_id)"  != "<null>" ] || fail "file_entries.rule_id 为空（归属信息丢失）"
-ok "索引行字段正确（source=agent / sha256 / agent_id / rule_id）"
+ok "索引行字段正确（source=${DB_SOURCE} / sha256 / agent_id / rule_id）"
 
 # 写放大护栏（原子落盘）：规则用的是默认 append_mode（overwrite），文件是原子 mv 进来的，
 # 所以恰好 1 条是确定的。默认模式一旦再次出现重复上传，这里就会红。
@@ -425,18 +463,28 @@ BULK_DB_SHA="$(psql_q "select coalesce(sha256::text,'<null>') from file_entries 
 [ "$BULK_DB_SHA" = "$BULK_SHA" ] || fail "bulk.csv 索引的 sha256 与源文件不符：$BULK_DB_SHA != $BULK_SHA —— 上传了写到一半的内容（截断上传回归）"
 ok "16MB 分块写终态连续 3 轮均为 1 次上传，且 sha256 与源文件一致（无写放大、无截断上传）"
 
-# ── webhook 投递（配置契约护栏）────────────────────────────────────────────
-# 上面所有断言都要求 source='agent'，也就是**主路径**。这意味着 webhook 整条
-# 链路（MinIO 通知 → CP 鉴权 → 索引）就算完全坏掉，上面也全是绿的——
-# INTERNAL_WEBHOOK_SECRET 与 init-minio.sh 的 WEBHOOK_AUTH_TOKEN 一旦漂移，
-# CP 会 401 拒绝所有事件，而没有任何断言会红（评审实测：故意写错 token 仍全绿）。
-# 所以这里绕开 agent 直接往 bucket 里放一个对象，断言它以 source='minio_event'
-# 进索引——这是对账兜底能力的唯一探针。
-# seaweedfs 分支下没有存储事件源（D-037：事件源走 filer 订阅适配器，归
-# B3-PR3b），这一环不执行、不算通过；结尾横幅同步如实标注。
+# ── 存储事件回读（配置契约护栏）────────────────────────────────────────────
+# 上面所有断言都要求 source='agent'，也就是**主路径**。这意味着存储事件源
+# 整条链路就算完全坏掉，上面也全是绿的——所以这里绕开 agent 直接往 bucket 里
+# 放一个探针对象。两条分支各验各的事件链路，机制不同、断言同等严格：
+#   - minio：MinIO 通知 → CP webhook → 索引（source='minio_event'）；
+#   - seaweedfs：filer 元数据订阅 → S3 HEAD 回读 → 索引（source='storage_readback'），
+#     再删掉探针对象，断言软删除也经回读落账（status='deleted'）——这是
+#     D1「事件只是提示、按回读写账」两向（建/删）的唯一探针。
+# mc 探针用 ADMIN 身份（CP 身份按 iam.json.tpl 刻意没有 s3:DeleteObject；
+# 探针要删对象，借 admin 的全权限，与被测的 CP 链路无关）。
 if [ "$FA_STORAGE" = "seaweedfs" ]; then
-  step "webhook 投递（seaweedfs 下不执行）"
-  echo "  PENDING(B3-PR3b): 存储事件源尚未接入 SeaweedFS"
+  step "存储事件回读（绕过 agent：filer 订阅 → S3 回读 → 索引）"
+  mc alias set swadmin "http://localhost:${FA_SEAWEEDFS_S3_PORT}" \
+    "$SW_ADMIN_ACCESS_KEY" "$SW_ADMIN_SECRET_KEY" >/dev/null \
+    || fail "mc alias swadmin 失败（无法投放回读探针）"
+  printf 'readback probe\n' > "$WORK/probe.txt"
+  mc cp --quiet "$WORK/probe.txt" "swadmin/data-sensor/probe/readback-probe.txt" >/dev/null \
+    || fail "mc cp 失败（无法投放回读探针对象）"
+  wait_for "filer 事件经回读进索引（source=storage_readback）" 90 readback_is_indexed
+  mc rm "swadmin/data-sensor/probe/readback-probe.txt" >/dev/null \
+    || fail "mc rm 失败（无法删除回读探针对象）"
+  wait_for "回读删除进索引（status=deleted）" 90 readback_is_deleted
 else
   step "webhook 投递（绕过 agent 的对账兜底路径）"
   printf 'webhook probe\n' > "$WORK/probe.txt"
@@ -467,9 +515,10 @@ ok "下载内容与源文件逐字节一致（${SRC_SHA}）"
 
 echo ""
 echo "════════════════════════════════════════════════════════"
+# 两条分支都只在**真的全过**时走到这里（任何一环失败都会被 fail 截停），
+# 横幅可以如实打印同一句话；后端区别放在括号里备查。
 if [ "$FA_STORAGE" = "seaweedfs" ]; then
-  # 不打印「十二环全部通过」：webhook 环在 seaweedfs 下是 PENDING，不是通过。
-  echo " SMOKE PASSED (seaweedfs, 事件环 PENDING)"
+  echo " SMOKE PASSED — 目标 A 的十二环全部通过（seaweedfs：存储事件环走 filer 订阅回读）"
 else
   echo " SMOKE PASSED — 目标 A 的十二环全部通过"
 fi

@@ -14,6 +14,60 @@ import (
 // B3-PR3b.
 var ErrUnsupportedKind = errors.New("storageevent: event kind not supported by the index sink")
 
+// ErrEmptySource is returned by the index sink for an Event whose Source is
+// empty. Adapters must label every fact with its provenance explicitly
+// (Event.Source); the sink refuses to guess, because a mislabeled row corrupts
+// the ledger's answer to "who wrote this fact" forever after.
+var ErrEmptySource = errors.New("storageevent: event Source is empty — adapters must set it explicitly")
+
+// ErrSuppressed is returned by a suppression-aware Sink (see
+// SuppressionReporting / NewSuppressionAwareIndexSink) when the index write
+// was EVICTED by a newer observation instead of landing: the row's
+// observed_at already exceeds this fact's, so the fact was not applied. It is
+// a retryable outcome, not a processing failure in the dead-letter sense —
+// the read-back adapter re-derives the fact (fresh DB clock + fresh HEAD +
+// re-Apply, F1a); once the newer write is on the row, the fresh clock wins.
+// The plain NewIndexSink keeps returning nil for suppressed writes (MinIO
+// webhook behavior unchanged).
+var ErrSuppressed = errors.New("storageevent: index write suppressed by a newer observation")
+
+// SuppressionReporting is an optional IndexWriter extension for
+// implementations that can distinguish "the write landed" from "the write was
+// evicted by a newer observation". The signatures mirror IndexWriter's and
+// return the suppression flag alongside the same error semantics.
+//
+// The MinIO webhook path does not need it — a suppressed webhook event is
+// processed, full stop (the newer observation is by definition fresher). The
+// SeaweedFS read-back adapter needs it: its facts are re-derived from live S3
+// state, so a suppressed fact has to be re-read and re-applied with a fresh
+// clock instead of being acknowledged (the suppressed write may have been the
+// key's LAST event — acknowledging it would lose the deletion forever).
+type SuppressionReporting interface {
+	// IndexUploadReporting mirrors IndexUpload and reports whether the write
+	// was suppressed by the index's observed_at eviction guard.
+	IndexUploadReporting(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string, source string) (suppressed bool, err error)
+	// IndexDeletionReporting mirrors IndexDeletion likewise.
+	IndexDeletionReporting(ctx context.Context, bucketName, objectKey string, observedAt time.Time, eventSeq string, source string) (suppressed bool, err error)
+	// RowState reports the CURRENT ledger state of one key (N1): what the
+	// adapter compares against the fact it just read back, to tell a
+	// "same-state confirmation" (a newer observation already recorded exactly
+	// this fact — treat as processed) from a genuine conflict (re-derive).
+	RowState(ctx context.Context, bucketName, objectKey string) (RowState, error)
+}
+
+// RowState is the ledger's current view of one key (N1).
+type RowState struct {
+	// Found is false when no row exists for the key.
+	Found bool
+	// Status is the row's status ("completed" / "deleted" / …); empty when
+	// Found is false.
+	Status string
+	// Size/ETag mirror the row's content fields (meaningful for created
+	// facts).
+	Size int64
+	ETag string
+}
+
 // Sink is the only entry point the index side knows. Apply returns a non-nil
 // error when processing FAILED — the caller decides retry / dead-letter
 // policy (the MinIO webhook handler counts failures under the event identity,
@@ -27,19 +81,24 @@ type Sink interface {
 }
 
 // IndexWriter is the indexing surface the index sink adapts: exactly the two
-// operations the MinIO webhook path already drove (signatures unchanged from
-// the former handler.IndexerClient). It is satisfied by *indexer.Indexer.
+// operations the MinIO webhook path already drove, extended in B3-PR3b with
+// the source parameter (the adapter's provenance label persisted in
+// file_entries.source; migration 000011 added 'storage_readback'). It is
+// satisfied by *indexer.Indexer.
 type IndexWriter interface {
-	// IndexUpload records an ObjectCreated event in the file index.
+	// IndexUpload records an ObjectCreated event in the file index. source is
+	// the adapter's provenance label (see Event.Source) and is persisted
+	// verbatim in file_entries.source.
 	// A returned error is a PROCESSING failure: the caller counts it under
 	// the event's identity and answers 5xx (under the cap) so the source
 	// redelivers, or dead-letters the event past the cap. This is the core
 	// IC-4a semantic; errors are NOT "logged only".
-	IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string) error
+	IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string, source string) error
 	// IndexDeletion records an ObjectRemoved event: it soft-deletes the
-	// matching file entry and publishes events.file.deleted. Errors follow
-	// the same counted failure path as IndexUpload.
-	IndexDeletion(ctx context.Context, bucketName, objectKey string, observedAt time.Time, eventSeq string) error
+	// matching file entry and publishes events.file.deleted. source follows
+	// the same contract as IndexUpload. Errors follow the same counted
+	// failure path as IndexUpload.
+	IndexDeletion(ctx context.Context, bucketName, objectKey string, observedAt time.Time, eventSeq string, source string) error
 }
 
 // indexSink routes storage events into the file index. It is the MinIO-era
@@ -51,24 +110,86 @@ type indexSink struct {
 
 // NewIndexSink adapts an IndexWriter (the concrete indexer) into a Sink.
 // ix must be non-nil; wiring that wants "no indexing" passes a nil Sink
-// instead of an IndexWriter here.
+// instead of an IndexWriter here. Suppressed writes stay a silent success on
+// this sink — that is the MinIO webhook contract (a newer observation won,
+// nothing to redo).
 func NewIndexSink(ix IndexWriter) Sink {
 	return &indexSink{ix: ix}
 }
 
 // Apply routes one event to the index writer. See Sink for the error
 // contract; ErrUnsupportedKind covers KindBucketRemoved and unknown kinds.
+// An Event with an empty Source is rejected: provenance is part of the fact,
+// and silently defaulting it (to minio_event) would mislabel every read-back
+// row the SeaweedFS adapter writes.
 func (s *indexSink) Apply(ctx context.Context, ev Event) error {
+	if ev.Source == "" {
+		return ErrEmptySource
+	}
 	switch ev.Kind {
 	case KindObjectCreated:
-		return s.ix.IndexUpload(ctx, ev.Bucket, ev.Key, ev.Size, ev.ETag, ev.ObservedAt, ev.Seq)
+		return s.ix.IndexUpload(ctx, ev.Bucket, ev.Key, ev.Size, ev.ETag, ev.ObservedAt, ev.Seq, ev.Source)
 	case KindObjectRemoved:
-		return s.ix.IndexDeletion(ctx, ev.Bucket, ev.Key, ev.ObservedAt, ev.Seq)
+		return s.ix.IndexDeletion(ctx, ev.Bucket, ev.Key, ev.ObservedAt, ev.Seq, ev.Source)
 	default:
 		// Includes KindBucketRemoved: the index has no bucket-removal
 		// semantics yet (PR3b), and silently dropping the event would hide
 		// exactly the "bucket gone but rows remain" divergence D-037 says
 		// must alert.
+		return ErrUnsupportedKind
+	}
+}
+
+// suppressionAwareIndexSink is the read-back adapter's sink: identical
+// routing, but a suppressed write surfaces as ErrSuppressed so the adapter
+// re-derives the fact instead of acknowledging it (F1a).
+type suppressionAwareIndexSink struct {
+	ix IndexWriter
+	sr SuppressionReporting
+}
+
+// NewSuppressionAwareIndexSink adapts an IndexWriter that also implements
+// SuppressionReporting into a Sink whose suppressed writes return
+// ErrSuppressed. ix must implement both interfaces; wiring for the MinIO
+// webhook keeps using NewIndexSink.
+func NewSuppressionAwareIndexSink(ix IndexWriter) Sink {
+	sr, _ := ix.(SuppressionReporting)
+	return &suppressionAwareIndexSink{ix: ix, sr: sr}
+}
+
+// Apply routes one event like indexSink, mapping the writer's suppression
+// result to ErrSuppressed. Empty Source and unsupported kinds are refused
+// identically.
+func (s *suppressionAwareIndexSink) Apply(ctx context.Context, ev Event) error {
+	if ev.Source == "" {
+		return ErrEmptySource
+	}
+	switch ev.Kind {
+	case KindObjectCreated:
+		if s.sr == nil {
+			return s.ix.IndexUpload(ctx, ev.Bucket, ev.Key, ev.Size, ev.ETag, ev.ObservedAt, ev.Seq, ev.Source)
+		}
+		suppressed, err := s.sr.IndexUploadReporting(ctx, ev.Bucket, ev.Key, ev.Size, ev.ETag, ev.ObservedAt, ev.Seq, ev.Source)
+		if err != nil {
+			return err
+		}
+		if suppressed {
+			return ErrSuppressed
+		}
+		return nil
+	case KindObjectRemoved:
+		if s.sr == nil {
+			return s.ix.IndexDeletion(ctx, ev.Bucket, ev.Key, ev.ObservedAt, ev.Seq, ev.Source)
+		}
+		suppressed, err := s.sr.IndexDeletionReporting(ctx, ev.Bucket, ev.Key, ev.ObservedAt, ev.Seq, ev.Source)
+		if err != nil {
+			return err
+		}
+		if suppressed {
+			return ErrSuppressed
+		}
+		return nil
+	default:
 		return ErrUnsupportedKind
 	}
 }
