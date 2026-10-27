@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -448,50 +447,27 @@ func main() {
 	// keeps the two sources symmetric during the transition).
 	// adapterDone is closed when the storage-event-source goroutine returns
 	// (nil when the adapter is disabled) — the shutdown path joins it.
-	var adapterDone chan struct{}
+	var adapterDone <-chan struct{}
 	if cfg.StorageEventSource == config.StorageEventSourceSeaweedFSFiler {
-		// The read-back reuses the existing MinIO client/config: in the
-		// SeaweedFS deployment MINIO_* already points at the SeaweedFS S3
-		// gateway (smoke.sh seaweedfs branch), so no second object-store
-		// client exists (D6).
-		adapter, err := seaweedfs.NewAdapter(
-			seaweedfs.AdapterConfig{
-				SourceID:          cfg.SeaweedfsSourceID(),
-				ClientName:        cfg.SeaweedfsClientName,
-				ClientID:          cfg.SeaweedfsClientID,
-				ResumeMargin:      cfg.SeaweedfsResumeMargin,
-				ApplyMaxRetries:   cfg.SeaweedfsApplyMaxRetries,
-				ApplyRetryBackoff: cfg.SeaweedfsApplyRetryBackoff,
-			},
-			seaweedfs.NewGRPCDialer(cfg.SeaweedfsFilerGRPCAddr),
-			&minioObjectReader{client: minioAdminClient},
-			&storageEventStore{q: queries},
-			&dbClock{q: queries},
-			// The suppression-aware sink (F1a): a read-back fact evicted by a
-			// newer observation (e.g. a delayed agent UploadResult winning the
-			// observed_at race) comes back as storageevent.ErrSuppressed so the
-			// adapter re-derives it (fresh clock + fresh HEAD) instead of
-			// acknowledging it and losing the key's last event. The MinIO
-			// webhook route keeps the plain NewIndexSink below (behavior
-			// unchanged there).
-			storageevent.NewSuppressionAwareIndexSink(ix),
-			logger,
-		)
+		// N2：必须「赋值」给外层声明的 adapterDone——用 := 会声明新的局部变量
+		// 遮蔽外层，退出时的 join 引用的还是 nil channel，永远不会等待。
+		done, err := startSeaweedfsEventSource(ctx, seaweedfsSourceConfig{
+			SourceID:     cfg.SeaweedfsSourceID(),
+			FilerAddr:    cfg.SeaweedfsFilerGRPCAddr,
+			ClientName:   cfg.SeaweedfsClientName,
+			ClientID:     cfg.SeaweedfsClientID,
+			ResumeMargin: cfg.SeaweedfsResumeMargin,
+			MaxRetries:   cfg.SeaweedfsApplyMaxRetries,
+			RetryBackoff: cfg.SeaweedfsApplyRetryBackoff,
+			MinioClient:  minioAdminClient,
+			Indexer:      ix,
+			Queries:      queries,
+			Logger:       logger,
+		})
 		if err != nil {
 			logger.Fatal("storage event source adapter init failed", zap.Error(err))
 		}
-		adapterDone := make(chan struct{})
-		go func() {
-			defer close(adapterDone)
-			if err := adapter.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				logger.Error("storage event source adapter stopped with an error", zap.Error(err))
-			}
-		}()
-		logger.Info("storage event source: seaweedfs filer subscription started",
-			zap.String("source_id", cfg.SeaweedfsSourceID()),
-			zap.String("filer", cfg.SeaweedfsFilerGRPCAddr),
-			zap.Duration("resume_margin", cfg.SeaweedfsResumeMargin),
-		)
+		adapterDone = done
 	} else {
 		logger.Info("storage event source: minio webhook (default; SeaweedFS filer subscription disabled)",
 			zap.String("source", cfg.StorageEventSource))
@@ -564,12 +540,8 @@ func main() {
 	// return so a Recv/Apply in flight at cancellation is not cut off
 	// mid-write. Run exits on ctx cancellation; the bound only guards a wedged
 	// final DB call from delaying process exit forever.
-	if adapterDone != nil {
-		select {
-		case <-adapterDone:
-		case <-time.After(10 * time.Second):
-			logger.Error("storage event source adapter did not stop within 10s of shutdown")
-		}
+	if !awaitEventSourceStop(adapterDone, 10*time.Second) {
+		logger.Error("storage event source adapter did not stop within 10s of shutdown")
 	}
 	logger.Info("control plane stopped")
 }

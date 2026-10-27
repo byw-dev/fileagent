@@ -35,6 +35,10 @@ func (w *reportingWriter) IndexDeletionReporting(ctx context.Context, bucket, ke
 	return w.delSuppress, w.IndexDeletion(ctx, bucket, key, observedAt, seq, source)
 }
 
+func (w *reportingWriter) RowState(context.Context, string, string) (RowState, error) {
+	return RowState{Found: false}, nil
+}
+
 var _ SuppressionReporting = (*reportingWriter)(nil)
 
 // The suppression-aware sink converts a suppressed result into ErrSuppressed
