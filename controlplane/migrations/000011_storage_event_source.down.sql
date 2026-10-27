@@ -13,7 +13,7 @@ BEGIN
     SELECT count(*) INTO readback_rows FROM file_entries WHERE source = 'storage_readback';
     IF readback_rows > 0 THEN
         RAISE EXCEPTION USING MESSAGE = format(
-            '迁移 000011 已投入使用：file_entries 存在 % 条 storage_readback 行，不能直接回滚（静默改写 provenance 或 CHECK 失败都不可接受）。请先人工处理这些行（归档 / 改写为允许的 source / 确认丢弃）后再执行 down。',
+            '迁移 000011 已投入使用：file_entries 存在 %s 条 storage_readback 行，不能直接回滚（静默改写 provenance 或 CHECK 失败都不可接受）。请先人工处理这些行（归档 / 改写为允许的 source / 确认丢弃）后再执行 down。',
             readback_rows
         );
     END IF;

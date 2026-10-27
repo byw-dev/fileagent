@@ -100,9 +100,11 @@ func storageEventTestDB(t *testing.T) string {
 }
 
 // migrateTestDBExpectFailure runs the migration step expecting it to FAIL with
-// a message containing all the given substrings (rework F4: a guarded down
-// must refuse loudly, not half-apply).
-func migrateTestDBExpectFailure(t *testing.T, dsn string, steps int, substrings ...string) {
+// a server-side error containing all the given substrings (rework N3: assert
+// the actual pq error message — the migrate wrapper's Error() includes the
+// whole submitted SQL, so matching against it would pass regardless of whether
+// the server actually raised our guard). Returns the server-side message.
+func migrateTestDBExpectFailure(t *testing.T, dsn string, steps int, substrings ...string) string {
 	t.Helper()
 	source, err := iofs.New(migrations.FS, ".")
 	require.NoError(t, err)
@@ -113,9 +115,16 @@ func migrateTestDBExpectFailure(t *testing.T, dsn string, steps int, substrings 
 	require.NoError(t, srcErr)
 	require.NoError(t, dbErr)
 	require.Error(t, stepErr, "the migration step must fail")
+
+	// The server-side message arrives in the `(details: pq: …)` suffix.
+	const marker = "(details: pq: "
+	i := strings.Index(stepErr.Error(), marker)
+	require.GreaterOrEqual(t, i, 0, "migration error must carry a pq details section: %v", stepErr)
+	serverMsg := stepErr.Error()[i+len(marker):]
 	for _, sub := range substrings {
-		require.Contains(t, stepErr.Error(), sub, "the failure must explain the remedy")
+		require.Contains(t, serverMsg, sub, "the SERVER error must explain the remedy (not just the wrapped SQL text)")
 	}
+	return serverMsg
 }
 
 // sourceCheckDef returns the CHECK constraint definition text for
@@ -272,7 +281,7 @@ func TestMigration000011_DownRejectsWhenStorageReadbackRowsExist(t *testing.T) {
 	defer conn.Close()
 	require.NoError(t, tryInsertSource(t, conn, "storage_readback"))
 
-	// The down step must fail loudly and name the remedy.
+	// The down step must fail loudly with the SERVER-side guard message.
 	migrateTestDBExpectFailure(t, dsn, -1, "storage_readback", "人工处理")
 
 	// The database is untouched: version still 000011, tables present, the
@@ -287,4 +296,48 @@ func TestMigration000011_DownRejectsWhenStorageReadbackRowsExist(t *testing.T) {
 	// tryInsertSource leaves status at the column default ('uploading'); what
 	// matters is that the row (and its provenance) survived untouched.
 	require.Equal(t, "uploading", status, "the row must be intact after the refused down")
+}
+
+// TestMigration000011_DirtyRecoveryAfterRefusedDown (rework N3): a failed
+// guarded down leaves schema_migrations at (11, dirty=true); subsequent Ups
+// are refused until the dirty flag is cleared. The documented recovery flow —
+// handle the rows, `migrate force 11` to clean the dirty flag, then down —
+// must be walkable end to end.
+func TestMigration000011_DirtyRecoveryAfterRefusedDown(t *testing.T) {
+	dsn := storageEventTestDB(t)
+	migrateTestDB(t, dsn, +1)
+
+	conn, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, tryInsertSource(t, conn, "storage_readback"))
+
+	// The guarded down refuses (server-side message).
+	serverMsg := migrateTestDBExpectFailure(t, dsn, -1, "storage_readback", "人工处理")
+	t.Logf("server guard: %s", serverMsg)
+
+	// The migration metadata is dirty: a subsequent Up is refused.
+	source, err := iofs.New(migrations.FS, ".")
+	require.NoError(t, err)
+	m, err := migrate.NewWithSourceInstance("iofs", source, dsn)
+	require.NoError(t, err)
+	require.Error(t, m.Up(), "up must be refused while dirty")
+	// Recovery step 3: force the version to 11 (clears the dirty flag).
+	require.NoError(t, m.Force(11))
+	// Recovery step 2: handle the rows (rewrite provenance to an allowed value).
+	_, err = conn.ExecContext(context.Background(),
+		`UPDATE file_entries SET source = 'audit' WHERE source = 'storage_readback'`)
+	require.NoError(t, err)
+	// Recovery step 4: down now succeeds (guard count is 0).
+	require.NoError(t, m.Steps(-1))
+	srcErr, dbErr := m.Close()
+	require.NoError(t, srcErr)
+	require.NoError(t, dbErr)
+
+	// The schema is back at 10: tables gone, CHECK without storage_readback.
+	var exists bool
+	require.NoError(t, conn.QueryRowContext(context.Background(),
+		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'storage_event_cursors')`).Scan(&exists))
+	require.False(t, exists, "tables must be dropped after the completed down")
+	require.Error(t, tryInsertSource(t, conn, "storage_readback"), "CHECK must reject storage_readback after down")
 }
