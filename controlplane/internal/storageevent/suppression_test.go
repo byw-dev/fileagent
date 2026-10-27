@@ -90,6 +90,23 @@ func TestSuppressionAwareSink_BucketRemovedStillUnsupported(t *testing.T) {
 	}
 }
 
+// A writer that does NOT implement SuppressionReporting still works through
+// the aware sink (falls back to plain routing, suppression unknowable — the
+// cmd wiring always passes the real indexer, which reports).
+func TestSuppressionAwareSink_NonReportingWriterFallsBackToPlain(t *testing.T) {
+	w := &fakeIndexWriter{}
+	sink := NewSuppressionAwareIndexSink(w)
+	if err := sink.Apply(context.Background(), Event{Kind: KindObjectCreated, Bucket: "b", Key: "k", Source: SourceMinioEvent}); err != nil {
+		t.Fatalf("Apply(non-reporting upload) = %v, want nil", err)
+	}
+	if err := sink.Apply(context.Background(), Event{Kind: KindObjectRemoved, Bucket: "b", Key: "k", Source: SourceMinioEvent}); err != nil {
+		t.Fatalf("Apply(non-reporting deletion) = %v, want nil", err)
+	}
+	if len(w.uploads) != 1 || len(w.deletions) != 1 {
+		t.Errorf("uploads=%d deletions=%d, want 1/1 (plain methods used)", len(w.uploads), len(w.deletions))
+	}
+}
+
 // The MinIO webhook path keeps using the plain constructor: suppression stays
 // a silent success there (behavior unchanged by F1a).
 func TestPlainIndexSink_IgnoresSuppressionReporting(t *testing.T) {
