@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,7 +65,7 @@ func n1ThrowawayDB(t *testing.T) string {
 // racingReader: the hot key's HEAD performs the competing delayed agent write
 // (same size/etag as the HEAD fact) right before answering.
 type racingReader struct {
-	db      *sql.DB
+	ix      *indexer.Indexer
 	bucket  string
 	hotKey  string
 	hotHits int
@@ -73,23 +74,18 @@ type racingReader struct {
 func (r *racingReader) StatObject(ctx context.Context, bucket, key string) (seaweedfs.ObjectInfo, error) {
 	if key == r.hotKey {
 		r.hotHits++
-		_, err := r.db.ExecContext(ctx, `
-			INSERT INTO file_entries (org_id, bucket_id, storage_path, file_name, size_bytes, etag, status, source, observed_at, uploaded_at, meta_incomplete)
-			SELECT org_id, id, $2::text, $2::varchar(512), 1, 'same', 'completed', 'agent', clock_timestamp(), clock_timestamp(), false
-			FROM buckets WHERE name = $1`, r.bucket, r.hotKey)
-		if err != nil {
-			return seaweedfs.ObjectInfo{}, err
-		}
-		// note: storage_path 与 file_name 同为 $2——TEXT vs VARCHAR 推导冲突需显式转换
-		if err != nil {
+		// R3-2: 生产 upsert（同状态覆盖），非裸 INSERT。
+		if _, err := r.ix.IndexUploadReporting(ctx, bucket, key, 1, "same",
+			time.Now().UTC(), "", "agent"); err != nil {
 			return seaweedfs.ObjectInfo{}, err
 		}
 	}
 	return seaweedfs.ObjectInfo{Size: 1, ETag: "same"}, nil
 }
 
-// n1CursorStore records saved cursors (needs a DB handle for nothing — plain).
+// n1CursorStore records saved cursors (mutex-protected for -race, R3-2).
 type n1CursorStore struct {
+	mu    sync.Mutex
 	Saves []int64
 }
 
@@ -97,8 +93,21 @@ func (s *n1CursorStore) DeclaredCursor(context.Context, string) (int64, bool, er
 	return 0, false, nil
 }
 func (s *n1CursorStore) SaveCursor(_ context.Context, _ string, v int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.Saves = append(s.Saves, v)
 	return nil
+}
+func (s *n1CursorStore) MaxSaved() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var m int64
+	for _, v := range s.Saves {
+		if v > m {
+			m = v
+		}
+	}
+	return m
 }
 func (s *n1CursorStore) RecordMark(context.Context, seaweedfs.MarkAlias) error { return nil }
 func (s *n1CursorStore) CountActiveEntries(context.Context, string) (int64, error) {
@@ -131,7 +140,7 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 	ix := indexer.NewIndexer(conn, nil, zap.NewNop())
 	sink := storageevent.NewSuppressionAwareIndexSink(ix)
 
-	reader := &racingReader{db: conn, bucket: "n1-bucket", hotKey: "hot.csv"}
+	reader := &racingReader{ix: ix, bucket: "n1-bucket", hotKey: "hot.csv"}
 	store := &n1CursorStore{}
 
 	// 流：热 key（同状态竞争）→ 心跳 → 冷 key → 心跳。
@@ -166,8 +175,7 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 	for time.Now().Before(deadline) {
 		require.NoError(t, conn.QueryRowContext(context.Background(),
 			`SELECT count(*) FROM file_entries WHERE storage_path='cold.csv' AND source='storage_readback'`).Scan(&coldRows))
-		saves = len(store.Saves)
-		if coldRows == 1 && saves >= 1 {
+		if coldRows == 1 && store.MaxSaved() >= 2000 {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
