@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
@@ -43,16 +44,30 @@ import (
 )
 
 // Run drives the adapter until ctx is cancelled: it loads the persisted
-// cursor, runs the startup self-check (out-of-range cursor detection), and
-// keeps one subscription stream alive — resubscribing with
-// ResumeFrom(persisted cursor, M) whenever the stream ends — until ctx is
-// done. It returns ctx.Err() on shutdown; a non-cancel error means the loop
-// gave up before ctx was cancelled (only persistent startup-store failures do
-// this — stream failures resubscribe forever).
+// cursor (retrying transient failures with cancellable backoff — a single
+// failed read must not permanently stop the event source while the CP keeps
+// serving, F2), runs the startup self-check (out-of-range cursor detection,
+// bounded by its own deadline), and keeps one subscription stream alive —
+// resubscribing with ResumeFrom(persisted cursor, M) whenever the stream
+// ends — until ctx is done. It returns only ctx.Err() on shutdown; stream
+// and store failures resubscribe/retry forever.
 func (a *Adapter) Run(ctx context.Context) error {
-	declared, found, err := a.store.DeclaredCursor(ctx, a.cfg.SourceID)
-	if err != nil {
-		return fmt.Errorf("seaweedfs: load cursor for %s: %w", a.cfg.SourceID, err)
+	var declared int64
+	var found bool
+	for {
+		var err error
+		declared, found, err = a.store.DeclaredCursor(ctx, a.cfg.SourceID)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		a.logger.Warn("seaweedfs: loading the persisted cursor failed; retrying (the event source will not start without it)",
+			zap.Error(err), zap.String("source_id", a.cfg.SourceID))
+		if err := a.sleep(ctx, a.reconnectDelay); err != nil {
+			return ctx.Err()
+		}
 	}
 	if !found {
 		// Fresh deployment: no cursor row. Subscribe from 0 — the metadata log
@@ -219,9 +234,9 @@ func (a *Adapter) handleBucketRemoved(ctx context.Context, change Change) error 
 	bucket := change.Bucket
 	if err := a.store.RecordMark(ctx, Mark{
 		SourceID: a.cfg.SourceID,
-		Reason: MarkReasonBucketRemoved,
-		Bucket: &bucket,
-		Detail: detail,
+		Reason:   MarkReasonBucketRemoved,
+		Bucket:   &bucket,
+		Detail:   detail,
 	}); err != nil {
 		return fmt.Errorf("seaweedfs: record bucket_removed mark for %s: %w", change.Bucket, err)
 	}
@@ -282,6 +297,12 @@ func (a *Adapter) persistCursor(ctx context.Context, lastDeclared *int64, ts int
 // cursor_before_earliest_log mark, then startup continues as usual. Any
 // failure here is a Warn, never a startup blocker.
 func (a *Adapter) selfCheck(ctx context.Context, cursor int64) {
+	// The self-check is best-effort: give it its OWN deadline so a filer that
+	// accepts the dial but stalls the listing cannot delay the subscription
+	// past the timeout (F2). On timeout (or any failure) we Warn and continue.
+	ctx, cancel := context.WithTimeout(ctx, a.selfCheckTimeout)
+	defer cancel()
+
 	client, closeConn, err := a.dial(ctx)
 	if err != nil {
 		a.logger.Warn("seaweedfs: startup self-check could not dial the filer; skipping the out-of-range check",
@@ -291,25 +312,27 @@ func (a *Adapter) selfCheck(ctx context.Context, cursor int64) {
 	if closeConn != nil {
 		defer closeConn()
 	}
-	stream, err := client.ListEntries(ctx, &filerpb.ListEntriesRequest{
-		Directory:  systemLogDir, // /topics/.system/log
-		Limit:      1,            // entries list in lexicographic = chronological order
-		OmitChunks: true,
-	})
+	earliest, err := a.listFirstEntry(ctx, client, systemLogDir)
 	if err != nil {
 		a.logger.Warn("seaweedfs: startup self-check could not list the metadata log dir; skipping the out-of-range check",
 			zap.Error(err), zap.String("source_id", a.cfg.SourceID))
 		return
 	}
-	resp, err := stream.Recv()
-	if err != nil || resp.GetEntry() == nil || resp.GetEntry().GetName() == "" {
-		// An empty log dir (fresh filer) also lands here — nothing to be
-		// out of range of yet.
-		a.logger.Warn("seaweedfs: startup self-check found no metadata log entries (or listing failed); skipping the out-of-range check",
-			zap.Error(err), zap.String("source_id", a.cfg.SourceID))
-		return
+
+	// Two-level layout (D-037 / D5): the log dir holds DAY directories, each
+	// holding minute files. The earliest ENTRY is the earliest day's earliest
+	// minute file, not the day's midnight — a cursor in between is already out
+	// of range and must be detected as such (F2).
+	name := earliest
+	if !strings.Contains(earliest, "/") {
+		if dayEarliest, err := a.listFirstEntry(ctx, client, systemLogDir+"/"+earliest); err != nil {
+			a.logger.Warn("seaweedfs: startup self-check could not list the earliest day directory; comparing against the day boundary",
+				zap.String("day_dir", earliest), zap.Error(err))
+		} else if dayEarliest != "" {
+			name = earliest + "/" + dayEarliest
+		}
 	}
-	name := resp.GetEntry().GetName()
+
 	before, err := CursorBeforeEarliestLog(cursor, name)
 	if err != nil {
 		a.logger.Warn("seaweedfs: startup self-check could not parse the earliest log name; skipping the out-of-range check",
@@ -322,8 +345,8 @@ func (a *Adapter) selfCheck(ctx context.Context, cursor int64) {
 	detail, _ := json.Marshal(map[string]any{"cursor": cursor, "earliest_log": name})
 	if err := a.store.RecordMark(ctx, Mark{
 		SourceID: a.cfg.SourceID,
-		Reason: MarkReasonCursorBeforeEarliestLog,
-		Detail: detail,
+		Reason:   MarkReasonCursorBeforeEarliestLog,
+		Detail:   detail,
 	}); err != nil {
 		a.logger.Error("seaweedfs: cursor predates the earliest metadata log file AND the mark could not be written — the purged range will be skipped silently; investigate now",
 			zap.Int64("cursor", cursor), zap.String("earliest_log", name), zap.Error(err))
@@ -334,6 +357,24 @@ func (a *Adapter) selfCheck(ctx context.Context, cursor int64) {
 		zap.String("earliest_log", name),
 		zap.String("source_id", a.cfg.SourceID),
 	)
+}
+
+// listFirstEntry returns the first entry's name in dir, or "" when the
+// directory is empty.
+func (a *Adapter) listFirstEntry(ctx context.Context, client FilerClient, dir string) (string, error) {
+	stream, err := client.ListEntries(ctx, &filerpb.ListEntriesRequest{
+		Directory:  dir,
+		Limit:      1, // entries list in lexicographic = chronological order
+		OmitChunks: true,
+	})
+	if err != nil {
+		return "", err
+	}
+	resp, err := stream.Recv()
+	if err != nil {
+		return "", err
+	}
+	return resp.GetEntry().GetName(), nil
 }
 
 // sleep waits for d, honoring ctx cancellation.

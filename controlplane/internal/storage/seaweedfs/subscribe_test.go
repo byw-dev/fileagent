@@ -34,14 +34,24 @@ func (s *scriptedStream) Recv() (*filerpb.SubscribeMetadataResponse, error) {
 	return nil, errors.New("scripted stream exhausted")
 }
 
-// scriptedFiler serves scripted subscribe streams and an optional
-// ListEntries answer for the startup self-check.
+// listExpect is one scripted ListEntries answer: the directory asked and the
+// entry name to return (F2 two-level self-check serves two of these).
+type listExpect struct {
+	dir  string
+	name string
+}
+
+// scriptedFiler serves scripted subscribe streams and optional ListEntries
+// answers for the startup self-check (one per directory, consumed in order;
+// the legacy single-answer fields remain for older tests).
 type scriptedFiler struct {
 	mu        sync.Mutex
 	streams   []*scriptedStream // consumed in subscribe order
 	streamIdx int
 	requests  []*filerpb.SubscribeMetadataRequest
-	listName  string // earliest log entry name for the self-check
+	lists     []listExpect // consumed in ListEntries order
+	blockList bool         // ListEntries never answers (deadline test)
+	listName  string       // earliest log entry name for the self-check
 	listErr   error
 }
 
@@ -57,13 +67,26 @@ func (f *scriptedFiler) SubscribeLocalMetadata(_ context.Context, in *filerpb.Su
 	return s, nil
 }
 
-func (f *scriptedFiler) ListEntries(_ context.Context, _ *filerpb.ListEntriesRequest) (ListEntriesStream, error) {
+func (f *scriptedFiler) ListEntries(ctx context.Context, in *filerpb.ListEntriesRequest) (ListEntriesStream, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
+	if f.blockList {
+		// Never answers: the caller's deadline (not the stream) must end it.
+		<-ctx.Done() //nolint:staticcheck // intentionally blocking
+		return nil, ctx.Err()
+	}
 	name := f.listName
+	if len(f.lists) > 0 {
+		exp := f.lists[0]
+		f.lists = f.lists[1:]
+		if in.GetDirectory() != exp.dir {
+			return nil, errors.New("scriptedFiler: unexpected ListEntries dir " + in.GetDirectory() + " (want " + exp.dir + ")")
+		}
+		name = exp.name
+	}
 	var entry *filerpb.Entry
 	if name != "" {
 		entry = &filerpb.Entry{Name: name}
@@ -93,6 +116,7 @@ func (s *scriptedListStream) Recv() (*filerpb.ListEntriesResponse, error) {
 type fakeStore struct {
 	cursorDeclared int64
 	cursorFound    bool
+	cursorErrs     []error // consumed per DeclaredCursor call; exhausted = ok
 	saves          []int64
 	marks          []Mark
 	activeCount    int64
@@ -101,6 +125,11 @@ type fakeStore struct {
 }
 
 func (s *fakeStore) DeclaredCursor(_ context.Context, _ string) (int64, bool, error) {
+	if len(s.cursorErrs) > 0 {
+		err := s.cursorErrs[0]
+		s.cursorErrs = s.cursorErrs[1:]
+		return 0, false, err
+	}
 	return s.cursorDeclared, s.cursorFound, nil
 }
 
@@ -276,7 +305,13 @@ func TestRun_SelfCheck_CursorBeforeEarliestLog_MarksAndContinues(t *testing.T) {
 	// CursorBeforeEarliestLog = true: the range the cursor points into was
 	// purged.
 	cursor := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC).UnixNano()
-	filer := &scriptedFiler{listName: "2026-10-01", streams: []*scriptedStream{{resps: []*filerpb.SubscribeMetadataResponse{respHeartbeat(cursor + 5_000)}}}}
+	filer := &scriptedFiler{
+		lists: []listExpect{
+			{dir: "/topics/.system/log", name: "2026-10-01"},
+			{dir: "/topics/.system/log/2026-10-01", name: "00-00.0badc0de"},
+		},
+		streams: []*scriptedStream{{resps: []*filerpb.SubscribeMetadataResponse{respHeartbeat(cursor + 5_000)}}},
+	}
 	store := &fakeStore{cursorFound: true, cursorDeclared: cursor}
 	core, logs := observer.New(zap.ErrorLevel)
 	a := newLoopAdapter(t, loopConfig(), filer, &fakeReader{outcome: map[string]any{}}, store, &fakeSink{}, zap.New(core))

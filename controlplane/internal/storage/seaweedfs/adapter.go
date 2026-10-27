@@ -72,6 +72,9 @@ const (
 	// reconnectDelay is the pause between resubscribe attempts after a stream
 	// ends. Fixed: reconnect pacing is failure handling, not a deployment knob.
 	reconnectDelay = time.Second
+	// DefaultSelfCheckTimeout bounds one startup self-check (F2). The check is
+	// best-effort: on timeout it Warns and the subscription proceeds.
+	DefaultSelfCheckTimeout = 5 * time.Second
 	// subscribePathPrefix is the filer path prefix every S3 object lives under.
 	subscribePathPrefix = "/buckets/"
 )
@@ -188,6 +191,10 @@ type AdapterConfig struct {
 	// Defaults to DefaultCursorFlushInterval; ≤0 disables throttling (write
 	// every heartbeat).
 	CursorFlushInterval time.Duration
+	// SelfCheckTimeout bounds the startup out-of-range self-check (F2).
+	// Zero/omitted → DefaultSelfCheckTimeout. Not env surface (D6); wired
+	// tests shrink it.
+	SelfCheckTimeout time.Duration
 }
 
 // validate applies defaults and rejects misconfiguration.
@@ -225,6 +232,15 @@ func (c *AdapterConfig) validate() error {
 	return nil
 }
 
+// selfCheckTimeoutOrDefault returns the configured self-check bound, or the
+// default when unset (validate does not inject it — it is not env surface).
+func (c *AdapterConfig) selfCheckTimeoutOrDefault() time.Duration {
+	if c.SelfCheckTimeout > 0 {
+		return c.SelfCheckTimeout
+	}
+	return DefaultSelfCheckTimeout
+}
+
 // Adapter is the storage-event-source adapter: one subscription loop over one
 // filer local stream (D5: a single goroutine, strictly ordered — later
 // read-backs must carry later ObservedAt, which parallelism would break).
@@ -247,6 +263,8 @@ type Adapter struct {
 	lastFlush time.Time
 	// reconnectDelay is a var (not const) only so tests can shrink it.
 	reconnectDelay time.Duration
+	// selfCheckTimeout bounds the startup out-of-range self-check (F2).
+	selfCheckTimeout time.Duration
 }
 
 // NewAdapter wires an Adapter. dial, reader, store, clock and sink must all be
@@ -274,14 +292,15 @@ func NewAdapter(cfg AdapterConfig, dial DialFunc, reader ObjectReader, store Cur
 		logger = zap.NewNop()
 	}
 	return &Adapter{
-		cfg:            cfg,
-		dial:           dial,
-		reader:         reader,
-		store:          store,
-		clock:          clock,
-		sink:           sink,
-		logger:         logger,
-		reconnectDelay: reconnectDelay,
+		cfg:              cfg,
+		dial:             dial,
+		reader:           reader,
+		store:            store,
+		clock:            clock,
+		sink:             sink,
+		logger:           logger,
+		reconnectDelay:   reconnectDelay,
+		selfCheckTimeout: cfg.selfCheckTimeoutOrDefault(),
 	}, nil
 }
 
