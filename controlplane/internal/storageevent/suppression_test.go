@@ -107,6 +107,32 @@ func TestSuppressionAwareSink_NonReportingWriterFallsBackToPlain(t *testing.T) {
 	}
 }
 
+// The aware sink refuses empty Source and unsupported kinds exactly like the
+// plain one (identical refusal contract).
+func TestSuppressionAwareSink_RefusalsMatchPlainSink(t *testing.T) {
+	sink := NewSuppressionAwareIndexSink(&reportingWriter{})
+	if err := sink.Apply(context.Background(), Event{Kind: KindObjectCreated, Bucket: "b", Key: "k"}); !errors.Is(err, ErrEmptySource) {
+		t.Fatalf("Apply(empty Source) = %v, want ErrEmptySource", err)
+	}
+	if err := sink.Apply(context.Background(), Event{Kind: 0, Bucket: "b", Key: "k", Source: SourceMinioEvent}); !errors.Is(err, ErrUnsupportedKind) {
+		t.Fatalf("Apply(unknown kind) = %v, want ErrUnsupportedKind", err)
+	}
+}
+
+// A reporting writer whose underlying methods FAIL propagates the error even
+// when it also reports suppression (error precedence).
+func TestSuppressionAwareSink_ReportedErrorPrecedesSuppression(t *testing.T) {
+	wantErr := errors.New("write failed")
+	w := &reportingWriter{fakeIndexWriter: fakeIndexWriter{err: wantErr}, upSuppress: true, delSuppress: true}
+	sink := NewSuppressionAwareIndexSink(w)
+	if err := sink.Apply(context.Background(), Event{Kind: KindObjectCreated, Bucket: "b", Key: "k", Source: SourceMinioEvent}); !errors.Is(err, wantErr) {
+		t.Errorf("Apply(created, writer err + suppressed) = %v, want the writer error", err)
+	}
+	if err := sink.Apply(context.Background(), Event{Kind: KindObjectRemoved, Bucket: "b", Key: "k", Source: SourceMinioEvent}); !errors.Is(err, wantErr) {
+		t.Errorf("Apply(removed, writer err + suppressed) = %v, want the writer error", err)
+	}
+}
+
 // The MinIO webhook path keeps using the plain constructor: suppression stays
 // a silent success there (behavior unchanged by F1a).
 func TestPlainIndexSink_IgnoresSuppressionReporting(t *testing.T) {
