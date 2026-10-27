@@ -22,6 +22,21 @@
 
 ## 技术债
 
+### 同桶 key 前缀冲突：`a` 与 `a/b` 共存语义（2026-10-15 拍板，随 B7 落地）
+
+**背景（实测）**：S3 协议允许同一桶内 `a` 与 `a/b` 共存（`a` 是平面 key，不是目录）。
+- **MinIO 单盘**（RELEASE.2025-04-22，协调者 2026-10-15 实测）：`a/b` 后 `PUT a` 成功但 `a/b` 不可 stat；`c` 后 `PUT c/d` 回报成功但 `c/d` 不存在——**静默丢一个**。
+- **SeaweedFS 4.48**：单次 PUT 可共存（带 `x-seaweedfs-prefix-object` 标记的目录条目，D-038 实测）；但 **owner 路由下分片完成（multipart complete）到 `a` 失败**（`routed mkfile … existing entry is a directory` → internal error → 重试到放弃，最终对象不存在、无事件，D-038 实测补充）。
+- 现有路径模板默认以 `{filename}` 结尾，正常不会产生前缀包含关系；风险在手工/异常模板。
+
+**决定（用户 2026-10-15 拍板，方案 3）**：
+1. B7 的部署/运维文档写明约定——**同一桶内一个 key 不得是另一个 key 的前缀**（建议模板末段为文件名）；
+2. CP 只对**能确定冲突**的规则模板给**警告、不拒绝**。
+
+**落点**：[`active.md`](active.md)「当前里程碑 B」B7 行（已列入）。另见 [`bugs/open.md`](bugs/open.md) 无对应卡片（非缺陷，是产品约定）；IC-BUG-57 等账本条目与本条无关。
+
+---
+
 ### `phase-3-rft.md` 遗留项逐条核对（2026-09-13 立）
 
 `docs/tasks/phases/phase-3-rft.md` 已于 2026-09-13 从「⬜ 待执行」改标为
