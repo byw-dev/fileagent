@@ -1856,9 +1856,18 @@ mc event add myminio/data-sensor arn:minio:sqs::primary:webhook \
 > `storage_event_marks` 待核对标记**（只写不消费，消费方是 L2 对账 IC-13）。
 > filer gRPC 无令牌鉴权（仅 mTLS，D-037 已知约束），本刀仅支持明文且必须显式
 > `SEAWEEDFS_FILER_INSECURE=true` 才启动（fail-closed）；mTLS 归 B7。
+> **suppress 的处理（返工 3，N1 同状态确认）**：回读写入被更新的观察压制
+> （`ErrSuppressed`）时，若账本当前状态已与回读事实一致（Created：completed 且
+> size/etag 相同；Removed：无行或 deleted）则视为**已处理**；状态不同才重取
+> 时钟 + 重新 HEAD + 重新 Apply（计入重试，超上限断流重订）。
 > **边界**：① 账本后建桶（先写对象后建 buckets 行）的旧事件若已越过 `声明值−M`，
 > 不会自动补账——需该 key 新事件 / 全量重放 / L2 补上；② 迁移 000011 down 不可在
-> 有 `storage_readback` 行时直接回滚（guard 拒绝；回退流程见迁移文件注释）。
+> 有 `storage_readback` 行时直接回滚（guard 拒绝）。精确回退流程：核实 schema 仍为
+> 000011 形态且 go-migrate 元数据为 **version=10, dirty=true**（实测：guard 拒绝时
+> dirty 位已先于 down SQL 置位、失败不清除）→ 处理 `storage_readback` 行（归档 /
+> 改写 / 确认丢弃，force 前后均可、最终 down 前必须完成）→ `migrate force 11` 清
+> dirty → `migrate down 1`（同见 `000011_*.down.sql` 头部注释与
+> `TestMigration000011_DirtyRecoveryAfterRefusedDown`）。
 
 ### 6.5.1 失败语义与死信（IC-4a ①，IC-BUG-6）
 

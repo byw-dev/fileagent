@@ -284,8 +284,19 @@ func TestMigration000011_DownRejectsWhenStorageReadbackRowsExist(t *testing.T) {
 	// The down step must fail loudly with the SERVER-side guard message.
 	migrateTestDBExpectFailure(t, dsn, -1, "storage_readback", "人工处理")
 
-	// The database is untouched: version still 000011, tables present, the
-	// offending row intact.
+	// Measured (rework 3): go-migrate sets the dirty bit BEFORE running the
+	// down SQL and does not clear it when the guard refuses — the metadata is
+	// left at version=10, dirty=true (not "untouched at 11"). The tables and
+	// the offending row are intact, but every subsequent Up is refused until
+	// the documented recovery (handle rows → force 11 → down) runs.
+	var mver int64
+	var mdirty bool
+	require.NoError(t, conn.QueryRowContext(context.Background(),
+		`SELECT version, dirty FROM schema_migrations`).Scan(&mver, &mdirty))
+	require.Equal(t, int64(10), mver, "the refused down leaves schema_migrations.version=10")
+	require.True(t, mdirty, "the refused down leaves schema_migrations.dirty=true")
+
+	// The schema is untouched: tables present, the offending row intact.
 	var exists bool
 	require.NoError(t, conn.QueryRowContext(context.Background(),
 		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'storage_event_cursors')`).Scan(&exists))
@@ -299,10 +310,11 @@ func TestMigration000011_DownRejectsWhenStorageReadbackRowsExist(t *testing.T) {
 }
 
 // TestMigration000011_DirtyRecoveryAfterRefusedDown (rework N3): a failed
-// guarded down leaves schema_migrations at (11, dirty=true); subsequent Ups
-// are refused until the dirty flag is cleared. The documented recovery flow —
-// handle the rows, `migrate force 11` to clean the dirty flag, then down —
-// must be walkable end to end.
+// guarded down leaves schema_migrations at (10, dirty=true) — go-migrate sets
+// the dirty bit before running the down SQL and leaves it set on failure
+// (measured; an earlier comment incorrectly claimed (11, dirty=true)).
+// Subsequent Ups are refused until the documented recovery flow — handle the
+// rows, `migrate force 11` to clean the dirty flag, then down — is walked.
 func TestMigration000011_DirtyRecoveryAfterRefusedDown(t *testing.T) {
 	dsn := storageEventTestDB(t)
 	migrateTestDB(t, dsn, +1)
@@ -316,7 +328,14 @@ func TestMigration000011_DirtyRecoveryAfterRefusedDown(t *testing.T) {
 	serverMsg := migrateTestDBExpectFailure(t, dsn, -1, "storage_readback", "人工处理")
 	t.Logf("server guard: %s", serverMsg)
 
-	// The migration metadata is dirty: a subsequent Up is refused.
+	// The migration metadata is dirty at version 10 (measured): a subsequent
+	// Up is refused.
+	var mver int64
+	var mdirty bool
+	require.NoError(t, conn.QueryRowContext(context.Background(),
+		`SELECT version, dirty FROM schema_migrations`).Scan(&mver, &mdirty))
+	require.Equal(t, int64(10), mver, "the refused down leaves schema_migrations.version=10")
+	require.True(t, mdirty, "the refused down leaves schema_migrations.dirty=true")
 	source, err := iofs.New(migrations.FS, ".")
 	require.NoError(t, err)
 	m, err := migrate.NewWithSourceInstance("iofs", source, dsn)

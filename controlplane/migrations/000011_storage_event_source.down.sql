@@ -6,6 +6,21 @@
 -- restored CHECK would reject the rows (obscure failure) and silently
 -- rewriting provenance is not acceptable. Refuse loudly with the remedy and
 -- leave the schema untouched.
+--
+-- 精确回退流程（PR #135 返工 3 实测校准；执行顺序如下）：
+--   0. 核实现场：schema 仍是 000011 的形态（storage_event_cursors /
+--      storage_event_marks 表存在、file_entries 的 CHECK 仍含
+--      'storage_readback'）；go-migrate 元数据为 version=10, dirty=true
+--      （guard 拒绝 down 时 dirty 位已先于 down SQL 置位，失败后不清除——
+--      实测见 TestMigration000011_DirtyRecoveryAfterRefusedDown）。
+--   1. 处理 file_entries 里的 storage_readback 行（归档 / 改写为允许的
+--      source / 确认丢弃）——这一步在 force 前后均可，但**必须在最终 down
+--      之前完成**，否则本文件的 guard 会再次拒绝。
+--   2. `migrate force 11`（清除 dirty 位；force 到 11 = 当前版本号本身，
+--      不改变 schema）。
+--   3. `migrate down 1`（执行本文件：guard 此时计数为 0，放行）。
+-- 注意 CLAUDE.md「迁移只追加」约束：本文件随 000011 同属 PR #135 新增、
+-- 尚未合并，故直接修订注释；合并后只追加不改。
 
 DO $$
 DECLARE readback_rows bigint;

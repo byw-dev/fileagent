@@ -98,6 +98,14 @@ func startSeaweedfsEventSource(ctx context.Context, cfg seaweedfsSourceConfig) (
 	}
 	adapter.WithSuppressionReporter(cfg.Indexer)
 
+	// 启动配置日志（nit，返工 3 恢复）：接线重构曾把 main 里这条日志弄丢；
+	// 订阅成功的 adapter 日志另含 source_id/epoch，这里记录的是配置事实。
+	cfg.Logger.Info("storage event source: seaweedfs filer subscription started",
+		zap.String("source_id", cfg.SourceID),
+		zap.String("filer", cfg.FilerAddr),
+		zap.Duration("resume_margin", cfg.ResumeMargin),
+	)
+
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
