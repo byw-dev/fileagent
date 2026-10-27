@@ -1422,7 +1422,9 @@ func (s *STSManager) IssueCredentials(agentID string,
 >    否则删除事件重投会把刚重建的活对象再标成 `deleted`。修 IC-BUG-8 / IC-BUG-13 的防清空半边。
 > 2. **`observed_at` 按来源取各自最可信、且客户端左右不了的时刻**：`minio_event` ← 载荷的 `eventTime`
 >    （MinIO 生成）；`agent` / `api` ← **PostgreSQL 的 `now()`**（不是 CP 进程时钟——dev 实测进程时钟
->    比 PG/MinIO 慢约 16ms，用它会让每一次合法上报都被守卫拦掉）；`audit` ← 列举那一刻。
+>    比 PG/MinIO 慢约 16ms，用它会让每一次合法上报都被守卫拦掉）；`audit` ← 列举那一刻；
+>    `storage_readback`（B3-PR3b，SeaweedFS 事件源）← **HEAD 发出之前的 DB `clock_timestamp()`**——
+>    与 agent 行同一时钟域才可比，且取「HEAD 之前」使更晚的回读必带更晚的时间戳（订阅流内严格顺序处理）。
 >    **绝不采信 `UploadResult.uploaded_at`**（由 agent 提供，报 `2099` 即可永久冻结该行）。
 > 3. **失败上报不写 `file_entries`，只写 `upload_logs`**（`file_entry_id` 置空）。原实现无论成败都 upsert，
 >    而 `DO UPDATE` 会无条件覆盖 `status`，能把「已成功上传、后来重传失败」的**活对象标成 `failed`**（IC-BUG-33）。
@@ -1839,6 +1841,18 @@ mc event add myminio/data-sensor arn:minio:sqs::primary:webhook \
 `file_entries`，故必须鉴权。CP 用配置项 `INTERNAL_WEBHOOK_SECRET` 校验 MinIO 发来的
 `auth_token`（`Authorization` 头，兼容 `Bearer <token>` 与裸 token，常量时间比较）。
 **未配置密钥时端点失败即拒（fail-closed）**，拒绝一切请求而非放行，避免未鉴权写入。
+
+> ✅ **存储事件源双形态（D-037 / B3-PR3b 落地）**：运行时的事件入口由
+> `STORAGE_EVENT_SOURCE` 选择——`minio_webhook`（默认，即本节的 webhook 链路，
+> 过渡期保留）或 `seaweedfs_filer`：CP 进程内订阅 SeaweedFS filer 元数据日志
+> （`SubscribeLocalMetadata` + 空闲心跳声明值持久游标），对每个事件按 (bucket, key)
+> 走 **S3 HEAD 回读当前状态再写索引**（事件只是提示；`observed_at` 取 HEAD 之前
+> 的 DB `clock_timestamp()`，与 agent 行同一时钟域），`source='storage_readback'`。
+> 断流按「声明值 − 余量 M」重订、绝不跳过事件；每次（重）订阅后的缺口窗口与
+> 游标越界、桶目录删除（D-037 第四条的事故信号）都只**落
+> `storage_event_marks` 待核对标记**（只写不消费，消费方是 L2 对账 IC-13）。
+> filer gRPC 无令牌鉴权（仅 mTLS，D-037 已知约束），本刀仅支持明文且必须显式
+> `SEAWEEDFS_FILER_INSECURE=true` 才启动（fail-closed）；mTLS 归 B7。
 
 ### 6.5.1 失败语义与死信（IC-4a ①，IC-BUG-6）
 
