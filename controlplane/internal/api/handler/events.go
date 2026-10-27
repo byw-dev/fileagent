@@ -903,6 +903,7 @@ func translateRecord(rec minioEventRecord) (ev storageevent.Event, decodeErr err
 		ETag:       rec.S3.Object.ETag,
 		ObservedAt: rec.EventTime,
 		Seq:        rec.S3.Object.Sequencer,
+		Source:     storageevent.SourceMinioEvent, // explicit provenance (PR3b D3)
 	}
 	switch {
 	case strings.HasPrefix(rec.EventName, "s3:ObjectRemoved:"):

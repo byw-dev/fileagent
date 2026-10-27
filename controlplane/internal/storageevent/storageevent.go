@@ -82,4 +82,24 @@ type Event struct {
 	// index orders solely by ObservedAt (see the caveat above), so the
 	// empty-string case is "no source-side tie-break", not "no ordering".
 	Seq string
+	// Source records which storage-event adapter produced the fact — the
+	// file_entries.source value the index will persist. It MUST be filled
+	// explicitly by the adapter (SourceMinioEvent for the MinIO webhook
+	// translateRecord, SourceStorageReadback for the SeaweedFS filer
+	// read-back adapter); the index sink refuses Events with an empty Source
+	// rather than defaulting one, because provenance is part of the fact.
+	Source string
 }
+
+// Provenance values adapters must set on Event.Source. They are part of the
+// file_entries.source CHECK constraint (migration 000011) — extend that
+// migration chain first if a new source ever appears.
+const (
+	// SourceMinioEvent marks facts that arrived via the MinIO S3-event webhook
+	// (the transitional backend's event path, unchanged behavior).
+	SourceMinioEvent = "minio_event"
+	// SourceStorageReadback marks facts the SeaweedFS filer-subscription
+	// adapter wrote after re-reading the object's current state over S3
+	// (the "event is only a hint, read back the truth" semantic, D-037).
+	SourceStorageReadback = "storage_readback"
+)

@@ -753,19 +753,22 @@ type mockIndexerClient struct {
 	lastBucket string
 	lastKey    string
 	deletedKey string
+	lastSource string // provenance label the sink threaded through
 }
 
-func (m *mockIndexerClient) IndexUpload(_ context.Context, bucketName, objectKey string, _ int64, _ string, _ time.Time, _ string) error {
+func (m *mockIndexerClient) IndexUpload(_ context.Context, bucketName, objectKey string, _ int64, _ string, _ time.Time, _ string, source string) error {
 	m.called = true
 	m.lastBucket = bucketName
 	m.lastKey = objectKey
+	m.lastSource = source
 	return m.err
 }
 
-func (m *mockIndexerClient) IndexDeletion(_ context.Context, bucketName, objectKey string, _ time.Time, _ string) error {
+func (m *mockIndexerClient) IndexDeletion(_ context.Context, bucketName, objectKey string, _ time.Time, _ string, source string) error {
 	m.deleted = true
 	m.lastBucket = bucketName
 	m.deletedKey = objectKey
+	m.lastSource = source
 	return m.err
 }
 

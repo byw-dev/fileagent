@@ -1,7 +1,7 @@
 package storageevent
 
 // boundary_test.go — import-boundary enforcement for the storage event source
-// (D-037 rule 2, B3-PR1).
+// (D-037 rule 2, B3-PR1; adapter tree landed in PR3a, the wiring in PR3b).
 //
 // D-037: only the SeaweedFS adapter may import SeaweedFS clients; index and
 // business code only know the storageevent interfaces. Two rules guard that:
@@ -14,12 +14,18 @@ package storageevent
 //	  <module>/internal/storage/seaweedfs (or any of its subpackages) may
 //	  appear only inside that tree and under controlplane/cmd/.
 //
-// The seaweedfs packages do not exist yet (they arrive with PR3a/PR3b). The
-// test must still pass today and must catch the first violating import the
-// moment one is written — go/parser only looks at syntax, so it fires on
-// imports of packages that do not exist. Effectiveness is proven by mutation:
-// temporarily add a violating import to a handler file and watch this test go
-// red (see the B3-PR1 report for the recorded runs).
+// The adapter tree (internal/storage/seaweedfs/, with its vendored filerpb
+// subpackage) EXISTS since PR3a and is the one place both rules allow such
+// imports; since PR3b, cmd/ may additionally import the wrapper package to
+// wire the subscription worker. The scan below walks the REAL tree (so the
+// rules are exercised against every file that exists today, including the
+// adapter itself), and the synthetic-module regression tests prove the rule
+// logic independently of the current repository contents. go/parser only
+// looks at syntax, so the scan catches a violating import the moment one is
+// written — even in a file whose package does not otherwise compile.
+// Effectiveness is proven by mutation: temporarily add a violating import to
+// a handler file and watch this test go red (see the B3-PR1 report for the
+// recorded runs).
 //
 // ── Scan boundary (stated honestly) ──────────────────────────────────────
 //
@@ -373,8 +379,7 @@ func TestImportBoundary_SymlinkRefused(t *testing.T) {
 }
 
 // TestClassifyFile pins the rule logic on synthetic samples so the rules are
-// tested independently of the current repository contents (which today
-// contain no seaweedfs import at all).
+// tested independently of the repository contents.
 func TestClassifyFile(t *testing.T) {
 	const modulePath = "github.com/byw-dev/fileagent/controlplane"
 	tests := []struct {
