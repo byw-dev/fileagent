@@ -3,12 +3,14 @@
 package main
 
 // n1_contention_integration_test.go — formal version of review-r2's
-// r2-contention probe (N1): a hot key whose read-back is raced by a
-// same-state delayed agent write (clock T1 → agent write T2>T1 with the same
-// size/etag → HEAD) must NOT starve the stream. With the N1 fix the
-// same-state suppression is acknowledged (processed) and the cold key + the
-// following heartbeat advance; without the fix the hot key exhausts retries,
-// the stream breaks, and the cold key/heartbeat are never consumed.
+// r2-contention probe (N1): a hot key whose EVERY read-back is raced by a
+// later same-state agent write on an EXISTING row (R4-4: sustained contention
+// through the real production upsert) must NOT starve the stream. With the N1
+// fix each suppression is confirmed as same-state (processed) and the cold key
+// + the following heartbeat advance; if the confirmation were treated as a
+// retry instead, the hot key would exhaust the retry budget every attempt
+// (each HEAD injects a fresh newer observation), the stream would break, and
+// the cold key/heartbeat would never be consumed.
 //
 // Lives in cmd/server: the only package allowed to wire the REAL chain across
 // modules (seaweedfs adapter + indexer + real PG, D-037 rule 2 / D7).
@@ -61,25 +63,51 @@ func n1ThrowawayDB(t *testing.T) string {
 	return dsn[:i+1] + name + "?sslmode=disable"
 }
 
-// racingReader: the hot key's HEAD performs the competing delayed agent write
-// (same size/etag as the HEAD fact) right before answering.
+// racingReader: the hot key's EVERY HEAD performs the competing delayed agent
+// write — via the real production upsert (IndexUploadReporting) on the
+// pre-seeded EXISTING hot-key row, so every injection takes the
+// "update an existing row with a later observation" branch (R4-4). The
+// injected fact is the same state as the HEAD answer (size=1, etag=same), so
+// the adapter must confirm each suppression as same-state and move on; a
+// regression that retries instead would exhaust the budget against a fresh
+// newer observation on every attempt.
 type racingReader struct {
-	ix      *indexer.Indexer
-	bucket  string
-	hotKey  string
-	hotHits int
+	ix     *indexer.Indexer
+	bucket string
+	hotKey string
+
+	mu              sync.Mutex
+	hotHits         int
+	hotInjErrs      []error
+	hotInjSuppressed int
 }
 
 func (r *racingReader) StatObject(ctx context.Context, bucket, key string) (seaweedfs.ObjectInfo, error) {
 	if key == r.hotKey {
+		r.mu.Lock()
 		r.hotHits++
-		if r.hotHits == 1 {
-			// 只在第一次 HEAD 时写入同状态（模拟一次延迟的上报）。
-			_, _ = r.ix.IndexUploadReporting(ctx, bucket, key, 1, "same",
-				time.Now().UTC(), "", "agent")
+		r.mu.Unlock()
+		// source=agent → observed_at 取 DB now()，晚于适配器本次回读取的钟 →
+		// 本次回读的 Apply 必然被 suppress（正是要守护的同状态竞争）。
+		suppressed, err := r.ix.IndexUploadReporting(ctx, r.bucket, key, 1, "same",
+			time.Now().UTC(), "", "agent")
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if err != nil {
+			r.hotInjErrs = append(r.hotInjErrs, err)
+		}
+		if suppressed {
+			r.hotInjSuppressed++
 		}
 	}
 	return seaweedfs.ObjectInfo{Size: 1, ETag: "same"}, nil
+}
+
+// snapshot returns the contention counters (race-safe).
+func (r *racingReader) snapshot() (hits int, injErrs []error, injSuppressed int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.hotHits, r.hotInjErrs, r.hotInjSuppressed
 }
 
 // n1CursorStore records saved cursors (mutex-protected for -race, R3-2).
@@ -169,6 +197,13 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 	require.NoError(t, err)
 	adapter.WithSuppressionReporter(ix)
 
+	// R4-4：预置热 key 行（真实生产 upsert）——后续每次 HEAD 注入都走
+	// 「更新已有行」分支，覆盖原始饥饿场景（反复同状态更新同一行）。
+	injSuppressed, injErr := ix.IndexUploadReporting(ctx, "n1-bucket", "hot.csv", 1, "same",
+		time.Now().UTC(), "", "agent")
+	require.NoError(t, injErr)
+	require.False(t, injSuppressed, "seeding the hot-key row must land (nothing newer yet)")
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	runDone := make(chan error, 1)
@@ -212,6 +247,14 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 	}
 	require.True(t, confirmed,
 		"production wiring must yield the suppression-aware sink so the same-state contention is explicitly confirmed (a plain sink drops the write silently)")
+
+	// R4-4：竞争注入本身的健康检查——每次注入都必须成功落库（真实生产
+	// upsert、更新已有行、不被 suppress；被 suppress 的注入说明时钟假设破裂）。
+	hits, injErrs, injSup := reader.snapshot()
+	require.NotZero(t, hits, "the hot key must have been HEADed at least once")
+	require.Empty(t, injErrs, "every injected same-state observation must land without error")
+	require.Zero(t, injSup, "injected observations are the newest write and must not be suppressed")
+
 	cancel()
 	require.ErrorIs(t, <-runDone, context.Canceled)
 }

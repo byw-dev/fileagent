@@ -5,7 +5,8 @@ package main
 // n6_wiring_integration_test.go — R3-1：驱动真实生产接线 startSeaweedfsEventSource
 //（不设置 SinkOverride），配真实 indexer + PG，用可控 HEAD 制造「suppressed 且账本
 // 状态不同」→ 要求重新 HEAD 并最终落成正确状态。plain sink 的变异（工厂换回
-// NewIndexSink）必须红（suppressed 被吞 → 冷 key 不入账）。
+// NewIndexSink）下：不同状态（999/other）的回读写被静默丢弃 → 热 key 停留在
+// agent 写入的旧状态（冷 key 照常入账，不发生饥饿）→ 本测试的热 key 终态断言红。
 
 import (
 	"context"
@@ -28,17 +29,23 @@ import (
 	"go.uber.org/zap"
 )
 
-// n6RacingReader 每次热 key HEAD 之前用生产 upsert 写入同状态竞争行。
+// n6RacingReader 每次热 key HEAD 之前用生产 upsert 写入不同状态竞争行（首次
+// 才写：重试时不再写，否则永远被更新的 agent 写压制）；hotHeadCalls 计数供
+// 「重新 HEAD ≥ 2 次」硬断言（nit，返工 4：不依赖 fixture 时钟漂移才触发重读）。
 type n6RacingReader struct {
 	ix           *indexer.Indexer
 	hotKey       string
 	hotSuppressN *atomic.Int64
+	hotHeadCalls *atomic.Int64
 	hotHits      int
 }
 
 func (r *n6RacingReader) StatObject(ctx context.Context, bucket, key string) (seaweedfs.ObjectInfo, error) {
 	if key == r.hotKey {
 		r.hotHits++
+		if r.hotHeadCalls != nil {
+			r.hotHeadCalls.Add(1)
+		}
 		if r.hotHits == 1 {
 			// 只在第一次 HEAD 时写入不同状态（模拟一次延迟的上报）——
 			// 重试时不再写（否则永远被更新的 agent 写压制）。
@@ -73,7 +80,8 @@ func TestN6WiringSuppressedDifferentStateReReads(t *testing.T) {
 
 	ix := indexer.NewIndexer(conn, nil, zap.NewNop())
 	supN := &atomic.Int64{}
-	reader := &n6RacingReader{ix: ix, hotKey: "hot.csv", hotSuppressN: supN}
+	headCalls := &atomic.Int64{}
+	reader := &n6RacingReader{ix: ix, hotKey: "hot.csv", hotSuppressN: supN, hotHeadCalls: headCalls}
 
 	// N1 的 same-state fixture 需要被替换：这里写的是 DIFFERENT state
 	// （size=999, etag=other），不是同状态 → 适配器必须重读。
@@ -130,6 +138,11 @@ func TestN6WiringSuppressedDifferentStateReReads(t *testing.T) {
 		`SELECT size_bytes, source FROM file_entries WHERE storage_path='hot.csv'`).Scan(&hotSize, &hotSrc))
 	require.Equal(t, int64(1), hotSize, "hot key size must come from HEAD re-read")
 	require.Equal(t, "storage_readback", hotSrc)
+
+	// nit（返工 4）：热 key 必须真的被重新 HEAD（≥2 次）——不再依赖 fixture
+	// 时钟漂移才触发重读；plain-sink 变异下首次 Apply 即被静默吞掉，只有 1 次。
+	require.GreaterOrEqual(t, headCalls.Load(), int64(2),
+		"the adapter must re-HEAD the hot key (≥2 calls) when a suppression conflicts with the ledger state")
 
 	cancel()
 	require.ErrorIs(t, <-runDone, context.Canceled)
