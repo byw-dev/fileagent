@@ -69,13 +69,22 @@ func storageEventTestDB(t *testing.T) string {
 	t.Helper()
 	admin, err := sql.Open("postgres", testAdminDSN(t))
 	require.NoError(t, err)
-	defer admin.Close()
 	name := "fa_pr3b_" + strings.ReplaceAll(uuid.New().String(), "-", "")[:16]
 	_, err = admin.ExecContext(context.Background(), fmt.Sprintf("CREATE DATABASE %s", name))
 	require.NoError(t, err)
+	// F5: the DROP must run on the STILL-OPEN admin connection and complete
+	// before it is closed — the previous version deferred admin.Close() at
+	// helper-return time, so the cleanup's DROP hit "sql: database is closed"
+	// and the error was swallowed, leaking one migrated database per test run.
 	t.Cleanup(func() {
-		_, _ = admin.ExecContext(context.Background(),
+		_, err := admin.ExecContext(context.Background(),
 			fmt.Sprintf("DROP DATABASE %s WITH (FORCE)", name))
+		if err != nil {
+			t.Errorf("drop throwaway database %s: %v", name, err)
+		}
+		if cerr := admin.Close(); cerr != nil {
+			t.Errorf("close admin connection after dropping %s: %v", name, cerr)
+		}
 	})
 	// Swap the database name in TEST_DATABASE_URL for the throwaway one:
 	// everything up to the last "/" is preserved (scheme, credentials, host),
