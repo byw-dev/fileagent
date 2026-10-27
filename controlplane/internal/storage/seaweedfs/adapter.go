@@ -114,10 +114,19 @@ type FilerStream interface {
 	Recv() (*filerpb.SubscribeMetadataResponse, error)
 }
 
+// SubStream is an exported alias for test support packages.
+type SubStream = FilerStream
+
 // ListEntriesStream is the receive side of a filer directory listing.
 type ListEntriesStream interface {
 	Recv() (*filerpb.ListEntriesResponse, error)
 }
+
+// ListStreamAlias is an exported alias for test support packages.
+type ListStreamAlias = ListEntriesStream
+
+// MarkAlias is an exported alias for test support packages.
+type MarkAlias = Mark
 
 // FilerClient is the narrow filer gRPC surface the adapter needs (D7). The
 // real implementation wraps filerpb.SeaweedFilerClient and lives beside the
@@ -265,6 +274,10 @@ type Adapter struct {
 	reconnectDelay time.Duration
 	// selfCheckTimeout bounds the startup out-of-range self-check (F2).
 	selfCheckTimeout time.Duration
+	// reporter (optional, N1) lets the adapter distinguish a suppressed write
+	// that a newer observation already confirmed (same state → processed)
+	// from a genuine conflict (re-derive). Wired with the indexer.
+	reporter storageevent.SuppressionReporting
 }
 
 // NewAdapter wires an Adapter. dial, reader, store, clock and sink must all be
@@ -291,7 +304,7 @@ func NewAdapter(cfg AdapterConfig, dial DialFunc, reader ObjectReader, store Cur
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &Adapter{
+	a := &Adapter{
 		cfg:              cfg,
 		dial:             dial,
 		reader:           reader,
@@ -301,7 +314,16 @@ func NewAdapter(cfg AdapterConfig, dial DialFunc, reader ObjectReader, store Cur
 		logger:           logger,
 		reconnectDelay:   reconnectDelay,
 		selfCheckTimeout: cfg.selfCheckTimeoutOrDefault(),
-	}, nil
+	}
+	return a, nil
+}
+
+// WithSuppressionReporter wires the optional suppression reporter (N1). The
+// reporter must be the SAME index writer family the sink applies to (the
+// indexer), so its row view reflects what the sink wrote.
+func (a *Adapter) WithSuppressionReporter(r storageevent.SuppressionReporting) *Adapter {
+	a.reporter = r
+	return a
 }
 
 // UnknownBucketEvents reports how many events named a bucket the ledger does

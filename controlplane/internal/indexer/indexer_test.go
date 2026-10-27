@@ -92,6 +92,10 @@ func (m *mockIndexerStore) UpsertFileEntry(_ context.Context, params UpsertFileE
 	return m.fileEntry, m.suppressed, m.upsertErr
 }
 
+func (m *mockIndexerStore) GetIndexedFileByKey(_ context.Context, _ uuid.UUID, _ string) (*db.FileEntry, error) {
+	return nil, sql.ErrNoRows
+}
+
 func (m *mockIndexerStore) MarkFileEntryDeleted(_ context.Context, _ db.DeleteIndexedFileParams) (*db.FileEntry, bool, bool, error) {
 	if m.deleteErr == sql.ErrNoRows {
 		return nil, false, false, nil

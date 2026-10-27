@@ -48,6 +48,24 @@ type SuppressionReporting interface {
 	IndexUploadReporting(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string, source string) (suppressed bool, err error)
 	// IndexDeletionReporting mirrors IndexDeletion likewise.
 	IndexDeletionReporting(ctx context.Context, bucketName, objectKey string, observedAt time.Time, eventSeq string, source string) (suppressed bool, err error)
+	// RowState reports the CURRENT ledger state of one key (N1): what the
+	// adapter compares against the fact it just read back, to tell a
+	// "same-state confirmation" (a newer observation already recorded exactly
+	// this fact — treat as processed) from a genuine conflict (re-derive).
+	RowState(ctx context.Context, bucketName, objectKey string) (RowState, error)
+}
+
+// RowState is the ledger's current view of one key (N1).
+type RowState struct {
+	// Found is false when no row exists for the key.
+	Found bool
+	// Status is the row's status ("completed" / "deleted" / …); empty when
+	// Found is false.
+	Status string
+	// Size/ETag mirror the row's content fields (meaningful for created
+	// facts).
+	Size int64
+	ETag string
 }
 
 // Sink is the only entry point the index side knows. Apply returns a non-nil

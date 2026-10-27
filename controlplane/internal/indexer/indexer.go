@@ -14,6 +14,7 @@ import (
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
 	"github.com/byw-dev/fileagent/controlplane/internal/bootstrap"
 	"github.com/byw-dev/fileagent/controlplane/internal/db"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/byw-dev/fileagent/pkg/trollsift"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -31,6 +32,7 @@ type IndexerStore interface {
 	GetBucketByName(ctx context.Context, orgID uuid.UUID, name string) (*db.Bucket, error)
 	UpsertFileEntry(ctx context.Context, params UpsertFileEntryParams) (*db.FileEntry, bool, error)
 	MarkFileEntryDeleted(ctx context.Context, arg db.DeleteIndexedFileParams) (*db.FileEntry, bool, bool, error)
+	GetIndexedFileByKey(ctx context.Context, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error)
 	CreateUploadLog(ctx context.Context, params CreateUploadLogParams) (*db.UploadLog, error)
 	ListFileTypeRules(ctx context.Context) ([]*db.FileTypeRule, error)
 	GetRuleTagInfo(ctx context.Context, orgID, ruleID uuid.UUID) (RuleTagInfo, error)
@@ -61,6 +63,11 @@ func (d *dbtxIndexerStore) UpsertFileEntry(ctx context.Context, params UpsertFil
 // MarkFileEntryDeleted delegates to the package-level function.
 func (d *dbtxIndexerStore) MarkFileEntryDeleted(ctx context.Context, arg db.DeleteIndexedFileParams) (*db.FileEntry, bool, bool, error) {
 	return MarkFileEntryDeleted(ctx, d.dbtx, arg)
+}
+
+// GetIndexedFileByKey delegates to the package-level function.
+func (d *dbtxIndexerStore) GetIndexedFileByKey(ctx context.Context, bucketID uuid.UUID, storagePath string) (*db.FileEntry, error) {
+	return GetIndexedFileByKey(ctx, d.dbtx, bucketID, storagePath)
 }
 
 // CreateUploadLog delegates to the package-level function.
@@ -669,6 +676,33 @@ func (ix *Indexer) IndexDeletionReporting(ctx context.Context, bucketName, objec
 		zap.String("key", objectKey),
 	)
 	return false, nil
+}
+
+// RowState implements storageevent.SuppressionReporting (N1): the current
+// ledger view of one key, for the read-back adapter to distinguish a
+// "same-state confirmation" (the newer observation already recorded exactly
+// this fact) from a genuine conflict. Unknown bucket → Found=false.
+func (ix *Indexer) RowState(ctx context.Context, bucketName, objectKey string) (storageevent.RowState, error) {
+	bucket, err := ix.store.GetBucketByName(ctx, bootstrap.DefaultOrgID, bucketName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return storageevent.RowState{Found: false}, nil
+		}
+		return storageevent.RowState{}, fmt.Errorf("indexer: get bucket %q for row state: %w", bucketName, err)
+	}
+	fe, err := ix.store.GetIndexedFileByKey(ctx, bucket.ID, objectKey)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return storageevent.RowState{Found: false}, nil
+		}
+		return storageevent.RowState{}, fmt.Errorf("indexer: row state for %s/%s: %w", bucketName, objectKey, err)
+	}
+	return storageevent.RowState{
+		Found:  true,
+		Status: string(fe.Status),
+		Size:   fe.SizeBytes,
+		ETag:   fe.Etag.String,
+	}, nil
 }
 
 // publishFileDeleted emits events.file.deleted for a soft-deleted entry.

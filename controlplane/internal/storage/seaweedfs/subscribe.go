@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs/filerpb"
 	"go.uber.org/zap"
 )
@@ -209,12 +210,47 @@ func (a *Adapter) processChange(ctx context.Context, change Change) error {
 				)
 				return nil
 			}
+			if errors.Is(err, storageevent.ErrSuppressed) && a.reporter != nil {
+				// N1: a suppression is only a conflict if the ledger's CURRENT
+				// state differs from the fact just read back. A newer
+				// observation that recorded EXACTLY this fact (created with
+				// the same size/etag, or already deleted) is a confirmation —
+				// treat as processed so a hot key cannot starve the stream.
+				// A genuine difference re-derives the fact (fresh clock +
+				// fresh HEAD) via the retry below.
+				st, rerr := a.reporter.RowState(ctx, event.Bucket, event.Key)
+				if rerr == nil && sameStateAsFact(event, st) {
+					a.logger.Info("seaweedfs: suppressed write confirmed same-state by a newer observation; treated as processed",
+						zap.String("bucket", event.Bucket),
+						zap.String("key", event.Key),
+						zap.String("event_kind", event.Kind.String()),
+						zap.String("row_status", st.Status),
+					)
+					return nil
+				}
+			}
 			lastErr = err
 			continue
 		}
 		return nil
 	}
 	return fmt.Errorf("after %d attempts: %w", a.cfg.ApplyMaxRetries+1, lastErr)
+}
+
+// sameStateAsFact (N1) reports whether the ledger's current row state already
+// records exactly the fact the read-back derived: a created fact whose row is
+// completed with the same size and etag, or a removed fact whose row is gone
+// or soft-deleted. In both cases a newer observation has confirmed the fact —
+// acknowledging it does not lose anything.
+func sameStateAsFact(event storageevent.Event, st storageevent.RowState) bool {
+	switch event.Kind {
+	case storageevent.KindObjectCreated:
+		return st.Found && st.Status == "completed" && st.Size == event.Size && st.ETag == event.ETag
+	case storageevent.KindObjectRemoved:
+		return !st.Found || st.Status == "deleted"
+	default:
+		return false
+	}
 }
 
 // handleBucketRemoved implements D5 + D-037 rule 4: a deleted bucket directory
