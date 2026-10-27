@@ -29,8 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs/filerpb"
+	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"go.uber.org/zap"
 )
 
@@ -129,9 +129,11 @@ type FilerClient interface {
 // returned close func is called when the attempt ends. close may be nil.
 type DialFunc func(ctx context.Context) (FilerClient, func(), error)
 
-// Mark is one pending-reconciliation row for storage_event_marks. Optional
-// columns are pointers (nil = NULL). Detail carries reason-specific JSON.
+// Mark is one pending-reconciliation row for storage_event_marks. SourceID is
+// the event-source instance the mark belongs to; optional columns are pointers
+// (nil = NULL). Detail carries reason-specific JSON.
 type Mark struct {
+	SourceID string
 	Reason   string
 	Bucket   *string
 	FromTsNs *int64
