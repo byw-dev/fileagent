@@ -26,7 +26,6 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs/seaweedfstest"
-	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/byw-dev/fileagent/controlplane/migrations"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
@@ -136,10 +135,9 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 	_, err = conn.ExecContext(ctx, `INSERT INTO buckets (org_id, name, description) VALUES ($1, 'n1-bucket', 'x')`, orgID)
 	require.NoError(t, err)
 
-	// 生产链路：real indexer + real aware sink（同 cmd/server 接线）。
+	// 生产链路（R3-1）：走 startSeaweedfsEventSource 的同一工厂 scfg.adapter()，
+	// 不设 SinkOverride —— 工厂回退 plain sink 的变异必须被本测试抓红。
 	ix := indexer.NewIndexer(conn, nil, zap.NewNop())
-	sink := storageevent.NewSuppressionAwareIndexSink(ix)
-
 	reader := &racingReader{ix: ix, bucket: "n1-bucket", hotKey: "hot.csv"}
 	store := &n1CursorStore{}
 
@@ -152,15 +150,22 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 	}
 	filer := seaweedfstest.NewScriptedFiler(resps)
 
-	cfg := seaweedfs.AdapterConfig{
-		SourceID: "seaweedfs:n1", ClientName: "n1-test", ClientID: 11,
-		ResumeMargin: time.Minute, ApplyMaxRetries: 3, ApplyRetryBackoff: time.Millisecond,
-		CursorFlushInterval: 0,
-	}
 	logger, logs := n1TestLogger(t)
-	adapter, err := seaweedfs.NewAdapter(cfg,
-		func(ctx context.Context) (seaweedfs.FilerClient, func(), error) { return filer, func() {}, nil },
-		reader, store, &n1NoClock{}, sink, logger)
+	scfg := seaweedfsSourceConfig{
+		SourceID: "seaweedfs:n1", FilerAddr: "unused:0",
+		ClientName: "n1-test", ClientID: 11,
+		ResumeMargin: time.Minute, MaxRetries: 3, RetryBackoff: time.Millisecond,
+		Indexer:       ix,
+		Logger:        logger,
+		StoreOverride: store,
+		ClockOverride: &n1NoClock{},
+		ReaderOverride: reader,
+		DialOverride: func(ctx context.Context) (seaweedfs.FilerClient, func(), error) {
+			return filer, func() {}, nil
+		},
+		// SinkOverride 未设置 → 生产 newEventSink(true, ix)（aware sink，N6 守护点）。
+	}
+	adapter, err := scfg.adapter()
 	require.NoError(t, err)
 	adapter.WithSuppressionReporter(ix)
 
@@ -169,27 +174,44 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 	runDone := make(chan error, 1)
 	go func() { runDone <- adapter.Run(ctx) }()
 
-	// 修复后：同状态竞争被确认 → 冷 key 入账 → 心跳游标保存。轮询等待（10s）。
+	// 修复后：同状态竞争被确认 → 心跳 2000 的游标保存 → 冷 key 入账。轮询等待（10s）。
+	// 游标是硬断言（R3-1）：截止时间内 MaxSaved 必须越过热 key 之后的目标心跳 2000
+	//（饥饿时流断在热 key 上，2000 永远不会被处理，游标永远停在初始值）。
+	// 末尾心跳 4000 不作断言点：生产接线的 CursorFlushInterval 是默认 1s 节流，
+	// 游标只在心跳上保存，4000 若被节流跳过则之后没有任何心跳再触发补写——
+	// 它不是确定可达的断言（饥饿检测由 2000 + 冷 key 共同保证）。
 	deadline := time.Now().Add(10 * time.Second)
-	coldRows, saves := 0, 0
+	coldRows, saves := 0, int64(0)
 	for time.Now().Before(deadline) {
 		require.NoError(t, conn.QueryRowContext(context.Background(),
 			`SELECT count(*) FROM file_entries WHERE storage_path='cold.csv' AND source='storage_readback'`).Scan(&coldRows))
-		if coldRows == 1 && store.MaxSaved() >= 2000 {
+		saves = store.MaxSaved()
+		if coldRows == 1 && saves >= 2000 {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if coldRows != 1 {
+	if coldRows != 1 || saves < 2000 {
 		for _, e := range logs.All() {
 			t.Logf("adapter: %s %v", e.Message, e.Context)
 		}
 	}
 	require.Equal(t, 1, coldRows,
 		"cold key must be applied after the hot key's same-state suppression is acknowledged (pre-fix: the stream starves and this times out)")
-	if store.MaxSaved() < 2000 {
-		t.Logf("cursor not yet past 2000 (MaxSaved=%d) — non-starvation (coldRows) is the primary assertion", store.MaxSaved())
+	require.GreaterOrEqual(t, saves, int64(2000),
+		"cursor must pass the target heartbeat (2000) that follows the contended hot key — a starved stream never reaches it")
+
+	// N1 的 same-state 确认必须真的发生：plain-sink 变异下同状态写被静默丢弃
+	//（无 ErrSuppressed → 无确认日志）→ 本断言红；aware 路径绿。
+	confirmed := false
+	for _, e := range logs.All() {
+		if strings.Contains(e.Message, "confirmed same-state") {
+			confirmed = true
+			break
+		}
 	}
+	require.True(t, confirmed,
+		"production wiring must yield the suppression-aware sink so the same-state contention is explicitly confirmed (a plain sink drops the write silently)")
 	cancel()
 	require.ErrorIs(t, <-runDone, context.Canceled)
 }
