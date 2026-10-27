@@ -14,6 +14,13 @@ import (
 
 // ── fakes shared by the adapter tests ────────────────────────────────────────
 
+// readingCount reports how many clock readings were taken.
+func (f *fakeClock) readingCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.times)
+}
+
 // fakeClock is a DBClock whose readings are scripted; it records the global
 // call sequence so tests can pin that the DB clock is read BEFORE the S3 HEAD
 // (decision D2).

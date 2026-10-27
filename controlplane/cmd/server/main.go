@@ -464,7 +464,14 @@ func main() {
 			&minioObjectReader{client: minioAdminClient},
 			&storageEventStore{q: queries},
 			&dbClock{q: queries},
-			storageevent.NewIndexSink(ix),
+			// The suppression-aware sink (F1a): a read-back fact evicted by a
+			// newer observation (e.g. a delayed agent UploadResult winning the
+			// observed_at race) comes back as storageevent.ErrSuppressed so the
+			// adapter re-derives it (fresh clock + fresh HEAD) instead of
+			// acknowledging it and losing the key's last event. The MinIO
+			// webhook route keeps the plain NewIndexSink below (behavior
+			// unchanged there).
+			storageevent.NewSuppressionAwareIndexSink(ix),
 			logger,
 		)
 		if err != nil {

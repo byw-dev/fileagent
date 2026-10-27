@@ -1424,7 +1424,10 @@ func (s *STSManager) IssueCredentials(agentID string,
 >    （MinIO 生成）；`agent` / `api` ← **PostgreSQL 的 `now()`**（不是 CP 进程时钟——dev 实测进程时钟
 >    比 PG/MinIO 慢约 16ms，用它会让每一次合法上报都被守卫拦掉）；`audit` ← 列举那一刻；
 >    `storage_readback`（B3-PR3b，SeaweedFS 事件源）← **HEAD 发出之前的 DB `clock_timestamp()`**——
->    与 agent 行同一时钟域才可比，且取「HEAD 之前」使更晚的回读必带更晚的时间戳（订阅流内严格顺序处理）。
+>    与 agent 行同一时钟域才可比，且取「HEAD 之前」使更晚的回读必带更晚的时间戳。
+>    ⚠️ 该「更晚必赢」只成立于**回读之间**（订阅流内严格顺序处理）；迟到的 agent 上报若插在回读取钟与
+>    HEAD 之间，适配器会收到 suppressed 并重新取时钟/HEAD/Apply（PR #135 返工 1，F1a）；但迟到上报落在
+>    回读落账**之后**仍会复活旧状态（agent 写入协议问题，与 MinIO 路径同源，靠 L2 对账兜底）。
 >    **绝不采信 `UploadResult.uploaded_at`**（由 agent 提供，报 `2099` 即可永久冻结该行）。
 > 3. **失败上报不写 `file_entries`，只写 `upload_logs`**（`file_entry_id` 置空）。原实现无论成败都 upsert，
 >    而 `DO UPDATE` 会无条件覆盖 `status`，能把「已成功上传、后来重传失败」的**活对象标成 `failed`**（IC-BUG-33）。

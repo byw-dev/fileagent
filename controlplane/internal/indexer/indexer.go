@@ -572,12 +572,23 @@ var ErrUnknownBucket = errors.New("indexer: bucket not found in the ledger")
 // the same object, so publishing here would double-emit. This method
 // implements storageevent.IndexWriter.
 func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string, source string) error {
+	_, err := ix.IndexUploadReporting(ctx, bucketName, objectKey, sizeBytes, etag, observedAt, eventSeq, source)
+	return err
+}
+
+// IndexUploadReporting implements storageevent.SuppressionReporting: it is
+// IndexUpload with the eviction outcome surfaced — suppressed=true means the
+// row already carried a newer observation and this write was dropped by the
+// upsert guard. The MinIO webhook wrapper (IndexUpload) discards the flag (a
+// suppressed event is processed, full stop); the SeaweedFS read-back wiring
+// uses it to re-derive suppressed facts (F1a).
+func (ix *Indexer) IndexUploadReporting(ctx context.Context, bucketName, objectKey string, sizeBytes int64, etag string, observedAt time.Time, eventSeq string, source string) (suppressed bool, err error) {
 	bucket, err := ix.store.GetBucketByName(ctx, bootstrap.DefaultOrgID, bucketName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("indexer: get bucket %q for storage event: %w", bucketName, ErrUnknownBucket)
+			return false, fmt.Errorf("indexer: get bucket %q for storage event: %w", bucketName, ErrUnknownBucket)
 		}
-		return fmt.Errorf("indexer: get bucket %q for storage event: %w", bucketName, err)
+		return false, fmt.Errorf("indexer: get bucket %q for storage event: %w", bucketName, err)
 	}
 
 	fileTypeID, err := ix.classifier.Classify(ctx, objectKey)
@@ -599,12 +610,12 @@ func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string
 		UploadedAt:  sql.NullTime{Time: observedAt, Valid: true},
 	})
 	if err != nil {
-		return fmt.Errorf("indexer: upsert file entry for storage event: %w", err)
+		return false, fmt.Errorf("indexer: upsert file entry for storage event: %w", err)
 	}
 
 	if suppressed {
 		ix.suppressedWrites.Add(1)
-		return nil
+		return true, nil
 	}
 	ix.logger.Info("storage event indexed",
 		zap.String("source", source),
@@ -612,7 +623,7 @@ func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string
 		zap.String("bucket", bucketName),
 		zap.String("key", objectKey),
 	)
-	return nil
+	return false, nil
 }
 
 // IndexDeletion handles an ObjectRemoved event from a storage event source: it
@@ -620,25 +631,35 @@ func (ix *Indexer) IndexUpload(ctx context.Context, bucketName, objectKey string
 // source is the provenance label persisted in file_entries.source. Deleting an
 // object that was never indexed (or already deleted) is a no-op.
 func (ix *Indexer) IndexDeletion(ctx context.Context, bucketName, objectKey string, observedAt time.Time, eventSeq string, source string) error {
+	_, err := ix.IndexDeletionReporting(ctx, bucketName, objectKey, observedAt, eventSeq, source)
+	return err
+}
+
+// IndexDeletionReporting implements storageevent.SuppressionReporting: it is
+// IndexDeletion with the eviction outcome surfaced — suppressed=true means a
+// newer observation already sat on the row and this delete was dropped by the
+// guard. The SeaweedFS read-back wiring uses the flag to re-derive the fact
+// with a fresh clock (F1a); the MinIO webhook wrapper discards it.
+func (ix *Indexer) IndexDeletionReporting(ctx context.Context, bucketName, objectKey string, observedAt time.Time, eventSeq string, source string) (suppressed bool, err error) {
 	bucket, err := ix.store.GetBucketByName(ctx, bootstrap.DefaultOrgID, bucketName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("indexer: get bucket %q for delete event: %w", bucketName, ErrUnknownBucket)
+			return false, fmt.Errorf("indexer: get bucket %q for delete event: %w", bucketName, ErrUnknownBucket)
 		}
-		return fmt.Errorf("indexer: get bucket %q for delete event: %w", bucketName, err)
+		return false, fmt.Errorf("indexer: get bucket %q for delete event: %w", bucketName, err)
 	}
 
 	fileEntry, suppressed, found, err := ix.store.MarkFileEntryDeleted(ctx, db.DeleteIndexedFileParams{BucketID: bucket.ID, StoragePath: objectKey, ObservedAt: observedAt, EventSeq: sql.NullString{String: eventSeq, Valid: eventSeq != ""}, Source: source})
 	if err != nil {
-		return fmt.Errorf("indexer: mark file entry deleted: %w", err)
+		return false, fmt.Errorf("indexer: mark file entry deleted: %w", err)
 	}
 	if !found {
 		ix.absentDeletes.Add(1)
-		return nil
+		return false, nil
 	}
 	if suppressed {
 		ix.suppressedWrites.Add(1)
-		return nil
+		return true, nil
 	}
 
 	ix.publishFileDeleted(fileEntry)
@@ -647,7 +668,7 @@ func (ix *Indexer) IndexDeletion(ctx context.Context, bucketName, objectKey stri
 		zap.String("bucket", bucketName),
 		zap.String("key", objectKey),
 	)
-	return nil
+	return false, nil
 }
 
 // publishFileDeleted emits events.file.deleted for a soft-deleted entry.

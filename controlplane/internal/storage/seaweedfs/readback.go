@@ -26,7 +26,16 @@ package seaweedfs
 //     moment it was issued, so any later read-back of the same key carries a
 //     later timestamp and wins the eviction race — old facts lose to new
 //     facts, never the reverse. This only holds because the adapter processes
-//     its stream strictly in order (single goroutine, D5).
+//     its stream strictly in order (single goroutine, D5) — i.e. it holds
+//     BETWEEN READ-BACKS, not against agent/API writers: a delayed agent
+//     UploadResult landing between this clock reading and the HEAD wins the
+//     eviction and suppresses this fact. The adapter therefore treats a
+//     suppressed Apply (storageevent.ErrSuppressed, F1a) as a retryable
+//     outcome: fresh clock, fresh HEAD, re-Apply (bounded by the retry
+//     budget). A delayed agent write landing AFTER a read-back fact has
+//     already landed still resurrects the old state — that is an agent
+//     write-protocol problem shared with the MinIO path (F1b, out of scope
+//     here; L2 reconciliation is the backstop).
 //
 // Known gap (recorded in the PR description): the MinIO webhook path keeps
 // using MinIO eventTime — a different clock domain, out of PR3b's scope.
