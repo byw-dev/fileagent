@@ -399,19 +399,28 @@ fe() { psql_q "select coalesce(${1}::text,'<null>') from file_entries where file
 
 # source 放在最前面断言：agent 不上报时 webhook 兜底路径**仍会建出行**，
 # 所以「有没有行」挡不住 IC-2a 回归，「行是谁写的」才挡得住。
-# seaweedfs 分支的并发写者：filer 订阅的 S3 回读（source='storage_readback'）
-# 也会为同一个对象建行/刷新行（D-037：事件只是提示，回读才是事实）。回读行的
-# observed_at 取自「HEAD 之前」的 DB 时钟，而 filer 事件在 PUT 完成前就已产生，
-# 因此正常时序里 agent 行（observed_at=DB now()，更晚）会最后覆盖获胜——用
-# wait_for 轮询等 agent 行出现，把「回读行先到」的正常竞态消化掉。
-agent_row_is_source_of_truth() {
-  [ "$(psql_q "select count(*) from file_entries where file_name='smoke.csv' and source='agent'")" -ge 1 ]
-}
+# seaweedfs 分支（PR #135 返工 1 修正）：filer 订阅开启后，S3 回读也会为同一
+# 对象建行/刷新行（D-037：事件只是提示，回读才是事实），且回读行的
+# observed_at（HEAD 前的 DB 时钟）**可能晚于** agent 行的 now()——尤其在高负载
+# 下——此时行的 source 合法地变为 'storage_readback'（upsert 的 COALESCE 保留
+# agent 写入的 sha256/agent_id/rule_id）。因此 seaweedfs 分支改用「agent 专属
+# 字段」断言 agent 主路径（upload_logs 只有 agent 写；agent_id/rule_id 只有
+# agent 上报填），source 允许两者；minio 分支维持严格 source='agent'。
 if [ "$FA_STORAGE" = "seaweedfs" ]; then
-  wait_for "file_entries 出现 agent 上报的索引行（seaweedfs：回读行可能先到）" 120 agent_row_is_source_of_truth
+  agent_row_is_source_of_truth() {
+    [ "$(psql_q "select count(*) from file_entries where file_name='smoke.csv' and agent_id is not null and rule_id is not null")" -ge 1 ]
+  }
+  wait_for "file_entries 出现 agent 上报写入的索引行（agent_id/rule_id 已填）" 120 agent_row_is_source_of_truth
+  DB_SOURCE="$(fe source)"
+  case "$DB_SOURCE" in
+    agent|storage_readback) ;;
+    *) fail "source='${DB_SOURCE}'，期望 'agent' 或 'storage_readback'（seaweedfs：回读行可能后到并以更晚时钟覆盖）" ;;
+  esac
 fi
-DB_SOURCE="$(fe source)"
-[ "$DB_SOURCE" = "agent" ] || fail "source='${DB_SOURCE}'，期望 'agent' —— 索引行不是 agent 上报写的（IC-2a 主路径回归，退化成了存储事件兜底）"
+if [ "$FA_STORAGE" != "seaweedfs" ]; then
+  DB_SOURCE="$(fe source)"
+  [ "$DB_SOURCE" = "agent" ] || fail "source='${DB_SOURCE}'，期望 'agent' —— 索引行不是 agent 上报写的（IC-2a 主路径回归，退化成了 webhook 兜底）"
+fi
 DB_SHA="$(fe sha256)"
 [ "$DB_SHA" = "$SRC_SHA" ] || fail "索引的 sha256 与源文件不符：${DB_SHA} != ${SRC_SHA}"
 [ "$(fe agent_id)" != "<null>" ] || fail "file_entries.agent_id 为空（归属信息丢失）"
