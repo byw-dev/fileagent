@@ -495,6 +495,26 @@ type RetagJob struct {
 	FinishedAt    sql.NullTime    `db:"finished_at" json:"finished_at"`
 }
 
+// Durable storage-event-source subscription cursors: per source_id, the last idle-heartbeat declared value (source clock ns) claimed after all earlier events were applied. Written only by the storage event source adapter (B3-PR3b).
+type StorageEventCursor struct {
+	SourceID     string    `db:"source_id" json:"source_id"`
+	DeclaredTsNs int64     `db:"declared_ts_ns" json:"declared_ts_ns"`
+	UpdatedAt    time.Time `db:"updated_at" json:"updated_at"`
+}
+
+// Pending-reconciliation marks for the storage event source (gap windows after reconnects, cursor-before-earliest-log, bucket-removed incidents). WRITE-ONLY in PR3b: the consumer is L2 reconciliation (IC-13, not yet built) — do not build readers against this table before that lands.
+type StorageEventMark struct {
+	ID         uuid.UUID             `db:"id" json:"id"`
+	SourceID   string                `db:"source_id" json:"source_id"`
+	Reason     string                `db:"reason" json:"reason"`
+	Bucket     sql.NullString        `db:"bucket" json:"bucket"`
+	FromTsNs   sql.NullInt64         `db:"from_ts_ns" json:"from_ts_ns"`
+	ToTsNs     sql.NullInt64         `db:"to_ts_ns" json:"to_ts_ns"`
+	Detail     pqtype.NullRawMessage `db:"detail" json:"detail"`
+	CreatedAt  time.Time             `db:"created_at" json:"created_at"`
+	ResolvedAt sql.NullTime          `db:"resolved_at" json:"resolved_at"`
+}
+
 type TagAudit struct {
 	ID          uuid.UUID      `db:"id" json:"id"`
 	OrgID       uuid.UUID      `db:"org_id" json:"org_id"`
