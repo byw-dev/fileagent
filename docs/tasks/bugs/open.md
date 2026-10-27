@@ -10,7 +10,26 @@
 **IC-BUG 系列（数据面写入链路，2026-09-08 审计发现；IC-BUG-16…34 为 2026-09-09 起陆续追加：16/17 来自 IC-1 编码期，18/19 是 IC-1 的 live-e2e 中暴露的，20…25 来自 IC-1 的 code review，26…28 来自 IC-SEC-1 的 code review，29 来自 M-1 类扫描，30…32 来自 M-2 类扫描，33/34 来自同日 PR #95 的评审，其中 22/23 随 IC-1 修复、24/25 随 IC-SEC-1 修复、19 随 IC-2c 修复、**2/8/28/29/33 随 IC-2a 修复**；35 是 IC-2c 期间顺带发现的部署脚本缺陷，**36 是 IC-2a 的 live 验收被挡住时挖出来的、37/38 是 IC-2a 的 live 验收过程中暴露的、39…41 来自 PR #97 的 code review**）** —— 关联决策 [`DECISIONS.md`](../../../DECISIONS.md) D-030、
 设计 [`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)。
 
-> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判；2026-09-24 IC-4a 关闭 6/9；**IC-BUG-6 的 (d) 只落了 `active=true` 标记位，无消费方，强制解封归 IC-12 的验收与依赖（PR #110 复审 B4）**）**：共 **56** 条 = **已关闭 37** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 18**（**2 条挡** 7/40 + **13 条可推** + **3 条拆半** 13、46 与 32）。**2026-10-12：IC-BUG-56 随 D-037 文档 PR 立卡（判可推），来自存储层调研。****口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。
+> **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判；2026-09-24 IC-4a 关闭 6/9；**IC-BUG-6 的 (d) 只落了 `active=true` 标记位，无消费方，强制解封归 IC-12 的验收与依赖（PR #110 复审 B4）**）**：共 **56** 条 = **已关闭 37** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 18**（**2 条挡** 7/40 + **13 条可推** + **3 条拆半** 13、46 与 32）。**2026-10-12：IC-BUG-56 随 D-037 文档 PR 立卡（判可推），来自存储层调研。****口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。（⚠️ 本段判定口径已被下一段取代，保留为历史。）
+
+> ### 🔄 计数与判定（2026-10-27 里程碑 B 重判）——以本段为准
+>
+> **共 57 条 = 已关闭 37 + 已撤销 1（IC-BUG-49）+ 未关闭 19**（新增 **IC-BUG-57**，随本次重判立卡，见文末）。
+> 判据更换：旧口径「挡 / 可推」（2026-09-11 重判为「挡 / 不挡 A」）已让位于**里程碑 B 判据**——
+> **这条缺陷在 SeaweedFS 试点部署里还成立吗？成立的话挡不挡试点？**（依据 D-037、`docs/tasks/active.md`「当前里程碑 B」，
+> B7 之后即可试点部署。）18 条未关缺陷逐条重判，判定只针对仍开着的那一半（拆半卡片 13/46/32 先判 ◐ 再判剩余半边）：
+>
+> | 判定 | 条数 | 明细 |
+> |---|---|---|
+> | **挡试点** | **0** | 无 |
+> | **不挡试点** | **16** | 13、14、15、32、38、40、42、45、48、51、52、53、54、55、56、57（新卡） |
+> | **MinIO 专属** | **2** | 7、41（不关闭——MinIO 过渡期仍是默认后端；MinIO 适配器退役时随之关闭。7 在 SeaweedFS 上无对应物：事件源按 `/buckets/` 前缀订阅，新桶天然覆盖，PR3b 合并后成立；41 的 SeaweedFS 侧同类问题已另立 57） |
+> | **已失效 / 撤销** | **0** | 无（无一条满足「必须给出代码证据」的撤销门槛） |
+> | **待产品定** | **1** | 46 剩余半边——tail 模式在试点里是否必须可用是产品问题，不替产品拍板（报告单列） |
+>
+> 一行式口径：**挡试点 0 / 不挡试点 16 / MinIO 专属 2（7、41）/ 已失效 0 / 待产品定 1（46 剩余半边）**。
+> 逐条判定、理由与文件:行号证据见各卡片的「**B 重判（2026-10-27）**」行；下方总表的未关行标题后带统一格式的判定标记（机械重算见 `bin/recount.sh`）。
+> 机械重算脚本 `bin/recount.sh`（不提交）的输出与本段、`consistency-ingest.md`、`active.md`、`CLAUDE.md`、`TASK_LIST.md` 中的数字一致。
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -107,15 +126,15 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-4 | STS session policy 缺 multipart 权限、多授 DeleteObject  ✅ 随 IC-1 修复 | 🔴 P0 | controlplane |
 | IC-BUG-5 | 断点续传状态从未落盘，重试永远从头重传 + 孤儿分片累积 ✅ 随 IC-3 修复 | 🟠 P1 | agent |
 | IC-BUG-6 | minio-event 索引失败仍返回 200，MinIO 丢弃事件 ✅ 随 IC-4a 修复 | 🟠 P1 | controlplane |
-| IC-BUG-7 | 通过 API 新建的 bucket 不注册事件通知，文件永不入索引 | 🟠 P1 | controlplane + deploy |
+| IC-BUG-7 | 通过 API 新建的 bucket 不注册事件通知，文件永不入索引 〔B:MinIO 专属〕 | 🟠 P1 | controlplane + deploy |
 | IC-BUG-8 | `UpsertFileEntry` 无排序键，webhook 会把 agent 富字段覆盖为 NULL ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-9 | webhook `queue_dir` 位于 `/tmp`，MinIO 重启即丢未投递事件 ✅ 随 IC-4a 修复 | 🟠 P1 | deploy |
 | IC-BUG-10 | `IsProcessed` 忽略 mtime/size，文件修改后永不重传 ✅ 随 IC-5 修复 | 🟡 P2 | agent |
 | IC-BUG-11 | tail 模式 `file_offset` / `append_mode` 是死参数 ✅ 随 IC-5 修复 | 🟡 P2 | agent |
 | IC-BUG-12 | 上传无超时；重试耗尽后不通知 Control Plane ✅ 两半均已修复（上报半边随 IC-2a，超时半边随 IC-5）| 🟡 P2 | agent |
-| IC-BUG-13 | `content_type` 两条索引路径都不赋值，且会被 upsert 清空 ◐ **拆半**：防清空半边 ✅ 随 IC-2a 已关，填值半边仍开 | 🟡 P2 | controlplane |
-| IC-BUG-14 | Dashboard `COUNT(*)` / `SUM` 全表扫描（规模隐患） | 🟡 P2 | controlplane |
-| IC-BUG-15 | 预签名下载 URL TTL 硬编码 15 分钟，大文件不够用 | 🟡 P2 | controlplane |
+| IC-BUG-13 | `content_type` 两条索引路径都不赋值，且会被 upsert 清空 ◐ **拆半**：防清空半边 ✅ 随 IC-2a 已关，填值半边仍开 〔B:不挡试点〕 | 🟡 P2 | controlplane |
+| IC-BUG-14 | Dashboard `COUNT(*)` / `SUM` 全表扫描（规模隐患） 〔B:不挡试点〕 | 🟡 P2 | controlplane |
+| IC-BUG-15 | 预签名下载 URL TTL 硬编码 15 分钟，大文件不够用 〔B:不挡试点〕 | 🟡 P2 | controlplane |
 | IC-BUG-16 | 模板前导 `/` 使 MT-3 的 path_var 打标对多数规则静默失效  ✅ 随 IC-1 修复 | 🟠 P1 | agent + controlplane |
 | IC-BUG-17 | 缓存 token 重启后 `AgentID`/`AgentName` 恒为空，`dest_path_template` 整体失效  ✅ 随 IC-1 修复 | 🔴 P0 | agent |
 | IC-BUG-18 | Agent 只能以 TLS 拨号，而 CP gRPC 是明文，本地永远连不上  ✅ 随 IC-1 修复 | 🔴 P0 | agent |
@@ -132,31 +151,32 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-29 | `UploadResult.rule_id` 无归属校验，agent 可把上传记到别人的规则上并借其元数据打标 ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-30 | 规则 cancel 无补偿通道：断连期间删除的规则，agent 重连后继续采集上传 ✅ 随 IC-2b 修复（快照形态）| 🟠 P1 | controlplane + agent |
 | IC-BUG-31 | `registry.Send` 队列满即静默丢弃，且 Connect 在消费者启动前入队 ✅ 两半均已修复（ack 半边随 IC-2a，结构半边随 IC-2b）| 🟠 P1 | controlplane |
-| IC-BUG-32 | `Revoke` 的 `Send` 与 `Disconnect` 存在竞态窗口，命令可能在切流前被丢弃 ◐ **拆半**：有界等待 + teardown 二态 ✅ 随 IC-SEC-2（空闲路径送达确定性成立）；积压下送达保证未关（服务端无 flush 等待 API，关闭路径=应用层 ACK，未排期） | 🟡 P2 | controlplane |
+| IC-BUG-32 | `Revoke` 的 `Send` 与 `Disconnect` 存在竞态窗口，命令可能在切流前被丢弃 ◐ **拆半**：有界等待 + teardown 二态 ✅ 随 IC-SEC-2（空闲路径送达确定性成立）；积压下送达保证未关（服务端无 flush 等待 API，关闭路径=应用层 ACK，未排期） 〔B:不挡试点〕 | 🟡 P2 | controlplane |
 | IC-BUG-33 | 失败的上报仍写 `file_entries` 行，制造「DB 有、对象无」的反向幽灵 ✅ 随 IC-2a 修复 | 🟠 P1 | controlplane |
 | IC-BUG-34 | agent 重启后 `running` 态任务无复位，永久孤儿：不重传也不上报 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
 | IC-BUG-35 | `init-minio.sh` 默认 CP 服务账号 access key 超出 MinIO 20 字符上限，脚本第 4 步必失败 ✅ 已修（PR #97） | 🟠 P1 | deploy |
 | IC-BUG-36 | CP 凭据被 `init-minio.sh` 建成 **service account**，而 MinIO 的 service account 不能调 AssumeRole → 全新环境 STS 必然 `Access Denied` ✅ 已修（PR #97） | 🔴 P0 | deploy |
 | IC-BUG-37 | watcher 的 fsnotify 分支没有初始扫描，规则指向的**既有文件永不被采集**；而 polling 回退分支却会扫——同一条规则的行为取决于 fsnotify 是否可用 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
-| IC-BUG-38 | agent 的 `log.output` / `log.max_size_mb` / `log.max_backups` 解析了、校验了、写进文档了，就是没人读——日志只落 stdout，无文件、无轮转 | 🟡 P2 | agent |
+| IC-BUG-38 | agent 的 `log.output` / `log.max_size_mb` / `log.max_backups` 解析了、校验了、写进文档了，就是没人读——日志只落 stdout，无文件、无轮转 〔B:不挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 ✅ 随 IC-3 修复（新增 `policy_script_test.go` 交叉校验）| 🟡 P2 | deploy + controlplane |
-| IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 | 🟠 P1 | controlplane |
-| IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 | 🟡 P2 | deploy |
-| IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT | 🟡 P2 | agent |
+| IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 〔B:不挡试点〕 | 🟠 P1 | controlplane |
+| IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 〔B:MinIO 专属〕 | 🟡 P2 | deploy |
+| IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT 〔B:不挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-43 | close_wait 初始扫描跳过「仍在写」的文件，但 fsnotify 分支只扫一次、也没有后续事件兜底——写完即停的文件会被永久跳过 ✅ 随 IC-BUG-44 同刀修复（PR #108：一次性 debounce recheck）| 🟡 P2 | agent |
 | IC-BUG-44 | 阻塞发送期间内核 watch 队列可能溢出——两个生产平台都会把溢出报上 `fw.Errors`（Linux `IN_Q_OVERFLOW` / Windows `ErrEventOverflow`），但代码只打一条 Warn 就扔了，缺一次安全网重扫闭环 ✅ 已修（PR #108：溢出触发安全网重扫）| 🟠 P1 | agent |
-| IC-BUG-45 | tail 偏移在**事件发出时**推进而非**上传确认后**，一次彻底失败的 tail 上传会静默丢掉一段字节区间且无任何信号 | 🟡 P2 | agent |
-| IC-BUG-46 | **`append_mode=tail` 静默丢数据**：`singlePartUpload` 在 `offset>0` 时把**只含增量**的内容 `PutObject` 到同一键，对象被整体替换，此前已采集的内容从对象中消失 ◐ **拆半**：挡掉半边 ✅ 随 IC-3（CP 422 + agent 闸门 + UI 禁用）；**正确实现归 IC-15** | 🔴 P0 | agent |
+| IC-BUG-45 | tail 偏移在**事件发出时**推进而非**上传确认后**，一次彻底失败的 tail 上传会静默丢掉一段字节区间且无任何信号 〔B:不挡试点〕 | 🟡 P2 | agent |
+| IC-BUG-46 | **`append_mode=tail` 静默丢数据**：`singlePartUpload` 在 `offset>0` 时把**只含增量**的内容 `PutObject` 到同一键，对象被整体替换，此前已采集的内容从对象中消失 ◐ **拆半**：挡掉半边 ✅ 随 IC-3（CP 422 + agent 闸门 + UI 禁用）；**正确实现归 IC-15** 〔B:待产品定〕 | 🔴 P0 | agent |
 | IC-BUG-47 | 实时 fsnotify 事件路径仍用非阻塞 `emit`（满即丢弃），大量小文件并发写入时被丢弃的文件**永不被采集**——IC-5 的 F1 只修了初始扫描那一半 ✅ 随 IC-3 修复（4 处实时发送点全改 `emitBlocking`） | 🟠 P1 | agent |
-| IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 | 🟡 P2 | agent |
+| IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 〔B:不挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-49 | ~~`dest_path_template` 带不带 `{time}` 隐式决定「追加后产生新版本对象 vs 覆盖同一对象」，产品语义从未定义~~ **❌ 已撤销（2026-09-13，前提被实测证伪）**，其中成立的产品问题拆出为 [backlog](../backlog.md)「同一文件重复采集的覆盖语义」条目 | 🟡 P2 | 产品 + agent |
 | IC-BUG-50 | `time` 是**未声明的保留字**（三端契约只有 agent 知道）、**优先级与同体系系统变量相反**（无条件覆盖解析结果）、且**名字误导**（实为「文件被提交上传的时刻」）✅ 随 D-034 修复（PR #106：改名 `{submit_time}` + 解析结果优先 + 旧名 deprecated 兼容） | 🟡 P2 | agent + controlplane + webui |
-| IC-BUG-51 | 上报的 `sha256` / `size_bytes` / 实际上传字节**来自三次独立的文件读**，三者可以描述文件的不同版本；且 `PutObject` 返回的 ETag 虽已拿到却无人用来复核 | 🟠 P1 | agent |
-| IC-BUG-52 | `dry_run_limit` 的**有效上限恒为 10**：CP 只在响应端按它裁剪（1–10 生效），**从不下发给 agent**，而 agent 硬编码上限 10——请求 11–50 被静默压成 10，且无截断标记 | 🟡 P2 | controlplane + agent + proto |
-| IC-BUG-53 | watcher 的 `seen` 语义是「**已交付**」而非「**已持久入队**」：下游 `submitFile` 提交/判重失败**只 Warn 不重试**，文件此后不再变化时**永不被采集**（初扫路径自 PR #100 F1 起即受影响，实时路径因 IC-BUG-44/43 的 P1 裁决而**保留重试机会**） | 🟡 P2 | agent |
-| IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 | 🟡 P2 | docs |
-| IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** | 🟠 P1 | agent + CP |
-| IC-BUG-56 | **过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」只认 `AccessDenied`**——不会卡住（后台每分钟检查一次，唤醒后约 1 分钟内恢复），但期间开始的上传各失败一次、推迟一个退避档并白耗一次重试 | 🟡 P2 | agent |
+| IC-BUG-51 | 上报的 `sha256` / `size_bytes` / 实际上传字节**来自三次独立的文件读**，三者可以描述文件的不同版本；且 `PutObject` 返回的 ETag 虽已拿到却无人用来复核 〔B:不挡试点〕 | 🟠 P1 | agent |
+| IC-BUG-52 | `dry_run_limit` 的**有效上限恒为 10**：CP 只在响应端按它裁剪（1–10 生效），**从不下发给 agent**，而 agent 硬编码上限 10——请求 11–50 被静默压成 10，且无截断标记 〔B:不挡试点〕 | 🟡 P2 | controlplane + agent + proto |
+| IC-BUG-53 | watcher 的 `seen` 语义是「**已交付**」而非「**已持久入队**」：下游 `submitFile` 提交/判重失败**只 Warn 不重试**，文件此后不再变化时**永不被采集**（初扫路径自 PR #100 F1 起即受影响，实时路径因 IC-BUG-44/43 的 P1 裁决而**保留重试机会**） 〔B:不挡试点〕 | 🟡 P2 | agent |
+| IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 〔B:不挡试点〕 | 🟡 P2 | docs |
+| IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** 〔B:不挡试点〕 | 🟠 P1 | agent + CP |
+| IC-BUG-56 | **过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」只认 `AccessDenied`**——不会卡住（后台每分钟检查一次，唤醒后约 1 分钟内恢复），但期间开始的上传各失败一次、推迟一个退避档并白耗一次重试 〔B:不挡试点〕 | 🟡 P2 | agent |
+| IC-BUG-57 | `init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕 | 🟡 P2 | deploy |
 
 ---
 
@@ -235,10 +255,11 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | 字段 | 内容 |
 |------|------|
 | **根因** | `mc event add` 只在初始化脚本里对 `${BUCKET_DATA}` 执行了一次；`BucketsHandler.Create` 只调 `MakeBucket`，不注册通知规则 |
-| **精确位置** | `deploy/scripts/init-minio.sh:148-150`；`controlplane/internal/api/handler/events.go`（Create → `minioBucketMaker.MakeBucket`，`controlplane/cmd/server/main.go:57-60`） |
+| **精确位置** | `deploy/scripts/init-minio.sh:433`（`mc event add`）；`controlplane/internal/api/handler/events.go:155`（Create → `minioBucketMaker.MakeBucket`，`controlplane/cmd/server/main.go:60-62`）（2026-10-27 更正行号） |
 | **后果** | 在当前架构下（webhook 是唯一写入路径），**通过 Web UI 创建的任何 bucket，其文件都永远不会进入索引** |
 | **修复** | `MakeBucket` 后调用 `SetBucketNotification` 注册与初始化脚本相同的 ARN 与事件类型；对已存在的 bucket 提供一次性补注册（启动时对 `buckets` 表逐个 ensure，幂等） |
 | **验收** | 通过 API 建一个新 bucket，直接 `mc cp` 一个对象进去，`file_entries` 出现该行 |
+| **B 重判（2026-10-27）** | **MinIO 专属** — 根因（建桶不注册通知）只在 MinIO webhook 架构上成立：SeaweedFS 事件源按 `/buckets/` 前缀订阅 filer 元数据流，新桶的对象事件天然进入订阅，无需逐桶注册（D-037 §五.4「只认 `/buckets/<桶>/` 下的条目」；实测 `bin/b3-evidence/events.jsonl` 首个事件即 `/buckets` 目录枚举）。该订阅在 PR3b（未合并）里落地——本条在 SeaweedFS 上「不存在对应物」以 **PR3b 合并后** 为准（归 PR3b）。MinIO 过渡期建桶仍坏，**不关闭**；MinIO 适配器退役时随之关闭。证据：`events.go:155`（MakeBucket 无通知注册） |
 
 ## IC-BUG-8 — `UpsertFileEntry` 无排序键，webhook 覆盖 agent 富字段 🟠 P1 ✅ 已修（IC-2a）
 
@@ -304,33 +325,36 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | 字段 | 内容 |
 |------|------|
 | **根因** | `UpsertFileEntryParams` 有 `ContentType` 字段，但 `HandleUploadResult` 与 `IndexUpload` 都不填充；而 `DO UPDATE` 又无条件写 `content_type = EXCLUDED.content_type` |
-| **精确位置** | `controlplane/internal/indexer/indexer.go`（全文无 `ContentType`）；`controlplane/internal/indexer/queries.go:56` |
+| **精确位置** | `controlplane/internal/indexer/indexer.go`（全文无 `ContentType`，2026-10-27 复核）；upsert SQL 已随 sqlc 收敛至 `controlplane/internal/db/queries/ingest.sql:24`（COALESCE 守卫；原记 `indexer/queries.go:56` 已失效）（2026-10-27 更正行号） |
 | **后果** | 该列恒为 NULL；将来任何补齐它的路径都会被另一条路径清空（与 IC-BUG-8 同源） |
 | **修复** | 随 IC-BUG-8 的 `COALESCE` 一并修；MinIO 事件载荷含 `contentType` 时填入，agent 侧由 `UploadResult` 带上（需 proto 增字段，只增不改编号） |
 | **载荷里本来就有（2026-09-10 实测）** | webhook 与 NATS 载荷均含 `"contentType":"text/plain"`，是 CP 侧 `IndexUpload` 没读它——**填值半边的 webhook 那一路今天就能做，无需任何前置**。与传输无关，IC-11 不改变这一点 |
 | **⚠️ 拆分（2026-09-10）——归档时不得整条关闭** | **防清空半边**（`DO UPDATE` 的 `COALESCE`）随 **IC-2a ⑤** 免费带上——它就是 IC-BUG-8 的同一条 SQL；**填值半边**（agent 侧经 `UploadResult` 带 `content_type`、webhook 侧从事件载荷取）**仍开着**，需 proto 增字段，可推到准入阶段之后。**两半都完成前本卡片保持 open** |
 | **验收** | 上传一个 `.csv`，`file_entries.content_type` 为 `text/csv`（填值半边），随后到达的 webhook 事件不会清空它（防清空半边） |
 | **防清空半边已随 IC-2a ⑤ 关闭（2026-09-11）** | `DO UPDATE` 的 `COALESCE` 已落地，后到的 webhook 不会再清空已有值。**填值半边仍开着**（agent 侧经 `UploadResult` 带 `content_type` 需 proto 增字段；webhook 侧从事件载荷取 `contentType` 今天就能做），本卡片保持 open
+| **B 重判（2026-10-27）** | **不挡试点** — 填值半边只影响 `content_type` 元数据列（下载/预览的 Content-Type 展示），对象内容与索引正确性无恙；预签名下载由客户端推断类型。兜底 = 展示层缺元数据但不影响数据安全。证据：`controlplane/internal/db/queries/ingest.sql:24`（防清空守卫在位）、`indexer.go` 全文无 ContentType（2026-10-27 复核） |
 
 ## IC-BUG-14 — Dashboard `COUNT(*)` / `SUM` 全表扫描 🟡 P2
 
 | 字段 | 内容 |
 |------|------|
 | **根因** | 统计端点对 `file_entries` 做 `COUNT(*)` 与 `SUM(size_bytes)`——三条查询均带 `WHERE org_id = $1`，但第一版单组织下该条件不筛掉任何行，**实际等同全表扫描**（多租户落地后仍需索引/物化，不是加个 `org_id` 条件就修好了）；文件列表按 D-007 还要每次返回 `total` |
-| **精确位置** | `controlplane/internal/db/read_queries.go:514,517,522` |
+| **精确位置** | `controlplane/internal/db/read_queries.go:465,469,473`（2026-10-27 更正行号，原记 :514,517,522 已漂移） |
 | **后果** | 百万行尚可，按 §6.7 推算的量级（高频小文件 50 台 ≈ 2600 万对象/年，3–5 年上亿）会成为主要的 DB 负载来源 |
 | **修复** | 见 D-030 地基阶段（IC-7）：增量维护的计数表，或 `pg_class.reltuples` 估算 + 明确标注为估算值。改动 `total` 契约需新开决策记录（D-007 关联） |
 | **验收** | 造 1000 万行后 Dashboard 首屏 P95 < 500ms |
+| **B 重判（2026-10-27）** | **不挡试点** — 纯 PG 侧规模隐患，与存储后端无关；试点量级远低于百万行，全表扫描无感（分诊表原判仍有效）；B5/B6 的计数契约（IC-7）会结构性解决。证据：`read_queries.go:465,469,473` |
 
 ## IC-BUG-15 — 预签名下载 URL TTL 硬编码 15 分钟 🟡 P2
 
 | 字段 | 内容 |
 |------|------|
 | **根因** | `const presignTTL = 15 * time.Minute` 写死在 handler 内 |
-| **精确位置** | `controlplane/internal/api/handler/files.go:342`（`DownloadURL`）、`:401`（`BatchDownloadURLs`） |
+| **精确位置** | `controlplane/internal/api/handler/files.go:344`（`DownloadURL`）、`:402`（`BatchDownloadURLs`）（2026-10-27 更正行号） |
 | **后果** | 违反「禁止 hardcode 配置项」；ETL 拉取 GB 级文件时 15 分钟不足，下载中途 403 |
 | **修复** | 提为配置项（默认保持 15min），并在响应的 `expires_in` 中如实返回 |
 | **验收** | 改配置后 `expires_in` 随之变化 |
+| **B 重判（2026-10-27）** | **不挡试点** — CP 本地签名，与存储后端无关；试点下载场景 15 分钟够用，过期重取一次 URL 即可（幂等），无数据风险；ETL 大文件场景未启用。证据：`files.go:344,402` |
 
 ## IC-BUG-16 — 模板前导 `/` 使 path_var 打标对多数规则静默失效 🟠 P1 ✅ 已修（IC-1，PR #93）
 
@@ -540,13 +564,14 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **根因** | `Revoke` 先 `registry.Send(RevokeCommand)` 入队，紧接着调 `registry.Disconnect` cancel 掉 context，二者之间没有任何同步 |
 | **⚠️ 量级修正（2026-09-10 评审实测）** | 初版写「约半数丢失」——**证伪**。复刻 `handler.go:115-132` 的 select 结构 + `agents.go:401/410` 的调用序实测：发送 goroutine **已 park 在 select 上**（`SendCh` 空）时，channel 直接交接，`SendCh` 分支在 `Send` 返回前就已提交，随后的 `cancel()` 追不上——**20000 次 100% 送达**；只有 goroutine **不在 select** 时（正卡在前一条消息的 `stream.Send` 里，或尚未启动）两分支才同时就绪，此时 49.6%。**稳态下的空闲连接正是前者**，所以「约半数」不成立 |
 | **真正的主窗口** | 不是 select 的随机选择，而是：`ctx.Done()` 让 `Connect` 的主循环 `return`、RPC 就此结束，**后续的 `stream.Send` 必然失败**。即命令是否送出取决于「发送 goroutine 有没有抢在 handler 返回之前把它写进流」——这是个时间赛跑，不是 50/50 的掷硬币 |
-| **精确位置** | `controlplane/internal/api/handler/agents.go:399-413`（`Send` 后立即 `Disconnect`）；`controlplane/internal/grpcserver/handler.go:114-129`（发送 goroutine 的 select） |
+| **精确位置** | `controlplane/internal/api/handler/agents.go:439-460`（`Revoke` → `RevokeConn`）；`controlplane/internal/grpcserver/registry.go:401`（`SendSync`）、`:254`（`Stop`）（2026-10-27 更正：IC-SEC-2 后调用形态已变） |
 | **后果** | 有限。切流是硬手段且已经生效（IC-SEC-1），协作式命令本就尽力而为。真实损失是**守规矩的 agent 收不到 `Revoke` 就不执行 `handleRevokeCommand`**，本地 token 留在磁盘上直到 30 天 TTL 到期。安全上不构成新暴露面——状态闸门（IC-BUG-23 修复）拦住重连，**且 PR #109 评审补上了中途竞态的另一半**（此前这句话说重了）：过首检但被吊销事务抢先的连接原先只被记一条 warning、会全功能存活到 STS 过期，现于 `MarkAgentOnlineIfUsable`=0 时立即 PermissionDenied（`TestServer_Connect_RevokedMidSetup_IsCutNotPersisted`） |
 | **来源** | 原埋在 IC-BUG-25 的「备注（本刀未处理）」里，处置写的是「随 IC-2 顺手处理」。2026-09-10 的 M-2 类扫描把它升格为独立卡片 |
 | **修复** | 让切流等一个**有界**的短窗：`Send` 之后不立刻 cancel，等发送 goroutine 确认写出（或固定等 ≤1s）再 `Disconnect`，超时则直接切。**上限必须是硬的**——绝不能无限等一个不读流的 agent，那会重蹈 IC-BUG-25 复审里 MF-4 的覆辙 |
 | **验收** | bufconn 用例：正常 agent 被吊销时先收到 `RevokeCommand`、流随后才断；**不读流的 agent 在上限时间内仍被切断**（不因等待而挂住 handler） |
 | **◐ 已关半边（IC-SEC-2，2026-09-14）** | `Send`→`Disconnect` 之间加 **1s 硬上限的有界等待**（`registry.SendSync`：入队即分配 FIFO 序号、发送 goroutine 写出确认才放行；等待零锁、队满即拒绝；等待者由 writerDone 关闭释放，writer 退出与「writer 尚未启动即注销」两条路径都覆盖（sync.Once，PR #109 复审 P2-4 补齐后一路径））；teardown 二态：确认→`registry.Stop` 正常收尾（不 cancel、不 RST 在途写）、超时→`Disconnect` 强制切。「切流 regardless」语义保持。**空闲路径**（writer park 在 select、无积压——稳态常态）命令先于断流送达，确定性成立并有契约测试（`TestRevoke_IdlePath_DeliversCommandBeforeStreamEnd`，-count=50）；不读流的 agent 在上限内被切断（`TestRevoke_NonReadingAgent_StillCutWithinCap`，-count=50）、等待者在 writer 退出或 writer 未启动即注销两条路径上都被及时释放（`TestSendSync_WaiterReleasedWhenWriterStops` / `TestSendSync_WaiterReleasedWhenWriterNeverStarted`，各 -count=50）；handler 级分支守卫（确认→Stop / 超时→Disconnect、上限恒 1s）变异可红 |
 | **◐ 未关半边（拆半，未排期）** | **积压下服务端无法保证「命令先于断流送达」**。根因（2026-09-14 复核实证）：`stream.Send` 返回=帧**入队**而非上 wire，服务端没有等待 flush 的 API，流收尾也不等对端开窗——未 flush 的排队帧（含命令）在收尾时被丢弃。同一钉住 harness 实测：Send+立即 Disconnect ~50%、graceful 收尾 ~45%，无实质改善；双向字节捕获证明服务端 wire 顺序正确、客户端 transport 收齐全部字节、应用只见 1/4 条（bufconn 上「未读积压 + trailers」另有客户端 transport 丢弃缓冲帧的角点）。**关闭路径=agent 对 RevokeCommand 的应用层 ACK + CP 有界等待、超时回退强制切断，跨 proto/agent/CP 三端，不属于 IC-SEC-2（`agent/` 另有归属），未排期**。空闲路径契约与积压路径诚实口径分别由 `TestRevoke_IdlePath_*` 与 `TestRevoke_Backlog_HardCapAndCut`（送达仅记日志、明示尽力而为、不断言）钉住 |
+| **B 重判（2026-10-27）** | **不挡试点** — 只影响协作式 RevokeCommand 在积压下的送达：切流（Disconnect）硬手段已生效、状态闸门拦重连（IC-BUG-23 修复），漏投的只是本地 token 清理（最多留到 30 天 TTL），安全边界不破；空闲路径（稳态常态）确定性送达有契约测试钉住。证据：`registry.go:186,401`、`agents.go:439-460` |
 
 ## IC-BUG-33 — 失败的上报仍写 `file_entries` 行，制造反向幽灵 🟠 P1 ✅ 已修（IC-2a ⑥）
 
@@ -629,12 +654,13 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | 字段 | 内容 |
 |------|------|
 | **根因** | `agent/cmd/agent/main.go:69` 只把 `cfg.Log.Level` 传给 `buildLogger`，`cfg.Log.Output` / `MaxSizeMB` / `MaxBackups` 三个字段**解析了、有默认值、有校验、写进了文档，就是没有任何消费方** |
-| **精确位置** | `agent/internal/config/config.go:79-80,103,200-209`（定义/默认值/环境变量覆盖）；`agent/cmd/agent/main.go:69`（唯一消费点，只用了 Level） |
+| **精确位置** | `agent/internal/config/config.go:85-90`（三字段定义）；`agent/cmd/agent/main.go:71`（唯一消费点，只用了 Level）（2026-10-27 更正行号） |
 | **后果** | agent 日志永远只落 stdout/stderr：配了 `output = "/var/log/fileagent/agent.log"` 也不会有那个文件，更没有轮转。**部署形态下等于没有日志留存**——出事之后回溯全靠 systemd/docker 的 stdout 捕获，而 `max_size_mb`/`max_backups` 这两个「配了会安心」的旋钮完全是摆设 |
 | **发现路径** | IC-2a 的 live 验收（2026-09-11）：用例给 agent 配了 `[log] output=…/agent.json.log`，跑完发现该文件根本不存在，日志全在进程 stdout 重定向的文件里 |
 | **修复** | 用 `lumberjack` 之类的轮转 writer 接上三个字段（`output` 为空或为 `stdout` 时保持现状）；或者**反过来删掉这三个字段**并同步文档——**但不要保持现状**，「配了不生效」比「没有这个功能」更坏 |
 | **验收** | 配 `output` 指向一个文件后重启 agent，日志写进该文件；写满 `max_size_mb` 后发生轮转且保留 `max_backups` 份 |
 | **归属** | 未排期。属「参数收了不用」类（与 IC-BUG-5/11 同类，本条是第三个实例——见上方「缺陷模式」一节） |
+| **B 重判（2026-10-27）** | **不挡试点** — agent 侧运维便利性问题，与后端无关；stdout 由容器/systemd 捕获，试点运维文档写明日志收集路径即可兜底（B7 文档项顺带覆盖）。证据：`main.go:71`、`config.go:85-90` |
 
 
 ## IC-BUG-39 — 脚本硬编码的 session policy 与 `storage/policy.go` 无联动 🟡 P2 ✅ 已修（IC-3，PR #105）
@@ -654,11 +680,12 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 | 字段 | 内容 |
 |------|------|
-| **根因** | `controlplane/cmd/server/main.go:206-221` 构造 MinIO 客户端时只调 `miniogo.New`——那是纯本地构造，**不发任何网络请求**。凭据是错的、账号被删了、secret 被轮换过，CP 都会照常启动并报告健康 |
+| **根因** | `controlplane/cmd/server/main.go:209-222` 构造 MinIO 客户端时只调 `miniogo.New`——那是纯本地构造，**不发任何网络请求**。凭据是错的、账号被删了、secret 被轮换过，CP 都会照常启动并报告健康 |
 | **后果** | 故障延后且移位：预签名下载要等有人点下载才 500；STS 要等 agent 连上来才 `Access Denied`；**若 STS 会话已签发，还要再等 ≤1h 会话过期才开始失败**。报错点在 agent 侧，离根因隔了一小时和两个进程。IC-BUG-36 当初难查、以及 PR #97 评审发现的「重跑脚本静默换密」之所以危险，都有这条在放大 |
 | **修复** | 启动时做一次轻量探活并 fail-fast（例如对配置的 bucket 调一次 `BucketExists`，或直接签一次 STS）。**注意别把 CP 的启动硬绑在 MinIO 可用性上**——探活失败应该是「响亮地记录 + 健康检查置为降级」还是「拒绝启动」，需要拍一下；倾向后者，理由是凭据错配属于配置错误，不是可恢复的依赖抖动 |
 | **验收** | 把 `MINIO_SECRET_KEY` 改错启动 CP → 启动阶段就明确报错，而不是健康启动后在下载/上传时才暴露 |
 | **归属** | 未排期。发现于 PR #97 的 code review |
+| **B 重判（2026-10-27）** | **不挡试点** — 凭据错配在 bootstrap 时即被 `init-seaweedfs.sh` 三项自检实测暴露（AssumeRole / CreateBucket / 预签名 GET，`init-seaweedfs.sh:237-323`）；试点凭据静态（iam.json 渲染产物，轮换须重渲染 + 容器重启，compose 文档写明），运行期「延后爆雷」窗口窄；agent 侧失败仍会上报可见。证据：`main.go:209,219`（miniogo.New 纯本地构造，SeaweedFS 分支下凭据来源变为 SW_CP_* 但消费路径不变） |
 
 ## IC-BUG-41 — `init-minio.sh` 把 secret 放进命令行 argv 🟡 P2
 
@@ -670,6 +697,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | `mc` 支持从环境变量读凭据（`MC_HOST_<alias>`），curl 支持 `--netrc-file`；两者都能把 secret 移出 argv。改动不大但要小心别把 secret 写进会残留的文件 |
 | **同类卫生问题** | `mc share download` 每跑一次会在 `~/.mc/share/downloads.json` 留一条 `.init-check` 的预签名记录，脚本的 `cleanup()` 不清理。不含 secret、5 分钟过期，属同一类卫生问题，宜一并处理 |
 | **归属** | 未排期。发现于 PR #97 的 code review |
+| **B 重判（2026-10-27）** | **MinIO 专属** — 三处 argv 明文都在 `init-minio.sh`；SeaweedFS 渲染器经环境变量注密（`render-seaweedfs-configs.sh:88-111`，python3 读 env，secret 不进 argv），无对应物——但 `init-seaweedfs.sh` 有同类新问题，已另立 **IC-BUG-57**（不偷换本卡含义）。**不关闭**（MinIO 过渡期仍是默认后端）；MinIO 适配器退役时随之关闭。证据：`init-minio.sh:433` 附近三处 argv 用法 |
 
 
 ## IC-BUG-42 — `EnqueueIfNoActive` 不拦 `failed`，退避重试期间重复提交会双传 🟡 P2
@@ -683,6 +711,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 二选一：(a) 给 `upload_tasks` 增加「下次重试时刻」列，守卫把「`failed` 且重试仍已安排」视为 active；(b) 退避改为不落 `failed`，而用一个显式的 `retry_wait` 状态并计入 active。(b) 更干净但要动状态机，需评估与 IC-2a 上报路径的交互 |
 | **验收** | 任务失败进入退避期间重复提交同一四元组 → 只产生一个任务；退避结束后正常重试；而一个**已放弃**（重试耗尽）的任务不得阻止该文件日后被重新采集 |
 | **归属** | 未排期。宜与 IC-3（续传落盘，同样要动 `upload_tasks` 的状态与列）同刀 |
+| **B 重判（2026-10-27）** | **不挡试点** — 双传影响有界（多一次 PUT、多一行 upload_logs；键含 `{submit_time}` 时多一个对象），无数据丢失；模板失败已不猜键（IC-BUG-21 修复）。证据：`queue.go:287`（active 集合 pending/running/reported 不含 failed，2026-10-27 复核） |
 
 ## IC-BUG-43 — close_wait 初始扫描跳过的文件没有兜底路径 🟡 P2 ✅ 已修（PR #108）
 
@@ -718,6 +747,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 让偏移推进与上传确认对齐：要么在 `CompleteReported` 之后回写偏移，要么让 watcher 不再持有权威偏移、每次都从 `processed_files` 读。后者更简单且与恢复路径天然一致 |
 | **验收** | tail 规则下让一次上传彻底失败，随后文件继续增长——下一次上传必须覆盖失败的那段字节，不得出现空洞 |
 | **归属** | 未排期。与 **IC-BUG-42** 同源（都是「任务失败后的状态推进」），宜同刀 |
+| **B 重判（2026-10-27）** | **不挡试点** — 只影响 tail 模式，而 tail 已被 IC-3 fail-closed（`executor.go:340-341` 创建被拒、上传显式失败），缺陷路径当前不可达；IC-15 正确实现时一并修。证据：`executor.go:340-341`；`watcher.go:926,1225-1226`（偏移仍按事件发出推进，根因未变） |
 
 ## IC-BUG-46 — `append_mode=tail` 静默丢数据 🔴 P0 ◐ 拆半（挡掉 ✅ IC-3 / 正确实现 → IC-15）
 
@@ -731,6 +761,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | **本刀（IC-3）先 fail-closed 挡掉**：规则创建/更新时 `append_mode=tail` 返回 422 并说明原因；已存在的 tail 规则在上传路径上**显式失败并告警**，不得静默写坏对象。**正确实现见 IC-15**。⚠️ 挡掉的理由**不是「当前无消费方」**——一个已在 `system-design.md` / 规则 schema / proto 中对外提供的模式，会静默丢数据就必须先停；可见的失败优于静默的错误结果，与消费方多少无关 |
 | **验收** | 创建 `append_mode=tail` 的规则返回 422；已存在的 tail 规则触发上传时任务显式失败并留下可检索的告警，MinIO 侧**不产生**任何被替换的对象 |
 | **归属** | **挡掉随 IC-3；正确实现见 IC-15** |
+| **B 重判（2026-10-27）** | **待产品定** — 剩余半边 = tail 的正确实现（IC-15：滚动分块 + 服务端合并）。tail 模式在试点里是否必须可用是产品问题，文档无法确定（`system-design.md` §4.4.3 场景为「大文件持续追加、带宽敏感」，试点是否包含该场景无记载）——不替产品拍板，报告单列。已挡半边（422 + 上传显式失败）不受影响、维持 fail-closed。证据：`executor.go:340-341`（挡掉半边在位） |
 
 ## IC-BUG-47 — 实时 fsnotify 路径仍会静默丢弃事件 🟠 P1 ✅ 已修（IC-3，PR #105）
 
@@ -755,6 +786,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 把身份从推断升级为**验证**：已记录分片的 ETag 与**重新读取本地对应区间算出的 MD5** 比对；`mtime+size` 降级为廉价预筛。代价是本地重读已上传前缀（**纯本地 I/O，不走网络**；10GB 文件重读 10GB 本地，远比重传 10GB 便宜）。这是 S3 续传上传器的标准做法 |
 | **验收** | 同秒同尺寸改写后必须重采；保留 mtime 的原地重建（内容不同）必须重采；内容确实相同的重建仍可跳过（账本语义正确，无新内容可传） |
 | **归属** | **宜与 IC-15 同刀**——IC-15 本来就要定内容身份判据，一次解决续传版本判定 + 本条两个盲区 |
+| **B 重判（2026-10-27）** | **不挡试点** — 盲区面窄（同秒同尺寸改写、保留 mtime 原地重建、写入方倒拨 mtime 三类边界），常态采集正确（A 基线实测 sha256 三方一致）；影响 = 个别文件漏采、非损坏已有对象；IC-15（「明确不做」清单）落地时同刀解决。证据：`queue.go:721-726`（四元组推断判重，2026-10-27 复核） |
 
 ## IC-BUG-49 — 追加写入后「新版本对象 vs 覆盖」语义未定义 🟡 P2 ❌ 已撤销（2026-09-13）
 
@@ -789,6 +821,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 对每一条已标 ✅ 的缺陷，其卡片正文与任务行不得出现无限定的现在时状态断言；机械检查：取总览表的已关闭 ID 集，扫其卡片正文中的「当前/从不/仍/尚未/未排期」，命中即需带「发现时/修复前」限定 |
 | **⚠️ 范围争议（如实记录）** | PR #109 评审把本条判为**阻塞该 PR**；协调者提出异议——评审自己在上一轮对「分诊表仅收录 31 条」等问题的裁决是「**未被本提交扩大**的存量问题…不阻塞本 PR」，而本条绝大多数实例由 IC-2a/IC-2b/IC-3/IC-5/PR #97 等更早的刀留下，本刀既未扩大也未触碰。最终按后一标准处理：**本刀只修自己造成的自相矛盾**（IC-BUG-44 卡片、IC-SEC-2 任务行 `:255/:285`）+ 加基线声明，其余立本卡。留此记录是为了让下一个人知道这里判过一次、依据是什么 |
 | **归属** | 未排期。纯文档整理，无代码风险；建议与「分诊表仅收录 31 条（42…53 未收录）」「`open.md:203/:300` 标题与总览行标记不一致」两条存量一并做 |
+| **B 重判（2026-10-27）** | **不挡试点** — 账本自身的卫生问题（已关卡片残留现在时表述），无任何运行时影响；「内容列是基线快照」声明已随 PR #109 落地（`consistency-ingest.md` 任务清单表前）。证据：`consistency-ingest.md:246-248`（基线声明） |
 
 ---
 
@@ -809,6 +842,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 让**哈希与上传共享同一次读**：`io.TeeReader(f, sha256.New())` 包住交给 `PutObject` 的 reader，上传完成后取 hash——此时 `sha256` 按定义精确描述「实际送上去的字节」，不可能失配；`size_bytes` 同样改为取自该次读的计数（`io.Counter` 或 PutObject 返回的 `info.Size`）而非①的 stat。multipart 路径同理，逐片 Tee 后汇总。**可选加固**：上传后用 `info.ETag` 与本地重算的 MD5（单片）或分片 ETag 列表（多片）复核，把「手边的校验信号」真正用起来（与 IC-BUG-48 的 ETag 验证同一套基建，宜同刀） |
 | **验收** | 构造「上传进行中文件被追加/截断」的用例（慢 reader 或在 PutObject 期间写源文件）：上报的 `sha256` 必须等于对象实际内容的 sha256（用 `mc cat \| shasum` 核），`size_bytes` 必须等于对象的 `size`；变异——退回两次独立读，该用例必须变红 |
 | **归属** | 未排期。**是 IC-11…13（分片对账）的硬前置**：对账的全部前提就是「DB 记的 sha256/size 可信」，本条不修则对账会把好对象判成不一致、也会把坏对象判成一致。宜与 **IC-BUG-48**（ETag 验证）同刀，两者共用同一套校验基建 |
+| **B 重判（2026-10-27）** | **不挡试点** — 尺寸一变即自愈：`IsProcessed` 四元组比较因 size/mtime 变化触发重采（`queue.go:721-726`），失配只在上传窗口内被改写且此后尺寸永不再变时持续；缩短方向响亮失败不静默；影响限单文件元数据。证据：`uploader.go:168,190,238-239,284`（三次独立读，2026-10-27 复核仍在） |
 
 ## IC-BUG-52 — `dry_run_limit` 收了不用：请求 50 静默只得 10 🟡 P2
 
@@ -822,6 +856,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 三选一，**建议 (a)**：(a) proto 增字段（只增不改，符合 `buf breaking` 约束——**三轮 review 已确认相容**，且在 `DryRunResult` 增 `truncated`/`total` 同样相容）→ CP 下发 → agent 用下发值、无值时回落 10，并在结果里带「是否被截断」标记；(b) 若判定该参数不该存在，则 CP 侧直接删掉接收与夹取，避免契约撒谎；(c) 最小止血：CP 在 `dry_run_limit != 10` 时返回 warning 说明「该参数当前不生效」。**不接受维持现状**——一个被认真校验却永不生效的参数，比没有这个参数更糟 |
 | **验收** | 请求 `dry_run_limit=50` 且 base_path 下有 >10 个匹配文件 → 预览返回 50 条（或返回 10 条但带明确的截断标记）；变异：agent 端改回硬编码 10，该用例必须变红 |
 | **归属** | 未排期。**不阻塞任何在途刀**；宜与 `phase-3-rft.md` 遗留项一并清理 |
+| **B 重判（2026-10-27）** | **不挡试点** — dry-run 是预览辅助，1–10 条真实生效，缺截断标记属 API 易用性缺口，无数据风险。证据：`agent/cmd/agent/main.go:1096,1136`、`agents.go:654-658,711`（2026-10-27 复核） |
 
 - 已关闭 Bug：[`closed.md`](closed.md)
 - 当前活跃任务：[`../active.md`](../active.md)
@@ -839,6 +874,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **定级理由** | 🟡 P2 而非 P1：触发条件是「下游 `exec.Submit` 失败 + 文件此后不再变化」两个条件的交集——而 Submit 失败本身通常伴随基础设施异常（SQLite busy timeout、磁盘 I/O），这类异常同时会被其它链路暴露并留下可检索的 Warn 日志，且丢失范围限于当前 watcher 生命周期（重启/重建 watcher 用全新 seen map 的初扫即全量兜底）。⚠️ 降级理由**不是**「安全网重扫会兜住」——重扫复用同一个 seen，对本条覆盖的文件它恰恰一直跳过。后果仍属「静默漏采」族（仅剩日志、无持久重试状态），高于一般正确性缺陷，不宜 P3 |
 | **发现路径** | PR #108（IC-BUG-44/43 + 评审 F1/F2/F3/P1/P2）的 codex 复审：P1 指出 F1 的 markSeen 挡掉了溢出重扫的重试机会，协调者复核后裁决按 (b) 撤回实时路径 markSeen（保留有界重发放大），并把「seen ≠ 已持久」这个全局洞立卡为本条 |
 | **归属** | 未排期。修复归属就是上面 (a) 那条闭环的刀；与 IC-BUG-42（重复提交同源：都是交付/入队边界的状态语义）关联紧密。⚠️ IC-BUG-44 的安全网重扫对本条覆盖的文件**没有**兜底作用（同一 seen），唯一的运行期恢复手段是重启/重建 watcher |
+| **B 重判（2026-10-27）** | **不挡试点** — 触发 = Submit 失败（SQLite busy / 磁盘 I/O）+ 文件此后不再变化；重启即由初扫全量恢复，实时路径保留重试机会（PR #108 F1 撤回裁决）；试点单机低频下窗口小。证据：`agent/cmd/agent/main.go:897-899`（Submit 失败只 Warn，2026-10-27 复核） |
 
 ---
 
@@ -854,6 +890,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 ⚠️ **「不填该列、由 UI 显示未知」行不通**：该列契约是 `BIGINT NOT NULL DEFAULT 0`（迁移 000001:181）、Go `int64` 非指针（`models.go:539`）、JSON 无 `omitempty` 恒返回（`events.go:548-549`）——不赋值得到的是 `0`，UI 会显示「0 B / X」而不是未知；而 D-027 **明写「`bytes_transferred` 为 0 也是有效值、语义明确」**，把失败态的 0 一律解释成「未知」会抹掉「真实零进度」这个语义。若确实需要表达「未知」，那是**契约变更**（列可空 + `*int64` + `omitempty`，或加一个 presence 标志），得单独拍板，不是本卡的备选项。
 **随第 3 步「IC 账本按 A 的标尺重判」时定级。** |
 | **发现与订正** | 2026-09-25 排查 PR #118 独立评审 P1 时立卡，**同日经 PR #121 的 codex 独立评审证伪核心断言并收窄至当前形态**。保留本卡而非撤销，是因为失败路径的语义问题真实存在（与 IC-BUG-49「前提被完全证伪」不同）。 |
+| **B 重判（2026-10-27）** | **不挡试点** — 仅失败行的进度展示数字错误（显示「已传输整个文件」），无数据风险；Logs 页错误信息本身可见；成功路径无问题（PR #121 复审定案）。证据：`agent/internal/executor/reports.go:35,39`、`indexer.go:266-280`（2026-10-27 复核） |
 
 ## IC-BUG-56 — 过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」不触发 🟡 P2
 
@@ -866,3 +903,19 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **定级** | 🟡 P2，不挡目标 A，可推；随第 3 步账本重判时复核。 |
 | **附带事实** | minio-go v7.0.91 会把 `AssumeRole` 的 `DurationSeconds < 3600` 钳成 3600（`pkg/credentials/assume_role.go`），CP 想缩短凭据有效期时须绕开它。 |
 | **发现** | 2026-10-03 存储层调研时撞见，2026-10-12 随 D-037 文档 PR 立卡（此前只记在会话笔记里）。 |
+| **B 重判（2026-10-27）** | **不挡试点** — SeaweedFS 上同类错误码已有实测：篡改 / 缺失 session token 均返回 `InvalidAccessKeyId`（`research/storage-layer-eval/results/probe-neg/seaweedfs-loose-run.jsonl` G1.8/G1.9）；**过期场景本身待实测**（探针当时 SKIP，需 `EXPIRY_TEST=1` 重跑）。影响有界：后台每分钟刷新，唤醒后约 1 分钟内恢复，代价 = 几个任务各失败一次 + 一档退避。证据：`agent/cmd/agent/main.go:617-624`（`isAccessDenied` 只认 `AccessDenied`，2026-10-27 复核） |
+
+## IC-BUG-57 — `init-seaweedfs.sh` 把 secret 放进命令行 argv 🟡 P2
+
+> 2026-10-27 里程碑 B 重判（B3-PR4）新立：IC-BUG-41 的 SeaweedFS 侧同类问题，
+> 按「另立新卡、不偷换旧卡含义」处理（`bin/pr4.md` 新判据）。
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | `mc alias set ALIAS ENDPOINT AK SK`（admin 与 CP 两个 alias）、`curl --user "AK:SK"`（AssumeRole 自检）三处把 secret 作为 argv 传递，执行期间同机任意用户 `ps -ef` 可见——与 IC-BUG-41 在 `init-minio.sh` 的形态相同 |
+| **精确位置** | `deploy/scripts/init-seaweedfs.sh:179-180`（admin alias）、`:254-255`（CP alias）、`:142-153`（`assume_role` 的 `--user "$1:$2"`） |
+| **后果** | 仅在脚本执行的几秒窗口内可见，且通常在运维自己的机器/跳板机上执行，实际风险低（与 IC-BUG-41 同判）。渲染器**无**此问题：`render-seaweedfs-configs.sh:88-111` 经环境变量向 python3 注密，secret 不进 argv |
+| **修复** | `mc` 支持从环境变量读凭据（`MC_HOST_<alias>`）；curl 的 `--user` 可改 `--netrc-file` / `--config -`。与 IC-BUG-41 同修法，两脚本宜同刀 |
+| **验收** | 脚本运行期间 `ps -ef` 输出不含任何 `SW_*_SECRET_KEY` 值；AssumeRole / CreateBucket / 预签名 GET 三项自检仍全过 |
+| **归属** | 未排期。宜与 IC-BUG-41（`init-minio.sh` 同类问题）同刀 |
+| **B 重判（2026-10-27）** | **不挡试点** — 执行窗口秒级、通常在运维自己的机器上，实际风险低；bootstrap 三项自检本就要求操作者在场。证据：`init-seaweedfs.sh:179-180,254-255,142-153` |
