@@ -446,6 +446,9 @@ func main() {
 	// every other worker (clean shutdown, no half-written cursor on exit).
 	// The webhook route stays registered in BOTH modes (harmless, and it
 	// keeps the two sources symmetric during the transition).
+	// adapterDone is closed when the storage-event-source goroutine returns
+	// (nil when the adapter is disabled) — the shutdown path joins it.
+	var adapterDone chan struct{}
 	if cfg.StorageEventSource == config.StorageEventSourceSeaweedFSFiler {
 		// The read-back reuses the existing MinIO client/config: in the
 		// SeaweedFS deployment MINIO_* already points at the SeaweedFS S3
@@ -477,7 +480,9 @@ func main() {
 		if err != nil {
 			logger.Fatal("storage event source adapter init failed", zap.Error(err))
 		}
+		adapterDone := make(chan struct{})
 		go func() {
+			defer close(adapterDone)
 			if err := adapter.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				logger.Error("storage event source adapter stopped with an error", zap.Error(err))
 			}
@@ -554,6 +559,17 @@ func main() {
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("HTTP server shutdown error", zap.Error(err))
+	}
+	// Lifecycle (review P2): wait for the storage-event-source adapter to
+	// return so a Recv/Apply in flight at cancellation is not cut off
+	// mid-write. Run exits on ctx cancellation; the bound only guards a wedged
+	// final DB call from delaying process exit forever.
+	if adapterDone != nil {
+		select {
+		case <-adapterDone:
+		case <-time.After(10 * time.Second):
+			logger.Error("storage event source adapter did not stop within 10s of shutdown")
+		}
 	}
 	logger.Info("control plane stopped")
 }
