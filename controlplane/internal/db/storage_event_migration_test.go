@@ -90,6 +90,25 @@ func storageEventTestDB(t *testing.T) string {
 	return base[:slash+1] + name + query
 }
 
+// migrateTestDBExpectFailure runs the migration step expecting it to FAIL with
+// a message containing all the given substrings (rework F4: a guarded down
+// must refuse loudly, not half-apply).
+func migrateTestDBExpectFailure(t *testing.T, dsn string, steps int, substrings ...string) {
+	t.Helper()
+	source, err := iofs.New(migrations.FS, ".")
+	require.NoError(t, err)
+	m, err := migrate.NewWithSourceInstance("iofs", source, dsn)
+	require.NoError(t, err)
+	stepErr := m.Steps(steps)
+	srcErr, dbErr := m.Close()
+	require.NoError(t, srcErr)
+	require.NoError(t, dbErr)
+	require.Error(t, stepErr, "the migration step must fail")
+	for _, sub := range substrings {
+		require.Contains(t, stepErr.Error(), sub, "the failure must explain the remedy")
+	}
+}
+
 // sourceCheckDef returns the CHECK constraint definition text for
 // file_entries.source ("" when none exists).
 func sourceCheckDef(t *testing.T, conn *sql.DB) string {
@@ -227,4 +246,36 @@ func TestMigration000011_DownRevertsAndUpReapplies(t *testing.T) {
 	// Up again: 000011 applies cleanly a second time.
 	migrateTestDB(t, dsn, +1)
 	require.NoError(t, tryInsertSource(t, conn, "storage_readback"))
+}
+
+// TestMigration000011_DownRejectsWhenStorageReadbackRowsExist (rework F4):
+// once the migration is in use, storage_readback rows exist and a plain down
+// would either fail on the restored CHECK or (worse) require silently
+// rewriting provenance. The down migration must REFUSE with a clear message
+// and leave the database untouched; only a database without such rows can
+// roundtrip.
+func TestMigration000011_DownRejectsWhenStorageReadbackRowsExist(t *testing.T) {
+	dsn := storageEventTestDB(t)
+	migrateTestDB(t, dsn, +1)
+
+	conn, err := sql.Open("postgres", dsn)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, tryInsertSource(t, conn, "storage_readback"))
+
+	// The down step must fail loudly and name the remedy.
+	migrateTestDBExpectFailure(t, dsn, -1, "storage_readback", "人工处理")
+
+	// The database is untouched: version still 000011, tables present, the
+	// offending row intact.
+	var exists bool
+	require.NoError(t, conn.QueryRowContext(context.Background(),
+		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'storage_event_cursors')`).Scan(&exists))
+	require.True(t, exists, "the failed down must leave the schema alone")
+	var status, source string
+	require.NoError(t, conn.QueryRowContext(context.Background(),
+		`SELECT status, source FROM file_entries WHERE source = 'storage_readback' LIMIT 1`).Scan(&status, &source))
+	// tryInsertSource leaves status at the column default ('uploading'); what
+	// matters is that the row (and its provenance) survived untouched.
+	require.Equal(t, "uploading", status, "the row must be intact after the refused down")
 }
