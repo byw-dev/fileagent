@@ -340,7 +340,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 |------|------|
 | **根因** | 统计端点对 `file_entries` 做 `COUNT(*)` 与 `SUM(size_bytes)`——三条查询均带 `WHERE org_id = $1`，但第一版单组织下该条件不筛掉任何行，**实际等同全表扫描**（多租户落地后仍需索引/物化，不是加个 `org_id` 条件就修好了）；文件列表按 D-007 还要每次返回 `total` |
 | **精确位置** | `controlplane/internal/db/read_queries.go:465,469,473`（2026-10-27 更正行号，原记 :514,517,522 已漂移） |
-| **后果** | 百万行尚可，按 §6.7 推算的量级（高频小文件 50 台 ≈ 2600 万对象/年，3–5 年上亿）会成为主要的 DB 负载来源 |
+| **后果** | （历史假设，未测量）百万行尚可，按 §6.7 推算的量级（高频小文件 50 台 ≈ 2600 万对象/年，3–5 年上亿）会成为主要的 DB 负载来源 |
 | **修复** | 见 D-030 地基阶段（IC-7）：增量维护的计数表，或 `pg_class.reltuples` 估算 + 明确标注为估算值。改动 `total` 契约需新开决策记录（D-007 关联） |
 | **验收** | 造 1000 万行后 Dashboard 首屏 P95 < 500ms |
 | **B 重判（2026-10-27）** | **不挡试点** — 仅 Dashboard 统计变慢，不影响数据正确性与采集链路；试点规模边界未定（原「远低于百万行/扫描无感」无出处，已删），B5/B6 落地后复判。证据：`read_queries.go:465,469,473`（三处聚合查询，2026-10-27 复核） |
@@ -874,7 +874,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **定级理由** | 🟡 P2 而非 P1：触发条件是「下游 `exec.Submit` 失败 + 文件此后不再变化」两个条件的交集——而 Submit 失败本身通常伴随基础设施异常（SQLite busy timeout、磁盘 I/O），这类异常同时会被其它链路暴露并留下可检索的 Warn 日志，且丢失范围限于当前 watcher 生命周期（重启/重建 watcher 用全新 seen map 的初扫即全量兜底）。⚠️ 降级理由**不是**「安全网重扫会兜住」——重扫复用同一个 seen，对本条覆盖的文件它恰恰一直跳过。后果仍属「静默漏采」族（仅剩日志、无持久重试状态），高于一般正确性缺陷，不宜 P3 |
 | **发现路径** | PR #108（IC-BUG-44/43 + 评审 F1/F2/F3/P1/P2）的 codex 复审：P1 指出 F1 的 markSeen 挡掉了溢出重扫的重试机会，协调者复核后裁决按 (b) 撤回实时路径 markSeen（保留有界重发放大），并把「seen ≠ 已持久」这个全局洞立卡为本条 |
 | **归属** | 未排期。修复归属就是上面 (a) 那条闭环的刀；与 IC-BUG-42（重复提交同源：都是交付/入队边界的状态语义）关联紧密。⚠️ IC-BUG-44 的安全网重扫对本条覆盖的文件**没有**兜底作用（同一 seen），唯一的运行期恢复手段是重启/重建 watcher |
-| **B 重判（2026-10-27）** | **不挡试点**（返工 1 修订：删无据低频假设，兜底改写为可执行规程、列入 B7 运维文档清单） — 规程：**监测 agent 日志 `agent: submit task failed` → 基础设施恢复后重启 agent → 核对补采**。重启可恢复有代码依据：`processed_files` 仅在成功 ack 时写入（`queue/reports.go:96-99`，`if uploaded` 分支），Submit 失败的文件既无任务行也无 processed 行，重启后初扫以全新 seen 重新交付（`watcher.go:486`）、`IsProcessed`=false 必然重新提交；实时路径保留重试机会但不自动重试。证据：`agent/cmd/agent/main.go:897-899`（Submit 失败只 Warn，2026-10-27 复核） |
+| **B 重判（2026-10-27）** | **不挡试点**（返工 1 修订：删无据低频假设，兜底改写为可执行规程、列入 B7 运维文档清单） — 规程：**监测 agent 日志 `agent: submit task failed` → 基础设施恢复后重启 agent → 核对补采**。重启可恢复有代码依据：`processed_files` 仅在成功 ack 时写入（`queue/reports.go:96-99`，`if uploaded` 分支），此次 Submit 失败不会新增**当前候选版本**（rule_id + local_path + mtime + size）的 processed 记录——可能仍存在旧版本的成功记录（processed_files / completed 任务行），不影响恢复：当前版本 `IsProcessed`=false（`queue.go:721-726` 按四元组比较），基础设施恢复、源文件与规则仍在且匹配时，重启后初扫以全新 seen 重新交付（`watcher.go:486`）并尝试入队（评审 r2 探针实测：旧版本记录在场、新版本 INSERT 被拒后重开队列 + 初扫 → pending=1，`bin/review-r2-recovery.log`——真实 queue/submitFile/watcher，非 live）；实时路径保留重试机会但不自动重试。证据：`agent/cmd/agent/main.go:897-899`（Submit 失败只 Warn，2026-10-27 复核） |
 
 ---
 
