@@ -38,10 +38,11 @@ type seaweedfsSourceConfig struct {
 	Logger      *zap.Logger
 
 	// 测试注入钩子（nil → 生产实现）。
-	StoreOverride seaweedfs.CursorMarkStore
-	ClockOverride seaweedfs.DBClock
-	DialOverride  seaweedfs.DialFunc
-	SinkOverride  storageevent.Sink
+	StoreOverride  seaweedfs.CursorMarkStore
+	ClockOverride  seaweedfs.DBClock
+	DialOverride   seaweedfs.DialFunc
+	SinkOverride   storageevent.Sink
+	ReaderOverride seaweedfs.ObjectReader
 }
 
 // newEventSink 按事件源选择 sink（N6 守护点）：SeaweedFS → suppression-aware
@@ -71,7 +72,10 @@ func (c *seaweedfsSourceConfig) adapter() (*seaweedfs.Adapter, error) {
 	if sink == nil {
 		sink = newEventSink(true, c.Indexer)
 	}
-	reader := &minioObjectReader{client: c.MinioClient}
+	reader := c.ReaderOverride
+	if reader == nil {
+		reader = &minioObjectReader{client: c.MinioClient}
+	}
 	return seaweedfs.NewAdapter(
 		seaweedfs.AdapterConfig{
 			SourceID:          c.SourceID,
