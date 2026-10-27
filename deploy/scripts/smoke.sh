@@ -425,7 +425,7 @@ DB_SHA="$(fe sha256)"
 [ "$DB_SHA" = "$SRC_SHA" ] || fail "索引的 sha256 与源文件不符：${DB_SHA} != ${SRC_SHA}"
 [ "$(fe agent_id)" != "<null>" ] || fail "file_entries.agent_id 为空（归属信息丢失）"
 [ "$(fe rule_id)"  != "<null>" ] || fail "file_entries.rule_id 为空（归属信息丢失）"
-ok "索引行字段正确（source=agent / sha256 / agent_id / rule_id）"
+ok "索引行字段正确（source=${DB_SOURCE} / sha256 / agent_id / rule_id）"
 
 # 写放大护栏（原子落盘）：规则用的是默认 append_mode（overwrite），文件是原子 mv 进来的，
 # 所以恰好 1 条是确定的。默认模式一旦再次出现重复上传，这里就会红。

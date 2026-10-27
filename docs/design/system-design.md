@@ -1845,7 +1845,7 @@ mc event add myminio/data-sensor arn:minio:sqs::primary:webhook \
 `auth_token`（`Authorization` 头，兼容 `Bearer <token>` 与裸 token，常量时间比较）。
 **未配置密钥时端点失败即拒（fail-closed）**，拒绝一切请求而非放行，避免未鉴权写入。
 
-> ✅ **存储事件源双形态（D-037 / B3-PR3b 落地）**：运行时的事件入口由
+> ✅ **存储事件源双形态（D-037 / B3-PR3b 落地；返工 2 补充边界）**：运行时的事件入口由
 > `STORAGE_EVENT_SOURCE` 选择——`minio_webhook`（默认，即本节的 webhook 链路，
 > 过渡期保留）或 `seaweedfs_filer`：CP 进程内订阅 SeaweedFS filer 元数据日志
 > （`SubscribeLocalMetadata` + 空闲心跳声明值持久游标），对每个事件按 (bucket, key)
@@ -1856,6 +1856,9 @@ mc event add myminio/data-sensor arn:minio:sqs::primary:webhook \
 > `storage_event_marks` 待核对标记**（只写不消费，消费方是 L2 对账 IC-13）。
 > filer gRPC 无令牌鉴权（仅 mTLS，D-037 已知约束），本刀仅支持明文且必须显式
 > `SEAWEEDFS_FILER_INSECURE=true` 才启动（fail-closed）；mTLS 归 B7。
+> **边界**：① 账本后建桶（先写对象后建 buckets 行）的旧事件若已越过 `声明值−M`，
+> 不会自动补账——需该 key 新事件 / 全量重放 / L2 补上；② 迁移 000011 down 不可在
+> 有 `storage_readback` 行时直接回滚（guard 拒绝；回退流程见迁移文件注释）。
 
 ### 6.5.1 失败语义与死信（IC-4a ①，IC-BUG-6）
 
