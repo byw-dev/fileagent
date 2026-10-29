@@ -59,17 +59,22 @@ fatal() { echo "  ☠ FATAL: $*"; exit 1; }
 MC=mc
 export MC_CONFIG_DIR="$OUT/mc"
 
-# ts_ns — 可移植的纳秒级 Unix 时间戳（纯数字）。GNU date 的 %N 在 macOS 的
-# BSD date 上可能输出字面 N 或静默丢弃纳秒位，故先验证 date 输出为纯数字，
-# 否则退回 python3（仅标准库，time.time_ns()）。消费方（writes*.jsonl /
-# ovr-times.txt 的第二列）只做展示性对照，不解析格式。
-# TS_ENGINE 导出后，子脚本（writer-s2.sh）用同一引擎，两端时间戳同源。
+# ts_ns — 可移植的纳秒级 Unix 时间戳（纯数字）。date 的 %N 在 GNU date 与新版
+# macOS（Darwin 24 实测）都可用；但部分旧版 macOS/BSD date 会输出字面 N 或
+# 静默丢弃纳秒位，故先验证 date 输出为纯数字：date 可用用 date；否则 python3
+# 可用则退回 python3（仅标准库，time.time_ns()）；都不行用秒级 date +%s 兜底
+#（仍为纯数字）。消费方（writes*.jsonl / ovr-times.txt 的第二列）只做展示性
+# 对照，不解析格式。TS_ENGINE 导出后，子脚本（writer-s2.sh）用同一引擎，
+# 两端时间戳同源。
+# ⚠ 不能写成 `[ ... ] || cmd && X`：&& 的优先级会让 date 分支被 python3 覆盖。
 TS_ENGINE=""
 case "$(date +%s%N 2>/dev/null)" in
   ''|*[!0-9]*) ;;
   *) TS_ENGINE="date" ;;
 esac
-[ -n "$TS_ENGINE" ] || command -v python3 >/dev/null 2>&1 && TS_ENGINE="python3"
+if [ -z "$TS_ENGINE" ] && command -v python3 >/dev/null 2>&1; then
+  TS_ENGINE="python3"
+fi
 export TS_ENGINE
 ts_ns() {
   case "${TS_ENGINE:-}" in

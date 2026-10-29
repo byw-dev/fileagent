@@ -39,9 +39,12 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 - **docker**（compose v2，容器需可拉取 postgres/redis/nats/seaweedfs 镜像）
 - **mc**（MinIO client，用于 S3 写入/删除/列举）
 - **Go**（构建 `bin/controlplane` 与 `bin/faultproxy-bin`，与仓库其余部分同版本要求）
-- **python3**（仅标准库）：macOS 的 BSD `date` 不支持 `%N`，脚本在检测到
-  `date +%s%N` 输出非纯数字时自动退回 `python3 -c 'time.time_ns()'` 生成纳秒
-  时间戳（Linux 上直接用 `date +%s%N`，两边行为一致：纯数字纳秒）
+- **python3（仅标准库，兜底，非必需）**：脚本先验证 `date +%s%N` 输出为纯数字
+  （新版 macOS 与 Linux 的 `date` 均满足，如 Darwin 24 实测支持 `%N`），可用则
+  直接用 `date`；仅当 `date` 不支持 `%N`（部分旧版 macOS/BSD `date` 会输出
+  字面 `N`）时才退回 `python3 -c 'time.time_ns()'` 生成纳秒时间戳；两者都
+  不可用时用秒级 `date +%s` 兜底。即：python3 只在宿主 `date` 缺 `%N` 支持
+  时才是前置条件
 - 端口空闲（被占用时脚本 fail-closed 拒绝运行）：`25132 26179 27122 28122
   29334 28334 28898 28899 28081 29091 28990`
 
