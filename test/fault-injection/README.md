@@ -14,16 +14,23 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 
 单测与集成测试覆盖不到这条链路的故障面：它们用的是**假 filer 流**（内存里造的
 事件序列），断不了「真 SeaweedFS 容器被杀/重启后，订阅、游标、回读、入账各环节
-各自的真实行为」。本脚本自起一套完全隔离的环境（独立 compose 项目 `fileagent-fi`
+各自的真实行为」。本脚本自起一套隔离环境（独立 compose 项目 `fileagent-fi`
 + 高位端口），从当前工作树构建被测二进制，对真实容器注入故障。
+
+> ⚠ **隔离边界（务必先读）**：compose 项目/容器名与端口均与 smoke/dev 隔离，
+> 被测二进制构建到 `bin/tmp/fi/` 专有路径（不覆盖共享的 `bin/controlplane`）。
+> 但脚本会**重写共享的 `deploy/config/seaweedfs/{s3,iam}.json`**（compose 挂载
+> 路径写死；凭据为 `env-defaults.sh` 的 dev 默认值）——因此**不要与 smoke
+> （`FA_STORAGE=seaweedfs`）或 dev 的 SeaweedFS 在同一工作树里并发运行**。
+> 不同 worktree 之间无此问题；但端口固定，同一台机器同时只能跑一份 FI。
 
 ## 四个场景
 
 | # | 场景 | 操作 | 断言 |
 |---|------|------|------|
-| 1 | 断流重连 | CP 经一个可杀 TCP 代理（`faultproxy/`，纯字节转发）订阅 filer；写入 200 个新对象 + 删除 20 个新建 + 删除/覆盖各 15 个**已入账**对象后，`kill -9` 代理制造断流，再重启代理 | ① S3 存活集合 == 账本 `completed` 集合 == 预先固定的期望存活集合（180 个）；② 新建即删的对象在账本为 `deleted` 或合法缺席；③ 已入账后删除组全部 `status='deleted'`；④ 已入账后覆盖组行必须**存在**且 `completed` + `source='storage_readback'` + size/etag 匹配新内容（缺行即失败）；⑤ `storage_event_marks` 新增 `gap` 标记 |
-| 2 | filer 优雅重启 | 持续写入 120 个对象期间 `docker compose restart seaweed-filer`（`stop_grace_period` 保障优雅停机），重启后删除 10 个 | 与场景 1 同口径的等集合断言：存活 110、计划 120、删除 10、增量写失败 0 |
-| 3 | CP 停机期间写入 | 停 CP（TERM→KILL 确认退出）→ 写 120 个新 + 删 12 个新建 + 删/覆盖各 15 个已入账 → 重启 CP（同一 DB，游标来自 `storage_event_cursors` 持久化行） | 同口径等集合断言 + 已入账后删除/覆盖两组断言（同场景 1 ③④） |
+| 1 | 断流重连 | ① 预写两组**已入账**对象（s1del/、s1ovr/ 各 15 个，等 status=completed）→ ② `kill -9` 代理制造 CP↔filer 断流 → ③ 断流窗口内：写 200 个新对象（fi1/）、删 20 个新建（含新建即删样本）、删 15 个已入账、覆盖 15 个已入账 → ④ 重启代理 → ⑤ 断言 | ① S3 存活集合 == 账本 `completed` 集合 == 预先固定的期望存活集合（180 个）；② 新建即删的对象在账本为 `deleted` 或合法缺席；③ 已入账后删除组全部 `status='deleted'`；④ 已入账后覆盖组行必须**存在**且 `completed` + `source='storage_readback'` + size/etag 匹配新内容（缺行即失败）；⑤ `storage_event_marks` 新增 `gap` 标记 |
+| 2 | filer 优雅重启 | 后台写入器持续写 120 个对象（fi2/）期间 `docker compose restart seaweed-filer`（`stop_grace_period` 保障优雅停机），等 S3 网关就绪后停写入器、再删 10 个 | 与场景 1 同口径的等集合断言：存活 110、计划 120、删除 10、增量写失败 0 |
+| 3 | CP 停机期间写入 | 预写两组已入账对象（s3del/、s3ovr/ 各 15 个）并读持久游标 → 停 CP（TERM→KILL 确认退出）→ 停机期间写 120 个新（fi3/）+ 删 12 个新建 + 删/覆盖各 15 个已入账 → 重启 CP（同一 DB，游标来自 `storage_event_cursors` 持久化行） | 同口径等集合断言 + 已入账后删除/覆盖两组断言（同场景 1 ③④） |
 | 4 | filer 硬杀 | 连写 80 个拉满落盘窗口后 `docker kill -s KILL seaweed-filer`，显式 `docker start` + 等 healthy，再写 20 个 | **只记录、不要求通过**：统计硬杀窗口内「S3 有、账本无」的丢失对象数与 `gap` 窗口，结果写入 `SCENARIO4_LOST=<n> (recorded only)`，不计数进 FAILURES |
 
 ## 通过判据
@@ -38,13 +45,14 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 
 - **docker**（compose v2，容器需可拉取 postgres/redis/nats/seaweedfs 镜像）
 - **mc**（MinIO client，用于 S3 写入/删除/列举）
-- **Go**（构建 `bin/controlplane` 与 `bin/faultproxy-bin`，与仓库其余部分同版本要求）
-- **python3（仅标准库，兜底，非必需）**：脚本先验证 `date +%s%N` 输出为纯数字
-  （新版 macOS 与 Linux 的 `date` 均满足，如 Darwin 24 实测支持 `%N`），可用则
-  直接用 `date`；仅当 `date` 不支持 `%N`（部分旧版 macOS/BSD `date` 会输出
-  字面 `N`）时才退回 `python3 -c 'time.time_ns()'` 生成纳秒时间戳；两者都
-  不可用时用秒级 `date +%s` 兜底。即：python3 只在宿主 `date` 缺 `%N` 支持
-  时才是前置条件
+- **Go**（构建 `bin/tmp/fi/controlplane` 与 `bin/tmp/fi/faultproxy`，与仓库其余部分同版本要求）
+- **python3（必需，仅标准库）**：起基础设施时渲染 SeaweedFS JSON 配置
+ （`deploy/scripts/render-seaweedfs-configs.sh` 缺 python3 直接报错退出），
+  脚本开跑前的工具预检也会 fatal 提示。附带说明：时间戳 `ts_ns` 的引擎选择
+  与此独立——先验证 `date +%s%N` 输出纯数字（新版 macOS 与 Linux 均满足，
+  如 Darwin 24 实测支持 `%N`）则用 `date`，仅当 `date` 缺 `%N` 支持（部分旧版
+  macOS/BSD `date` 输出字面 `N`）时才退回 `python3 time.time_ns()`，两者都
+  不可用时用秒级 `date +%s` 兜底
 - 端口空闲（被占用时脚本 fail-closed 拒绝运行）：`25132 26179 27122 28122
   29334 28334 28898 28899 28081 29091 28990`
 
@@ -56,9 +64,12 @@ FI_ONLY=2 bash test/fault-injection/run.sh  # 只跑场景 2（可组合：FI_ON
 FI_HANG_DEMO=1 bash test/fault-injection/run.sh   # 有界调用自证（预期失败退出）
 ```
 
-脚本自己构建被测二进制（从当前工作树），不需要预先 `make build`。
-输出与中间产物全部落在 `bin/tmp/fi/`（结果汇总 `result.txt`、CP 日志 `cp.log`、
-代理日志 `proxy.log`、各场景计划/清单文件等），不污染仓库其它目录。
+脚本自己构建被测二进制（从当前工作树，输出到 `bin/tmp/fi/` 专有路径，不碰
+共享的 `bin/` 产物）。输出与中间产物落在 `bin/tmp/fi/`（结果汇总 `result.txt`、
+CP 日志 `cp.log`、代理日志 `proxy.log`、各场景计划/清单文件等）。**例外**：
+SeaweedFS 配置渲染会重写共享的 `deploy/config/seaweedfs/{s3,iam}.json`（见
+顶部「隔离边界」），这是当前 compose 挂载路径决定的、本脚本不试图改共享
+compose；除此之外不写仓库其它目录。
 
 退出时 cleanup 对**自己创建的资源**做 `down -v --remove-orphans`（两个 compose
 项目）、按 pid 杀 CP/代理/写入器进程组并确认退出、核验自有端口全部释放；端口

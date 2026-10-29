@@ -12,6 +12,12 @@
 # 通过判据：FAILURES=0 且退出码 0（场景 4 只记录）。用法详见同目录 README.md，
 # 常用开关：FI_ONLY=<n> 只跑某场景；FI_HANG_DEMO=1 有界调用自证（预期失败）。
 #
+# 隔离边界：compose 项目/容器名（fileagent-fi）与端口均与 smoke/dev 隔离；
+# 被测二进制构建到 bin/tmp/fi/ 专有路径（不碰共享的 bin/controlplane）。
+# 但 SeaweedFS 配置渲染写共享的 deploy/config/seaweedfs/{s3,iam}.json（compose
+# 挂载路径写死，见 README）——不要与 smoke（FA_STORAGE=seaweedfs）或 dev 的
+# SeaweedFS 在同一工作树里并发运行；端口固定，同一台机器同时只能跑一份 FI。
+#
 # 设计要点（评审轮次标签 F3/F6/F7/N4/N5/R3-x/R4-x 来自 PR #135 的评审轮次）：
 #   F3  every group has an independent GENERATION PLAN (key|size|etag from the
 #       actual upload); asserts verify against the plan (existence, status,
@@ -298,6 +304,19 @@ cleanup() {
 trap cleanup EXIT
 
 
+# ── 前置工具检查（fail-closed；PRECHECK_OK 置位之前，fatal 不触发任何清理）──
+# python3 是硬前置：起基础设施时 render-seaweedfs-configs.sh 缺 python3 直接
+# exit 1（渲染 SeaweedFS JSON 凭据配置）；docker/mc/go 同样缺一不可。
+req_tool() { # <cmd> <用途说明>
+  command -v "$1" >/dev/null 2>&1 && return 0
+  echo "FATAL: 缺少前置工具 $1（$2）—— 请先安装再跑本脚本。" >&2
+  exit 1
+}
+req_tool docker "容器运行时（compose v2 起隔离环境）"
+req_tool mc     "MinIO client（S3 写入/删除/列举）"
+req_tool go     "构建 controlplane 与 faultproxy（当前工作树）"
+req_tool python3 "渲染 SeaweedFS JSON 配置（render-seaweedfs-configs.sh 硬依赖；亦是 ts_ns 时间戳的兜底引擎）"
+
 # ── 遗留进程预检（fail-closed）───────────────────────────────────────────────
 for spec in "${FA_POSTGRES_PORT}:PostgreSQL" "${FA_REDIS_PORT}:Redis" "${FA_NATS_PORT}:NATS" \
             "${FA_NATS_MONITOR_PORT}:NATS-monitor" "${FA_SEAWEEDFS_MASTER_PORT}:SeaweedFS-master" \
@@ -311,15 +330,16 @@ ok "全部端口预检通过（无遗留进程占用）——cleanup 所有权�
 
 # ── 构建被测二进制（从当前工作树，不依赖预置产物）────────────────────────────
 # CP 用仓库统一构建方式（与 Makefile build-controlplane 同一命令）；faultproxy
-# 是独立 Go 模块（根 go.work 不含它），用 GOWORK=off 单独构建。产物只放 bin/
+# 是独立 Go 模块（根 go.work 不含它），用 GOWORK=off 单独构建。产物放 FI 专有
+# 路径 bin/tmp/fi/（不覆盖共享的 bin/controlplane，避免与 smoke/dev 互踩）。
 #（⚠ -C 切目录后 -o 的相对路径基准也随切，故这里用 $REPO 绝对路径）。
-step "构建 controlplane 与 faultproxy（当前工作树）"
-run_to 600 go build -o "$REPO/bin/controlplane" ./controlplane/cmd/server \
+step "构建 controlplane 与 faultproxy（当前工作树 → bin/tmp/fi/ 专有路径）"
+run_to 600 go build -o "$REPO/$OUT/controlplane" ./controlplane/cmd/server \
   >"$OUT/build-cp.log" 2>&1 || fatal "go build controlplane（see $OUT/build-cp.log）"
 run_to 120 env GOWORK=off go build -C "$REPO/test/fault-injection/faultproxy" \
-  -o "$REPO/bin/faultproxy-bin" . >"$OUT/build-proxy.log" 2>&1 \
+  -o "$REPO/$OUT/faultproxy" . >"$OUT/build-proxy.log" 2>&1 \
   || fatal "go build faultproxy（see $OUT/build-proxy.log）"
-ok "bin/controlplane 与 bin/faultproxy-bin 就绪"
+ok "$OUT/controlplane 与 $OUT/faultproxy 就绪（FI 专有路径，不碰 bin/ 共享产物）"
 
 # ── infra ────────────────────────────────────────────────────────────────────
 step "起基础设施（SeaweedFS 拓扑 + PG/Redis/NATS，项目 ${COMPOSE_PROJECT_NAME}）"
@@ -340,7 +360,7 @@ fi
 
 # ── CP（经代理订阅 filer）────────────────────────────────────────────────────
 start_proxy() {
-  in_new_group "$REPO/bin/faultproxy-bin" "127.0.0.1:${PROXY_PORT}" "127.0.0.1:${FA_SEAWEEDFS_FILER_GRPC_PORT}" >>"$OUT/proxy.log" 2>&1 &
+  in_new_group "$REPO/$OUT/faultproxy" "127.0.0.1:${PROXY_PORT}" "127.0.0.1:${FA_SEAWEEDFS_FILER_GRPC_PORT}" >>"$OUT/proxy.log" 2>&1 &
   PROXY_PID=$!
   sleep 0.5
   kill -0 "$PROXY_PID" 2>/dev/null || fatal "faultproxy 启动即退出"
@@ -364,7 +384,7 @@ start_cp() {
   SEAWEEDFS_FILER_GRPC_ADDR="127.0.0.1:${PROXY_PORT}" \
   SEAWEEDFS_FILER_INSECURE=true \
   SEAWEEDFS_RESUME_MARGIN=60s \
-    "$REPO/bin/controlplane" >>"$OUT/cp.log" 2>&1 &
+    "$REPO/$OUT/controlplane" >>"$OUT/cp.log" 2>&1 &
   CP_PID=$!
   local i
   for i in $(seq 1 60); do
