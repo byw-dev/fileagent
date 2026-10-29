@@ -1856,6 +1856,8 @@ mc event add myminio/data-sensor arn:minio:sqs::primary:webhook \
 > `storage_event_marks` 待核对标记**（只写不消费，消费方是 L2 对账 IC-13）。
 > filer gRPC 无令牌鉴权（仅 mTLS，D-037 已知约束），本刀仅支持明文且必须显式
 > `SEAWEEDFS_FILER_INSECURE=true` 才启动（fail-closed）；mTLS 归 B7。
+> 故障注入回归：断流重连 / filer 优雅重启 / CP 停机写入 / filer 硬杀四场景见
+> [`test/fault-injection/`](../../test/fault-injection/)（何时必须跑见其 README）。
 > **suppress 的处理（返工 3，N1 同状态确认）**：回读写入被更新的观察压制
 > （`ErrSuppressed`）时，若账本当前状态已与回读事实一致（Created：completed 且
 > size/etag 相同；Removed：无行或 deleted）则视为**已处理**；状态不同才重取
