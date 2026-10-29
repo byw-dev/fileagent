@@ -304,12 +304,13 @@ ok "全部端口预检通过（无遗留进程占用）——cleanup 所有权�
 
 # ── 构建被测二进制（从当前工作树，不依赖预置产物）────────────────────────────
 # CP 用仓库统一构建方式（与 Makefile build-controlplane 同一命令）；faultproxy
-# 是独立 Go 模块（根 go.work 不含它），用 GOWORK=off 单独构建。产物只放 bin/。
+# 是独立 Go 模块（根 go.work 不含它），用 GOWORK=off 单独构建。产物只放 bin/
+#（⚠ -C 切目录后 -o 的相对路径基准也随切，故这里用 $REPO 绝对路径）。
 step "构建 controlplane 与 faultproxy（当前工作树）"
-run_to 600 go build -o bin/controlplane ./controlplane/cmd/server \
+run_to 600 go build -o "$REPO/bin/controlplane" ./controlplane/cmd/server \
   >"$OUT/build-cp.log" 2>&1 || fatal "go build controlplane（see $OUT/build-cp.log）"
-run_to 120 env GOWORK=off go build -C test/fault-injection/faultproxy \
-  -o bin/faultproxy-bin . >"$OUT/build-proxy.log" 2>&1 \
+run_to 120 env GOWORK=off go build -C "$REPO/test/fault-injection/faultproxy" \
+  -o "$REPO/bin/faultproxy-bin" . >"$OUT/build-proxy.log" 2>&1 \
   || fatal "go build faultproxy（see $OUT/build-proxy.log）"
 ok "bin/controlplane 与 bin/faultproxy-bin 就绪"
 
