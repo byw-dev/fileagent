@@ -63,14 +63,16 @@ export MC_CONFIG_DIR="$OUT/mc"
 # BSD date 上可能输出字面 N 或静默丢弃纳秒位，故先验证 date 输出为纯数字，
 # 否则退回 python3（仅标准库，time.time_ns()）。消费方（writes*.jsonl /
 # ovr-times.txt 的第二列）只做展示性对照，不解析格式。
+# TS_ENGINE 导出后，子脚本（writer-s2.sh）用同一引擎，两端时间戳同源。
 TS_ENGINE=""
 case "$(date +%s%N 2>/dev/null)" in
   ''|*[!0-9]*) ;;
   *) TS_ENGINE="date" ;;
 esac
 [ -n "$TS_ENGINE" ] || command -v python3 >/dev/null 2>&1 && TS_ENGINE="python3"
+export TS_ENGINE
 ts_ns() {
-  case "$TS_ENGINE" in
+  case "${TS_ENGINE:-}" in
     date)    date +%s%N ;;
     python3) python3 -c 'import time; print(time.time_ns())' ;;
     *)       date +%s ;;   # 兜底：秒级整数（仍为数字，不做格式断言）
@@ -804,8 +806,16 @@ comm -23 <(cut -d'|' -f1 "$PLAN_S2" | sort -u) <(sort -u "$DEL2") > "$OUT/s2-liv
 cat > "$OUT/writer-s2.sh" <<'WEOF'
 #!/usr/bin/env bash
 # 场景 2 持续写入器（由 run.sh 以 in_new_group 启动 → 独立进程组，可整组清理）
+# 时间戳引擎由父脚本导出的 TS_ENGINE 提供（ts_ns 的副本，两端同源）。
 set -uo pipefail
 : "${OUT:?}" "${FAILED_WRITES:?}" "${PLAN_S2:?}"
+ts_ns() {
+  case "${TS_ENGINE:-}" in
+    date)    date +%s%N ;;
+    python3) python3 -c 'import time; print(time.time_ns())' ;;
+    *)       date +%s ;;
+  esac
+}
 put_bounded() { # <key> <content-file> — 单次 mc cp 带 30s 上限（目标桶与主脚本 put_object 一致）
   mc cp --quiet "$2" "swcp/data-sensor/$1" >/dev/null 2>&1 < /dev/null &
   local pid=$! waited=0
