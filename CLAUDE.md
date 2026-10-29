@@ -71,6 +71,9 @@ fileagent/                        # Monorepo 根目录
 │   └── scripts/
 │       └── init-minio.sh
 │
+├── test/
+│   └── fault-injection/          # B3 故障注入测试（filer 订阅链路四场景，见其 README.md；计划入 CI）
+│
 ├── research/
 │   └── storage-layer-eval/       # 存储层替代调研的测试工具与原始结果（研究工具，不进 CI；报告见 docs/reports/）
 │
@@ -281,6 +284,11 @@ type:
 > 它是下面这套步骤的**可执行版本**（CI 的 `ci-smoke.yml` 跑的就是它），
 > 默认用独立项目名与高位端口，可与你正在跑的 dev 环境并存、互不影响。
 > 手工分步操作见下。
+>
+> smoke 验证的是正常路径；改 filer 订阅 / 存储事件源相关代码时还需跑
+> **故障注入测试** `bash test/fault-injection/run.sh`（断流重连、filer 重启、
+> CP 停机写入、filer 硬杀四场景，验故障后的账本一致性；何时必跑见其
+> [`README.md`](test/fault-injection/README.md)）。
 
 ```bash
 # 1) 启动基础服务（PostgreSQL、Redis、MinIO、NATS），--wait 等 healthcheck 通过
