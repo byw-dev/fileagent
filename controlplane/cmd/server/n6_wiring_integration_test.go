@@ -148,8 +148,9 @@ func TestN6WiringSuppressedDifferentStateReReads(t *testing.T) {
 	require.ErrorIs(t, <-runDone, context.Canceled)
 }
 
-// 变异红证明：工厂回退 plain sink 时 suppressed 被吞 → 冷 key 不入账 → 红。
-// 本测试直接调用 scfg.adapter() 并检查 sink 行为（不走 Run——只验证接线）。
+// 变异红证明：newEventSink(true, …) 若回退为 plain sink，suppressed 写入被吞成 nil
+// → 本测试红（上面的 E2E 中表现为热 key 不再被重新 HEAD；冷 key 照常入账，不受影响）。
+// 本测试直接调用 newEventSink 并检查 sink 行为（不走 Run——只验证工厂接线）。
 func TestN6WiringPlainSinkMutationWouldFail(t *testing.T) {
 	orgID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
 	_ = orgID // not needed for this unit-level check
