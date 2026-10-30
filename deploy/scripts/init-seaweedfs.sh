@@ -9,7 +9,7 @@
 # the filer, so changing credentials still requires re-render + container
 # restart (documented in deploy/docker-compose.seaweedfs.yml).
 #
-# This script is IDEMPOTENT: safe to run multiple times. It uses `mc` and curl:
+# This script is IDEMPOTENT: safe to run multiple times. It uses AWS CLI v2 and curl:
 #   1. Create the required buckets (data-sensor, tmp-uploads)
 #   2. Set a 7-day lifecycle expiry on tmp-uploads and a 7-day
 #      abort-incomplete-multipart rule on data-sensor (same backstops as
@@ -26,7 +26,16 @@
 # STORAGE_EVENT_SOURCE=seaweedfs_filer + SEAWEEDFS_FILER_GRPC_ADDR; nothing to
 # configure on the storage side).
 #
-# Requirements: `mc` AND `curl` (>= 7.75, for --aws-sigv4) on PATH.
+# Requirements: `aws` (AWS CLI **v2**) AND `curl` (>= 7.75, for --aws-sigv4)
+# on PATH.
+#
+# AWS config isolation (B7: mc → aws cli v2; aws's default config is GLOBAL at
+# ~/.aws — never touch the developer's): the script writes its own config /
+# credentials files into a private temp dir and points AWS_CONFIG_FILE /
+# AWS_SHARED_CREDENTIALS_FILE at them. Identity variables that could leak in
+# from the caller's environment (AWS_PROFILE / AWS_SESSION_TOKEN / …) are
+# unset; AWS_PAGER="" and AWS_EC2_METADATA_DISABLED=true; the endpoint is
+# always passed via --endpoint-url (path-style addressing, region us-east-1).
 #
 # Environment variables (all have defaults suitable for local dev; they must
 # match what render-seaweedfs-configs.sh used, or the self-checks will fail —
@@ -40,10 +49,6 @@
 #   SW_BUCKET_DATA      data bucket             (default: data-sensor)
 #   SW_BUCKET_TMP       staging bucket          (default: tmp-uploads)
 #   SW_LIFECYCLE_DAYS   lifecycle days          (default: 7)
-#   SW_ALIAS            mc alias prefix         (default: swinit)
-#   MC_CONFIG_DIR       mc config isolation (smoke.sh sets this; otherwise a
-#                       private temp dir is used so the dev machine's ~/.mc is
-#                       never touched)
 
 set -euo pipefail
 
@@ -58,16 +63,25 @@ SW_S3_ENDPOINT="${SW_S3_ENDPOINT:-http://localhost:38333}"
 SW_BUCKET_DATA="${SW_BUCKET_DATA:-data-sensor}"
 SW_BUCKET_TMP="${SW_BUCKET_TMP:-tmp-uploads}"
 SW_LIFECYCLE_DAYS="${SW_LIFECYCLE_DAYS:-7}"
-SW_ALIAS="${SW_ALIAS:-swinit}"
 
 # ---------------------------------------------------------------------------
 # Tool checks
 # ---------------------------------------------------------------------------
-if ! command -v mc &>/dev/null; then
-  echo "ERROR: 'mc' (MinIO Client) is not installed or not in PATH." >&2
-  echo "       Install it from https://min.io/docs/minio/linux/reference/minio-mc.html" >&2
+if ! command -v aws &>/dev/null; then
+  echo "ERROR: 'aws' (AWS CLI v2) is not installed or not in PATH." >&2
+  echo "       Install: brew install awscli (macOS) or see" >&2
+  echo "       https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html" >&2
   exit 1
 fi
+case "$(aws --version 2>&1)" in
+  aws-cli/2.*) ;;
+  *)
+    echo "ERROR: AWS CLI v2 is required (got: $(aws --version 2>&1))." >&2
+    echo "       v1 lacks the profile-level S3 configuration and checksum" >&2
+    echo "       behaviour this script was verified against (B7 PoC on 2.39.2)." >&2
+    exit 1
+    ;;
+esac
 if ! command -v curl &>/dev/null; then
   echo "ERROR: 'curl' is required for the STS and presigned-GET self-checks." >&2
   exit 1
@@ -81,45 +95,72 @@ case "$(curl --help all 2>/dev/null || true)" in
 esac
 
 # ---------------------------------------------------------------------------
-# mc config isolation (mc's config is GLOBAL at ~/.mc/config.json; never
-# touch the developer's aliases). smoke.sh exports MC_CONFIG_DIR already.
-# bash 3.2 (macOS) safe array expansion is used throughout.
+# AWS CLI config isolation (see header comment): private config/credentials
+# in a mktemp dir, torn down by the EXIT trap. bash 3.2 (macOS) safe array
+# expansion is used throughout.
 #
-# Cleanup ordering (rework P2-3): probe object/bucket are removed FIRST —
-# those mc calls need the admin alias to still exist — and only then are the
-# aliases and the temporary mc config dir torn down. Every cleanup step that
-# can leak state warns loudly instead of failing silently: a leftover probe
-# object is never cleaned up by the (currently non-executing) lifecycle rules.
+# Two profiles: swadmin (storage admin identity) and swcp (the Control Plane
+# identity used by the self-checks 3a–3c). `retry_mode = standard` keeps the
+# CLI's default retry behaviour for transient errors; path-style addressing
+# is REQUIRED for a non-AWS endpoint without DNS wildcards.
+#
+# Cleanup ordering (rework P2-3, kept): probe object/bucket are removed FIRST
+# — those calls need the admin credentials to still exist — and only then is
+# the temporary AWS config dir torn down. Every cleanup step that can leak
+# state warns loudly instead of failing silently: a leftover probe object is
+# never cleaned up by the (currently non-executing) lifecycle rules.
 # ---------------------------------------------------------------------------
-OWN_MC_DIR=""
+OWN_AWS_DIR=""
 LC_DIR=""
 CHECK_OBJECT=""
 CHECK_BUCKET=""
-ADMIN_ALIAS_SET=0
-CP_ALIAS_SET=0
-if [ -z "${MC_CONFIG_DIR:-}" ]; then
-  OWN_MC_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fileagent-swinit-mc.XXXXXX")"
-  export MC_CONFIG_DIR="${OWN_MC_DIR}"
-fi
+OWN_AWS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fileagent-swinit-aws.XXXXXX")"
+export AWS_CONFIG_FILE="${OWN_AWS_DIR}/config" AWS_SHARED_CREDENTIALS_FILE="${OWN_AWS_DIR}/credentials"
+unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_DEFAULT_REGION
+export AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true
+cat >"${AWS_CONFIG_FILE}" <<'AWSCFG'
+[profile swadmin]
+region = us-east-1
+s3 =
+  addressing_style = path
+retry_mode = standard
+[profile swcp]
+region = us-east-1
+s3 =
+  addressing_style = path
+retry_mode = standard
+AWSCFG
+cat >"${AWS_SHARED_CREDENTIALS_FILE}" <<AWSCRED
+[swadmin]
+aws_access_key_id = ${SW_ADMIN_ACCESS_KEY}
+aws_secret_access_key = ${SW_ADMIN_SECRET_KEY}
+[swcp]
+aws_access_key_id = ${SW_CP_ACCESS_KEY}
+aws_secret_access_key = ${SW_CP_SECRET_KEY}
+AWSCRED
+
+# awsx <profile> <args...> — aws with the explicit endpoint and no pager.
+awsx() {
+  local profile=$1; shift
+  AWS_PROFILE="${profile}" aws --endpoint-url "${SW_S3_ENDPOINT}" --no-cli-pager "$@"
+}
+
 cleanup() {
+  # CHECK_OBJECT 形如 "bucket/key"（CP 身份按 iam.json.tpl 刻意没有
+  # DeleteObject；探针一律借 admin 身份清理，与 3b/3c 的注释一致）。
   if [ -n "${CHECK_OBJECT:-}" ]; then
-    mc rm --force "${SW_ALIAS}/${CHECK_OBJECT}" >/dev/null 2>&1 \
-      || echo "WARNING: failed to remove probe object '${SW_ALIAS}/${CHECK_OBJECT}' — remove it manually (lifecycle rules are NOT executed by SeaweedFS)." >&2
+    awsx swadmin delete-object \
+      --bucket "${CHECK_OBJECT%%/*}" --key "${CHECK_OBJECT#*/}" >/dev/null 2>&1 \
+      || echo "WARNING: failed to remove probe object '${CHECK_OBJECT}' — remove it manually (lifecycle rules are NOT executed by SeaweedFS)." >&2
   fi
   if [ -n "${CHECK_BUCKET:-}" ]; then
-    mc rb "${SW_ALIAS}/${CHECK_BUCKET}" >/dev/null 2>&1 \
-      || echo "WARNING: failed to remove probe bucket '${SW_ALIAS}/${CHECK_BUCKET}' — remove it manually." >&2
+    awsx swadmin delete-bucket --bucket "${CHECK_BUCKET}" >/dev/null 2>&1 \
+      || echo "WARNING: failed to remove probe bucket '${CHECK_BUCKET}' — remove it manually." >&2
   fi
   # `if` 形式（而非 `|| { [ ] && echo; }`）：flag=0 时后者整体返回 1，set -e
-  # 会在 trap 里中途中断 cleanup（LC_DIR/OWN_MC_DIR 泄漏 + rc 漂移）。
-  if [ "${ADMIN_ALIAS_SET}" = "1" ] && ! mc alias remove "${SW_ALIAS}" >/dev/null 2>&1; then
-    echo "WARNING: failed to remove mc alias '${SW_ALIAS}' from MC_CONFIG_DIR '${MC_CONFIG_DIR}'." >&2
-  fi
-  if [ "${CP_ALIAS_SET}" = "1" ] && ! mc alias remove "${SW_ALIAS}-cp" >/dev/null 2>&1; then
-    echo "WARNING: failed to remove mc alias '${SW_ALIAS}-cp' from MC_CONFIG_DIR '${MC_CONFIG_DIR}'." >&2
-  fi
+  # 会在 trap 里中途中断 cleanup（LC_DIR/OWN_AWS_DIR 泄漏 + rc 漂移）。
   [ -n "${LC_DIR}" ] && rm -rf "${LC_DIR}"
-  [ -n "${OWN_MC_DIR}" ] && rm -rf "${OWN_MC_DIR}"
+  [ -n "${OWN_AWS_DIR}" ] && rm -rf "${OWN_AWS_DIR}"
   # trap 的返回值会成为脚本的退出码（bash 在 set -e 下的行为）：
   # `[ -n "" ] && ...` 求值为假曾把成功跑完的脚本变成 rc=1。
   return 0
@@ -176,18 +217,24 @@ if [ ! -f "${REPO_ROOT}/deploy/config/seaweedfs/s3.json" ] || \
 fi
 
 # ---------------------------------------------------------------------------
-# 1. Admin alias + buckets
+# 1. Buckets (B7: mc mb --ignore-existing → head-bucket probe + create; aws
+#    has no --ignore-existing, and a duplicate create-bucket fails with
+#    BucketAlreadyOwnedByYou — PoC-verified — so "exists == success" is kept
+#    by probing first).
 # ---------------------------------------------------------------------------
-echo "==> Configuring mc alias '${SW_ALIAS}' -> ${SW_S3_ENDPOINT}"
-mc alias set "${SW_ALIAS}" "${SW_S3_ENDPOINT}" \
-  "${SW_ADMIN_ACCESS_KEY}" "${SW_ADMIN_SECRET_KEY}" --api S3v4 --quiet
-ADMIN_ALIAS_SET=1
+ensure_bucket() { # <profile> <bucket> — mb --ignore-existing semantics
+  local profile=$1 bucket=$2
+  if awsx "${profile}" head-bucket --bucket "${bucket}" >/dev/null 2>&1; then
+    return 0
+  fi
+  awsx "${profile}" create-bucket --bucket "${bucket}" >/dev/null
+}
 
 echo "==> Creating bucket: ${SW_BUCKET_DATA}"
-mc mb --ignore-existing "${SW_ALIAS}/${SW_BUCKET_DATA}"
+ensure_bucket swadmin "${SW_BUCKET_DATA}"
 
 echo "==> Creating bucket: ${SW_BUCKET_TMP}"
-mc mb --ignore-existing "${SW_ALIAS}/${SW_BUCKET_TMP}"
+ensure_bucket swadmin "${SW_BUCKET_TMP}"
 
 # ---------------------------------------------------------------------------
 # 2. Lifecycle rules (verified supported on SeaweedFS 4.48: both rules are
@@ -205,8 +252,13 @@ cat >"${LC_DIR}/tmp-expire.json" <<EOF
 {"Rules":[{"ID":"auto-expire-tmp-uploads","Status":"Enabled","Filter":{"Prefix":""},"Expiration":{"Days":${SW_LIFECYCLE_DAYS}}}]}
 EOF
 TMP_RULE_EFFECTIVE="no"
-if mc ilm import "${SW_ALIAS}/${SW_BUCKET_TMP}" <"${LC_DIR}/tmp-expire.json" >/dev/null 2>&1; then
-  if mc ilm export "${SW_ALIAS}/${SW_BUCKET_TMP}" 2>/dev/null | grep -q '"ID":"auto-expire-tmp-uploads"'; then
+# B7: mc ilm import/export → put/get-bucket-lifecycle-configuration。mc 的
+# import JSON 形状（{"Rules":[…]}）对 aws 原样可用（PoC 实测），按 Rule ID
+# 读回的判据不变（get 输出顶层多个 TransitionDefaultMinimumObjectSize 字段，
+# 不影响 grep）。
+if awsx swadmin put-bucket-lifecycle-configuration --bucket "${SW_BUCKET_TMP}" \
+     --lifecycle-configuration "file://${LC_DIR}/tmp-expire.json" >/dev/null 2>&1; then
+  if awsx swadmin get-bucket-lifecycle-configuration --bucket "${SW_BUCKET_TMP}" 2>/dev/null | grep -q '"ID":"auto-expire-tmp-uploads"'; then
     TMP_RULE_EFFECTIVE="yes"
   fi
 else
@@ -221,8 +273,9 @@ cat >"${LC_DIR}/data-abort.json" <<EOF
 {"Rules":[{"ID":"abort-incomplete-multipart-data-sensor","Status":"Enabled","Filter":{"Prefix":""},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":${SW_LIFECYCLE_DAYS}}}]}
 EOF
 ABORT_RULE_EFFECTIVE="no"
-if mc ilm import "${SW_ALIAS}/${SW_BUCKET_DATA}" <"${LC_DIR}/data-abort.json" >/dev/null 2>&1; then
-  if mc ilm export "${SW_ALIAS}/${SW_BUCKET_DATA}" 2>/dev/null | grep -q '"ID":"abort-incomplete-multipart-data-sensor"'; then
+if awsx swadmin put-bucket-lifecycle-configuration --bucket "${SW_BUCKET_DATA}" \
+     --lifecycle-configuration "file://${LC_DIR}/data-abort.json" >/dev/null 2>&1; then
+  if awsx swadmin get-bucket-lifecycle-configuration --bucket "${SW_BUCKET_DATA}" 2>/dev/null | grep -q '"ID":"abort-incomplete-multipart-data-sensor"'; then
     ABORT_RULE_EFFECTIVE="yes"
   fi
 else
@@ -253,24 +306,22 @@ STS_ACCESS_KEY="${STS_OUT#*<AccessKeyId>}"
 STS_ACCESS_KEY="${STS_ACCESS_KEY%%</AccessKeyId>*}"
 echo "    Self-check AssumeRole: OK (temporary access key prefix: ${STS_ACCESS_KEY:0:8}...)"
 
-# The CP identity's own alias for 3b/3c.
-mc alias set "${SW_ALIAS}-cp" "${SW_S3_ENDPOINT}" \
-  "${SW_CP_ACCESS_KEY}" "${SW_CP_SECRET_KEY}" --api S3v4 --quiet
-CP_ALIAS_SET=1
+# The CP identity's own profile for 3b/3c: swcp (credentials in the private
+# config, B7 — was a second mc alias).
 
 # 3b. CreateBucket (POST /api/v1/buckets at runtime).
 echo "==> Self-checking CP identity CreateBucket"
 CHECK_BUCKET="fileagent-init-check-$$-$(date +%s)"
 MB_OUT=""
-if ! MB_OUT=$(mc mb "${SW_ALIAS}-cp/${CHECK_BUCKET}" 2>&1); then
+if ! MB_OUT=$(awsx swcp create-bucket --bucket "${CHECK_BUCKET}" 2>&1); then
   echo "ERROR: CP identity '${SW_CP_ACCESS_KEY}' cannot create a bucket: ${MB_OUT}" >&2
   echo "       POST /api/v1/buckets would fail at runtime; check s3:CreateBucket in the fileagent-cp policy." >&2
   exit 1
 fi
 # The CP identity deliberately has no DeleteBucket; drop the empty probe as
-# admin. Plain rb (no --force): the bucket IS empty, and with
+# admin. Plain delete-bucket (no force): the bucket IS empty, and with
 # -s3.allowDeleteBucketNotEmpty=false a recursive delete must never be needed.
-if ! mc rb "${SW_ALIAS}/${CHECK_BUCKET}" >/dev/null; then
+if ! awsx swadmin delete-bucket --bucket "${CHECK_BUCKET}" >/dev/null; then
   echo "ERROR: CreateBucket self-check succeeded, but admin cleanup failed for bucket '${CHECK_BUCKET}'." >&2
   exit 1
 fi
@@ -282,28 +333,25 @@ echo "==> Self-checking CP identity presigned GET"
 CHECK_OBJECT="${SW_BUCKET_TMP}/.init-check/$(date +%s)-$$"
 CHECK_BODY="fileagent-seaweedfs-init-check"
 printf '%s' "${CHECK_BODY}" >"${LC_DIR}/probe-body.txt"
-# `mc cp` (NOT `mc pipe`): piping from stdin triggers a Content-MD5 mismatch
-# against SeaweedFS 4.48 (live-verified); a real file upload does not.
-if ! mc cp --quiet "${LC_DIR}/probe-body.txt" "${SW_ALIAS}/${CHECK_OBJECT}" >/dev/null; then
+# B7: mc pipe 从 stdin 上传会触发 Content-MD5 不匹配（SeaweedFS 4.48，当时
+# 实测），故旧版刻意用 `mc cp` 真文件上传；aws 的 put-object --body（真文件）
+# 无此问题，且 CLI 默认附带的 CRC 校验和已被 SeaweedFS 接受（B7 PoC 实测）。
+if ! awsx swadmin put-object --bucket "${CHECK_OBJECT%%/*}" \
+     --key "${CHECK_OBJECT#*/}" --body "${LC_DIR}/probe-body.txt" >/dev/null; then
   echo "ERROR: failed to upload the presign probe object as admin." >&2
   exit 1
 fi
 
 SHARE_OUT=""
-if ! SHARE_OUT=$(mc share download --expire 5m --json \
-  "${SW_ALIAS}-cp/${CHECK_OBJECT}" 2>&1); then
+if ! SHARE_OUT=$(awsx swcp s3 presign "s3://${CHECK_OBJECT}" --expires-in 300 2>&1); then
   echo "ERROR: CP identity '${SW_CP_ACCESS_KEY}' failed to sign a presigned GET: ${SHARE_OUT}" >&2
   exit 1
 fi
-PRESIGNED_URL=""
-case "${SHARE_OUT}" in
-  *'"share":"'*)
-    PRESIGNED_URL="${SHARE_OUT#*\"share\":\"}"
-    PRESIGNED_URL="${PRESIGNED_URL%%\"*}"
-    ;;
-esac
+# `aws s3 presign` 的 stdout 就是 URL 本身（SigV4 query 签名，host 取
+# --endpoint-url 的 host），无需 JSON 解析（mc --json 输出 "share":"…"）。
+PRESIGNED_URL="${SHARE_OUT}"
 if [ -z "${PRESIGNED_URL}" ]; then
-  echo "ERROR: mc returned no presigned URL: ${SHARE_OUT}" >&2
+  echo "ERROR: aws returned no presigned URL: ${SHARE_OUT}" >&2
   exit 1
 fi
 
@@ -318,7 +366,8 @@ if [ "$(cat "${LC_DIR}/presigned-body.txt")" != "${CHECK_BODY}" ]; then
   exit 1
 fi
 # CP identity has no DeleteObject (write-only by design); cleanup as admin.
-if ! mc rm --force "${SW_ALIAS}/${CHECK_OBJECT}" >/dev/null; then
+if ! awsx swadmin delete-object --bucket "${CHECK_OBJECT%%/*}" \
+     --key "${CHECK_OBJECT#*/}" >/dev/null; then
   echo "ERROR: presigned-GET self-check succeeded, but admin cleanup failed for '${CHECK_OBJECT}'." >&2
   exit 1
 fi
