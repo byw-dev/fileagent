@@ -268,8 +268,9 @@ ok "内嵌迁移已自动应用"
 #    同一顺序只是让两条分支的步骤排列一致。
 if [ "$FA_STORAGE" = "seaweedfs" ]; then
   step "初始化 SeaweedFS（buckets / 生命周期 / 三项自检）"
+  # B7：init-seaweedfs.sh 自管私有 AWS CLI 配置（mktemp + trap 清理，不碰
+  # ~/.aws），smoke 不再传 MC_CONFIG_DIR。
   SW_S3_ENDPOINT="http://localhost:${FA_SEAWEEDFS_S3_PORT}" \
-  MC_CONFIG_DIR="$WORK/mc" \
     bash deploy/scripts/init-seaweedfs.sh > "$WORK/init-seaweedfs.log" 2>&1 \
     || { tail -n 5 "$WORK/init-seaweedfs.log" >&2; fail "init-seaweedfs.sh 失败（完整日志：$WORK/init-seaweedfs.log）"; }
   ok "buckets + 生命周期就绪，CP 身份自检（AssumeRole / 建桶 / 预签名 GET）通过"
@@ -471,19 +472,38 @@ ok "16MB 分块写终态连续 3 轮均为 1 次上传，且 sha256 与源文件
 #   - seaweedfs：filer 元数据订阅 → S3 HEAD 回读 → 索引（source='storage_readback'），
 #     再删掉探针对象，断言软删除也经回读落账（status='deleted'）——这是
 #     D1「事件只是提示、按回读写账」两向（建/删）的唯一探针。
-# mc 探针用 ADMIN 身份（CP 身份按 iam.json.tpl 刻意没有 s3:DeleteObject；
-# 探针要删对象，借 admin 的全权限，与被测的 CP 链路无关）。
 if [ "$FA_STORAGE" = "seaweedfs" ]; then
   step "存储事件回读（绕过 agent：filer 订阅 → S3 回读 → 索引）"
-  mc alias set swadmin "http://localhost:${FA_SEAWEEDFS_S3_PORT}" \
-    "$SW_ADMIN_ACCESS_KEY" "$SW_ADMIN_SECRET_KEY" >/dev/null \
-    || fail "mc alias swadmin 失败（无法投放回读探针）"
+  # AWS 探针用 ADMIN 身份（CP 身份按 iam.json.tpl 刻意没有 s3:DeleteObject；
+  # 探针要删对象，借 admin 的全权限，与被测的 CP 链路无关）。B7：mc → aws；
+  # 私有 AWS 配置落在 $WORK（mktemp 目录，cleanup 随 WORK 一并删除），
+  # 绝不触碰开发者的 ~/.aws。
+  SW_AWS_DIR="$WORK/aws"
+  mkdir -p "$SW_AWS_DIR"
+  cat > "$SW_AWS_DIR/config" <<'SWAWSCFG'
+[profile swadmin]
+region = us-east-1
+s3 =
+  addressing_style = path
+SWAWSCFG
+  cat > "$SW_AWS_DIR/credentials" <<SWAWSCRED
+[swadmin]
+aws_access_key_id = $SW_ADMIN_ACCESS_KEY
+aws_secret_access_key = $SW_ADMIN_SECRET_KEY
+SWAWSCRED
+  swaws() { # <aws s3api args...> — admin 身份 + 显式 endpoint 的私有 aws 调用
+    AWS_PROFILE=swadmin \
+    AWS_CONFIG_FILE="$SW_AWS_DIR/config" \
+    AWS_SHARED_CREDENTIALS_FILE="$SW_AWS_DIR/credentials" \
+    AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true \
+    aws --endpoint-url "http://localhost:${FA_SEAWEEDFS_S3_PORT}" --no-cli-pager "$@"
+  }
   printf 'readback probe\n' > "$WORK/probe.txt"
-  mc cp --quiet "$WORK/probe.txt" "swadmin/data-sensor/probe/readback-probe.txt" >/dev/null \
-    || fail "mc cp 失败（无法投放回读探针对象）"
+  swaws put-object --bucket data-sensor --key probe/readback-probe.txt --body "$WORK/probe.txt" >/dev/null \
+    || fail "aws put-object 失败（无法投放回读探针对象）"
   wait_for "filer 事件经回读进索引（source=storage_readback）" 90 readback_is_indexed
-  mc rm "swadmin/data-sensor/probe/readback-probe.txt" >/dev/null \
-    || fail "mc rm 失败（无法删除回读探针对象）"
+  swaws delete-object --bucket data-sensor --key probe/readback-probe.txt >/dev/null \
+    || fail "aws delete-object 失败（无法删除回读探针对象）"
   wait_for "回读删除进索引（status=deleted）" 90 readback_is_deleted
 else
   step "webhook 投递（绕过 agent 的对账兜底路径）"
