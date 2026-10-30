@@ -476,7 +476,7 @@ if [ "$FA_STORAGE" = "seaweedfs" ]; then
   step "存储事件回读（绕过 agent：filer 订阅 → S3 回读 → 索引）"
   # AWS 探针用 ADMIN 身份（CP 身份按 iam.json.tpl 刻意没有 s3:DeleteObject；
   # 探针要删对象，借 admin 的全权限，与被测的 CP 链路无关）。B7：mc → aws；
-  # 私有 AWS 配置落在 $WORK（mktemp 目录，cleanup 随 WORK 一并删除），
+  # 私有 AWS 配置落在 ${WORK}（mktemp 目录，cleanup 随 WORK 一并删除），
   # 绝不触碰开发者的 ~/.aws。
   SW_AWS_DIR="$WORK/aws"
   mkdir -p "$SW_AWS_DIR"

@@ -736,7 +736,7 @@ preindexed_group() {
     content="pre-content-$key-$(printf 'x%.0s' $(seq 1 100))"
     put_object "$key" "$content" || fatal "pre-indexed put failed: $key"
     size=${#content}
-    etag=$(md5_of "$content") || fatal "md5_of 失败：$key（计划完整性受损）"
+    etag=$(md5_of "$content") || fatal "md5_of 失败：${key}（计划完整性受损）"
     echo "$key|$size|$etag" >> "$plan"
   done
   wait_indexed "$prefix" "$n" "$timeout" || fatal "pre-indexed group ${prefix} 未全部入账"
@@ -805,7 +805,7 @@ note "删除 $S1_DELN 个新建对象（fi1/，固定集合 DEL1，含 p001—�
 DEL1_ACTUAL="$OUT/del1-actual.txt"; : > "$DEL1_ACTUAL"
 while read -r k <&3; do
   if grep -qxF "$k" "$FAILED_WRITES"; then
-    note "跳过删除 $k（写入已失败；视为对期望删除计划的偏离，集合断言会失败）"
+    note "跳过删除 ${k}（写入已失败；视为对期望删除计划的偏离，集合断言会失败）"
   else
     delete_object "$k"
     echo "$k" >> "$DEL1_ACTUAL"
@@ -980,7 +980,7 @@ note "窗口证据（B7 时序登记）：writer 于重启前 $(( T_RESTART_STAR
 DEL2_ACTUAL="$OUT/del2-actual.txt"; : > "$DEL2_ACTUAL"
 while read -r k <&3; do
   if grep -qxF "$k" "$FAILED_WRITES"; then
-    note "跳过删除 $k（写入已失败；视为对期望删除计划的偏离，集合断言会失败）"
+    note "跳过删除 ${k}（写入已失败；视为对期望删除计划的偏离，集合断言会失败）"
   else
     delete_object "$k"
     echo "$k" >> "$DEL2_ACTUAL"
@@ -1039,7 +1039,7 @@ note "删除 $S3_DELN 个新建对象（fi3/，固定集合 DEL3，含 p001—�
 DEL3_ACTUAL="$OUT/del3-actual.txt"; : > "$DEL3_ACTUAL"
 while read -r k <&3; do
   if grep -qxF "$k" "$FAILED_WRITES"; then
-    note "跳过删除 $k（写入已失败；视为对期望删除计划的偏离，集合断言会失败）"
+    note "跳过删除 ${k}（写入已失败；视为对期望删除计划的偏离，集合断言会失败）"
   else
     delete_object "$k"
     echo "$k" >> "$DEL3_ACTUAL"
