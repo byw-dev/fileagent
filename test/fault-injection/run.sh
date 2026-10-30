@@ -66,10 +66,10 @@ fatal() { echo "  ☠ FATAL: $*"; exit 1; }
 # 开发者的 ~/.aws；调用者环境里可能漏进来的身份变量全部 unset。两个身份：
 #   swcp    — CP 身份（put 走它，与 agent/CP 运行时同源）
 #   swadmin — 管理员身份（delete / list / 建桶）
-# 重试取舍：数据操作保持 CLI 默认 standard 重试（对瞬时 5xx/SlowDown/连接
-# 重置有容错，等价于 mc/minio-go 的内置重试；run_to 的时间上限照旧兜底）；
-# 只有就绪探测（wait_s3_ready）逐次加 AWS_MAX_ATTEMPTS=1 追求秒退——网关
-# 未就绪时默认重试会把每次探测拖长数秒。
+# 重试取舍：数据操作保持 CLI standard 重试并把 max_attempts 提到 8（与
+# mc/minio-go 的内置瞬时错误容错等价，理由写在生成的 config 内注释；run_to
+# 的时间上限照旧兜底）；只有就绪探测（wait_s3_ready）逐次加 AWS_MAX_ATTEMPTS=1
+# 追求秒退——网关未就绪时默认重试会把每次探测拖长数秒。
 AWS_S3="http://localhost:${FA_SEAWEEDFS_S3_PORT}"
 export AWS_CONFIG_FILE="$REPO/$OUT/aws/config" AWS_SHARED_CREDENTIALS_FILE="$REPO/$OUT/aws/credentials"
 unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_DEFAULT_REGION
@@ -81,11 +81,19 @@ region = us-east-1
 s3 =
   addressing_style = path
 retry_mode = standard
+# max_attempts=8（standard 退避累计 ~30s）——与 mc/minio-go 的内置重试等价：
+# 场景 2 的写入器本来就会横跨 filer 重启的 ~17s 停机窗口，mc 时代短暂连接
+# 拒绝由 minio-go 内部重试吸收（FI 级 3 次重试从不触发）；aws standard 默认
+# 3 次尝试（~4s）盖不住 17s，实测 fi2/p007 永久失败。8 次退避在 run_to 的
+# 30s 单次上限之内兜底（真故障仍被 run_to 砍掉并按原判据计失败）；FI 级的
+# 3 次重试次数不变。
+max_attempts = 8
 [profile swadmin]
 region = us-east-1
 s3 =
   addressing_style = path
 retry_mode = standard
+max_attempts = 8
 AWSCFG
 cat > "${AWS_SHARED_CREDENTIALS_FILE}" <<AWSCRED
 [swcp]
