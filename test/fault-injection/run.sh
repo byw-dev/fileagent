@@ -101,8 +101,9 @@ AWSCRED
 AWSBIN="$REPO/$OUT/aws-s3"
 cat > "$AWSBIN" <<AWSBIN
 #!/usr/bin/env bash
-# B7 生成物（bin/tmp/fi/ 下，不入库）：FI 的 aws S3 封装
-exec env AWS_PROFILE="\$1" aws --endpoint-url "${AWS_S3}" --no-cli-pager "\${@:2}"
+# B7 生成物（bin/tmp/fi/ 下，不入库）：FI 的 aws S3 API 封装（恒走 s3api；
+# 身份用第 1 个参数选 profile；endpoint 显式给出）。
+exec env AWS_PROFILE="\$1" aws --endpoint-url "${AWS_S3}" --no-cli-pager s3api "\${@:2}"
 AWSBIN
 chmod +x "$AWSBIN"
 

@@ -491,12 +491,12 @@ SWAWSCFG
 aws_access_key_id = $SW_ADMIN_ACCESS_KEY
 aws_secret_access_key = $SW_ADMIN_SECRET_KEY
 SWAWSCRED
-  swaws() { # <aws s3api args...> — admin 身份 + 显式 endpoint 的私有 aws 调用
+  swaws() { # <aws s3api args...> — admin 身份 + 显式 endpoint 的私有 aws 调用（恒走 s3api）
     AWS_PROFILE=swadmin \
     AWS_CONFIG_FILE="$SW_AWS_DIR/config" \
     AWS_SHARED_CREDENTIALS_FILE="$SW_AWS_DIR/credentials" \
     AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true \
-    aws --endpoint-url "http://localhost:${FA_SEAWEEDFS_S3_PORT}" --no-cli-pager "$@"
+    aws --endpoint-url "http://localhost:${FA_SEAWEEDFS_S3_PORT}" --no-cli-pager s3api "$@"
   }
   printf 'readback probe\n' > "$WORK/probe.txt"
   swaws put-object --bucket data-sensor --key probe/readback-probe.txt --body "$WORK/probe.txt" >/dev/null \

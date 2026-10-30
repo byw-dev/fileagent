@@ -140,9 +140,15 @@ aws_secret_access_key = ${SW_CP_SECRET_KEY}
 AWSCRED
 
 # awsx <profile> <args...> — aws with the explicit endpoint and no pager.
+# The service segment (s3api) is injected here so call sites read like the
+# old mc commands; `s3` (high-level, e.g. `s3 presign`) is passed through.
 awsx() {
   local profile=$1; shift
-  AWS_PROFILE="${profile}" aws --endpoint-url "${SW_S3_ENDPOINT}" --no-cli-pager "$@"
+  if [ "${1:-}" = "s3" ]; then
+    AWS_PROFILE="${profile}" aws --endpoint-url "${SW_S3_ENDPOINT}" --no-cli-pager "$@"
+  else
+    AWS_PROFILE="${profile}" aws --endpoint-url "${SW_S3_ENDPOINT}" --no-cli-pager s3api "$@"
+  fi
 }
 
 cleanup() {
@@ -254,11 +260,11 @@ EOF
 TMP_RULE_EFFECTIVE="no"
 # B7: mc ilm import/export → put/get-bucket-lifecycle-configuration。mc 的
 # import JSON 形状（{"Rules":[…]}）对 aws 原样可用（PoC 实测），按 Rule ID
-# 读回的判据不变（get 输出顶层多个 TransitionDefaultMinimumObjectSize 字段，
-# 不影响 grep）。
+# 读回的判据不变（aws 的 get 输出是 pretty-print，冒号带空格，grep 用
+# [[:space:]]* 兼容；顶层多个 TransitionDefaultMinimumObjectSize 字段不影响）。
 if awsx swadmin put-bucket-lifecycle-configuration --bucket "${SW_BUCKET_TMP}" \
      --lifecycle-configuration "file://${LC_DIR}/tmp-expire.json" >/dev/null 2>&1; then
-  if awsx swadmin get-bucket-lifecycle-configuration --bucket "${SW_BUCKET_TMP}" 2>/dev/null | grep -q '"ID":"auto-expire-tmp-uploads"'; then
+  if awsx swadmin get-bucket-lifecycle-configuration --bucket "${SW_BUCKET_TMP}" 2>/dev/null | grep -q '"ID":[[:space:]]*"auto-expire-tmp-uploads"'; then
     TMP_RULE_EFFECTIVE="yes"
   fi
 else
@@ -275,7 +281,7 @@ EOF
 ABORT_RULE_EFFECTIVE="no"
 if awsx swadmin put-bucket-lifecycle-configuration --bucket "${SW_BUCKET_DATA}" \
      --lifecycle-configuration "file://${LC_DIR}/data-abort.json" >/dev/null 2>&1; then
-  if awsx swadmin get-bucket-lifecycle-configuration --bucket "${SW_BUCKET_DATA}" 2>/dev/null | grep -q '"ID":"abort-incomplete-multipart-data-sensor"'; then
+  if awsx swadmin get-bucket-lifecycle-configuration --bucket "${SW_BUCKET_DATA}" 2>/dev/null | grep -q '"ID":[[:space:]]*"abort-incomplete-multipart-data-sensor"'; then
     ABORT_RULE_EFFECTIVE="yes"
   fi
 else
