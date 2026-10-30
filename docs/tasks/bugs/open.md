@@ -176,7 +176,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 〔B:不挡试点〕 | 🟡 P2 | docs |
 | IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** 〔B:不挡试点〕 | 🟠 P1 | agent + CP |
 | IC-BUG-56 | **过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」只认 `AccessDenied`**——不会卡住（后台每分钟检查一次，唤醒后约 1 分钟内恢复），但期间开始的上传各失败一次、推迟一个退避档并白耗一次重试 〔B:不挡试点〕 | 🟡 P2 | agent |
-| IC-BUG-57 | `init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕 | 🟡 P2 | deploy |
+| IC-BUG-57 | `init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕；B7（#TBD）后 `mc alias set` 两处已随 S3 客户端换成 AWS CLI（凭据走私有 config 文件，不再进 argv）而消除，`curl --user` 残留 | 🟡 P2 | deploy |
 
 ---
 
