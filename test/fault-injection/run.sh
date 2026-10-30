@@ -23,7 +23,7 @@
 #       actual upload); asserts verify against the plan (existence, status,
 #       source, size, etag) — a vanished row or an empty list is a FAILURE,
 #       never a pass; set-compare carries an expected-live-count guard.
-#   F6  every external call (psql_q, s3_keys, mc, curl) is bounded via run_to
+#   F6  every external call (psql_q, s3_keys, aws, curl) is bounded via run_to
 #       and fail-closed on error; FI_HANG_DEMO=1 injects one hanging query to
 #       prove the bound (script exits within the deadline counting a failure).
 #   F7  after every filer restart the script waits for the S3 gateway to
@@ -61,9 +61,50 @@ ok()    { echo "  ✓ $*"; }
 bad()   { echo "  ✗ $*"; FAILURES=$((FAILURES+1)); }
 fatal() { echo "  ☠ FATAL: $*"; exit 1; }
 
-# shellcheck disable=SC2034  # mc 实际以裸命令调用；变量保留以便一键改为绝对路径
-MC=mc
-export MC_CONFIG_DIR="$OUT/mc"
+# ── AWS CLI v2（B7：mc → aws cli v2，MinIO 生态不再依赖）────────────────────
+# 私有配置隔离：config/credentials 落在 FI 专有目录 $OUT/aws/ 下，绝不触碰
+# 开发者的 ~/.aws；调用者环境里可能漏进来的身份变量全部 unset。两个身份：
+#   swcp    — CP 身份（put 走它，与 agent/CP 运行时同源）
+#   swadmin — 管理员身份（delete / list / 建桶）
+# 重试取舍：数据操作保持 CLI 默认 standard 重试（对瞬时 5xx/SlowDown/连接
+# 重置有容错，等价于 mc/minio-go 的内置重试；run_to 的时间上限照旧兜底）；
+# 只有就绪探测（wait_s3_ready）逐次加 AWS_MAX_ATTEMPTS=1 追求秒退——网关
+# 未就绪时默认重试会把每次探测拖长数秒。
+AWS_S3="http://localhost:${FA_SEAWEEDFS_S3_PORT}"
+export AWS_CONFIG_FILE="$REPO/$OUT/aws/config" AWS_SHARED_CREDENTIALS_FILE="$REPO/$OUT/aws/credentials"
+unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_DEFAULT_REGION
+export AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true
+mkdir -p "$OUT/aws"
+cat > "${AWS_CONFIG_FILE}" <<'AWSCFG'
+[profile swcp]
+region = us-east-1
+s3 =
+  addressing_style = path
+retry_mode = standard
+[profile swadmin]
+region = us-east-1
+s3 =
+  addressing_style = path
+retry_mode = standard
+AWSCFG
+cat > "${AWS_SHARED_CREDENTIALS_FILE}" <<AWSCRED
+[swcp]
+aws_access_key_id = ${SW_CP_ACCESS_KEY}
+aws_secret_access_key = ${SW_CP_SECRET_KEY}
+[swadmin]
+aws_access_key_id = ${SW_ADMIN_ACCESS_KEY}
+aws_secret_access_key = ${SW_ADMIN_SECRET_KEY}
+AWSCRED
+# aws-s3 — aws S3 薄封装（身份用第 1 个参数选 profile）。写成文件是因为
+# run_to 经 in_new_group 的 exec 启动子进程，shell 函数无法穿过去（mc 时代
+# 等价物是裸 mc + alias；aws 时代身份经 AWS_PROFILE 选择）。
+AWSBIN="$REPO/$OUT/aws-s3"
+cat > "$AWSBIN" <<AWSBIN
+#!/usr/bin/env bash
+# B7 生成物（bin/tmp/fi/ 下，不入库）：FI 的 aws S3 封装
+exec env AWS_PROFILE="\$1" aws --endpoint-url "${AWS_S3}" --no-cli-pager "\${@:2}"
+AWSBIN
+chmod +x "$AWSBIN"
 
 # ts_ns — 可移植的纳秒级 Unix 时间戳（纯数字）。date 的 %N 在 GNU date 与新版
 # macOS（Darwin 24 实测）都可用；但部分旧版 macOS/BSD date 会输出字面 N 或
@@ -306,16 +347,24 @@ trap cleanup EXIT
 
 # ── 前置工具检查（fail-closed；PRECHECK_OK 置位之前，fatal 不触发任何清理）──
 # python3 是硬前置：起基础设施时 render-seaweedfs-configs.sh 缺 python3 直接
-# exit 1（渲染 SeaweedFS JSON 凭据配置）；docker/mc/go 同样缺一不可。
+# exit 1（渲染 SeaweedFS JSON 凭据配置）；docker/aws/go 同样缺一不可。
 req_tool() { # <cmd> <用途说明>
   command -v "$1" >/dev/null 2>&1 && return 0
   echo "FATAL: 缺少前置工具 $1（$2）—— 请先安装再跑本脚本。" >&2
   exit 1
 }
 req_tool docker "容器运行时（compose v2 起隔离环境）"
-req_tool mc     "MinIO client（S3 写入/删除/列举）"
+req_tool aws    "AWS CLI v2（S3 写入/删除/列举；macOS: brew install awscli，其余见 https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html）"
 req_tool go     "构建 controlplane 与 faultproxy（当前工作树）"
 req_tool python3 "渲染 SeaweedFS JSON 配置（render-seaweedfs-configs.sh 硬依赖；亦是 ts_ns 时间戳的兜底引擎）"
+case "$(aws --version 2>&1)" in
+  aws-cli/2.*) ;;
+  *)
+    echo "FATAL: 需要 AWS CLI v2（实测基线 2.39.2），当前：$(aws --version 2>&1)" >&2
+    echo "       v1 的 profile 配置/校验和行为与本次改造验证过的路径不同，不支持。" >&2
+    exit 1
+    ;;
+esac
 
 # ── 遗留进程预检（fail-closed）───────────────────────────────────────────────
 for spec in "${FA_POSTGRES_PORT}:PostgreSQL" "${FA_REDIS_PORT}:Redis" "${FA_NATS_PORT}:NATS" \
@@ -348,10 +397,14 @@ run_to 120 bash deploy/scripts/render-seaweedfs-configs.sh >"$OUT/render.log" 2>
 run_to 600 $SWCOMPOSE up -d --wait >>"$OUT/compose-sw.log" 2>&1 || fatal "seaweedfs compose up"
 ok "基础设施 healthy"
 
-run_to 30 mc alias set swcp "http://localhost:${FA_SEAWEEDFS_S3_PORT}" "$SW_CP_ACCESS_KEY" "$SW_CP_SECRET_KEY" >/dev/null || fatal "alias swcp"
-run_to 30 mc alias set swadmin "http://localhost:${FA_SEAWEEDFS_S3_PORT}" "$SW_ADMIN_ACCESS_KEY" "$SW_ADMIN_SECRET_KEY" >/dev/null || fatal "alias swadmin"
-run_to 30 mc mb --ignore-existing "swcp/data-sensor" >/dev/null || fatal "mb data-sensor"
-ok "mc 别名与桶就绪"
+# B7：mc alias ×2 → 私有 AWS profile（凭据在 $OUT/aws/credentials，见文件头）；
+# mc mb --ignore-existing → head-bucket 探测 + 缺失时 create-bucket（aws 无
+# --ignore-existing；「已存在算成功」语义由此保持：head 命中即跳过，重复
+# create 会以 BucketAlreadyOwnedByYou 报错——PoC 实测，故必须先探）。
+run_to 30 "$AWSBIN" swcp head-bucket --bucket data-sensor >/dev/null 2>&1 \
+  || run_to 30 "$AWSBIN" swcp create-bucket --bucket data-sensor >/dev/null \
+  || fatal "create bucket data-sensor"
+ok "AWS CLI 配置与桶就绪"
 
 if [ "${FI_HANG_DEMO:-0}" = "1" ]; then
   note "F6 红证明：人为挂起一次查询（pg_sleep 300，run_to 15s）——脚本必须数秒内按失败退出"
@@ -426,29 +479,35 @@ md5_of() {
 }
 
 # put_object <key> <content> — 重试 3 次；失败记入 FAILED_WRITES 并返回 1
+# B7：mc cp --quiet → s3api put-object --body（CP 身份 swcp）。用底层 API 而
+# 非高层 `s3 cp`：输出稳定（stdout JSON），且少一层本地扫描。CLI 默认附带
+# 的 CRC 校验和 SeaweedFS 接受（PoC 实测），无需任何环境变量覆盖。
 put_object() {
   local key=$1 content=$2 try
   printf '%s' "$content" > "$OUT/.putobj"
   for try in 1 2 3; do
-    if run_to 30 mc cp --quiet "$OUT/.putobj" "swcp/data-sensor/$key" >/dev/null; then
+    if run_to 30 "$AWSBIN" swcp put-object --bucket data-sensor --key "$key" --body "$OUT/.putobj" >/dev/null; then
       return 0
     fi
     sleep 1
   done
   echo "$key" >> "$FAILED_WRITES"
-  echo "FATAL: mc cp failed after 3 retries: $key" >&2
+  echo "FATAL: aws put-object failed after 3 retries: $key" >&2
   return 1
 }
 
 delete_object() { # <key> — 重试 3 次；stderr 记日志；仍失败则致命
+  # B7：mc rm → s3api delete-object。语义差异（实测）：mc rm 对不存在的对象
+  # 报错（rc=1），delete-object 按 S3 语义幂等（rc=0）。本脚本只删「已确认
+  # 写入成功」的 key，重试判据基于退出码——aws 语义更宽松，不会引入假失败。
   local try
   for try in 1 2 3; do
-    if run_to 30 mc rm "swadmin/data-sensor/$1" >>"$RM_ERRORS" 2>&1; then
+    if run_to 30 "$AWSBIN" swadmin delete-object --bucket data-sensor --key "$1" >>"$RM_ERRORS" 2>&1; then
       return 0
     fi
     sleep 1
   done
-  echo "FATAL: mc rm failed after 3 retries: $1 (see $RM_ERRORS tail below)" >&2
+  echo "FATAL: aws delete-object failed after 3 retries: $1 (see $RM_ERRORS tail below)" >&2
   tail -3 "$RM_ERRORS" >&2
   exit 1
 }
@@ -467,7 +526,10 @@ wait_s3_ready() {
     elapsed=$(( $(date +%s) - start ))
     [ "$elapsed" -ge "$budget" ] && break
     probe_rc=0
-    run_to $(( budget - elapsed )) mc ls "swadmin/data-sensor/" >/dev/null 2>&1 || probe_rc=$?
+    # 就绪探测专用 AWS_MAX_ATTEMPTS=1：网关未就绪时秒退（0.3s），不被 CLI
+    # 默认重试拖长（数据操作保持 standard 重试，见文件头「重试取舍」）。
+    run_to $(( budget - elapsed )) env AWS_MAX_ATTEMPTS=1 "$AWSBIN" swadmin \
+      list-objects-v2 --bucket data-sensor --max-items 1 >/dev/null 2>&1 || probe_rc=$?
     if [ "$probe_rc" = "0" ]; then
       ok "S3 网关就绪（${label}，第 $((i+1)) 次探测，实际耗时 $(($(date +%s)-start))s）"
       return 0
@@ -494,15 +556,23 @@ PLAN_S3_OVR="$OUT/plan-s3-ovr.txt"
 
 # s3_keys / ledger_keys — 失败**返回 1**（不再 FATAL）：调用方（断言/轮询）必须
 # 显式检查 rc 并自行决定（N4：listing 失败绝不能当作空结果）。错误打印到 stderr。
+# B7：mc ls --recursive → list-objects-v2 --prefix。解析差异（实测）：
+#   · mc 的最后一列是相对 prefix 的 key（旧解析用 sed 补回前缀）；
+#   · aws 的 Key 是完整 key，无需补前缀；
+#   · text 输出把同页多个 key 用 TAB 连接（分页时按页换行），tr 还原成行；
+#   · 前缀下无对象时 JMESPath 投影在 text 模式输出字面 "None"（CLI 已知行为，
+#     FI 的 key 都是 fi*/pNNN，不会撞名），按空清单过滤；
+#   · >1000 个对象时 CLI 自动携带 continuation token 分页。
 s3_keys() {
   local out rc
-  out=$(run_to 60 mc ls --recursive "swadmin/data-sensor/$1" 2>&1)
+  out=$(run_to 60 "$AWSBIN" swadmin list-objects-v2 --bucket data-sensor \
+          --prefix "$1" --query 'Contents[].Key' --output text 2>&1)
   rc=$?
   if [ "$rc" != "0" ]; then
-    echo "QUERY FAILED: mc ls (rc=$rc) for prefix $1: ${out:0:200}" >&2
+    echo "QUERY FAILED: aws list-objects-v2 (rc=$rc) for prefix $1: ${out:0:200}" >&2
     return 1
   fi
-  printf '%s\n' "$out" | awk '{print $NF}' | sed "s|^|$1|" | sort
+  printf '%s\n' "$out" | tr '\t' '\n' | sed '/^$/d' | grep -vx 'None' | sort
 }
 
 ledger_keys() {
@@ -701,7 +771,9 @@ if ! GAP_BEFORE=$(gap_marks_total); then
 fi
 note "杀代理前 gap 标记总数：$GAP_BEFORE"
 kill -9 "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null
-note "代理已杀（CP↔filer gRPC 断流）；断流窗口内操作："
+T_OUTAGE_START=$(date +%s)
+note "代理已杀（CP↔filer gRPC 断流）；断流窗口起点 $(date '+%H:%M:%S')——窗口由「写完才恢复代理」界定（非固定时长），写入变慢只拉长窗口、不改变被测对象（B7 aws put 变慢的影响登记，见 report-impl）"
+note "断流窗口内操作："
 # N5：预先固定写 / 删 / 存活三个 key 集合（不随实际写入成功与否收缩）。
 S1_N=200; S1_DELN=20; LIVE1_EXPECT=$(( S1_N - S1_DELN ))
 S1_KEYS="$OUT/s1-keys.txt"
@@ -744,6 +816,8 @@ while read -r kline <&3; do
   fi
 done 3< "$PLAN_S1_OVR"
 sleep_capped 5 || true
+OUTAGE_WINDOW=$(( $(date +%s) - T_OUTAGE_START ))
+note "断流窗口内写/删/覆盖段结束于 $(date '+%H:%M:%S')（窗口实际 ${OUTAGE_WINDOW}s，全部操作已落在窗口内——恢复代理是最后一步）"
 note "恢复代理"
 start_proxy
 
@@ -841,8 +915,8 @@ ts_ns() {
     *)       date +%s ;;
   esac
 }
-put_bounded() { # <key> <content-file> — 单次 mc cp 带 30s 上限（目标桶与主脚本 put_object 一致）
-  mc cp --quiet "$2" "swcp/data-sensor/$1" >/dev/null 2>&1 < /dev/null &
+put_bounded() { # <key> <content-file> — 单次 put 带 30s 上限（目标桶与主脚本 put_object 一致；B7: mc cp → aws s3api put-object，CP 身份）
+  "$AWSBIN" swcp put-object --bucket data-sensor --key "$1" --body "$2" >/dev/null 2>&1 < /dev/null &
   local pid=$! waited=0
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$waited" -ge 30 ]; then
@@ -873,7 +947,8 @@ while IFS='|' read -r k exp_size <&3; do
   fi
 done 3< "$PLAN_S2"
 WEOF
-in_new_group env OUT="$OUT" FAILED_WRITES="$FAILED_WRITES" PLAN_S2="$PLAN_S2" bash "$OUT/writer-s2.sh" &
+T_WRITER_START=$(date +%s)
+in_new_group env OUT="$OUT" FAILED_WRITES="$FAILED_WRITES" PLAN_S2="$PLAN_S2" AWSBIN="$AWSBIN" bash "$OUT/writer-s2.sh" &
 WRITER_PID=$!
 sleep_capped 6 || true
 note "重启 seaweed-filer（compose stop_grace_period 保障优雅停机）"
@@ -892,6 +967,7 @@ while kill -0 "$WRITER_PID" 2>/dev/null; do
   sleep_capped 2 || true
 done
 wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""
+note "窗口证据（B7 时序登记）：writer 于重启前 $(( T_RESTART_START - T_WRITER_START ))s 启动、写完计划总耗时 $(( $(date +%s) - T_WRITER_START ))s、重启耗时见上——「持续写入期间重启」由写入跨过重启时刻界定，aws put 变慢只会扩大重叠区间"
 DEL2_ACTUAL="$OUT/del2-actual.txt"; : > "$DEL2_ACTUAL"
 while read -r k <&3; do
   if grep -qxF "$k" "$FAILED_WRITES"; then
@@ -931,7 +1007,8 @@ CURSOR_BEFORE_STOP=$(psql_q "select declared_ts_ns from storage_event_cursors") 
 }
 note "停 CP 前的持久游标：$CURSOR_BEFORE_STOP"
 stop_and_confirm "$CP_PID" || bad "停 CP 后进程仍存活"; CP_PID=""
-note "CP 已停；写入 120 个新对象（fi3/）+ 删除 12 个新建 + 删 15 个已入账 + 覆盖 15 个已入账"
+T_CPDOWN_START=$(date +%s)
+note "CP 已停（停机窗口起点 $(date '+%H:%M:%S')——窗口由「写完才重启 CP」界定，非固定时长，写入变慢不改变被测对象：游标恢复自持久化行）；写入 120 个新对象（fi3/）+ 删除 12 个新建 + 删 15 个已入账 + 覆盖 15 个已入账"
 # N5：预先固定写 / 删 / 存活三个 key 集合（不随实际写入成功与否收缩）。
 S3_N=120; S3_DELN=12; LIVE3_EXPECT=$(( S3_N - S3_DELN ))
 S3_KEYS="$OUT/s3-keys-fi3.txt"
@@ -970,7 +1047,7 @@ while read -r kline <&3; do
     bad "put(overwrite) $k 失败"
   fi
 done 3< "$PLAN_S3_OVR"
-note "重启 CP（同一 DB：游标来自持久化行）"
+note "重启 CP（同一 DB：游标来自持久化行；停机窗口实际 $(( $(date +%s) - T_CPDOWN_START ))s，全部写入已落在窗口内——重启 CP 是最后一步）"
 start_cp
 # N5/R4-2：期望集合 = 固定计划文件（s3-live-keys.txt / DEL3）；实际计数由查询写入 AC_*
 LIVE3_EXPECT=$(wc -l < "$OUT/s3-live-keys.txt" | tr -d ' ')
@@ -1011,11 +1088,13 @@ if should_run 4; then
 sc_deadline_set 900
 step "场景 4：硬杀 filer（docker kill -s KILL 后显式 start + 等 healthy；只记录）"
 rm -f "$OUT/writes.jsonl"
-note "连续写入 80 个对象（拉满落盘窗口，制造未落盘事件）"
+T_S4W_START=$(date +%s)
+note "连续写入 80 个对象（拉满落盘窗口，制造未落盘事件）——窗口由「写完立即硬杀」界定：写入串行、kill 紧跟最后一个 put，末段写入始终贴近落盘窗口边缘，单次 put 变慢不改变语义（B7 时序登记）"
 for i in $(seq -w 1 80); do
   put_object "fi4/p$i" "fi4-payload-$i-$(printf 'u%.0s' $(seq 1 60))" || bad "put fi4/p$i"
   echo "fi4/p$i $(ts_ns)" >> "$OUT/writes.jsonl"
 done
+note "80 个写入段耗时 $(( $(date +%s) - T_S4W_START ))s（起 $(date -r "$T_S4W_START" '+%H:%M:%S' 2>/dev/null || echo "$T_S4W_START") → 止 $(date '+%H:%M:%S')），随后立即硬杀"
 cp "$OUT/writes.jsonl" "$OUT/writes-s4.jsonl"
 note "docker kill -s KILL $FILER_CONTAINER"
 run_to 30 docker kill --signal=KILL "$FILER_CONTAINER" >/dev/null || bad "docker kill 失败"

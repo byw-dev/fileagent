@@ -44,7 +44,13 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 ## 前置条件
 
 - **docker**（compose v2，容器需可拉取 postgres/redis/nats/seaweedfs 镜像）
-- **mc**（MinIO client，用于 S3 写入/删除/列举）
+- **AWS CLI v2**（S3 写入/删除/列举；B7 起 mc → aws cli v2，实测基线 2.39.2）。
+  脚本自建私有 AWS 配置（config/credentials 落在 `bin/tmp/fi/aws/`，`--endpoint-url`
+  显式给出、path-style、region `us-east-1`），**不触碰开发者的 `~/.aws`**；缺 `aws`
+  或装的是 v1 时预检 fail-closed 并给出安装提示。数据操作保留 CLI 默认 standard
+  重试（等价 mc/minio-go 的内置容错），仅就绪探测用 `AWS_MAX_ATTEMPTS=1` 秒退。
+  安装：`brew install awscli`（macOS）或
+  <https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html>
 - **Go**（构建 `bin/tmp/fi/controlplane` 与 `bin/tmp/fi/faultproxy`，与仓库其余部分同版本要求）
 - **python3（必需，仅标准库）**：起基础设施时渲染 SeaweedFS JSON 配置
  （`deploy/scripts/render-seaweedfs-configs.sh` 缺 python3 直接报错退出），
