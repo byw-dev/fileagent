@@ -1026,12 +1026,12 @@ S2_WIN_INFO=$(awk -v lo="$T_RESTART_START" -v hi="$T_RESTART_END" '
     if (min=="" || ts<min) { min=ts; mink=$1 }
     if (ts>max)            { max=ts; maxk=$1 }
     if (ts>=lo && ts<=hi)  { n++;  if (wfirst=="") { wfirst=$1; wfirst_ts=ts }; wlast=$1; wlast_ts=ts } }
-  END { print n+0 "|" (wfirst==""?"-":wfirst) "|" (wfirst==""?0:wfirst_ts) "|" (wlast==""?"-":wlast) "|" (wlast==""?0:wlast_ts) "|" (min==""?0:min) "|" (min==""?"-":mink) "|" (max==""?0:max) "|" (max==""?"-":maxk) }
+  END { print n+0 "|" (wfirst==""?"-":wfirst) "|" (wfirst==""?0:wfirst_ts) "|" (wlast==""?"-":wlast) "|" (wlast==""?0:wlast_ts) "|" (min==""?"-":mink) "|" (max==""?"-":maxk) }
 ' "$OUT/writes2.jsonl")
 S2_WIN_N=${S2_WIN_INFO%%|*}; S2_WIN_REST=${S2_WIN_INFO#*|}
 S2_WIN_FIRST=${S2_WIN_REST%%|*}; S2_WIN_REST=${S2_WIN_REST#*|}; S2_WIN_FIRST_TS=${S2_WIN_REST%%|*}; S2_WIN_REST=${S2_WIN_REST#*|}
 S2_WIN_LAST=${S2_WIN_REST%%|*}; S2_WIN_REST=${S2_WIN_REST#*|}; S2_WIN_LAST_TS=${S2_WIN_REST%%|*}; S2_WIN_REST=${S2_WIN_REST#*|}
-S2_ALL_MIN=${S2_WIN_REST%%|*}; S2_ALL_REST=${S2_WIN_REST#*|}; S2_ALL_MINK=${S2_ALL_REST%%|*}; S2_ALL_REST=${S2_ALL_REST#*|}; S2_ALL_MAX=${S2_ALL_REST%%|*}; S2_ALL_MAXK=${S2_ALL_REST##*|}
+S2_ALL_MINK=${S2_WIN_REST%%|*}; S2_ALL_MAXK=${S2_WIN_REST##*|}
 note "F4 窗口证据：writer 于重启前 $(( T_RESTART_START - T_WRITER_START ))s 启动；重启窗口 [$T_RESTART_START → $T_RESTART_END]（restart 命令起止）；窗口内实际成功写入 ${S2_WIN_N} 个（首次 ${S2_WIN_FIRST} @$(date -r "$S2_WIN_FIRST_TS" '+%H:%M:%S' 2>/dev/null || echo '?')，末次 ${S2_WIN_LAST} @$(date -r "$S2_WIN_LAST_TS" '+%H:%M:%S' 2>/dev/null || echo '?')）；全场首次写入 ${S2_ALL_MINK} / 末次 ${S2_ALL_MAXK}"
 SC2_VALID=OK
 if [ "${S2_WIN_N:-0}" -eq 0 ]; then
