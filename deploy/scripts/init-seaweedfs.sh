@@ -119,9 +119,12 @@ OWN_AWS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fileagent-swinit-aws.XXXXXX")" || {
   exit 1
 }
 # J3（评审 r3）：mktemp 成功后**立刻**装一个能删掉 OWN_AWS_DIR 的 EXIT trap，
-# 再做 chmod 和写入——否则写 credentials 中途失败（磁盘满等）或被可捕获信号
-# 终止时，含明文 secret 的目录会残留。之后主 `trap cleanup EXIT` 接管（cleanup
-# 同样删除该目录），接管是原子的、没有无 trap 保护的空窗。
+# 再做 chmod 和写入——否则写 credentials 中途失败（磁盘满等）时，含明文 secret
+# 的目录会残留。之后主 `trap cleanup EXIT` 接管（cleanup 同样删除该目录），
+# 接管是原子的、没有无 trap 保护的空窗。
+# L1（评审 r5）：信号覆盖范围（2026-10-31 实测）——外部 kill -TERM/-INT/-HUP
+# 时 EXIT trap 会执行、目录被清；**脚本内 kill -$$ 自杀与 SIGKILL/崩溃时不执行**，
+# 目录会残留（产品 2026-10-31 决定不另做信号 trap，见 backlog「信号中断时的清理」）。
 trap 'rm -rf "${OWN_AWS_DIR:-}" 2>/dev/null' EXIT
 # F1（评审 r1）防御性加固：mktemp -d 本就 0700，这里显式校正并在写入凭据时
 # 用 umask 077 子壳，保证文件落盘即 0600（先建权限再写内容，无可读空窗）。

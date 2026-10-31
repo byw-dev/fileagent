@@ -47,8 +47,10 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 - **AWS CLI v2**（S3 写入/删除/列举；B7 起 mc → aws cli v2，实测基线 2.39.2）。
   脚本自建私有 AWS 配置（config/credentials/aws-s3 封装落在每次运行
   `mktemp -d` 新建的 `bin/tmp/fi/aws.XXXXXX/` 里——不是固定路径、不可能被
-  换成指向 `~/.aws` 的符号链接；目录 0700、凭据文件 0600，退出时**整个目录**
-  删除；历史固定路径 `bin/tmp/fi/aws/` 只清理、不再写入），`--endpoint-url`
+  换成指向 `~/.aws` 的符号链接；目录 0700、凭据文件 0600，正常退出与 fatal
+  时**整个目录**删除（外部 TERM/INT/HUP 实测也会清理；脚本内 kill -$$ 自杀
+  与 SIGKILL/崩溃不保证，见 backlog「信号中断时的清理」）；历史固定路径
+  `bin/tmp/fi/aws/` 只清理、不再写入），`--endpoint-url`
   显式给出、path-style、region `us-east-1`，**不触碰开发者的 `~/.aws`**；
   调用者环境里的 AWS_*（及 FI_AWS_MAX_ATTEMPTS）变量按白名单全部清除
   （凭据/region/retry 等只来自脚本自己的配置文件）。缺 `aws`
