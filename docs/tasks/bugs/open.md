@@ -176,7 +176,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 〔B:不挡试点〕 | 🟡 P2 | docs |
 | IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** 〔B:不挡试点〕 | 🟠 P1 | agent + CP |
 | IC-BUG-56 | **过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」只认 `AccessDenied`**——不会卡住（后台每分钟检查一次，唤醒后约 1 分钟内恢复），但期间开始的上传各失败一次、推迟一个退避档并白耗一次重试 〔B:不挡试点〕 | 🟡 P2 | agent |
-| IC-BUG-57 | `init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕；B7（#TBD）后 `mc alias set` 两处已随 S3 客户端换成 AWS CLI（凭据走私有 config 文件，不再进 argv）而消除，`curl --user` 残留 | 🟡 P2 | deploy |
+| IC-BUG-57 | （立卡时）`init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕；**B7（#138）后 `mc alias set` 两处已随 S3 客户端换成 AWS CLI 而消除（凭据走私有 config 文件，不再进 argv），现存只剩 `curl --user`**（见详情卡「B7 进展」） | 🟡 P2 | deploy |
 
 ---
 
@@ -912,11 +912,11 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 | 字段 | 内容 |
 |------|------|
-| **根因** | `mc alias set ALIAS ENDPOINT AK SK`（admin 与 CP 两个 alias）、`curl --user "AK:SK"`（AssumeRole 自检）三处把 secret 作为 argv 传递，执行期间同机任意用户 `ps -ef` 可见——与 IC-BUG-41 在 `init-minio.sh` 的形态相同 |
+| **根因** | （立卡时）`mc alias set ALIAS ENDPOINT AK SK`（admin 与 CP 两个 alias）、`curl --user "AK:SK"`（AssumeRole 自检）三处把 secret 作为 argv 传递，执行期间同机任意用户 `ps -ef` 可见——与 IC-BUG-41 在 `init-minio.sh` 的形态相同。**B7（#138）后 `mc alias set` 两处已消除，现存只剩 `curl --user`**（见下方「B7 进展」） |
 | **精确位置** | （立卡时）`deploy/scripts/init-seaweedfs.sh:179-180`（admin alias）、`:254-255`（CP alias）、`:142-153`（`assume_role` 的 `--user "$1:$2"`）——行号为历史值，B7 后两处 alias 已不存在，见下行 |
 | **后果** | 仅在脚本执行的几秒窗口内可见，且通常在运维自己的机器/跳板机上执行，实际风险低（与 IC-BUG-41 同判）。渲染器**无**此问题：`render-seaweedfs-configs.sh:120-148` 经环境变量向 python3 注密，secret 不进 argv |
 | **修复** | `mc` 支持从环境变量读凭据（`MC_HOST_<alias>`）；curl 的 `--user` 可改 `--netrc-file` / `--config -`。与 IC-BUG-41 同修法，两脚本宜同刀 |
 | **验收** | 脚本运行期间 `ps -ef` 输出不含任何 `SW_*_SECRET_KEY` 值；AssumeRole / CreateBucket / 预签名 GET 三项自检仍全过 |
 | **归属** | 未排期。宜与 IC-BUG-41（`init-minio.sh` 同类问题）同刀 |
 | **B 重判（2026-10-27）** | **不挡试点** — 执行窗口秒级、通常在运维自己的机器上，实际风险低；bootstrap 三项自检本就要求操作者在场。证据：`init-seaweedfs.sh:179-180,254-255,142-153`（历史行号，同上） |
-| **B7 进展（#TBD，2026-10-31）** | `mc alias set` 两处已随 S3 客户端改为 AWS CLI（B7）而消除；凭据改为写入**私有 0700 目录、0600 权限**的 config/credentials 文件（`mktemp -d` + trap 清理，不进 argv 也不进全局 `~/.aws`）。**现存的 argv 暴露只剩 `curl --user`**（`assume_role` 函数里的 `curl --user "$1:$2"`，即 AssumeRole 自检；不写行号以免漂移）；另注：预签名 URL 进入 curl argv（预签名 GET 自检里的 `curl "${PRESIGNED_URL}"`）是**旧版就有的**短期凭据（5 分钟过期），非新增暴露。**IC-BUG-57 仍未关闭**（curl --user 残留），计数不变 |
+| **B7 进展（#138，2026-10-31）** | `mc alias set` 两处已随 S3 客户端改为 AWS CLI（B7）而消除；凭据改为写入**私有 0700 目录、0600 权限**的 config/credentials 文件（`mktemp -d` + trap 清理，不进 argv 也不进全局 `~/.aws`）。**现存的 argv 暴露只剩 `curl --user`**（`assume_role` 函数里的 `curl --user "$1:$2"`，即 AssumeRole 自检；不写行号以免漂移）；另注：预签名 URL 进入 curl argv（预签名 GET 自检里的 `curl "${PRESIGNED_URL}"`）是**旧版就有的**短期凭据（5 分钟过期），非新增暴露。**IC-BUG-57 仍未关闭**（curl --user 残留），计数不变 |
