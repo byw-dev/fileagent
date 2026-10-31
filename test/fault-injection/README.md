@@ -31,7 +31,7 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 | 1 | 断流重连 | ① 预写两组**已入账**对象（s1del/、s1ovr/ 各 15 个，等 status=completed）→ ② `kill -9` 代理制造 CP↔filer 断流 → ③ 断流窗口内：写 200 个新对象（fi1/）、删 20 个新建（含新建即删样本）、删 15 个已入账、覆盖 15 个已入账 → ④ 重启代理 → ⑤ 断言 | ① S3 存活集合 == 账本 `completed` 集合 == 预先固定的期望存活集合（180 个）；② 新建即删的对象在账本为 `deleted` 或合法缺席；③ 已入账后删除组全部 `status='deleted'`；④ 已入账后覆盖组行必须**存在**且 `completed` + `source='storage_readback'` + size/etag 匹配新内容（缺行即失败）；⑤ `storage_event_marks` 新增 `gap` 标记 |
 | 2 | filer 优雅重启 | 后台写入器持续写 120 个对象（fi2/）期间 `docker compose restart seaweed-filer`（`stop_grace_period` 保障优雅停机），等 S3 网关就绪后停写入器、再删 10 个 | 与场景 1 同口径的等集合断言：存活 110、计划 120、删除 10、增量写失败 0 |
 | 3 | CP 停机期间写入 | 预写两组已入账对象（s3del/、s3ovr/ 各 15 个）并读持久游标 → 停 CP（TERM→KILL 确认退出）→ 停机期间写 120 个新（fi3/）+ 删 12 个新建 + 删/覆盖各 15 个已入账 → 重启 CP（同一 DB，游标来自 `storage_event_cursors` 持久化行） | 同口径等集合断言 + 已入账后删除/覆盖两组断言（同场景 1 ③④） |
-| 4 | filer 硬杀 | 连写 80 个拉满落盘窗口后 `docker kill -s KILL seaweed-filer`，显式 `docker start` + 等 healthy，再写 20 个 | **只记录、不要求通过**：统计硬杀窗口内「S3 有、账本无」的丢失对象数与 `gap` 窗口，结果写入 `SCENARIO4_LOST=<n> (recorded only)`，不计数进 FAILURES |
+| 4 | filer 硬杀 | 连续写入 80 个（**记录 kill 前 60s 内的成功写入数、最后一次成功写入到 kill 的间隔——不保证填满落盘窗口**，窗口内积压量取决于单次写入耗时）后 `docker kill -s KILL seaweed-filer`，显式 `docker start` + 等 healthy，再写 20 个 | **只记录、不要求通过**：统计硬杀窗口内「S3 有、账本无」的丢失对象数与 `gap` 窗口，结果写入 `SCENARIO4_LOST=<n> (recorded only)`，不计数进 FAILURES |
 
 ## 通过判据
 
@@ -44,7 +44,21 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 ## 前置条件
 
 - **docker**（compose v2，容器需可拉取 postgres/redis/nats/seaweedfs 镜像）
-- **mc**（MinIO client，用于 S3 写入/删除/列举）
+- **AWS CLI v2**（S3 写入/删除/列举；B7 起 mc → aws cli v2，实测基线 2.39.2）。
+  脚本自建私有 AWS 配置（config/credentials/aws-s3 封装落在每次运行
+  `mktemp -d` 新建的 `bin/tmp/fi/aws.XXXXXX/` 里——不是固定路径、不可能被
+  换成指向 `~/.aws` 的符号链接；目录 0700、凭据文件 0600，正常退出与 fatal
+  时**整个目录**删除（外部 TERM/INT/HUP 实测也会清理；脚本内 kill -$$ 自杀
+  与 SIGKILL/崩溃不保证，见 backlog「信号中断时的清理」）；历史固定路径
+  `bin/tmp/fi/aws/` 只清理、不再写入），`--endpoint-url`
+  显式给出、path-style、region `us-east-1`，**不触碰开发者的 `~/.aws`**；
+  调用者环境里的 AWS_*（及 FI_AWS_MAX_ATTEMPTS）变量按白名单全部清除
+  （凭据/region/retry 等只来自脚本自己的配置文件）。缺 `aws`
+  或装的是 v1 时预检 fail-closed 并给出安装提示。数据操作 standard 重试 +
+  `max_attempts=8`（与 mc/minio-go 的内置瞬时容错等价；每次调用仍被 run_to
+  的 30s 截断，外层 FI 级 3 次重试不变），仅就绪探测用 1 次尝试秒退。
+  安装：`brew install awscli`（macOS）或
+  <https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html>
 - **Go**（构建 `bin/tmp/fi/controlplane` 与 `bin/tmp/fi/faultproxy`，与仓库其余部分同版本要求）
 - **python3（必需，仅标准库）**：起基础设施时渲染 SeaweedFS JSON 配置
  （`deploy/scripts/render-seaweedfs-configs.sh` 缺 python3 直接报错退出），

@@ -37,6 +37,33 @@
 
 ---
 
+### 信号中断时脚本的自清理（EXIT trap 不保证执行）（2026-10-31 立，产品决定另立卡）
+
+**现象（2026-10-31 实测，B7 mc → AWS CLI v2 收尾时发现）**：`test/fault-injection/run.sh`、
+`deploy/scripts/init-seaweedfs.sh`、`deploy/scripts/smoke.sh` 都只装 `EXIT` trap。实测分三种情形：
+
+- **外部信号**（`kill -TERM/-INT/-HUP <pid>`，即 `timeout`、`kill` 等常见方式打向脚本进程）：
+  EXIT trap **会执行**——私有 AWS 凭据目录（0700 目录 / 0600 文件，含明文长期凭据）被清，
+  FI/smoke 的 compose 容器随 cleanup 收掉。三种信号各实测一次均通过。
+- **脚本内 `kill -TERM $$` 自杀**（评审 r5 的复现方式）：EXIT trap **不执行**，凭据目录残留。
+- **SIGKILL / 崩溃**：无法用 trap 处理，凭据目录与 compose 资源必然残留。
+
+INT 的终端 Ctrl-C 场景是向前台进程组整体发 INT（与上面「只打脚本进程」略有差异），方向上同样
+可用信号转 exit 兜住，落地时须补测。**这不是 B7 引入的**：以前 `mc` 的临时配置
+（`MC_CONFIG_DIR`）与 compose 资源在信号中断时同样残留。
+
+**影响**：残留目录含 0600 明文长期凭据（0700 目录挡住其他普通用户，但操作者/备份可读）；
+FI/smoke 的容器与端口残留会让下一次运行被 fail-closed 预检拒绝，需要手工清理。
+
+**方向**：`trap 'exit 143' TERM`（INT=130、HUP=129）把信号转成 exit，由现有 EXIT cleanup 统一
+清理。落地注意两点：FI 的 `in_new_group` 进程组 kill 与 cleanup 的「退出码保存」（R4-1）如何配合；
+实测中断后凭据目录被删、最终退出码正确。SIGKILL 与崩溃无法用 trap 处理，只能靠以后的定期清理兜底。
+
+**来源**：PR #138 codex 第 5 轮评审；产品 2026-10-31 决定信号处理这一刀不做、另立卡。
+不占 `IC-BUG-NN` 编号（该命名空间属于 IC track，见本节说明）。
+
+---
+
 ### `phase-3-rft.md` 遗留项逐条核对（2026-09-13 立）
 
 `docs/tasks/phases/phase-3-rft.md` 已于 2026-09-13 从「⬜ 待执行」改标为
