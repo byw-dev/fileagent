@@ -87,10 +87,12 @@ done
 export AWS_CONFIG_FILE="$REPO/$OUT/aws/config" AWS_SHARED_CREDENTIALS_FILE="$REPO/$OUT/aws/credentials"
 export AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true
 # F1（评审 r1）：凭据目录 0700、凭据文件 0600，且**先建好权限再写内容**（不能先写
-# 后 chmod——那中间有可读空窗）。mkdir -p + chmod 同时把上一轮残留的旧权限
-# （0755/0644）一并校正；credentials 用 umask 077 子壳写入，落盘即 0600。
+# 后 chmod——那中间有可读空窗）。mkdir -p + chmod 同时把上一轮残留的旧目录权限
+# （0755）一并校正；旧凭据文件可能已是 0644，cat > 只截断不改模式——先 rm 删掉
+# 再以 umask 077 子壳新建，落盘即 0600（上一轮残留的 bin/tmp/fi/aws/* 由此修正）。
 mkdir -p "$OUT/aws"
 chmod 700 "$OUT/aws"
+rm -f "${AWS_CONFIG_FILE}" "${AWS_SHARED_CREDENTIALS_FILE}"
 ( umask 077; cat > "${AWS_CONFIG_FILE}" <<'AWSCFG'
 [profile swcp]
 region = us-east-1

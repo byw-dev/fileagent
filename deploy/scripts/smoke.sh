@@ -480,9 +480,11 @@ if [ "$FA_STORAGE" = "seaweedfs" ]; then
   # 绝不触碰开发者的 ~/.aws。
   SW_AWS_DIR="$WORK/aws"
   # F1（评审 r1）：目录 0700、凭据文件 0600，先建权限再写内容（FA_WORK_DIR
-  # 可由调用者指定，父目录权限不能依赖 mktemp）。
+  # 可由调用者指定且可能被复用——旧凭据文件可能是 0644，cat > 只截断不改
+  # 模式，先 rm 再以 umask 077 子壳新建，落盘即 0600）。
   mkdir -p "$SW_AWS_DIR"
   chmod 700 "$SW_AWS_DIR"
+  rm -f "$SW_AWS_DIR/config" "$SW_AWS_DIR/credentials"
   ( umask 077; cat > "$SW_AWS_DIR/config" <<'SWAWSCFG'
 [profile swadmin]
 region = us-east-1
