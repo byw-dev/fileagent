@@ -195,13 +195,13 @@ ts_hms() { # <ts：19 位纳秒或 10 位秒> — 人类可读时刻（纳秒取
 # （S2_TS_DEGRADED=1，调用方打印降级说明），其余按严格比较分类。
 # 结果（全局）：S2_PRE_KEY/S2_PRE_TS（重启前最后一次成功写入，取最大）、
 # S2_POST_KEY/S2_POST_TS（恢复后第一次成功写入，取最小）、S2_WIN_N（restart
-# 起止之间——观测值，不参与判定）、S2_TS_MODE/S2_TS_DEGRADED。
+# 起止之间——观测值，不参与判定）、S2_TS_DEGRADED（1=秒级兜底降级）。
 s2_span_classify() {
   local file=$1 rs=$2 re=$3 rd=$4 k ts
   S2_PRE_KEY='-'; S2_PRE_TS=''; S2_POST_KEY='-'; S2_POST_TS=''; S2_WIN_N=0
-  S2_TS_MODE="ns"; S2_TS_DEGRADED=0
+  S2_TS_DEGRADED=0
   if [ "${#rs}" -ne 19 ] || [ "${#re}" -ne 19 ] || [ "${#rd}" -ne 19 ]; then
-    S2_TS_MODE="seconds-fallback"; S2_TS_DEGRADED=1
+    S2_TS_DEGRADED=1
   fi
   while read -r k ts <&5; do
     [ -z "${k:-}" ] && continue
@@ -1059,8 +1059,7 @@ T_RESTART_END_NS=$(ts_ns)
 echo "  · filer 重启耗时 $(( T_RESTART_END - T_RESTART_START ))s"
 # F7：重启后先等 S3 网关真正应答，再做任何删除/断言
 wait_s3_ready "场景2 filer 重启后"
-T_S2_READY=$(date +%s)
-T_S2_READY_NS=$(ts_ns)   # G1：网关确认恢复服务的时刻（横跨判据的后沿，比 T_RESTART_END 更严）
+T_S2_READY_NS=$(ts_ns)   # G1：网关确认恢复服务的时刻（横跨判据后沿，比 T_RESTART_END 更严）
 # R3-5：writer join 有界（场景剩余预算）；超时杀整组并计失败
 while kill -0 "$WRITER_PID" 2>/dev/null; do
   if [ "$(sc_remaining)" -le 0 ]; then
