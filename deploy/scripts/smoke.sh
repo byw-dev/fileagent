@@ -479,18 +479,23 @@ if [ "$FA_STORAGE" = "seaweedfs" ]; then
   # 私有 AWS 配置落在 ${WORK}（mktemp 目录，cleanup 随 WORK 一并删除），
   # 绝不触碰开发者的 ~/.aws。
   SW_AWS_DIR="$WORK/aws"
+  # F1（评审 r1）：目录 0700、凭据文件 0600，先建权限再写内容（FA_WORK_DIR
+  # 可由调用者指定，父目录权限不能依赖 mktemp）。
   mkdir -p "$SW_AWS_DIR"
-  cat > "$SW_AWS_DIR/config" <<'SWAWSCFG'
+  chmod 700 "$SW_AWS_DIR"
+  ( umask 077; cat > "$SW_AWS_DIR/config" <<'SWAWSCFG'
 [profile swadmin]
 region = us-east-1
 s3 =
   addressing_style = path
 SWAWSCFG
-  cat > "$SW_AWS_DIR/credentials" <<SWAWSCRED
+  )
+  ( umask 077; cat > "$SW_AWS_DIR/credentials" <<SWAWSCRED
 [swadmin]
 aws_access_key_id = $SW_ADMIN_ACCESS_KEY
 aws_secret_access_key = $SW_ADMIN_SECRET_KEY
 SWAWSCRED
+  )
   swaws() { # <aws s3api args...> — admin 身份 + 显式 endpoint 的私有 aws 调用（恒走 s3api）
     AWS_PROFILE=swadmin \
     AWS_CONFIG_FILE="$SW_AWS_DIR/config" \

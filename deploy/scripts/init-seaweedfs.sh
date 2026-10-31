@@ -115,22 +115,28 @@ LC_DIR=""
 CHECK_OBJECT=""
 CHECK_BUCKET=""
 OWN_AWS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fileagent-swinit-aws.XXXXXX")"
+# F1（评审 r1）防御性加固：mktemp -d 本就 0700，这里显式校正并在写入凭据时
+# 用 umask 077 子壳，保证文件落盘即 0600（先建权限再写内容，无可读空窗）。
+chmod 700 "${OWN_AWS_DIR}"
 export AWS_CONFIG_FILE="${OWN_AWS_DIR}/config" AWS_SHARED_CREDENTIALS_FILE="${OWN_AWS_DIR}/credentials"
 unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_DEFAULT_REGION
 export AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true
-cat >"${AWS_CONFIG_FILE}" <<'AWSCFG'
+( umask 077; cat >"${AWS_CONFIG_FILE}" <<'AWSCFG'
 [profile swadmin]
 region = us-east-1
 s3 =
   addressing_style = path
 retry_mode = standard
+max_attempts = 3
 [profile swcp]
 region = us-east-1
 s3 =
   addressing_style = path
 retry_mode = standard
+max_attempts = 3
 AWSCFG
-cat >"${AWS_SHARED_CREDENTIALS_FILE}" <<AWSCRED
+)
+( umask 077; cat >"${AWS_SHARED_CREDENTIALS_FILE}" <<AWSCRED
 [swadmin]
 aws_access_key_id = ${SW_ADMIN_ACCESS_KEY}
 aws_secret_access_key = ${SW_ADMIN_SECRET_KEY}
@@ -138,6 +144,7 @@ aws_secret_access_key = ${SW_ADMIN_SECRET_KEY}
 aws_access_key_id = ${SW_CP_ACCESS_KEY}
 aws_secret_access_key = ${SW_CP_SECRET_KEY}
 AWSCRED
+)
 
 # awsx <profile> <args...> — aws with the explicit endpoint and no pager.
 # The service segment (s3api) is injected here so call sites read like the

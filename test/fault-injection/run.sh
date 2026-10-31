@@ -74,8 +74,12 @@ AWS_S3="http://localhost:${FA_SEAWEEDFS_S3_PORT}"
 export AWS_CONFIG_FILE="$REPO/$OUT/aws/config" AWS_SHARED_CREDENTIALS_FILE="$REPO/$OUT/aws/credentials"
 unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_DEFAULT_REGION
 export AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true
+# F1（评审 r1）：凭据目录 0700、凭据文件 0600，且**先建好权限再写内容**（不能先写
+# 后 chmod——那中间有可读空窗）。mkdir -p + chmod 同时把上一轮残留的旧权限
+# （0755/0644）一并校正；credentials 用 umask 077 子壳写入，落盘即 0600。
 mkdir -p "$OUT/aws"
-cat > "${AWS_CONFIG_FILE}" <<'AWSCFG'
+chmod 700 "$OUT/aws"
+( umask 077; cat > "${AWS_CONFIG_FILE}" <<'AWSCFG'
 [profile swcp]
 region = us-east-1
 s3 =
@@ -84,9 +88,9 @@ retry_mode = standard
 # max_attempts=8（standard 退避累计 ~30s）——与 mc/minio-go 的内置重试等价：
 # 场景 2 的写入器本来就会横跨 filer 重启的 ~17s 停机窗口，mc 时代短暂连接
 # 拒绝由 minio-go 内部重试吸收（FI 级 3 次重试从不触发）；aws standard 默认
-# 3 次尝试（~4s）盖不住 17s，实测 fi2/p007 永久失败。8 次退避在 run_to 的
-# 30s 单次上限之内兜底（真故障仍被 run_to 砍掉并按原判据计失败）；FI 级的
-# 3 次重试次数不变。
+# 3 次尝试（~4s）盖不住 17s，实测 fi2/p007 永久失败。最多 8 次，每次调用被
+# run_to 强制在 30s 截断（不保证 8 次内走完）；外层 FI 级的 3 次重试不变，
+# 单个 key 最坏 ≈ 3×30s + 2×1s sleep ≈ 93s，再由各场景绝对预算硬截止。
 max_attempts = 8
 [profile swadmin]
 region = us-east-1
@@ -95,7 +99,8 @@ s3 =
 retry_mode = standard
 max_attempts = 8
 AWSCFG
-cat > "${AWS_SHARED_CREDENTIALS_FILE}" <<AWSCRED
+)
+( umask 077; cat > "${AWS_SHARED_CREDENTIALS_FILE}" <<AWSCRED
 [swcp]
 aws_access_key_id = ${SW_CP_ACCESS_KEY}
 aws_secret_access_key = ${SW_CP_SECRET_KEY}
@@ -103,6 +108,7 @@ aws_secret_access_key = ${SW_CP_SECRET_KEY}
 aws_access_key_id = ${SW_ADMIN_ACCESS_KEY}
 aws_secret_access_key = ${SW_ADMIN_SECRET_KEY}
 AWSCRED
+)
 # aws-s3 — aws S3 薄封装（身份用第 1 个参数选 profile）。写成文件是因为
 # run_to 经 in_new_group 的 exec 启动子进程，shell 函数无法穿过去（mc 时代
 # 等价物是裸 mc + alias；aws 时代身份经 AWS_PROFILE 选择）。
@@ -310,6 +316,9 @@ cleanup() {
   # 退出码；任何 echo/命令都会把它清零。最终码 = 主流程非零或清理失败任一。
   echo ""; echo "══ cleanup ══"
   SCEN_END=0   # 清理阶段的 down 不受场景预算约束（sc_remaining 视为无限）
+  # F1：本目录是 FI 自己生成的凭据文件（上一轮残留也算在 FI 名下），
+  # 无条件删除；其余 aws/ 诊断文件保留。
+  rm -f "${AWS_SHARED_CREDENTIALS_FILE:-}" 2>/dev/null || true
   if [ "${PRECHECK_OK:-0}" != 1 ]; then
     echo "  · 预检未全部通过（拒绝路径）：本次未创建任何基础设施，不执行任何 down/pkill（R3-6）"
     return $rc
