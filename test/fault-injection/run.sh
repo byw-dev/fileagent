@@ -66,9 +66,12 @@ fatal() { echo "  ☠ FATAL: $*"; exit 1; }
 # 开发者的 ~/.aws；调用者环境里可能漏进来的身份变量全部 unset。两个身份：
 #   swcp    — CP 身份（put 走它，与 agent/CP 运行时同源）
 #   swadmin — 管理员身份（delete / list / 建桶）
-# 重试取舍：数据操作保持 CLI standard 重试并把 max_attempts 提到 8（与
-# mc/minio-go 的内置瞬时错误容错等价，理由写在生成的 config 内注释；run_to
-# 的时间上限照旧兜底）；只有就绪探测（wait_s3_ready）逐次加 AWS_MAX_ATTEMPTS=1
+# 重试取舍：数据操作 standard 重试 + max_attempts=8（与 mc/minio-go 的内置
+# 瞬时错误容错等价；理由写在生成的 config 注释里）。**最多 8 次**，但每次
+# 调用被 run_to 强制在 30s 截断（8 次退避不保证在 30s 内走完）；外层 FI 级
+# 的 3 次重试不变——单个 key 最坏 ≈ 3×30s + 2×1s sleep ≈ 93s，再由各场景的
+# 绝对预算硬截止。max_attempts=8 不可被环境覆盖：调用者 AWS_* 已按 F2 白名单
+# 全部清除。就绪探测（wait_s3_ready）经 FI_AWS_MAX_ATTEMPTS 逐次设 1 次尝试
 # 追求秒退——网关未就绪时默认重试会把每次探测拖长数秒。
 AWS_S3="http://localhost:${FA_SEAWEEDFS_S3_PORT}"
 # F2（评审 r1）白名单：调用者环境里的 AWS_* 一律不得漏入——凭据/region 的
@@ -994,7 +997,8 @@ sleep_capped 6 || true
 note "重启 seaweed-filer（compose stop_grace_period 保障优雅停机）"
 T_RESTART_START=$(date +%s)
 run_to 180 $SWCOMPOSE restart seaweed-filer >>"$OUT/compose-sw.log" 2>&1 || bad "restart 命令失败/超时"
-echo "  · filer 重启耗时 $(( $(date +%s) - T_RESTART_START ))s"
+T_RESTART_END=$(date +%s)
+echo "  · filer 重启耗时 $(( T_RESTART_END - T_RESTART_START ))s"
 # F7：重启后先等 S3 网关真正应答，再做任何删除/断言
 wait_s3_ready "场景2 filer 重启后"
 # R3-5：writer join 有界（场景剩余预算）；超时杀整组并计失败
@@ -1007,7 +1011,31 @@ while kill -0 "$WRITER_PID" 2>/dev/null; do
   sleep_capped 2 || true
 done
 wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""
-note "窗口证据（B7 时序登记）：writer 于重启前 $(( T_RESTART_START - T_WRITER_START ))s 启动、写完计划总耗时 $(( $(date +%s) - T_WRITER_START ))s、重启耗时见上——「持续写入期间重启」由写入跨过重启时刻界定，aws put 变慢只会扩大重叠区间"
+# F4（评审 r1）有效性守卫：「持续写入期间重启」必须以写入时间戳与重启区间
+# 的实际重叠证明，不再用「写完总耗时」敷衍（那个数字包含等重启的时间）。
+# 「窗口内」定义：restart 命令开始（T_RESTART_START，含容器停止）到结束
+# （T_RESTART_END，容器重新拉起）之间；写入按它在 writes2.jsonl 里的
+# **实际成功时刻**归属——aws 重试把一次写入拖过窗口的，记在成功时刻、
+# 不计入窗口内。writes2.jsonl 只记成功写入，天然排除失败尝试。
+# 守卫：窗口内成功写入数为 0 → 本次场景无效（bad），不经过任何收敛断言
+# 判「通过」（与 F3/N4 同一原则：空结果不得当作通过）。期望计数不变。
+S2_WIN_INFO=$(awk -v lo="$T_RESTART_START" -v hi="$T_RESTART_END" '
+  { ts=$2; if (length(ts)>10) ts=substr(ts,1,10); ts=ts+0
+    if (min=="" || ts<min) { min=ts; mink=$1 }
+    if (ts>max)            { max=ts; maxk=$1 }
+    if (ts>=lo && ts<=hi)  { n++;  if (wfirst=="") { wfirst=$1; wfirst_ts=ts }; wlast=$1; wlast_ts=ts } }
+  END { print n+0 "|" (wfirst==""?"-":wfirst) "|" (wfirst==""?0:wfirst_ts) "|" (wlast==""?"-":wlast) "|" (wlast==""?0:wlast_ts) "|" (min==""?0:min) "|" (min==""?"-":mink) "|" (max==""?0:max) "|" (max==""?"-":maxk) }
+' "$OUT/writes2.jsonl")
+S2_WIN_N=${S2_WIN_INFO%%|*}; S2_WIN_REST=${S2_WIN_INFO#*|}
+S2_WIN_FIRST=${S2_WIN_REST%%|*}; S2_WIN_REST=${S2_WIN_REST#*|}; S2_WIN_FIRST_TS=${S2_WIN_REST%%|*}; S2_WIN_REST=${S2_WIN_REST#*|}
+S2_WIN_LAST=${S2_WIN_REST%%|*}; S2_WIN_REST=${S2_WIN_REST#*|}; S2_WIN_LAST_TS=${S2_WIN_REST%%|*}; S2_WIN_REST=${S2_WIN_REST#*|}
+S2_ALL_MIN=${S2_WIN_REST%%|*}; S2_ALL_REST=${S2_WIN_REST#*|}; S2_ALL_MINK=${S2_ALL_REST%%|*}; S2_ALL_REST=${S2_ALL_REST#*|}; S2_ALL_MAX=${S2_ALL_REST%%|*}; S2_ALL_MAXK=${S2_ALL_REST##*|}
+note "F4 窗口证据：writer 于重启前 $(( T_RESTART_START - T_WRITER_START ))s 启动；重启窗口 [$T_RESTART_START → $T_RESTART_END]（restart 命令起止）；窗口内实际成功写入 ${S2_WIN_N} 个（首次 ${S2_WIN_FIRST} @$(date -r "$S2_WIN_FIRST_TS" '+%H:%M:%S' 2>/dev/null || echo '?')，末次 ${S2_WIN_LAST} @$(date -r "$S2_WIN_LAST_TS" '+%H:%M:%S' 2>/dev/null || echo '?')）；全场首次写入 ${S2_ALL_MINK} / 末次 ${S2_ALL_MAXK}"
+SC2_VALID=OK
+if [ "${S2_WIN_N:-0}" -eq 0 ]; then
+  bad "场景2 有效性守卫（F4）：重启窗口内没有一次成功写入——「持续写入期间重启」未发生，本次场景无效，不计通过（空结果不得当作通过，fail-closed）"
+  SC2_VALID=FAIL
+fi
 DEL2_ACTUAL="$OUT/del2-actual.txt"; : > "$DEL2_ACTUAL"
 while read -r k <&3; do
   if grep -qxF "$k" "$FAILED_WRITES"; then
@@ -1023,6 +1051,7 @@ LIVE2_EXPECT=$(wc -l < "$OUT/s2-live-keys.txt" | tr -d ' ')
 DEL2_N=$(grep -c . "$DEL2")
 DEL2_ACTUAL_N=$(grep -c . "$DEL2_ACTUAL")
 if wait_converged "fi2/" "$DEL2_ACTUAL" "$OUT/s2-live-keys.txt" "$DEL2" 300; then SC2=OK; else SC2=FAIL; fi
+[ "${SC2_VALID:-OK}" = OK ] || { SC2=FAIL; bad "场景2 因 F4 有效性守卫失败而判 FAIL"; }
 LIVE2_ACTUAL=${AC_LIVE:-0}
 [ "$PLAN2_N" = 120 ] || { bad "场景2 计划 $PLAN2_N ≠ 120"; SC2=FAIL; }
 [ "$DEL2_N" = "$DEL2_EXPECT" ] || { bad "场景2 期望删除集合 ≠ $DEL2_EXPECT 个"; SC2=FAIL; }
@@ -1129,12 +1158,19 @@ sc_deadline_set 900
 step "场景 4：硬杀 filer（docker kill -s KILL 后显式 start + 等 healthy；只记录）"
 rm -f "$OUT/writes.jsonl"
 T_S4W_START=$(date +%s)
-note "连续写入 80 个对象（拉满落盘窗口，制造未落盘事件）——窗口由「写完立即硬杀」界定：写入串行、kill 紧跟最后一个 put，末段写入始终贴近落盘窗口边缘，单次 put 变慢不改变语义（B7 时序登记）"
+note "连续写入 80 个对象（制造硬杀前的写入流，观测其相对落盘窗口的分布）——filer 元数据日志的落盘窗口可达约 60s（docs/reports/storage-layer-eval.md:183）；换用 AWS CLI 后单次写入变慢，窗口内的积压量取决于单次写入耗时，**不再能从「80 个」这个数量推出**（最早的写入可能已落盘）。下面打印本次实测值；场景 4 仍然只记录、不设通过线"
 for i in $(seq -w 1 80); do
   put_object "fi4/p$i" "fi4-payload-$i-$(printf 'u%.0s' $(seq 1 60))" || bad "put fi4/p$i"
   echo "fi4/p$i $(ts_ns)" >> "$OUT/writes.jsonl"
 done
-note "80 个写入段耗时 $(( $(date +%s) - T_S4W_START ))s（起 $(date -r "$T_S4W_START" '+%H:%M:%S' 2>/dev/null || echo "$T_S4W_START") → 止 $(date '+%H:%M:%S')），随后立即硬杀"
+T_S4_KILL=$(date +%s)
+# F5（评审 r1）观测值：最后一次成功 put 到 kill 的间隔、kill 前 60s 内的
+# 成功写入数。writes.jsonl 此时只含这 80 个预杀写入；时间戳秒级兜底时
+# （length≤10）直接用，纳秒取前 10 位换算成秒。
+S4_LAST_PUT_S=$(awk '{ts=$2; if (length(ts)>10) ts=substr(ts,1,10); if (ts+0>m) m=ts+0} END{print m+0}' "$OUT/writes.jsonl")
+S4_KILL_GAP=$(( T_S4_KILL - S4_LAST_PUT_S ))
+S4_WIN60=$(awk -v lo="$(( T_S4_KILL - 60 ))" '{ts=$2; if (length(ts)>10) ts=substr(ts,1,10); if (ts+0>=lo) n++} END{print n+0}' "$OUT/writes.jsonl")
+note "F5 实测：80 个写入段耗时 $(( T_S4_KILL - T_S4W_START ))s（起 $(date -r "$T_S4W_START" '+%H:%M:%S' 2>/dev/null || echo "$T_S4W_START") → 止 $(date '+%H:%M:%S')）；最后一次成功 put 距 kill ${S4_KILL_GAP}s；kill 前 60s 内成功写入 ${S4_WIN60}/80 个（其余更早、可能已落盘）——硬杀未落盘量以 SCENARIO4_LOST 的账本对账为准"
 cp "$OUT/writes.jsonl" "$OUT/writes-s4.jsonl"
 note "docker kill -s KILL $FILER_CONTAINER"
 run_to 30 docker kill --signal=KILL "$FILER_CONTAINER" >/dev/null || bad "docker kill 失败"
