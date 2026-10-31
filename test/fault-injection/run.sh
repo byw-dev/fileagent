@@ -608,7 +608,11 @@ s3_keys() {
     echo "QUERY FAILED: aws list-objects-v2 (rc=$rc) for prefix $1: ${out:0:200}" >&2
     return 1
   fi
-  printf '%s\n' "$out" | tr '\t' '\n' | sed '/^$/d' | grep -vx 'None' | sort
+  printf '%s\n' "$out" | tr '\t' '\n' | awk '$0 != "" && $0 != "None"' | sort
+  # F3（评审 r1）：过滤用 awk 而不是 grep——空前缀时 CLI 输出字面 "None"（rc=0），
+  # grep -vx 对空/全过滤输入返回 1，pipefail 会把「成功、零对象」误判成查询
+  # 失败（场景 4 纯观测与异常态会触发）；awk 对空输入 rc=0。run_to 非零时的
+  # 显式失败分支保持不变（真正的 API/连接错误仍走上面的 return 1）。
 }
 
 ledger_keys() {
