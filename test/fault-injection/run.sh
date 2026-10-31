@@ -620,17 +620,19 @@ delete_object() { # <key> — 重试 3 次；stderr 记日志；仍失败则致�
   # 丢失暴露出来，新版删除成功 + 账本断言接受「deleted 或缺席」会把丢失掩盖成
   # 通过。实现用 `--if-match '*'` 条件删除（原子，无 HEAD/DELETE 竞态）——
   # SeaweedFS 4.48 实测：存在 → 204/rc=0；不存在 → PreconditionFailed/rc=254。
-  # 错误分类：PreconditionFailed/412/NoSuchKey = 对象不存在（删除目标已丢失）；
-  # 其余 = 删除请求本身出错（连接失败等）。两类都计失败、进入原有的 3 次重试，
-  # 3 次都失败照旧 fatal。
+  # K2（评审 r4）：错误分类只精确匹配 AWS CLI 错误码
+  # `An error occurred (PreconditionFailed)` / `(NoSuchKey)`——宽泛的 `*412*`
+  # 会把恰好含 "412"（如端口号）的连接错误误记成对象不存在。两类都计失败、
+  # 进入原有的 3 次重试，3 次都失败照旧 fatal；RM_ERRORS 两条分支都附原始
+  # 错误输出（截断），原始信息不丢。
   local try out
   for try in 1 2 3; do
     if out=$(run_to 30 "$AWSBIN" swadmin delete-object --bucket data-sensor --key "$1" --if-match '*' 2>&1); then
       return 0
     fi
     case "$out" in
-      *PreconditionFailed*|*412*|*NoSuchKey*)
-        echo "$(date '+%H:%M:%S') try=$try 对象不存在（删除目标已丢失——旧 mc rm 语义同样会失败）: $1" >> "$RM_ERRORS" ;;
+      *"An error occurred (PreconditionFailed)"*|*"An error occurred (NoSuchKey)"*)
+        echo "$(date '+%H:%M:%S') try=$try 对象不存在（删除目标已丢失——旧 mc rm 语义同样会失败）: $1 :: ${out:0:200}" >> "$RM_ERRORS" ;;
       *)
         echo "$(date '+%H:%M:%S') try=$try 删除请求本身出错（连接失败等）: $1 :: ${out:0:200}" >> "$RM_ERRORS" ;;
     esac
