@@ -1130,7 +1130,20 @@ if [ -n "$S2_PRE_TS" ] && [ -n "$S2_POST_TS" ]; then
 else
   S2_SPAN_GAP='-'
 fi
-note "G1 横跨判据（$( [ "$S2_TS_DEGRADED" = 1 ] && echo '降级：存在非 19 位时间戳，按 10 位秒比较、同秒不计入任何一侧' || echo '纳秒精度、严格比较')）：writer 于重启前 $(( ${T_RESTART_START:0:10} - ${T_WRITER_START:0:10} ))s 启动；重启前最后一次成功写入 ${S2_PRE_KEY} @$(ts_hms "$S2_PRE_TS")、网关恢复（T_S2_READY=$(ts_hms "$T_S2_READY_NS")，restart 窗口 [$T_RESTART_START → $T_RESTART_END]）后第一次成功写入 ${S2_POST_KEY} @$(ts_hms "$S2_POST_TS")，两者间隔 ${S2_SPAN_GAP}s；重启窗口内成功写入 ${S2_WIN_N} 个（仅观测，不参与判定）、同秒无法判定 ${S2_UNDECIDED} 个（J2：不计入任何一侧）"
+# K3（评审 r4）：降级分支（存在非 19 位时间戳）里，同秒的候选无法排先后，
+# 选出的 pre/post 不一定是真正的「最后一次/第一次」——日志必须如实降格为
+# 「秒级精度、同秒候选无法排序」，间隔标注「秒级、近似」；全 19 位分支的
+# 严格输出保持不变。G1 判据（前后各至少一个）不受影响。
+if [ "$S2_TS_DEGRADED" = 1 ]; then
+  S2_PRE_DESC="秒级精度：重启前最后一次成功写入在第 $(date -r "${S2_PRE_TS:0:10}" '+%H:%M:%S' 2>/dev/null || echo '?')（同秒候选无法排序，key=${S2_PRE_KEY} 为同秒候选之一）"
+  S2_POST_DESC="网关恢复（T_S2_READY=$(ts_hms "$T_S2_READY_NS")，restart 窗口 [$T_RESTART_START → $T_RESTART_END]）后第一次成功写入在第 $(date -r "${S2_POST_TS:0:10}" '+%H:%M:%S' 2>/dev/null || echo '?')（同秒候选无法排序，key=${S2_POST_KEY} 为同秒候选之一）"
+  S2_GAP_DESC="${S2_SPAN_GAP}s（秒级、近似）"
+else
+  S2_PRE_DESC="重启前最后一次成功写入 ${S2_PRE_KEY} @$(ts_hms "$S2_PRE_TS")"
+  S2_POST_DESC="网关恢复（T_S2_READY=$(ts_hms "$T_S2_READY_NS")，restart 窗口 [$T_RESTART_START → $T_RESTART_END]）后第一次成功写入 ${S2_POST_KEY} @$(ts_hms "$S2_POST_TS")"
+  S2_GAP_DESC="${S2_SPAN_GAP}s"
+fi
+note "G1 横跨判据（$( [ "$S2_TS_DEGRADED" = 1 ] && echo '降级：存在非 19 位时间戳，按 10 位秒比较、同秒不计入任何一侧' || echo '纳秒精度、严格比较')）：writer 于重启前 $(( ${T_RESTART_START:0:10} - ${T_WRITER_START:0:10} ))s 启动；${S2_PRE_DESC}、${S2_POST_DESC}，两者间隔 ${S2_GAP_DESC}；重启窗口内成功写入 ${S2_WIN_N} 个（仅观测，不参与判定）、同秒无法判定 ${S2_UNDECIDED} 个（J2：不计入任何一侧）"
 SC2_VALID=OK
 if [ -z "$S2_PRE_TS" ]; then
   bad "场景2 有效性守卫（G1a）：重启之前没有任何成功写入——writer 在重启前就写完了（或写入全失败），「持续写入期间重启」未发生，本次场景无效（fail-closed）"
