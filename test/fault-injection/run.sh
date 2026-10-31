@@ -62,8 +62,8 @@ bad()   { echo "  ✗ $*"; FAILURES=$((FAILURES+1)); }
 fatal() { echo "  ☠ FATAL: $*"; exit 1; }
 
 # ── AWS CLI v2（B7：mc → aws cli v2，MinIO 生态不再依赖）────────────────────
-# 私有配置隔离：config/credentials 落在 FI 专有目录 $OUT/aws/ 下，绝不触碰
-# 开发者的 ~/.aws；调用者环境里可能漏进来的身份变量全部 unset。两个身份：
+# 私有配置隔离：config/credentials/aws-s3 封装全部落在本次运行 mktemp -d 新建的
+# 私有目录里，绝不触碰开发者的 ~/.aws。两个身份：
 #   swcp    — CP 身份（put 走它，与 agent/CP 运行时同源）
 #   swadmin — 管理员身份（delete / list / 建桶）
 # 重试取舍：数据操作 standard 重试 + max_attempts=8（与 mc/minio-go 的内置
@@ -71,28 +71,41 @@ fatal() { echo "  ☠ FATAL: $*"; exit 1; }
 # 调用被 run_to 强制在 30s 截断（8 次退避不保证在 30s 内走完）；外层 FI 级
 # 的 3 次重试不变——单个 key 最坏 ≈ 3×30s + 2×1s sleep ≈ 93s，再由各场景的
 # 绝对预算硬截止。max_attempts=8 不可被环境覆盖：调用者 AWS_* 已按 F2 白名单
-# 全部清除。就绪探测（wait_s3_ready）经 FI_AWS_MAX_ATTEMPTS 逐次设 1 次尝试
-# 追求秒退——网关未就绪时默认重试会把每次探测拖长数秒。
+# 全部清除，FI_AWS_MAX_ATTEMPTS 也在清理之列（H2）——只有 wait_s3_ready 那
+# 一次调用经 env 显式传入 1，追求秒退（网关未就绪时默认重试会把每次探测拖长）。
 AWS_S3="http://localhost:${FA_SEAWEEDFS_S3_PORT}"
 # F2（评审 r1）白名单：调用者环境里的 AWS_* 一律不得漏入——凭据/region 的
 # 优先级高于 profile 文件，AWS_MAX_ATTEMPTS/AWS_RETRY_MODE 会覆盖 config 里
 # 的重试配置（实测 AWS_MAX_ATTEMPTS=1 会把数据操作的 max_attempts=8 打回
 # 1 次、场景 2 的问题复发），AWS_CA_BUNDLE/AWS_ENDPOINT_URL* 同理。先全部
 # unset，再显式 export 本脚本需要的；封装脚本（aws-s3）内部再做同样清理，
-# 保证 run_to / writer 子进程路径同样生效。就绪探测的 AWS_MAX_ATTEMPTS=1
-# 经 FI_AWS_MAX_ATTEMPTS 在封装内、清理之后设置。
+# 保证 run_to / writer 子进程路径同样生效。H2（评审 r2）：FI_AWS_MAX_ATTEMPTS
+# 同样会被封装映射成 AWS_MAX_ATTEMPTS，一并从调用者环境清除——它只允许经
+# wait_s3_ready 那一次调用以 `env FI_AWS_MAX_ATTEMPTS=1` 显式传入。
 for _aws_v in $(compgen -e); do
-  case "$_aws_v" in AWS_*|AWS) unset "$_aws_v" ;; esac
+  case "$_aws_v" in AWS_*|AWS|FI_AWS_MAX_ATTEMPTS) unset "$_aws_v" ;; esac
 done
-export AWS_CONFIG_FILE="$REPO/$OUT/aws/config" AWS_SHARED_CREDENTIALS_FILE="$REPO/$OUT/aws/credentials"
+# H1（评审 r2）：历史固定路径残留只清理、不再写入——bin/tmp/fi/aws（跨运行
+# 保留的旧凭据目录）与 bin/tmp/fi/aws-s3（旧封装位置）。若被换成指向别处的
+# 符号链接，只删链接本身（rm -f，不加 -r、不跟随）；普通目录/文件（上一轮
+# FI 自建）直接删除。
+if [ -L "$REPO/$OUT/aws" ]; then
+  rm -f "$REPO/$OUT/aws"
+elif [ -d "$REPO/$OUT/aws" ]; then
+  rm -rf "$REPO/$OUT/aws"
+fi
+rm -f "$REPO/$OUT/aws-s3"
+# H1：凭据目录每次运行 mktemp -d 新建——mktemp 建出的目录不会是既有链接、
+# 权限即 0700，config/credentials/aws-s3 封装都写在里面，cleanup 整目录删除。
+# 本脚本 set -uo pipefail 没有 -e：以下每一步显式 fail-closed。
+AWS_DIR="$(mktemp -d "$REPO/$OUT/aws.XXXXXX")" \
+  || fatal "创建私有 AWS 凭据目录失败（mktemp -d $REPO/$OUT/aws.XXXXXX）"
+# AWS 块先于主 cleanup trap 定义；这个临时 trap 覆盖「凭据初始化自身 fatal」
+# 的窗口，随后主 `trap cleanup EXIT` 会将其替换（cleanup 同样删除 AWS_DIR）。
+trap 'rm -rf "${AWS_DIR:-}" 2>/dev/null' EXIT
+chmod 700 "$AWS_DIR" || fatal "校正 AWS 凭据目录权限失败（$AWS_DIR）"
+export AWS_CONFIG_FILE="$AWS_DIR/config" AWS_SHARED_CREDENTIALS_FILE="$AWS_DIR/credentials"
 export AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true
-# F1（评审 r1）：凭据目录 0700、凭据文件 0600，且**先建好权限再写内容**（不能先写
-# 后 chmod——那中间有可读空窗）。mkdir -p + chmod 同时把上一轮残留的旧目录权限
-# （0755）一并校正；旧凭据文件可能已是 0644，cat > 只截断不改模式——先 rm 删掉
-# 再以 umask 077 子壳新建，落盘即 0600（上一轮残留的 bin/tmp/fi/aws/* 由此修正）。
-mkdir -p "$OUT/aws"
-chmod 700 "$OUT/aws"
-rm -f "${AWS_CONFIG_FILE}" "${AWS_SHARED_CREDENTIALS_FILE}"
 ( umask 077; cat > "${AWS_CONFIG_FILE}" <<'AWSCFG'
 [profile swcp]
 region = us-east-1
@@ -113,7 +126,7 @@ s3 =
 retry_mode = standard
 max_attempts = 8
 AWSCFG
-)
+) || fatal "写入 AWS config 失败（$AWS_CONFIG_FILE）"
 ( umask 077; cat > "${AWS_SHARED_CREDENTIALS_FILE}" <<AWSCRED
 [swcp]
 aws_access_key_id = ${SW_CP_ACCESS_KEY}
@@ -122,13 +135,14 @@ aws_secret_access_key = ${SW_CP_SECRET_KEY}
 aws_access_key_id = ${SW_ADMIN_ACCESS_KEY}
 aws_secret_access_key = ${SW_ADMIN_SECRET_KEY}
 AWSCRED
-)
+) || fatal "写入 AWS credentials 失败（$AWS_SHARED_CREDENTIALS_FILE）"
 # aws-s3 — aws S3 薄封装（身份用第 1 个参数选 profile）。写成文件是因为
 # run_to 经 in_new_group 的 exec 启动子进程，shell 函数无法穿过去（mc 时代
-# 等价物是裸 mc + alias；aws 时代身份经 AWS_PROFILE 选择）。
+# 等价物是裸 mc + alias；aws 时代身份经 AWS_PROFILE 选择）。H1：放在本次
+# mktemp 私有目录里（无既有文件、cleanup 随目录一起消失）。
 # F2：封装自带白名单——先清掉继承环境里的全部 AWS_*，再显式设置本封装需要的
 # （config/credentials 路径在生成时烘焙进来，endpoint 同）。
-AWSBIN="$REPO/$OUT/aws-s3"
+AWSBIN="$AWS_DIR/aws-s3"
 cat > "$AWSBIN" <<AWSBIN
 #!/usr/bin/env bash
 # B7 生成物（bin/tmp/fi/ 下，不入库）：FI 的 aws S3 API 封装（恒走 s3api；
@@ -141,7 +155,7 @@ export AWS_PAGER='' AWS_EC2_METADATA_DISABLED=true
 case "\${FI_AWS_MAX_ATTEMPTS:-}" in ''|*[!0-9]*) ;; *) AWS_MAX_ATTEMPTS="\${FI_AWS_MAX_ATTEMPTS}"; export AWS_MAX_ATTEMPTS ;; esac
 exec env AWS_PROFILE="\$1" aws --endpoint-url "${AWS_S3}" --no-cli-pager s3api "\${@:2}"
 AWSBIN
-chmod +x "$AWSBIN"
+chmod +x "$AWSBIN" || fatal "chmod +x aws-s3 封装失败（$AWSBIN）"
 
 # ts_ns — 可移植的纳秒级 Unix 时间戳（纯数字）。date 的 %N 在 GNU date 与新版
 # macOS（Darwin 24 实测）都可用；但部分旧版 macOS/BSD date 会输出字面 N 或
@@ -166,6 +180,42 @@ ts_ns() {
     python3) python3 -c 'import time; print(time.time_ns())' ;;
     *)       date +%s ;;   # 兜底：秒级整数（仍为数字，不做格式断言）
   esac
+}
+
+ts_hms() { # <ts：19 位纳秒或 10 位秒> — 人类可读时刻（纳秒取前 10 位换秒）
+  local s=$1
+  [ "${#s}" -gt 10 ] && s=${s:0:10}
+  [ "$s" -gt 0 ] 2>/dev/null && date -r "$s" '+%H:%M:%S' 2>/dev/null || echo '-'
+}
+
+# s2_span_classify <writes-file> <restart-start> <restart-end> <ready> — G1 横跨
+# 判据的时间戳分类（H3，评审 r2）。三个边界与写入时间戳**同宽度**时用 bash
+# `[[ ]]` 定长字符串比较（同宽度下字符串序=数值序；19 位纳秒绝不进 awk 浮点）；
+# 边界为 10 位秒（ts_ns 秒级兜底）时降级：**同秒写入无法排序，不计入任何一侧**
+# （S2_TS_DEGRADED=1，调用方打印降级说明），其余按严格比较分类。
+# 结果（全局）：S2_PRE_KEY/S2_PRE_TS（重启前最后一次成功写入，取最大）、
+# S2_POST_KEY/S2_POST_TS（恢复后第一次成功写入，取最小）、S2_WIN_N（restart
+# 起止之间——观测值，不参与判定）、S2_TS_MODE/S2_TS_DEGRADED。
+s2_span_classify() {
+  local file=$1 rs=$2 re=$3 rd=$4 k ts
+  S2_PRE_KEY='-'; S2_PRE_TS=''; S2_POST_KEY='-'; S2_POST_TS=''; S2_WIN_N=0
+  S2_TS_MODE="ns"; S2_TS_DEGRADED=0
+  if [ "${#rs}" -ne 19 ] || [ "${#re}" -ne 19 ] || [ "${#rd}" -ne 19 ]; then
+    S2_TS_MODE="seconds-fallback"; S2_TS_DEGRADED=1
+  fi
+  while read -r k ts <&5; do
+    [ -z "${k:-}" ] && continue
+    case "${ts:-}" in ''|*[!0-9]*) continue ;; esac
+    if [[ "$ts" < "$rs" ]]; then
+      if [ -z "$S2_PRE_TS" ] || [[ "$ts" > "$S2_PRE_TS" ]]; then S2_PRE_TS=$ts; S2_PRE_KEY=$k; fi
+    fi
+    if [[ "$ts" > "$rd" ]]; then
+      if [ -z "$S2_POST_TS" ] || [[ "$ts" < "$S2_POST_TS" ]]; then S2_POST_TS=$ts; S2_POST_KEY=$k; fi
+    fi
+    if [[ ( "$ts" > "$rs" || "$ts" = "$rs" ) && ( "$ts" < "$re" || "$ts" = "$re" ) ]]; then
+      S2_WIN_N=$((S2_WIN_N+1))
+    fi
+  done 5< "$file"
 }
 
 # sc_deadline_set <seconds> — 设置当前场景的绝对截止（SCEN_END）。
@@ -338,9 +388,11 @@ cleanup() {
   # 退出码；任何 echo/命令都会把它清零。最终码 = 主流程非零或清理失败任一。
   echo ""; echo "══ cleanup ══"
   SCEN_END=0   # 清理阶段的 down 不受场景预算约束（sc_remaining 视为无限）
-  # F1：本目录是 FI 自己生成的凭据文件（上一轮残留也算在 FI 名下），
-  # 无条件删除；其余 aws/ 诊断文件保留。
-  rm -f "${AWS_SHARED_CREDENTIALS_FILE:-}" 2>/dev/null || true
+  # H1：本次运行的私有 AWS 目录（config/credentials/aws-s3 封装）整目录删除；
+  # 历史固定路径 bin/tmp/fi/aws 已在启动时清理且不再写入。
+  if [ -n "${AWS_DIR:-}" ]; then
+    rm -rf "${AWS_DIR}"
+  fi
   if [ "${PRECHECK_OK:-0}" != 1 ]; then
     echo "  · 预检未全部通过（拒绝路径）：本次未创建任何基础设施，不执行任何 down/pkill（R3-6）"
     return $rc
@@ -960,6 +1012,8 @@ ts_ns() {
     *)       date +%s ;;
   esac
 }
+
+
 put_bounded() { # <key> <content-file> — 单次 put 带 30s 上限（目标桶与主脚本 put_object 一致；B7: mc cp → aws s3api put-object，CP 身份）
   "$AWSBIN" swcp put-object --bucket data-sensor --key "$1" --body "$2" >/dev/null 2>&1 < /dev/null &
   local pid=$! waited=0
@@ -998,12 +1052,15 @@ WRITER_PID=$!
 sleep_capped 6 || true
 note "重启 seaweed-filer（compose stop_grace_period 保障优雅停机）"
 T_RESTART_START=$(date +%s)
+T_RESTART_START_NS=$(ts_ns)   # H3：纳秒边界（ts_ns 秒级兜底时为 10 位秒，见 s2_span_classify）
 run_to 180 $SWCOMPOSE restart seaweed-filer >>"$OUT/compose-sw.log" 2>&1 || bad "restart 命令失败/超时"
 T_RESTART_END=$(date +%s)
+T_RESTART_END_NS=$(ts_ns)
 echo "  · filer 重启耗时 $(( T_RESTART_END - T_RESTART_START ))s"
 # F7：重启后先等 S3 网关真正应答，再做任何删除/断言
 wait_s3_ready "场景2 filer 重启后"
-T_S2_READY=$(date +%s)   # G1：网关确认恢复服务的时刻（横跨判据的后沿，比 T_RESTART_END 更严）
+T_S2_READY=$(date +%s)
+T_S2_READY_NS=$(ts_ns)   # G1：网关确认恢复服务的时刻（横跨判据的后沿，比 T_RESTART_END 更严）
 # R3-5：writer join 有界（场景剩余预算）；超时杀整组并计失败
 while kill -0 "$WRITER_PID" 2>/dev/null; do
   if [ "$(sc_remaining)" -le 0 ]; then
@@ -1019,40 +1076,29 @@ wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""
 # 成功——所以「窗口内成功数」是偶然值（返工 1 实测 p006 恰好落在重启开始的
 # 第一秒才碰巧通过，换一次运行很可能为 0，会把测到了东西的场景误判无效）。
 # 新判据（两条任一不满足 → bad + SC2_VALID=FAIL，fail-closed，期望计数不变）：
-#   (a) 存在成功写入的时刻 ≤ T_RESTART_START（重启前 writer 确实在写）。
-#       边界说明：T_RESTART_START 是 date +%s 的秒级截断，与其同秒的写入无法
-#       区分先后，按「重启前」计——返工 1 实测 p006 即此情形（1793414435 秒）；
+#   (a) 存在成功写入的时刻 < 重启开始时刻（重启前 writer 确实在写）；
 #   (b) 存在成功写入的时刻 > T_S2_READY（wait_s3_ready 成功返回、网关确认
 #       恢复服务之后 writer 仍在写；比 T_RESTART_END 更严）。
-# 重启前最后一次成功写入 → 恢复后第一次成功写入的间隔，本身就是「写入在
-# 重试中跨过停机」的证据（返工 1 实测 p006→p007 ≈ 29s ≈ 停机时长）。重启
-# 窗口内的成功写入数仅作观测打印、不参与判定。writes2.jsonl 只记成功写入，
+# H3（评审 r2）：边界与写入时间戳都用 ts_ns 的纳秒、**严格比较**——秒级截断
+# 会把「恢复后同一秒的成功写入」漏掉（假阴性）、把「重启开始后同一秒的写入」
+# 算成重启前（假阳性）；ts_ns 秒级兜底时明确降级（同秒写入无法排序、不计入
+# 任何一侧，见 s2_span_classify 与下方日志）。重启前最后一次成功写入 → 恢复
+# 后第一次成功写入的间隔，本身就是「写入在重试中跨过停机」的证据。重启窗口
+# 内的成功写入数仅作观测打印、不参与判定。writes2.jsonl 只记成功写入，
 # 天然排除失败尝试。
-S2_SPAN_INFO=$(awk -v rs="$T_RESTART_START" -v re="$T_RESTART_END" -v rd="$T_S2_READY" '
-  { ts=$2; if (length(ts)>10) ts=substr(ts,1,10); ts=ts+0
-    if (ts<=rs)           { if (pre_max=="" || ts>pre_max) { pre_max=ts; pre_key=$1 } }
-    if (ts>rd)            { if (post_min=="" || ts<post_min) { post_min=ts; post_key=$1 } }
-    if (ts>=rs && ts<=re) { win++ } }
-  END { print (pre_max==""?"-":pre_key) "|" (pre_max==""?0:pre_max) "|" (post_min==""?"-":post_key) "|" (post_min==""?0:post_min) "|" win+0 }
-' "$OUT/writes2.jsonl")
-S2_PRE_KEY=${S2_SPAN_INFO%%|*}; S2_SPAN_REST=${S2_SPAN_INFO#*|}
-S2_PRE_TS=${S2_SPAN_REST%%|*}; S2_SPAN_REST=${S2_SPAN_REST#*|}
-S2_POST_KEY=${S2_SPAN_REST%%|*}; S2_SPAN_REST=${S2_SPAN_REST#*|}
-S2_POST_TS=${S2_SPAN_REST%%|*}; S2_SPAN_REST=${S2_SPAN_REST#*|}
-S2_WIN_N=${S2_SPAN_REST%%|*}
-ts_hms() { [ "$1" -gt 0 ] 2>/dev/null && date -r "$1" '+%H:%M:%S' 2>/dev/null || echo '-'; }
-if [ "${S2_PRE_TS:-0}" -gt 0 ] && [ "${S2_POST_TS:-0}" -gt 0 ]; then
-  S2_SPAN_GAP=$(( S2_POST_TS - S2_PRE_TS ))
+s2_span_classify "$OUT/writes2.jsonl" "$T_RESTART_START_NS" "$T_RESTART_END_NS" "$T_S2_READY_NS"
+if [ -n "$S2_PRE_TS" ] && [ -n "$S2_POST_TS" ]; then
+  S2_SPAN_GAP=$(( ${S2_POST_TS:0:10} - ${S2_PRE_TS:0:10} ))
 else
   S2_SPAN_GAP='-'
 fi
-note "G1 横跨判据：writer 于重启前 $(( T_RESTART_START - T_WRITER_START ))s 启动；重启前最后一次成功写入 ${S2_PRE_KEY} @$(ts_hms "$S2_PRE_TS")、网关恢复（T_S2_READY=$(ts_hms "$T_S2_READY")，restart 窗口 [$T_RESTART_START → $T_RESTART_END]）后第一次成功写入 ${S2_POST_KEY} @$(ts_hms "$S2_POST_TS")，两者间隔 ${S2_SPAN_GAP}s；重启窗口内成功写入 ${S2_WIN_N} 个（仅观测，不参与判定）"
+note "G1 横跨判据（$( [ "$S2_TS_DEGRADED" = 1 ] && echo '秒级兜底降级：同秒写入无法排序、不计入任何一侧' || echo '纳秒精度、严格比较')）：writer 于重启前 $(( ${T_RESTART_START:0:10} - ${T_WRITER_START:0:10} ))s 启动；重启前最后一次成功写入 ${S2_PRE_KEY} @$(ts_hms "$S2_PRE_TS")、网关恢复（T_S2_READY=$(ts_hms "$T_S2_READY_NS")，restart 窗口 [$T_RESTART_START → $T_RESTART_END]）后第一次成功写入 ${S2_POST_KEY} @$(ts_hms "$S2_POST_TS")，两者间隔 ${S2_SPAN_GAP}s；重启窗口内成功写入 ${S2_WIN_N} 个（仅观测，不参与判定）"
 SC2_VALID=OK
-if [ "${S2_PRE_TS:-0}" -le 0 ]; then
+if [ -z "$S2_PRE_TS" ]; then
   bad "场景2 有效性守卫（G1a）：重启之前没有任何成功写入——writer 在重启前就写完了（或写入全失败），「持续写入期间重启」未发生，本次场景无效（fail-closed）"
   SC2_VALID=FAIL
 fi
-if [ "${S2_POST_TS:-0}" -le 0 ]; then
+if [ -z "$S2_POST_TS" ]; then
   bad "场景2 有效性守卫（G1b）：网关恢复（T_S2_READY）之后没有任何成功写入——写入没有横跨重启，本次场景无效（fail-closed）"
   SC2_VALID=FAIL
 fi

@@ -478,13 +478,12 @@ if [ "$FA_STORAGE" = "seaweedfs" ]; then
   # 探针要删对象，借 admin 的全权限，与被测的 CP 链路无关）。B7：mc → aws；
   # 私有 AWS 配置落在 ${WORK}（mktemp 目录，cleanup 随 WORK 一并删除），
   # 绝不触碰开发者的 ~/.aws。
-  SW_AWS_DIR="$WORK/aws"
-  # F1（评审 r1）：目录 0700、凭据文件 0600，先建权限再写内容（FA_WORK_DIR
-  # 可由调用者指定且可能被复用——旧凭据文件可能是 0644，cat > 只截断不改
-  # 模式，先 rm 再以 umask 077 子壳新建，落盘即 0600）。
-  mkdir -p "$SW_AWS_DIR"
-  chmod 700 "$SW_AWS_DIR"
-  rm -f "$SW_AWS_DIR/config" "$SW_AWS_DIR/credentials"
+  SW_AWS_DIR="$(mktemp -d "$WORK/aws.XXXXXX")" \
+    || fail "创建私有 AWS 凭据目录失败（mktemp -d $WORK/aws.XXXXXX）"
+  # H1（评审 r2）：凭据目录每次 mktemp -d 新建——不是既有路径、不可能被换成
+  # 指向 ~/.aws 的符号链接（旧实现 mkdir -p "$WORK/aws" 会跟随链接，chmod/rm/
+  # 重定向全部命中真实配置）。mktemp 目录本身即 0700；KEEP=1 时 WORK 整体
+  # 保留，aws.XXXXXX 诊断目录随之保留（约定不变）。
   ( umask 077; cat > "$SW_AWS_DIR/config" <<'SWAWSCFG'
 [profile swadmin]
 region = us-east-1
