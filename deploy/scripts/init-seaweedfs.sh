@@ -199,12 +199,19 @@ cleanup() {
     awsx swadmin delete-bucket --bucket "${CHECK_BUCKET}" >/dev/null 2>&1 \
       || echo "WARNING: failed to remove probe bucket '${CHECK_BUCKET}' — remove it manually." >&2
   fi
-  # `if` 形式（而非 `|| { [ ] && echo; }`）：flag=0 时后者整体返回 1，set -e
-  # 会在 trap 里中途中断 cleanup（LC_DIR/OWN_AWS_DIR 泄漏 + rc 漂移）。
-  [ -n "${LC_DIR}" ] && rm -rf "${LC_DIR}"
-  [ -n "${OWN_AWS_DIR}" ] && rm -rf "${OWN_AWS_DIR}"
-  # trap 的返回值会成为脚本的退出码（bash 在 set -e 下的行为）：
-  # `[ -n "" ] && ...` 求值为假曾把成功跑完的脚本变成 rc=1。
+  # K1（评审 r4）：每一项删除都写成独立 `if … && ! rm …; then WARNING; fi`，
+  # 任何一步失败（set -e 不会在 if 条件里中止）后**仍然会执行到删 AWS 目录**——
+  # 旧写法 `[ -n … ] && rm -rf …` 在 rm 返回非零时让 set -e 立刻结束 trap，
+  # 含明文 long-term secret 的 OWN_AWS_DIR 会残留在磁盘上。顺序保留：先删探针
+  # 对象和桶（要用凭据）→ 再删 LC_DIR → 最后删 AWS 目录。
+  if [ -n "${LC_DIR:-}" ] && ! rm -rf "${LC_DIR}"; then
+    echo "WARNING: failed to remove the lifecycle temp dir '${LC_DIR}' — remove it manually." >&2
+  fi
+  if [ -n "${OWN_AWS_DIR:-}" ] && ! rm -rf "${OWN_AWS_DIR}"; then
+    echo "WARNING: failed to remove the private AWS config dir '${OWN_AWS_DIR}' — it contains credential files (0600); remove it manually." >&2
+  fi
+  # trap 的返回值由 return 0 固定（bash 在 set -e 下的行为：trap 的返回值会
+  # 成为脚本退出码），不改变脚本原有的退出码语义。
   return 0
 }
 trap cleanup EXIT
