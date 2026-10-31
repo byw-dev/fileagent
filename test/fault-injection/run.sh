@@ -1126,7 +1126,9 @@ wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""
 # writes2.jsonl 只记成功写入，天然排除失败尝试。
 s2_span_classify "$OUT/writes2.jsonl" "$T_RESTART_START_NS" "$T_RESTART_END_NS" "$T_S2_READY_NS"
 if [ -n "$S2_PRE_TS" ] && [ -n "$S2_POST_TS" ]; then
-  S2_SPAN_GAP=$(( ${S2_POST_TS:0:10} - ${S2_PRE_TS:0:10} ))
+  # 10# 强制十进制：秒级兜底时间戳理论上不会以 0 开头，但防御性处理
+  # （带前导零的值按八进制解析会直接报错，K3 证据用例实测）。
+  S2_SPAN_GAP=$(( 10#${S2_POST_TS:0:10} - 10#${S2_PRE_TS:0:10} ))
 else
   S2_SPAN_GAP='-'
 fi
@@ -1135,8 +1137,16 @@ fi
 # 「秒级精度、同秒候选无法排序」，间隔标注「秒级、近似」；全 19 位分支的
 # 严格输出保持不变。G1 判据（前后各至少一个）不受影响。
 if [ "$S2_TS_DEGRADED" = 1 ]; then
-  S2_PRE_DESC="秒级精度：重启前最后一次成功写入在第 $(date -r "${S2_PRE_TS:0:10}" '+%H:%M:%S' 2>/dev/null || echo '?')（同秒候选无法排序，key=${S2_PRE_KEY} 为同秒候选之一）"
-  S2_POST_DESC="网关恢复（T_S2_READY=$(ts_hms "$T_S2_READY_NS")，restart 窗口 [$T_RESTART_START → $T_RESTART_END]）后第一次成功写入在第 $(date -r "${S2_POST_TS:0:10}" '+%H:%M:%S' 2>/dev/null || echo '?')（同秒候选无法排序，key=${S2_POST_KEY} 为同秒候选之一）"
+  if [ -n "$S2_PRE_TS" ]; then
+    S2_PRE_DESC="秒级精度：重启前最后一次成功写入在第 $(date -r "${S2_PRE_TS:0:10}" '+%H:%M:%S' 2>/dev/null || echo '?')（同秒候选无法排序，key=${S2_PRE_KEY} 为同秒候选之一）"
+  else
+    S2_PRE_DESC="重启前没有任何可排序的成功写入（守卫将判 G1a 失败）"
+  fi
+  if [ -n "$S2_POST_TS" ]; then
+    S2_POST_DESC="网关恢复（T_S2_READY=$(ts_hms "$T_S2_READY_NS")，restart 窗口 [$T_RESTART_START → $T_RESTART_END]）后第一次成功写入在第 $(date -r "${S2_POST_TS:0:10}" '+%H:%M:%S' 2>/dev/null || echo '?')（同秒候选无法排序，key=${S2_POST_KEY} 为同秒候选之一）"
+  else
+    S2_POST_DESC="网关恢复（T_S2_READY=$(ts_hms "$T_S2_READY_NS")，restart 窗口 [$T_RESTART_START → $T_RESTART_END]）后没有任何可排序的成功写入（守卫将判 G1b 失败）"
+  fi
   S2_GAP_DESC="${S2_SPAN_GAP}s（秒级、近似）"
 else
   S2_PRE_DESC="重启前最后一次成功写入 ${S2_PRE_KEY} @$(ts_hms "$S2_PRE_TS")"
