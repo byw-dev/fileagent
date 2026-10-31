@@ -31,7 +31,7 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 | 1 | 断流重连 | ① 预写两组**已入账**对象（s1del/、s1ovr/ 各 15 个，等 status=completed）→ ② `kill -9` 代理制造 CP↔filer 断流 → ③ 断流窗口内：写 200 个新对象（fi1/）、删 20 个新建（含新建即删样本）、删 15 个已入账、覆盖 15 个已入账 → ④ 重启代理 → ⑤ 断言 | ① S3 存活集合 == 账本 `completed` 集合 == 预先固定的期望存活集合（180 个）；② 新建即删的对象在账本为 `deleted` 或合法缺席；③ 已入账后删除组全部 `status='deleted'`；④ 已入账后覆盖组行必须**存在**且 `completed` + `source='storage_readback'` + size/etag 匹配新内容（缺行即失败）；⑤ `storage_event_marks` 新增 `gap` 标记 |
 | 2 | filer 优雅重启 | 后台写入器持续写 120 个对象（fi2/）期间 `docker compose restart seaweed-filer`（`stop_grace_period` 保障优雅停机），等 S3 网关就绪后停写入器、再删 10 个 | 与场景 1 同口径的等集合断言：存活 110、计划 120、删除 10、增量写失败 0 |
 | 3 | CP 停机期间写入 | 预写两组已入账对象（s3del/、s3ovr/ 各 15 个）并读持久游标 → 停 CP（TERM→KILL 确认退出）→ 停机期间写 120 个新（fi3/）+ 删 12 个新建 + 删/覆盖各 15 个已入账 → 重启 CP（同一 DB，游标来自 `storage_event_cursors` 持久化行） | 同口径等集合断言 + 已入账后删除/覆盖两组断言（同场景 1 ③④） |
-| 4 | filer 硬杀 | 连写 80 个拉满落盘窗口后 `docker kill -s KILL seaweed-filer`，显式 `docker start` + 等 healthy，再写 20 个 | **只记录、不要求通过**：统计硬杀窗口内「S3 有、账本无」的丢失对象数与 `gap` 窗口，结果写入 `SCENARIO4_LOST=<n> (recorded only)`，不计数进 FAILURES |
+| 4 | filer 硬杀 | 连续写入 80 个（**记录 kill 前 60s 内的成功写入数、最后一次成功写入到 kill 的间隔——不保证填满落盘窗口**，窗口内积压量取决于单次写入耗时）后 `docker kill -s KILL seaweed-filer`，显式 `docker start` + 等 healthy，再写 20 个 | **只记录、不要求通过**：统计硬杀窗口内「S3 有、账本无」的丢失对象数与 `gap` 窗口，结果写入 `SCENARIO4_LOST=<n> (recorded only)`，不计数进 FAILURES |
 
 ## 通过判据
 
