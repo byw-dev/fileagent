@@ -71,8 +71,17 @@ fatal() { echo "  ☠ FATAL: $*"; exit 1; }
 # 的时间上限照旧兜底）；只有就绪探测（wait_s3_ready）逐次加 AWS_MAX_ATTEMPTS=1
 # 追求秒退——网关未就绪时默认重试会把每次探测拖长数秒。
 AWS_S3="http://localhost:${FA_SEAWEEDFS_S3_PORT}"
+# F2（评审 r1）白名单：调用者环境里的 AWS_* 一律不得漏入——凭据/region 的
+# 优先级高于 profile 文件，AWS_MAX_ATTEMPTS/AWS_RETRY_MODE 会覆盖 config 里
+# 的重试配置（实测 AWS_MAX_ATTEMPTS=1 会把数据操作的 max_attempts=8 打回
+# 1 次、场景 2 的问题复发），AWS_CA_BUNDLE/AWS_ENDPOINT_URL* 同理。先全部
+# unset，再显式 export 本脚本需要的；封装脚本（aws-s3）内部再做同样清理，
+# 保证 run_to / writer 子进程路径同样生效。就绪探测的 AWS_MAX_ATTEMPTS=1
+# 经 FI_AWS_MAX_ATTEMPTS 在封装内、清理之后设置。
+for _aws_v in $(compgen -e); do
+  case "$_aws_v" in AWS_*|AWS) unset "$_aws_v" ;; esac
+done
 export AWS_CONFIG_FILE="$REPO/$OUT/aws/config" AWS_SHARED_CREDENTIALS_FILE="$REPO/$OUT/aws/credentials"
-unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_DEFAULT_REGION
 export AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true
 # F1（评审 r1）：凭据目录 0700、凭据文件 0600，且**先建好权限再写内容**（不能先写
 # 后 chmod——那中间有可读空窗）。mkdir -p + chmod 同时把上一轮残留的旧权限
@@ -112,11 +121,19 @@ AWSCRED
 # aws-s3 — aws S3 薄封装（身份用第 1 个参数选 profile）。写成文件是因为
 # run_to 经 in_new_group 的 exec 启动子进程，shell 函数无法穿过去（mc 时代
 # 等价物是裸 mc + alias；aws 时代身份经 AWS_PROFILE 选择）。
+# F2：封装自带白名单——先清掉继承环境里的全部 AWS_*，再显式设置本封装需要的
+# （config/credentials 路径在生成时烘焙进来，endpoint 同）。
 AWSBIN="$REPO/$OUT/aws-s3"
 cat > "$AWSBIN" <<AWSBIN
 #!/usr/bin/env bash
 # B7 生成物（bin/tmp/fi/ 下，不入库）：FI 的 aws S3 API 封装（恒走 s3api；
 # 身份用第 1 个参数选 profile；endpoint 显式给出）。
+# F2 白名单：调用者环境的全部 AWS_* 一律不得漏入。
+for _v in \$(compgen -e); do case "\$_v" in AWS_*|AWS) unset "\$_v" ;; esac; done
+export AWS_CONFIG_FILE='${AWS_CONFIG_FILE}' AWS_SHARED_CREDENTIALS_FILE='${AWS_SHARED_CREDENTIALS_FILE}'
+export AWS_PAGER='' AWS_EC2_METADATA_DISABLED=true
+# 就绪探测经 FI_AWS_MAX_ATTEMPTS 传入，在清理**之后**映射成 AWS_MAX_ATTEMPTS。
+case "\${FI_AWS_MAX_ATTEMPTS:-}" in ''|*[!0-9]*) ;; *) AWS_MAX_ATTEMPTS="\${FI_AWS_MAX_ATTEMPTS}"; export AWS_MAX_ATTEMPTS ;; esac
 exec env AWS_PROFILE="\$1" aws --endpoint-url "${AWS_S3}" --no-cli-pager s3api "\${@:2}"
 AWSBIN
 chmod +x "$AWSBIN"
@@ -544,9 +561,10 @@ wait_s3_ready() {
     elapsed=$(( $(date +%s) - start ))
     [ "$elapsed" -ge "$budget" ] && break
     probe_rc=0
-    # 就绪探测专用 AWS_MAX_ATTEMPTS=1：网关未就绪时秒退（0.3s），不被 CLI
-    # 默认重试拖长（数据操作保持 standard 重试，见文件头「重试取舍」）。
-    run_to $(( budget - elapsed )) env AWS_MAX_ATTEMPTS=1 "$AWSBIN" swadmin \
+    # 就绪探测专用 1 次尝试：网关未就绪时秒退（0.3s），不被 CLI 默认重试拖长。
+    # 经 FI_AWS_MAX_ATTEMPTS 传入——封装脚本先清环境再映射成 AWS_MAX_ATTEMPTS
+    # （F2：调用者的 AWS_MAX_ATTEMPTS 不得漏入，探测的 1 只由本脚本自己设）。
+    run_to $(( budget - elapsed )) env FI_AWS_MAX_ATTEMPTS=1 "$AWSBIN" swadmin \
       list-objects-v2 --bucket data-sensor --max-items 1 >/dev/null 2>&1 || probe_rc=$?
     if [ "$probe_rc" = "0" ]; then
       ok "S3 网关就绪（${label}，第 $((i+1)) 次探测，实际耗时 $(($(date +%s)-start))s）"

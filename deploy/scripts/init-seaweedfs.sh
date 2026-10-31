@@ -121,6 +121,10 @@ chmod 700 "${OWN_AWS_DIR}"
 export AWS_CONFIG_FILE="${OWN_AWS_DIR}/config" AWS_SHARED_CREDENTIALS_FILE="${OWN_AWS_DIR}/credentials"
 unset AWS_PROFILE AWS_DEFAULT_PROFILE AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_DEFAULT_REGION
 export AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true
+# retry 显式写死（F6）：standard + max_attempts=3。理由：init 只对健康网关做
+# 幂等初始化，不存在 filer 重启式的长停机窗口；瞬时失败应当响亮退出、幂等
+# 重跑即恢复，不需要更长的重试尾巴。显式写值而不依赖 CLI 默认——环境变量
+# 已被 awsx 的白名单清除，这里的值就是权威。
 ( umask 077; cat >"${AWS_CONFIG_FILE}" <<'AWSCFG'
 [profile swadmin]
 region = us-east-1
@@ -147,14 +151,28 @@ AWSCRED
 )
 
 # awsx <profile> <args...> — aws with the explicit endpoint and no pager.
+# F2（评审 r1）白名单：每次调用前先清掉继承环境里的**全部** AWS_*，再显式设置
+# 本脚本需要的（凭据/region/retry 只来自 OUR config 文件；调用者的
+# AWS_ACCESS_KEY_ID/AWS_SESSION_TOKEN/AWS_REGION/AWS_MAX_ATTEMPTS/
+# AWS_RETRY_MODE/AWS_CA_BUNDLE/AWS_ENDPOINT_URL* 等一律不得漏入）。
 # The service segment (s3api) is injected here so call sites read like the
 # old mc commands; `s3` (high-level, e.g. `s3 presign`) is passed through.
 awsx() {
-  local profile=$1; shift
+  local profile=$1 _v
+  shift
+  for _v in $(compgen -e); do
+    case "$_v" in AWS_*|AWS) unset "$_v" ;; esac
+  done
   if [ "${1:-}" = "s3" ]; then
-    AWS_PROFILE="${profile}" aws --endpoint-url "${SW_S3_ENDPOINT}" --no-cli-pager "$@"
+    AWS_PROFILE="${profile}" AWS_CONFIG_FILE="${OWN_AWS_DIR}/config" \
+    AWS_SHARED_CREDENTIALS_FILE="${OWN_AWS_DIR}/credentials" \
+    AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true \
+      aws --endpoint-url "${SW_S3_ENDPOINT}" --no-cli-pager "$@"
   else
-    AWS_PROFILE="${profile}" aws --endpoint-url "${SW_S3_ENDPOINT}" --no-cli-pager s3api "$@"
+    AWS_PROFILE="${profile}" AWS_CONFIG_FILE="${OWN_AWS_DIR}/config" \
+    AWS_SHARED_CREDENTIALS_FILE="${OWN_AWS_DIR}/credentials" \
+    AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true \
+      aws --endpoint-url "${SW_S3_ENDPOINT}" --no-cli-pager s3api "$@"
   fi
 }
 

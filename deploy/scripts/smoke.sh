@@ -488,6 +488,12 @@ if [ "$FA_STORAGE" = "seaweedfs" ]; then
 region = us-east-1
 s3 =
   addressing_style = path
+# retry 显式写死（F6）：standard + max_attempts=3。理由：探针只有 put/delete
+# 两次短调用，且发生在 init 全部自检通过之后（网关已健康、无重启窗口）；
+# 失败应快速红在冒烟里。显式写值而不依赖 CLI 默认——swaws 的白名单已清掉
+# 调用者环境里的 AWS_RETRY_MODE/AWS_MAX_ATTEMPTS，这里的值就是权威。
+retry_mode = standard
+max_attempts = 3
 SWAWSCFG
   )
   ( umask 077; cat > "$SW_AWS_DIR/credentials" <<SWAWSCRED
@@ -497,6 +503,13 @@ aws_secret_access_key = $SW_ADMIN_SECRET_KEY
 SWAWSCRED
   )
   swaws() { # <aws s3api args...> — admin 身份 + 显式 endpoint 的私有 aws 调用（恒走 s3api）
+    # F2（评审 r1）白名单：清掉调用者环境里的**全部** AWS_*（凭据/region 的
+    # 优先级高于 profile 文件；AWS_MAX_ATTEMPTS/AWS_RETRY_MODE/AWS_CA_BUNDLE/
+    # AWS_ENDPOINT_URL* 等同样不得漏入），再显式设置本探针需要的。
+    local _v
+    for _v in $(compgen -e); do
+      case "$_v" in AWS_*|AWS) unset "$_v" ;; esac
+    done
     AWS_PROFILE=swadmin \
     AWS_CONFIG_FILE="$SW_AWS_DIR/config" \
     AWS_SHARED_CREDENTIALS_FILE="$SW_AWS_DIR/credentials" \
