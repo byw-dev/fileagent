@@ -521,8 +521,11 @@ SWAWSCRED
   swaws put-object --bucket data-sensor --key probe/readback-probe.txt --body "$WORK/probe.txt" >/dev/null \
     || fail "aws put-object 失败（无法投放回读探针对象）"
   wait_for "filer 事件经回读进索引（source=storage_readback）" 90 readback_is_indexed
-  swaws delete-object --bucket data-sensor --key probe/readback-probe.txt >/dev/null \
-    || fail "aws delete-object 失败（无法删除回读探针对象）"
+  # J1（评审 r3）：探针删除用 `--if-match '*'` 条件删除——对象不存在即失败
+  # （SeaweedFS 实测返回 PreconditionFailed），与「删除前确认对象存在」同义且
+  # 原子；旧实现只看 delete rc，对象已被删掉/丢失时会假成功。
+  swaws delete-object --bucket data-sensor --key probe/readback-probe.txt --if-match '*' >/dev/null \
+    || fail "aws delete-object（--if-match 条件删除）失败（探针对象不存在或删除请求出错）"
   wait_for "回读删除进索引（status=deleted）" 90 readback_is_deleted
 else
   step "webhook 投递（绕过 agent 的对账兜底路径）"

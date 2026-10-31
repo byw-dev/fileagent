@@ -114,7 +114,15 @@ OWN_AWS_DIR=""
 LC_DIR=""
 CHECK_OBJECT=""
 CHECK_BUCKET=""
-OWN_AWS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fileagent-swinit-aws.XXXXXX")"
+OWN_AWS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fileagent-swinit-aws.XXXXXX")" || {
+  echo "ERROR: failed to create the private AWS config directory (mktemp -d)." >&2
+  exit 1
+}
+# J3（评审 r3）：mktemp 成功后**立刻**装一个能删掉 OWN_AWS_DIR 的 EXIT trap，
+# 再做 chmod 和写入——否则写 credentials 中途失败（磁盘满等）或被可捕获信号
+# 终止时，含明文 secret 的目录会残留。之后主 `trap cleanup EXIT` 接管（cleanup
+# 同样删除该目录），接管是原子的、没有无 trap 保护的空窗。
+trap 'rm -rf "${OWN_AWS_DIR:-}" 2>/dev/null' EXIT
 # F1（评审 r1）防御性加固：mktemp -d 本就 0700，这里显式校正并在写入凭据时
 # 用 umask 077 子壳，保证文件落盘即 0600（先建权限再写内容，无可读空窗）。
 chmod 700 "${OWN_AWS_DIR}"
@@ -179,6 +187,9 @@ awsx() {
 cleanup() {
   # CHECK_OBJECT 形如 "bucket/key"（CP 身份按 iam.json.tpl 刻意没有
   # DeleteObject；探针一律借 admin 身份清理，与 3b/3c 的注释一致）。
+  # J1（评审 r3）：这里是**清理**不是断言，保持宽松（delete 不带 If-Match、
+  # 失败只告警）——探针对象此前刚被本脚本创建并验证过，正常路径必然存在；
+  # 若真已丢失，宽松清理不会掩盖任何断言。
   if [ -n "${CHECK_OBJECT:-}" ]; then
     awsx swadmin delete-object \
       --bucket "${CHECK_OBJECT%%/*}" --key "${CHECK_OBJECT#*/}" >/dev/null 2>&1 \
@@ -397,6 +408,9 @@ if [ "$(cat "${LC_DIR}/presigned-body.txt")" != "${CHECK_BODY}" ]; then
   exit 1
 fi
 # CP identity has no DeleteObject (write-only by design); cleanup as admin.
+# J1（评审 r3）：保持无条件 delete（不加 If-Match）——同 cleanup 的理由：这是
+# 清理而非断言，对象刚在本函数上文创建并经预签名 GET 200 + 字节比对验证过，
+# 缺失早就会在上面的检查里响亮失败。
 if ! awsx swadmin delete-object --bucket "${CHECK_OBJECT%%/*}" \
      --key "${CHECK_OBJECT#*/}" >/dev/null; then
   echo "ERROR: presigned-GET self-check succeeded, but admin cleanup failed for '${CHECK_OBJECT}'." >&2

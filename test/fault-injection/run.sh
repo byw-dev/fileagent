@@ -69,7 +69,7 @@ fatal() { echo "  ☠ FATAL: $*"; exit 1; }
 # 重试取舍：数据操作 standard 重试 + max_attempts=8（与 mc/minio-go 的内置
 # 瞬时错误容错等价；理由写在生成的 config 注释里）。**最多 8 次**，但每次
 # 调用被 run_to 强制在 30s 截断（8 次退避不保证在 30s 内走完）；外层 FI 级
-# 的 3 次重试不变——单个 key 最坏 ≈ 3×30s + 2×1s sleep ≈ 93s，再由各场景的
+# 的 3 次重试不变——单个 key 最坏 ≈ 3×(30s run_to + 1s sleep) ≈ 93s，再由各场景的
 # 绝对预算硬截止。max_attempts=8 不可被环境覆盖：调用者 AWS_* 已按 F2 白名单
 # 全部清除，FI_AWS_MAX_ATTEMPTS 也在清理之列（H2）——只有 wait_s3_ready 那
 # 一次调用经 env 显式传入 1，追求秒退（网关未就绪时默认重试会把每次探测拖长）。
@@ -95,7 +95,7 @@ elif [ -d "$REPO/$OUT/aws" ]; then
   rm -rf "$REPO/$OUT/aws"
 fi
 rm -f "$REPO/$OUT/aws-s3"
-# H1：凭据目录每次运行 mktemp -d 新建——mktemp 建出的目录不会是既有链接、
+# H1（评审 r2）：凭据目录每次运行 mktemp -d 新建——mktemp 建出的目录不会是既有链接、
 # 权限即 0700，config/credentials/aws-s3 封装都写在里面，cleanup 整目录删除。
 # 本脚本 set -uo pipefail 没有 -e：以下每一步显式 fail-closed。
 AWS_DIR="$(mktemp -d "$REPO/$OUT/aws.XXXXXX")" \
@@ -117,7 +117,7 @@ retry_mode = standard
 # 拒绝由 minio-go 内部重试吸收（FI 级 3 次重试从不触发）；aws standard 默认
 # 3 次尝试（~4s）盖不住 17s，实测 fi2/p007 永久失败。最多 8 次，每次调用被
 # run_to 强制在 30s 截断（不保证 8 次内走完）；外层 FI 级的 3 次重试不变，
-# 单个 key 最坏 ≈ 3×30s + 2×1s sleep ≈ 93s，再由各场景绝对预算硬截止。
+# 单个 key 最坏 ≈ 3×(30s run_to + 1s sleep) ≈ 93s，再由各场景绝对预算硬截止。
 max_attempts = 8
 [profile swadmin]
 region = us-east-1
@@ -189,31 +189,55 @@ ts_hms() { # <ts：19 位纳秒或 10 位秒> — 人类可读时刻（纳秒取
 }
 
 # s2_span_classify <writes-file> <restart-start> <restart-end> <ready> — G1 横跨
-# 判据的时间戳分类（H3，评审 r2）。三个边界与写入时间戳**同宽度**时用 bash
-# `[[ ]]` 定长字符串比较（同宽度下字符串序=数值序；19 位纳秒绝不进 awk 浮点）；
-# 边界为 10 位秒（ts_ns 秒级兜底）时降级：**同秒写入无法排序，不计入任何一侧**
-# （S2_TS_DEGRADED=1，调用方打印降级说明），其余按严格比较分类。
+# 判据的时间戳分类（H3/J2）。边界与写入**全部为 19 位纳秒**时用 bash `[[ ]]`
+# 定长字符串严格比较（同宽度下字符串序=数值序；纳秒绝不进 awk 浮点）；
+# **逐行检查宽度（J2，评审 r3）**：任一行或任一边界不是 19 位时，该行与边界
+# 都截成 10 位秒比较，且与 pre/post 边界**同秒**的写入无法排序——pre/post/
+# 窗口内三处都不计，只计入「未定」计数 S2_UNDECIDED（打印，不参与判定），
+# S2_TS_DEGRADED=1（「纳秒精度」标签只在全 19 位时显示）。
 # 结果（全局）：S2_PRE_KEY/S2_PRE_TS（重启前最后一次成功写入，取最大）、
 # S2_POST_KEY/S2_POST_TS（恢复后第一次成功写入，取最小）、S2_WIN_N（restart
-# 起止之间——观测值，不参与判定）、S2_TS_DEGRADED（1=秒级兜底降级）。
+# 起止之间——观测值，不参与判定）、S2_TS_DEGRADED（1=发生降级）、S2_UNDECIDED。
 s2_span_classify() {
   local file=$1 rs=$2 re=$3 rd=$4 k ts
   S2_PRE_KEY='-'; S2_PRE_TS=''; S2_POST_KEY='-'; S2_POST_TS=''; S2_WIN_N=0
-  S2_TS_DEGRADED=0
+  S2_UNDECIDED=0; S2_TS_DEGRADED=0
+  local ns_mode=1
   if [ "${#rs}" -ne 19 ] || [ "${#re}" -ne 19 ] || [ "${#rd}" -ne 19 ]; then
-    S2_TS_DEGRADED=1
+    ns_mode=0; S2_TS_DEGRADED=1
   fi
   while read -r k ts <&5; do
     [ -z "${k:-}" ] && continue
     case "${ts:-}" in ''|*[!0-9]*) continue ;; esac
-    if [[ "$ts" < "$rs" ]]; then
-      if [ -z "$S2_PRE_TS" ] || [[ "$ts" > "$S2_PRE_TS" ]]; then S2_PRE_TS=$ts; S2_PRE_KEY=$k; fi
-    fi
-    if [[ "$ts" > "$rd" ]]; then
-      if [ -z "$S2_POST_TS" ] || [[ "$ts" < "$S2_POST_TS" ]]; then S2_POST_TS=$ts; S2_POST_KEY=$k; fi
-    fi
-    if [[ ( "$ts" > "$rs" || "$ts" = "$rs" ) && ( "$ts" < "$re" || "$ts" = "$re" ) ]]; then
-      S2_WIN_N=$((S2_WIN_N+1))
+    if [ "$ns_mode" = 1 ] && [ "${#ts}" -eq 19 ]; then
+      # 全 19 位：严格纳秒比较
+      if [[ "$ts" < "$rs" ]]; then
+        if [ -z "$S2_PRE_TS" ] || [[ "$ts" > "$S2_PRE_TS" ]]; then S2_PRE_TS=$ts; S2_PRE_KEY=$k; fi
+      fi
+      if [[ "$ts" > "$rd" ]]; then
+        if [ -z "$S2_POST_TS" ] || [[ "$ts" < "$S2_POST_TS" ]]; then S2_POST_TS=$ts; S2_POST_KEY=$k; fi
+      fi
+      if [[ ( "$ts" > "$rs" || "$ts" = "$rs" ) && ( "$ts" < "$re" || "$ts" = "$re" ) ]]; then
+        S2_WIN_N=$((S2_WIN_N+1))
+      fi
+    else
+      # 混合宽度 / 秒级兜底：整行与边界截成 10 位秒；同秒（=rs 或 =rd）不计入
+      # 任何一侧，只计「未定」（J2：字典序在宽度混用时不是时间序，不能伪精确）。
+      S2_TS_DEGRADED=1
+      local ts10=${ts:0:10} rs10=${rs:0:10} re10=${re:0:10} rd10=${rd:0:10}
+      if [ "$ts10" = "$rs10" ] || [ "$ts10" = "$rd10" ]; then
+        S2_UNDECIDED=$((S2_UNDECIDED+1))
+      else
+        if [ "$ts10" -lt "$rs10" ]; then
+          if [ -z "$S2_PRE_TS" ] || [ "$ts10" -gt "${S2_PRE_TS:0:10}" ]; then S2_PRE_TS=$ts10; S2_PRE_KEY=$k; fi
+        fi
+        if [ "$ts10" -gt "$rd10" ]; then
+          if [ -z "$S2_POST_TS" ] || [ "$ts10" -lt "${S2_POST_TS:0:10}" ]; then S2_POST_TS=$ts10; S2_POST_KEY=$k; fi
+        fi
+        if [ "$ts10" -gt "$rs10" ] && [ "$ts10" -lt "$re10" ]; then
+          S2_WIN_N=$((S2_WIN_N+1))
+        fi
+      fi
     fi
   done 5< "$file"
 }
@@ -489,7 +513,8 @@ run_to 120 bash deploy/scripts/render-seaweedfs-configs.sh >"$OUT/render.log" 2>
 run_to 600 $SWCOMPOSE up -d --wait >>"$OUT/compose-sw.log" 2>&1 || fatal "seaweedfs compose up"
 ok "基础设施 healthy"
 
-# B7：mc alias ×2 → 私有 AWS profile（凭据在 $OUT/aws/credentials，见文件头）；
+# B7：mc alias ×2 → 私有 AWS profile（config/credentials/aws-s3 封装都在本次
+# 运行 mktemp 的 $OUT/aws.XXXXXX/ 下，见文件头与 H1 注释；J4 路径已同步）；
 # mc mb --ignore-existing → head-bucket 探测 + 缺失时 create-bucket（aws 无
 # --ignore-existing；「已存在算成功」语义由此保持：head 命中即跳过，重复
 # create 会以 BucketAlreadyOwnedByYou 报错——PoC 实测，故必须先探）。
@@ -589,17 +614,29 @@ put_object() {
 }
 
 delete_object() { # <key> — 重试 3 次；stderr 记日志；仍失败则致命
-  # B7：mc rm → s3api delete-object。语义差异（实测）：mc rm 对不存在的对象
-  # 报错（rc=1），delete-object 按 S3 语义幂等（rc=0）。本脚本只删「已确认
-  # 写入成功」的 key，重试判据基于退出码——aws 语义更宽松，不会引入假失败。
-  local try
+  # J1（评审 r3）：恢复 mc rm 的旧语义——**对象不存在时删除算失败**。B7 早期曾
+  # 把「delete-object 对缺失对象幂等返回 204」当成更宽松、无害，这个判断是错的：
+  # 「写入成功之后、删除之前」正处故障窗口，对象可能已经丢失；旧版删除失败会把
+  # 丢失暴露出来，新版删除成功 + 账本断言接受「deleted 或缺席」会把丢失掩盖成
+  # 通过。实现用 `--if-match '*'` 条件删除（原子，无 HEAD/DELETE 竞态）——
+  # SeaweedFS 4.48 实测：存在 → 204/rc=0；不存在 → PreconditionFailed/rc=254。
+  # 错误分类：PreconditionFailed/412/NoSuchKey = 对象不存在（删除目标已丢失）；
+  # 其余 = 删除请求本身出错（连接失败等）。两类都计失败、进入原有的 3 次重试，
+  # 3 次都失败照旧 fatal。
+  local try out
   for try in 1 2 3; do
-    if run_to 30 "$AWSBIN" swadmin delete-object --bucket data-sensor --key "$1" >>"$RM_ERRORS" 2>&1; then
+    if out=$(run_to 30 "$AWSBIN" swadmin delete-object --bucket data-sensor --key "$1" --if-match '*' 2>&1); then
       return 0
     fi
+    case "$out" in
+      *PreconditionFailed*|*412*|*NoSuchKey*)
+        echo "$(date '+%H:%M:%S') try=$try 对象不存在（删除目标已丢失——旧 mc rm 语义同样会失败）: $1" >> "$RM_ERRORS" ;;
+      *)
+        echo "$(date '+%H:%M:%S') try=$try 删除请求本身出错（连接失败等）: $1 :: ${out:0:200}" >> "$RM_ERRORS" ;;
+    esac
     sleep 1
   done
-  echo "FATAL: aws delete-object failed after 3 retries: $1 (see $RM_ERRORS tail below)" >&2
+  echo "FATAL: aws delete-object（--if-match '*' 条件删除）failed after 3 retries: $1 (see $RM_ERRORS tail below)" >&2
   tail -3 "$RM_ERRORS" >&2
   exit 1
 }
@@ -1078,20 +1115,20 @@ wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""
 #   (a) 存在成功写入的时刻 < 重启开始时刻（重启前 writer 确实在写）；
 #   (b) 存在成功写入的时刻 > T_S2_READY（wait_s3_ready 成功返回、网关确认
 #       恢复服务之后 writer 仍在写；比 T_RESTART_END 更严）。
-# H3（评审 r2）：边界与写入时间戳都用 ts_ns 的纳秒、**严格比较**——秒级截断
-# 会把「恢复后同一秒的成功写入」漏掉（假阴性）、把「重启开始后同一秒的写入」
-# 算成重启前（假阳性）；ts_ns 秒级兜底时明确降级（同秒写入无法排序、不计入
-# 任何一侧，见 s2_span_classify 与下方日志）。重启前最后一次成功写入 → 恢复
-# 后第一次成功写入的间隔，本身就是「写入在重试中跨过停机」的证据。重启窗口
-# 内的成功写入数仅作观测打印、不参与判定。writes2.jsonl 只记成功写入，
-# 天然排除失败尝试。
+# H3/J2（评审 r2/r3）：边界与写入时间戳都用 ts_ns 记录，全部 19 位时严格纳秒
+# 比较——秒级截断会把「恢复后同一秒的成功写入」漏掉（假阴性）、把「重启开始
+# 后同一秒的写入」算成重启前（假阳性）；**逐行检查宽度**（J2），任一行或边界
+# 非 19 位时降级为 10 位秒比较、同秒写入不计入任何一侧只计「未定」。重启前最
+# 后一次成功写入 → 恢复后第一次成功写入的间隔，本身就是「写入在重试中跨过
+# 停机」的证据。重启窗口内的成功写入数仅作观测打印、不参与判定。
+# writes2.jsonl 只记成功写入，天然排除失败尝试。
 s2_span_classify "$OUT/writes2.jsonl" "$T_RESTART_START_NS" "$T_RESTART_END_NS" "$T_S2_READY_NS"
 if [ -n "$S2_PRE_TS" ] && [ -n "$S2_POST_TS" ]; then
   S2_SPAN_GAP=$(( ${S2_POST_TS:0:10} - ${S2_PRE_TS:0:10} ))
 else
   S2_SPAN_GAP='-'
 fi
-note "G1 横跨判据（$( [ "$S2_TS_DEGRADED" = 1 ] && echo '秒级兜底降级：同秒写入无法排序、不计入任何一侧' || echo '纳秒精度、严格比较')）：writer 于重启前 $(( ${T_RESTART_START:0:10} - ${T_WRITER_START:0:10} ))s 启动；重启前最后一次成功写入 ${S2_PRE_KEY} @$(ts_hms "$S2_PRE_TS")、网关恢复（T_S2_READY=$(ts_hms "$T_S2_READY_NS")，restart 窗口 [$T_RESTART_START → $T_RESTART_END]）后第一次成功写入 ${S2_POST_KEY} @$(ts_hms "$S2_POST_TS")，两者间隔 ${S2_SPAN_GAP}s；重启窗口内成功写入 ${S2_WIN_N} 个（仅观测，不参与判定）"
+note "G1 横跨判据（$( [ "$S2_TS_DEGRADED" = 1 ] && echo '降级：存在非 19 位时间戳，按 10 位秒比较、同秒不计入任何一侧' || echo '纳秒精度、严格比较')）：writer 于重启前 $(( ${T_RESTART_START:0:10} - ${T_WRITER_START:0:10} ))s 启动；重启前最后一次成功写入 ${S2_PRE_KEY} @$(ts_hms "$S2_PRE_TS")、网关恢复（T_S2_READY=$(ts_hms "$T_S2_READY_NS")，restart 窗口 [$T_RESTART_START → $T_RESTART_END]）后第一次成功写入 ${S2_POST_KEY} @$(ts_hms "$S2_POST_TS")，两者间隔 ${S2_SPAN_GAP}s；重启窗口内成功写入 ${S2_WIN_N} 个（仅观测，不参与判定）、同秒无法判定 ${S2_UNDECIDED} 个（J2：不计入任何一侧）"
 SC2_VALID=OK
 if [ -z "$S2_PRE_TS" ]; then
   bad "场景2 有效性守卫（G1a）：重启之前没有任何成功写入——writer 在重启前就写完了（或写入全失败），「持续写入期间重启」未发生，本次场景无效（fail-closed）"

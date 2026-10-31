@@ -45,10 +45,13 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 
 - **docker**（compose v2，容器需可拉取 postgres/redis/nats/seaweedfs 镜像）
 - **AWS CLI v2**（S3 写入/删除/列举；B7 起 mc → aws cli v2，实测基线 2.39.2）。
-  脚本自建私有 AWS 配置（config/credentials 落在 `bin/tmp/fi/aws/`，目录 0700、
-  凭据文件 0600 且退出时删除，`--endpoint-url` 显式给出、path-style、region
-  `us-east-1`），**不触碰开发者的 `~/.aws`**；调用者环境里的 AWS_* 变量按
-  白名单全部清除（凭据/region/retry 等只来自脚本自己的配置文件）。缺 `aws`
+  脚本自建私有 AWS 配置（config/credentials/aws-s3 封装落在每次运行
+  `mktemp -d` 新建的 `bin/tmp/fi/aws.XXXXXX/` 里——不是固定路径、不可能被
+  换成指向 `~/.aws` 的符号链接；目录 0700、凭据文件 0600，退出时**整个目录**
+  删除；历史固定路径 `bin/tmp/fi/aws/` 只清理、不再写入），`--endpoint-url`
+  显式给出、path-style、region `us-east-1`，**不触碰开发者的 `~/.aws`**；
+  调用者环境里的 AWS_*（及 FI_AWS_MAX_ATTEMPTS）变量按白名单全部清除
+  （凭据/region/retry 等只来自脚本自己的配置文件）。缺 `aws`
   或装的是 v1 时预检 fail-closed 并给出安装提示。数据操作 standard 重试 +
   `max_attempts=8`（与 mc/minio-go 的内置瞬时容错等价；每次调用仍被 run_to
   的 30s 截断，外层 FI 级 3 次重试不变），仅就绪探测用 1 次尝试秒退。
