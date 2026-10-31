@@ -909,7 +909,7 @@ DEL2="$OUT/del2.txt"
 head -10 "$PLAN_S2" | awk -F'|' '{print $1}' > "$DEL2"
 comm -23 <(cut -d'|' -f1 "$PLAN_S2" | sort -u) <(sort -u "$DEL2") > "$OUT/s2-live-keys.txt"
 : > "$OUT/writes2.jsonl"
-# R3-5：写入器放独立进程组（生成的脚本自带 mc 上限 + 重试），join 有界——
+# R3-5：写入器放独立进程组（生成的脚本自带单次 put 上限 + 重试），join 有界——
 # 超出场景预算则杀整组并计失败，绝不无限等待。
 cat > "$OUT/writer-s2.sh" <<'WEOF'
 #!/usr/bin/env bash
