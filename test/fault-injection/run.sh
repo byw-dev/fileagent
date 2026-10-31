@@ -103,7 +103,7 @@ AWS_DIR="$(mktemp -d "$REPO/$OUT/aws.XXXXXX")" \
 # AWS 块先于主 cleanup trap 定义；这个临时 trap 覆盖「凭据初始化自身 fatal」
 # 的窗口，随后主 `trap cleanup EXIT` 会将其替换（cleanup 同样删除 AWS_DIR）。
 trap 'rm -rf "${AWS_DIR:-}" 2>/dev/null' EXIT
-chmod 700 "$AWS_DIR" || fatal "校正 AWS 凭据目录权限失败（$AWS_DIR）"
+chmod 700 "$AWS_DIR" || fatal "校正 AWS 凭据目录权限失败（${AWS_DIR}）"
 export AWS_CONFIG_FILE="$AWS_DIR/config" AWS_SHARED_CREDENTIALS_FILE="$AWS_DIR/credentials"
 export AWS_PAGER="" AWS_EC2_METADATA_DISABLED=true
 ( umask 077; cat > "${AWS_CONFIG_FILE}" <<'AWSCFG'
@@ -126,7 +126,7 @@ s3 =
 retry_mode = standard
 max_attempts = 8
 AWSCFG
-) || fatal "写入 AWS config 失败（$AWS_CONFIG_FILE）"
+) || fatal "写入 AWS config 失败（${AWS_CONFIG_FILE}）"
 ( umask 077; cat > "${AWS_SHARED_CREDENTIALS_FILE}" <<AWSCRED
 [swcp]
 aws_access_key_id = ${SW_CP_ACCESS_KEY}
@@ -135,7 +135,7 @@ aws_secret_access_key = ${SW_CP_SECRET_KEY}
 aws_access_key_id = ${SW_ADMIN_ACCESS_KEY}
 aws_secret_access_key = ${SW_ADMIN_SECRET_KEY}
 AWSCRED
-) || fatal "写入 AWS credentials 失败（$AWS_SHARED_CREDENTIALS_FILE）"
+) || fatal "写入 AWS credentials 失败（${AWS_SHARED_CREDENTIALS_FILE}）"
 # aws-s3 — aws S3 薄封装（身份用第 1 个参数选 profile）。写成文件是因为
 # run_to 经 in_new_group 的 exec 启动子进程，shell 函数无法穿过去（mc 时代
 # 等价物是裸 mc + alias；aws 时代身份经 AWS_PROFILE 选择）。H1：放在本次
@@ -155,7 +155,7 @@ export AWS_PAGER='' AWS_EC2_METADATA_DISABLED=true
 case "\${FI_AWS_MAX_ATTEMPTS:-}" in ''|*[!0-9]*) ;; *) AWS_MAX_ATTEMPTS="\${FI_AWS_MAX_ATTEMPTS}"; export AWS_MAX_ATTEMPTS ;; esac
 exec env AWS_PROFILE="\$1" aws --endpoint-url "${AWS_S3}" --no-cli-pager s3api "\${@:2}"
 AWSBIN
-chmod +x "$AWSBIN" || fatal "chmod +x aws-s3 封装失败（$AWSBIN）"
+chmod +x "$AWSBIN" || fatal "chmod +x aws-s3 封装失败（${AWSBIN}）"
 
 # ts_ns — 可移植的纳秒级 Unix 时间戳（纯数字）。date 的 %N 在 GNU date 与新版
 # macOS（Darwin 24 实测）都可用；但部分旧版 macOS/BSD date 会输出字面 N 或
