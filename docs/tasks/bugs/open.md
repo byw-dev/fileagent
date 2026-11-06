@@ -30,6 +30,8 @@
 > 一行式口径：**挡试点 3（40、48、51）/ 不挡试点 14 / MinIO 专属 2（7、41）/ 已失效 0 / 待产品定 0**（返工 3：46 剩余半边经产品拍板改判不挡试点；返工 1 前：挡 0 / 不挡 16，历史保留）。
 > 逐条判定、理由与文件:行号证据见各卡片的「**B 重判（2026-10-27）**」行；下方总表的未关行标题后带统一格式的判定标记（机械重算见 `bin/recount.sh`）。
 > 机械重算脚本 `bin/recount.sh`（不提交）的输出与本段、`consistency-ingest.md`、`active.md`、`CLAUDE.md`、`TASK_LIST.md` 中的数字一致。
+>
+> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #TBD），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；上表的 37/19/3/14 口径为 2026-10-27 时点快照，保留为历史。**
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -170,7 +172,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 〔B:挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-49 | ~~`dest_path_template` 带不带 `{time}` 隐式决定「追加后产生新版本对象 vs 覆盖同一对象」，产品语义从未定义~~ **❌ 已撤销（2026-09-13，前提被实测证伪）**，其中成立的产品问题拆出为 [backlog](../backlog.md)「同一文件重复采集的覆盖语义」条目 | 🟡 P2 | 产品 + agent |
 | IC-BUG-50 | `time` 是**未声明的保留字**（三端契约只有 agent 知道）、**优先级与同体系系统变量相反**（无条件覆盖解析结果）、且**名字误导**（实为「文件被提交上传的时刻」）✅ 随 D-034 修复（PR #106：改名 `{submit_time}` + 解析结果优先 + 旧名 deprecated 兼容） | 🟡 P2 | agent + controlplane + webui |
-| IC-BUG-51 | 上报的 `sha256` / `size_bytes` / 实际上传字节**来自三次独立的文件读**，三者可以描述文件的不同版本；且 `PutObject` 返回的 ETag 虽已拿到却无人用来复核 〔B:挡试点〕 | 🟠 P1 | agent |
+| IC-BUG-51 | 上报的 `sha256` / `size_bytes` / 实际上传字节**来自三次独立的文件读**，三者可以描述文件的不同版本；且 `PutObject` 返回的 ETag 虽已拿到却无人用来复核 ✅ 已修（分支 `fix/b7-ic-bug-51-single-read-hash`，PR #TBD：哈希/计数/上传共用同一次读 + 分片 ETag 验证） | 🟠 P1 | agent |
 | IC-BUG-52 | `dry_run_limit` 的**有效上限恒为 10**：CP 只在响应端按它裁剪（1–10 生效），**从不下发给 agent**，而 agent 硬编码上限 10——请求 11–50 被静默压成 10，且无截断标记 〔B:不挡试点〕 | 🟡 P2 | controlplane + agent + proto |
 | IC-BUG-53 | watcher 的 `seen` 语义是「**已交付**」而非「**已持久入队**」：下游 `submitFile` 提交/判重失败**只 Warn 不重试**，文件此后不再变化时**永不被采集**（初扫路径自 PR #100 F1 起即受影响，实时路径因 IC-BUG-44/43 的 P1 裁决而**保留重试机会**） 〔B:不挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 〔B:不挡试点〕 | 🟡 P2 | docs |
@@ -829,9 +831,9 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 - 决策记录：[`DECISIONS.md`](../../../DECISIONS.md) **D-030**（写入准入与一致性模型）
 - 设计文档：[`docs/design/consistency-and-ingest.md`](../../design/consistency-and-ingest.md)
-## IC-BUG-51 — sha256 / size / 上传字节来自三次独立读，可描述不同版本 🟠 P1
+## IC-BUG-51 — sha256 / size / 上传字节来自三次独立读，可描述不同版本 🟠 P1 ✅ 已修（分支 `fix/b7-ic-bug-51-single-read-hash`，PR #TBD）
 
-> **定级**：立卡时定 🟡 P2，**经 PR #107 review 上调为 🟠 P1**——静默的索引↔对象失配正是本 track 要消灭的那一类，且它是 IC-11…13 对账的硬前置；触发条件的稀有性不折抵后果的性质。
+> **定级**：立卡时定 🟡 P2，**经 PR #107 review 上调为 🟠 P1**——静默的索引↔对象失配正是本 track 要消灭的那一类，且它是 IC-11…13 对账的硬前置；触发条件的稀有性不折抵后果的性质。以下「根因/后果」等列为发现时快照，修复形态见末行「修复记录」。
 
 | 字段 | 内容 |
 |------|------|
@@ -843,6 +845,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 构造「上传进行中文件被追加/截断」的用例（慢 reader 或在 PutObject 期间写源文件）：上报的 `sha256` 必须等于对象实际内容的 sha256（用 `mc cat \| shasum` 核），`size_bytes` 必须等于对象的 `size`；变异——退回两次独立读，该用例必须变红 |
 | **归属** | 未排期。**是 IC-11…13（分片对账）的硬前置**：对账的全部前提就是「DB 记的 sha256/size 可信」，本条不修则对账会把好对象判成不一致、也会把坏对象判成一致。宜与 **IC-BUG-48**（ETag 验证）同刀，两者共用同一套校验基建 |
 | **B 重判（2026-10-27）** | **挡试点**（返工 1 修订） — 三次独立读之间文件被改写时，**成功上报**的 sha256/size 可与对象实际字节不符，且判重会跳过补传——尺寸/mtime 判重只是候选过滤，不校验已传字节，不构成兜底（原「尺寸一变即自愈」理由删除）。评审以生产 `UploadFile` + mock ObjectStore 实测复现：先哈希 AAAA、读取前原地改 BBBB，返回成功、上报旧哈希、`IsProcessed=true`（`bin/review-r1-probe.log` TestReviewR1HashMismatch——生产函数 + mock，非 live）。**B7 必修**：哈希与上传共享同一次读（TeeReader），宜与 48 同刀。证据：`uploader.go:168,190,238-239,284`（三次独立读，2026-10-27 复核仍在）；`executor/reports.go:35-41`（该哈希直接进入上报） |
+| **✅ 修复记录（2026-11-06，PR #TBD）** | 分支 `fix/b7-ic-bug-51-single-read-hash`（基于 master `e14ed72`），四提交：红测试 → 实现 → 验收测试 → 集成测试修复。**改法**：① 单片路径删独立 `fileSHA256` 预读，`PutObject` 的 reader 改为 `countingTeeReader`（TeeReader+计数）同时喂全文 sha256 与 md5，`SizeBytes` 取该次读计数，读完后核对计数＝声明 size，不等响亮失败（`errByteCountMismatch`）；另用返回的 `info.ETag` 与送达字节 md5 交叉核对（ETag 不可比时跳过，不依赖它）。② 分片路径：同一全文 sha256 按片号顺序喂入——本次上传的片边传边 Tee；**续传跳过的片**重读本地区间喂哈希，并用该次读出的 md5 核对远端 ETag（`hashResumePart`），不一致/ETag 不可比/短读→`errStaleRemoteParts`→沿用现有 `discardStaleUpload`（先落盘 abort 意图再 abort）从头传。③ tail（offset>0）在 uploader 侧改为显式报错（executor 的 fail-closed 不动，双闸）；④ `processed_files` 结论：写入的是入队时四元组，上传期间变化→下次扫描 `IsProcessed=false` 重采，无需改表，已补测试钉住（`processed_files_ic51_test.go`）。**ETag 实测结论**（`bin/b7-ic-bug-51/poc.md`）：MinIO（自持镜像 RELEASE.2025-04-22）与 SeaweedFS CE 4.48 的分片 ETag **均为该片字节的 md5 十六进制**（3 片×5MiB 逐一比对全中，单 PUT ETag 同样＝md5），两后端均可安全续传，无需降级。**验收**：两个红测试（单片原地改写、续传陈旧分片）变绿；另补截短响亮失败/增长上报送达前缀/续传 ETag 一致不重传（mock 计数证明）/ETag 不一致丢弃从头传/ETag 不可比丢弃/短读不 panic 六个场景；变异测试 3 个全红（a 恢复预读、b size 取 stat+拆计数闸、c 跳过 ETag 核对；b 需同时拆计数闸才可活，如实记录）；`go vet` + `go test -race` 全绿；integration（真 MinIO）全绿（含修复两个 master 上就坏的存量集成测试）；两后端 smoke 全绿（日志 `bin/b7-ic-bug-51/logs/smoke-*.log`）。未动 proto/CP/webui/表结构。**残余**：IC-BUG-48 的判重面（同秒同尺寸改写永不重采）不在本刀，卡片仍开着 |
 
 ## IC-BUG-52 — `dry_run_limit` 收了不用：请求 50 静默只得 10 🟡 P2
 
