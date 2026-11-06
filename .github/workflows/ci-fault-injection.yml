@@ -9,8 +9,9 @@ name: CI — Fault Injection
 # 全量跑约 17 分钟（本机基线），最长单场景含准备约 7.5 分钟，CI 冷 runner
 # 再加拉镜像还要更久。这个量级不能进 PR 必过门禁——否则任何小改动都要
 # 等它跑完才能合。所以定位是「每日定时回归 + 手动按需触发」：白天改坏了
-# filer 链路，最迟第二天凌晨（北京时间 02:00）会红出来；等不及的人自己
-# workflow_dispatch 点一下。也不要把它加成必过检查（同理由）。
+# filer 链路，通常会在次日凌晨的定时运行中暴露（注意 GitHub 的定时触发
+# 在高峰期可能延迟或被跳过，不承诺准点；需要确定结论时手动
+# workflow_dispatch 点一下）。也不要把它加成必过检查（同理由）。
 #
 # 为什么四个 job 并行：本机实测 93% 的耗时在场景里、固定成本（构建+起环境）
 # 只有 ~72s。脚本原生支持 FI_ONLY=<n> 只跑单场景，四个 matrix job 并行后
@@ -34,8 +35,12 @@ jobs:
       matrix:
         fi_only: [1, 2, 3, 4]
 
-    # 按 (workflow, 场景号) 分组：定时与手动重跑同一场景会排队而不是互相取消。
-    # 不设 cancel-in-progress——手动重跑不该把正在跑的同场景定时任务杀掉。
+    # 按 (workflow, 场景号) 分组。GitHub 的 concurrency 语义是：同组同一时刻
+    # 只有一个在跑、只有一个 pending；连续第三个同组运行会**替换掉旧的
+    # pending**，不是无限排队。cancel-in-progress: false 保护的是「正在跑的
+    # 那个」——手动重跑不会杀掉正在跑的同场景定时任务；不保证所有等待者
+    # 都能轮到（我们的触发频率是每日一次 + 偶尔手动，实际撞不上 pending
+    # 替换，但注释不该把它写成「排队」）。
     # ⚠️ 必须写在 job 级：matrix 上下文只在 job 级可用，workflow 级
     # concurrency 只认 github/inputs/vars，引用 matrix 会让整个 workflow
     # 直接加载失败（Unrecognized named-value）。
