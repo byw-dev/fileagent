@@ -332,9 +332,44 @@ Agent 首次启动是显式状态机（`INIT → PENDING → APPROVED → RUNNIN
 
 1. Agent 生成机器指纹（缓存于 `fingerprint_file`），gRPC `Register()` 上报，进入 **PENDING**。
 2. 管理员在 Web UI 的 Agent 列表**审批**该 agent。
-3. Agent 轮询到审批后取得 token（加密存 `token_file`，0600），进入 **RUNNING** 开始采集。
+3. Agent 轮询到审批后取得 token（加密存 `token_file`，0600），进入 **RUNNING` 开始采集。
 
 未审批前 agent 会持续等待（有日志），不采集。
+
+---
+
+## CP 启动自检失败怎么排查（IC-BUG-40）
+
+CP 启动后会用**实际生效的配置**（`MINIO_*` 环境变量，不是 init 脚本的 `SW_CP_*`/`CP_ADMIN_*`）
+在后台做一次存储自检：用 CP 的 S3 身份对 `data-sensor` 桶做一次 `ListBucketMultipartUploads`，
+再用 `MINIO_ROLE_ARN` 真实签一次 STS `AssumeRole`（凭据用完即丢）。**任何失败都会在
+`MINIO_STARTUP_CHECK_TIMEOUT`（默认 120s）内退避重试；窗口耗尽仍失败，CP 会拒绝启动**（打
+`storage startup self-check FAILED` 的 Error + `refusing to run` 的 Fatal，非零退出）。窗口内
+`/healthz` 照常 200，这是有意为之：全新环境里 `init-minio.sh` 必须在 CP 起来之后才能跑
+（它初始化时要拨 CP 的 webhook）。
+
+排查步骤（按 Fatal 日志里的字段定位）：
+
+1. **看 `item` 字段**：`s3-identity` = S3 凭据/端点问题；`sts-assume-role` = role ARN 或 STS 问题。
+2. **看 `class` 字段**：`auth/config` = 后端拒绝了身份（secret 配错 / 身份不存在 / role 未授权）；
+   `network` = 连不上（存储没起、端点配错、防火墙）。
+3. **对照 `endpoint` 与 `access_key_id`**（日志只打 key id，绝不打 secret）：确认它们与存储侧一致——
+   MinIO 后端对照 `init-minio.sh` 的 `CP_ADMIN_ACCESS_KEY`/`CP_ADMIN_SECRET_KEY`；SeaweedFS 后端
+   对照 `deploy/seaweedfs/env-defaults.sh` 的 `SW_CP_ACCESS_KEY`/`SW_CP_SECRET_KEY`（渲染进 s3.json）。
+4. **按 `fix_hint` 行动**：日志自带的修复提示即下一步（如「检查 MINIO_SECRET_KEY 与存储侧 CP 身份是否一致」）。
+
+常见场景：
+
+| 症状（Fatal 的 error 字段） | 含义 | 处置 |
+|------|------|------|
+| `SignatureDoesNotMatch` | secret 与存储侧不一致（含轮换后漏改） | 对齐 `MINIO_SECRET_KEY` 与存储侧 CP 身份；若要轮换用 `CP_ADMIN_ROTATE=1` 重跑 init |
+| `InvalidAccessKeyId`（auth/config） | CP 身份不存在于存储侧 | 全新环境：先跑 init 脚本再重启 CP；已初始化环境：检查 `MINIO_ACCESS_KEY` 是否被改 |
+| `not authorized to assume role`（仅 SeaweedFS） | `MINIO_ROLE_ARN` 与 iam.json 的 role 不一致 | 对齐两边的 role ARN（SeaweedFS 默认 12 零账号段，MinIO 默认空账号段，不可混用） |
+| `connection refused` / `i/o timeout`（network） | 存储晚于 CP 或端点配错 | 窗口内会自意恢复；持续失败则检查 `MINIO_ENDPOINT` 与存储是否在跑 |
+| 窗口内一直 Warn 后自检通过 | 存储启动慢于 CP | 正常现象，无需处理；嫌慢可调大 `MINIO_STARTUP_CHECK_TIMEOUT` |
+
+> 已知盲区：MinIO 的 STS 不校验 RoleArn（任意 ARN 都签发成功），所以「role 配错」在 MinIO
+> 后端不会被自检拦下，只在 SeaweedFS 后端报 `AccessDenied`。这是 MinIO 后端行为，不是自检缺陷。
 
 ---
 

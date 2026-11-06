@@ -1676,7 +1676,8 @@ controlplane/
 │   ├── storage/
 │   │   ├── minio.go
 │   │   ├── sts.go
-│   │   └── policy.go
+│   │   ├── policy.go
+│   │   └── startupcheck/      # IC-BUG-40：启动自检（S3 身份探活 + STS AssumeRole；窗口耗尽拒绝启动）
 │   ├── event/
 │   │   ├── engine.go
 │   │   ├── publisher.go
@@ -2435,6 +2436,26 @@ step ca root > /etc/fileagent/ca-root.crt
 - 生产部署**无需** `migrate` CLI，也无需随二进制分发 `migrations/` 目录或设置 `MIGRATIONS_PATH`
   （该配置项已移除）。
 - 升级只需发布新二进制并重启——新迁移在启动时应用。迁移文件**只追加不改**（契约约束）。
+
+### 启动顺序与存储自检（IC-BUG-40）
+
+CP 的启动顺序为：**加载配置 → 迁移 → 连接 PG/Redis/NATS → 起 gRPC/HTTP 监听 → 后台存储自检**。
+存储自检（`internal/storage/startupcheck`）**不阻塞监听**，原因：`init-minio.sh` 在初始化
+MinIO（创建 CP IAM 身份）时要拨 CP 的 webhook 端点，自检若阻塞在监听之前，全新环境的
+初始化会与 CP 启动互等死锁。自检内容与失败语义：
+
+- 用 CP 的 S3 身份对 `data-sensor` 桶做一次 `ListBucketMultipartUploads`（验证 endpoint
+  连通 + 凭据有效）；再用 `MINIO_ROLE_ARN` 真实签一次 STS `AssumeRole`（凭据丢弃）。MinIO 与
+  SeaweedFS 两后端同一代码路径，无后端分支。
+- 任何失败（含鉴权/配置类，如 `SignatureDoesNotMatch` / `InvalidAccessKeyId`）在
+  `MINIO_STARTUP_CHECK_TIMEOUT`（默认 120s）内退避重试——窗口兼容「存储晚于 CP 启动」与
+  「全新环境 init 脚本后跑」两种合法顺序；窗口耗尽仍失败则打出诊断日志（检查项 /
+  endpoint / access key id / 原始错误 / 修复提示，**绝不打 secret**）并**拒绝启动**（非零退出，
+  走正常关停路径）。`/healthz` 在窗口内保持 200。
+- 不探 `MINIO_PUBLIC_ENDPOINT`：它是 agent/浏览器侧端点（D-024），从 CP 所在网络可能
+  本就不可达。
+- 已知盲区：MinIO 的 STS 不校验 RoleArn（任意 ARN 都签发成功），「role 配错」只能在
+  SeaweedFS 上检出。
 
 ```
 # 迁移文件命名规范（golang-migrate）
