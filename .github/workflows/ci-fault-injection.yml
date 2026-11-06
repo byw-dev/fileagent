@@ -64,9 +64,14 @@ jobs:
           # 缓存键只需要 controlplane/go.sum。
           cache-dependency-path: controlplane/go.sum
 
-      # 预检：run.sh 的工具门控只接受 aws-cli/2.*（v1 的 profile 配置/校验
+      # ── 前置工具自检 ──────────────────────────────────────────────────────
+      # 把所有预检集中到一段：哪个工具缺了/版本不对，红的时候一眼能看出是哪一环，
+      # 而不是等到场景跑到一半才以不相干的症状死掉。风格照 ci-smoke.yml 的预检
+      # （把失败原因写清楚，不只是 exit 1）。
+
+      # AWS CLI v2：run.sh 的工具门控只接受 aws-cli/2.*（v1 的 profile 配置/校验
       # 行为与验证过的路径不同，fail-closed）。ubuntu-latest 自带 v2，但版本
-      # 随 runner 镜像漂移，提前打出来 + 断言，红了能直接看出是哪一环。
+      # 随 runner 镜像漂移，提前打出来 + 断言。
       # ⚠️ 不从网上现下载安装：那会引入新的漂移源，与钉定镜像的思路相悖。
       - name: Preflight — AWS CLI v2
         run: |
@@ -80,10 +85,29 @@ jobs:
               ;;
           esac
 
-      # 预检：起基础设施时 deploy/scripts/render-seaweedfs-configs.sh 硬依赖
-      # python3（缺了直接报错退出）。ubuntu-latest 自带，打出版本即可。
+      # python3：起基础设施时 deploy/scripts/render-seaweedfs-configs.sh 硬依赖
+      # python3（缺了直接报错退出），亦是 ts_ns 时间戳的兜底引擎。ubuntu-latest
+      # 自带，打出版本即可。
       - name: Preflight — python3
         run: python3 --version
+
+      # lsof：run.sh 的端口预检三件套（assert_port_free / verify_listening_pid /
+      # port_occupied）都靠 `lsof -nP -iTCP:… -sTCP:LISTEN` 查监听 pid。GitHub 的
+      # Ubuntu runner 镜像**不预装 lsof**（apt 清单 vital/common/cmd 三份都没有它），
+      # 而缺了不会报错：`2>/dev/null` 吞掉 command-not-found，预检把「查不到占用者」
+      # 当成「端口空闲」放行——不是干脆失败，是**静默放宽 fail-closed 防线**，
+      # 所以必须在这里显式装上并自证可用。已自带则跳过网络操作。
+      - name: Preflight — lsof
+        run: |
+          if command -v lsof >/dev/null 2>&1; then
+            echo "lsof 已预装，跳过安装"
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq lsof
+          fi
+          # 自证：装完必须真的能跑，版本号进 job log 一眼可见
+          lsof -v 2>&1 | head -1
+          command -v lsof >/dev/null 2>&1 || { echo "::error::lsof 安装后仍不可用，端口预检会被静默放宽"; exit 1; }
 
       # 运行单场景。不设 KEEP：那是 deploy/scripts/smoke.sh 的开关，FI 脚本
       # 没有这个用法。脚本自己 cleanup（compose down、杀进程、释放端口），

@@ -44,6 +44,10 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 ## 前置条件
 
 - **docker**（compose v2，容器需可拉取 postgres/redis/nats/seaweedfs 镜像）
+- **lsof**（端口预检三件套 `assert_port_free` / `verify_listening_pid` /
+  `port_occupied` 靠它查监听 pid；缺失时不会报错，只会**静默放宽**
+  fail-closed 预检。GitHub Ubuntu runner 不预装，CI workflow 里显式
+  `apt-get install lsof`，见 `.github/workflows/ci-fault-injection.yml`）
 - **AWS CLI v2**（S3 写入/删除/列举；B7 起 mc → aws cli v2，实测基线 2.39.2）。
   脚本自建私有 AWS 配置（config/credentials/aws-s3 封装落在每次运行
   `mktemp -d` 新建的 `bin/tmp/fi/aws.XXXXXX/` 里——不是固定路径、不可能被
