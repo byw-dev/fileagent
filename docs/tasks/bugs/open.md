@@ -12,26 +12,26 @@
 
 > **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判；2026-09-24 IC-4a 关闭 6/9；**IC-BUG-6 的 (d) 只落了 `active=true` 标记位，无消费方，强制解封归 IC-12 的验收与依赖（PR #110 复审 B4）**）**：共 **56** 条 = **已关闭 37** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 18**（**2 条挡** 7/40 + **13 条可推** + **3 条拆半** 13、46 与 32）。**2026-10-12：IC-BUG-56 随 D-037 文档 PR 立卡（判可推），来自存储层调研。****口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。（⚠️ 本段判定口径已被下一段取代，保留为历史。）
 
-> ### 🔄 计数与判定（2026-10-27 里程碑 B 重判；#TBD 随 IC-BUG-40 修复更新）——以本段为准
+> ### 🔄 计数与判定（2026-10-27 里程碑 B 重判；#142 随 IC-BUG-40 修复更新）——以本段为准
 >
-> **共 57 条 = 已关闭 39（2026-11-06：IC-BUG-51 随 PR #140、IC-BUG-40 随 PR #TBD 修复）+ 已撤销 1（IC-BUG-49）+ 未关闭 17**（新增 **IC-BUG-57**，随本次重判立卡，见文末）。
+> **共 57 条 = 已关闭 39（2026-11-06：IC-BUG-51 随 PR #140、IC-BUG-40 随 PR #142 修复）+ 已撤销 1（IC-BUG-49）+ 未关闭 17**（新增 **IC-BUG-57**，随本次重判立卡，见文末）。
 > 判据更换：旧口径「挡 / 可推」（2026-09-11 重判为「挡 / 不挡 A」）已让位于**里程碑 B 判据**——
 > **这条缺陷在 SeaweedFS 试点部署里还成立吗？成立的话挡不挡试点？**（依据 D-037、`docs/tasks/active.md`「当前里程碑 B」，
 > B7 之后即可试点部署。）重判时原有的 18 条未关缺陷逐条重判，判定只针对仍开着的那一半（拆半卡片 13/46/32 先判 ◐ 再判剩余半边）：
 >
 > | 判定 | 条数 | 明细 |
 > |---|---|---|
-> | **挡试点** | **1** | 48（~~51~~ 2026-11-06 随 PR #140 修复；同日返工 1 依 PR #134 评审 F1–F3 改判：51 成功上报错误哈希、48 同版本改写永久漏采，均经生产函数探针实测；~~40 的 init 自检不覆盖 CP 实际生效配置~~ 40 已随 #TBD 修复：启动自检拒绝启动） |
+> | **挡试点** | **1** | 48（~~51~~ 2026-11-06 随 PR #140 修复；同日返工 1 依 PR #134 评审 F1–F3 改判：51 成功上报错误哈希、48 同版本改写永久漏采，均经生产函数探针实测；~~40 的 init 自检不覆盖 CP 实际生效配置~~ 40 已随 #142 修复：启动自检拒绝启动） |
 > | **不挡试点** | **14** | 13、14、15、32、38、42、45、46（剩余半边，返工 3 经产品拍板改判）、52、53、54、55、56、57（新卡） |
 > | **MinIO 专属** | **2** | 7、41（不关闭——MinIO 过渡期仍是默认后端；MinIO 适配器退役时随之关闭。7 在 SeaweedFS 上无对应物：事件源按 `/buckets/` 前缀订阅，新桶天然覆盖，PR3b 合并后成立；41 的 SeaweedFS 侧同类问题已另立 57） |
 > | **已失效 / 撤销** | **0** | 无（无一条满足「必须给出代码证据」的撤销门槛） |
 > | **待产品定** | **0** | 无（46 剩余半边原判待产品定，产品 2026-10-27 拍板试点无持续追加大文件，返工 3 改判不挡试点） |
 >
-> 一行式口径：**挡试点 1（48）/ 不挡试点 14 / MinIO 专属 2（7、41）/ 已失效 0 / 待产品定 0**（返工 3：46 剩余半边经产品拍板改判不挡试点；PR #140：51 修复关闭；#TBD：40 随启动自检修复关闭；返工 1 前：挡 0 / 不挡 16，历史保留）。
+> 一行式口径：**挡试点 1（48）/ 不挡试点 14 / MinIO 专属 2（7、41）/ 已失效 0 / 待产品定 0**（返工 3：46 剩余半边经产品拍板改判不挡试点；PR #140：51 修复关闭；#142：40 随启动自检修复关闭；返工 1 前：挡 0 / 不挡 16，历史保留）。
 > 逐条判定、理由与文件:行号证据见各卡片的「**B 重判（2026-10-27）**」行；下方总表的未关行标题后带统一格式的判定标记（机械重算见 `bin/recount.sh`）。
 > 机械重算脚本 `bin/recount.sh`（不提交）的输出与本段、`consistency-ingest.md`、`active.md`、`CLAUDE.md`、`TASK_LIST.md` 中的数字一致。
 >
-> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #140），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；上表的 37/19/3/14 口径为 2026-10-27 时点快照，保留为历史。** **2026-11-06：IC-BUG-40 亦已修（PR #TBD：CP 启动存储自检，窗口耗尽拒绝运行），已关闭 39 + 未关闭 17、挡试点余 1（48）**
+> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #140），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；上表的 37/19/3/14 口径为 2026-10-27 时点快照，保留为历史。** **2026-11-06：IC-BUG-40 亦已修（PR #142：CP 启动存储自检，窗口耗尽拒绝运行），已关闭 39 + 未关闭 17、挡试点余 1（48）**
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -161,7 +161,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-37 | watcher 的 fsnotify 分支没有初始扫描，规则指向的**既有文件永不被采集**；而 polling 回退分支却会扫——同一条规则的行为取决于 fsnotify 是否可用 ✅ 随 IC-5 修复 | 🟠 P1 | agent |
 | IC-BUG-38 | agent 的 `log.output` / `log.max_size_mb` / `log.max_backups` 解析了、校验了、写进文档了，就是没人读——日志只落 stdout，无文件、无轮转 〔B:不挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-39 | `init-minio.sh` 硬编码的 STS session policy 与 `storage/policy.go` 的 Action 列表**无任何联动**，改一边不改另一边会在交集处被静默削权 ✅ 随 IC-3 修复（新增 `policy_script_test.go` 交叉校验）| 🟡 P2 | deploy + controlplane |
-| IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 ✅ 已修（#TBD：启动自检拒绝启动）| 🟠 P1 | controlplane |
+| IC-BUG-40 | CP 启动**不校验 MinIO 凭据**（只 `miniogo.New`，不发请求），凭据错了照常起，故障延后到 agent 连接时才在别的进程里冒出来 ✅ 已修（#142：启动自检拒绝启动）| 🟠 P1 | controlplane |
 | IC-BUG-41 | `init-minio.sh` 把 secret 放进命令行 argv（`mc admin user add` / `mc alias set` / `curl --user`），执行期间同机任意用户 `ps -ef` 可见 〔B:MinIO 专属〕 | 🟡 P2 | deploy |
 | IC-BUG-42 | `EnqueueIfNoActive` 不拦 `failed`：任务在退避重试期间被重新提交会产生两个任务、两次真实 PUT 〔B:不挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-43 | close_wait 初始扫描跳过「仍在写」的文件，但 fsnotify 分支只扫一次、也没有后续事件兜底——写完即停的文件会被永久跳过 ✅ 随 IC-BUG-44 同刀修复（PR #108：一次性 debounce recheck）| 🟡 P2 | agent |
@@ -678,7 +678,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **归属** | 未排期。宜与 IC-3 或 IC-8（下一次要动 policy 的刀）同刀 |
 | **✅ 已修（IC-3，PR #105，2026-09-12）** | 新增 `controlplane/internal/storage/policy_script_test.go`：解出脚本里的 `STS_SESSION_POLICY` JSON 与 `BuildSessionPolicy`（对脚本钉定的同一 bucket `data-sensor`）逐文档比对（`TestSessionPolicyMatchesInitScript` + 逐 statement 的 Action 集合断言 `TestSessionPolicyActionSetsMatch`）。反向变异已自验：给 `objectActions` 加 `s3:GetObject` 而不改脚本 → `go build` 通过且两条用例红；还原后 5/5 稳定绿。本刀未改 `policy.go`（IC-1 已把 `AbortMultipartUpload` 放进 `objectActions`），脚本无需同步 |
 
-## IC-BUG-40 — CP 启动不校验 MinIO 凭据，故障延后到 agent 侧才爆 🟠 P1 ✅ 已修（#TBD）
+## IC-BUG-40 — CP 启动不校验 MinIO 凭据，故障延后到 agent 侧才爆 🟠 P1 ✅ 已修（#142）
 
 | 字段 | 内容 |
 |------|------|
@@ -688,7 +688,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 把 `MINIO_SECRET_KEY` 改错启动 CP → 启动阶段就明确报错，而不是健康启动后在下载/上传时才暴露 |
 | **归属** | 未排期。发现于 PR #97 的 code review |
 | **B 重判（2026-10-27）** | **挡试点**（返工 1 修订） — init 三项自检验证的是 `SW_CP_*`（`init-seaweedfs.sh:237-323`），CP 运行时读的是独立的 `MINIO_*`（`config.go:154,158,168`），两者仅在 smoke 路径显式桥接（`smoke.sh:207-227`）——凭据/端点/role 配错或轮换遗漏时 CP 照常健康启动，STS/下载在 agent 与用户侧才失败，正是本条要防的「故障延后 + 隔进程排障」。**B7 必修**：CP 启动时用实际生效配置做一次凭据/端点/STS 自检，失败即拒绝启动或显式告警（机制留给实现那一刀，本 PR 不定）。证据：`main.go:209,219`（miniogo.New 纯本地构造）；CP 凭据实际由 `deploy/seaweedfs/s3.json.tpl:12-20` 渲染（原判定误写 iam.json，2026-10-27 更正） |
-| **✅ 修复记录（#TBD，分支 `fix/b7-ic-bug-40-cp-startup-selfcheck`）** | 新包 `controlplane/internal/storage/startupcheck`（`main.go` 只调用）：**自检内容** = ① 用 CP 的 S3 身份对 `data-sensor` 桶做一次 `ListBucketMultipartUploads`（两后端 CP policy 交集里唯一无副作用的读操作，验证 endpoint 连通 + 凭据有效；桶不存在仍算身份有效——返工 1 已实测两后端均**先鉴权后查桶**：错 secret + 不存在的桶返回 `SignatureDoesNotMatch` 而非 `NoSuchBucket`，凭据错误不会被误判为通过；桶名是探测目标而非业务断言，`data-sensor` 由 bootstrap 保证存在，故不设配置项）；② 用 `MINIO_ROLE_ARN` 真实签一次 STS `AssumeRole`，凭据直接丢弃不缓存不打日志。**失败语义**（产品 2026-11-06 拍板 + 实现细化）：自检在 CP 开始监听后的后台 goroutine 里跑（`init-minio.sh` 初始化时要拨 CP webhook，阻塞式会死锁全新部署）；任何失败（含鉴权类）在 `MINIO_STARTUP_CHECK_TIMEOUT`（新 env，默认 120s，已进 `.env.example`，`config.Validate` 拒绝非正值）内退避重试，窗口耗尽打出完整诊断（检查项 / endpoint / access key id（仅 id）/ 原始错误 / 修复提示；绝不打 secret）后走正常关停路径非零退出（返工 1 修正：goroutine 只投递失败，编排函数 select 后非阻塞 tie-break，失败与 SIGTERM 同时就绪时**确定性**走失败分支——裸 select 随机选分支曾可能以 0 退出吞掉失败；退出用 `run() int` + Error 日志而非 `zap.Fatal`——Fatal 会 `os.Exit` 跳过关停与 defer；守护测试 `DeterministicUnderRace` 循环 200 轮，去 tie-break 变异 round 1 即红）；`/healthz` 窗口内保持 200。**不探 `MINIO_PUBLIC_ENDPOINT`**（D-024 拆分端点下 CP 网络可能本就不可达）。**已知盲区**：MinIO 的 STS 不校验 RoleArn（任意 ARN 都签发成功，live 实测），“role 配错”只能在 SeaweedFS 上检出（报 `AccessDenied`）；STS 时长取 minio-go 库默认 3600（两后端最小 900，但库会把 ≤3600 改写为 3600）。错误分类：S3 非 5xx 响应 = 鉴权/配置类，5xx 与传输错误 = 网络类（窗口内重试）。单元测试 94.9%（mock，含鉴权失败重试调用计数 / 窗口耗尽 / context 取消 / 日志不含 secret），接线守护 AST 测试防「不调用自检」回归；变异 a/b/c 均红。Live 验证：两后端错误 secret/错误 role 均窗口耗尽非零退出带诊断日志；存储晚于 CP 启动时窗口内自检通过；两后端 smoke 十二环全绿 |
+| **✅ 修复记录（#142，分支 `fix/b7-ic-bug-40-cp-startup-selfcheck`）** | 新包 `controlplane/internal/storage/startupcheck`（`main.go` 只调用）：**自检内容** = ① 用 CP 的 S3 身份对 `data-sensor` 桶做一次 `ListBucketMultipartUploads`（两后端 CP policy 交集里唯一无副作用的读操作，验证 endpoint 连通 + 凭据有效；桶不存在仍算身份有效——返工 1 已实测两后端均**先鉴权后查桶**：错 secret + 不存在的桶返回 `SignatureDoesNotMatch` 而非 `NoSuchBucket`，凭据错误不会被误判为通过；桶名是探测目标而非业务断言，`data-sensor` 由 bootstrap 保证存在，故不设配置项）；② 用 `MINIO_ROLE_ARN` 真实签一次 STS `AssumeRole`，凭据直接丢弃不缓存不打日志。**失败语义**（产品 2026-11-06 拍板 + 实现细化）：自检在 CP 开始监听后的后台 goroutine 里跑（`init-minio.sh` 初始化时要拨 CP webhook，阻塞式会死锁全新部署）；任何失败（含鉴权类）在 `MINIO_STARTUP_CHECK_TIMEOUT`（新 env，默认 120s，已进 `.env.example`，`config.Validate` 拒绝非正值）内退避重试，窗口耗尽打出完整诊断（检查项 / endpoint / access key id（仅 id）/ 原始错误 / 修复提示；绝不打 secret）后走正常关停路径非零退出（返工 1 修正：goroutine 只投递失败，编排函数 select 后非阻塞 tie-break，失败与 SIGTERM 同时就绪时**确定性**走失败分支——裸 select 随机选分支曾可能以 0 退出吞掉失败；退出用 `run() int` + Error 日志而非 `zap.Fatal`——Fatal 会 `os.Exit` 跳过关停与 defer；守护测试 `DeterministicUnderRace` 循环 200 轮，去 tie-break 变异 round 1 即红）；`/healthz` 窗口内保持 200。**不探 `MINIO_PUBLIC_ENDPOINT`**（D-024 拆分端点下 CP 网络可能本就不可达）。**已知盲区**：MinIO 的 STS 不校验 RoleArn（任意 ARN 都签发成功，live 实测），“role 配错”只能在 SeaweedFS 上检出（报 `AccessDenied`）；STS 时长取 minio-go 库默认 3600（两后端最小 900，但库会把 ≤3600 改写为 3600）。错误分类：S3 非 5xx 响应 = 鉴权/配置类，5xx 与传输错误 = 网络类（窗口内重试）。单元测试 94.9%（mock，含鉴权失败重试调用计数 / 窗口耗尽 / context 取消 / 日志不含 secret），接线守护 AST 测试防「不调用自检」回归；变异 a/b/c 均红。Live 验证：两后端错误 secret/错误 role 均窗口耗尽非零退出带诊断日志；存储晚于 CP 启动时窗口内自检通过；两后端 smoke 十二环全绿 |
 
 ## IC-BUG-41 — `init-minio.sh` 把 secret 放进命令行 argv 🟡 P2
 
