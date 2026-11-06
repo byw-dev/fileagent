@@ -427,3 +427,125 @@ func TestIC51_Multipart_ResumeRemoteDisagreesWithSQLite(t *testing.T) {
 	assert.Equal(t, int64(3*mib), result.SizeBytes)
 	assert.Equal(t, []int{1, 2, 3}, store.completedPartNums)
 }
+
+// ── Rework-2 fix 1: the digest-feeding read and the ETag check are ONE read ──
+
+// TestIC51_Multipart_RewriteBetweenPrecheckAndHashFeed is the rework-2
+// blocker case: the up-front ETag pre-check and the digest-feeding read are
+// two separate reads of the same range. If the file is rewritten between
+// them, the OLD code fed the SECOND read's bytes into the SHA-256 while only
+// the FIRST read was ever verified — the reported hash could describe bytes
+// the object does not contain. The fix re-verifies the remote ETag over the
+// very bytes entering the digest (hashResumePartChecked); this test rewrites
+// part 3's range while part 2 is being uploaded — after the pre-check of
+// part 3 passed, before part 3 is fed — and requires the resume to be
+// discarded and the file re-uploaded from scratch with a correct hash.
+func TestIC51_Multipart_RewriteBetweenPrecheckAndHashFeed(t *testing.T) {
+	const mib = 1024 * 1024
+	dir := t.TempDir()
+	path := filepath.Join(dir, "window.dat")
+	content := append(append([]byte{}, bytesRepeat("A", mib)...), bytesRepeat("B", mib)...)
+	content = append(content, bytesRepeat("C", mib)...)
+	require.NoError(t, os.WriteFile(path, content, 0o644))
+
+	q := newTestQueue(t)
+	task := newTask(t, path, "bucket1", "ic51/window.dat")
+	task.UploadID = "window-upload-id"
+	task.CompletedParts = `{"parts":[]}`
+	st, err := os.Stat(path)
+	require.NoError(t, err)
+	task.PartsFileMtime = st.ModTime().Unix()
+	task.PartsFileSize = st.Size()
+	require.NoError(t, q.Enqueue(task))
+
+	store := newIC51MultipartStore()
+	store.mockStore.uploadID = "window-fresh"
+	// Remote holds parts 1 and 3 (non-contiguous), both with ETags of the
+	// ORIGINAL bytes — the pre-check over parts 1 and 3 passes on the
+	// original content.
+	store.listParts = []minio.ObjectPart{
+		{PartNumber: 1, ETag: md5Hex(content[:mib]), Size: int64(mib)},
+		{PartNumber: 3, ETag: md5Hex(content[2*mib:]), Size: int64(mib)},
+	}
+	store.remotePartData[1] = content[:mib]
+	store.remotePartData[3] = content[2*mib:]
+
+	// The ordered loop: part 1 (skipped — read+verified against the ORIGINAL
+	// content), part 2 (uploaded), part 3 (skipped). Rewrite part 3's range
+	// while part 2 streams: the pre-check for part 3 has ALREADY passed, but
+	// the bytes about to enter the digest differ from what the remote holds.
+	rewritten := false
+	store.beforePutPart = func(partNum int) {
+		if partNum == 2 && !rewritten {
+			rewritten = true
+			f, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+			require.NoError(t, err)
+			_, err = f.WriteAt(bytesRepeat("D", mib), 2*mib)
+			require.NoError(t, err)
+			require.NoError(t, f.Close())
+		}
+	}
+
+	u := newWithStore(store, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	result, err := u.UploadFile(context.Background(), task)
+	require.NoError(t, err, "the in-read ETag check discards the resume and the fresh upload of the current file succeeds")
+
+	// The stale upload (with remote part 3 of the ORIGINAL bytes) must be
+	// discarded: abort + fresh initiation + the current file fully uploaded
+	// — no splice, and the reported hash describes the current content.
+	assert.Equal(t, 1, store.mockStore.abortCalls,
+		"the rewrite window between pre-check and digest-feed must discard the resume")
+	assert.Equal(t, 1, store.mockStore.initCalls, "a fresh multipart upload is initiated after the discard")
+	// First attempt uploaded part 2 before part 3's in-read check tripped; the
+	// fresh attempt uploads ALL THREE parts from the current file.
+	assert.Equal(t, []int{2, 1, 2, 3}, store.uploadedPartNum,
+		"first attempt: part 2 up, part 3's in-read ETag check trips; after the discard NO part may be skipped")
+	current := append(append([]byte{}, content[:2*mib]...), bytesRepeat("D", mib)...)
+	assert.Equal(t, sha256Hex(store.object), result.SHA256,
+		"reported sha256 = hash of the object actually assembled")
+	assert.Equal(t, sha256Hex(current), result.SHA256,
+		"the object is the CURRENT file content (A+B+D), not a splice with the stale remote part 3")
+	assert.Equal(t, int64(3*mib), result.SizeBytes)
+}
+
+// TestIC51_Multipart_StreamedRanges_NoFullPartBuffer pins the rework-2 fix 2
+// helper contract: skipped-part ranges are processed STREAMING (io.Copy into
+// the digest/MD5 writers via LimitReader — no whole-part buffering; a part
+// can be 64 MiB and the agent runs on edge devices). Correctness of the
+// streamed digests and the short-read error path are asserted directly.
+func TestIC51_Multipart_StreamedRanges_NoFullPartBuffer(t *testing.T) {
+	const mib = 1024 * 1024
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stream.dat")
+	content := bytesRepeat("S", 16*mib)
+	require.NoError(t, os.WriteFile(path, content, 0o644))
+
+	// The streamed MD5 of the whole range equals the in-memory digest, and
+	// the byte count is exact.
+	got, n, err := streamRangeMD5(path, 0, int64(len(content)))
+	require.NoError(t, err)
+	assert.Equal(t, int64(len(content)), n)
+	h := md5.Sum(content)
+	assert.Equal(t, hex.EncodeToString(h[:]), got)
+
+	var count int64
+	sink := countingWriter{n: &count}
+	n, err = streamRangeInto(path, 4*mib, 8*mib, sink)
+	require.NoError(t, err)
+	assert.Equal(t, int64(8*mib), n)
+	assert.Equal(t, int64(8*mib), count)
+
+	// Short read is an error, not a partial success.
+	_, _, err = streamRangeMD5(path, 0, int64(len(content))+1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "shrank")
+}
+
+// countingWriter counts bytes written to it (a test sink for
+// streamRangeInto).
+type countingWriter struct{ n *int64 }
+
+func (w countingWriter) Write(p []byte) (int, error) {
+	*w.n += int64(len(p))
+	return len(p), nil
+}
