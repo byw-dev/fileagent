@@ -42,6 +42,17 @@
 # traverse into it, and the Docker daemon resolves bind mounts as root
 # regardless of file mode.
 #
+# Operational invariants of that model (rework 1):
+#   * Rendering must ALWAYS be done by the SAME uid. Root must not take over
+#     a directory another user rendered (the ownership gate below refuses
+#     it on purpose): 0644 files under a directory some other uid can
+#     re-permission would void the 0700 guarantee. Re-render as the owning
+#     user, or move the directory aside and render fresh.
+#   * Upgrading an existing deployment from the 0600 scheme: re-run this
+#     renderer once after upgrading (as the same uid that owns the config
+#     directory). init-seaweedfs.sh only invokes the renderer when the files
+#     are MISSING, so stale 0600 files are not fixed by running init alone.
+#
 # The DEFAULTS below are development placeholders shared with
 # init-seaweedfs.sh and the seaweedfs branch of smoke.sh via
 # deploy/seaweedfs/env-defaults.sh (single source of truth) — they are NOT
@@ -220,6 +231,60 @@ if [ -L "${SW_CONFIG_DIR}" ]; then
   exit 1
 fi
 mkdir -p "${SW_CONFIG_DIR}"
+# --- Parent-directory trust gate (rework 1, review R1-1) --------------------
+# With the files at 0644, the 0700 SW_CONFIG_DIR is the only thing keeping
+# other host users away from the credentials — so nobody may be able to swap
+# that directory out from under us after the chmod. On Linux, renaming a
+# directory entry requires write permission on the PARENT directory, so the
+# direct parent must be trusted BEFORE anything containing credentials is
+# rendered: owned by us or root, and not group/other-writable unless the
+# sticky bit is set (sticky makes renames safe: only the entry's owner, the
+# directory owner, or root may rename/remove it — same rule that makes /tmp
+# usable). This closes the swap attack master did not have (0600 files stayed
+# unreadable even under a swapped directory); a fd/inode-pinning scheme would
+# be stronger still but is deliberately out of scope (keep it simple, check
+# the path once, render).
+#
+# Symlinked parents: checked as RESOLVED. We deliberately do NOT reject a
+# parent that is a symlink — unlike SW_CONFIG_DIR itself (rejected above,
+# because we chmod IT), we only need the real parent's owner/write bits, and
+# stat(1) below already follows links, so the check lands on the directory
+# that actually mediates renames. The residual risk of the link being
+# re-pointed between check and use is the same class as any path-based check
+# and is not worsened by 0644 (master had it too); accepted for simplicity.
+PARENT_DIR="$(dirname -- "${SW_CONFIG_DIR}")"
+# mode: GNU `stat -c %a` prints up to 4 octal digits incl. sticky (1777);
+# BSD `stat -f %Lp` DROPS the sticky bit (777), so use %p which keeps the
+# full st_mode (e.g. 41777) — masked with 07777 below to drop the file-type
+# nibble (4/10/…). Both then feed the same octal arithmetic.
+P_UID="$(stat -c '%u' "${PARENT_DIR}" 2>/dev/null || stat -f '%u' "${PARENT_DIR}")"
+P_MODE="$(stat -c '%a' "${PARENT_DIR}" 2>/dev/null || stat -f '%p' "${PARENT_DIR}")"
+# Normalize the mode into OCTAL DIGITS (no prefix) so every later use can
+# prefix 8# exactly once: GNU %a and BSD %p both yield octal digits only, but
+# results of $((…)) are DECIMAL and must never be re-prefixed. Mask 07777
+# drops BSD's file-type nibble (41777 → 01777); printf re-renders as octal.
+_MODE_DEC="$(( 8#${P_MODE} & 07777 ))"
+P_MODE="$(printf '%04o' "${_MODE_DEC}")"
+if [ "${P_UID}" != "0" ] && [ "${P_UID}" != "$(id -u)" ]; then
+  echo "ERROR: parent directory of SW_CONFIG_DIR is not trusted — refusing to render." >&2
+  echo "       ${PARENT_DIR} is owned by uid=${P_UID} (mode ${P_MODE}); only the current" >&2
+  echo "       user (uid=$(id -u)) or root may own it. With the published files at 0644," >&2
+  echo "       a foreign owner of the parent could swap the 0700 directory aside and read" >&2
+  echo "       the credentials. Fix: chown the parent to the rendering user (or root), or" >&2
+  echo "       point SW_CONFIG_DIR somewhere under a directory you own." >&2
+  exit 1
+fi
+# Group/other writable is acceptable ONLY with the sticky bit (mode & 01000):
+# sticky restricts rename/unlink to the entry owner, directory owner or root —
+# the same rule that makes a 1777 /tmp safe to use.
+if [ "$(( 8#${P_MODE} & 0022 ))" -ne 0 ] && [ "$(( 8#${P_MODE} & 01000 ))" -eq 0 ]; then
+  echo "ERROR: parent directory of SW_CONFIG_DIR is writable by group/other without the" >&2
+  echo "       sticky bit — refusing to render. ${PARENT_DIR} (uid=${P_UID}, mode ${P_MODE})" >&2
+  echo "       could let another user rename the 0700 config directory aside and read the" >&2
+  echo "       0644 credentials inside. Fix: chmod go-w ${PARENT_DIR} (or chmod +t if it" >&2
+  echo "       must stay shared), or point SW_CONFIG_DIR elsewhere." >&2
+  exit 1
+fi
 # --- Directory permission gate (B7, 2026-11-06) -----------------------------
 # SW_CONFIG_DIR must end up 0700 (see the permission-model note in the file
 # header). Cases, all fail-closed:
@@ -236,8 +301,12 @@ mkdir -p "${SW_CONFIG_DIR}"
 #   * newly created — mkdir already applied the umask, chmod pins it exactly.
 if [ -d "${SW_CONFIG_DIR}" ] && [ "$(id -u)" != "$(stat -c '%u' "${SW_CONFIG_DIR}" 2>/dev/null || stat -f '%u' "${SW_CONFIG_DIR}")" ]; then
   echo "ERROR: SW_CONFIG_DIR (${SW_CONFIG_DIR}) is owned by another user — cannot enforce 0700." >&2
-  stat -c '       current: owner uid=%u mode=%a' "${SW_CONFIG_DIR}" 2>/dev/null \
-    || stat '       current: %Su %Sp' "${SW_CONFIG_DIR}" >&2
+  # Diagnostics only (rework 1, review R1-2): both branches redirect to stderr
+  # and `|| true` keeps a failing diagnostic from aborting under set -e — the
+  # fix suggestions and exit 1 below MUST stay reachable. BSD/macOS needs
+  # `stat -f`; GNU coreutils needs `stat -c`.
+  { stat -c '       current: owner uid=%u mode=%a' "${SW_CONFIG_DIR}" 2>/dev/null \
+      || stat -f '       current: owner=%Su mode=%Sp' "${SW_CONFIG_DIR}" 2>/dev/null; } || true
   echo "       Fix suggestions: chown the directory to the user running this script" >&2
   echo "       (sudo chown -R $(id -u) ${SW_CONFIG_DIR}), or move it aside and let the" >&2
   echo "       renderer create a fresh one (mv ${SW_CONFIG_DIR} ${SW_CONFIG_DIR}.old)." >&2
