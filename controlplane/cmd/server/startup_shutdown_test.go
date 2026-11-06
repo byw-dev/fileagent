@@ -25,6 +25,11 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
+// noServeFatal is an always-empty serveFatal channel for the happy/signal
+// paths (a nil channel would block forever in the select, which is also fine,
+// but an explicit empty one documents intent).
+func noServeFatal() chan error { return make(chan error, 1) }
+
 func testCfg() *config.Config {
 	return &config.Config{
 		MinIOEndpoint:  "s3.test:9000",
@@ -49,7 +54,7 @@ func TestAwaitShutdownOrSelfCheckFailure_DeterministicUnderRace(t *testing.T) {
 		ch := make(chan *startupcheck.Failure, 1)
 		ch <- &startupcheck.Failure{Item: "s3-identity", Class: startupcheck.ClassAuthConfig}
 
-		code := awaitShutdownOrSelfCheckFailure(ctx, ch, logger, cfg)
+		code := awaitShutdownOrSelfCheckFailure(ctx, ch, noServeFatal(), logger, cfg)
 		require.NotZerof(t, code, "round %d: 自检失败与信号同时就绪时退出码为 0 —— 失败被吞（rework 1 finding 1 回归）", i)
 	}
 }
@@ -63,7 +68,7 @@ func TestAwaitShutdownOrSelfCheckFailure_FailureOnly(t *testing.T) {
 	ch := make(chan *startupcheck.Failure, 1)
 	ch <- &startupcheck.Failure{Item: "sts-assume-role", Class: startupcheck.ClassAuthConfig}
 
-	code := awaitShutdownOrSelfCheckFailure(ctx, ch, logger, cfg)
+	code := awaitShutdownOrSelfCheckFailure(ctx, ch, noServeFatal(), logger, cfg)
 	assert.Equal(t, 1, code)
 	// tie-break 已把失败取走；再 drain 不应有残留。
 	_, ok := drainStartupCheckFailure(ch)
@@ -78,7 +83,7 @@ func TestAwaitShutdownOrSelfCheckFailure_SignalOnly(t *testing.T) {
 	cancel()
 	ch := make(chan *startupcheck.Failure, 1)
 
-	code := awaitShutdownOrSelfCheckFailure(ctx, ch, logger, cfg)
+	code := awaitShutdownOrSelfCheckFailure(ctx, ch, noServeFatal(), logger, cfg)
 	assert.Zero(t, code)
 }
 
@@ -92,7 +97,7 @@ func TestAwaitShutdownOrSelfCheckFailure_LateFailureAfterSignal(t *testing.T) {
 	cancel()
 	ch := make(chan *startupcheck.Failure, 1) // still empty
 
-	code := awaitShutdownOrSelfCheckFailure(ctx, ch, logger, cfg)
+	code := awaitShutdownOrSelfCheckFailure(ctx, ch, noServeFatal(), logger, cfg)
 	assert.Zero(t, code)
 }
 
@@ -110,7 +115,7 @@ func TestAwaitShutdownOrSelfCheckFailure_LogsErrorNotFatal(t *testing.T) {
 		Err: assert.AnError, Window: 15 * time.Second, Attempts: 5,
 	}
 
-	code := awaitShutdownOrSelfCheckFailure(ctx, ch, logger, cfg)
+	code := awaitShutdownOrSelfCheckFailure(ctx, ch, noServeFatal(), logger, cfg)
 	assert.Equal(t, 1, code)
 
 	entries := obs.FilterMessage("storage startup self-check failed — refusing to run with a broken storage identity (IC-BUG-40)")
@@ -143,4 +148,70 @@ func TestDrainStartupCheckFailure(t *testing.T) {
 	if !ok || got != want {
 		t.Fatalf("drain(filled) = %v, %v; want %v, true", got, ok, want)
 	}
+}
+
+// ── Rework 2 finding 2: serveFatal must be a first-class wait input ─────────
+
+// serveFatal 有错误时必须立即唤醒等待并返回非零 —— listener 中途退出不能
+// 让进程挂着（master 上这种情况直接退出；返工 1 的单次事后轮询会永远挂起）。
+// 用超时壳包住调用：挂死时给出一条明确失败，而不是整个测试二进制 panic。
+func TestAwaitShutdownOrSelfCheckFailure_ServeFatalWakes(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := testCfg()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan *startupcheck.Failure, 1)
+	sf := make(chan error, 1)
+	sf <- assert.AnError // a listener died
+
+	done := make(chan int, 1)
+	go func() { done <- awaitShutdownOrSelfCheckFailure(ctx, ch, sf, logger, cfg) }()
+	select {
+	case code := <-done:
+		assert.Equal(t, 1, code)
+	case <-time.After(10 * time.Second):
+		t.Fatal("serveFatal 有错误时等待未唤醒 —— 进程会挂着不退出（rework 2 finding 2 回归：serveFatal 未参与等待）")
+	}
+}
+
+// serveFatal 为空且无其他事件时必须**阻塞**等待（不能提前返回 0）：用短超时
+// goroutine 断言函数在窗口内未返回 —— 这就是「中途退出挂死」回归的反向守护。
+func TestAwaitShutdownOrSelfCheckFailure_BlocksWhileServing(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := testCfg()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan *startupcheck.Failure, 1)
+	sf := make(chan error, 1)
+
+	returned := make(chan int, 1)
+	go func() { returned <- awaitShutdownOrSelfCheckFailure(ctx, ch, sf, logger, cfg) }()
+	select {
+	case <-returned:
+		t.Fatal("无任何事件时提前返回 —— 进程会在无故障时退出（假阳性）")
+	case <-time.After(50 * time.Millisecond):
+		// still waiting: correct.
+	}
+	cancel() // release the goroutine via the signal path
+	select {
+	case code := <-returned:
+		assert.Zero(t, code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel 后未返回 —— 等待不响应 ctx")
+	}
+}
+
+// 自检失败与 serveFatal 同时就绪：非零（任一故障路径都不得被吞）。
+func TestAwaitShutdownOrSelfCheckFailure_FailureAndServeFatalBothReady(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := testCfg()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan *startupcheck.Failure, 1)
+	ch <- &startupcheck.Failure{Item: "s3-identity"}
+	sf := make(chan error, 1)
+	sf <- assert.AnError
+
+	code := awaitShutdownOrSelfCheckFailure(ctx, ch, sf, logger, cfg)
+	assert.Equal(t, 1, code)
 }

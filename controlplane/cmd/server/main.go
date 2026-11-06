@@ -219,6 +219,7 @@ func run() int {
 	// ── Run migrations ───────────────────────────────────────────────────────
 	if err := db.Migrate(cfg.DatabaseURL, migrations.FS, logger); err != nil {
 		logger.Error("database migration failed", zap.Error(err))
+		return 1 // rework 2 finding 1: continue-on-failure would serve on a broken schema (master: Fatal)
 	}
 
 	// ── Connect to database ──────────────────────────────────────────────────
@@ -228,6 +229,7 @@ func run() int {
 	database, err := db.Open(ctx, cfg.DatabaseURL, logger)
 	if err != nil {
 		logger.Error("database connection failed", zap.Error(err))
+		return 1 // rework 2 finding 1: nil DB would panic on first use; return BEFORE defer database.Close (database is nil)
 	}
 	defer database.Close()
 
@@ -235,6 +237,7 @@ func run() int {
 	redisClient, err := cache.New(cfg.RedisURL, logger)
 	if err != nil {
 		logger.Error("redis connection failed", zap.Error(err))
+		return 1 // rework 2 finding 1: nil client would panic later; return BEFORE its defer
 	}
 	defer redisClient.Close()
 
@@ -242,6 +245,7 @@ func run() int {
 	natsConn, err := natsgo.Connect(cfg.NATSURL)
 	if err != nil {
 		logger.Error("NATS connection failed", zap.Error(err))
+		return 1 // rework 2 finding 1: nil conn would panic later; return BEFORE its defer
 	}
 	defer natsConn.Close()
 	nats := &natsPublisher{conn: natsConn}
@@ -260,6 +264,7 @@ func run() int {
 	)
 	if err != nil {
 		logger.Error("bootstrap admin failed", zap.Error(err))
+		return 1 // rework 2 finding 1: no admin account = deployment unusable (master: Fatal)
 	}
 	if bootstrapResult.Created {
 		credentialsPath, err := writeBootstrapCredentials(
@@ -269,6 +274,7 @@ func run() int {
 		)
 		if err != nil {
 			logger.Error("write bootstrap admin credentials file failed", zap.Error(err))
+			return 1 // rework 2 finding 1: first-admin password would be lost with no recovery path (master: Fatal)
 		}
 		logger.Warn("bootstrap admin user created",
 			zap.String("username", bootstrapResult.Username),
@@ -284,6 +290,7 @@ func run() int {
 		)
 		if err != nil {
 			logger.Error("write bootstrap admin credentials file failed", zap.Error(err))
+			return 1 // rework 2 finding 1: the reset password would be lost with no recovery path (master: Fatal)
 		}
 		logger.Warn("bootstrap admin password reset by configuration",
 			zap.String("username", bootstrapResult.Username),
@@ -293,6 +300,7 @@ func run() int {
 	}
 	if err := bootstrap.EnsureDefaultBuckets(ctx, queries, bootstrap.DefaultOrgID); err != nil {
 		logger.Error("bootstrap default buckets failed", zap.Error(err))
+		return 1 // rework 2 finding 1: the self-check probe bucket would not exist (master: Fatal)
 	}
 
 	agentMgr := agent.NewManager(queries, redisClient, authSvc, nats, logger, cfg.AgentTokenTTL)
@@ -322,6 +330,7 @@ func run() int {
 	})
 	if err != nil {
 		logger.Error("minio admin client init failed", zap.Error(err))
+		return 1 // rework 2 finding 1: nil client would panic later (master: Fatal)
 	}
 	// Presign client on the PUBLIC endpoint. PresignedGetObject signs locally
 	// (no network call), so this only fixes the host the URL is signed for — it
@@ -332,6 +341,7 @@ func run() int {
 	})
 	if err != nil {
 		logger.Error("minio presign client init failed", zap.Error(err))
+		return 1 // rework 2 finding 1: nil client would panic later (master: Fatal)
 	}
 
 	webhookSender := event.NewWebhookSender(event.NewDBAdapter(database), logger)
@@ -350,12 +360,14 @@ func run() int {
 	grpcSrv.WithStateDB(queries)
 	grpcSrv.WithDirResultStore(dirStore)
 	grpcSrv.WithDryRunStore(dryRunStore)
-	// Rework 1 finding 2 (spirit): a listener that dies mid-run is a process
-	// that cannot continue — but it must still exit through the shutdown path
-	// (Fatal would os.Exit(1) from this goroutine and skip every defer). The
-	// error is handed to the same shutdown orchestration as the self-check
-	// failure: serveFatal cancels ctx, the select below wakes, the shutdown
-	// block runs, run() returns non-zero.
+	// Rework 1+2: a listener (or the storage-event-source adapter, which is
+	// initialized later) that dies mid-run means the process cannot continue
+	// serving — but it must still exit through the shutdown path (a Fatal here
+	// would os.Exit(1) from a goroutine and skip every defer). The error is
+	// handed to serveFatal; awaitShutdownOrSelfCheckFailure WAITS on it as a
+	// first-class input (rework 2 finding 2: the old single post-hoc poll
+	// would hang forever when only a listener died), then the shutdown block
+	// below runs and run() returns non-zero.
 	serveFatal := make(chan error, 2)
 	go func() {
 		if err := grpcSrv.Run(cfg.GRPCPort); err != nil {
@@ -486,6 +498,14 @@ func run() int {
 		})
 		if err != nil {
 			logger.Error("storage event source adapter init failed", zap.Error(err))
+			// Rework 2 finding 1: master exited here via Fatal. The gRPC
+			// listener is already up, so this must go through the shutdown
+			// path, not a bare return: hand the error to serveFatal — the
+			// shutdown orchestration below wakes on it, runs the shutdown
+			// block (ctx cancel, HTTP shutdown, event-source join), and
+			// run() returns non-zero.
+			serveFatal <- err
+			done = nil // nothing to join; keep adapterDone nil-safe
 		}
 		adapterDone = done
 	} else {
@@ -602,16 +622,10 @@ func run() int {
 	// — a self-check failure wins over a coincidental signal — record the
 	// diagnostics with Error, and let the shutdown block below complete before
 	// run() returns the non-zero code.
-	exitCode := awaitShutdownOrSelfCheckFailure(ctx, selfCheckFailed, logger, cfg)
-	// A listener that died mid-run (gRPC/HTTP serve error) also fails the
-	// process — same non-zero exit through the same shutdown path.
-	select {
-	case <-serveFatal:
-		if exitCode == 0 {
-			exitCode = 1
-		}
-	default:
-	}
+	// Rework 2 finding 2: serveFatal participates IN the wait — a listener
+	// (or late-init adapter) that dies must wake the shutdown path itself;
+	// a single post-hoc poll would hang forever if nothing else fired.
+	exitCode := awaitShutdownOrSelfCheckFailure(ctx, selfCheckFailed, serveFatal, logger, cfg)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -653,6 +667,7 @@ func run() int {
 func awaitShutdownOrSelfCheckFailure(
 	ctx context.Context,
 	selfCheckFailed <-chan *startupcheck.Failure,
+	serveFatal <-chan error,
 	logger *zap.Logger,
 	cfg *config.Config,
 ) int {
@@ -663,6 +678,13 @@ func awaitShutdownOrSelfCheckFailure(
 	case failure := <-selfCheckFailed:
 		exitCode = 1
 		logSelfCheckFailure(logger, cfg, failure)
+	case err := <-serveFatal:
+		// Rework 2 finding 2: a listener (gRPC/HTTP serve) or the storage
+		// event source adapter died — the process cannot continue serving.
+		// The error itself was already logged at its origin; here we only
+		// convert it into the fail-closed exit code.
+		_ = err
+		exitCode = 1
 	}
 	// Deterministic tie-break: even if the signal fired first, a pending
 	// failure converts the exit into the fail-closed one. buffered(1) +
