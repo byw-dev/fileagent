@@ -180,6 +180,10 @@ func TestUploader_Multipart_Integration(t *testing.T) {
 		StoragePath: "uploads/multipart-test.bin",
 		Bucket:      bucket,
 	}
+	// The uploader persists multipart progress via the queue (IC-3 P1-c:
+	// the FIRST persist is fatal when the task row is absent), so the task
+	// must actually be enqueued.
+	require.NoError(t, q.Enqueue(task))
 
 	result, err := u.UploadFile(ctx, task)
 	require.NoError(t, err)
@@ -238,6 +242,8 @@ func TestUploader_Resume_Integration(t *testing.T) {
 
 	// Create the upload task with the existing UploadID. CompletedParts is
 	// intentionally empty — verifyRemoteParts will fetch the real list from MinIO.
+	// The version snapshot must match the current file or the fail-closed
+	// resume gate (IC-3 R-A) discards the recorded parts as unversioned.
 	task := &queue.UploadTask{
 		ID:          "it-resume-1",
 		RuleID:      "rule-1",
@@ -246,6 +252,11 @@ func TestUploader_Resume_Integration(t *testing.T) {
 		Bucket:      bucket,
 		UploadID:    uploadID,
 	}
+	st, err := os.Stat(filePath)
+	require.NoError(t, err)
+	task.PartsFileMtime = st.ModTime().Unix()
+	task.PartsFileSize = st.Size()
+	require.NoError(t, q.Enqueue(task))
 
 	logger, _ := zap.NewDevelopment()
 	u, err := uploader.New(uploader.Config{
