@@ -56,10 +56,9 @@ jobs:
           go-version-file: tools/go.mod
           # run.sh 会构建两份 Go 产物：controlplane（仓库主模块）和
           # faultproxy（test/fault-injection/faultproxy 是独立 Go 模块、
-          # GOWORK=off 单独构建）。两条都列上，模块缓存才齐。
-          cache-dependency-path: |
-            controlplane/go.sum
-            test/fault-injection/faultproxy/go.sum
+          # GOWORK=off 单独构建，但它零第三方依赖、没有 go.sum）。所以模块
+          # 缓存键只需要 controlplane/go.sum。
+          cache-dependency-path: controlplane/go.sum
 
       # 预检：run.sh 的工具门控只接受 aws-cli/2.*（v1 的 profile 配置/校验
       # 行为与验证过的路径不同，fail-closed）。ubuntu-latest 自带 v2，但版本
