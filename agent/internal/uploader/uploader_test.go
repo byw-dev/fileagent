@@ -195,10 +195,12 @@ func TestUploadFile_Multipart_ResumeFromQueue(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, bytes.Repeat([]byte("B"), size), 0o644))
 
 	// Pre-populate task with an existing upload ID and one completed part.
+	// IC-BUG-51: the remote ETag must be the REAL md5 of the part's bytes
+	// ("B" * 1 MiB) — a resume now verifies it against the local range.
 	task := newTask(t, path, "bucket3", "resume/file.dat")
 	task.UploadID = "existing-upload-id"
 	// Part 1 already done.
-	task.CompletedParts = `{"parts":[{"part_number":1,"etag":"part-etag-1"}]}`
+	task.CompletedParts = `{"parts":[{"part_number":1,"etag":"` + md5Hex(bytes.Repeat([]byte("B"), 1024*1024)) + `"}]}`
 	// R-A: a matching file-version snapshot — without one the resume would
 	// discard the parts as unversioned.
 	if info, statErr := os.Stat(path); assert.NoError(t, statErr) {
@@ -208,7 +210,7 @@ func TestUploadFile_Multipart_ResumeFromQueue(t *testing.T) {
 
 	store := &mockStore{
 		uploadID: "existing-upload-id",
-		parts:    []minio.ObjectPart{{PartNumber: 1, ETag: "part-etag-1"}},
+		parts:    []minio.ObjectPart{{PartNumber: 1, ETag: md5Hex(bytes.Repeat([]byte("B"), 1024*1024))}},
 	}
 	q := newTestQueue(t)
 	require.NoError(t, q.Enqueue(task))
@@ -292,7 +294,7 @@ func TestUploadFile_Multipart_ResumeAfterCrash(t *testing.T) {
 	// value forces a fresh initiation and the test fails below.
 	store2 := &mockStore{
 		uploadID: restarted.UploadID,
-		parts:    []minio.ObjectPart{{PartNumber: 1, ETag: "part-etag-1"}},
+		parts:    []minio.ObjectPart{{PartNumber: 1, ETag: md5Hex(bytes.Repeat([]byte("D"), 1024*1024))}},
 	}
 	u2 := newWithStore(store2, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
 	result, err := u2.UploadFile(context.Background(), restarted)
@@ -398,15 +400,16 @@ func TestUploadFile_FileMissing(t *testing.T) {
 	assert.Contains(t, err.Error(), "stat")
 }
 
-func TestFileSHA256(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "checksum.txt")
-	require.NoError(t, os.WriteFile(path, []byte("hello world"), 0o644))
-
-	sha, err := fileSHA256(path)
-	require.NoError(t, err)
-	assert.Len(t, sha, 64, "SHA-256 hex string should be 64 characters")
-	assert.NotEmpty(t, sha)
+func TestNormalizeETagAndComparability(t *testing.T) {
+	assert.Equal(t, "abc123", normalizeETag(`"ABC123"`))
+	assert.Equal(t, "abc123", normalizeETag("ABC123"))
+	assert.True(t, etagIsComparable(`"B8FC857A25E7958868C2F003D5E0952D"`))
+	assert.True(t, etagIsComparable("0123456789abcdef0123456789abcdef"))
+	// Composite multipart etag ("md5-N") is not comparable.
+	assert.False(t, etagIsComparable("b8fc857a25e7958868c2f003d5e0952d-5"))
+	// SSE / opaque etags are not comparable.
+	assert.False(t, etagIsComparable("not-a-md5-at-all"))
+	assert.False(t, etagIsComparable(""))
 }
 
 func TestLoadCompletedParts_InvalidJSON(t *testing.T) {
@@ -420,28 +423,23 @@ func TestLoadCompletedParts_Empty(t *testing.T) {
 	assert.Nil(t, u.loadCompletedParts(""))
 }
 
-func TestNewSectionReader_BadPath(t *testing.T) {
-	_, err := newSectionReader("/nonexistent/file.dat", 0, 100)
+// sectionReader helpers were removed with IC-BUG-51: parts now stream
+// through countingTeeReader (open + seek + LimitReader inline), so their
+// dedicated unit tests went with them — the offset/short-read paths are
+// covered by the part-upload tests.
+
+// TestUploadFile_MissingFile_Errors is the old fileSHA256-BadPath error path:
+// fileSHA256 was removed with IC-BUG-51 (the digest now comes from the upload
+// stream itself), so the equivalent error path is a missing file at stat time.
+func TestUploadFile_MissingFile_Errors(t *testing.T) {
+	store := &mockStore{}
+	q := newTestQueue(t)
+	task := newTask(t, "/nonexistent/file.dat", "bucket", "key")
+
+	u := newWithStore(store, Config{PartSizeMB: 64}, q, zap.NewNop())
+	_, err := u.UploadFile(context.Background(), task)
 	require.Error(t, err)
-}
-
-func TestNewSectionReader_WithOffset(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "data.bin")
-	require.NoError(t, os.WriteFile(path, []byte("AAABBBCCC"), 0o644))
-
-	sr, err := newSectionReader(path, 3, 3)
-	require.NoError(t, err)
-	defer sr.f.Close()
-
-	buf, err := io.ReadAll(sr)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("BBB"), buf)
-}
-
-func TestFileSHA256_BadPath(t *testing.T) {
-	_, err := fileSHA256("/nonexistent/file.dat")
-	require.Error(t, err)
+	assert.Contains(t, err.Error(), "stat")
 }
 
 func TestNewWithStore_DefaultPartSize(t *testing.T) {
@@ -450,105 +448,52 @@ func TestNewWithStore_DefaultPartSize(t *testing.T) {
 	assert.Equal(t, 64, u.cfg.ThresholdMB)
 }
 
-func TestUploadFile_TailMode_UploadsTailOnly(t *testing.T) {
-// Create a file with 10 bytes total.
-dir := t.TempDir()
-path := filepath.Join(dir, "data.txt")
-require.NoError(t, os.WriteFile(path, []byte("0123456789"), 0o644))
+// IC-BUG-46 / IC-BUG-51: tail tasks with a positive offset are refused by
+// the uploader itself now. The old behaviour uploaded only the suffix while
+// reporting a FULL-file digest — structurally incapable of describing the
+// delivered bytes — and PutObject would have replaced the whole object with
+// just the appended bytes. The executor refuses tail tasks before the
+// uploader already (fail-closed, IC-BUG-46); these tests pin the uploader's
+// own second guard so the invariant cannot be violated by any future caller.
+func TestUploadFile_TailMode_PositiveOffset_Refused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.txt")
+	require.NoError(t, os.WriteFile(path, []byte("0123456789"), 0o644))
 
-var received []byte
-store := &mockStore{
-putFn: func(_ context.Context, _, _ string, r io.Reader, _ int64, _ minio.PutObjectOptions) (minio.UploadInfo, error) {
-b, err := io.ReadAll(r)
-if err != nil {
-return minio.UploadInfo{}, err
-}
-received = b
-return minio.UploadInfo{ETag: "etag-tail"}, nil
-},
-}
-q, _ := queue.Open(":memory:")
-defer q.Close()
+	store := &mockStore{}
+	q, _ := queue.Open(":memory:")
+	defer q.Close()
 
-u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
-task := &queue.UploadTask{
-ID:          "t1",
-LocalPath:   path,
-StoragePath: "obj",
-Bucket:      "b",
-FileOffset:  5,
-AppendMode:  "tail",
+	u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
+	task := &queue.UploadTask{
+		ID: "t1", LocalPath: path, StoragePath: "obj", Bucket: "b",
+		FileOffset: 5, AppendMode: "tail",
+	}
+
+	_, err := u.UploadFile(context.Background(), task)
+	require.Error(t, err, "tail with offset > 0 must be refused, not uploaded as a suffix")
+	assert.Contains(t, err.Error(), "IC-BUG-46")
+	assert.Zero(t, store.putCalls, "nothing may be uploaded for a refused tail task")
 }
 
-res, err := u.UploadFile(context.Background(), task)
-require.NoError(t, err)
-assert.Equal(t, int64(5), res.SizeBytes)
-assert.Equal(t, []byte("56789"), received)
-}
+func TestUploadFile_TailMode_OffsetBeyondEnd_Refused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.txt")
+	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
 
-func TestUploadFile_TailMode_OffsetBeyondEnd_NoOp(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "data.txt")
-require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
+	store := &mockStore{}
+	q, _ := queue.Open(":memory:")
+	defer q.Close()
 
-store := &mockStore{}
-q, _ := queue.Open(":memory:")
-defer q.Close()
+	u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
+	task := &queue.UploadTask{
+		ID: "t2", LocalPath: path, StoragePath: "obj", Bucket: "b",
+		FileOffset: 10, AppendMode: "tail",
+	}
 
-u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
-task := &queue.UploadTask{
-ID:          "t2",
-LocalPath:   path,
-StoragePath: "obj",
-Bucket:      "b",
-FileOffset:  10, // beyond file end
-AppendMode:  "tail",
-}
-
-res, err := u.UploadFile(context.Background(), task)
-require.NoError(t, err)
-assert.Equal(t, int64(0), res.SizeBytes)
-}
-
-func TestUploadFile_SinglePart_SeekError(t *testing.T) {
-// Create a tiny file (1 byte) and try to seek to offset 5 — stat says size 1
-// so offset 5 >= size 1 so this becomes a no-op (no bytes to upload).
-dir := t.TempDir()
-path := filepath.Join(dir, "small.txt")
-require.NoError(t, os.WriteFile(path, []byte("x"), 0o644))
-
-store := &mockStore{}
-q, _ := queue.Open(":memory:")
-defer q.Close()
-
-u := newWithStore(store, Config{ThresholdMB: 1}, q, zap.NewNop())
-task := &queue.UploadTask{
-ID: "s1", LocalPath: path, StoragePath: "obj", Bucket: "b",
-FileOffset: 100, AppendMode: "tail",
-}
-// Offset >= file size: should return SizeBytes=0 without error.
-res, err := u.UploadFile(context.Background(), task)
-require.NoError(t, err)
-assert.Equal(t, int64(0), res.SizeBytes)
-}
-
-func TestNewSectionReader_InvalidPath(t *testing.T) {
-_, err := newSectionReader("/nonexistent/path.dat", 0, 10)
-require.Error(t, err)
-}
-
-func TestNewSectionReader_ZeroSize(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "data.bin")
-require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
-
-sr, err := newSectionReader(path, 2, 3)
-require.NoError(t, err)
-defer sr.f.Close()
-
-data, err := io.ReadAll(sr)
-require.NoError(t, err)
-assert.Len(t, data, 3)
+	_, err := u.UploadFile(context.Background(), task)
+	require.Error(t, err, "the uploader does not special-case offset >= size any more: the suffix upload is refused on invariant grounds")
+	assert.Zero(t, store.putCalls)
 }
 
 // TestNew_ValidEndpoint verifies that New creates an Uploader without requiring
@@ -784,7 +729,7 @@ func TestUploadFile_Multipart_ResumeUnchangedFileStillResumes(t *testing.T) {
 	restarted := rows[0]
 
 	store2 := &mockStore{uploadID: restarted.UploadID,
-		parts: []minio.ObjectPart{{PartNumber: 1, ETag: "part-etag-1"}}}
+		parts: []minio.ObjectPart{{PartNumber: 1, ETag: md5Hex(bytes.Repeat([]byte("B"), 1024*1024))}}}
 	u2 := newWithStore(store2, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
 	_, err = u2.UploadFile(context.Background(), restarted)
 	require.NoError(t, err)

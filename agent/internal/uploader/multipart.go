@@ -2,6 +2,9 @@ package uploader
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,7 +47,9 @@ type completedParts struct {
 // by tests and logs instead of being scattered across branches — scattered
 // conditions are exactly how the fail-open holes (A1/A2) slipped in.
 // Deliberate blind spot, shared with IC-BUG-10's mtime+size identity: a file
-// rewritten within the same second at the same size is undetectable.
+// rewritten within the same second at the same size is undetectable —
+// IC-BUG-51 closes that hole for the RESUME path via per-part ETag
+// verification (see hashResumePart below), not via stat identity.
 func canResumeParts(task *queue.UploadTask, current queue.FileVersion, statOK, isMultipart bool) (bool, string) {
 	if task.PartsFileMtime == 0 && task.PartsFileSize == 0 {
 		return false, "no version snapshot for the recorded parts (legacy row, untrusted)"
@@ -61,11 +66,32 @@ func canResumeParts(task *queue.UploadTask, current queue.FileVersion, statOK, i
 	return true, ""
 }
 
+// multipartUpload uploads a large file using multipart upload.
+//
+// IC-BUG-51 ORDER LAW — the full-file SHA-256 must be fed in PART-NUMBER
+// order, 1..totalParts, with exactly one write per byte of the final object:
+//   - a part uploaded in THIS attempt is hashed by TeeReader as it streams to
+//     PutObjectPart (the same bytes, the same read);
+//   - a part SKIPPED because the remote already has it is re-read from the
+//     local file at its range and hashed after its ETag has been verified
+//     against the re-read bytes' MD5 (hashResumePart). Those bytes entered the
+//     object during the earlier attempt; this attempt re-describes them from
+//     the local copy.
+//
+// Any other feeding order (e.g. hashing skipped parts lazily after later
+// parts) would produce a digest of a byte sequence that never existed as an
+// object. The digests and the delivered-byte count are the ONLY source for
+// UploadResult.SHA256 / SizeBytes — the stat snapshot is never used for them.
 func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, fv queue.FileVersion, size int64) (*UploadResult, error) {
 	partSize := int64(u.cfg.PartSizeMB) * 1024 * 1024
 
 	uploadID := task.UploadID
 	var doneParts []minio.CompletePart
+	// fullSHA is the ONE full-content digest required by the IC-BUG-51
+	// invariant. It is fed strictly in part-number order (see the order law
+	// above); SizeBytes is its byte counter, likewise.
+	fullSHA := sha256.New()
+	var hashedBytes int64
 
 	// The fail-closed resume gate already ran in UploadFile: reaching here
 	// with a non-empty upload ID means the recorded parts ARE trustworthy
@@ -96,6 +122,23 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 			uploadID = ""
 			doneParts = nil
 		} else if skipped := len(doneParts); skipped > 0 {
+			// IC-BUG-51: before any of these skipped parts may be trusted
+			// into the final object (and its digest), each part's ETag is
+			// verified against the MD5 of its CURRENT local bytes. The
+			// stat-based gates above cannot see an in-place rewrite that
+			// restores mtime and size; the ETag can. A mismatch (or an
+			// unreadable / short read of the range) aborts the resume via
+			// errStaleRemoteParts — UploadFile then discards the recorded
+			// upload and re-uploads from scratch.
+			//
+			// Cost note: this re-reads the skipped ranges (pure local I/O,
+			// no network) — the standard trade-off of S3 resume uploaders,
+			// and far cheaper than re-transmitting.
+			for _, p := range doneParts {
+				if err := u.hashResumePart(task, size, partSize, p, fullSHA, &hashedBytes); err != nil {
+					return nil, fmt.Errorf("%w: part %d: %v", errStaleRemoteParts, p.PartNumber, err)
+				}
+			}
 			// The acceptance evidence for IC-BUG-5 lives in this line: a resume
 			// must be visible in the log together with how many parts were
 			// skipped, and the upload ID must be the one recorded before the
@@ -156,7 +199,10 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 	}
 
 	totalParts := int((size + partSize - 1) / partSize)
-
+	// The resume verification above may have hashed the skipped prefix, but a
+	// failure discovered LATER in the set (part N's ETag mismatched) already
+	// aborted this attempt; reaching here means every skipped part fed the
+	// digest in order. Parts are hashed strictly ascending below.
 	for partNum := 1; partNum <= totalParts; partNum++ {
 		if _, already := doneSet[partNum]; already {
 			continue
@@ -168,16 +214,39 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 			pSize = remaining
 		}
 
-		r, err := newSectionReader(task.LocalPath, offset, pSize)
+		f, err := os.Open(task.LocalPath)
 		if err != nil {
 			return nil, fmt.Errorf("uploader: open part %d of %q: %w", partNum, task.LocalPath, err)
 		}
+		if offset > 0 {
+			if _, err = f.Seek(offset, io.SeekStart); err != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("uploader: seek %q to %d for part %d: %w", task.LocalPath, offset, partNum, err)
+			}
+		}
+		// IC-BUG-51: the part's bytes stream through the full-file digest on
+		// their way to the store — one read feeds both. A short file (the
+		// source shrank mid-upload) makes the count check below fail loudly.
+		md5h := md5.New()
+		body := &countingTeeReader{r: io.LimitReader(f, pSize), w: io.MultiWriter(fullSHA, md5h)}
 
 		part, err := u.store.PutObjectPart(ctx, task.Bucket, task.StoragePath, uploadID,
-			partNum, r, pSize, minio.PutObjectPartOptions{})
-		r.close()
+			partNum, body, pSize, minio.PutObjectPartOptions{})
+		_ = f.Close()
 		if err != nil {
 			return nil, fmt.Errorf("uploader: upload part %d: %w", partNum, err)
+		}
+		if body.n != pSize {
+			return nil, fmt.Errorf("uploader: part %d delivered %d bytes but declared %d (file changed during upload): %w",
+				partNum, body.n, pSize, errByteCountMismatch)
+		}
+		hashedBytes += body.n
+		// Cross-check the returned ETag against the MD5 of the bytes this
+		// call actually delivered (same rationale as the single-part check;
+		// non-comparable ETags are skipped, the byte-count check above does
+		// not depend on it).
+		if want := hex.EncodeToString(md5h.Sum(nil)); etagIsComparable(part.ETag) && normalizeETag(part.ETag) != want {
+			return nil, fmt.Errorf("uploader: part %d ETag %q does not match the delivered bytes (md5 %s)", partNum, part.ETag, want)
 		}
 
 		doneParts = append(doneParts, minio.CompletePart{
@@ -212,6 +281,16 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 		}
 	}
 
+	// The digest was fed in strict part order over every part of the object;
+	// its byte count must therefore equal the size this attempt planned to
+	// deliver. Any divergence means the ordering law above was violated —
+	// fail loudly rather than report a digest of a sequence that was never
+	// assembled.
+	if hashedBytes != size {
+		return nil, fmt.Errorf("uploader: hashed %d bytes across parts but the object size is %d: %w",
+			hashedBytes, size, errByteCountMismatch)
+	}
+
 	info, err := u.store.CompleteMultipartUpload(ctx, task.Bucket, task.StoragePath, uploadID, doneParts, minio.PutObjectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("uploader: complete multipart upload: %w", err)
@@ -221,7 +300,68 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 		StoragePath: task.StoragePath,
 		Bucket:      task.Bucket,
 		ETag:        info.ETag,
+		SHA256:      hex.EncodeToString(fullSHA.Sum(nil)),
+		SizeBytes:   hashedBytes,
 	}, nil
+}
+
+// hashResumePart re-reads the local byte range of a skipped (already-remote)
+// part, feeds it to the full-file digest in order, and verifies the part's
+// remote ETag against the MD5 of the re-read bytes. It returns an error when
+// the local content no longer matches what the remote holds — the caller
+// reacts by discarding the upload and starting over (IC-BUG-51: never splice
+// mismatched parts under a fresh digest).
+//
+// Failure modes all mean "cannot describe the object from local bytes":
+//   - ETag mismatch: the range's content changed since the part was uploaded
+//     (an in-place rewrite that restored mtime+size is invisible to every
+//     stat gate — the ETag is the only witness);
+//   - the remote ETag is not a comparable 32-hex MD5 (e.g. SSE, gateway
+//     quirk): treated as a mismatch — the safe direction is re-transmitting,
+//     never assuming compatibility;
+//   - the local read is short or errors (file truncated between attempts):
+//     the bytes the object holds cannot be re-derived, so the resume is off.
+func (u *Uploader) hashResumePart(task *queue.UploadTask, totalSize, partSize int64, part minio.CompletePart, fullSHA interface{ Write([]byte) (int, error) }, hashedBytes *int64) error {
+	offset := int64(part.PartNumber-1) * partSize
+	pSize := partSize
+	if remaining := totalSize - offset; remaining < pSize {
+		pSize = remaining
+	}
+	if pSize <= 0 || offset >= totalSize {
+		// A recorded part outside the planned object layout can never be
+		// described; treat as stale.
+		return fmt.Errorf("part range [%d,%d) is outside the object size %d", offset, offset+pSize, totalSize)
+	}
+
+	f, err := os.Open(task.LocalPath)
+	if err != nil {
+		return fmt.Errorf("open %q: %w", task.LocalPath, err)
+	}
+	defer f.Close()
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return fmt.Errorf("seek %q to %d: %w", task.LocalPath, offset, err)
+		}
+	}
+	md5h := md5.New()
+	n, err := io.Copy(io.MultiWriter(fullSHA, md5h), io.LimitReader(f, pSize))
+	if err != nil {
+		return fmt.Errorf("read %d bytes of range [%d,%d): %w", n, offset, offset+pSize, err)
+	}
+	if n != pSize {
+		// Short read: the file no longer contains the bytes the remote part
+		// holds (truncated between attempts). Not a mismatch to "verify"
+		// further — the local copy simply cannot describe the object.
+		return fmt.Errorf("local range [%d,%d) yielded only %d bytes (file shrank since the part was uploaded)", offset, offset+pSize, n)
+	}
+	if !etagIsComparable(part.ETag) {
+		return fmt.Errorf("remote ETag %q is not a comparable md5 digest", part.ETag)
+	}
+	if got := hex.EncodeToString(md5h.Sum(nil)); normalizeETag(part.ETag) != got {
+		return fmt.Errorf("remote ETag %s != local md5 %s for range [%d,%d)", normalizeETag(part.ETag), got, offset, offset+pSize)
+	}
+	*hashedBytes += n
+	return nil
 }
 
 // loadCompletedParts deserialises the parts JSON blob from the queue task.
@@ -250,30 +390,6 @@ func (u *Uploader) verifyRemoteParts(ctx context.Context, task *queue.UploadTask
 	*doneParts = remote
 	return nil
 }
-
-// sectionReader reads a fixed-length section of a file starting at offset.
-type sectionReader struct {
-	f      *os.File
-	reader io.Reader
-}
-
-// newSectionReader opens path and positions a LimitedReader at [offset, offset+size).
-func newSectionReader(path string, offset, size int64) (*sectionReader, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	if offset > 0 {
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			_ = f.Close()
-			return nil, err
-		}
-	}
-	return &sectionReader{f: f, reader: io.LimitReader(f, size)}, nil
-}
-
-func (s *sectionReader) Read(p []byte) (int, error) { return s.reader.Read(p) }
-func (s *sectionReader) close()                     { _ = s.f.Close() }
 
 // discardStaleUpload drops a recorded multipart upload whose parts the
 // fail-closed gate rejected. Order law (P1-c / R2 / A3): the durable abort

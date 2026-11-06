@@ -1,16 +1,15 @@
-// Package uploader uploads files to MinIO using either single-part or
-// multipart uploads depending on file size. It integrates with the SQLite
-// queue to support resume after agent restart.
 package uploader
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/minio/minio-go/v7"
@@ -138,8 +137,8 @@ func newWithStore(store ObjectStore, cfg Config, q *queue.Queue, logger *zap.Log
 	normalise(&cfg)
 	return &Uploader{
 		store:  store,
-		queue:  q,
 		cfg:    cfg,
+		queue:  q,
 		logger: logger,
 	}
 }
@@ -154,16 +153,37 @@ func normalise(cfg *Config) {
 	}
 }
 
+// errStaleRemoteParts signals that parts already uploaded to the remote (which
+// this attempt would skip) do not match the local bytes of their ranges: the
+// recorded multipart upload can never be completed into an object whose bytes
+// the local side can describe. UploadFile reacts by discarding the recorded
+// upload (durable abort intent + abort, same path as the version gate) and
+// uploading the current content from scratch — re-transmitting is always safe,
+// splicing mismatched parts never is.
+var errStaleRemoteParts = errors.New("uploader: remote parts do not match the local file bytes")
+
 // UploadFile uploads the file described by task to MinIO. It chooses between
 // single-part and multipart strategies based on file size, and honours any
 // partially-uploaded state stored in the queue.
 //
+// IC-BUG-51 invariant: on success, result.SHA256 and result.SizeBytes
+// describe, by construction, the bytes that were actually delivered to
+// PutObject / PutObjectPart on THIS attempt. There is no separate pre-read of
+// the file for hashing: the digest is computed over the very byte stream that
+// is handed to the object store (single part: one TeeReader over the upload
+// stream; multipart: one full-file sha256 fed in part-number order, where
+// skipped — already remote — parts are re-read locally and verified against
+// their remote ETag first). SizeBytes is the byte count of that same stream,
+// never the stat size. Any disagreement between the count and the size
+// declared to the store fails the upload loudly; it is never reported as
+// success.
+//
 // ⚠️ IC-BUG-46: tasks with AppendMode "tail" are refused by the executor
-// BEFORE UploadFile is reached, so the tail-specific path below (offset > 0 →
-// Seek + PutObject to the same key) is currently unreachable. It must NOT be
-// re-enabled: PutObject replaces the whole object, so an incremental tail
-// upload would silently destroy the previously collected content. The correct
-// implementation (rolling chunks + server-side merge) is IC-15.
+// BEFORE UploadFile is reached. UploadFile additionally refuses tail tasks
+// with a positive offset itself (see below) so the invariant cannot be
+// violated at the code level either: an incremental suffix upload can never be
+// described by a full-file hash. The correct implementation (rolling chunks +
+// server-side merge) is IC-15.
 func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*UploadResult, error) {
 	info, err := os.Stat(task.LocalPath)
 	if err != nil {
@@ -171,26 +191,19 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 	}
 	fileSize := info.Size()
 
-	// For tail mode, only upload the new bytes since the last upload.
-	offset := task.FileOffset
-	if task.AppendMode == "tail" && offset > 0 {
-		if offset >= fileSize {
-			// No new bytes — nothing to upload.
-			return &UploadResult{
-				StoragePath: task.StoragePath,
-				Bucket:      task.Bucket,
-				SizeBytes:   0,
-			}, nil
-		}
-	} else {
-		offset = 0
+	// Tail mode with a positive offset uploads only the bytes after the
+	// offset, so a full-content digest could never describe the delivered
+	// bytes (IC-BUG-51 invariant) — the old code hashed the whole file and
+	// reported that hash alongside a suffix upload. Refuse instead: the
+	// executor's fail-closed gate (IC-BUG-46) already blocks every tail task
+	// before this point, and this second guard keeps the invariant true at
+	// the uploader level too, for any future caller. Tail mode with offset 0
+	// is a plain full upload and remains supported.
+	if task.AppendMode == "tail" && task.FileOffset > 0 {
+		return nil, fmt.Errorf("uploader: append_mode=tail with offset %d > 0 is unsupported (IC-BUG-46): an incremental tail upload would both replace the whole object with only the appended bytes and be un-describable by a full-content digest; the correct implementation is IC-15", task.FileOffset)
 	}
+	offset := int64(0)
 	uploadSize := fileSize - offset
-
-	sha, err := fileSHA256(task.LocalPath)
-	if err != nil {
-		return nil, fmt.Errorf("uploader: sha256 %q: %w", task.LocalPath, err)
-	}
 
 	u.logger.Info("uploader: uploading file",
 		zap.String("path", task.LocalPath),
@@ -229,14 +242,33 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 
 	if isMultipart {
 		result, err = u.multipartUpload(ctx, task, current, fileSize)
+		// The ETag verification of skipped parts can fail even when every
+		// stat-based gate passed (same size, same mtime — e.g. an in-place
+		// rewrite that restored mtime). The recorded parts are then unusable:
+		// discard the upload exactly like the version gate does and upload
+		// the current content from scratch. Re-transmitting is the safe
+		// direction; silently splicing mismatched parts under a fresh hash
+		// is the IC-BUG-51 failure mode and must never happen.
+		if errors.Is(err, errStaleRemoteParts) {
+			u.logger.Warn("uploader: recorded parts do not match the local bytes (ETag mismatch), discarding the upload and starting over",
+				zap.String("task_id", task.ID),
+				zap.String("upload_id", task.UploadID))
+			if derr := u.discardStaleUpload(ctx, task, task.UploadID); derr != nil {
+				return nil, fmt.Errorf("uploader: discard stale multipart upload %q: %w", task.UploadID, derr)
+			}
+			task.UploadID = ""
+			task.CompletedParts = ""
+			result, err = u.multipartUpload(ctx, task, current, fileSize)
+		}
 	} else {
 		result, err = u.singlePartUpload(ctx, task, offset, uploadSize)
 	}
 	if err != nil {
 		return nil, err
 	}
-	result.SHA256 = sha
-	result.SizeBytes = uploadSize
+	// result.SHA256 / result.SizeBytes are already filled by the upload path
+	// from the single byte stream it delivered (IC-BUG-51). Deliberately NOT
+	// overwritten here from the stat snapshot.
 	return result, nil
 }
 
@@ -279,8 +311,17 @@ func (u *Uploader) AbandonUpload(ctx context.Context, task *queue.UploadTask) er
 
 // singlePartUpload uploads a file (or a portion of it) using PutObject.
 // offset is the byte position to start reading from; size is the number of
-// bytes to upload. When offset is 0 and size equals the full file size, the
-// entire file is uploaded.
+// bytes to upload.
+//
+// IC-BUG-51: the SHA-256 digest, the MD5 (for the opportunistic ETag
+// cross-check) and the delivered-byte count are all computed over the SAME
+// reader that is handed to PutObject — there is no second read of the file.
+// The reader is a plain io.Reader (not *os.File), so minio-go does not pin the
+// stream into an io.SectionReader; the request carries Content-Length = size
+// and the transport pulls exactly size bytes from this reader. Whatever the
+// file does during the upload, the digest therefore describes the bytes that
+// were actually sent. A short read (file truncated mid-upload) fails the
+// count check below loudly even if the store were to tolerate it.
 func (u *Uploader) singlePartUpload(ctx context.Context, task *queue.UploadTask, offset, size int64) (*UploadResult, error) {
 	f, err := os.Open(task.LocalPath)
 	if err != nil {
@@ -294,29 +335,85 @@ func (u *Uploader) singlePartUpload(ctx context.Context, task *queue.UploadTask,
 		}
 	}
 
-	info, err := u.store.PutObject(ctx, task.Bucket, task.StoragePath, f, size, minio.PutObjectOptions{})
+	sha := sha256.New()
+	md5h := md5.New()
+	body := &countingTeeReader{r: f, w: io.MultiWriter(sha, md5h)}
+
+	info, err := u.store.PutObject(ctx, task.Bucket, task.StoragePath, body, size, minio.PutObjectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("uploader: put object: %w", err)
+	}
+	if body.n != size {
+		return nil, fmt.Errorf("uploader: delivered %d bytes but declared %d (file changed during upload): %w",
+			body.n, size, errByteCountMismatch)
+	}
+	// Opportunistic cross-check: on the supported backends (live-verified for
+	// MinIO and SeaweedFS, see bin/b7-ic-bug-51/poc.md) the PutObject ETag is
+	// the MD5 of the delivered bytes. If the ETag is a comparable MD5 and it
+	// disagrees with what we just hashed, the store received something other
+	// than what we believe we sent — fail loudly rather than report success.
+	// A non-comparable ETag (e.g. SSE-encrypted objects) skips this check;
+	// the invariant above does not depend on it.
+	if want := hex.EncodeToString(md5h.Sum(nil)); etagIsComparable(info.ETag) && normalizeETag(info.ETag) != want {
+		return nil, fmt.Errorf("uploader: put object ETag %q does not match the delivered bytes (md5 %s)", info.ETag, want)
 	}
 
 	return &UploadResult{
 		StoragePath: task.StoragePath,
 		Bucket:      task.Bucket,
 		ETag:        info.ETag,
+		SHA256:      hex.EncodeToString(sha.Sum(nil)),
+		SizeBytes:   body.n,
 	}, nil
 }
 
-// fileSHA256 calculates the SHA-256 hash of the file at path.
-func fileSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
+// errByteCountMismatch reports that the number of bytes the store consumed
+// from the upload stream differs from the size declared to it. The upload is
+// never reported as success in that case.
+var errByteCountMismatch = errors.New("byte count mismatch")
 
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+// countingTeeReader is an io.TeeReader that also counts the bytes read. The
+// count is the authoritative "bytes actually moved" number for IC-BUG-51:
+// SizeBytes is taken from it, not from a stat snapshot.
+type countingTeeReader struct {
+	r io.Reader
+	w io.Writer
+	n int64
+}
+
+func (c *countingTeeReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		if _, werr := c.w.Write(p[:n]); werr != nil {
+			return n, werr
+		}
+		c.n += int64(n)
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return n, err
+}
+
+// normalizeETag canonicalises an S3 ETag for comparison with a locally
+// computed digest: surrounding quotes are stripped and hex letters folded to
+// lowercase (both appear in the wild; the PoC probe saw quoted ETags from the
+// AWS CLI view, unquoted from minio-go).
+func normalizeETag(etag string) string {
+	return strings.ToLower(strings.Trim(etag, `"`))
+}
+
+// etagIsComparable reports whether etag is a plain 32-hex-char MD5 digest —
+// the only form that can be compared against a locally computed MD5. Anything
+// else (an SSE-encrypted object's opaque ETag, a multipart composite
+// "md5-N" tag, a gateway-specific value) is not comparable, and callers treat
+// that as "cannot verify" rather than "verified".
+func etagIsComparable(etag string) bool {
+	e := normalizeETag(etag)
+	if len(e) != 32 {
+		return false
+	}
+	for _, c := range e {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return false
+		}
+	}
+	return true
 }
