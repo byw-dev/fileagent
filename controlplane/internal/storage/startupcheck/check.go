@@ -184,6 +184,13 @@ func Run(ctx context.Context, cfg Config) error {
 	defer cancelWindow()
 
 	var last *Failure
+	// lastSubstantive is the most recent attempt whose failure was NOT just
+	// the window deadline cutting the probe mid-flight. When the window
+	// expires ON a cut attempt, the terminal report must still name the
+	// SUBSTANTIVE cause (e.g. s3_code=NoSuchBucket → the bucket runbook)
+	// rather than a bare timeout — the operator reads the terminal line,
+	// not the retry warns (spec, rework 4 finding 1).
+	var lastSubstantive *Failure
 	delay := backoff
 	for attempt := 1; ; attempt++ {
 		// Parent cancelled first (SIGTERM): clean shutdown, not a failure.
@@ -191,6 +198,9 @@ func Run(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("startupcheck: aborted by context cancellation: %w", err)
 		}
 		last = attemptOnce(wctx, cfg, s3p, sts)
+		if last != nil && !isDeadlineCut(last.Err) {
+			lastSubstantive = last
+		}
 
 		if last == nil {
 			// Rework 4 finding 3: a success observed AFTER the window (or a
@@ -235,7 +245,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if wctx.Err() != nil {
 			// Window expired (or was cancelled together with the parent —
 			// the parent case is handled above): terminal failure.
-			return terminalFailure(cfg, last, attempt)
+			return terminalFailure(cfg, last, lastSubstantive, attempt)
 		}
 		retryFields := append(whitelistFields(last, cfg.Endpoint, cfg.AccessKey,
 			FixHint(cfg.RoleARN, cfg.ProbeBucket, last.Item, last.Diag)),
@@ -257,7 +267,7 @@ func Run(ctx context.Context, cfg Config) error {
 				if err := ctx.Err(); err != nil {
 					return fmt.Errorf("startupcheck: aborted by context cancellation: %w", err)
 				}
-				return terminalFailure(cfg, last, attempt)
+				return terminalFailure(cfg, last, lastSubstantive, attempt)
 			case <-time.After(wait):
 			}
 		}
@@ -270,16 +280,29 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+// isDeadlineCut reports whether err is the WINDOW deadline expiring mid-probe
+// (as opposed to a real answer from the wire / transport).
+func isDeadlineCut(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
 // terminalFailure fills in the window metadata, logs the terminal Error
 // with the whitelisted diagnostics (no error text), and returns the *Failure.
-func terminalFailure(cfg Config, last *Failure, attempt int) *Failure {
-	last.Window = cfg.Timeout
-	last.Attempts = attempt
+// When the final attempt was merely the deadline cutting an in-flight probe,
+// the SUBSTANTIVE last diagnostic is reported instead (attempts still counts
+// every attempt) — see lastSubstantive in Run.
+func terminalFailure(cfg Config, last, lastSubstantive *Failure, attempt int) *Failure {
+	reported := last
+	if isDeadlineCut(last.Err) && lastSubstantive != nil {
+		reported = lastSubstantive
+	}
+	reported.Window = cfg.Timeout
+	reported.Attempts = attempt
 	cfg.Logger.Error("storage startup self-check FAILED: window expired, shutting down",
-		whitelistFields(last, cfg.Endpoint, cfg.AccessKey,
-			FixHint(cfg.RoleARN, cfg.ProbeBucket, last.Item, last.Diag))...,
+		whitelistFields(reported, cfg.Endpoint, cfg.AccessKey,
+			FixHint(cfg.RoleARN, cfg.ProbeBucket, reported.Item, reported.Diag))...,
 	)
-	return last
+	return reported
 }
 
 // whitelistFields builds the whitelisted log fields for a Failure. Single
