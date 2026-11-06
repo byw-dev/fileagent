@@ -220,9 +220,9 @@ with open(dst, "w", encoding="utf-8") as f:
 PYEOF
 }
 
-# The gate runs BEFORE mkdir -p: mkdir -p on a symlinked path would happily
-# create/keep the LINK's target directory and we would never notice (mkdir
-# -p succeeds silently when the link resolves to an existing dir).
+# The symlink gate runs BEFORE mkdir -p: mkdir -p on a symlinked path would
+# happily create/keep the LINK's target directory and we would never notice
+# (mkdir -p succeeds silently when the link resolves to an existing dir).
 if [ -L "${SW_CONFIG_DIR}" ]; then
   echo "ERROR: SW_CONFIG_DIR (${SW_CONFIG_DIR}) is a symbolic link — refusing to operate." >&2
   echo "       chmod would follow the link and re-permission a directory this script" >&2
@@ -231,61 +231,100 @@ if [ -L "${SW_CONFIG_DIR}" ]; then
   exit 1
 fi
 mkdir -p "${SW_CONFIG_DIR}"
-# --- Parent-directory trust gate (rework 1, review R1-1) --------------------
-# With the files at 0644, the 0700 SW_CONFIG_DIR is the only thing keeping
-# other host users away from the credentials — so nobody may be able to swap
-# that directory out from under us after the chmod. On Linux, renaming a
-# directory entry requires write permission on the PARENT directory, so the
-# direct parent must be trusted BEFORE anything containing credentials is
-# rendered: owned by us or root, and not group/other-writable unless the
-# sticky bit is set (sticky makes renames safe: only the entry's owner, the
-# directory owner, or root may rename/remove it — same rule that makes /tmp
-# usable). This closes the swap attack master did not have (0600 files stayed
-# unreadable even under a swapped directory); a fd/inode-pinning scheme would
-# be stronger still but is deliberately out of scope (keep it simple, check
-# the path once, render).
+
+# --- Path canonicalization + ancestor trust walk (rework 2, review R2-1/2/3)
+# Modeled on OpenSSH StrictModes (secure_filename / auth_secure_path): instead
+# of checking one directory and then writing through the ORIGINAL path (which
+# may contain re-pointable symlinks — the review's probe-link-swap.sh proved
+# that fatal), we (1) canonicalize the path once so it contains no symlinks,
+# (2) verify EVERY ancestor from the parent up to /, and (3) do ALL later
+# chmod/mktemp/mv/cp exclusively on the canonical path.
 #
-# Symlinked parents: checked as RESOLVED. We deliberately do NOT reject a
-# parent that is a symlink — unlike SW_CONFIG_DIR itself (rejected above,
-# because we chmod IT), we only need the real parent's owner/write bits.
-# `stat -L` follows the link on BOTH GNU and BSD coreutils (plain stat does
-# NOT follow on GNU and reports the link itself), so the check lands on the
-# directory that actually mediates renames. The residual risk of the link
-# being re-pointed between check and use is the same class as any path-based
-# check and is not worsened by 0644 (master had it too); accepted for
-# simplicity.
-PARENT_DIR="$(dirname -- "${SW_CONFIG_DIR}")"
-# mode: GNU `stat -c %a` prints up to 4 octal digits incl. sticky (1777);
-# BSD `stat -f %p` prints the full st_mode (41777) — normalized below to 4
-# octal digits by masking the file-type nibble.
-P_UID="$(stat -Lc '%u' "${PARENT_DIR}" 2>/dev/null || stat -Lf '%u' "${PARENT_DIR}")"
-P_MODE="$(stat -Lc '%a' "${PARENT_DIR}" 2>/dev/null || stat -Lf '%p' "${PARENT_DIR}")"
-# Normalize the mode into OCTAL DIGITS (no prefix) so every later use can
-# prefix 8# exactly once: GNU %a and BSD %p both yield octal digits only, but
-# results of $((…)) are DECIMAL and must never be re-prefixed. Mask 07777
-# drops BSD's file-type nibble (41777 → 01777); printf re-renders as octal.
-_MODE_DEC="$(( 8#${P_MODE} & 07777 ))"
-P_MODE="$(printf '%04o' "${_MODE_DEC}")"
-if [ "${P_UID}" != "0" ] && [ "${P_UID}" != "$(id -u)" ]; then
-  echo "ERROR: parent directory of SW_CONFIG_DIR is not trusted — refusing to render." >&2
-  echo "       ${PARENT_DIR} is owned by uid=${P_UID} (mode ${P_MODE}); only the current" >&2
-  echo "       user (uid=$(id -u)) or root may own it. With the published files at 0644," >&2
-  echo "       a foreign owner of the parent could swap the 0700 directory aside and read" >&2
-  echo "       the credentials. Fix: chown the parent to the rendering user (or root), or" >&2
-  echo "       point SW_CONFIG_DIR somewhere under a directory you own." >&2
+# realpath: present on both GNU coreutils and macOS (since Big Sur). If a
+# host lacks it, `cd -P "$dir" && pwd -P` is the equivalent fallback — one
+# of the two must exist; both resolve ALL symlinks and ".." components.
+SW_CANON="$(realpath "${SW_CONFIG_DIR}" 2>/dev/null || { cd -P "${SW_CONFIG_DIR}" 2>/dev/null && pwd -P; })"
+if [ -z "${SW_CANON}" ] || [ ! -d "${SW_CANON}" ]; then
+  echo "ERROR: cannot canonicalize SW_CONFIG_DIR (${SW_CONFIG_DIR}) — realpath and cd -P both failed." >&2
   exit 1
 fi
-# Group/other writable is acceptable ONLY with the sticky bit (mode & 01000):
-# sticky restricts rename/unlink to the entry owner, directory owner or root —
-# the same rule that makes a 1777 /tmp safe to use.
-if [ "$(( 8#${P_MODE} & 0022 ))" -ne 0 ] && [ "$(( 8#${P_MODE} & 01000 ))" -eq 0 ]; then
-  echo "ERROR: parent directory of SW_CONFIG_DIR is writable by group/other without the" >&2
-  echo "       sticky bit — refusing to render. ${PARENT_DIR} (uid=${P_UID}, mode ${P_MODE})" >&2
-  echo "       could let another user rename the 0700 config directory aside and read the" >&2
-  echo "       0644 credentials inside. Fix: chmod go-w ${PARENT_DIR} (or chmod +t if it" >&2
-  echo "       must stay shared), or point SW_CONFIG_DIR elsewhere." >&2
+if [ "${SW_CANON}" = "/" ]; then
+  echo "ERROR: SW_CONFIG_DIR canonicalizes to / — refusing (the script would chmod 700 / and" >&2
+  echo "       break the whole system's traversability). Point SW_CONFIG_DIR at a dedicated" >&2
+  echo "       directory." >&2
   exit 1
 fi
+
+# check_ancestor <dir> <child-on-path>: one hop of the walk. A directory is
+# trusted when its owner is root or the current user AND it is not writable
+# by group/other — EXCEPT when it has the sticky bit AND the next entry on
+# the path (child) is owned by root or the current user: sticky only stops
+# users from renaming entries they do not own, so a sticky directory is safe
+# for us exactly when OUR entry inside it cannot be swapped by anyone else.
+check_ancestor() { # <dir> <child-path>
+  local dir=$1 child=$2 uid mode
+  uid="$(stat -c '%u' "${dir}" 2>/dev/null || stat -f '%u' "${dir}")"
+  mode="$(stat -c '%a' "${dir}" 2>/dev/null || stat -f '%p' "${dir}")"
+  # Normalize: mask BSD %p's file-type nibble (41777 → 1777), re-render as
+  # octal digits; `8#` is prefixed exactly ONCE per use below (results of
+  # $((…)) are decimal and must never be re-prefixed).
+  mode="$(printf '%04o' "$(( 8#${mode} & 07777 ))")"
+  if [ "${uid}" != "0" ] && [ "${uid}" != "$(id -u)" ]; then
+    echo "ERROR: untrusted ancestor directory — refusing to render." >&2
+    echo "       ${dir} is owned by uid=${uid} (mode ${mode}); only the current user" >&2
+    echo "       (uid=$(id -u)) or root may own a directory on the path to SW_CONFIG_DIR." >&2
+    echo "       With the published files at 0644, a foreign owner could swap a directory" >&2
+    echo "       on the path and read the credentials. Fix: chown the directory to the" >&2
+    echo "       rendering user (or root), or point SW_CONFIG_DIR somewhere you own." >&2
+    return 1
+  fi
+  if [ "$(( 8#${mode} & 0022 ))" -ne 0 ]; then
+    if [ "$(( 8#${mode} & 01000 ))" -eq 0 ]; then
+      echo "ERROR: ancestor directory writable by group/other without the sticky bit — refusing to render." >&2
+      echo "       ${dir} (uid=${uid}, mode ${mode}) lets another user rename a directory on" >&2
+      echo "       the path aside and read the 0644 credentials inside. Fix: chmod go-w" >&2
+      echo "       ${dir} (or chmod +t if it must stay shared AND the entry below it is" >&2
+      echo "       owned by root/you), or point SW_CONFIG_DIR elsewhere." >&2
+      return 1
+    fi
+    # Sticky + writable: our entry inside it must be ours (root/cur-user),
+    # else the ENTRY's owner could swap it (sticky protects owners' rights
+    # to their OWN entries — including replacing them).
+    local cuid
+    cuid="$(stat -c '%u' "${child}" 2>/dev/null || stat -f '%u' "${child}")"
+    if [ "${cuid}" != "0" ] && [ "${cuid}" != "$(id -u)" ]; then
+      echo "ERROR: sticky ancestor is writable, and the entry on the path is owned by" >&2
+      echo "       uid=${cuid} — that owner could swap it (sticky protects only owners'" >&2
+      echo "       own entries). Ancestor: ${dir} (mode ${mode}); entry: ${child}." >&2
+      echo "       Fix: chown ${child} to root/the rendering user, chmod go-w ${dir}, or" >&2
+      echo "       point SW_CONFIG_DIR elsewhere." >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Walk from SW_CANON's parent up to / (inclusive): each hop checks an
+# ancestor against the entry DIRECTLY under it on the path (that is the entry
+# sticky semantics would let its owner swap).
+_anc="${SW_CANON}"
+while :; do
+  _parent="$(dirname -- "${_anc}")"
+  check_ancestor "${_parent}" "${_anc}" || exit 1
+  [ "${_parent}" = "/" ] && break
+  _anc="${_parent}"
+done
+
+# Residual risk, known and accepted (no handling): between the walk above and
+# the writes below there is still a time-of-check/time-of-use window IF some
+# attacker had rename rights on an ancestor. The walk already guarantees no
+# OTHER user has such rights on ANY level — what remains is root or the
+# current user themselves, both inside the trust boundary.
+
+# From here on the canonical path is the ONLY path used for writes: the
+# original SW_CONFIG_DIR may contain symlinks that can be re-pointed between
+# check and use (review R2-2); SW_CANON contains none by construction.
+SW_CONFIG_DIR="${SW_CANON}"
 # --- Directory permission gate (B7, 2026-11-06) -----------------------------
 # SW_CONFIG_DIR must end up 0700 (see the permission-model note in the file
 # header). Cases, all fail-closed:
