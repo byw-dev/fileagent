@@ -247,18 +247,19 @@ mkdir -p "${SW_CONFIG_DIR}"
 #
 # Symlinked parents: checked as RESOLVED. We deliberately do NOT reject a
 # parent that is a symlink — unlike SW_CONFIG_DIR itself (rejected above,
-# because we chmod IT), we only need the real parent's owner/write bits, and
-# stat(1) below already follows links, so the check lands on the directory
-# that actually mediates renames. The residual risk of the link being
-# re-pointed between check and use is the same class as any path-based check
-# and is not worsened by 0644 (master had it too); accepted for simplicity.
+# because we chmod IT), we only need the real parent's owner/write bits.
+# `stat -L` follows the link on BOTH GNU and BSD coreutils (plain stat does
+# NOT follow on GNU and reports the link itself), so the check lands on the
+# directory that actually mediates renames. The residual risk of the link
+# being re-pointed between check and use is the same class as any path-based
+# check and is not worsened by 0644 (master had it too); accepted for
+# simplicity.
 PARENT_DIR="$(dirname -- "${SW_CONFIG_DIR}")"
 # mode: GNU `stat -c %a` prints up to 4 octal digits incl. sticky (1777);
-# BSD `stat -f %Lp` DROPS the sticky bit (777), so use %p which keeps the
-# full st_mode (e.g. 41777) — masked with 07777 below to drop the file-type
-# nibble (4/10/…). Both then feed the same octal arithmetic.
-P_UID="$(stat -c '%u' "${PARENT_DIR}" 2>/dev/null || stat -f '%u' "${PARENT_DIR}")"
-P_MODE="$(stat -c '%a' "${PARENT_DIR}" 2>/dev/null || stat -f '%p' "${PARENT_DIR}")"
+# BSD `stat -f %p` prints the full st_mode (41777) — normalized below to 4
+# octal digits by masking the file-type nibble.
+P_UID="$(stat -Lc '%u' "${PARENT_DIR}" 2>/dev/null || stat -Lf '%u' "${PARENT_DIR}")"
+P_MODE="$(stat -Lc '%a' "${PARENT_DIR}" 2>/dev/null || stat -Lf '%p' "${PARENT_DIR}")"
 # Normalize the mode into OCTAL DIGITS (no prefix) so every later use can
 # prefix 8# exactly once: GNU %a and BSD %p both yield octal digits only, but
 # results of $((…)) are DECIMAL and must never be re-prefixed. Mask 07777
@@ -306,7 +307,7 @@ if [ -d "${SW_CONFIG_DIR}" ] && [ "$(id -u)" != "$(stat -c '%u' "${SW_CONFIG_DIR
   # fix suggestions and exit 1 below MUST stay reachable. BSD/macOS needs
   # `stat -f`; GNU coreutils needs `stat -c`.
   { stat -c '       current: owner uid=%u mode=%a' "${SW_CONFIG_DIR}" 2>/dev/null \
-      || stat -f '       current: owner=%Su mode=%Sp' "${SW_CONFIG_DIR}" 2>/dev/null; } || true
+      || stat -f '       current: owner=%Su mode=%Sp' "${SW_CONFIG_DIR}" 2>/dev/null; } >&2 || true
   echo "       Fix suggestions: chown the directory to the user running this script" >&2
   echo "       (sudo chown -R $(id -u) ${SW_CONFIG_DIR}), or move it aside and let the" >&2
   echo "       renderer create a fresh one (mv ${SW_CONFIG_DIR} ${SW_CONFIG_DIR}.old)." >&2
