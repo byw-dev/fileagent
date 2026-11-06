@@ -108,5 +108,9 @@ compose；除此之外不写仓库其它目录。
 
 ## CI 状态
 
-**尚未接入 CI。** 计划作为路径触发的 CI 门禁（下一个 PR 添加 workflow：先非必过、
-稳定后设为必过），当前只能本地运行。
+已接入 `.github/workflows/ci-fault-injection.yml`：**每日定时（UTC 18:00，即北京时间
+次日 02:00）+ 手动 `workflow_dispatch` 触发**，四个场景由 matrix 展开成四个并行 job
+（各设 `FI_ONLY`，墙钟时间 ≈ 最长场景而非四场景串行）。刻意**不进 PR 必过门禁**
+（全量约 17 分钟，不能让小改动等它），也不是必过检查；白天改坏 filer 链路最迟
+次日凌晨红出来，等不及就手动 dispatch。本地仍可随时运行，`FI_ONLY=<n>` 单跑
+单个场景（可组合：`FI_ONLY=1,3`）。

@@ -1,0 +1,112 @@
+name: CI — Fault Injection
+
+# B3 故障注入测试（test/fault-injection/run.sh）：验证 CP「订阅 SeaweedFS filer
+# 事件 → S3 回读 → 入账」链路在断流/重启/停机/硬杀四类故障下的最终一致性
+# （等集合断言，非抽样）。单测与集成测试用的是假 filer 流，覆盖不到这条
+# 链路的故障面，所以这条套件有独立存在价值。
+#
+# 为什么只有 schedule + workflow_dispatch、没有 pull_request/push：
+# 全量跑约 17 分钟（本机基线），最长单场景含准备约 7.5 分钟，CI 冷 runner
+# 再加拉镜像还要更久。这个量级不能进 PR 必过门禁——否则任何小改动都要
+# 等它跑完才能合。所以定位是「每日定时回归 + 手动按需触发」：白天改坏了
+# filer 链路，最迟第二天凌晨（北京时间 02:00）会红出来；等不及的人自己
+# workflow_dispatch 点一下。也不要把它加成必过检查（同理由）。
+#
+# 为什么四个 job 并行：本机实测 93% 的耗时在场景里、固定成本（构建+起环境）
+# 只有 ~72s。脚本原生支持 FI_ONLY=<n> 只跑单场景，四个 matrix job 并行后
+# 整条 workflow 的墙钟时间 ≈ 最长场景（448s）+ 冷启动开销，而不是四场景
+# 串行的 1058s。四个 job 各自在独立的一次性 runner VM 上跑，端口/容器名
+# （本机隔离边界里强调的单实例限制）互不冲突。
+
+on:
+  schedule:
+    # UTC 18:00 = 北京时间次日 02:00，避开白天开发时段（本套件只此一个触发点）
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+# 按 (workflow, 场景号) 分组：定时与手动重跑同一场景会排队而不是互相取消。
+# 不设 cancel-in-progress——手动重跑不该把正在跑的同场景定时任务杀掉。
+concurrency:
+  group: ${{ github.workflow }}-${{ matrix.fi_only }}
+  cancel-in-progress: false
+
+jobs:
+  fi:
+    name: FI scenario ${{ matrix.fi_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false   # 一个场景红不该取消其余三个：它们是独立证据
+      matrix:
+        fi_only: [1, 2, 3, 4]
+    env:
+      # run.sh 的场景门控：FI_ONLY=2 只跑场景 2（断流重连 1 / filer 优雅
+      # 重启 2 / CP 停机写入 3 / filer 硬杀 4，语义见 test/fault-injection/README.md）
+      FI_ONLY: ${{ matrix.fi_only }}
+    # 只需要 checkout；SeaweedFS 镜像是 Docker Hub 公开镜像（按 digest 钉定），
+    # 不像 ci-smoke.yml 那样要拉私有 GHCR package——所以没有 packages:read、
+    # 也没有 GHCR 登录步骤，更不需要从镜像里抽 mc（B7 起 S3 操作用 aws cli v2）。
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/go.mod
+          # run.sh 会构建两份 Go 产物：controlplane（仓库主模块）和
+          # faultproxy（test/fault-injection/faultproxy 是独立 Go 模块、
+          # GOWORK=off 单独构建）。两条都列上，模块缓存才齐。
+          cache-dependency-path: |
+            controlplane/go.sum
+            test/fault-injection/faultproxy/go.sum
+
+      # 预检：run.sh 的工具门控只接受 aws-cli/2.*（v1 的 profile 配置/校验
+      # 行为与验证过的路径不同，fail-closed）。ubuntu-latest 自带 v2，但版本
+      # 随 runner 镜像漂移，提前打出来 + 断言，红了能直接看出是哪一环。
+      # ⚠️ 不从网上现下载安装：那会引入新的漂移源，与钉定镜像的思路相悖。
+      - name: Preflight — AWS CLI v2
+        run: |
+          AWS_VERSION="$(aws --version 2>&1)"
+          echo "$AWS_VERSION"
+          case "$AWS_VERSION" in
+            aws-cli/2.*) echo "ok: AWS CLI v2" ;;
+            *)
+              echo "::error::需要 AWS CLI v2（run.sh 预检只接受 aws-cli/2.*，v1 的行为与验证基线不同），当前是：$AWS_VERSION。ubuntu-latest runner 镜像应自带 v2；若此预检红了，说明 runner 镜像漂移，请更新断言或到 runner 镜像 issue 反馈，不要改成从网上现下载安装。"
+              exit 1
+              ;;
+          esac
+
+      # 预检：起基础设施时 deploy/scripts/render-seaweedfs-configs.sh 硬依赖
+      # python3（缺了直接报错退出）。ubuntu-latest 自带，打出版本即可。
+      - name: Preflight — python3
+        run: python3 --version
+
+      # 运行单场景。不设 KEEP：那是 deploy/scripts/smoke.sh 的开关，FI 脚本
+      # 没有这个用法。脚本自己 cleanup（compose down、杀进程、释放端口），
+      # 且 cleanup 不会删 bin/tmp/fi/ 下的日志与中间产物——失败证据留给
+      # 下面的 artifact 步骤。
+      - name: Run fault injection scenario ${{ matrix.fi_only }}
+        run: bash test/fault-injection/run.sh
+
+      # 失败时把 bin/tmp/fi/ 整个捞出来：cp.log、proxy.log、result.txt、
+      # compose-*.log、writes.jsonl、各场景计划/清单文件都在这里。红灯但
+      # 看不出为什么，等于没红。
+      - name: Upload FI logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fi-logs-scenario-${{ matrix.fi_only }}
+          path: bin/tmp/fi/
+          retention-days: 7
+          if-no-files-found: warn
+
+      # 补一份运行现场快照进 job log：artifact 已覆盖文件证据，这里主要看
+      # 「cleanup 之后还剩什么容器」——不正常残留说明 cleanup 没跑干净。
+      - name: Dump compose state on failure
+        if: failure()
+        run: |
+          echo "── seaweedfs compose ps ──"
+          docker compose -p fileagent-fi -f deploy/docker-compose.seaweedfs.yml ps || true
+          echo "── base compose ps ──"
+          docker compose -p fileagent-fi -f deploy/docker-compose.dev.yml ps || true
