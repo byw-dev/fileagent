@@ -341,35 +341,52 @@ Agent 首次启动是显式状态机（`INIT → PENDING → APPROVED → RUNNIN
 ## CP 启动自检失败怎么排查（IC-BUG-40）
 
 CP 启动后会用**实际生效的配置**（`MINIO_*` 环境变量，不是 init 脚本的 `SW_CP_*`/`CP_ADMIN_*`）
-在后台做一次存储自检：用 CP 的 S3 身份对 `data-sensor` 桶做一次 `ListBucketMultipartUploads`，
+在后台做一次存储自检：用 CP 的 S3 身份对探测桶（`MINIO_STARTUP_CHECK_BUCKET`，默认
+`data-sensor`）做一次 `ListBucketMultipartUploads`（200 响应还必须**点名该桶**才算数），
 再用 `MINIO_ROLE_ARN` 真实签一次 STS `AssumeRole`（凭据用完即丢）。**任何失败都会在
 `MINIO_STARTUP_CHECK_TIMEOUT`（默认 120s）内退避重试；窗口耗尽仍失败，CP 会拒绝启动**（打
-`storage startup self-check FAILED` 的 Error + `refusing to run` 的 Fatal，非零退出）。窗口内
-`/healthz` 照常 200，这是有意为之：全新环境里 `init-minio.sh` 必须在 CP 起来之后才能跑
-（它初始化时要拨 CP 的 webhook）。
+`storage startup self-check FAILED: window expired, shutting down` 的 Error（级别是
+Error，不是 Fatal），进程非零退出）。窗口内 `/healthz` 照常 200，这是有意为之：全新环境里
+`init-minio.sh` 必须在 CP 起来之后才能跑（它初始化时要拨 CP 的 webhook）。
 
-排查步骤（按 Fatal 日志里的字段定位）：
+自检失败的日志**只有白名单字段**，没有任何原始错误文本（防泄漏设计）。终局 Error 长这样
+（真实字段示例，非 secret）：
 
-1. **看 `item` 字段**：`s3-identity` = S3 凭据/端点问题；`sts-assume-role` = role ARN 或 STS 问题。
-2. **看 `class` 字段**：`auth/config` = 后端拒绝了身份（secret 配错 / 身份不存在 / role 未授权）；
-   `network` = 连不上（存储没起、端点配错、防火墙）。
-3. **对照 `endpoint` 与 `access_key_id`**（日志只打 key id，绝不打 secret）：确认它们与存储侧一致——
+```json
+{"level":"error","msg":"storage startup self-check FAILED: window expired, shutting down",
+ "item":"s3-identity (ListBucketMultipartUploads)","class":"auth","endpoint":"127.0.0.1:9000",
+ "access_key_id":"cpAdminIAM0000000000","s3_code":"SignatureDoesNotMatch","http_status":403,
+ "attempts":5,"window":120,"fix_hint":"check MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY ..."}
+```
+
+排查步骤（按终局 Error 的字段定位）：
+
+1. **看 `item` 字段**：`s3-identity` = S3 凭据/端点/桶问题；`sts-assume-role` = role ARN 或 STS 问题。
+2. **看 `class` 字段**：`auth` = 后端拒绝了身份（secret 配错 / 身份不存在）；`config` = 请求与部署
+   不匹配（桶不存在、role 未授权、端点路由到别的服务）；`network` = 连不上（存储没起、端点配错、
+   防火墙，`net_kind` 细分为 `dial_refused`/`timeout`/`dns`/`tls`/`other`）；`unknown` = 无法分类。
+3. **看 `s3_code` / `sts_code` / `http_status`**：服务端错误码（只输出预定义机器码，其余显示
+   `<non-standard>`）。注意：MinIO 的 STS 会把签名错误包成 `sts_code=AccessDenied`，
+   要靠 `class=auth` 与 fix_hint 判断。
+4. **对照 `endpoint` 与 `access_key_id`**（日志只打 key id，绝不打 secret）：确认它们与存储侧一致——
    MinIO 后端对照 `init-minio.sh` 的 `CP_ADMIN_ACCESS_KEY`/`CP_ADMIN_SECRET_KEY`；SeaweedFS 后端
    对照 `deploy/seaweedfs/env-defaults.sh` 的 `SW_CP_ACCESS_KEY`/`SW_CP_SECRET_KEY`（渲染进 s3.json）。
-4. **按 `fix_hint` 行动**：日志自带的修复提示即下一步（如「检查 MINIO_SECRET_KEY 与存储侧 CP 身份是否一致」）。
+5. **按 `fix_hint` 行动**：日志自带的修复提示即下一步。
 
 常见场景：
 
-| 症状（Fatal 的 error 字段） | 含义 | 处置 |
+| 终局字段特征 | 含义 | 处置 |
 |------|------|------|
-| `SignatureDoesNotMatch` | secret 与存储侧不一致（含轮换后漏改） | 对齐 `MINIO_SECRET_KEY` 与存储侧 CP 身份；若要轮换用 `CP_ADMIN_ROTATE=1` 重跑 init |
-| `InvalidAccessKeyId`（auth/config） | CP 身份不存在于存储侧 | 全新环境：先跑 init 脚本再重启 CP；已初始化环境：检查 `MINIO_ACCESS_KEY` 是否被改 |
-| `not authorized to assume role`（仅 SeaweedFS） | `MINIO_ROLE_ARN` 与 iam.json 的 role 不一致 | 对齐两边的 role ARN（SeaweedFS 默认 12 零账号段，MinIO 默认空账号段，不可混用） |
-| `connection refused` / `i/o timeout`（network） | 存储晚于 CP 或端点配错 | 窗口内会自意恢复；持续失败则检查 `MINIO_ENDPOINT` 与存储是否在跑 |
+| `s3_code=SignatureDoesNotMatch` | secret 与存储侧不一致（含轮换后漏改） | 对齐 `MINIO_SECRET_KEY` 与存储侧 CP 身份；若要轮换用 `CP_ADMIN_ROTATE=1` 重跑 init |
+| `s3_code=InvalidAccessKeyId` | CP 身份不存在于存储侧 | 全新环境：先跑 init 脚本再重启 CP；已初始化环境：检查 `MINIO_ACCESS_KEY` 是否被改 |
+| `s3_code=NoSuchBucket` | 探测桶不存在 | 全新环境先跑 init；自定义 `MINIO_STARTUP_CHECK_BUCKET` 的桶要事先创建（MinIO 的 init 固定只建 `data-sensor`，SeaweedFS 可用 `SW_BUCKET_DATA`） |
+| `http_status=200` 且无 `s3_code` | 200 但不是该桶的 S3 列表响应 | `MINIO_ENDPOINT` 可能指向了别的服务/被网关错误路由，核对 S3 API 地址 |
+| `sts_code=AccessDenied` 且 `class=config`（仅 SeaweedFS） | role 未授权 | `MINIO_ROLE_ARN` 与 iam.json 的 role 不一致（SeaweedFS 默认 12 零账号段，MinIO 默认空账号段，不可混用） |
+| `net_kind=dial_refused`/`timeout` 等（network） | 存储晚于 CP 或端点配错 | 窗口内会自行恢复；持续失败则检查 `MINIO_ENDPOINT` 与存储是否在跑 |
 | 窗口内一直 Warn 后自检通过 | 存储启动慢于 CP | 正常现象，无需处理；嫌慢可调大 `MINIO_STARTUP_CHECK_TIMEOUT` |
 
 > 已知盲区：MinIO 的 STS 不校验 RoleArn（任意 ARN 都签发成功），所以「role 配错」在 MinIO
-> 后端不会被自检拦下，只在 SeaweedFS 后端报 `AccessDenied`。这是 MinIO 后端行为，不是自检缺陷。
+> 后端不会被自检拦下，只在 SeaweedFS 后端报 `sts_code=AccessDenied`。这是 MinIO 后端行为，不是自检缺陷。
 
 ---
 

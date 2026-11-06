@@ -41,15 +41,34 @@ type ProbeS3 struct {
 // window (fresh deployments pass once init completes), and a wrong
 // endpoint/policy can no longer slip through as a fake absence.
 //
-// minio-go's channel API surfaces the first error via ObjectMultipartInfo.
-// Err; an empty channel is success.
+// Rework 5 finding 1: the channel API (ListIncompleteUploads) only decodes a
+// 200 body into a struct with NO root-element validation — a mis-routed
+// gateway answering 200 with arbitrary XML (or an S3 <Error> document)
+// decoded to zero values and PASSED. The probe now uses the Core API, which
+// returns the parsed ListMultipartUploadsResult, and requires BOTH err==nil
+// AND result.Bucket == the configured bucket: a listing that does not name
+// the configured bucket is a class=config failure (see errWrongProbeResponse
+// and its fix hint), not a pass.
 func (p ProbeS3) ListMultipartUploads(ctx context.Context, bucket string) error {
-	for info := range p.Client.ListIncompleteUploads(ctx, bucket, "", false) {
-		if info.Err != nil {
-			return info.Err
-		}
+	result, err := miniogo.Core{Client: p.Client}.ListMultipartUploads(ctx, bucket, "", "", "", "", 1)
+	if err != nil {
+		return err
+	}
+	if result.Bucket != bucket {
+		return errWrongProbeResponse{got: result.Bucket}
 	}
 	return nil
+}
+
+// errWrongProbeResponse marks a 200 answer that is not the configured
+// bucket's S3 listing (wrong route / non-S3 service / decodable-but-foreign
+// XML). diagnose() maps it to class=config with http_status=200 — a real S3
+// error never carries 200, so FixHint can key the endpoint-routing hint off
+// that shape. The error's own text is never logged.
+type errWrongProbeResponse struct{ got string }
+
+func (e errWrongProbeResponse) Error() string {
+	return "endpoint answered 200 but not with the configured bucket's S3 listing"
 }
 
 // stsProbeTimeout bounds a single AssumeRole call. minio-go's STS flow takes

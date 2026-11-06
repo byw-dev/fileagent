@@ -9,13 +9,25 @@
 // in effect at runtime (MINIO_* env → config.Config), that:
 //
 //  1. the internal endpoint is reachable and the CP S3 identity authenticates,
-//     using ListBucketMultipartUploads (minio-go ListIncompleteUploads) — the
-//     one action present in the CP policy on BOTH backends (MinIO: init-minio.sh
-//     policy "fileagent-controlplane"; SeaweedFS: deploy/seaweedfs/s3.json.tpl
-//     policy "fileagent-cp"), and the only one in the intersection that reads
-//     without touching objects or creating buckets;
+//     using ListBucketMultipartUploads — the one action present in the CP
+//     policy on BOTH backends (MinIO: init-minio.sh policy
+//     "fileagent-controlplane"; SeaweedFS: deploy/seaweedfs/s3.json.tpl policy
+//     "fileagent-cp"), and the only one in the intersection that reads
+//     without touching objects or creating buckets. A 200 answer only counts
+//     when the parsed listing names the configured bucket;
 //  2. one real STS AssumeRole with MINIO_ROLE_ARN succeeds. The issued
 //     credentials are discarded immediately — never cached, never logged.
+//
+// THREAT MODEL (coordinator decision, rework 5): this check defends against
+// CONFIGURATION ERRORS — wrong credentials, wrong endpoint pointing at
+// another honest service, a mis-routed gateway, a missing bucket, storage
+// not yet initialized — NOT against a malicious storage endpoint. The CP
+// hands its data to this storage anyway; a hostile endpoint has far bigger
+// attack surface than fooling a startup probe, and SigV4 never sends the
+// secret to the server so the server cannot echo it back. The bar is
+// therefore: a misconfigured but HONEST endpoint must not pass the check,
+// and the logs must never print our configured secret. A controlled endpoint
+// that deliberately forges responses is explicitly OUT of scope.
 //
 // Both backends (MinIO and SeaweedFS) go through the SAME checks: the CP only
 // speaks the S3 API and STS, which both provide, so there is no per-backend
@@ -129,6 +141,11 @@ const (
 // keeps the credential/role hints.
 func FixHint(roleARN, probeBucket, item string, diag Diagnostic) string {
 	if item == itemS3 {
+		// The wrong-route signature: a 200 with no S3 error code — a real
+		// S3 error never carries 200 (see errWrongProbeResponse).
+		if diag.HTTPStatus == 200 && diag.S3Code == "" {
+			return "the endpoint returned 200 but not this bucket's S3 listing response: check whether MINIO_ENDPOINT really points at the S3 API (a mis-routed gateway or another service may be answering)"
+		}
 		if diag.S3Code == "NoSuchBucket" {
 			return fmt.Sprintf("probe bucket %q does not exist: run the init script (init-minio.sh / init-seaweedfs.sh, both create data-sensor), or point MINIO_STARTUP_CHECK_BUCKET at a bucket that physically exists", probeBucket)
 		}
@@ -184,13 +201,13 @@ func Run(ctx context.Context, cfg Config) error {
 	defer cancelWindow()
 
 	var last *Failure
-	// lastSubstantive is the most recent attempt whose failure was NOT just
-	// the window deadline cutting the probe mid-flight. When the window
-	// expires ON a cut attempt, the terminal report must still name the
-	// SUBSTANTIVE cause (e.g. s3_code=NoSuchBucket → the bucket runbook)
-	// rather than a bare timeout — the operator reads the terminal line,
-	// not the retry warns (spec, rework 4 finding 1).
-	var lastSubstantive *Failure
+	// Per-item record of the most recent SUBSTANTIVE failure (one that was
+	// NOT just the window deadline cutting the probe mid-flight). Rework 5
+	// finding 3: the terminal report may fall back to one of these ONLY for
+	// the item that was actually cut, and an item that SUCCEEDS in a later
+	// round clears its record — otherwise a stale S3 NoSuchBucket would be
+	// reported after the bucket appeared and STS became the real blocker.
+	var lastS3Substantive, lastSTSSubstantive *Failure
 	delay := backoff
 	for attempt := 1; ; attempt++ {
 		// Parent cancelled first (SIGTERM): clean shutdown, not a failure.
@@ -198,8 +215,18 @@ func Run(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("startupcheck: aborted by context cancellation: %w", err)
 		}
 		last = attemptOnce(wctx, cfg, s3p, sts)
-		if last != nil && !isDeadlineCut(last.Err) {
-			lastSubstantive = last
+		if last != nil {
+			if isDeadlineCut(last.Err) {
+				// A cut carries no new substance; the per-item records stand.
+			} else if last.Item == itemS3 {
+				lastS3Substantive = last
+			} else {
+				lastSTSSubstantive = last
+				// attemptOnce returned an STS failure, which means the S3
+				// probe PASSED this round — the bucket exists now; drop any
+				// stale S3 failure so it can never be reported again.
+				lastS3Substantive = nil
+			}
 		}
 
 		if last == nil {
@@ -245,13 +272,17 @@ func Run(ctx context.Context, cfg Config) error {
 		if wctx.Err() != nil {
 			// Window expired (or was cancelled together with the parent —
 			// the parent case is handled above): terminal failure.
-			return terminalFailure(cfg, last, lastSubstantive, attempt)
+			return terminalFailure(cfg, last, lastS3Substantive, lastSTSSubstantive, attempt)
 		}
+		// Rework 5 finding 5: the retry Warn uses ONLY whitelisted field
+		// names — attempts / window (the configured total, same meaning as in
+		// the terminal Error) / fix_hint — plus the shared diagnostic fields.
+		// The old attempt/window_remaining/hint extras are gone; the
+		// fresh-deployment guidance lives in fix_hint.
 		retryFields := append(whitelistFields(last, cfg.Endpoint, cfg.AccessKey,
 			FixHint(cfg.RoleARN, cfg.ProbeBucket, last.Item, last.Diag)),
-			zap.Int("attempt", attempt),
-			zap.Duration("window_remaining", windowRemaining(wctx)),
-			zap.String("hint", "if this is a fresh deployment where init-minio.sh / init-seaweedfs.sh has not run yet, this is expected and the check will pass once it does"),
+			zap.Int("attempts", attempt),
+			zap.Duration("window", cfg.Timeout),
 		)
 		cfg.Logger.Warn("storage startup self-check attempt failed; retrying", retryFields...)
 		// Sleep at most the remaining window (finding 4): never past expiry.
@@ -267,7 +298,7 @@ func Run(ctx context.Context, cfg Config) error {
 				if err := ctx.Err(); err != nil {
 					return fmt.Errorf("startupcheck: aborted by context cancellation: %w", err)
 				}
-				return terminalFailure(cfg, last, lastSubstantive, attempt)
+				return terminalFailure(cfg, last, lastS3Substantive, lastSTSSubstantive, attempt)
 			case <-time.After(wait):
 			}
 		}
@@ -288,13 +319,28 @@ func isDeadlineCut(err error) bool {
 
 // terminalFailure fills in the window metadata, logs the terminal Error
 // with the whitelisted diagnostics (no error text), and returns the *Failure.
-// When the final attempt was merely the deadline cutting an in-flight probe,
-// the SUBSTANTIVE last diagnostic is reported instead (attempts still counts
-// every attempt) — see lastSubstantive in Run.
-func terminalFailure(cfg Config, last, lastSubstantive *Failure, attempt int) *Failure {
+//
+// Rework 5 finding 3: when the final attempt was merely the deadline cutting
+// an in-flight probe, the terminal report falls back to the last SUBSTANTIVE
+// failure of the SAME item only (attempts still counts every attempt). If
+// the cut item has no substantive record — it succeeded earlier and only the
+// deadline cut it, or it never got a real answer — the cut itself is
+// reported (item=current, net_kind=timeout). A substantive failure of a
+// DIFFERENT item is never substituted: that was the stale-diagnosis bug
+// (S3 NoSuchBucket reported after the bucket appeared, while STS was the
+// blocker).
+func terminalFailure(cfg Config, last, lastS3Substantive, lastSTSSubstantive *Failure, attempt int) *Failure {
 	reported := last
-	if isDeadlineCut(last.Err) && lastSubstantive != nil {
-		reported = lastSubstantive
+	if isDeadlineCut(last.Err) {
+		var same *Failure
+		if last.Item == itemS3 {
+			same = lastS3Substantive
+		} else {
+			same = lastSTSSubstantive
+		}
+		if same != nil {
+			reported = same
+		}
 	}
 	reported.Window = cfg.Timeout
 	reported.Attempts = attempt
@@ -307,7 +353,12 @@ func terminalFailure(cfg Config, last, lastSubstantive *Failure, attempt int) *F
 
 // whitelistFields builds the whitelisted log fields for a Failure. Single
 // source shared by the retry Warn and the terminal Error so the two can
-// never drift (see diagnostics.go for the field contract).
+// never drift (see diagnostics.go for the field contract). The complete
+// whitelist: item / class / endpoint / access_key_id / s3_code / sts_code /
+// http_status / net_kind / attempts / window / fix_hint — plus role_arn on
+// the SUCCESS Info only (it is our own configuration value, never a secret,
+// and names which role the check actually exercised; added to the contract
+// in rework 5 finding 5).
 func whitelistFields(f *Failure, endpoint, accessKeyID, fixHint string) []zap.Field {
 	return f.LogFields(endpoint, accessKeyID, fixHint)
 }

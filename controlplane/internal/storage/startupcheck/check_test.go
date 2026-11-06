@@ -9,7 +9,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -156,7 +158,7 @@ func TestDiagnose_S3Shapes(t *testing.T) {
 		{"unknown access key", errInvalidAK(), ClassAuth, "InvalidAccessKeyId", 403},
 		{"missing probe bucket", miniogo.ErrorResponse{Code: "NoSuchBucket", StatusCode: 404, RequestID: "r1"}, ClassConfig, "NoSuchBucket", 404},
 		{"access denied", miniogo.ErrorResponse{Code: "AccessDenied", StatusCode: 403}, ClassConfig, "AccessDenied", 403},
-		{"unknown 4xx", miniogo.ErrorResponse{Code: "NoSuchLifecycleConfiguration", StatusCode: 404}, ClassConfig, "NoSuchLifecycleConfiguration", 404},
+		{"unknown 4xx code", miniogo.ErrorResponse{Code: "NoSuchLifecycleConfiguration", StatusCode: 404}, ClassConfig, "<non-standard>", 404},
 		{"500 InternalError", miniogo.ErrorResponse{Code: "InternalError", StatusCode: 500}, ClassNetwork, "InternalError", 500},
 		{"503 SlowDown", miniogo.ErrorResponse{Code: "SlowDown", StatusCode: 503}, ClassNetwork, "SlowDown", 503},
 		{"malicious non-standard code", miniogo.ErrorResponse{Code: "AccessDenied Authorization: Bearer tok", StatusCode: 403}, ClassConfig, "<non-standard>", 403},
@@ -204,7 +206,11 @@ func TestDiagnose_STSShapes(t *testing.T) {
 }
 
 func TestDiagnose_TransportShapes(t *testing.T) {
-	refused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	// Rework 5 finding 4: dial_refused is an errno fact — only a genuine
+	// ECONNREFUSED (possibly wrapped in OpError/url.Error) gets the label.
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+	perm := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("socket", syscall.EACCES)}
+	unreach := &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ENETUNREACH)}
 	timedOut := &net.OpError{Op: "dial", Net: "tcp", Err: timeoutErr{}}
 	dnsErr := &net.DNSError{Err: "no such host", Name: "s3.test", IsNotFound: true}
 	tlsErr := &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}
@@ -216,11 +222,13 @@ func TestDiagnose_TransportShapes(t *testing.T) {
 		class   FailureClass
 		netKind string
 	}{
-		{"dial refused", refused, ClassNetwork, "dial_refused"},
+		{"connect refused (syscall errno)", refused, ClassNetwork, "dial_refused"},
+		{"wrapped refused via url.Error", wrappedRefused, ClassNetwork, "dial_refused"},
+		{"dial EACCES is other, not refused", perm, ClassNetwork, "other"},
+		{"dial ENETUNREACH is other, not refused", unreach, ClassNetwork, "other"},
 		{"dial timeout", timedOut, ClassNetwork, "timeout"},
 		{"dns", dnsErr, ClassNetwork, "dns"},
 		{"tls", tlsErr, ClassNetwork, "tls"},
-		{"url.Error wrapping dial refused", wrappedRefused, ClassNetwork, "dial_refused"},
 		{"context deadline", context.DeadlineExceeded, ClassNetwork, "timeout"},
 	}
 	for _, tc := range cases {
@@ -417,7 +425,9 @@ func TestRun_LogsNeverContainSecret(t *testing.T) {
 	assert.Equal(t, 1, term.Len())
 }
 
-// Retry warns during the window, including the fresh-deployment hint.
+// Retry Warns carry the fresh-deployment guidance via fix_hint (the separate
+// hint field was removed in rework 5 finding 5 — Warn uses whitelist names
+// only: attempts / window / fix_hint).
 func TestRun_RetryWarnCarriesHint(t *testing.T) {
 	s3 := &fakeS3{script: []error{makeURLErr()}}
 	sts := &fakeSTS{script: []error{nil}}
@@ -429,13 +439,16 @@ func TestRun_RetryWarnCarriesHint(t *testing.T) {
 	warns := obs.FilterMessage("storage startup self-check attempt failed; retrying")
 	assert.GreaterOrEqual(t, warns.Len(), 1)
 	entry := warns.All()[0]
-	var hint string
+	var fixHint string
 	for _, f := range entry.Context {
-		if f.Key == "hint" {
-			hint = f.String
+		if f.Key == "fix_hint" {
+			fixHint = f.String
+		}
+		if f.Key == "hint" || f.Key == "attempt" || f.Key == "window_remaining" {
+			t.Errorf("retry Warn still carries the removed field %q", f.Key)
 		}
 	}
-	assert.Contains(t, hint, "fresh deployment")
+	assert.Contains(t, fixHint, "fresh deployment")
 }
 
 // Guard the guard: an unsatisfiable config (no logger / non-positive window)
@@ -650,11 +663,14 @@ func TestRun_LogsAreWhitelistOnly(t *testing.T) {
 	var failure *Failure
 	require.ErrorAs(t, err, &failure)
 
+	// The COMPLETE whitelist (rework 5 finding 5): the shared diagnostic
+	// fields + attempts / window / fix_hint, plus role_arn on the success
+	// Info (our own config, see whitelistFields' doc). The old retry-only
+	// extras (attempt / window_remaining / hint) are NOT whitelisted.
 	allowed := map[string]bool{
 		"item": true, "class": true, "endpoint": true, "access_key_id": true,
 		"s3_code": true, "sts_code": true, "http_status": true, "net_kind": true,
-		"attempts": true, "window": true, "fix_hint": true, "attempt": true,
-		"window_remaining": true, "hint": true, "role_arn": true,
+		"attempts": true, "window": true, "fix_hint": true, "role_arn": true,
 	}
 	for _, entry := range obs.All() {
 		assert.NotContains(t, entry.Message, secret)
@@ -751,4 +767,93 @@ func TestRun_LateProbeSuccessAfterParentCancelIsClean(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled)
 	var f *Failure
 	assert.False(t, errors.As(err, &f))
+}
+
+// ─── Rework 5 finding 3: terminal diagnostics must not go stale across items ──
+
+// stallS3 fails once with NoSuchBucket, then blocks until the ctx deadline —
+// the window cuts the S3 probe mid-flight on later rounds (same-item test).
+type stallS3 struct {
+	failedOnce bool
+}
+
+func (s *stallS3) ListMultipartUploads(ctx context.Context, bucket string) error {
+	if !s.failedOnce {
+		s.failedOnce = true
+		return miniogo.ErrorResponse{Code: "NoSuchBucket", StatusCode: 404, RequestID: "r1"}
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// failOnceS3 fails the first call with NoSuchBucket and SUCCEEDS afterwards
+// (the bucket appears mid-window) — the cross-item test's S3 side.
+type failOnceS3 struct {
+	failedOnce bool
+}
+
+func (s *failOnceS3) ListMultipartUploads(ctx context.Context, bucket string) error {
+	if !s.failedOnce {
+		s.failedOnce = true
+		return miniogo.ErrorResponse{Code: "NoSuchBucket", StatusCode: 404, RequestID: "r1"}
+	}
+	return nil
+}
+
+// Same-item cut: S3 keeps failing (NoSuchBucket recorded), the final in-flight
+// S3 probe is cut by the deadline → the terminal report KEEPS the substantive
+// NoSuchBucket cause (same item).
+func TestRun_TerminalSameItemCutKeepsSubstantiveCause(t *testing.T) {
+	s3 := &stallS3{}
+	logger, obs := observedLogger(t)
+	cfg := testConfig(t, s3, &fakeSTS{script: []error{nil}}, 40*time.Millisecond)
+	cfg.Logger = logger
+	cfg.RetryBackoff = time.Millisecond
+
+	err := Run(context.Background(), cfg)
+	var f *Failure
+	require.ErrorAs(t, err, &f)
+	assert.Equal(t, itemS3, f.Item, "the cut item is S3")
+	assert.Equal(t, "NoSuchBucket", f.Diag.S3Code, "same-item substantive cause must be kept")
+	assert.Equal(t, ClassConfig, f.Diag.Class)
+	// The terminal fix_hint is the bucket runbook.
+	term := obs.FilterMessage("storage startup self-check FAILED: window expired, shutting down")
+	require.Equal(t, 1, term.Len())
+	for _, fd := range term.All()[0].Context {
+		if fd.Key == "fix_hint" {
+			assert.Contains(t, fd.String, "MINIO_STARTUP_CHECK_BUCKET")
+		}
+	}
+}
+
+// stallAfterS3Success: S3 succeeds immediately; STS blocks until the deadline
+// (the review probe TestReviewTerminalStaleBucket's shape).
+type succeedS3 struct{}
+
+func (succeedS3) ListMultipartUploads(ctx context.Context, bucket string) error { return nil }
+
+type stallSTS struct{}
+
+func (stallSTS) AssumeRole(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// Cross-item advance: S3 failed once (NoSuchBucket) then SUCCEEDED; STS stalls
+// until the window cuts it → the terminal report must name the CURRENT item
+// (sts) with net_kind=timeout, NOT the stale S3 NoSuchBucket.
+func TestRun_TerminalCrossItemCutReportsCurrentItem(t *testing.T) {
+	s3 := &failOnceS3{} // first call fails with NoSuchBucket, then succeeds
+	logger := zaptestLogger(t)
+	cfg := testConfig(t, s3, stallSTS{}, 40*time.Millisecond)
+	cfg.Logger = logger
+	cfg.RetryBackoff = time.Millisecond
+
+	err := Run(context.Background(), cfg)
+	var f *Failure
+	require.ErrorAs(t, err, &f)
+	assert.Equal(t, itemSTS, f.Item, "the cut item is STS, and it must be reported as such")
+	assert.Equal(t, ClassNetwork, f.Diag.Class)
+	assert.Equal(t, "timeout", f.Diag.NetKind)
+	assert.Empty(t, f.Diag.S3Code, "stale S3 NoSuchBucket must NOT leak into the terminal report")
 }

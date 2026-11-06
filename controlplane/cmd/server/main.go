@@ -577,11 +577,13 @@ func run() int {
 	// script creates). Any failure — auth/config included — retries inside
 	// MINIO_STARTUP_CHECK_TIMEOUT (default 120s, product decision 2026-11-06);
 	// when the window expires still failing, Run logs the terminal Error with
-	// the full diagnostics (item / endpoint / access key id / SANITIZED error
-	// summary / fix hint — never the secret or raw wire text) and returns a
-	// *startupcheck.Failure; the goroutine ONLY hands THAT shape to run() —
-	// a plain context error (SIGTERM during a failing check, rework 3
-	// finding 1) sends nothing, so a clean shutdown stays exit 0.
+	// ONLY the whitelisted diagnostic fields (item / class / endpoint /
+	// access_key_id / s3_code / sts_code / http_status / net_kind / attempts /
+	// window / fix_hint — never the secret, never raw error text; see
+	// startupcheck/diagnostics.go) and returns a *startupcheck.Failure; the
+	// goroutine ONLY hands THAT shape to run() — a plain context error
+	// (SIGTERM during a failing check, rework 3 finding 1) sends nothing, so
+	// a clean shutdown stays exit 0.
 	// /healthz stays 200 during the window: smoke/dev flows rely on reaching
 	// the API (incl. the webhook init talks to) before storage initialization
 	// completes.

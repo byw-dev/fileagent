@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"regexp"
 	"strings"
+	"syscall"
 
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -52,11 +52,33 @@ type Diagnostic struct {
 	NetKind string
 }
 
-// codePattern is the ONLY shape of server-provided code we are willing to
-// print: a single leading letter then letters/digits/dots. Anything else
-// (spaces, colons, base64 blobs a malicious gateway might smuggle in as a
-// "code") collapses to "<non-standard>".
-var codePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9.]{0,63}$`)
+// knownS3Codes is the FIXED ENUM of S3/STS error codes we are willing to
+// print verbatim (rework 5 finding 2). A shape-based regex was not a value
+// whitelist: any alphanumeric blob — including a server echoing a
+// legitimate-SHAPED secret as the Code — would have passed it and reached
+// the logs. Only these machine codes are printed; every other code collapses
+// to "<non-standard>". The set covers everything the two supported backends
+// actually return for the failure modes this check diagnoses (live-verified:
+// SignatureDoesNotMatch / InvalidAccessKeyId / NoSuchBucket on S3;
+// AccessDenied / SignatureDoesNotMatch / InvalidAccessKeyId on STS) plus the
+// standard S3 machine codes the same family can produce. Adding a code here
+// requires a live capture showing a supported backend returning it.
+var knownS3Codes = map[string]struct{}{
+	"AccessDenied":            {},
+	"InvalidAccessKeyId":      {},
+	"SignatureDoesNotMatch":   {},
+	"NoSuchBucket":            {},
+	"InvalidBucketName":       {},
+	"ExpiredToken":            {},
+	"InvalidClientTokenId":    {},
+	"MalformedPolicyDocument": {},
+	"InvalidParameterValue":   {},
+	"InternalError":           {},
+	"ServiceUnavailable":      {},
+	"SlowDown":                {},
+	"RequestTimeTooSkewed":    {},
+	"NotImplemented":          {},
+}
 
 // FailureClass is our own classification of a probe failure. The four values
 // are exactly the set the diagnostics whitelist allows.
@@ -127,9 +149,16 @@ func diagnose(err error) Diagnostic {
 		// Cancellation is never logged as a failure; keep a sane shape anyway.
 		return Diagnostic{Class: ClassNetwork, NetKind: "other"}
 	}
+	// Our own sentinel for "200 but not this bucket's listing" (probe.go).
+	var wrongProbe errWrongProbeResponse
+	if errors.As(err, &wrongProbe) {
+		// http_status=200 with no code is the wrong-route signature; a real
+		// S3 error never carries 200 — FixHint keys off exactly that shape.
+		return Diagnostic{Class: ClassConfig, HTTPStatus: 200}
+	}
 	// S3 ErrorResponse (parsed or synthesized by minio-go — we do not, and
-	// cannot, tell which; the CODE itself is regex-validated before any
-	// output, so a synthesized/gateway value cannot smuggle text).
+	// cannot, tell which; the CODE itself is enum-checked before any output,
+	// so a synthesized/gateway value cannot smuggle text).
 	if resp := miniogo.ToErrorResponse(err); resp.Code != "" || resp.StatusCode != 0 {
 		d := Diagnostic{HTTPStatus: resp.StatusCode, S3Code: safeCode(resp.Code)}
 		switch {
@@ -177,10 +206,10 @@ func diagnose(err error) Diagnostic {
 	return Diagnostic{Class: ClassUnknown}
 }
 
-// safeCode returns code when it matches the whitelist pattern, else the
+// safeCode returns code when it is one of the known machine codes, else the
 // literal "<non-standard>" marker.
 func safeCode(code string) string {
-	if codePattern.MatchString(code) {
+	if _, ok := knownS3Codes[code]; ok {
 		return code
 	}
 	return "<non-standard>"
@@ -233,7 +262,11 @@ func diagnoseTransport(err error) (Diagnostic, bool) {
 	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
-		if opErr.Op == "dial" {
+		// Rework 5 finding 4: "refused" is an errno fact, not an Op fact —
+		// dial can also fail with EACCES/ENETUNREACH/etc. Only a genuine
+		// ECONNREFUSED anywhere in the chain is labeled dial_refused; every
+		// other transport failure lands in "other".
+		if errors.Is(err, syscall.ECONNREFUSED) {
 			return Diagnostic{Class: ClassNetwork, NetKind: "dial_refused"}, true
 		}
 		return Diagnostic{Class: ClassNetwork, NetKind: "other"}, true

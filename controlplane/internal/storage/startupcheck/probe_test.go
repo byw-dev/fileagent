@@ -236,3 +236,49 @@ func TestProbeS3_Gateway404WithRequestHeaderFails(t *testing.T) {
 	perr := ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor")
 	require.Error(t, perr, "gateway HTML 404 with x-amz-request-id must fail the probe (review r2 exploit)")
 }
+
+// ─── Rework 5 finding 1: a 200 answer must BE the bucket's listing ────────────
+
+// A 200 with foreign XML (mis-routed gateway) must FAIL: the Core API decodes
+// it into zero values, the Bucket check rejects it — the review probe
+// TestReviewUnexpected200XMLAccepted asserted the broken pass-through.
+func TestProbeS3_Unexpected200XMLFails(t *testing.T) {
+	for _, body := range []string{
+		`<Gateway>wrong route</Gateway>`,
+		`<Error><Code>AccessDenied</Code></Error>`,
+	} {
+		srv := s3Server(t, 200, body)
+		client, err := newInternalClient(probeCfg(srv.Addr))
+		require.NoError(t, err)
+		perr := ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor")
+		require.Error(t, perr, "non-list 200 body must fail the probe: %s", body)
+		d := diagnose(perr)
+		assert.Equal(t, ClassConfig, d.Class)
+		assert.Equal(t, 200, d.HTTPStatus)
+		// The wrong-route signature FixHint keys on: 200 with no code.
+		assert.Empty(t, d.S3Code)
+	}
+}
+
+// A 200 that IS a listing but names a DIFFERENT bucket must fail.
+func TestProbeS3_WrongBucketIn200Fails(t *testing.T) {
+	wrongBucket := `<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>some-other-bucket</Bucket><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>`
+	srv := s3Server(t, 200, wrongBucket)
+	client, err := newInternalClient(probeCfg(srv.Addr))
+	require.NoError(t, err)
+	perr := ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor")
+	require.Error(t, perr, "a listing for a different bucket must fail the probe")
+	d := diagnose(perr)
+	assert.Equal(t, ClassConfig, d.Class)
+	assert.Equal(t, 200, d.HTTPStatus)
+	assert.Empty(t, d.S3Code)
+}
+
+// The wrong-route fix hint (endpoint routing) is selected for the 200-shape.
+func TestFixHint_WrongRouteHint(t *testing.T) {
+	hint := FixHint("arn:aws:iam:::role/agent-role", "data-sensor", itemS3,
+		Diagnostic{Class: ClassConfig, HTTPStatus: 200})
+	assert.Contains(t, hint, "MINIO_ENDPOINT")
+	assert.Contains(t, hint, "S3 listing response")
+}

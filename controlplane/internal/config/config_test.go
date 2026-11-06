@@ -182,6 +182,24 @@ func TestLoad_StartupCheckBucket(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_BUCKET")
 	})
+	// Rework 5 finding 7: a syntactically invalid bucket name fails Validate
+	// immediately (same validator minio-go's probe path uses — the non-strict
+	// CheckValidBucketName, which the S3 API would apply locally anyway)
+	// instead of burning the whole retry window on a locally-rejected probe.
+	// Note UPPERCASE is legal per the non-strict rule; the backends may still
+	// reject it server-side, which then surfaces as a normal retried failure.
+	t.Run("invalid bucket name rejected by Validate", func(t *testing.T) {
+		for _, bad := range []string{"invalid bucket name", "a", "-leading-dash", "trailing-dot.", "192.168.1.1", "under_score_is_fine_but..dots"} {
+			env := validEnv()
+			env["MINIO_STARTUP_CHECK_BUCKET"] = bad
+			setEnv(t, env)
+			cfg, err := Load()
+			require.NoError(t, err)
+			err = cfg.Validate()
+			require.Error(t, err, "bucket name %q must be rejected", bad)
+			assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_BUCKET")
+		}
+	})
 }
 
 func TestLoad_CustomAgentTokenTTL(t *testing.T) {

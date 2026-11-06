@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
 )
 
 // Config holds the complete runtime configuration for the Control Plane.
@@ -353,6 +354,13 @@ func (c *Config) Validate() error {
 	}
 	if c.MinIOStartupCheckBucket == "" {
 		return errors.New("MINIO_STARTUP_CHECK_BUCKET cannot be empty (the bucket the storage startup self-check probes; it must physically exist — the init scripts create data-sensor)")
+	}
+	// Rework 5 finding 7: a syntactically invalid bucket name is a config
+	// error that no amount of storage retry can fix — fail at startup with
+	// the exact reason instead of burning the whole retry window on a
+	// locally-rejected probe. Same validator minio-go itself uses.
+	if err := s3utils.CheckValidBucketName(c.MinIOStartupCheckBucket); err != nil {
+		return fmt.Errorf("invalid MINIO_STARTUP_CHECK_BUCKET %q: %w", c.MinIOStartupCheckBucket, err)
 	}
 	// S1 (PR #110 review): below-floor WEBHOOK_FAIL_LIMIT is a startup failure,
 	// not a silent fallback — limit=1 tolerates ~3s of outage, which would
