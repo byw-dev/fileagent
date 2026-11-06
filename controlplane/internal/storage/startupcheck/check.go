@@ -108,7 +108,7 @@ func (c FailureClass) String() string {
 // same message on MinIO STS; SeaweedFS wrong role → AccessDenied "not
 // authorized to assume role".
 var authErrorCodes = map[string]struct{}{
-	"InvalidAccessKeyId":   {},
+	"InvalidAccessKeyId":    {},
 	"SignatureDoesNotMatch": {},
 	"AccessDenied":          {},
 	"InvalidClientTokenId":  {},

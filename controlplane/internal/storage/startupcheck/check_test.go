@@ -78,16 +78,16 @@ func (f *fakeSTS) callCount() int {
 func testConfig(t *testing.T, s3 S3Prober, sts STSAssumer, window time.Duration) Config {
 	t.Helper()
 	return Config{
-		Endpoint:    "s3.test:9000",
-		AccessKey:   "TESTACCESSKEYID",
-		SecretKey:   "test-secret",
-		RoleARN:     "arn:aws:iam:::role/agent-role",
-		ProbeBucket: "data-sensor",
-		Timeout:     window,
-		Logger:      zaptestLogger(t),
+		Endpoint:     "s3.test:9000",
+		AccessKey:    "TESTACCESSKEYID",
+		SecretKey:    "test-secret",
+		RoleARN:      "arn:aws:iam:::role/agent-role",
+		ProbeBucket:  "data-sensor",
+		Timeout:      window,
+		Logger:       zaptestLogger(t),
 		RetryBackoff: 5 * time.Millisecond,
-		S3:          s3,
-		STS:         sts,
+		S3:           s3,
+		STS:          sts,
 	}
 }
 
@@ -198,7 +198,7 @@ func TestClassifySTS(t *testing.T) {
 		{"unknown code, access-key text → auth", byTextAK, ClassAuthConfig},
 		{"unknown code, token text → auth", byTextToken, ClassAuthConfig},
 		{"unknown code, credential text → auth", byTextCred, ClassAuthConfig},
-		{"unknown code, signature text (case-insensitive) → auth", byTextSignature, ClassAuthConfig},		{"unknown code, authless message → network", unknownCode, ClassNetwork},
+		{"unknown code, signature text (case-insensitive) → auth", byTextSignature, ClassAuthConfig}, {"unknown code, authless message → network", unknownCode, ClassNetwork},
 		{"dial refused → network", makeURLErr(), ClassNetwork},
 		{"plain error → network", errors.New("boom"), ClassNetwork},
 		{"nil → network (total function)", nil, ClassNetwork},

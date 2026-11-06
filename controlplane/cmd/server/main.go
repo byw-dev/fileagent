@@ -185,29 +185,40 @@ func nullInt64(p *int64) sql.NullInt64 {
 	return sql.NullInt64{Int64: *p, Valid: true}
 }
 
+// main is a thin wrapper so run() can return an exit CODE: os.Exit skips
+// deferred cleanup, so all defers must live inside run() and only the final,
+// deliberate exit happens here (see the IC-BUG-40 shutdown note below).
 func main() {
+	os.Exit(run())
+}
+
+// run boots the Control Plane and returns the process exit code (0 = clean
+// shutdown, 1 = startup/config failure incl. the IC-BUG-40 storage self-check
+// window expiring). Every deferred cleanup is registered inside run() so a
+// non-zero return still unwinds through all of them before main's os.Exit.
+func run() int {
 	// ── Load configuration ───────────────────────────────────────────────────
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: invalid configuration: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// ── Bootstrap logger ─────────────────────────────────────────────────────
 	logger, err := buildLogger(cfg.LogLevel)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: build logger: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
 	defer logger.Sync() //nolint:errcheck
 
 	// ── Run migrations ───────────────────────────────────────────────────────
 	if err := db.Migrate(cfg.DatabaseURL, migrations.FS, logger); err != nil {
-		logger.Fatal("database migration failed", zap.Error(err))
+		logger.Error("database migration failed", zap.Error(err))
 	}
 
 	// ── Connect to database ──────────────────────────────────────────────────
@@ -216,21 +227,21 @@ func main() {
 
 	database, err := db.Open(ctx, cfg.DatabaseURL, logger)
 	if err != nil {
-		logger.Fatal("database connection failed", zap.Error(err))
+		logger.Error("database connection failed", zap.Error(err))
 	}
 	defer database.Close()
 
 	// ── Connect to Redis ─────────────────────────────────────────────────────
 	redisClient, err := cache.New(cfg.RedisURL, logger)
 	if err != nil {
-		logger.Fatal("redis connection failed", zap.Error(err))
+		logger.Error("redis connection failed", zap.Error(err))
 	}
 	defer redisClient.Close()
 
 	// ── Connect to NATS ──────────────────────────────────────────────────────
 	natsConn, err := natsgo.Connect(cfg.NATSURL)
 	if err != nil {
-		logger.Fatal("NATS connection failed", zap.Error(err))
+		logger.Error("NATS connection failed", zap.Error(err))
 	}
 	defer natsConn.Close()
 	nats := &natsPublisher{conn: natsConn}
@@ -248,7 +259,7 @@ func main() {
 		cfg.BootstrapAdminForceReset,
 	)
 	if err != nil {
-		logger.Fatal("bootstrap admin failed", zap.Error(err))
+		logger.Error("bootstrap admin failed", zap.Error(err))
 	}
 	if bootstrapResult.Created {
 		credentialsPath, err := writeBootstrapCredentials(
@@ -257,7 +268,7 @@ func main() {
 			bootstrapResult.Password,
 		)
 		if err != nil {
-			logger.Fatal("write bootstrap admin credentials file failed", zap.Error(err))
+			logger.Error("write bootstrap admin credentials file failed", zap.Error(err))
 		}
 		logger.Warn("bootstrap admin user created",
 			zap.String("username", bootstrapResult.Username),
@@ -272,7 +283,7 @@ func main() {
 			bootstrapResult.Password,
 		)
 		if err != nil {
-			logger.Fatal("write bootstrap admin credentials file failed", zap.Error(err))
+			logger.Error("write bootstrap admin credentials file failed", zap.Error(err))
 		}
 		logger.Warn("bootstrap admin password reset by configuration",
 			zap.String("username", bootstrapResult.Username),
@@ -281,7 +292,7 @@ func main() {
 		)
 	}
 	if err := bootstrap.EnsureDefaultBuckets(ctx, queries, bootstrap.DefaultOrgID); err != nil {
-		logger.Fatal("bootstrap default buckets failed", zap.Error(err))
+		logger.Error("bootstrap default buckets failed", zap.Error(err))
 	}
 
 	agentMgr := agent.NewManager(queries, redisClient, authSvc, nats, logger, cfg.AgentTokenTTL)
@@ -310,7 +321,7 @@ func main() {
 		Secure: cfg.MinIOUseSSL,
 	})
 	if err != nil {
-		logger.Fatal("minio admin client init failed", zap.Error(err))
+		logger.Error("minio admin client init failed", zap.Error(err))
 	}
 	// Presign client on the PUBLIC endpoint. PresignedGetObject signs locally
 	// (no network call), so this only fixes the host the URL is signed for — it
@@ -320,7 +331,7 @@ func main() {
 		Secure: cfg.MinIOPublicUseSSL,
 	})
 	if err != nil {
-		logger.Fatal("minio presign client init failed", zap.Error(err))
+		logger.Error("minio presign client init failed", zap.Error(err))
 	}
 
 	webhookSender := event.NewWebhookSender(event.NewDBAdapter(database), logger)
@@ -339,9 +350,17 @@ func main() {
 	grpcSrv.WithStateDB(queries)
 	grpcSrv.WithDirResultStore(dirStore)
 	grpcSrv.WithDryRunStore(dryRunStore)
+	// Rework 1 finding 2 (spirit): a listener that dies mid-run is a process
+	// that cannot continue — but it must still exit through the shutdown path
+	// (Fatal would os.Exit(1) from this goroutine and skip every defer). The
+	// error is handed to the same shutdown orchestration as the self-check
+	// failure: serveFatal cancels ctx, the select below wakes, the shutdown
+	// block runs, run() returns non-zero.
+	serveFatal := make(chan error, 2)
 	go func() {
 		if err := grpcSrv.Run(cfg.GRPCPort); err != nil {
-			logger.Fatal("gRPC server error", zap.Error(err))
+			logger.Error("gRPC server error", zap.Error(err))
+			serveFatal <- err
 		}
 	}()
 	logger.Info("gRPC server starting", zap.Int("port", cfg.GRPCPort))
@@ -466,7 +485,7 @@ func main() {
 			Logger:       logger,
 		})
 		if err != nil {
-			logger.Fatal("storage event source adapter init failed", zap.Error(err))
+			logger.Error("storage event source adapter init failed", zap.Error(err))
 		}
 		adapterDone = done
 	} else {
@@ -525,7 +544,8 @@ func main() {
 	go func() {
 		logger.Info("HTTP server starting", zap.Int("port", cfg.HTTPPort))
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatal("HTTP server error", zap.Error(err))
+			logger.Error("HTTP server error", zap.Error(err))
+			serveFatal <- err
 		}
 	}()
 
@@ -538,11 +558,19 @@ func main() {
 	// MINIO_STARTUP_CHECK_TIMEOUT (default 120s, product decision 2026-11-06);
 	// when the window expires still failing, Run logs the terminal Error with
 	// the full diagnostics (item / endpoint / access key id / raw error /
-	// fix hint — never the secret) and the goroutine cancels the process
-	// context so the NORMAL shutdown path runs (deferred closes, event-source
-	// join) before the Fatal exit below (non-zero). /healthz stays 200 during
-	// the window: smoke/dev flows rely on reaching the API (incl. the webhook
-	// init talks to) before storage initialization completes.
+	// fix hint — never the secret) and the goroutine ONLY hands the failure
+	// to run(); cancelling ctx and exiting happen below, deterministically.
+	// /healthz stays 200 during the window: smoke/dev flows rely on reaching
+	// the API (incl. the webhook init talks to) before storage initialization
+	// completes.
+	//
+	// ProbeBucket: the check only needs SOME bucket to exist-or-not; it is a
+	// connectivity + credential probe, not a business-bucket assertion — a
+	// NoSuchBucket answer still proves the identity authenticated (S3
+	// authorizes before it resolves the bucket; live-verified on MinIO and
+	// SeaweedFS, see report-rework1.md). "data-sensor" is used because
+	// bootstrap.EnsureDefaultBuckets guarantees it exists on every deployment,
+	// making the common case an empty 200 listing; it is not a config knob.
 	selfCheckFailed := make(chan *startupcheck.Failure, 1)
 	go func() {
 		err := startupcheck.Run(ctx, startupcheck.Config{
@@ -556,29 +584,42 @@ func main() {
 			Logger:      logger,
 		})
 		if failure, ok := err.(*startupcheck.Failure); ok {
-			// Window expired: hand the failure to main's select and cancel ctx
-			// so shutdown runs its normal course; main then exits non-zero.
-			select {
-			case selfCheckFailed <- failure:
-			default:
-			}
-			stop()
+			// Window expired. ONLY deliver the failure — do NOT cancel ctx
+			// here: a cancel would race ctx.Done() in the select below (Go
+			// picks a ready branch at random), letting the failure be logged
+			// as a plain "shutdown signal" and the process exit 0 (rework 1
+			// finding 1). Ordering is resolved by awaitShutdownOrSelfCheckFailure's tie-break.
+			selfCheckFailed <- failure
 		}
 	}()
 
+	// ── Graceful shutdown ────────────────────────────────────────────────────
+	// Rework 1 findings 1+2: the exit must be DETERMINISTIC (never a random
+	// pick between ctx.Done() and the failure) and must run the FULL shutdown
+	// path (zap's Fatal would os.Exit(1) from here, skipping httpSrv.Shutdown,
+	// the event-source join and every defer in run()). So: wait for whichever
+	// of the two happens first, then ALWAYS poll the failure channel once more
+	// — a self-check failure wins over a coincidental signal — record the
+	// diagnostics with Error, and let the shutdown block below complete before
+	// run() returns the non-zero code.
+	exitCode := awaitShutdownOrSelfCheckFailure(ctx, selfCheckFailed, logger, cfg)
+	// A listener that died mid-run (gRPC/HTTP serve error) also fails the
+	// process — same non-zero exit through the same shutdown path.
 	select {
-	case <-ctx.Done():
-		logger.Info("shutdown signal received, stopping…")
-	case failure := <-selfCheckFailed:
-		// IC-BUG-40 fail-closed exit. Fatal (a) logs at the level operators
-		// grep for and (b) exits non-zero. stop() was already called, so the
-		// deferred closes below still run on the way out.
-		logger.Fatal("storage startup self-check failed — refusing to run with a broken storage identity (IC-BUG-40)",
-			failure.LogFields(cfg.MinIOEndpoint, cfg.MinIOAccessKey, startupcheck.FixHint(cfg.MinIORoleARN, failure.Item))...)
+	case <-serveFatal:
+		if exitCode == 0 {
+			exitCode = 1
+		}
+	default:
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	// stop() releases the signal.NotifyContext resources and cancels ctx for
+	// the workers; harmless on the signal path (already cancelled), REQUIRED
+	// on the self-check path (nothing cancelled ctx yet — that is why the
+	// shutdown below must do it, not the goroutine).
+	stop()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("HTTP server shutdown error", zap.Error(err))
 	}
@@ -589,7 +630,66 @@ func main() {
 	if !awaitEventSourceStop(adapterDone, 10*time.Second) {
 		logger.Error("storage event source adapter did not stop within 10s of shutdown")
 	}
-	logger.Info("control plane stopped")
+	if exitCode != 0 {
+		logger.Error("control plane stopped with a startup/serve failure (non-zero exit)", zap.Int("exit_code", exitCode))
+	} else {
+		logger.Info("control plane stopped")
+	}
+	return exitCode
+}
+
+// awaitShutdownOrSelfCheckFailure blocks until either the shutdown context is
+// cancelled or the background storage self-check reports a terminal failure,
+// and returns the process exit code for that outcome (0 = clean signal path,
+// 1 = IC-BUG-40 fail-closed).
+//
+// Determinism (rework 1 finding 1): when BOTH are ready — e.g. SIGTERM lands
+// in the same scheduler slice as the window expiring — a bare select would
+// pick a branch at random, and picking ctx.Done() would log a plain
+// "shutdown signal" and let the process exit 0 with the failure swallowed.
+// The tie-break poll below makes the failure win EVERY time. It is extracted
+// from run() precisely so the determinism property can be loop-tested
+// (TestAwaitShutdownOrSelfCheckFailure_DeterministicUnderRace).
+func awaitShutdownOrSelfCheckFailure(
+	ctx context.Context,
+	selfCheckFailed <-chan *startupcheck.Failure,
+	logger *zap.Logger,
+	cfg *config.Config,
+) int {
+	exitCode := 0
+	select {
+	case <-ctx.Done():
+		logger.Info("shutdown signal received, stopping…")
+	case failure := <-selfCheckFailed:
+		exitCode = 1
+		logSelfCheckFailure(logger, cfg, failure)
+	}
+	// Deterministic tie-break: even if the signal fired first, a pending
+	// failure converts the exit into the fail-closed one. buffered(1) +
+	// single producer means this receive sees the failure if it was delivered.
+	if failure, ok := drainStartupCheckFailure(selfCheckFailed); ok && exitCode == 0 {
+		exitCode = 1
+		logSelfCheckFailure(logger, cfg, failure)
+	}
+	return exitCode
+}
+
+// drainStartupCheckFailure receives a pending self-check failure without
+// blocking; it is the non-blocking half of the tie-break above.
+func drainStartupCheckFailure(ch <-chan *startupcheck.Failure) (*startupcheck.Failure, bool) {
+	select {
+	case f := <-ch:
+		return f, true
+	default:
+		return nil, false
+	}
+}
+
+// logSelfCheckFailure records the terminal IC-BUG-40 diagnostics at Error
+// level (Fatal would os.Exit and skip the shutdown path — rework 1 finding 2).
+func logSelfCheckFailure(logger *zap.Logger, cfg *config.Config, failure *startupcheck.Failure) {
+	logger.Error("storage startup self-check failed — refusing to run with a broken storage identity (IC-BUG-40)",
+		failure.LogFields(cfg.MinIOEndpoint, cfg.MinIOAccessKey, startupcheck.FixHint(cfg.MinIORoleARN, failure.Item))...)
 }
 
 // buildLogger creates a production or development zap logger based on level.
