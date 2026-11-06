@@ -44,6 +44,10 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
 ## 前置条件
 
 - **docker**（compose v2，容器需可拉取 postgres/redis/nats/seaweedfs 镜像）
+- **lsof**（端口预检三件套 `assert_port_free` / `verify_listening_pid` /
+  `port_occupied` 靠它查监听 pid；缺失时不会报错，只会**静默放宽**
+  fail-closed 预检。GitHub Ubuntu runner 不预装，CI workflow 里显式
+  `apt-get install lsof`，见 `.github/workflows/ci-fault-injection.yml`）
 - **AWS CLI v2**（S3 写入/删除/列举；B7 起 mc → aws cli v2，实测基线 2.39.2）。
   脚本自建私有 AWS 配置（config/credentials/aws-s3 封装落在每次运行
   `mktemp -d` 新建的 `bin/tmp/fi/aws.XXXXXX/` 里——不是固定路径、不可能被
@@ -108,5 +112,10 @@ compose；除此之外不写仓库其它目录。
 
 ## CI 状态
 
-**尚未接入 CI。** 计划作为路径触发的 CI 门禁（下一个 PR 添加 workflow：先非必过、
-稳定后设为必过），当前只能本地运行。
+已接入 `.github/workflows/ci-fault-injection.yml`：**每日定时（UTC 18:00，即北京时间
+次日 02:00）+ 手动 `workflow_dispatch` 触发**，四个场景由 matrix 展开成四个并行 job
+（各设 `FI_ONLY`，墙钟时间 ≈ 最长场景而非四场景串行）。刻意**不进 PR 必过门禁**
+（全量约 17 分钟，不能让小改动等它），也不是必过检查；白天改坏 filer 链路，
+通常会在次日凌晨的定时运行中暴露（GitHub 的定时触发在高峰期可能延迟或被跳过，
+不承诺准点；需要确定结论时手动 dispatch）。本地仍可随时运行，`FI_ONLY=<n>` 单跑
+单个场景（可组合：`FI_ONLY=1,3`）。
