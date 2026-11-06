@@ -24,12 +24,6 @@ on:
     - cron: '0 18 * * *'
   workflow_dispatch:
 
-# 按 (workflow, 场景号) 分组：定时与手动重跑同一场景会排队而不是互相取消。
-# 不设 cancel-in-progress——手动重跑不该把正在跑的同场景定时任务杀掉。
-concurrency:
-  group: ${{ github.workflow }}-${{ matrix.fi_only }}
-  cancel-in-progress: false
-
 jobs:
   fi:
     name: FI scenario ${{ matrix.fi_only }}
@@ -39,6 +33,16 @@ jobs:
       fail-fast: false   # 一个场景红不该取消其余三个：它们是独立证据
       matrix:
         fi_only: [1, 2, 3, 4]
+
+    # 按 (workflow, 场景号) 分组：定时与手动重跑同一场景会排队而不是互相取消。
+    # 不设 cancel-in-progress——手动重跑不该把正在跑的同场景定时任务杀掉。
+    # ⚠️ 必须写在 job 级：matrix 上下文只在 job 级可用，workflow 级
+    # concurrency 只认 github/inputs/vars，引用 matrix 会让整个 workflow
+    # 直接加载失败（Unrecognized named-value）。
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.fi_only }}
+      cancel-in-progress: false
+
     env:
       # run.sh 的场景门控：FI_ONLY=2 只跑场景 2（断流重连 1 / filer 优雅
       # 重启 2 / CP 停机写入 3 / filer 硬杀 4，语义见 test/fault-injection/README.md）
