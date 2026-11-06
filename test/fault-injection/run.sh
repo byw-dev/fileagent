@@ -433,7 +433,7 @@ cleanup() {
   local _f _lf
   for _f in deploy/docker-compose.seaweedfs.yml deploy/docker-compose.dev.yml; do
     _lf="$OUT/logs-$(basename "$_f").txt"
-    if ! run_to 60 docker compose -f "$_f" logs --no-color --timestamps --no-log-prefix >"$_lf" 2>&1; then
+    if ! run_to 60 docker compose -f "$_f" logs --no-color --timestamps >"$_lf" 2>&1; then
       echo "  ⚠ 拉取 $_f 容器日志失败/超时（see $_lf）——不影响后续清理"
     else
       echo "  · 容器日志已存 $_lf"

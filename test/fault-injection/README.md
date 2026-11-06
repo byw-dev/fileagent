@@ -95,7 +95,8 @@ compose；除此之外不写仓库其它目录。渲染脚本会把该目录强�
 项目）、按 pid 杀 CP/代理/写入器进程组并确认退出、核验自有端口全部释放；
 fatal 或断言失败后、容器被 down 删除之前，两个 compose 项目所有容器的
 `docker compose logs --no-color --timestamps` 会先落到 `bin/tmp/fi/logs-docker-compose.*.yml.txt`
-（随 CI artifact 一起上传；拉取失败只警告、不影响清理）；端口
+（保留 compose 默认的逐行服务名前缀，同一项目里 master/volume/filer 的日志可区分；
+随 CI artifact 一起上传；拉取失败只警告、不影响清理）；端口
 预检失败（拒绝路径）则不创建任何东西、不做任何清理动作。
 
 ## 与 `deploy/scripts/smoke.sh` 的关系
