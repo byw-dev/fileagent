@@ -25,12 +25,14 @@
 // IC-BUG-40): the check runs in a background goroutine AFTER the CP starts
 // listening (init-minio.sh dials the CP webhook during initialization, so a
 // blocking pre-listen check would deadlock a fresh deployment). ANY failure —
-// auth/config included — retries with backoff inside one configurable window
-// (MinIOStartupCheckTimeout, default 120s): compose stacks may race CP vs
-// storage startup, and on a fresh MinIO deployment init-minio.sh legitimately
-// creates the CP identity only after the CP is up. When the window expires
-// still failing, the check reports every detail it has (which item, endpoint,
-// access key ID — NEVER the secret, the raw error, a fix hint) and shuts the
+// auth / config / network — retries with backoff inside one configurable
+// window (MinIOStartupCheckTimeout, default 120s): compose stacks may race
+// CP vs storage startup, and on a fresh deployment the init script
+// legitimately creates the CP identity and probe bucket only after the CP is
+// up. When the window expires still failing, the check reports the
+// whitelisted diagnostics only (item, class, endpoint, access key id, codes,
+// status, net_kind, fix hint — NEVER the secret and NEVER raw error text,
+// see diagnostics.go) and shuts the
 // process down through the normal shutdown path (non-zero exit), not a bare
 // os.Exit from the goroutine.
 //
@@ -47,7 +49,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 	"time"
 
@@ -72,110 +73,9 @@ type STSAssumer interface {
 	AssumeRole(ctx context.Context) error
 }
 
-// FailureClass classifies why a check attempt failed.
-type FailureClass int
-
-const (
-	// ClassAuthConfig means the backend answered and rejected the identity or
-	// the request shape: wrong secret (SignatureDoesNotMatch), unknown access
-	// key (InvalidAccessKeyId), denied (AccessDenied), invalid role (STS).
-	// A configuration error — the classic IC-BUG-40 case.
-	ClassAuthConfig FailureClass = iota
-	// ClassNetwork means no usable answer arrived: dial errors, timeouts, or
-	// 5xx — the storage may simply not be up yet.
-	ClassNetwork
-)
-
-// String implements fmt.Stringer for logs. An out-of-range value (only
-// possible if a future edit adds a class and forgets the name) still prints
-// a usable, greppable name rather than the empty string.
-func (c FailureClass) String() string {
-	switch c {
-	case ClassAuthConfig:
-		return "auth/config"
-	case ClassNetwork:
-		return "network"
-	default:
-		return fmt.Sprintf("FailureClass(%d)", int(c))
-	}
-}
-
-// authErrorCodes are S3/STS error codes that mean "the backend answered and
-// said no" rather than "could not reach/complete". Live-verified on both
-// MinIO (RELEASE.2025-04-22) and SeaweedFS (4.48): wrong secret →
-// SignatureDoesNotMatch (S3) / signature-mismatch text in STS ErrorResponse;
-// unknown access key → InvalidAccessKeyId (S3) / AccessDenied wrapping the
-// same message on MinIO STS; SeaweedFS wrong role → AccessDenied "not
-// authorized to assume role".
-var authErrorCodes = map[string]struct{}{
-	"InvalidAccessKeyId":    {},
-	"SignatureDoesNotMatch": {},
-	"AccessDenied":          {},
-	"InvalidClientTokenId":  {},
-	"InvalidToken":          {},
-	"ExpiredToken":          {},
-	"Unauthorized":          {},
-	"InvalidParameterValue": {},
-	"MalformedPolicy":       {},
-}
-
-// ClassifyS3 maps an error from the S3 probe to a FailureClass.
-//
-// Any parsed S3 ErrorResponse with an auth/config code, or any HTTP 401/403,
-// is ClassAuthConfig; 5xx statuses are ClassNetwork (backend reachable but
-// not ready); everything else (url.Error wrapping net errors, context
-// deadlines, undecodable bodies) is ClassNetwork — when in doubt we retry,
-// because retrying is safe inside the bounded window while refusing early on
-// a guess would break legitimate slow-starting deployments.
-func ClassifyS3(err error) FailureClass {
-	if err == nil {
-		return ClassNetwork // not an error; callers never ask, but stay total
-	}
-	if resp := miniogo.ToErrorResponse(err); resp.Code != "" || resp.StatusCode != 0 {
-		if resp.StatusCode >= 500 {
-			return ClassNetwork
-		}
-		// Any non-5xx S3 answer means the backend is up and talking: it either
-		// matched an auth/config code, or answered with a 4xx this version
-		// does not know by name — still a request-level rejection (auth/config
-		// family), never something retrying fixes.
-		return ClassAuthConfig
-	}
-	return ClassNetwork
-}
-
-// ClassifySTS maps an error from the STS probe to a FailureClass.
-//
-// minio-go's STS path returns credentials.ErrorResponse (a DIFFERENT type
-// from miniogo.ErrorResponse) or a bare *url.Error. The typed response has no
-// status code, so classification rides on STSError.Code and — because MinIO
-// wraps SigV4 failures as AccessDenied with a signature-mismatch message —
-// on the message text. Auth-ish words in the message mean the backend
-// answered; transport-shaped errors mean it did not.
-func ClassifySTS(err error) FailureClass {
-	if err == nil {
-		return ClassNetwork
-	}
-	var errResp credentials.ErrorResponse
-	if errors.As(err, &errResp) {
-		if _, ok := authErrorCodes[errResp.STSError.Code]; ok {
-			return ClassAuthConfig
-		}
-		msg := strings.ToLower(errResp.STSError.Message)
-		for _, marker := range []string{"signature", "access key", "not authorized", "credential", "token"} {
-			if strings.Contains(msg, marker) {
-				return ClassAuthConfig
-			}
-		}
-		return ClassNetwork
-	}
-	var uerr *url.Error
-	if errors.As(err, &uerr) {
-		return ClassNetwork
-	}
-	// Unknown shape: default to network (retryable within the window).
-	return ClassNetwork
-}
+// The FailureClass enum, its values and the diagnostic extraction
+// (diagnose) live in diagnostics.go — see that file for the whitelist
+// logging contract (rework 4 finding 2).
 
 // Config carries the values the check needs; main.go fills them from
 // config.Config so the check exercises the configuration actually in effect.
@@ -189,9 +89,13 @@ type Config struct {
 	// RoleARN is the STS role assumed once during the check.
 	RoleARN string
 	// ProbeBucket is the bucket the ListMultipartUploads probe targets
-	// (data-sensor; bootstrap guarantees it exists). A NoSuchBucket answer is
-	// a server-side state observation, not a credential failure — it still
-	// counts as "endpoint reachable + identity valid" for this probe.
+	// (MINIO_STARTUP_CHECK_BUCKET, default data-sensor). The bucket must
+	// PHYSICALLY exist: a NoSuchBucket answer is a FAILED attempt (class
+	// config) retried within the window — bootstrap only writes DB records,
+	// the physical bucket is created by the init scripts, so on a fresh
+	// deployment the check keeps retrying until init completes (rework 4
+	// finding 1: no answer taken from the wire can prove the identity when
+	// the bucket is absent, so absence is simply not a pass).
 	ProbeBucket string
 	// Timeout is the total retry window (MINIO_STARTUP_CHECK_TIMEOUT).
 	Timeout time.Duration
@@ -219,14 +123,18 @@ const (
 )
 
 // FixHint returns the repair hint for a failed item, for exit-time logs.
-// Exported so main.go can build the Fatal log line from a *Failure.
-func FixHint(roleARN, item string) string {
-	switch item {
-	case itemS3:
+// Exported so main.go can build the exit log line from a *Failure. The hint
+// is OUR text (safe by construction), keyed off the diagnostic: a
+// NoSuchBucket S3 answer gets the bucket-specific runbook, everything else
+// keeps the credential/role hints.
+func FixHint(roleARN, probeBucket, item string, diag Diagnostic) string {
+	if item == itemS3 {
+		if diag.S3Code == "NoSuchBucket" {
+			return fmt.Sprintf("probe bucket %q does not exist: run the init script (init-minio.sh / init-seaweedfs.sh, both create data-sensor), or point MINIO_STARTUP_CHECK_BUCKET at a bucket that physically exists", probeBucket)
+		}
 		return "check MINIO_ENDPOINT / MINIO_ACCESS_KEY / MINIO_SECRET_KEY against the storage side CP identity (init-minio.sh CP_ADMIN_* or deploy/seaweedfs s3.json SW_CP_*); on a fresh deployment run the init script first"
-	default:
-		return fmt.Sprintf("check MINIO_ROLE_ARN (%s) against the role configured on the storage side (init-minio.sh or deploy/seaweedfs iam.json) and that the CP identity may assume it; note MinIO's STS does not validate RoleArn, so a wrong ARN passes this check on MinIO and fails only on SeaweedFS", roleARN)
 	}
+	return fmt.Sprintf("check MINIO_ROLE_ARN (%s) against the role configured on the storage side (init-minio.sh or deploy/seaweedfs iam.json) and that the CP identity may assume it; note MinIO's STS does not validate RoleArn, so a wrong ARN passes this check on MinIO and fails only on SeaweedFS", roleARN)
 }
 
 // Run performs the self-check with retry. It returns:
@@ -285,6 +193,32 @@ func Run(ctx context.Context, cfg Config) error {
 		last = attemptOnce(wctx, cfg, s3p, sts)
 
 		if last == nil {
+			// Rework 4 finding 3: a success observed AFTER the window (or a
+			// SIGTERM) expired must not count — the check promised to answer
+			// within the window. Check the parent ctx first (SIGTERM stays a
+			// clean shutdown, never a failure), then the window deadline.
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("startupcheck: aborted by context cancellation: %w", err)
+			}
+			if wctx.Err() != nil {
+				// The last probe happened to succeed but the window was
+				// already gone when it returned. Class choice documented:
+				// class=network + net_kind=timeout — the failure IS that the
+				// window timed out while the probe was in flight (a distinct
+				// "late" class was rejected to keep the enum exactly the four
+				// whitelisted values); the config hint tells the operator to
+				// raise the window or fix the slow storage.
+				late := &Failure{
+					Item:   itemS3,
+					Err:    wctx.Err(),
+					Diag:   Diagnostic{Class: ClassNetwork, NetKind: "timeout"},
+					Window: cfg.Timeout, Attempts: attempt,
+				}
+				cfg.Logger.Error("storage startup self-check FAILED: window expired while the last probe was in flight",
+					late.LogFields(cfg.Endpoint, cfg.AccessKey,
+						"the probe bucket / STS answered, but only after MINIO_STARTUP_CHECK_TIMEOUT had expired: raise the window or investigate why storage answers that slowly")...)
+				return late
+			}
 			cfg.Logger.Info("storage startup self-check passed",
 				zap.String("endpoint", cfg.Endpoint),
 				zap.String("access_key_id", cfg.AccessKey),
@@ -303,16 +237,13 @@ func Run(ctx context.Context, cfg Config) error {
 			// the parent case is handled above): terminal failure.
 			return terminalFailure(cfg, last, attempt)
 		}
-		cfg.Logger.Warn("storage startup self-check attempt failed; retrying",
-			zap.String("item", last.Item),
-			zap.String("class", last.Class.String()),
-			zap.String("endpoint", cfg.Endpoint),
-			zap.String("access_key_id", cfg.AccessKey),
-			zap.String("error", last.SafeErr),
+		retryFields := append(whitelistFields(last, cfg.Endpoint, cfg.AccessKey,
+			FixHint(cfg.RoleARN, cfg.ProbeBucket, last.Item, last.Diag)),
 			zap.Int("attempt", attempt),
 			zap.Duration("window_remaining", windowRemaining(wctx)),
 			zap.String("hint", "if this is a fresh deployment where init-minio.sh / init-seaweedfs.sh has not run yet, this is expected and the check will pass once it does"),
 		)
+		cfg.Logger.Warn("storage startup self-check attempt failed; retrying", retryFields...)
 		// Sleep at most the remaining window (finding 4): never past expiry.
 		wait := delay
 		if rem := windowRemaining(wctx); rem < wait {
@@ -339,22 +270,23 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
-// terminalFailure fills in the window metadata, logs the terminal Error with
-// the full (sanitized) diagnostics, and returns the *Failure.
+// terminalFailure fills in the window metadata, logs the terminal Error
+// with the whitelisted diagnostics (no error text), and returns the *Failure.
 func terminalFailure(cfg Config, last *Failure, attempt int) *Failure {
 	last.Window = cfg.Timeout
 	last.Attempts = attempt
 	cfg.Logger.Error("storage startup self-check FAILED: window expired, shutting down",
-		zap.String("item", last.Item),
-		zap.String("class", last.Class.String()),
-		zap.String("endpoint", cfg.Endpoint),
-		zap.String("access_key_id", cfg.AccessKey),
-		zap.String("error", last.SafeErr),
-		zap.Int("attempts", attempt),
-		zap.Duration("window", cfg.Timeout),
-		zap.String("fix_hint", FixHint(cfg.RoleARN, last.Item)),
+		whitelistFields(last, cfg.Endpoint, cfg.AccessKey,
+			FixHint(cfg.RoleARN, cfg.ProbeBucket, last.Item, last.Diag))...,
 	)
 	return last
+}
+
+// whitelistFields builds the whitelisted log fields for a Failure. Single
+// source shared by the retry Warn and the terminal Error so the two can
+// never drift (see diagnostics.go for the field contract).
+func whitelistFields(f *Failure, endpoint, accessKeyID, fixHint string) []zap.Field {
+	return f.LogFields(endpoint, accessKeyID, fixHint)
 }
 
 // windowRemaining reports the time left before the window context expires
@@ -371,17 +303,15 @@ func windowRemaining(wctx context.Context) time.Duration {
 }
 
 // attemptOnce runs both probes once and converts any failure into a
-// *Failure; nil means both passed. Every Failure carries a PRE-SANITIZED
-// error summary (SafeErr): the raw Err stays for programmatic use, but all
-// log output goes through SafeErr so error text from the wire (which can
-// embed userinfo, signature params or echoed credentials — rework 3 finding
-// 2) never reaches the logs verbatim.
+// *Failure; nil means both passed. Every Failure carries the whitelisted
+// Diagnostic (diagnostics.go): the raw Err stays for programmatic use, but
+// NO log output ever derives from error text (rework 4 finding 2).
 func attemptOnce(ctx context.Context, cfg Config, s3p S3Prober, sts STSAssumer) *Failure {
 	if err := s3p.ListMultipartUploads(ctx, cfg.ProbeBucket); err != nil {
-		return &Failure{Item: itemS3, Err: err, Class: ClassifyS3(err), SafeErr: SafeErrorSummary(err, cfg.SecretKey)}
+		return &Failure{Item: itemS3, Err: err, Diag: diagnose(err)}
 	}
 	if err := sts.AssumeRole(ctx); err != nil {
-		return &Failure{Item: itemSTS, Err: err, Class: ClassifySTS(err), SafeErr: SafeErrorSummary(err, cfg.SecretKey)}
+		return &Failure{Item: itemSTS, Err: err, Diag: diagnose(err)}
 	}
 	return nil
 }
@@ -392,40 +322,70 @@ func attemptOnce(ctx context.Context, cfg Config, s3p S3Prober, sts STSAssumer) 
 type Failure struct {
 	// Item is which probe failed last (itemS3 / itemSTS).
 	Item string
-	// Class is the classification of the last error.
-	Class FailureClass
-	// Err is the raw last error. NEVER log it directly — error text from the
-	// wire can carry credentials (finding 2); use SafeErr for any output.
+	// Err is the raw last error. NEVER log it or any of its text — the
+	// whitelisted Diag is the only sanctioned log representation.
 	Err error
-	// SafeErr is the sanitized, log-safe summary of Err (SafeErrorSummary).
-	SafeErr string
+	// Diag is the whitelisted, log-safe diagnostic (diagnostics.go).
+	Diag Diagnostic
 	// Window is the configured total retry window.
 	Window time.Duration
 	// Attempts is how many attempts were made.
 	Attempts int
 }
 
-// Error implements error with the IC-BUG-40 exit diagnostics. Only sanitized
-// parts appear: item, class, the SafeErr summary — never the raw error.
+// Error implements error using ONLY the whitelisted diagnostic parts — no
+// error text (the string may be printed by wrappers/main; same rules as logs).
 func (f *Failure) Error() string {
-	return fmt.Sprintf("storage startup self-check failed after %d attempts over %s: item=%s class=%s err=%s",
-		f.Attempts, f.Window, f.Item, f.Class, f.SafeErr)
+	parts := []string{
+		fmt.Sprintf("item=%s", f.Item),
+		fmt.Sprintf("class=%s", f.Diag.Class),
+	}
+	if f.Diag.S3Code != "" {
+		parts = append(parts, "s3_code="+f.Diag.S3Code)
+	}
+	if f.Diag.STSCode != "" {
+		parts = append(parts, "sts_code="+f.Diag.STSCode)
+	}
+	if f.Diag.HTTPStatus != 0 {
+		parts = append(parts, fmt.Sprintf("http_status=%d", f.Diag.HTTPStatus))
+	}
+	if f.Diag.NetKind != "" {
+		parts = append(parts, "net_kind="+f.Diag.NetKind)
+	}
+	return fmt.Sprintf("storage startup self-check failed after %d attempts over %s: %s",
+		f.Attempts, f.Window, strings.Join(parts, " "))
 }
 
-// LogFields returns the structured fields main.go logs the terminal
-// diagnostics with. The error field is the pre-sanitized SafeErr string
-// (finding 2) — zap.Error(raw) is deliberately not used anywhere.
+// LogFields returns the structured fields for the terminal diagnostics log.
+// The whitelist (rework 4 finding 2): item / class / endpoint /
+// access_key_id / s3_code / sts_code / http_status / net_kind / attempts /
+// window / fix_hint — endpoint, access_key_id and the hint come from OUR
+// config, everything else from the Diagnostic. No free error text.
 func (f *Failure) LogFields(endpoint, accessKeyID, fixHint string) []zap.Field {
-	return []zap.Field{
+	fields := []zap.Field{
 		zap.String("item", f.Item),
-		zap.String("class", f.Class.String()),
+		zap.String("class", f.Diag.Class.String()),
 		zap.String("endpoint", endpoint),
 		zap.String("access_key_id", accessKeyID),
-		zap.String("error", f.SafeErr),
+	}
+	if f.Diag.S3Code != "" {
+		fields = append(fields, zap.String("s3_code", f.Diag.S3Code))
+	}
+	if f.Diag.STSCode != "" {
+		fields = append(fields, zap.String("sts_code", f.Diag.STSCode))
+	}
+	if f.Diag.HTTPStatus != 0 {
+		fields = append(fields, zap.Int("http_status", f.Diag.HTTPStatus))
+	}
+	if f.Diag.NetKind != "" {
+		fields = append(fields, zap.String("net_kind", f.Diag.NetKind))
+	}
+	fields = append(fields,
 		zap.Int("attempts", f.Attempts),
 		zap.Duration("window", f.Window),
 		zap.String("fix_hint", fixHint),
-	}
+	)
+	return fields
 }
 
 // newInternalClient builds the minio-go client on the INTERNAL endpoint with

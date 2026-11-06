@@ -29,30 +29,23 @@ type ProbeS3 struct {
 //     object and creates nothing, so a passing probe proves endpoint
 //     reachability AND credential validity with zero side effects.
 //
-// A missing bucket still proves both — bucket state is server data, not
-// identity — BUT ONLY for a genuine, parsed S3 NoSuchBucket answer (rework 3
-// finding 3). Two forgeries must NOT pass:
-//
-//   - a 404 with a different S3 code (e.g. AccessDenied from a rejecting
-//     proxy): caught by requiring Code == "NoSuchBucket" exactly;
-//   - a non-S3 404 (gateway HTML): minio-go SYNTHESIZES a NoSuchBucket
-//     ErrorResponse for any unparseable 404 body (api-error-response.go:
-//     httpRespToErrorResponse falls back to the status code), so the Code
-//     check alone would pass it. The tell: a synthesized response has an
-//     EMPTY RequestID (it never parsed a body), while every real S3 answer
-//     carries one (live-verified: MinIO and SeaweedFS both include
-//     <RequestId> in their NoSuchBucket XML). Hence the RequestID != ""
-//     guard.
+// Rework 4 finding 1: the probe bucket must PHYSICALLY exist. Every error
+// fails the attempt — including NoSuchBucket. Two rounds of trying to
+// distinguish "genuine" NoSuchBucket answers (exact code, then RequestID
+// provenance) were each broken by minio-go's error synthesis (it fabricates
+// NoSuchBucket for unparseable 404s and back-fills RequestID from the
+// x-amz-request-id header, which any gateway can set); NO wire-derived
+// signal reliably proves "authenticated but missing bucket". So the check
+// now requires the bucket to exist: the init scripts create data-sensor
+// before smoke/production traffic, a missing bucket retries inside the
+// window (fresh deployments pass once init completes), and a wrong
+// endpoint/policy can no longer slip through as a fake absence.
 //
 // minio-go's channel API surfaces the first error via ObjectMultipartInfo.
 // Err; an empty channel is success.
 func (p ProbeS3) ListMultipartUploads(ctx context.Context, bucket string) error {
 	for info := range p.Client.ListIncompleteUploads(ctx, bucket, "", false) {
 		if info.Err != nil {
-			if resp := miniogo.ToErrorResponse(info.Err); resp.Code == "NoSuchBucket" && resp.RequestID != "" {
-				// Bucket absent, identity authenticated, endpoint reachable.
-				return nil
-			}
 			return info.Err
 		}
 	}

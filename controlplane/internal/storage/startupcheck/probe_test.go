@@ -96,16 +96,20 @@ func TestProbeS3_SignatureDoesNotMatch(t *testing.T) {
 	resp := miniogo.ToErrorResponse(perr)
 	assert.Equal(t, "SignatureDoesNotMatch", resp.Code)
 	assert.Equal(t, 403, resp.StatusCode)
-	assert.Equal(t, ClassAuthConfig, ClassifyS3(perr))
+	assert.Equal(t, ClassAuth, diagnose(perr).Class)
 }
 
-// ListMultipartUploads: a missing bucket still proves identity + reachability
-// (bucket state is server data, not a credential fact) — must return nil.
-func TestProbeS3_NoSuchBucketStillPasses(t *testing.T) {
+// ListMultipartUploads (rework 4 finding 1): a missing bucket FAILS the probe
+// — the bucket must physically exist; NoSuchBucket retries within the window.
+func TestProbeS3_NoSuchBucketFails(t *testing.T) {
 	srv := s3Server(t, 404, noSuchBucketXML)
 	client, err := newInternalClient(probeCfg(srv.Addr))
 	require.NoError(t, err)
-	require.NoError(t, ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor"))
+	perr := ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor")
+	require.Error(t, perr, "NoSuchBucket must fail the probe (bucket must exist)")
+	d := diagnose(perr)
+	assert.Equal(t, "NoSuchBucket", d.S3Code)
+	assert.Equal(t, ClassConfig, d.Class)
 }
 
 // ListMultipartUploads: transport failure (server gone) is a network-class
@@ -122,7 +126,7 @@ func TestProbeS3_Unreachable(t *testing.T) {
 	require.Error(t, perr)
 	var uerr *url.Error
 	require.ErrorAs(t, perr, &uerr)
-	assert.Equal(t, ClassNetwork, ClassifyS3(perr))
+	assert.Equal(t, ClassNetwork, diagnose(perr).Class)
 }
 
 // AssumeRole: happy path — credentials returned but DISCARDED (function
@@ -143,7 +147,7 @@ func TestAssumeRoleSTS_RoleDenied(t *testing.T) {
 	var errResp credentials.ErrorResponse
 	require.ErrorAs(t, err, &errResp)
 	assert.Equal(t, "AccessDenied", errResp.STSError.Code)
-	assert.Equal(t, ClassAuthConfig, ClassifySTS(err))
+	assert.Equal(t, ClassConfig, diagnose(err).Class)
 }
 
 // AssumeRole: unreachable STS endpoint is network-class.
@@ -155,7 +159,7 @@ func TestAssumeRoleSTS_Unreachable(t *testing.T) {
 	cfg := probeCfg(addr)
 	err := AssumeRoleSTS{Config: cfg}.AssumeRole(context.Background())
 	require.Error(t, err)
-	assert.Equal(t, ClassNetwork, ClassifySTS(err))
+	assert.Equal(t, ClassNetwork, diagnose(err).Class)
 }
 
 // AssumeRole honours a pre-cancelled context without dialing.
@@ -186,48 +190,49 @@ func TestNewInternalClient_Valid(t *testing.T) {
 	_ = fmt.Sprint(client)
 }
 
-// ─── Rework 3 finding 3: only an exact NoSuchBucket code passes ─────────────
+// ─── Rework 4 finding 1: every 404 fails; the bucket must exist ──────────────
 
 // A 404 whose S3 error code is AccessDenied (a rejecting proxy shape) must
-// FAIL the probe, not be swallowed as "authenticated NoSuchBucket". This is
-// the review probe TestReviewAccessDenied404Accepted, asserted the FIXED way.
+// FAIL the probe.
 func TestProbeS3_AccessDenied404Fails(t *testing.T) {
 	srv := s3Server(t, 404, `<Error><Code>AccessDenied</Code><Message>proxy rejected this credential</Message></Error>`)
 	client, err := newInternalClient(probeCfg(srv.Addr))
 	require.NoError(t, err)
 	perr := ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor")
-	require.Error(t, perr, "404 + AccessDenied must fail the probe, not pass as NoSuchBucket")
+	require.Error(t, perr, "404 + AccessDenied must fail the probe")
 	resp := miniogo.ToErrorResponse(perr)
 	assert.Equal(t, "AccessDenied", resp.Code)
-	assert.Equal(t, ClassAuthConfig, ClassifyS3(perr))
+	assert.Equal(t, ClassConfig, diagnose(perr).Class)
 }
 
-// A gateway's HTML 404 (not S3 XML) must FAIL the probe: it proves neither
-// authentication nor a parsed S3 answer.
+// A gateway's HTML 404 (not S3 XML) must FAIL the probe.
 func TestProbeS3_GatewayHTML404Fails(t *testing.T) {
 	srv := s3Server(t, 404, `<html><head><title>404 Not Found</title></head><body>nginx</body></html>`)
 	client, err := newInternalClient(probeCfg(srv.Addr))
 	require.NoError(t, err)
 	perr := ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor")
 	require.Error(t, perr, "non-S3 HTML 404 must fail the probe")
-	// Whatever the decoded shape, it must NOT be a zero-code ErrorResponse
-	// that classifies as pass-through success; the probe returned an error,
-	// and classification falls to the network bucket (retryable, then fail).
-	_ = perr
 }
 
-// The exact NoSuchBucket code (with RequestId) still passes.
-func TestProbeS3_ExactNoSuchBucketStillPasses(t *testing.T) {
-	srv := s3Server(t, 404, noSuchBucketXML)
-	client, err := newInternalClient(probeCfg(srv.Addr))
+// Review r2 finding 1's exploit, asserted the FIXED way: minio-go synthesizes
+// NoSuchBucket for unparseable 404s and back-fills RequestID from the
+// x-amz-request-id header — a gateway can therefore forge the exact shape the
+// old "NoSuchBucket + RequestID" guard trusted. Under "the bucket must
+// exist", the forged absence FAILS like any other error.
+func TestProbeS3_Gateway404WithRequestHeaderFails(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	require.NoError(t, ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor"))
-}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-amz-request-id", "proxy-request-123")
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("<html>404 gateway route missing</html>"))
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
 
-// A RequestID-less NoSuchBucket is not trusted (synthesis-indistinguishable).
-func TestProbeS3_NoSuchBucketWithoutRequestIDFails(t *testing.T) {
-	srv := s3Server(t, 404, noSuchBucketNoRequestIDXML)
-	client, err := newInternalClient(probeCfg(srv.Addr))
+	client, err := newInternalClient(probeCfg(ln.Addr().String()))
 	require.NoError(t, err)
-	require.Error(t, ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor"))
+	perr := ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor")
+	require.Error(t, perr, "gateway HTML 404 with x-amz-request-id must fail the probe (review r2 exploit)")
 }

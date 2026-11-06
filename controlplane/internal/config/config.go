@@ -68,9 +68,18 @@ type Config struct {
 	// one STS AssumeRole). Any failure — auth/config included — retries with
 	// backoff inside this window before the process shuts down with a non-zero
 	// exit; the default tolerates compose stacks where storage starts after
-	// the CP, and fresh MinIO deployments where init-minio.sh runs after the
+	// the CP, and fresh deployments where the init script runs after the
 	// CP is listening (it dials the CP webhook). Default 120s.
 	MinIOStartupCheckTimeout time.Duration
+	// MinIOStartupCheckBucket is the bucket the IC-BUG-40 self-check probes
+	// with ListBucketMultipartUploads. The bucket must PHYSICALLY exist —
+	// a NoSuchBucket answer is a failed check (retried within the window),
+	// because it cannot prove the identity authenticated. bootstrap only
+	// writes DB records; the physical bucket is created by the init scripts
+	// (init-minio.sh / init-seaweedfs.sh, both create "data-sensor"), so on
+	// a fresh deployment the check retries until the init script completes.
+	// Default "data-sensor".
+	MinIOStartupCheckBucket string
 
 	// NATSURL is the NATS JetStream connection URL (required).
 	// Example: nats://localhost:4222
@@ -252,6 +261,15 @@ func Load() (*Config, error) {
 	} else {
 		cfg.MinIOStartupCheckTimeout = 120 * time.Second
 	}
+	// Like the timeout (rework 3 finding 5): a set-but-empty value must fail
+	// loudly rather than silently becoming the default — the check requires a
+	// physically existing bucket. LookupEnv distinguishes "set to empty"
+	// (rejected below by Validate) from "unset" (default data-sensor).
+	if raw, ok := os.LookupEnv("MINIO_STARTUP_CHECK_BUCKET"); ok {
+		cfg.MinIOStartupCheckBucket = raw
+	} else {
+		cfg.MinIOStartupCheckBucket = "data-sensor"
+	}
 
 	// ── nats ──────────────────────────────────────────────────────────────────
 	cfg.NATSURL = os.Getenv("NATS_URL")
@@ -332,6 +350,9 @@ func (c *Config) Validate() error {
 	// errors worth refusing at startup.
 	if c.MinIOStartupCheckTimeout <= 0 {
 		return errors.New("MINIO_STARTUP_CHECK_TIMEOUT must be a positive duration (the storage startup self-check retry window)")
+	}
+	if c.MinIOStartupCheckBucket == "" {
+		return errors.New("MINIO_STARTUP_CHECK_BUCKET cannot be empty (the bucket the storage startup self-check probes; it must physically exist — the init scripts create data-sensor)")
 	}
 	// S1 (PR #110 review): below-floor WEBHOOK_FAIL_LIMIT is a startup failure,
 	// not a silent fallback — limit=1 tolerates ~3s of outage, which would

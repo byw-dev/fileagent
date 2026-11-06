@@ -54,7 +54,7 @@ func TestAwaitShutdownOrSelfCheckFailure_DeterministicUnderRace(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		ch := make(chan *startupcheck.Failure, 1)
-		ch <- &startupcheck.Failure{Item: "s3-identity", Class: startupcheck.ClassAuthConfig}
+		ch <- &startupcheck.Failure{Item: "s3-identity", Diag: startupcheck.Diagnostic{Class: startupcheck.ClassAuth}}
 
 		code := awaitShutdownOrSelfCheckFailure(ctx, ch, noServeFatal(), logger, cfg)
 		require.NotZerof(t, code, "round %d: 自检失败与信号同时就绪时退出码为 0 —— 失败被吞（rework 1 finding 1 回归）", i)
@@ -68,7 +68,7 @@ func TestAwaitShutdownOrSelfCheckFailure_FailureOnly(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ch := make(chan *startupcheck.Failure, 1)
-	ch <- &startupcheck.Failure{Item: "sts-assume-role", Class: startupcheck.ClassAuthConfig}
+	ch <- &startupcheck.Failure{Item: "sts-assume-role", Diag: startupcheck.Diagnostic{Class: startupcheck.ClassAuth}}
 
 	code := awaitShutdownOrSelfCheckFailure(ctx, ch, noServeFatal(), logger, cfg)
 	assert.Equal(t, 1, code)
@@ -113,8 +113,9 @@ func TestAwaitShutdownOrSelfCheckFailure_LogsErrorNotFatal(t *testing.T) {
 	defer cancel()
 	ch := make(chan *startupcheck.Failure, 1)
 	ch <- &startupcheck.Failure{
-		Item: "s3-identity", Class: startupcheck.ClassAuthConfig,
-		Err: assert.AnError, Window: 15 * time.Second, Attempts: 5,
+		Item: "s3-identity",
+		Diag: startupcheck.Diagnostic{Class: startupcheck.ClassAuth, S3Code: "SignatureDoesNotMatch"},
+		Err:  assert.AnError, Window: 15 * time.Second, Attempts: 5,
 	}
 
 	code := awaitShutdownOrSelfCheckFailure(ctx, ch, noServeFatal(), logger, cfg)
@@ -128,13 +129,15 @@ func TestAwaitShutdownOrSelfCheckFailure_LogsErrorNotFatal(t *testing.T) {
 	for _, f := range entry.Context {
 		keys[f.Key] = f.String
 	}
-	for _, k := range []string{"item", "class", "endpoint", "access_key_id", "fix_hint"} {
+	for _, k := range []string{"item", "class", "endpoint", "access_key_id", "s3_code", "fix_hint"} {
 		assert.NotEmpty(t, keys[k], "缺少诊断字段 %s", k)
 	}
 	assert.Equal(t, "s3.test:9000", keys["endpoint"])
 	assert.Equal(t, "TESTACCESSKEYID", keys["access_key_id"])
-	// 绝不打 secret：日志字段集合里根本没有 secret 字段。
+	// 绝不打 secret：日志字段集合里根本没有 secret 字段；自由文本 error
+	// 字段也在白名单之外（rework 4 finding 2）。
 	assert.NotContains(t, keys, "secret")
+	assert.NotContains(t, keys, "error")
 }
 
 // drainStartupCheckFailure 的两分支：空 channel 返回 false，有待取失败返回 true。

@@ -586,15 +586,12 @@ func run() int {
 	// the API (incl. the webhook init talks to) before storage initialization
 	// completes.
 	//
-	// ProbeBucket: the check only needs SOME bucket to exist-or-not; it is a
-	// connectivity + credential probe, not a business-bucket assertion — a
-	// parsed NoSuchBucket answer still proves the identity authenticated (S3
-	// authorizes before it resolves the bucket; live-verified on MinIO and
-	// SeaweedFS, see report-rework1.md). "data-sensor" is the name in the
-	// default database records (bootstrap.EnsureDefaultBuckets only writes
-	// DB rows — the PHYSICAL bucket is created by the init scripts, so on a
-	// fresh deployment the probe may legitimately see NoSuchBucket); it is
-	// not a config knob.
+	// ProbeBucket comes from config (MINIO_STARTUP_CHECK_BUCKET, default
+	// data-sensor — no hardcoded literal). The bucket must PHYSICALLY exist:
+	// NoSuchBucket is a FAILED attempt that retries inside the window
+	// (rework 4 finding 1). bootstrap only writes DB records; the physical
+	// bucket is created by the init scripts, so on a fresh deployment the
+	// check retries until init completes — within the default 120s window.
 	selfCheckFailed := make(chan *startupcheck.Failure, 1)
 	go func() {
 		err := startupcheck.Run(ctx, startupcheck.Config{
@@ -603,7 +600,7 @@ func run() int {
 			SecretKey:   cfg.MinIOSecretKey,
 			UseSSL:      cfg.MinIOUseSSL,
 			RoleARN:     cfg.MinIORoleARN,
-			ProbeBucket: "data-sensor",
+			ProbeBucket: cfg.MinIOStartupCheckBucket,
 			Timeout:     cfg.MinIOStartupCheckTimeout,
 			Logger:      logger,
 		})
@@ -712,10 +709,12 @@ func drainStartupCheckFailure(ch <-chan *startupcheck.Failure) (*startupcheck.Fa
 }
 
 // logSelfCheckFailure records the terminal IC-BUG-40 diagnostics at Error
-// level (Fatal would os.Exit and skip the shutdown path — rework 1 finding 2).
+// level (Fatal would os.Exit and skip the shutdown path — rework 1 finding
+// 2). Only whitelisted fields (diagnostics.go) — no error text.
 func logSelfCheckFailure(logger *zap.Logger, cfg *config.Config, failure *startupcheck.Failure) {
 	logger.Error("storage startup self-check failed — refusing to run with a broken storage identity (IC-BUG-40)",
-		failure.LogFields(cfg.MinIOEndpoint, cfg.MinIOAccessKey, startupcheck.FixHint(cfg.MinIORoleARN, failure.Item))...)
+		failure.LogFields(cfg.MinIOEndpoint, cfg.MinIOAccessKey,
+			startupcheck.FixHint(cfg.MinIORoleARN, cfg.MinIOStartupCheckBucket, failure.Item, failure.Diag))...)
 }
 
 // buildLogger creates a production or development zap logger based on level.

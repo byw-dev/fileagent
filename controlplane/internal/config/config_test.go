@@ -152,6 +152,38 @@ func TestLoad_StartupCheckTimeout(t *testing.T) {
 	})
 }
 
+// IC-BUG-40 rework 4: the probe bucket is configurable (no hardcoded literal);
+// the default matches what both init scripts create, and an empty value is
+// rejected because a NoSuchBucket answer is now a FAILED check.
+func TestLoad_StartupCheckBucket(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		setEnv(t, validEnv())
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, "data-sensor", cfg.MinIOStartupCheckBucket)
+	})
+	t.Run("override", func(t *testing.T) {
+		env := validEnv()
+		env["MINIO_STARTUP_CHECK_BUCKET"] = "my-probe-bucket"
+		setEnv(t, env)
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, "my-probe-bucket", cfg.MinIOStartupCheckBucket)
+	})
+	t.Run("empty rejected by Validate", func(t *testing.T) {
+		env := validEnv()
+		env["MINIO_STARTUP_CHECK_BUCKET"] = ""
+		setEnv(t, env)
+		cfg, err := Load()
+		require.NoError(t, err)
+		err = cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_BUCKET")
+	})
+}
+
 func TestLoad_CustomAgentTokenTTL(t *testing.T) {
 	env := validEnv()
 	env["AGENT_TOKEN_TTL"] = "168h"

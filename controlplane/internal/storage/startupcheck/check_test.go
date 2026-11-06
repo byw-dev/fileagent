@@ -2,6 +2,8 @@ package startupcheck
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -140,77 +142,113 @@ func makeURLErr() error {
 
 // ─── classification ──────────────────────────────────────────────────────────
 
-func TestClassifyS3(t *testing.T) {
+// diagnose() replaces the old ClassifyS3/ClassifySTS pair (rework 4): one
+// function, whitelisted fields. Table-driven over the shapes that matter.
+func TestDiagnose_S3Shapes(t *testing.T) {
 	cases := []struct {
-		name string
-		err  error
-		want FailureClass
+		name     string
+		err      error
+		class    FailureClass
+		s3Code   string
+		httpStat int
 	}{
-		{"wrong secret → auth", errSigMismatch(), ClassAuthConfig},
-		{"unknown AK → auth", errInvalidAK(), ClassAuthConfig},
-		{"AccessDenied → auth", miniogo.ErrorResponse{Code: "AccessDenied", StatusCode: 403}, ClassAuthConfig},
-		{"bare 401 → auth", miniogo.ErrorResponse{Code: "Whatever", StatusCode: 401}, ClassAuthConfig},
-		{"bare 403 → auth", miniogo.ErrorResponse{Code: "Whatever", StatusCode: 403}, ClassAuthConfig},
-		{"unknown 4xx code → auth (backend answered)", miniogo.ErrorResponse{Code: "NoSuchLifecycleConfiguration", StatusCode: 404}, ClassAuthConfig},
-		{"500 → network", miniogo.ErrorResponse{Code: "InternalError", StatusCode: 500}, ClassNetwork},
-		{"503 → network", miniogo.ErrorResponse{Code: "SlowDown", StatusCode: 503}, ClassNetwork},
-		{"dial refused → network", makeURLErr(), ClassNetwork},
-		{"plain error → network", errors.New("boom"), ClassNetwork},
-		{"nil → network (total function)", nil, ClassNetwork},
+		{"wrong secret", errSigMismatch(), ClassAuth, "SignatureDoesNotMatch", 403},
+		{"unknown access key", errInvalidAK(), ClassAuth, "InvalidAccessKeyId", 403},
+		{"missing probe bucket", miniogo.ErrorResponse{Code: "NoSuchBucket", StatusCode: 404, RequestID: "r1"}, ClassConfig, "NoSuchBucket", 404},
+		{"access denied", miniogo.ErrorResponse{Code: "AccessDenied", StatusCode: 403}, ClassConfig, "AccessDenied", 403},
+		{"unknown 4xx", miniogo.ErrorResponse{Code: "NoSuchLifecycleConfiguration", StatusCode: 404}, ClassConfig, "NoSuchLifecycleConfiguration", 404},
+		{"500 InternalError", miniogo.ErrorResponse{Code: "InternalError", StatusCode: 500}, ClassNetwork, "InternalError", 500},
+		{"503 SlowDown", miniogo.ErrorResponse{Code: "SlowDown", StatusCode: 503}, ClassNetwork, "SlowDown", 503},
+		{"malicious non-standard code", miniogo.ErrorResponse{Code: "AccessDenied Authorization: Bearer tok", StatusCode: 403}, ClassConfig, "<non-standard>", 403},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, ClassifyS3(tc.err))
+			d := diagnose(tc.err)
+			assert.Equal(t, tc.class, d.Class)
+			assert.Equal(t, tc.s3Code, d.S3Code)
+			assert.Equal(t, tc.httpStat, d.HTTPStatus)
 		})
 	}
 }
 
-func TestClassifySTS(t *testing.T) {
-	// Real credentials.ErrorResponse needs its inner struct; build via XML is
-	// overkill — use the public type directly.
-	sig := credentials.ErrorResponse{}
-	sig.STSError.Code = "AccessDenied"
-	sig.STSError.Message = "The request signature we calculated does not match the signature you provided."
-	role := credentials.ErrorResponse{}
-	role.STSError.Code = "AccessDenied"
-	role.STSError.Message = "user fileagent-controlplane is not authorized to assume role arn:aws:iam::000000000000:role/nope"
-	byTextAK := credentials.ErrorResponse{}
-	byTextAK.STSError.Code = "SomeFutureCode"
-	byTextAK.STSError.Message = "The Access Key Id you provided does not exist"
-	byTextToken := credentials.ErrorResponse{}
-	byTextToken.STSError.Code = "SomeFutureCode"
-	byTextToken.STSError.Message = "invalid token"
-	byTextCred := credentials.ErrorResponse{}
-	byTextCred.STSError.Code = "SomeFutureCode"
-	byTextCred.STSError.Message = "credential mismatch"
-	byTextSignature := credentials.ErrorResponse{}
-	byTextSignature.STSError.Code = "SomeFutureCode"
-	byTextSignature.STSError.Message = "Credential SIGNATURE mismatch"
-	unknownCode := credentials.ErrorResponse{}
-	unknownCode.STSError.Code = "SomeFutureCode"
-	unknownCode.STSError.Message = "entirely opaque"
+func TestDiagnose_STSShapes(t *testing.T) {
+	roleDenied := credentials.ErrorResponse{}
+	roleDenied.STSError.Code = "AccessDenied"
+	roleDenied.STSError.Message = "user fileagent-controlplane is not authorized to assume role arn:aws:iam::000000000000:role/nope"
+	sigWrap := credentials.ErrorResponse{}
+	sigWrap.STSError.Code = "AccessDenied"
+	sigWrap.STSError.Message = "The request signature we calculated does not match."
+	plainSig := credentials.ErrorResponse{}
+	plainSig.STSError.Code = "SignatureDoesNotMatch"
+	nonStandard := credentials.ErrorResponse{}
+	nonStandard.STSError.Code = "AccessDenied Authorization: Bearer transient-session-token"
 
 	cases := []struct {
-		name string
-		err  error
-		want FailureClass
+		name    string
+		err     error
+		class   FailureClass
+		stsCode string
 	}{
-		{"signature mismatch text → auth", sig, ClassAuthConfig},
-		{"not authorized to assume role → auth", role, ClassAuthConfig},
-		{"unknown code, access-key text → auth", byTextAK, ClassAuthConfig},
-		{"unknown code, token text → auth", byTextToken, ClassAuthConfig},
-		{"unknown code, credential text → auth", byTextCred, ClassAuthConfig},
-		{"unknown code, signature text (case-insensitive) → auth", byTextSignature, ClassAuthConfig}, {"unknown code, authless message → network", unknownCode, ClassNetwork},
-		{"dial refused → network", makeURLErr(), ClassNetwork},
-		{"plain error → network", errors.New("boom"), ClassNetwork},
-		{"nil → network (total function)", nil, ClassNetwork},
+		{"MinIO signature wrap (AccessDenied+message)", sigWrap, ClassAuth, "AccessDenied"},
+		{"plain SignatureDoesNotMatch", plainSig, ClassAuth, "SignatureDoesNotMatch"},
+		{"role not assumable (SeaweedFS)", roleDenied, ClassConfig, "AccessDenied"},
+		{"malicious non-standard code", nonStandard, ClassConfig, "<non-standard>"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, ClassifySTS(tc.err))
+			d := diagnose(tc.err)
+			assert.Equal(t, tc.class, d.Class)
+			assert.Equal(t, tc.stsCode, d.STSCode)
 		})
 	}
 }
+
+func TestDiagnose_TransportShapes(t *testing.T) {
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	timedOut := &net.OpError{Op: "dial", Net: "tcp", Err: timeoutErr{}}
+	dnsErr := &net.DNSError{Err: "no such host", Name: "s3.test", IsNotFound: true}
+	tlsErr := &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}
+	wrappedRefused := &url.Error{Op: "Get", URL: "http://s3.test:9000/b", Err: refused}
+
+	cases := []struct {
+		name    string
+		err     error
+		class   FailureClass
+		netKind string
+	}{
+		{"dial refused", refused, ClassNetwork, "dial_refused"},
+		{"dial timeout", timedOut, ClassNetwork, "timeout"},
+		{"dns", dnsErr, ClassNetwork, "dns"},
+		{"tls", tlsErr, ClassNetwork, "tls"},
+		{"url.Error wrapping dial refused", wrappedRefused, ClassNetwork, "dial_refused"},
+		{"context deadline", context.DeadlineExceeded, ClassNetwork, "timeout"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := diagnose(tc.err)
+			assert.Equal(t, tc.class, d.Class)
+			assert.Equal(t, tc.netKind, d.NetKind)
+		})
+	}
+}
+
+// Unknown shapes collapse to class=unknown with NO other fields — the whole
+// point of the whitelist (round 2 proved any text can leak).
+func TestDiagnose_UnknownShapeSaysNothing(t *testing.T) {
+	d := diagnose(errors.New("gateway error: Authorization: Bearer transient-session-token status=403"))
+	assert.Equal(t, ClassUnknown, d.Class)
+	assert.Empty(t, d.S3Code)
+	assert.Empty(t, d.STSCode)
+	assert.Zero(t, d.HTTPStatus)
+	assert.Empty(t, d.NetKind)
+}
+
+// timeoutErr satisfies net.Error with Timeout()=true for the transport table.
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
 
 // ─── Run semantics ────────────────────────────────────────────────────────────
 
@@ -238,13 +276,14 @@ func TestRun_S3AuthFailure_RetriesThenFailsAtWindowEnd(t *testing.T) {
 	var failure *Failure
 	require.ErrorAs(t, err, &failure)
 	assert.Equal(t, itemS3, failure.Item)
-	assert.Equal(t, ClassAuthConfig, failure.Class)
+	assert.Equal(t, ClassAuth, failure.Diag.Class)
 	assert.Greater(t, failure.Attempts, 1, "auth failures must retry inside the window (call count: %d)", s3.callCount())
 	assert.Equal(t, failure.Attempts, s3.callCount())
 	// The STS probe runs after S3 succeeds only — it must never be reached.
 	assert.Equal(t, 0, sts.callCount())
 	assert.Contains(t, failure.Error(), "s3-identity")
-	assert.Contains(t, failure.Error(), "auth/config")
+	assert.Contains(t, failure.Error(), "class=auth")
+	assert.Contains(t, failure.Error(), "s3_code=SignatureDoesNotMatch")
 }
 
 // STS failure with correct S3 credentials: fails (retried) at window end.
@@ -259,7 +298,7 @@ func TestRun_STSFailure(t *testing.T) {
 	var failure *Failure
 	require.ErrorAs(t, err, &failure)
 	assert.Equal(t, itemSTS, failure.Item)
-	assert.Equal(t, ClassAuthConfig, failure.Class)
+	assert.Equal(t, ClassConfig, failure.Diag.Class)
 	assert.Greater(t, failure.Attempts, 1)
 	assert.Equal(t, failure.Attempts, s3.callCount(), "S3 probe succeeds every round")
 }
@@ -282,7 +321,7 @@ func TestRun_NetworkError_WindowExhausted(t *testing.T) {
 	require.Error(t, err)
 	var failure *Failure
 	require.ErrorAs(t, err, &failure)
-	assert.Equal(t, ClassNetwork, failure.Class)
+	assert.Equal(t, ClassNetwork, failure.Diag.Class)
 	assert.GreaterOrEqual(t, failure.Attempts, 2)
 	assert.Equal(t, 0, sts.callCount())
 }
@@ -455,34 +494,43 @@ func (c *ctxCancelSTS) AssumeRole(ctx context.Context) error {
 
 // Failure.LogFields carries exactly the IC-BUG-40 required diagnostics.
 func TestFailure_LogFields(t *testing.T) {
-	f := &Failure{Item: itemS3, Class: ClassAuthConfig, Err: errSigMismatch(), Window: 15 * time.Second, Attempts: 4}
+	f := &Failure{Item: itemS3, Err: errSigMismatch(), Diag: diagnose(errSigMismatch()), Window: 15 * time.Second, Attempts: 4}
 	fields := f.LogFields("minio:9000", "AKID123", "fix-me")
 	keys := map[string]bool{}
 	for _, fd := range fields {
 		keys[fd.Key] = true
 	}
-	for _, k := range []string{"item", "class", "endpoint", "access_key_id", "error", "attempts", "window", "fix_hint"} {
+	for _, k := range []string{"item", "class", "endpoint", "access_key_id", "s3_code", "http_status", "attempts", "window", "fix_hint"} {
 		assert.True(t, keys[k], "missing log field %s", k)
 	}
+	// The free-text "error" field is GONE by design (whitelist, rework 4).
+	assert.NotContains(t, keys, "error")
 	assert.Contains(t, f.Error(), "s3-identity")
 	assert.Contains(t, f.Error(), "15s")
 }
 
-// FixHint differentiates the two items.
+// FixHint differentiates the items and the NoSuchBucket case (rework 4
+// finding 1: a missing probe bucket gets the init-script runbook).
 func TestFixHint(t *testing.T) {
-	s3Hint := FixHint("arn:aws:iam:::role/agent-role", itemS3)
+	const role = "arn:aws:iam:::role/agent-role"
+	s3Hint := FixHint(role, "data-sensor", itemS3, Diagnostic{})
 	assert.Contains(t, s3Hint, "MINIO_SECRET_KEY")
-	stsHint := FixHint("arn:aws:iam:::role/agent-role", itemSTS)
+	stsHint := FixHint(role, "data-sensor", itemSTS, Diagnostic{})
 	assert.Contains(t, stsHint, "MINIO_ROLE_ARN")
 	assert.Contains(t, stsHint, "MinIO's STS does not validate RoleArn")
+	bucketHint := FixHint(role, "data-sensor", itemS3, Diagnostic{S3Code: "NoSuchBucket"})
+	assert.Contains(t, bucketHint, "MINIO_STARTUP_CHECK_BUCKET")
+	assert.Contains(t, bucketHint, "init")
 }
 
 // Atomic sanity check that FailureClass strings are stable (logs are an
 // operator interface; see the deployment doc added with this change).
 func TestFailureClassString(t *testing.T) {
-	assert.Equal(t, "auth/config", ClassAuthConfig.String())
+	assert.Equal(t, "auth", ClassAuth.String())
+	assert.Equal(t, "config", ClassConfig.String())
 	assert.Equal(t, "network", ClassNetwork.String())
-	assert.Equal(t, "FailureClass(7)", FailureClass(7).String())
+	assert.Equal(t, "unknown", ClassUnknown.String())
+	assert.Equal(t, "FailureClass(9)", FailureClass(9).String())
 }
 
 // Context cancellation mid-probe (not between retries): Run surfaces the
@@ -580,49 +628,18 @@ func TestAssumeRoleSTS_TimeoutBoundedByWindowCtx(t *testing.T) {
 	assert.Less(t, elapsed, 5*time.Second, "STS call must be bounded by the window deadline (took %s)", elapsed)
 }
 
-// Finding 2: sanitized summaries for the shapes the review enumerated.
-func TestSafeErrorSummary(t *testing.T) {
-	const secret = "SHOULD_NOT_LOG"
+// Finding 2 (rework 4): the whitelist contract. EVERY field the check ever
+// logs must come from the allow-list in diagnostics.go; the five malicious
+// scenarios from review round 2 (untrusted S3 code, untrusted STS code,
+// Authorization headers, unknown query params) plus the configured secret
+// itself must appear in NO log line or field.
+func TestRun_LogsAreWhitelistOnly(t *testing.T) {
+	const secret = "configured-secret"
+	const bearer = "transient-session-token"
 
-	t.Run("s3 error response", func(t *testing.T) {
-		got := SafeErrorSummary(errSigMismatch(), secret)
-		assert.Equal(t, "s3 error: code=SignatureDoesNotMatch status=403", got)
-	})
-	t.Run("sts error response", func(t *testing.T) {
-		role := credentials.ErrorResponse{}
-		role.STSError.Code = "AccessDenied"
-		role.STSError.Message = "user fileagent-controlplane is not authorized to assume role arn"
-		got := SafeErrorSummary(role, secret)
-		assert.Equal(t, "sts error: code=AccessDenied", got)
-	})
-	t.Run("url error keeps only scheme-host and leaf cause", func(t *testing.T) {
-		u := &url.Error{Op: "Get", URL: "https://ak:SHOULD_NOT_LOG@storage.test:9000/bucket?X-Amz-Signature=SHOULD_NOT_LOG&uploads=", Err: errors.New("dial tcp 10.0.0.9:9000: connect: connection refused")}
-		got := SafeErrorSummary(u, secret)
-		assert.Equal(t, "network error: Get https://storage.test:9000: dial tcp 10.0.0.9:9000: connect: connection refused", got)
-		assert.NotContains(t, got, "SHOULD_NOT_LOG")
-	})
-	t.Run("context errors", func(t *testing.T) {
-		assert.Equal(t, "context canceled", SafeErrorSummary(context.Canceled, secret))
-		assert.Equal(t, "context deadline exceeded", SafeErrorSummary(context.DeadlineExceeded, secret))
-	})
-	t.Run("malicious unknown-shape error is scrubbed", func(t *testing.T) {
-		malicious := errors.New("Get https://user:SHOULD_NOT_LOG@storage.test/x?X-Amz-Signature=SHOULD_NOT_LOG&X-Amz-Credential=SHOULD_NOT_LOG/20260101/us-east-1/s3/aws4_request&X-Amz-Security-Token=SHOULD_NOT_LOG: status 403")
-		got := SafeErrorSummary(malicious, secret)
-		assert.NotContains(t, got, "SHOULD_NOT_LOG")
-		assert.Contains(t, got, "X-Amz-Signature=***")
-	})
-}
-
-// Finding 2 (end-to-end): a malicious error flowing through the whole Run
-// loop must never put the secret (or signature params, userinfo, tokens) in
-// ANY log line — the review probe TestReviewRawErrorContainsSecret, under
-// the fixed contract.
-func TestRun_MaliciousErrorNeverLeaksToLogs(t *testing.T) {
-	const secret = "SHOULD_NOT_LOG"
-	s3 := &reviewS3{fn: func() error {
-		return fmt.Errorf(`Get https://user:%s@storage.test/x?X-Amz-Signature=%s&X-Amz-Credential=%s/20260101/us-east-1/s3/aws4_request&X-Amz-Security-Token=%s: status 403`,
-			secret, secret, secret, secret)
-	}}
+	malicious := fmt.Sprintf(`gateway error: Authorization: Bearer %s Get https://user:%s@storage.test/x?X-Amz-Signature=%s&session_token=%s: status 403`,
+		bearer, secret, secret, bearer)
+	s3 := &reviewS3{fn: func() error { return errors.New(malicious) }}
 	logger, obs := observedLogger(t)
 	cfg := testConfig(t, s3, &fakeSTS{script: []error{nil}}, 20*time.Millisecond)
 	cfg.Logger = logger
@@ -632,24 +649,106 @@ func TestRun_MaliciousErrorNeverLeaksToLogs(t *testing.T) {
 	err := Run(context.Background(), cfg)
 	var failure *Failure
 	require.ErrorAs(t, err, &failure)
-	// The returned error's string form is also sanitized.
-	assert.NotContains(t, err.Error(), secret)
+
+	allowed := map[string]bool{
+		"item": true, "class": true, "endpoint": true, "access_key_id": true,
+		"s3_code": true, "sts_code": true, "http_status": true, "net_kind": true,
+		"attempts": true, "window": true, "fix_hint": true, "attempt": true,
+		"window_remaining": true, "hint": true, "role_arn": true,
+	}
 	for _, entry := range obs.All() {
-		assert.NotContains(t, entry.Message, secret, "log message leaks")
+		assert.NotContains(t, entry.Message, secret)
+		assert.NotContains(t, entry.Message, bearer)
 		for _, f := range entry.Context {
+			assert.True(t, allowed[f.Key], "log field %q is outside the whitelist", f.Key)
 			v := f.String
 			if f.Interface != nil {
 				v = fmt.Sprint(f.Interface)
 			}
-			assert.NotContains(t, v, secret, "field %s leaks", f.Key)
+			assert.NotContains(t, v, secret, "field %q leaks the configured secret", f.Key)
+			assert.NotContains(t, v, bearer, "field %q leaks a third-party token", f.Key)
 		}
 	}
-	// Terminal Error's error field is the sanitized summary.
-	term := obs.FilterMessage("storage startup self-check FAILED: window expired, shutting down")
-	require.Equal(t, 1, term.Len())
-	for _, f := range term.All()[0].Context {
-		if f.Key == "error" {
-			assert.Contains(t, f.String, "X-Amz-Signature=***")
-		}
+	// The returned error's string form obeys the same rules.
+	assert.NotContains(t, err.Error(), secret)
+	assert.NotContains(t, err.Error(), bearer)
+}
+
+// Port of review r2's TestReviewSanitizerUntrustedCodeAndHeader: five
+// server-controlled shapes must yield diagnostics that carry none of the
+// smuggled values — asserted on the DIAGNOSTIC (the only thing that reaches
+// logs).
+func TestDiagnose_NeverCarriesUntrustedValues(t *testing.T) {
+	const tok = "transient-session-token"
+	const b64 = "base64-session-secret"
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"s3 code with bearer", miniogo.ErrorResponse{Code: "AccessDenied Authorization: Bearer " + tok, StatusCode: 403}},
+		{"sts code with bearer", func() error {
+			sts := credentials.ErrorResponse{}
+			sts.STSError.Code = "AccessDenied Authorization: Bearer " + tok
+			return sts
+		}()},
+		{"authorization bearer", errors.New("gateway error: Authorization: Bearer " + tok + " status=403")},
+		{"authorization basic", errors.New("gateway error: Authorization: Basic " + b64 + " status=403")},
+		{"unknown query param", errors.New("Get https://store.test/bucket?session_token=" + tok + "&uploads=: 404")},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := diagnose(tc.err)
+			for _, v := range []string{d.S3Code, d.STSCode, d.NetKind, d.Class.String()} {
+				assert.NotContains(t, v, tok)
+				assert.NotContains(t, v, b64)
+			}
+			// Code fields are either empty, whitelist-patterned, or the
+			// literal marker — never raw wire text.
+			for _, code := range []string{d.S3Code, d.STSCode} {
+				if code != "" && code != "<non-standard>" {
+					assert.Regexp(t, `^[A-Za-z][A-Za-z0-9.]{0,63}$`, code)
+				}
+			}
+		})
+	}
+}
+
+// ─── Rework 4 finding 3: a success observed after window expiry ─────────────
+
+// The review r2 probe TestReviewLateProbeSuccessMustNotPassExpiredWindow,
+// asserted the FIXED way: the probe "succeeds" only after the 1ms window has
+// expired — that success must NOT count; Run returns a *Failure with a
+// timeout-classed diagnostic.
+func TestRun_LateProbeSuccessAfterWindowExpiryFails(t *testing.T) {
+	s3 := &reviewS3{fn: func() error {
+		time.Sleep(20 * time.Millisecond) // window (1ms) expires mid-probe
+		return nil                        // "success" — but too late
+	}}
+	cfg := testConfig(t, s3, &fakeSTS{script: []error{nil}}, time.Millisecond)
+	cfg.RetryBackoff = time.Millisecond
+	err := Run(context.Background(), cfg)
+	require.Error(t, err)
+	var f *Failure
+	require.ErrorAs(t, err, &f, "window expired before the probe returned; Run must not report success")
+	assert.Equal(t, ClassNetwork, f.Diag.Class)
+	assert.Equal(t, "timeout", f.Diag.NetKind)
+	assert.Equal(t, 1, f.Attempts)
+}
+
+// Same boundary, SIGTERM flavor: parent cancelled while the (late) probe was
+// in flight → cancellation wins, clean shutdown (never a Failure).
+func TestRun_LateProbeSuccessAfterParentCancelIsClean(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s3 := &reviewS3{fn: func() error {
+		cancel() // SIGTERM lands mid-probe
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	}}
+	cfg := testConfig(t, s3, &fakeSTS{script: []error{nil}}, time.Minute)
+	cfg.RetryBackoff = time.Millisecond
+	err := Run(ctx, cfg)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	var f *Failure
+	assert.False(t, errors.As(err, &f))
 }

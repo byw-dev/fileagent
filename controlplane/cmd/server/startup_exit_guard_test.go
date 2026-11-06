@@ -1,24 +1,25 @@
 package main
 
-// startup_exit_guard_test.go — run() 退出语义的结构守护（AST 探针）。
+// startup_exit_guard_test.go — run() 退出语义的**回归提示**（AST 探针）。
 //
-// 返工 1 曾把 logger.Fatal 机械替换成 logger.Error 却漏了 return（「记日志
-// 后继续跑」的 fail-open）；返工 3（评审第 6 条）再把守护收紧：
+// ⚠️ 缩窄的承诺（返工 4，评审 r2 第 4 条）：这是一个针对**当前代码排布**的
+// tripwire，不是完备保证。它能抓住：删除 return 1、删除 listener goroutine
+// 里的 serveFatal 投递、把启动错误改成「记日志后继续跑」这类**保持现有形状**
+// 的回归。它抓不住：在 logger.Error 之前插入语句（探针只认首句）、只在某个
+// 条件分支里投递 serveFatal（blockSendsToServeFatal 只查块内是否出现过）、
+// 编排调用之后的任何新增自由代码（整体豁免关停段）。真正的保证来自行为
+// 测试（startup_shutdown_test.go 对 awaitShutdownOrSelfCheckFailure 的单测）
+// 与 live 退出码验证；本探针的价值是把「明显的手滑」挡在 review 之前。
+//
+// 返工 1 曾把 logger.Fatal 机械替换成 logger.Error 却漏了 return（fail-open）；
+// 规则本身：
 //
 //  1. run() 体内不得出现 logger.Fatal / os.Exit（退出必须经 return code）。
 //  2. 若某 if 块以 logger.Error 开头，它必须处于以下三类之一：
 //     a) 以 return 结尾（启动失败终止进程）；
-//     b) 位于 awaitShutdownOrSelfCheckFailure 调用**之后**（关停阶段的诊断，
-//        此时进程已在退出路上，Error 后继续执行关停步骤是正确行为）；
-//     c) 位于 go 语句的函数字面量内（listener goroutine）**且块内真的投递
-//        serveFatal** —— 不再整体豁免 goroutine：漏投递的 listener 死亡会
-//        让进程挂着（返工 2 finding 2 的形状）。
-//
-// 豁免不再按「消息子串」判断（评审意见：改个文案就能绕过），只按 AST 位置
-// 与控制流分类。可恢复的运行期告警（如 dead-letter sink 降级）不在 if 块
-// 首句为 logger.Error 的形状里（probeSink 用的是 switch），天然不受本探针
-// 约束；若未来有人把它改成 if 形状，本测试会要求给出 return 或移到关停
-// 阶段——那正是应当被审视的改动。
+//     b) 位于 awaitShutdownOrSelfCheckFailure 调用**之后**（关停阶段的诊断）；
+//     c) 位于 go 语句的函数字面量内（listener goroutine）**且块内出现过
+//        serveFatal 投递**。
 
 import (
 	"go/ast"
@@ -145,7 +146,7 @@ func TestRunBodyHasNoFatalOrOsExit(t *testing.T) {
 }
 
 // 每个「if 块以 logger.Error 开头」的错误块必须按 a/b/c 三类之一终止
-// （见文件头注释）。豁免按 AST 位置分类，不按消息内容。
+// （见文件头注释——回归提示，非完备保证）。豁免按 AST 位置分类，不按消息内容。
 func TestRunErrorBlocksAreTerminal(t *testing.T) {
 	run, fset := findRunFunc(t)
 	orchLine := orchestrationCallLine(run, fset)
@@ -197,10 +198,10 @@ func TestRunErrorBlocksAreTerminal(t *testing.T) {
 	}
 }
 
-// 反向守护：goroutine 内**没有** serveFatal 投递的错误块必须被上面那条测试
-// 抓红——本测试用一个人工构造的最小 run 形状验证探针本身的能力（变异
-// 证据见 report-rework3.md：在真实 main.go 的 listener goroutine 里删掉
-// serveFatal <- 后 TestRunErrorBlocksAreTerminal 变红）。
+// 探针能力自测（回归提示的一部分）：人工构造的最小 run 形状里，goroutine
+// 内**没有** serveFatal 投递的错误块必须被 TestRunErrorBlocksAreTerminal 的
+// 规则命中。注意这只验证「当前规则能抓当前形状」，不是完备性证明（见文件
+// 头的缩窄承诺）。
 func TestGuardDetectsMissingServeFatalInGoroutine(t *testing.T) {
 	src := `package main
 
