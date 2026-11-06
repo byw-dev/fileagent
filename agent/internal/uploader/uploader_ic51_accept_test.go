@@ -411,7 +411,7 @@ func TestIC51_Multipart_ResumeRemoteDisagreesWithSQLite(t *testing.T) {
 	store := newIC51MultipartStore()
 	store.mockStore.uploadID = "ra-upload-id"
 	store.listParts = []minio.ObjectPart{
-		{PartNumber: 2, ETag: md5Hex(content[mib:2*mib]), Size: int64(mib)},
+		{PartNumber: 2, ETag: md5Hex(content[mib : 2*mib]), Size: int64(mib)},
 	}
 	store.remotePartData[2] = content[mib : 2*mib]
 

@@ -30,16 +30,16 @@ type mockStore struct {
 	abortCalls    int
 	// failOnPart, when non-zero, makes PutObjectPart fail on that part number
 	// (1-indexed) and on every later part, simulating a mid-transfer failure.
-	failOnPart   int
-	putErr       error
-	initErr      error
-	uploadErr    error
-	completeErr  error
-	abortErr     error
-	listErr      error
-	uploadID     string
-	parts        []minio.ObjectPart
-	putFn        func(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
+	failOnPart  int
+	putErr      error
+	initErr     error
+	uploadErr   error
+	completeErr error
+	abortErr    error
+	listErr     error
+	uploadID    string
+	parts       []minio.ObjectPart
+	putFn       func(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
 }
 
 func (m *mockStore) PutObject(ctx context.Context, bucket, object string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
@@ -499,21 +499,20 @@ func TestUploadFile_TailMode_OffsetBeyondEnd_Refused(t *testing.T) {
 // TestNew_ValidEndpoint verifies that New creates an Uploader without requiring
 // an actual MinIO connection (minio.NewCore is lazy).
 func TestNew_ValidEndpoint(t *testing.T) {
-q, _ := queue.Open(":memory:")
-defer q.Close()
+	q, _ := queue.Open(":memory:")
+	defer q.Close()
 
-u, err := New(Config{
-Endpoint:  "localhost:9000",
-AccessKey: "minioadmin",
-SecretKey: "minioadmin",
-UseSSL:    false,
-}, q, zap.NewNop())
-require.NoError(t, err)
-assert.NotNil(t, u)
+	u, err := New(Config{
+		Endpoint:  "localhost:9000",
+		AccessKey: "minioadmin",
+		SecretKey: "minioadmin",
+		UseSSL:    false,
+	}, q, zap.NewNop())
+	require.NoError(t, err)
+	assert.NotNil(t, u)
 }
 
 // ── AbandonUpload (IC-3 ②: terminal-state part cleanup) ──────────────────────
-
 
 func TestAbandonUpload_AbortsRecordedUpload(t *testing.T) {
 	store := &mockStore{}

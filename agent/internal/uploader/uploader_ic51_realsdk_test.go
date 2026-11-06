@@ -76,7 +76,7 @@ func newRealSDKBucketServer(t *testing.T) *realSDKBucketServer {
 		}
 		// NOTE: no ETag is returned. Over plaintext HTTP the SDK signs the
 		// request with aws-chunked STREAMING-AWS4-HMAC-SHA256-PAYLOAD, whose
-	// // chunk framing/signature bytes are part of the raw body seen here;
+		// // chunk framing/signature bytes are part of the raw body seen here;
 		// a server-computed md5(s.body) is therefore NOT the md5 of the object
 		// payload and cannot be compared with the client-side digest. A real
 		// S3 backend decodes the framing; this test server counts the WIRE
