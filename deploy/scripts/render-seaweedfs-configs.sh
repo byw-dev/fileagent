@@ -26,6 +26,22 @@
 # BETWEEN the two renames can still leave a mixed generation (new s3.json +
 # old iam.json) — re-running the renderer converges, it is idempotent.
 #
+# Permission model (B7, 2026-11-06): SW_CONFIG_DIR is forced to 0700 and the
+# published s3.json / iam.json to 0644. The files must be world-READABLE on
+# purpose: on Linux the filer bind-mounts them straight from this directory,
+# and although the image starts as root, its entrypoint immediately drops to
+# uid 1000 (seaweed, via su-exec). A bind mount preserves the HOST uid and
+# mode bits, so the in-container seaweed user is literally "some other uid"
+# from the file's point of view — a 0600 root/runner-owned file is unreadable
+# to it, the S3 gate fails to load its config and the filer healthcheck goes
+# red. That is exactly what killed every Linux CI run of the fault-injection
+# suite after PR #139 (GitHub runner uid 1001 owned 0600 files; macOS Docker
+# Desktop never enforces host perms, so local runs stayed green). 0644 keeps
+# the file readable for ANY container uid without widening exposure on the
+# host: the containing directory is 0700, so no OTHER host user can even
+# traverse into it, and the Docker daemon resolves bind mounts as root
+# regardless of file mode.
+#
 # The DEFAULTS below are development placeholders shared with
 # init-seaweedfs.sh and the seaweedfs branch of smoke.sh via
 # deploy/seaweedfs/env-defaults.sh (single source of truth) — they are NOT
@@ -193,7 +209,45 @@ with open(dst, "w", encoding="utf-8") as f:
 PYEOF
 }
 
+# The gate runs BEFORE mkdir -p: mkdir -p on a symlinked path would happily
+# create/keep the LINK's target directory and we would never notice (mkdir
+# -p succeeds silently when the link resolves to an existing dir).
+if [ -L "${SW_CONFIG_DIR}" ]; then
+  echo "ERROR: SW_CONFIG_DIR (${SW_CONFIG_DIR}) is a symbolic link — refusing to operate." >&2
+  echo "       chmod would follow the link and re-permission a directory this script" >&2
+  echo "       does not own. Point SW_CONFIG_DIR at a real directory (or remove the link)" >&2
+  echo "       and re-run." >&2
+  exit 1
+fi
 mkdir -p "${SW_CONFIG_DIR}"
+# --- Directory permission gate (B7, 2026-11-06) -----------------------------
+# SW_CONFIG_DIR must end up 0700 (see the permission-model note in the file
+# header). Cases, all fail-closed:
+#   * symlink (even one whose target we could fix) — refused, same rationale
+#     as smoke.sh's ~/.aws guard: chmod on a symlink silently follows it and
+#     would re-permission a directory this script does not own (e.g. a real
+#     ~/.aws or an attacker-planted target); a symlinked config dir also
+#     breaks the “same directory ⇒ atomic rename" publish guarantee above
+#     when the link crosses a filesystem.
+#   * existing dir owned by someone else — refused: we cannot chmod it and the
+#     0700 guarantee this script promises would be a lie; report and exit.
+#   * existing dir owned by us — corrected to 0700 (it may have been created
+#     by an older renderer or a umask-happy process as 0755).
+#   * newly created — mkdir already applied the umask, chmod pins it exactly.
+if [ -d "${SW_CONFIG_DIR}" ] && [ "$(id -u)" != "$(stat -c '%u' "${SW_CONFIG_DIR}" 2>/dev/null || stat -f '%u' "${SW_CONFIG_DIR}")" ]; then
+  echo "ERROR: SW_CONFIG_DIR (${SW_CONFIG_DIR}) is owned by another user — cannot enforce 0700." >&2
+  stat -c '       current: owner uid=%u mode=%a' "${SW_CONFIG_DIR}" 2>/dev/null \
+    || stat '       current: %Su %Sp' "${SW_CONFIG_DIR}" >&2
+  echo "       Fix suggestions: chown the directory to the user running this script" >&2
+  echo "       (sudo chown -R $(id -u) ${SW_CONFIG_DIR}), or move it aside and let the" >&2
+  echo "       renderer create a fresh one (mv ${SW_CONFIG_DIR} ${SW_CONFIG_DIR}.old)." >&2
+  exit 1
+fi
+if ! chmod 700 "${SW_CONFIG_DIR}"; then
+  echo "ERROR: chmod 700 ${SW_CONFIG_DIR} failed — cannot guarantee the 0700 directory for" >&2
+  echo "       the rendered credentials; refusing to publish." >&2
+  exit 1
+fi
 # Stage BOTH files as temporaries in the destination directory (same
 # filesystem => each rename(2) is atomic). Only after both validate are they
 # published; if the SECOND publish fails, the first is rolled back from an
@@ -214,7 +268,16 @@ fi
 python3 -m json.tool "${TMP_S3}" >/dev/null
 python3 -m json.tool "${TMP_IAM}" >/dev/null
 
-chmod 600 "${TMP_S3}" "${TMP_IAM}"
+# 0644, NOT 0600: the filer bind-mounts these files and its entrypoint drops
+# to uid 1000 (seaweed) via su-exec while the host-side owner is whoever ran
+# this script (root, a CI runner uid, ...). On Linux the bind mount keeps the
+# host uid/mode, so 0600 files are unreadable in-container and the filer never
+# comes healthy (see the permission-model note in the header). Still safe:
+# the containing directory is 0700, so no other HOST user can traverse into it
+# (the window before publish is covered too — the mktemp temporaries below
+# live INSIDE that 0700 directory, and mktemp itself creates them 0600), and
+# the Docker daemon resolves bind mounts as root regardless of file mode.
+chmod 644 "${TMP_S3}" "${TMP_IAM}"
 
 # --- Publish (rework R2 P2) -------------------------------------------------
 # Back up the currently published s3.json so a failure of the SECOND rename
