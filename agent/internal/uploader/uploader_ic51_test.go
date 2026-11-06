@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -118,12 +119,13 @@ func TestIC51_SinglePart_ReportedSHA256MustDescribeDeliveredBytes(t *testing.T) 
 // the final object from the parts at CompleteMultipartUpload time.
 type ic51MultipartStore struct {
 	*mockStore
-	partData        map[int][]byte
-	remotePartData  map[int][]byte // bytes the "remote" already holds (skipped parts)
-	listParts       []minio.ObjectPart
-	afterList       func() // fired after ListObjectParts returns, before the resume consumes the parts
-	uploadedPartNum []int
-	object          []byte
+	partData          map[int][]byte
+	remotePartData    map[int][]byte // bytes the "remote" already holds (skipped parts)
+	listParts         []minio.ObjectPart
+	afterList         func() // fired after ListObjectParts returns, before the resume consumes the parts
+	uploadedPartNum   []int
+	completedPartNums []int // the part numbers CompleteMultipartUpload received, in sent order
+	object            []byte
 }
 
 func newIC51MultipartStore() *ic51MultipartStore {
@@ -153,14 +155,27 @@ func (s *ic51MultipartStore) ListObjectParts(ctx context.Context, b, o, u string
 }
 
 func (s *ic51MultipartStore) CompleteMultipartUpload(_ context.Context, _, _, _ string, parts []minio.CompletePart, _ minio.PutObjectOptions) (minio.UploadInfo, error) {
+	// Assemble the object BY PART NUMBER (review-r1 fix 1): a real S3 backend
+	// assembles parts by their number, not by the order the client lists
+	// them. The previous fake appended in list order, which silently masked
+	// the non-contiguous-resume bug (it "assembled" A+C+B and the wrong-order
+	// digest happened to match its own wrong assembly).
+	nums := make([]int, 0, len(parts))
 	for _, p := range parts {
-		b, ok := s.partData[p.PartNumber]
+		nums = append(nums, p.PartNumber)
+	}
+	sort.Ints(nums)
+	for _, n := range nums {
+		b, ok := s.partData[n]
 		if !ok {
 			// A part skipped by the resume was never uploaded in THIS session;
 			// the remote already holds its bytes from the earlier attempt.
-			b = s.remotePartData[p.PartNumber]
+			b = s.remotePartData[n]
 		}
 		s.object = append(s.object, b...)
+	}
+	for _, p := range parts {
+		s.completedPartNums = append(s.completedPartNums, p.PartNumber)
 	}
 	return minio.UploadInfo{ETag: "etag-obj"}, nil
 }

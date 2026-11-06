@@ -324,3 +324,106 @@ func TestIC51_SinglePart_ETagMismatch_FailsLoudly(t *testing.T) {
 }
 
 func timeUnixNowPlus(sec int64) time.Time { return time.Now().Add(time.Duration(sec) * time.Second) }
+
+// ── Review-r1 fix 1: non-contiguous remote part sets ─────────────────────────
+
+// TestIC51_Multipart_ResumeNonContiguous_HashMatchesAssembledObject is the
+// review-r1 blocker case: the remote already holds parts 1 and 3, part 2 is
+// missing. The digest must be fed 1+2+3 (each part at its own position), the
+// complete list must ascend, and the reported hash must equal the hash of the
+// object the backend assembles BY PART NUMBER. The fake store assembles by
+// part number like a real S3 backend — the previous fake appended in list
+// order and masked exactly this bug.
+func TestIC51_Multipart_ResumeNonContiguous_HashMatchesAssembledObject(t *testing.T) {
+	const mib = 1024 * 1024
+	dir := t.TempDir()
+	path := filepath.Join(dir, "noncontig.dat")
+	content := append(append([]byte{}, bytesRepeat("A", mib)...), bytesRepeat("B", mib)...)
+	content = append(content, bytesRepeat("C", mib)...)
+	require.NoError(t, os.WriteFile(path, content, 0o644))
+
+	q := newTestQueue(t)
+	task := newTask(t, path, "bucket1", "ic51/noncontig.dat")
+	task.UploadID = "noncontig-upload-id"
+	// SQLite's recorded parts say only part 1 — the remote list (the
+	// authority) will correct this to {1,3}.
+	task.CompletedParts = `{"parts":[{"part_number":1,"etag":"` + md5Hex(content[:mib]) + `"}]}`
+	st, err := os.Stat(path)
+	require.NoError(t, err)
+	task.PartsFileMtime = st.ModTime().Unix()
+	task.PartsFileSize = st.Size()
+	require.NoError(t, q.Enqueue(task))
+
+	store := newIC51MultipartStore()
+	store.mockStore.uploadID = "noncontig-upload-id"
+	store.listParts = []minio.ObjectPart{
+		{PartNumber: 1, ETag: md5Hex(content[:mib]), Size: int64(mib)},
+		{PartNumber: 3, ETag: md5Hex(content[2*mib:]), Size: int64(mib)},
+	}
+	store.remotePartData[1] = content[:mib]
+	store.remotePartData[3] = content[2*mib:]
+
+	u := newWithStore(store, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	result, err := u.UploadFile(context.Background(), task)
+	require.NoError(t, err)
+
+	assert.Equal(t, []int{2}, store.uploadedPartNum,
+		"only the missing part 2 is transmitted; parts 1 and 3 are resumed")
+	assert.Zero(t, store.mockStore.initCalls, "the recorded upload is resumed")
+	// The object is assembled 1+2+3 by part number; the reported hash must
+	// describe exactly that, NOT the feeding-order artifact 1+3+2.
+	assert.Equal(t, sha256Hex(store.object), result.SHA256,
+		"reported sha256 must equal the hash of the object assembled BY PART NUMBER")
+	assert.Equal(t, sha256Hex(content), result.SHA256)
+	assert.Equal(t, int64(3*mib), result.SizeBytes)
+	// And the complete list the client sent must ascend 1,2,3 — minio-go
+	// does not sort it, we must.
+	assert.Equal(t, []int{1, 2, 3}, store.completedPartNums,
+		"CompleteMultipartUpload must receive parts in ascending order")
+}
+
+// TestIC51_Multipart_ResumeRemoteDisagreesWithSQLite: the remote part list is
+// the authority (P1-a) — here SQLite claims parts {1,2} while the remote only
+// holds part 2. The resume must follow the REMOTE set (upload 1 and 3, skip
+// 2), hash in order 1+2+3, and succeed.
+func TestIC51_Multipart_ResumeRemoteDisagreesWithSQLite(t *testing.T) {
+	const mib = 1024 * 1024
+	dir := t.TempDir()
+	path := filepath.Join(dir, "remote-authority.dat")
+	content := append(append([]byte{}, bytesRepeat("X", mib)...), bytesRepeat("Y", mib)...)
+	content = append(content, bytesRepeat("Z", mib)...)
+	require.NoError(t, os.WriteFile(path, content, 0o644))
+
+	q := newTestQueue(t)
+	task := newTask(t, path, "bucket1", "ic51/remote-authority.dat")
+	task.UploadID = "ra-upload-id"
+	// SQLite optimistically recorded parts 1 and 2; the remote (authority)
+	// only has part 2 — e.g. part 1's UploadPart request never landed.
+	cp := fmt.Sprintf(`{"parts":[{"part_number":1,"etag":"%s"},{"part_number":2,"etag":"%s"}]}`,
+		md5Hex(content[:mib]), md5Hex(content[mib:2*mib]))
+	task.CompletedParts = cp
+	st, err := os.Stat(path)
+	require.NoError(t, err)
+	task.PartsFileMtime = st.ModTime().Unix()
+	task.PartsFileSize = st.Size()
+	require.NoError(t, q.Enqueue(task))
+
+	store := newIC51MultipartStore()
+	store.mockStore.uploadID = "ra-upload-id"
+	store.listParts = []minio.ObjectPart{
+		{PartNumber: 2, ETag: md5Hex(content[mib:2*mib]), Size: int64(mib)},
+	}
+	store.remotePartData[2] = content[mib : 2*mib]
+
+	u := newWithStore(store, Config{PartSizeMB: 1, ThresholdMB: 1}, q, zap.NewNop())
+	result, err := u.UploadFile(context.Background(), task)
+	require.NoError(t, err)
+
+	assert.Equal(t, []int{1, 3}, store.uploadedPartNum,
+		"the remote list is the authority: parts 1 and 3 are missing there and must be uploaded; SQLite's stale part-1 claim is ignored")
+	assert.Equal(t, sha256Hex(store.object), result.SHA256)
+	assert.Equal(t, sha256Hex(content), result.SHA256,
+		"object = part1(new) + part2(remote, verified) + part3(new), hashed in order")
+	assert.Equal(t, int64(3*mib), result.SizeBytes)
+	assert.Equal(t, []int{1, 2, 3}, store.completedPartNums)
+}
