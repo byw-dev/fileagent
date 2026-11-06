@@ -121,6 +121,7 @@ type ic51MultipartStore struct {
 	partData        map[int][]byte
 	remotePartData  map[int][]byte // bytes the "remote" already holds (skipped parts)
 	listParts       []minio.ObjectPart
+	afterList       func() // fired after ListObjectParts returns, before the resume consumes the parts
 	uploadedPartNum []int
 	object          []byte
 }
@@ -143,8 +144,12 @@ func (s *ic51MultipartStore) PutObjectPart(_ context.Context, _, _, _ string, pa
 	return minio.ObjectPart{PartNumber: partNum, ETag: md5Hex(b)}, nil
 }
 
-func (s *ic51MultipartStore) ListObjectParts(_ context.Context, _, _, _ string, _, _ int) (minio.ListObjectPartsResult, error) {
-	return minio.ListObjectPartsResult{ObjectParts: s.listParts}, nil
+func (s *ic51MultipartStore) ListObjectParts(ctx context.Context, b, o, u string, pn, mp int) (minio.ListObjectPartsResult, error) {
+	res := minio.ListObjectPartsResult{ObjectParts: s.listParts}
+	if s.afterList != nil {
+		s.afterList()
+	}
+	return res, nil
 }
 
 func (s *ic51MultipartStore) CompleteMultipartUpload(_ context.Context, _, _, _ string, parts []minio.CompletePart, _ minio.PutObjectOptions) (minio.UploadInfo, error) {
