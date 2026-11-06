@@ -128,6 +128,28 @@ func TestLoad_StartupCheckTimeout(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_TIMEOUT")
 	})
+	t.Run("negative rejected", func(t *testing.T) {
+		env := validEnv()
+		env["MINIO_STARTUP_CHECK_TIMEOUT"] = "-5s"
+		setEnv(t, env)
+		cfg, err := Load()
+		require.NoError(t, err)
+		err = cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_TIMEOUT")
+	})
+	// Rework 3 finding 5: a non-empty but unparseable value must fail Load,
+	// not silently fall back to the default.
+	t.Run("unparseable rejected at Load", func(t *testing.T) {
+		for _, bad := range []string{"banana", "120"} {
+			env := validEnv()
+			env["MINIO_STARTUP_CHECK_TIMEOUT"] = bad
+			setEnv(t, env)
+			_, err := Load()
+			require.Error(t, err, "value %q must be rejected", bad)
+			assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_TIMEOUT")
+		}
+	})
 }
 
 func TestLoad_CustomAgentTokenTTL(t *testing.T) {

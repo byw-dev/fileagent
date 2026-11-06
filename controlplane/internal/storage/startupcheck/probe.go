@@ -20,7 +20,7 @@ type ProbeS3 struct {
 
 // ListMultipartUploads performs GET /{bucket}?uploads (ListBucketMultipartUploads).
 //
-// Choice of operation (live-verified on both backends, PoC 2026-11-10):
+// Choice of operation (live-verified on both backends, PoC 2026-11-06):
 //   - MinIO init-minio.sh policy "fileagent-controlplane" grants
 //     s3:ListBucketMultipartUploads on arn:aws:s3:::*;
 //   - SeaweedFS deploy/seaweedfs/s3.json.tpl policy "fileagent-cp" grants
@@ -29,15 +29,28 @@ type ProbeS3 struct {
 //     object and creates nothing, so a passing probe proves endpoint
 //     reachability AND credential validity with zero side effects.
 //
-// A missing bucket (NoSuchBucket) still proves both — bucket state is server
-// data, not identity — so only non-404 errors fail the probe. minio-go's
-// channel API surfaces the first error via ObjectMultipartInfo.Err; an empty
-// channel is success (no incomplete uploads, or the listing was simply empty).
+// A missing bucket still proves both — bucket state is server data, not
+// identity — BUT ONLY for a genuine, parsed S3 NoSuchBucket answer (rework 3
+// finding 3). Two forgeries must NOT pass:
+//
+//   - a 404 with a different S3 code (e.g. AccessDenied from a rejecting
+//     proxy): caught by requiring Code == "NoSuchBucket" exactly;
+//   - a non-S3 404 (gateway HTML): minio-go SYNTHESIZES a NoSuchBucket
+//     ErrorResponse for any unparseable 404 body (api-error-response.go:
+//     httpRespToErrorResponse falls back to the status code), so the Code
+//     check alone would pass it. The tell: a synthesized response has an
+//     EMPTY RequestID (it never parsed a body), while every real S3 answer
+//     carries one (live-verified: MinIO and SeaweedFS both include
+//     <RequestId> in their NoSuchBucket XML). Hence the RequestID != ""
+//     guard.
+//
+// minio-go's channel API surfaces the first error via ObjectMultipartInfo.
+// Err; an empty channel is success.
 func (p ProbeS3) ListMultipartUploads(ctx context.Context, bucket string) error {
 	for info := range p.Client.ListIncompleteUploads(ctx, bucket, "", false) {
 		if info.Err != nil {
-			if resp := miniogo.ToErrorResponse(info.Err); resp.Code == "NoSuchBucket" || resp.StatusCode == 404 {
-				// Bucket absent: identity authenticated, endpoint reachable.
+			if resp := miniogo.ToErrorResponse(info.Err); resp.Code == "NoSuchBucket" && resp.RequestID != "" {
+				// Bucket absent, identity authenticated, endpoint reachable.
 				return nil
 			}
 			return info.Err
@@ -63,6 +76,10 @@ type AssumeRoleSTS struct {
 // configured MINIO_ROLE_ARN, then DISCARDS the returned credentials: nothing
 // is cached, nothing is logged beyond success/failure.
 //
+// The single HTTP call is bounded by BOTH stsProbeTimeout and the REMAINING
+// window time read off ctx (rework 3 finding 4: minio-go's STS flow takes
+// no context, so without this the call could run 10s past window expiry).
+//
 // DurationSeconds: both backends accept 900s as the minimum (live-verified:
 // lower values return InvalidParameterValue on MinIO and SeaweedFS alike),
 // but minio-go silently rewrites any DurationSeconds <= 3600 to its own
@@ -79,6 +96,15 @@ func (a AssumeRoleSTS) AssumeRole(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("startupcheck sts: %w", err)
 	}
+	timeout := stsProbeTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if rem := time.Until(deadline); rem < timeout {
+			if rem <= 0 {
+				return fmt.Errorf("startupcheck sts: %w", context.DeadlineExceeded)
+			}
+			timeout = rem
+		}
+	}
 	scheme := "http"
 	if a.Config.UseSSL {
 		scheme = "https"
@@ -92,7 +118,7 @@ func (a AssumeRoleSTS) AssumeRole(ctx context.Context) error {
 			RoleSessionName: "fileagent-startup-selfcheck",
 			DurationSeconds: 3600,
 		},
-		Client: &http.Client{Timeout: stsProbeTimeout},
+		Client: &http.Client{Timeout: timeout},
 	})
 	val, err := li.Get()
 	if err != nil {

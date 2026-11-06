@@ -62,10 +62,10 @@ func TestMainSelectsOnSelfCheckFailure(t *testing.T) {
 	// The orchestration now lives in awaitShutdownOrSelfCheckFailure; assert
 	// (1) run() hands selfCheckFailed to it, and (2) the run() BODY (the
 	// synchronous boot+shutdown path) contains no logger.Fatal — Fatal would
-	// os.Exit(1) from inside run() and skip httpSrv.Shutdown, the event-source
-	// join and every defer (rework 1 finding 2). The two listener goroutines
-	// (gRPC/HTTP bind failures) are outside run()'s synchronous path and keep
-	// Fatal deliberately: a dead listener means the process cannot continue.
+	// os.Exit(1) and skip httpSrv.Shutdown, the event-source join and every
+	// defer (rework 1 finding 2). The listener goroutines report their death
+	// through serveFatal (Error + channel send), which the orchestration
+	// waits on as a first-class input (rework 2 finding 2).
 	recvCase := false
 	fatalInRunBody := false
 	var runFunc *ast.FuncDecl

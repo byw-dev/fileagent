@@ -49,8 +49,16 @@ const listOK = `<?xml version="1.0" encoding="UTF-8"?>
 const sigMismatchXML = `<?xml version="1.0" encoding="UTF-8"?>
 <Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided.</Message><Resource>/data-sensor</Resource></Error>`
 
+// Real backends always include <RequestId> in the S3 error XML (MinIO and
+// SeaweedFS live-verified); the probe's anti-forgery guard requires it
+// (minio-go synthesizes a RequestID-less NoSuchBucket for unparseable 404s).
 const noSuchBucketXML = `<?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message><Resource>/data-sensor</Resource></Error>`
+<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message><Resource>/data-sensor</Resource><RequestId>18E5EXAMPLE</RequestId></Error>`
+
+// A NoSuchBucket WITHOUT RequestId is indistinguishable from minio-go's
+// synthesized fallback for non-S3 404 bodies — must NOT be trusted.
+const noSuchBucketNoRequestIDXML = `<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist.</Message></Error>`
 
 const stsOK = `<?xml version="1.0" encoding="UTF-8"?>
 <AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><AssumeRoleResult><Credentials><AccessKeyId>ASIAEXAMPLE</AccessKeyId><SecretAccessKey>tempsecret</SecretAccessKey><SessionToken>tok</SessionToken><Expiration>2030-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleResult></AssumeRoleResponse>`
@@ -176,4 +184,50 @@ func TestNewInternalClient_Valid(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, client)
 	_ = fmt.Sprint(client)
+}
+
+// ─── Rework 3 finding 3: only an exact NoSuchBucket code passes ─────────────
+
+// A 404 whose S3 error code is AccessDenied (a rejecting proxy shape) must
+// FAIL the probe, not be swallowed as "authenticated NoSuchBucket". This is
+// the review probe TestReviewAccessDenied404Accepted, asserted the FIXED way.
+func TestProbeS3_AccessDenied404Fails(t *testing.T) {
+	srv := s3Server(t, 404, `<Error><Code>AccessDenied</Code><Message>proxy rejected this credential</Message></Error>`)
+	client, err := newInternalClient(probeCfg(srv.Addr))
+	require.NoError(t, err)
+	perr := ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor")
+	require.Error(t, perr, "404 + AccessDenied must fail the probe, not pass as NoSuchBucket")
+	resp := miniogo.ToErrorResponse(perr)
+	assert.Equal(t, "AccessDenied", resp.Code)
+	assert.Equal(t, ClassAuthConfig, ClassifyS3(perr))
+}
+
+// A gateway's HTML 404 (not S3 XML) must FAIL the probe: it proves neither
+// authentication nor a parsed S3 answer.
+func TestProbeS3_GatewayHTML404Fails(t *testing.T) {
+	srv := s3Server(t, 404, `<html><head><title>404 Not Found</title></head><body>nginx</body></html>`)
+	client, err := newInternalClient(probeCfg(srv.Addr))
+	require.NoError(t, err)
+	perr := ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor")
+	require.Error(t, perr, "non-S3 HTML 404 must fail the probe")
+	// Whatever the decoded shape, it must NOT be a zero-code ErrorResponse
+	// that classifies as pass-through success; the probe returned an error,
+	// and classification falls to the network bucket (retryable, then fail).
+	_ = perr
+}
+
+// The exact NoSuchBucket code (with RequestId) still passes.
+func TestProbeS3_ExactNoSuchBucketStillPasses(t *testing.T) {
+	srv := s3Server(t, 404, noSuchBucketXML)
+	client, err := newInternalClient(probeCfg(srv.Addr))
+	require.NoError(t, err)
+	require.NoError(t, ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor"))
+}
+
+// A RequestID-less NoSuchBucket is not trusted (synthesis-indistinguishable).
+func TestProbeS3_NoSuchBucketWithoutRequestIDFails(t *testing.T) {
+	srv := s3Server(t, 404, noSuchBucketNoRequestIDXML)
+	client, err := newInternalClient(probeCfg(srv.Addr))
+	require.NoError(t, err)
+	require.Error(t, ProbeS3{Client: client}.ListMultipartUploads(context.Background(), "data-sensor"))
 }

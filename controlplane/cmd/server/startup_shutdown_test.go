@@ -14,6 +14,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -215,3 +217,90 @@ func TestAwaitShutdownOrSelfCheckFailure_FailureAndServeFatalBothReady(t *testin
 	code := awaitShutdownOrSelfCheckFailure(ctx, ch, sf, logger, cfg)
 	assert.Equal(t, 1, code)
 }
+
+// ─── Rework 3 finding 1: SIGTERM after failing attempts must exit 0 ──────────
+
+// wireS3/STS fakes for the orchestration-level test (the startupcheck package's
+// own fakes are not importable from here). calls is mutex-guarded: Run probes
+// from its own goroutine while the test reads the count.
+type wiringS3 struct {
+	mu       sync.Mutex
+	failures int // number of leading failures
+	calls    int
+}
+
+func (w *wiringS3) ListMultipartUploads(ctx context.Context, bucket string) error {
+	w.mu.Lock()
+	w.calls++
+	n := w.calls
+	fail := w.failures
+	w.mu.Unlock()
+	if n <= fail {
+		return errors.New("dial unavailable")
+	}
+	// Alloted failures exhausted: block until cancelled (like a real slow
+	// backend while the operator hits SIGTERM).
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (w *wiringS3) callCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.calls
+}
+
+// TestSelfCheckWiring_SigtermAfterFailuresExitsZero drives the EXACT wiring
+// main.go uses (goroutine → type-asserted *Failure send → orchestration
+// select): several failing attempts, then a SIGTERM (parent cancel) — the
+// orchestration must return 0, because Run surfaces cancellation as a
+// context error, NOT a *Failure, so nothing is ever delivered to
+// selfCheckFailed.
+func TestSelfCheckWiring_SigtermAfterFailuresExitsZero(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := testCfg()
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	s3p := &wiringS3{failures: 3}
+	checkCfg := startupcheck.Config{
+		Endpoint:     "s3.test:9000",
+		AccessKey:    "TESTACCESSKEYID",
+		SecretKey:    "test-secret",
+		RoleARN:      cfg.MinIORoleARN,
+		ProbeBucket:  "data-sensor",
+		Timeout:      time.Minute,
+		Logger:       logger,
+		RetryBackoff: 2 * time.Millisecond,
+		S3:           s3p,
+		// STS is never reached: S3 keeps failing/slow.
+		STS: &wiringSTS{},
+	}
+
+	selfCheckFailed := make(chan *startupcheck.Failure, 1)
+	go func() {
+		err := startupcheck.Run(ctx, checkCfg)
+		if failure, ok := err.(*startupcheck.Failure); ok {
+			selfCheckFailed <- failure
+		}
+		// anything else (context error) → send NOTHING: clean shutdown.
+	}()
+
+	// Let several failing attempts happen, then SIGTERM.
+	time.Sleep(30 * time.Millisecond)
+	stop()
+
+	code := awaitShutdownOrSelfCheckFailure(ctx, selfCheckFailed, noServeFatal(), logger, cfg)
+	assert.Zero(t, code, "SIGTERM after failing attempts must exit 0 — Run must not surface cancellation as *Failure")
+	assert.GreaterOrEqual(t, s3p.callCount(), 1, "at least one attempt must have run")
+	// And nothing was ever delivered.
+	select {
+	case f := <-selfCheckFailed:
+		t.Fatalf("selfCheckFailed received %v — cancellation must not be wired as a terminal failure", f)
+	default:
+	}
+}
+
+type wiringSTS struct{}
+
+func (w *wiringSTS) AssumeRole(ctx context.Context) error { return nil }

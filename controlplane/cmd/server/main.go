@@ -577,20 +577,24 @@ func run() int {
 	// script creates). Any failure — auth/config included — retries inside
 	// MINIO_STARTUP_CHECK_TIMEOUT (default 120s, product decision 2026-11-06);
 	// when the window expires still failing, Run logs the terminal Error with
-	// the full diagnostics (item / endpoint / access key id / raw error /
-	// fix hint — never the secret) and the goroutine ONLY hands the failure
-	// to run(); cancelling ctx and exiting happen below, deterministically.
+	// the full diagnostics (item / endpoint / access key id / SANITIZED error
+	// summary / fix hint — never the secret or raw wire text) and returns a
+	// *startupcheck.Failure; the goroutine ONLY hands THAT shape to run() —
+	// a plain context error (SIGTERM during a failing check, rework 3
+	// finding 1) sends nothing, so a clean shutdown stays exit 0.
 	// /healthz stays 200 during the window: smoke/dev flows rely on reaching
 	// the API (incl. the webhook init talks to) before storage initialization
 	// completes.
 	//
 	// ProbeBucket: the check only needs SOME bucket to exist-or-not; it is a
 	// connectivity + credential probe, not a business-bucket assertion — a
-	// NoSuchBucket answer still proves the identity authenticated (S3
+	// parsed NoSuchBucket answer still proves the identity authenticated (S3
 	// authorizes before it resolves the bucket; live-verified on MinIO and
-	// SeaweedFS, see report-rework1.md). "data-sensor" is used because
-	// bootstrap.EnsureDefaultBuckets guarantees it exists on every deployment,
-	// making the common case an empty 200 listing; it is not a config knob.
+	// SeaweedFS, see report-rework1.md). "data-sensor" is the name in the
+	// default database records (bootstrap.EnsureDefaultBuckets only writes
+	// DB rows — the PHYSICAL bucket is created by the init scripts, so on a
+	// fresh deployment the probe may legitimately see NoSuchBucket); it is
+	// not a config knob.
 	selfCheckFailed := make(chan *startupcheck.Failure, 1)
 	go func() {
 		err := startupcheck.Run(ctx, startupcheck.Config{

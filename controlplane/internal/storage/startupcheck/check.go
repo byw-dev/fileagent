@@ -229,14 +229,23 @@ func FixHint(roleARN, item string) string {
 	}
 }
 
-// Run performs the self-check with retry. It returns nil once BOTH probes
-// succeed, and a non-nil *Failure describing the last attempt when the
-// configured window (cfg.Timeout) expires still failing. ctx cancellation
-// aborts immediately with the context error (shutdown outranks the check).
+// Run performs the self-check with retry. It returns:
 //
-// Run is synchronous; main.go wraps it in a goroutine. All attempts log at
-// Warn with the classification, item, endpoint, access key ID (id only) and
-// raw error — never the secret.
+//   - nil once BOTH probes succeed;
+//   - a *Failure when the retry window (cfg.Timeout) expires still failing —
+//     the ONLY terminal-failure return: main.go treats exactly this shape as
+//     "refuse to run" (rework 3 finding 1: a plain SIGTERM during a failing
+//     check used to surface as *Failure and turn a clean shutdown into a
+//     non-zero exit);
+//   - a wrapped context error when the PARENT ctx is cancelled (shutdown
+//     outranks the check; this is NOT a startup failure);
+//   - a plain error for invalid config (no logger, non-positive window,
+//     unparseable endpoint).
+//
+// The window is enforced with a derived context (WithTimeout) so both the
+// sleeps AND the probes are bounded by it (rework 3 finding 4: the previous
+// wall-clock deadline only ran between attempts, letting a 1ms window sleep
+// out a 10s backoff and letting in-flight STS calls run 10s past expiry).
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.Logger == nil {
 		return errors.New("startupcheck: Logger is required")
@@ -260,19 +269,20 @@ func Run(ctx context.Context, cfg Config) error {
 		sts = AssumeRoleSTS{Config: cfg}
 	}
 
-	deadline := time.Now().Add(cfg.Timeout)
+	// The window is a derived context: cancellation of the parent (SIGTERM)
+	// is distinguishable from expiry (window exhausted) by checking ctx.Err()
+	// before wctx.Err().
+	wctx, cancelWindow := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancelWindow()
+
 	var last *Failure
 	delay := backoff
 	for attempt := 1; ; attempt++ {
+		// Parent cancelled first (SIGTERM): clean shutdown, not a failure.
 		if err := ctx.Err(); err != nil {
-			if last != nil {
-				// Cancelled mid-retry: prefer the pending failure (it explains
-				// what was wrong) over a bare context error.
-				return last
-			}
 			return fmt.Errorf("startupcheck: aborted by context cancellation: %w", err)
 		}
-		last = attemptOnce(ctx, cfg, s3p, sts)
+		last = attemptOnce(wctx, cfg, s3p, sts)
 
 		if last == nil {
 			cfg.Logger.Info("storage startup self-check passed",
@@ -284,38 +294,41 @@ func Run(ctx context.Context, cfg Config) error {
 			return nil
 		}
 
-		if ctx.Err() != nil {
-			return last
+		if err := ctx.Err(); err != nil {
+			// SIGTERM raced a failing attempt: still a clean shutdown.
+			return fmt.Errorf("startupcheck: aborted by context cancellation: %w", err)
 		}
-		if time.Now().After(deadline) {
-			last.Window = cfg.Timeout
-			last.Attempts = attempt
-			cfg.Logger.Error("storage startup self-check FAILED: window expired, shutting down",
-				zap.String("item", last.Item),
-				zap.String("class", last.Class.String()),
-				zap.String("endpoint", cfg.Endpoint),
-				zap.String("access_key_id", cfg.AccessKey),
-				zap.Error(last.Err),
-				zap.Int("attempts", attempt),
-				zap.Duration("window", cfg.Timeout),
-				zap.String("fix_hint", FixHint(cfg.RoleARN, last.Item)),
-			)
-			return last
+		if wctx.Err() != nil {
+			// Window expired (or was cancelled together with the parent —
+			// the parent case is handled above): terminal failure.
+			return terminalFailure(cfg, last, attempt)
 		}
 		cfg.Logger.Warn("storage startup self-check attempt failed; retrying",
 			zap.String("item", last.Item),
 			zap.String("class", last.Class.String()),
 			zap.String("endpoint", cfg.Endpoint),
 			zap.String("access_key_id", cfg.AccessKey),
-			zap.Error(last.Err),
+			zap.String("error", last.SafeErr),
 			zap.Int("attempt", attempt),
-			zap.Duration("window_remaining", time.Until(deadline)),
+			zap.Duration("window_remaining", windowRemaining(wctx)),
 			zap.String("hint", "if this is a fresh deployment where init-minio.sh / init-seaweedfs.sh has not run yet, this is expected and the check will pass once it does"),
 		)
-		select {
-		case <-ctx.Done():
-			return last
-		case <-time.After(delay):
+		// Sleep at most the remaining window (finding 4): never past expiry.
+		wait := delay
+		if rem := windowRemaining(wctx); rem < wait {
+			wait = rem
+		}
+		if wait > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("startupcheck: aborted by context cancellation: %w", ctx.Err())
+			case <-wctx.Done():
+				if err := ctx.Err(); err != nil {
+					return fmt.Errorf("startupcheck: aborted by context cancellation: %w", err)
+				}
+				return terminalFailure(cfg, last, attempt)
+			case <-time.After(wait):
+			}
 		}
 		if delay < maxBackoff {
 			delay *= 2
@@ -326,54 +339,89 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+// terminalFailure fills in the window metadata, logs the terminal Error with
+// the full (sanitized) diagnostics, and returns the *Failure.
+func terminalFailure(cfg Config, last *Failure, attempt int) *Failure {
+	last.Window = cfg.Timeout
+	last.Attempts = attempt
+	cfg.Logger.Error("storage startup self-check FAILED: window expired, shutting down",
+		zap.String("item", last.Item),
+		zap.String("class", last.Class.String()),
+		zap.String("endpoint", cfg.Endpoint),
+		zap.String("access_key_id", cfg.AccessKey),
+		zap.String("error", last.SafeErr),
+		zap.Int("attempts", attempt),
+		zap.Duration("window", cfg.Timeout),
+		zap.String("fix_hint", FixHint(cfg.RoleARN, last.Item)),
+	)
+	return last
+}
+
+// windowRemaining reports the time left before the window context expires
+// (0 once expired).
+func windowRemaining(wctx context.Context) time.Duration {
+	deadline, ok := wctx.Deadline()
+	if !ok {
+		return 0
+	}
+	if rem := time.Until(deadline); rem > 0 {
+		return rem
+	}
+	return 0
+}
+
 // attemptOnce runs both probes once and converts any failure into a
-// *Failure; nil means both passed.
+// *Failure; nil means both passed. Every Failure carries a PRE-SANITIZED
+// error summary (SafeErr): the raw Err stays for programmatic use, but all
+// log output goes through SafeErr so error text from the wire (which can
+// embed userinfo, signature params or echoed credentials — rework 3 finding
+// 2) never reaches the logs verbatim.
 func attemptOnce(ctx context.Context, cfg Config, s3p S3Prober, sts STSAssumer) *Failure {
 	if err := s3p.ListMultipartUploads(ctx, cfg.ProbeBucket); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return &Failure{Item: itemS3, Err: err, Class: ClassNetwork}
-		}
-		return &Failure{Item: itemS3, Err: err, Class: ClassifyS3(err)}
+		return &Failure{Item: itemS3, Err: err, Class: ClassifyS3(err), SafeErr: SafeErrorSummary(err, cfg.SecretKey)}
 	}
 	if err := sts.AssumeRole(ctx); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return &Failure{Item: itemSTS, Err: err, Class: ClassNetwork}
-		}
-		return &Failure{Item: itemSTS, Err: err, Class: ClassifySTS(err)}
+		return &Failure{Item: itemSTS, Err: err, Class: ClassifySTS(err), SafeErr: SafeErrorSummary(err, cfg.SecretKey)}
 	}
 	return nil
 }
 
 // Failure describes the terminal state of the check after the window
-// expired (or the context was cancelled mid-retry).
+// expired. (Context cancellation is NOT a Failure — Run returns a plain
+// context error for that, rework 3 finding 1.)
 type Failure struct {
 	// Item is which probe failed last (itemS3 / itemSTS).
 	Item string
 	// Class is the classification of the last error.
 	Class FailureClass
-	// Err is the raw last error (already included in logs; kept for callers).
+	// Err is the raw last error. NEVER log it directly — error text from the
+	// wire can carry credentials (finding 2); use SafeErr for any output.
 	Err error
+	// SafeErr is the sanitized, log-safe summary of Err (SafeErrorSummary).
+	SafeErr string
 	// Window is the configured total retry window.
 	Window time.Duration
 	// Attempts is how many attempts were made.
 	Attempts int
 }
 
-// Error implements error with the full IC-BUG-40 exit diagnostics: the item,
-// endpoint, access key ID (NEVER the secret), the raw error, and a fix hint.
+// Error implements error with the IC-BUG-40 exit diagnostics. Only sanitized
+// parts appear: item, class, the SafeErr summary — never the raw error.
 func (f *Failure) Error() string {
-	return fmt.Sprintf("storage startup self-check failed after %d attempts over %s: item=%s class=%s err=%v",
-		f.Attempts, f.Window, f.Item, f.Class, f.Err)
+	return fmt.Sprintf("storage startup self-check failed after %d attempts over %s: item=%s class=%s err=%s",
+		f.Attempts, f.Window, f.Item, f.Class, f.SafeErr)
 }
 
-// LogFields returns the structured fields main.go logs at Fatal with.
+// LogFields returns the structured fields main.go logs the terminal
+// diagnostics with. The error field is the pre-sanitized SafeErr string
+// (finding 2) — zap.Error(raw) is deliberately not used anywhere.
 func (f *Failure) LogFields(endpoint, accessKeyID, fixHint string) []zap.Field {
 	return []zap.Field{
 		zap.String("item", f.Item),
 		zap.String("class", f.Class.String()),
 		zap.String("endpoint", endpoint),
 		zap.String("access_key_id", accessKeyID),
-		zap.Error(f.Err),
+		zap.String("error", f.SafeErr),
 		zap.Int("attempts", f.Attempts),
 		zap.Duration("window", f.Window),
 		zap.String("fix_hint", fixHint),

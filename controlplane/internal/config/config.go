@@ -239,7 +239,19 @@ func Load() (*Config, error) {
 	cfg.MinIOPublicEndpoint = envString("MINIO_PUBLIC_ENDPOINT", cfg.MinIOEndpoint)
 	cfg.MinIOPublicUseSSL = envBool("MINIO_PUBLIC_USE_SSL", cfg.MinIOUseSSL)
 	cfg.MinIORoleARN = envString("MINIO_ROLE_ARN", "arn:aws:iam:::role/agent-role")
-	cfg.MinIOStartupCheckTimeout = envDuration("MINIO_STARTUP_CHECK_TIMEOUT", 120*time.Second)
+	// Rework 3 finding 5: a NON-EMPTY but unparseable value must fail Load
+	// loudly — envDuration would silently fall back to the 120s default and
+	// an operator's "banana"/"120" typo would go unnoticed (only <= 0 values
+	// are caught by Validate).
+	if raw := os.Getenv("MINIO_STARTUP_CHECK_TIMEOUT"); raw != "" {
+		d, perr := time.ParseDuration(raw)
+		if perr != nil {
+			return nil, fmt.Errorf("invalid MINIO_STARTUP_CHECK_TIMEOUT %q: %w (expected a duration like 120s, 2m)", raw, perr)
+		}
+		cfg.MinIOStartupCheckTimeout = d
+	} else {
+		cfg.MinIOStartupCheckTimeout = 120 * time.Second
+	}
 
 	// ── nats ──────────────────────────────────────────────────────────────────
 	cfg.NATSURL = os.Getenv("NATS_URL")

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"net/url"
 	"sync"
 	"testing"
@@ -286,7 +288,9 @@ func TestRun_NetworkError_WindowExhausted(t *testing.T) {
 }
 
 // Context cancelled mid-retry: Run returns promptly (the retry sleep must be
-// interruptible), with the last failure (or context error) — never a hang.
+// interruptible) with the CONTEXT error — NOT a *Failure (rework 3 finding
+// 1: cancellation is a clean shutdown, never a terminal startup failure, or
+// a SIGTERM during a failing check would exit non-zero).
 func TestRun_ContextCancelled(t *testing.T) {
 	s3 := &fakeS3{script: []error{makeURLErr()}}
 	sts := &fakeSTS{script: []error{nil}}
@@ -303,12 +307,9 @@ func TestRun_ContextCancelled(t *testing.T) {
 	elapsed := time.Since(start)
 	require.Error(t, err)
 	assert.Less(t, elapsed, 5*time.Second, "Run must return promptly after cancellation")
-	// Either the pending *Failure or the wrapped context error is acceptable;
-	// both mean "did not hang and did not report success".
+	assert.ErrorIs(t, err, context.Canceled)
 	var failure *Failure
-	if !errors.As(err, &failure) {
-		assert.ErrorIs(t, err, context.Canceled)
-	}
+	assert.False(t, errors.As(err, &failure), "cancellation must NOT surface as *Failure (would turn SIGTERM into a non-zero exit)")
 }
 
 // Context already cancelled before the first attempt: no probe is dialed.
@@ -426,8 +427,8 @@ func TestRun_InvalidConfig(t *testing.T) {
 	require.NoError(t, Run(context.Background(), cfg))
 }
 
-// STS probe cancelled mid-call (S3 succeeded): failure is STS-item,
-// network-class, and Run returns it.
+// STS probe cancelled mid-call (S3 succeeded): cancellation surfaces as the
+// context error, NOT a *Failure (rework 3 finding 1).
 func TestRun_STSCancelledMidProbe(t *testing.T) {
 	s3 := &fakeS3{script: []error{nil}}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -435,9 +436,9 @@ func TestRun_STSCancelledMidProbe(t *testing.T) {
 	cfg.RetryBackoff = time.Millisecond
 	err := Run(ctx, cfg)
 	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
 	var failure *Failure
-	require.ErrorAs(t, err, &failure)
-	assert.Equal(t, itemSTS, failure.Item)
+	assert.False(t, errors.As(err, &failure))
 }
 
 // ctxCancelSTS returns context.Canceled from the probe (shape the real
@@ -484,8 +485,8 @@ func TestFailureClassString(t *testing.T) {
 	assert.Equal(t, "FailureClass(7)", FailureClass(7).String())
 }
 
-// Context cancellation mid-probe (not between retries): the failure carries
-// the context error and stays network-class; Run surfaces it promptly.
+// Context cancellation mid-probe (not between retries): Run surfaces the
+// context error promptly — and never a *Failure.
 func TestRun_ContextCancelledDuringProbe(t *testing.T) {
 	s3 := &ctxCancelS3{}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -497,6 +498,9 @@ func TestRun_ContextCancelledDuringProbe(t *testing.T) {
 	}()
 	err := Run(ctx, cfg)
 	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	var failure *Failure
+	assert.False(t, errors.As(err, &failure))
 }
 
 // ctxCancelS3 blocks inside the probe until the context is cancelled,
@@ -511,3 +515,141 @@ func (c *ctxCancelS3) ListMultipartUploads(ctx context.Context, bucket string) e
 // unused helper silences the linter on errSTSAccessDenied when a test build
 // excludes it (kept for the shape documentation it carries).
 var _ = errSTSAccessDenied
+
+// ─── Rework 3: review findings ───────────────────────────────────────────────
+
+// Finding 1: a SIGTERM after several FAILING attempts must surface as the
+// context error, never as *Failure (which main wires into the non-zero exit).
+// Mirrors the review probe TestReviewCancelledWithPriorFailure — under the
+// FIXED contract this must hold.
+func TestRun_CancelledAfterPriorFailuresIsNotAFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s3 := &reviewS3{fn: func() error {
+		cancel() // SIGTERM lands right as an attempt fails
+		return errors.New("dial unavailable")
+	}}
+	cfg := testConfig(t, s3, &fakeSTS{script: []error{nil}}, time.Minute)
+	got := Run(ctx, cfg)
+	require.Error(t, got)
+	assert.ErrorIs(t, got, context.Canceled)
+	var failure *Failure
+	assert.False(t, errors.As(got, &failure), "cancelled Run must not return *Failure — main would exit non-zero on a clean SIGTERM")
+}
+
+type reviewS3 struct{ fn func() error }
+
+func (r *reviewS3) ListMultipartUploads(_ context.Context, _ string) error { return r.fn() }
+
+// Finding 4: the retry window must bound the SLEEPS too — a 1ms window with
+// a 100ms backoff must return in far less than the backoff (the old code
+// slept the full delay regardless of remaining window; review probe measured
+// 101ms). Upper bound generous enough to stay non-flaky.
+func TestRun_WindowBoundsTheSleep(t *testing.T) {
+	s3 := &reviewS3{fn: func() error { return errors.New("storage down") }}
+	cfg := testConfig(t, s3, &fakeSTS{script: []error{nil}}, time.Millisecond)
+	cfg.RetryBackoff = 100 * time.Millisecond
+	started := time.Now()
+	_ = Run(context.Background(), cfg)
+	elapsed := time.Since(started)
+	assert.Less(t, elapsed, 60*time.Millisecond, "1ms window with 100ms backoff took %s — sleep is not bounded by the window", elapsed)
+}
+
+// Finding 4 (STS side): the STS HTTP timeout shrinks to the remaining window
+// (exercised through the exported adapter against a hanging server: with a
+// tiny window the call must return before the full stsProbeTimeout).
+func TestAssumeRoleSTS_TimeoutBoundedByWindowCtx(t *testing.T) {
+	// A server that never answers; the deadline-bound STS call must give up
+	// when the window (50ms) expires, not after the 10s probe timeout.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(30 * time.Second):
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err = AssumeRoleSTS{Config: probeCfg(ln.Addr().String())}.AssumeRole(ctx)
+	elapsed := time.Since(started)
+	require.Error(t, err)
+	assert.Less(t, elapsed, 5*time.Second, "STS call must be bounded by the window deadline (took %s)", elapsed)
+}
+
+// Finding 2: sanitized summaries for the shapes the review enumerated.
+func TestSafeErrorSummary(t *testing.T) {
+	const secret = "SHOULD_NOT_LOG"
+
+	t.Run("s3 error response", func(t *testing.T) {
+		got := SafeErrorSummary(errSigMismatch(), secret)
+		assert.Equal(t, "s3 error: code=SignatureDoesNotMatch status=403", got)
+	})
+	t.Run("sts error response", func(t *testing.T) {
+		role := credentials.ErrorResponse{}
+		role.STSError.Code = "AccessDenied"
+		role.STSError.Message = "user fileagent-controlplane is not authorized to assume role arn"
+		got := SafeErrorSummary(role, secret)
+		assert.Equal(t, "sts error: code=AccessDenied", got)
+	})
+	t.Run("url error keeps only scheme-host and leaf cause", func(t *testing.T) {
+		u := &url.Error{Op: "Get", URL: "https://ak:SHOULD_NOT_LOG@storage.test:9000/bucket?X-Amz-Signature=SHOULD_NOT_LOG&uploads=", Err: errors.New("dial tcp 10.0.0.9:9000: connect: connection refused")}
+		got := SafeErrorSummary(u, secret)
+		assert.Equal(t, "network error: Get https://storage.test:9000: dial tcp 10.0.0.9:9000: connect: connection refused", got)
+		assert.NotContains(t, got, "SHOULD_NOT_LOG")
+	})
+	t.Run("context errors", func(t *testing.T) {
+		assert.Equal(t, "context canceled", SafeErrorSummary(context.Canceled, secret))
+		assert.Equal(t, "context deadline exceeded", SafeErrorSummary(context.DeadlineExceeded, secret))
+	})
+	t.Run("malicious unknown-shape error is scrubbed", func(t *testing.T) {
+		malicious := errors.New("Get https://user:SHOULD_NOT_LOG@storage.test/x?X-Amz-Signature=SHOULD_NOT_LOG&X-Amz-Credential=SHOULD_NOT_LOG/20260101/us-east-1/s3/aws4_request&X-Amz-Security-Token=SHOULD_NOT_LOG: status 403")
+		got := SafeErrorSummary(malicious, secret)
+		assert.NotContains(t, got, "SHOULD_NOT_LOG")
+		assert.Contains(t, got, "X-Amz-Signature=***")
+	})
+}
+
+// Finding 2 (end-to-end): a malicious error flowing through the whole Run
+// loop must never put the secret (or signature params, userinfo, tokens) in
+// ANY log line — the review probe TestReviewRawErrorContainsSecret, under
+// the fixed contract.
+func TestRun_MaliciousErrorNeverLeaksToLogs(t *testing.T) {
+	const secret = "SHOULD_NOT_LOG"
+	s3 := &reviewS3{fn: func() error {
+		return fmt.Errorf(`Get https://user:%s@storage.test/x?X-Amz-Signature=%s&X-Amz-Credential=%s/20260101/us-east-1/s3/aws4_request&X-Amz-Security-Token=%s: status 403`,
+			secret, secret, secret, secret)
+	}}
+	logger, obs := observedLogger(t)
+	cfg := testConfig(t, s3, &fakeSTS{script: []error{nil}}, 20*time.Millisecond)
+	cfg.Logger = logger
+	cfg.SecretKey = secret
+	cfg.RetryBackoff = time.Millisecond
+
+	err := Run(context.Background(), cfg)
+	var failure *Failure
+	require.ErrorAs(t, err, &failure)
+	// The returned error's string form is also sanitized.
+	assert.NotContains(t, err.Error(), secret)
+	for _, entry := range obs.All() {
+		assert.NotContains(t, entry.Message, secret, "log message leaks")
+		for _, f := range entry.Context {
+			v := f.String
+			if f.Interface != nil {
+				v = fmt.Sprint(f.Interface)
+			}
+			assert.NotContains(t, v, secret, "field %s leaks", f.Key)
+		}
+	}
+	// Terminal Error's error field is the sanitized summary.
+	term := obs.FilterMessage("storage startup self-check FAILED: window expired, shutting down")
+	require.Equal(t, 1, term.Len())
+	for _, f := range term.All()[0].Context {
+		if f.Key == "error" {
+			assert.Contains(t, f.String, "X-Amz-Signature=***")
+		}
+	}
+}
