@@ -316,12 +316,20 @@ func (u *Uploader) AbandonUpload(ctx context.Context, task *queue.UploadTask) er
 // IC-BUG-51: the SHA-256 digest, the MD5 (for the opportunistic ETag
 // cross-check) and the delivered-byte count are all computed over the SAME
 // reader that is handed to PutObject — there is no second read of the file.
-// The reader is a plain io.Reader (not *os.File), so minio-go does not pin the
-// stream into an io.SectionReader; the request carries Content-Length = size
-// and the transport pulls exactly size bytes from this reader. Whatever the
-// file does during the upload, the digest therefore describes the bytes that
-// were actually sent. A short read (file truncated mid-upload) fails the
-// count check below loudly even if the store were to tolerate it.
+//
+// The reader is deliberately NOT *os.File: wrapped in a TeeReader it is a
+// plain io.Reader, so minio-go does not pin the stream into an
+// io.SectionReader, and the request goes out with streaming signature +
+// Content-Length = size. The LimitReader matters here (review-r1 fix 2,
+// live-probed with minio-go v7.0.91, see bin/b7-ic-bug-51/review-r1/
+// minio_read_probe.go): WITHOUT it, a file that GROWS mid-upload makes the
+// streaming signer read past the declared length and the SDK fails LOUDLY
+// ("ContentLength != Body length"-style errors — verified: declared 100000,
+// reader offering 101024 → request fails). WITH it, exactly the first
+// `size` bytes are delivered and the upload succeeds with the reported
+// hash/size describing precisely that prefix. A file that SHRINKS mid-upload
+// still fails the count check below loudly. Either way the reported metadata
+// can only ever describe the bytes that were actually sent.
 func (u *Uploader) singlePartUpload(ctx context.Context, task *queue.UploadTask, offset, size int64) (*UploadResult, error) {
 	f, err := os.Open(task.LocalPath)
 	if err != nil {
@@ -337,7 +345,10 @@ func (u *Uploader) singlePartUpload(ctx context.Context, task *queue.UploadTask,
 
 	sha := sha256.New()
 	md5h := md5.New()
-	body := &countingTeeReader{r: f, w: io.MultiWriter(sha, md5h)}
+	// io.LimitReader pins the delivered bytes to the stat size declared in
+	// the request: growth beyond it is never read, truncation below it fails
+	// the count check below (see the function comment).
+	body := &countingTeeReader{r: io.LimitReader(f, size), w: io.MultiWriter(sha, md5h)}
 
 	info, err := u.store.PutObject(ctx, task.Bucket, task.StoragePath, body, size, minio.PutObjectOptions{})
 	if err != nil {
