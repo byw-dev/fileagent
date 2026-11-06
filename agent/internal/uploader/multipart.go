@@ -224,10 +224,12 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 	// order produces a digest of a byte sequence that was never assembled.
 	for partNum := 1; partNum <= totalParts; partNum++ {
 		if _, already := doneSet[partNum]; already {
-			// Skipped part: its bytes are already on the remote (ETag verified
-			// up front). Re-read the local range and feed the digest AT THIS
-			// POSITION so the digest describes the assembled object.
-			if err := u.hashResumePartAt(task, size, partSize, partNum, fullSHA, &hashedBytes); err != nil {
+			// Skipped part: its bytes are already on the remote. Stream the local
+			// range through the digest AT THIS POSITION (order law) and verify
+			// the remote ETag over THAT SAME read — the correctness check
+			// (rework-2 fix 1): the up-front pre-check used a different read,
+			// and the file may have changed since.
+			if err := u.hashResumePartChecked(task, size, partSize, partNum, remoteETags[partNum], fullSHA, &hashedBytes); err != nil {
 				return nil, fmt.Errorf("%w: part %d: %v", errStaleRemoteParts, partNum, err)
 			}
 			completeParts = append(completeParts, minio.CompletePart{PartNumber: partNum, ETag: remoteETags[partNum]})
@@ -331,14 +333,21 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 	}, nil
 }
 
-// verifyResumePartETag re-reads the local byte range of a skipped
-// (already-remote) part and verifies the part's remote ETag against the MD5
-// of the re-read bytes — WITHOUT feeding any digest. It runs for every
-// remote part up front, before hashing or uploading starts, so a stale
-// upload is discarded as early as possible. It returns an error when the
-// local content no longer matches what the remote holds — the caller reacts
-// by discarding the upload and starting over (IC-BUG-51: never splice
-// mismatched parts under a fresh digest).
+// verifyResumePartETag is the EARLY pre-check pass over a skipped
+// (already-remote) part: it streams the part's local byte range once, feeds
+// it ONLY into a throwaway MD5 (no digest), and compares that against the
+// part's remote ETag. Running it for every remote part up front lets a
+// stale upload be discarded before anything is hashed or uploaded — fail
+// fast. It returns an error when the local content does not match what the
+// remote holds; the caller reacts by discarding the upload and starting
+// over (IC-BUG-51: never splice mismatched parts under a fresh digest).
+//
+// ⚠️ This pre-check is an OPTIMISATION, not the correctness gate. It and the
+// digest-feeding read in hashResumePartChecked are two separate reads of the
+// same range; the file can change in between. The check that actually
+// decides correctness is the one inside the SAME read that feeds the digest
+// (see hashResumePartChecked) — this pass only fails fast on what was
+// already stale when the resume began.
 //
 // Failure modes all mean "cannot describe the object from local bytes":
 //   - ETag mismatch: the range's content changed since the part was uploaded
@@ -356,46 +365,94 @@ func (u *Uploader) verifyResumePartETag(task *queue.UploadTask, totalSize, partS
 	if err != nil {
 		return err
 	}
-	data, err := readLocalRange(task.LocalPath, offset, pSize)
-	if err != nil {
-		return err
-	}
 	if !etagIsComparable(part.ETag) {
 		return fmt.Errorf("remote ETag %q is not a comparable md5 digest", part.ETag)
 	}
-	if got := md5HexOf(data); normalizeETag(part.ETag) != got {
+	got, _, err := streamRangeMD5(task.LocalPath, offset, pSize)
+	if err != nil {
+		return err
+	}
+	if normalizeETag(part.ETag) != got {
 		return fmt.Errorf("remote ETag %s != local md5 %s for range [%d,%d)", normalizeETag(part.ETag), got, offset, offset+pSize)
 	}
 	return nil
 }
 
-// hashResumePartAt feeds the local byte range of a skipped (already-remote,
-// ETag-verified up front) part into the full-file digest at the part's own
-// position in the ordered loop — the ORDER LAW half for skipped parts. The
-// ETag is re-checked here too: between the up-front verification and this
-// position the file could have changed again, and a digest fed with bytes
-// that differ from the remote part's would describe an object that was never
-// assembled.
-func (u *Uploader) hashResumePartAt(task *queue.UploadTask, totalSize, partSize int64, partNum int, fullSHA interface{ Write([]byte) (int, error) }, hashedBytes *int64) error {
+// hashResumePartChecked feeds the local byte range of a skipped
+// (already-remote) part into the full-file digest at the part's own position
+// in the ordered loop — the ORDER LAW half for skipped parts — and, IN THE
+// SAME STREAMING READ, computes the MD5 and re-verifies it against the part's
+// remote ETag. This is the check that decides correctness (rework-2 fix 1):
+// the up-front pre-check (verifyResumePartETag) and this read are two
+// separate reads, and the file may be rewritten in between; only a check
+// over the very bytes entering the SHA-256 guarantees that the digest
+// describes the object the remote will assemble. A mismatch here is
+// errStaleRemoteParts (the caller discards the upload and starts over) —
+// by that point some later parts may already have been uploaded, which is
+// wasted work but never a wrong result.
+func (u *Uploader) hashResumePartChecked(task *queue.UploadTask, totalSize, partSize int64, partNum int, remoteETag string, fullSHA io.Writer, hashedBytes *int64) error {
 	offset, pSize, err := partRange(partNum, totalSize, partSize)
 	if err != nil {
 		return err
 	}
-	data, err := readLocalRange(task.LocalPath, offset, pSize)
+	md5h := md5.New()
+	n, err := streamRangeInto(task.LocalPath, offset, pSize, io.MultiWriter(fullSHA, md5h))
 	if err != nil {
 		return err
 	}
-	// The bytes' ETag equality with the remote part was established up front
-	// (verifyResumePartETag); here we only feed the digest. A second change to
-	// the file between the two reads would feed different bytes than the
-	// remote holds — indistinguishable locally, but the server's own Complete
-	// + any later reconciliation would expose it; the up-front window is small
-	// and this is the same trust model as the upload path's TeeReader.
-	if _, werr := fullSHA.Write(data); werr != nil {
-		return fmt.Errorf("hash range [%d,%d): %w", offset, offset+pSize, werr)
+	if n != pSize {
+		// Belt over the short-read guard inside streamRangeInto (defensive;
+		// kept so a future refactor of the helper cannot silently drop it).
+		return fmt.Errorf("local range [%d,%d) yielded only %d bytes (file shrank since the part was uploaded)", offset, offset+pSize, n)
 	}
-	*hashedBytes += int64(len(data))
+	if !etagIsComparable(remoteETag) {
+		return fmt.Errorf("remote ETag %q is not a comparable md5 digest", remoteETag)
+	}
+	if got := hex.EncodeToString(md5h.Sum(nil)); normalizeETag(remoteETag) != got {
+		return fmt.Errorf("remote ETag %s != local md5 %s for range [%d,%d) read into the digest", normalizeETag(remoteETag), got, offset, offset+pSize)
+	}
+	*hashedBytes += n
 	return nil
+}
+
+// streamRangeMD5 streams the [offset, offset+pSize) range of path through an
+// MD5 without buffering the range (a part can be 64 MiB and the agent runs
+// on edge devices), returning the hex digest and the number of bytes read.
+// A short read or I/O error is returned as an error — never silently
+// under-counted.
+func streamRangeMD5(path string, offset, pSize int64) (string, int64, error) {
+	md5h := md5.New()
+	n, err := streamRangeInto(path, offset, pSize, md5h)
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(md5h.Sum(nil)), n, nil
+}
+
+// streamRangeInto streams exactly pSize bytes starting at offset from path
+// into w (no whole-range buffering) and returns the number of bytes
+// written. A short read means the file no longer contains the bytes the
+// remote part holds (truncated since the part was uploaded) — the local copy
+// cannot describe the object, so it is an error, not a partial success.
+func streamRangeInto(path string, offset, pSize int64, w io.Writer) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("open %q: %w", path, err)
+	}
+	defer f.Close()
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return 0, fmt.Errorf("seek %q to %d: %w", path, offset, err)
+		}
+	}
+	n, err := io.Copy(w, io.LimitReader(f, pSize))
+	if err != nil {
+		return n, fmt.Errorf("read range [%d,%d): %w", offset, offset+pSize, err)
+	}
+	if n != pSize {
+		return n, fmt.Errorf("local range [%d,%d) yielded only %d bytes (file shrank since the part was uploaded)", offset, offset+pSize, n)
+	}
+	return n, nil
 }
 
 // partRange computes the [offset, offset+size) byte range of partNum within
@@ -413,40 +470,6 @@ func partRange(partNum int, totalSize, partSize int64) (offset, pSize int64, err
 		return 0, 0, fmt.Errorf("part range [%d,%d) is outside the object size %d", offset, offset+pSize, totalSize)
 	}
 	return offset, pSize, nil
-}
-
-// readLocalRange reads exactly pSize bytes at offset from path; a short read
-// or I/O error is returned as an error (never silently under-counted).
-func readLocalRange(path string, offset, pSize int64) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open %q: %w", path, err)
-	}
-	defer f.Close()
-	if offset > 0 {
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("seek %q to %d: %w", path, offset, err)
-		}
-	}
-	data, err := io.ReadAll(io.LimitReader(f, pSize))
-	if err != nil {
-		return nil, fmt.Errorf("read range [%d,%d): %w", offset, offset+pSize, err)
-	}
-	if int64(len(data)) != pSize {
-		// Short read: the file no longer contains the bytes the remote part
-		// holds (truncated between attempts). Not a mismatch to "verify"
-		// further — the local copy simply cannot describe the object.
-		return nil, fmt.Errorf("local range [%d,%d) yielded only %d bytes (file shrank since the part was uploaded)", offset, offset+pSize, len(data))
-	}
-	return data, nil
-}
-
-// md5HexOf returns the hex-encoded MD5 digest of b (the format S3 part
-// ETags use on both supported backends — live-verified, see
-// bin/b7-ic-bug-51/poc.md).
-func md5HexOf(b []byte) string {
-	h := md5.Sum(b)
-	return hex.EncodeToString(h[:])
 }
 
 // loadCompletedParts deserialises the parts JSON blob from the queue task.
