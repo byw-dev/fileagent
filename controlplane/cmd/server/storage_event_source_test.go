@@ -113,7 +113,7 @@ func TestAdapterDoneAssignmentAndJoinShareDeclaration(t *testing.T) {
 	joinLine := 0
 	for _, decl := range f.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "main" {
+		if !ok || (fn.Name.Name != "main" && fn.Name.Name != "run") {
 			continue
 		}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {

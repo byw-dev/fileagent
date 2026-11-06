@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/byw-dev/fileagent/controlplane/internal/api/handler"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
 )
 
 // Config holds the complete runtime configuration for the Control Plane.
@@ -62,6 +63,24 @@ type Config struct {
 	MinIOPublicUseSSL   bool // defaults to MinIOUseSSL
 	// MinIORoleARN is the STS AssumeRole ARN used when issuing Agent credentials.
 	MinIORoleARN string
+
+	// MinIOStartupCheckTimeout is the total retry window for the IC-BUG-40
+	// storage startup self-check (background goroutine: S3 identity probe +
+	// one STS AssumeRole). Any failure — auth/config included — retries with
+	// backoff inside this window before the process shuts down with a non-zero
+	// exit; the default tolerates compose stacks where storage starts after
+	// the CP, and fresh deployments where the init script runs after the
+	// CP is listening (it dials the CP webhook). Default 120s.
+	MinIOStartupCheckTimeout time.Duration
+	// MinIOStartupCheckBucket is the bucket the IC-BUG-40 self-check probes
+	// with ListBucketMultipartUploads. The bucket must PHYSICALLY exist —
+	// a NoSuchBucket answer is a failed check (retried within the window),
+	// because it cannot prove the identity authenticated. bootstrap only
+	// writes DB records; the physical bucket is created by the init scripts
+	// (init-minio.sh / init-seaweedfs.sh, both create "data-sensor"), so on
+	// a fresh deployment the check retries until the init script completes.
+	// Default "data-sensor".
+	MinIOStartupCheckBucket string
 
 	// NATSURL is the NATS JetStream connection URL (required).
 	// Example: nats://localhost:4222
@@ -230,6 +249,28 @@ func Load() (*Config, error) {
 	cfg.MinIOPublicEndpoint = envString("MINIO_PUBLIC_ENDPOINT", cfg.MinIOEndpoint)
 	cfg.MinIOPublicUseSSL = envBool("MINIO_PUBLIC_USE_SSL", cfg.MinIOUseSSL)
 	cfg.MinIORoleARN = envString("MINIO_ROLE_ARN", "arn:aws:iam:::role/agent-role")
+	// Rework 3 finding 5: a NON-EMPTY but unparseable value must fail Load
+	// loudly — envDuration would silently fall back to the 120s default and
+	// an operator's "banana"/"120" typo would go unnoticed (only <= 0 values
+	// are caught by Validate).
+	if raw := os.Getenv("MINIO_STARTUP_CHECK_TIMEOUT"); raw != "" {
+		d, perr := time.ParseDuration(raw)
+		if perr != nil {
+			return nil, fmt.Errorf("invalid MINIO_STARTUP_CHECK_TIMEOUT %q: %w (expected a duration like 120s, 2m)", raw, perr)
+		}
+		cfg.MinIOStartupCheckTimeout = d
+	} else {
+		cfg.MinIOStartupCheckTimeout = 120 * time.Second
+	}
+	// Like the timeout (rework 3 finding 5): a set-but-empty value must fail
+	// loudly rather than silently becoming the default — the check requires a
+	// physically existing bucket. LookupEnv distinguishes "set to empty"
+	// (rejected below by Validate) from "unset" (default data-sensor).
+	if raw, ok := os.LookupEnv("MINIO_STARTUP_CHECK_BUCKET"); ok {
+		cfg.MinIOStartupCheckBucket = raw
+	} else {
+		cfg.MinIOStartupCheckBucket = "data-sensor"
+	}
 
 	// ── nats ──────────────────────────────────────────────────────────────────
 	cfg.NATSURL = os.Getenv("NATS_URL")
@@ -304,6 +345,22 @@ func (c *Config) Validate() error {
 	}
 	if c.AgentTokenTTL <= 0 {
 		return errors.New("AGENT_TOKEN_TTL must be a positive duration")
+	}
+	// IC-BUG-40: a non-positive self-check window would either spin forever
+	// (0 means "disabled" to no one) or fail instantly; both are operator
+	// errors worth refusing at startup.
+	if c.MinIOStartupCheckTimeout <= 0 {
+		return errors.New("MINIO_STARTUP_CHECK_TIMEOUT must be a positive duration (the storage startup self-check retry window)")
+	}
+	if c.MinIOStartupCheckBucket == "" {
+		return errors.New("MINIO_STARTUP_CHECK_BUCKET cannot be empty (the bucket the storage startup self-check probes; it must physically exist — the init scripts create data-sensor)")
+	}
+	// Rework 5 finding 7: a syntactically invalid bucket name is a config
+	// error that no amount of storage retry can fix — fail at startup with
+	// the exact reason instead of burning the whole retry window on a
+	// locally-rejected probe. Same validator minio-go itself uses.
+	if err := s3utils.CheckValidBucketName(c.MinIOStartupCheckBucket); err != nil {
+		return fmt.Errorf("invalid MINIO_STARTUP_CHECK_BUCKET %q: %w", c.MinIOStartupCheckBucket, err)
 	}
 	// S1 (PR #110 review): below-floor WEBHOOK_FAIL_LIMIT is a startup failure,
 	// not a silent fallback — limit=1 tolerates ~3s of outage, which would

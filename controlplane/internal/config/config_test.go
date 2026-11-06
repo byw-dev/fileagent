@@ -99,6 +99,109 @@ func TestLoad_CustomDurations(t *testing.T) {
 	assert.Equal(t, 168*time.Hour, cfg.JWTRefreshTokenTTL)
 }
 
+// IC-BUG-40: the storage startup self-check window defaults to 120s and is
+// overridable; a non-positive value must be rejected by Validate.
+func TestLoad_StartupCheckTimeout(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		setEnv(t, validEnv())
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 120*time.Second, cfg.MinIOStartupCheckTimeout)
+	})
+	t.Run("override", func(t *testing.T) {
+		env := validEnv()
+		env["MINIO_STARTUP_CHECK_TIMEOUT"] = "15s"
+		setEnv(t, env)
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 15*time.Second, cfg.MinIOStartupCheckTimeout)
+	})
+	t.Run("zero rejected", func(t *testing.T) {
+		env := validEnv()
+		env["MINIO_STARTUP_CHECK_TIMEOUT"] = "0s"
+		setEnv(t, env)
+		cfg, err := Load()
+		require.NoError(t, err)
+		err = cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_TIMEOUT")
+	})
+	t.Run("negative rejected", func(t *testing.T) {
+		env := validEnv()
+		env["MINIO_STARTUP_CHECK_TIMEOUT"] = "-5s"
+		setEnv(t, env)
+		cfg, err := Load()
+		require.NoError(t, err)
+		err = cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_TIMEOUT")
+	})
+	// Rework 3 finding 5: a non-empty but unparseable value must fail Load,
+	// not silently fall back to the default.
+	t.Run("unparseable rejected at Load", func(t *testing.T) {
+		for _, bad := range []string{"banana", "120"} {
+			env := validEnv()
+			env["MINIO_STARTUP_CHECK_TIMEOUT"] = bad
+			setEnv(t, env)
+			_, err := Load()
+			require.Error(t, err, "value %q must be rejected", bad)
+			assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_TIMEOUT")
+		}
+	})
+}
+
+// IC-BUG-40 rework 4: the probe bucket is configurable (no hardcoded literal);
+// the default matches what both init scripts create, and an empty value is
+// rejected because a NoSuchBucket answer is now a FAILED check.
+func TestLoad_StartupCheckBucket(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		setEnv(t, validEnv())
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, "data-sensor", cfg.MinIOStartupCheckBucket)
+	})
+	t.Run("override", func(t *testing.T) {
+		env := validEnv()
+		env["MINIO_STARTUP_CHECK_BUCKET"] = "my-probe-bucket"
+		setEnv(t, env)
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, "my-probe-bucket", cfg.MinIOStartupCheckBucket)
+	})
+	t.Run("empty rejected by Validate", func(t *testing.T) {
+		env := validEnv()
+		env["MINIO_STARTUP_CHECK_BUCKET"] = ""
+		setEnv(t, env)
+		cfg, err := Load()
+		require.NoError(t, err)
+		err = cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_BUCKET")
+	})
+	// Rework 5 finding 7: a syntactically invalid bucket name fails Validate
+	// immediately (same validator minio-go's probe path uses — the non-strict
+	// CheckValidBucketName, which the S3 API would apply locally anyway)
+	// instead of burning the whole retry window on a locally-rejected probe.
+	// Note UPPERCASE is legal per the non-strict rule; the backends may still
+	// reject it server-side, which then surfaces as a normal retried failure.
+	t.Run("invalid bucket name rejected by Validate", func(t *testing.T) {
+		for _, bad := range []string{"invalid bucket name", "a", "-leading-dash", "trailing-dot.", "192.168.1.1", "under_score_is_fine_but..dots"} {
+			env := validEnv()
+			env["MINIO_STARTUP_CHECK_BUCKET"] = bad
+			setEnv(t, env)
+			cfg, err := Load()
+			require.NoError(t, err)
+			err = cfg.Validate()
+			require.Error(t, err, "bucket name %q must be rejected", bad)
+			assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_BUCKET")
+		}
+	})
+}
+
 func TestLoad_CustomAgentTokenTTL(t *testing.T) {
 	env := validEnv()
 	env["AGENT_TOKEN_TTL"] = "168h"
