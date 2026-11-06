@@ -9,13 +9,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestProcessedFiles_ChangedFileIsReCollected pins the IC-BUG-51 conclusion
-// about processed_files: the row written on ack carries the (size, mtime)
-// tuple the task was ENQUEUED with (CompleteReported projects it from
-// upload_tasks). If the file changes during the upload, the file's CURRENT
-// tuple no longer matches the stored one, so the next scan's IsProcessed
-// returns false and the new version is re-collected — the ledger can never
-// claim "already processed" for bytes it never saw.
+// TestProcessedFiles_ChangedFileIsReCollected pins the NARROWED IC-BUG-51
+// conclusion about processed_files (review-r1 fix 3): the row written on
+// ack carries the (size, mtime) tuple the task was ENQUEUED with
+// (CompleteReported projects it from upload_tasks). WHEN a next candidate
+// check runs and the file's tuple has CHANGED since enqueue (new second-
+// granularity mtime or new size), IsProcessed returns false and the new
+// version is re-collectable — the ledger cannot claim "already processed"
+// for a version it never saw.
+//
+// ⚠️ Scope (deliberately narrow — do not widen): this proves the QUEUE-
+// LEVEL predicate only. It does NOT prove that a next candidate check will
+// actually happen: the initial-scan and cron-walk paths re-walk the tree,
+// but the fsnotify/overwrite path debounces via watcher `seen` state and
+// does not rescan on its own — delivery of the new version there depends on
+// a new filesystem event. And it does NOT cover the same-second, same-size
+// in-place rewrite: that tuple is indistinguishable from the recorded one
+// and IsProcessed stays true — that blind spot belongs to IC-BUG-48
+// (content-identity verification) and is untouched here.
 func TestProcessedFiles_ChangedFileIsReCollected(t *testing.T) {
 	ctx := context.Background()
 	q, err := Open(":memory:")

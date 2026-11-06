@@ -1,3 +1,6 @@
+// Package uploader uploads files to MinIO using either single-part or
+// multipart uploads depending on file size. It integrates with the SQLite
+// queue to support resume after agent restart.
 package uploader
 
 import (
@@ -137,8 +140,8 @@ func newWithStore(store ObjectStore, cfg Config, q *queue.Queue, logger *zap.Log
 	normalise(&cfg)
 	return &Uploader{
 		store:  store,
-		cfg:    cfg,
 		queue:  q,
+		cfg:    cfg,
 		logger: logger,
 	}
 }
@@ -194,11 +197,20 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 	// Tail mode with a positive offset uploads only the bytes after the
 	// offset, so a full-content digest could never describe the delivered
 	// bytes (IC-BUG-51 invariant) — the old code hashed the whole file and
-	// reported that hash alongside a suffix upload. Refuse instead: the
-	// executor's fail-closed gate (IC-BUG-46) already blocks every tail task
-	// before this point, and this second guard keeps the invariant true at
-	// the uploader level too, for any future caller. Tail mode with offset 0
-	// is a plain full upload and remains supported.
+	// reported that hash alongside a suffix upload. Refuse instead.
+	//
+	// Which gate is THE authority: the EXECUTOR's fail-closed gate
+	// (IC-BUG-46, executor.go's tail check wrapping ErrTerminalUpload) is
+	// the one that matters — it rejects every tail task BEFORE the uploader
+	// runs, with a TERMINAL error so the task is not retried forever. This
+	// uploader-side check is deliberately only a SECOND line of defence for
+	// any future caller that bypasses the executor; its error is a plain
+	// error, not executor.ErrTerminalUpload, because the executor imports
+	// the uploader package and wrapping the executor's sentinel here would
+	// create an import cycle. If the executor gate is ever removed, this
+	// error must be upgraded to a terminal semantics the caller recognises
+	// (and the offset-0 case re-examined) in the same change. Tail mode with
+	// offset 0 is a plain full upload and remains supported.
 	if task.AppendMode == "tail" && task.FileOffset > 0 {
 		return nil, fmt.Errorf("uploader: append_mode=tail with offset %d > 0 is unsupported (IC-BUG-46): an incremental tail upload would both replace the whole object with only the appended bytes and be un-describable by a full-content digest; the correct implementation is IC-15", task.FileOffset)
 	}
