@@ -87,10 +87,16 @@ FI_HANG_DEMO=1 bash test/fault-injection/run.sh   # 有界调用自证（预期�
 CP 日志 `cp.log`、代理日志 `proxy.log`、各场景计划/清单文件等）。**例外**：
 SeaweedFS 配置渲染会重写共享的 `deploy/config/seaweedfs/{s3,iam}.json`（见
 顶部「隔离边界」），这是当前 compose 挂载路径决定的、本脚本不试图改共享
-compose；除此之外不写仓库其它目录。
+compose；除此之外不写仓库其它目录。渲染脚本会把该目录强制为 **0700**、
+发布文件 **0644**（容器内 filer 以 uid 1000 读它们；见
+`deploy/scripts/render-seaweedfs-configs.sh` 头部的权限模型注释）。
 
 退出时 cleanup 对**自己创建的资源**做 `down -v --remove-orphans`（两个 compose
-项目）、按 pid 杀 CP/代理/写入器进程组并确认退出、核验自有端口全部释放；端口
+项目）、按 pid 杀 CP/代理/写入器进程组并确认退出、核验自有端口全部释放；
+fatal 或断言失败后、容器被 down 删除之前，两个 compose 项目所有容器的
+`docker compose logs --no-color --timestamps` 会先落到 `bin/tmp/fi/logs-docker-compose.*.yml.txt`
+（保留 compose 默认的逐行服务名前缀，同一项目里 master/volume/filer 的日志可区分；
+随 CI artifact 一起上传；拉取失败只警告、不影响清理）；端口
 预检失败（拒绝路径）则不创建任何东西、不做任何清理动作。
 
 ## 与 `deploy/scripts/smoke.sh` 的关系

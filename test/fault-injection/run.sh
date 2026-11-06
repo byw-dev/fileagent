@@ -423,6 +423,22 @@ cleanup() {
     echo "  · 预检未全部通过（拒绝路径）：本次未创建任何基础设施，不执行任何 down/pkill（R3-6）"
     return $rc
   fi
+  # B7（权限修复返工）：fatal/失败后、down 删容器之前，先把两个 compose 项目
+  # 所有容器的 docker compose logs 存到 $OUT/ —— 这次排查 filer unhealthy 时
+  # 正是因为 artifact 里缺容器日志才多绕了几步（compose up 的输出只有
+  # 「container ... is unhealthy」一行）。保存失败只记警告，绝不影响 cleanup
+  # 本身（日志拉不出来时也要照常 down）。直接写 `docker compose -f …` 而不经
+  # $SWCOMPOSE/$COMPOSE 变量：那两个是要拼展的字符串，这里逐字面引用文件更
+  # 清晰；项目名沿 export 的 COMPOSE_PROJECT_NAME，与上面 down 的调用同源。
+  local _f _lf
+  for _f in deploy/docker-compose.seaweedfs.yml deploy/docker-compose.dev.yml; do
+    _lf="$OUT/logs-$(basename "$_f").txt"
+    if ! run_to 60 docker compose -f "$_f" logs --no-color --timestamps >"$_lf" 2>&1; then
+      echo "  ⚠ 拉取 $_f 容器日志失败/超时（see $_lf）——不影响后续清理"
+    else
+      echo "  · 容器日志已存 $_lf"
+    fi
+  done
   local pid spec left
   for pid in "${CP_PID:-}" "${PROXY_PID:-}" "${WRITER_PID:-}"; do
     [ -n "$pid" ] || continue

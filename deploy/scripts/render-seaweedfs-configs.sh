@@ -26,6 +26,33 @@
 # BETWEEN the two renames can still leave a mixed generation (new s3.json +
 # old iam.json) — re-running the renderer converges, it is idempotent.
 #
+# Permission model (B7, 2026-11-06): SW_CONFIG_DIR is forced to 0700 and the
+# published s3.json / iam.json to 0644. The files must be world-READABLE on
+# purpose: on Linux the filer bind-mounts them straight from this directory,
+# and although the image starts as root, its entrypoint immediately drops to
+# uid 1000 (seaweed, via su-exec). A bind mount preserves the HOST uid and
+# mode bits, so the in-container seaweed user is literally "some other uid"
+# from the file's point of view — a 0600 root/runner-owned file is unreadable
+# to it, the S3 gate fails to load its config and the filer healthcheck goes
+# red. That is exactly what killed every Linux CI run of the fault-injection
+# suite after PR #139 (GitHub runner uid 1001 owned 0600 files; macOS Docker
+# Desktop never enforces host perms, so local runs stayed green). 0644 keeps
+# the file readable for ANY container uid without widening exposure on the
+# host: the containing directory is 0700, so no OTHER host user can even
+# traverse into it, and the Docker daemon resolves bind mounts as root
+# regardless of file mode.
+#
+# Operational invariants of that model (rework 1):
+#   * Rendering must ALWAYS be done by the SAME uid. Root must not take over
+#     a directory another user rendered (the ownership gate below refuses
+#     it on purpose): 0644 files under a directory some other uid can
+#     re-permission would void the 0700 guarantee. Re-render as the owning
+#     user, or move the directory aside and render fresh.
+#   * Upgrading an existing deployment from the 0600 scheme: re-run this
+#     renderer once after upgrading (as the same uid that owns the config
+#     directory). init-seaweedfs.sh only invokes the renderer when the files
+#     are MISSING, so stale 0600 files are not fixed by running init alone.
+#
 # The DEFAULTS below are development placeholders shared with
 # init-seaweedfs.sh and the seaweedfs branch of smoke.sh via
 # deploy/seaweedfs/env-defaults.sh (single source of truth) — they are NOT
@@ -193,7 +220,143 @@ with open(dst, "w", encoding="utf-8") as f:
 PYEOF
 }
 
+# The symlink gate runs BEFORE mkdir -p: mkdir -p on a symlinked path would
+# happily create/keep the LINK's target directory and we would never notice
+# (mkdir -p succeeds silently when the link resolves to an existing dir).
+if [ -L "${SW_CONFIG_DIR}" ]; then
+  echo "ERROR: SW_CONFIG_DIR (${SW_CONFIG_DIR}) is a symbolic link — refusing to operate." >&2
+  echo "       chmod would follow the link and re-permission a directory this script" >&2
+  echo "       does not own. Point SW_CONFIG_DIR at a real directory (or remove the link)" >&2
+  echo "       and re-run." >&2
+  exit 1
+fi
 mkdir -p "${SW_CONFIG_DIR}"
+
+# --- Path canonicalization + ancestor trust walk (rework 2, review R2-1/2/3)
+# Modeled on OpenSSH StrictModes (secure_filename / auth_secure_path): instead
+# of checking one directory and then writing through the ORIGINAL path (which
+# may contain re-pointable symlinks — the review's probe-link-swap.sh proved
+# that fatal), we (1) canonicalize the path once so it contains no symlinks,
+# (2) verify EVERY ancestor from the parent up to /, and (3) do ALL later
+# chmod/mktemp/mv/cp exclusively on the canonical path.
+#
+# realpath: present on both GNU coreutils and macOS (since Big Sur). If a
+# host lacks it, `cd -P "$dir" && pwd -P` is the equivalent fallback — one
+# of the two must exist; both resolve ALL symlinks and ".." components.
+SW_CANON="$(realpath "${SW_CONFIG_DIR}" 2>/dev/null || { cd -P "${SW_CONFIG_DIR}" 2>/dev/null && pwd -P; })"
+if [ -z "${SW_CANON}" ] || [ ! -d "${SW_CANON}" ]; then
+  echo "ERROR: cannot canonicalize SW_CONFIG_DIR (${SW_CONFIG_DIR}) — realpath and cd -P both failed." >&2
+  exit 1
+fi
+if [ "${SW_CANON}" = "/" ]; then
+  echo "ERROR: SW_CONFIG_DIR canonicalizes to / — refusing (the script would chmod 700 / and" >&2
+  echo "       break the whole system's traversability). Point SW_CONFIG_DIR at a dedicated" >&2
+  echo "       directory." >&2
+  exit 1
+fi
+
+# check_ancestor <dir> <child-on-path>: one hop of the walk. A directory is
+# trusted when its owner is root or the current user AND it is not writable
+# by group/other — EXCEPT when it has the sticky bit AND the next entry on
+# the path (child) is owned by root or the current user: sticky only stops
+# users from renaming entries they do not own, so a sticky directory is safe
+# for us exactly when OUR entry inside it cannot be swapped by anyone else.
+check_ancestor() { # <dir> <child-path>
+  local dir=$1 child=$2 uid mode
+  uid="$(stat -c '%u' "${dir}" 2>/dev/null || stat -f '%u' "${dir}")"
+  mode="$(stat -c '%a' "${dir}" 2>/dev/null || stat -f '%p' "${dir}")"
+  # Normalize: mask BSD %p's file-type nibble (41777 → 1777), re-render as
+  # octal digits; `8#` is prefixed exactly ONCE per use below (results of
+  # $((…)) are decimal and must never be re-prefixed).
+  mode="$(printf '%04o' "$(( 8#${mode} & 07777 ))")"
+  if [ "${uid}" != "0" ] && [ "${uid}" != "$(id -u)" ]; then
+    echo "ERROR: untrusted ancestor directory — refusing to render." >&2
+    echo "       ${dir} is owned by uid=${uid} (mode ${mode}); only the current user" >&2
+    echo "       (uid=$(id -u)) or root may own a directory on the path to SW_CONFIG_DIR." >&2
+    echo "       With the published files at 0644, a foreign owner could swap a directory" >&2
+    echo "       on the path and read the credentials. Fix: chown the directory to the" >&2
+    echo "       rendering user (or root), or point SW_CONFIG_DIR somewhere you own." >&2
+    return 1
+  fi
+  if [ "$(( 8#${mode} & 0022 ))" -ne 0 ]; then
+    if [ "$(( 8#${mode} & 01000 ))" -eq 0 ]; then
+      echo "ERROR: ancestor directory writable by group/other without the sticky bit — refusing to render." >&2
+      echo "       ${dir} (uid=${uid}, mode ${mode}) lets another user rename a directory on" >&2
+      echo "       the path aside and read the 0644 credentials inside. Fix: chmod go-w" >&2
+      echo "       ${dir} (or chmod +t if it must stay shared AND the entry below it is" >&2
+      echo "       owned by root/you), or point SW_CONFIG_DIR elsewhere." >&2
+      return 1
+    fi
+    # Sticky + writable: our entry inside it must be ours (root/cur-user),
+    # else the ENTRY's owner could swap it (sticky protects owners' rights
+    # to their OWN entries — including replacing them).
+    local cuid
+    cuid="$(stat -c '%u' "${child}" 2>/dev/null || stat -f '%u' "${child}")"
+    if [ "${cuid}" != "0" ] && [ "${cuid}" != "$(id -u)" ]; then
+      echo "ERROR: sticky ancestor is writable, and the entry on the path is owned by" >&2
+      echo "       uid=${cuid} — that owner could swap it (sticky protects only owners'" >&2
+      echo "       own entries). Ancestor: ${dir} (mode ${mode}); entry: ${child}." >&2
+      echo "       Fix: chown ${child} to root/the rendering user, chmod go-w ${dir}, or" >&2
+      echo "       point SW_CONFIG_DIR elsewhere." >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Walk from SW_CANON's parent up to / (inclusive): each hop checks an
+# ancestor against the entry DIRECTLY under it on the path (that is the entry
+# sticky semantics would let its owner swap).
+_anc="${SW_CANON}"
+while :; do
+  _parent="$(dirname -- "${_anc}")"
+  check_ancestor "${_parent}" "${_anc}" || exit 1
+  [ "${_parent}" = "/" ] && break
+  _anc="${_parent}"
+done
+
+# Residual risk, known and accepted (no handling): between the walk above and
+# the writes below there is still a time-of-check/time-of-use window IF some
+# attacker had rename rights on an ancestor. The walk already guarantees no
+# OTHER user has such rights on ANY level — what remains is root or the
+# current user themselves, both inside the trust boundary.
+
+# From here on the canonical path is the ONLY path used for writes: the
+# original SW_CONFIG_DIR may contain symlinks that can be re-pointed between
+# check and use (review R2-2); SW_CANON contains none by construction.
+SW_CONFIG_DIR="${SW_CANON}"
+# --- Directory permission gate (B7, 2026-11-06) -----------------------------
+# SW_CONFIG_DIR must end up 0700 (see the permission-model note in the file
+# header). Cases, all fail-closed:
+#   * symlink (even one whose target we could fix) — refused, same rationale
+#     as smoke.sh's ~/.aws guard: chmod on a symlink silently follows it and
+#     would re-permission a directory this script does not own (e.g. a real
+#     ~/.aws or an attacker-planted target); a symlinked config dir also
+#     breaks the “same directory ⇒ atomic rename" publish guarantee above
+#     when the link crosses a filesystem.
+#   * existing dir owned by someone else — refused: we cannot chmod it and the
+#     0700 guarantee this script promises would be a lie; report and exit.
+#   * existing dir owned by us — corrected to 0700 (it may have been created
+#     by an older renderer or a umask-happy process as 0755).
+#   * newly created — mkdir already applied the umask, chmod pins it exactly.
+if [ -d "${SW_CONFIG_DIR}" ] && [ "$(id -u)" != "$(stat -c '%u' "${SW_CONFIG_DIR}" 2>/dev/null || stat -f '%u' "${SW_CONFIG_DIR}")" ]; then
+  echo "ERROR: SW_CONFIG_DIR (${SW_CONFIG_DIR}) is owned by another user — cannot enforce 0700." >&2
+  # Diagnostics only (rework 1, review R1-2): both branches redirect to stderr
+  # and `|| true` keeps a failing diagnostic from aborting under set -e — the
+  # fix suggestions and exit 1 below MUST stay reachable. BSD/macOS needs
+  # `stat -f`; GNU coreutils needs `stat -c`.
+  { stat -c '       current: owner uid=%u mode=%a' "${SW_CONFIG_DIR}" 2>/dev/null \
+      || stat -f '       current: owner=%Su mode=%Sp' "${SW_CONFIG_DIR}" 2>/dev/null; } >&2 || true
+  echo "       Fix suggestions: chown the directory to the user running this script" >&2
+  echo "       (sudo chown -R $(id -u) ${SW_CONFIG_DIR}), or move it aside and let the" >&2
+  echo "       renderer create a fresh one (mv ${SW_CONFIG_DIR} ${SW_CONFIG_DIR}.old)." >&2
+  exit 1
+fi
+if ! chmod 700 "${SW_CONFIG_DIR}"; then
+  echo "ERROR: chmod 700 ${SW_CONFIG_DIR} failed — cannot guarantee the 0700 directory for" >&2
+  echo "       the rendered credentials; refusing to publish." >&2
+  exit 1
+fi
 # Stage BOTH files as temporaries in the destination directory (same
 # filesystem => each rename(2) is atomic). Only after both validate are they
 # published; if the SECOND publish fails, the first is rolled back from an
@@ -214,7 +377,16 @@ fi
 python3 -m json.tool "${TMP_S3}" >/dev/null
 python3 -m json.tool "${TMP_IAM}" >/dev/null
 
-chmod 600 "${TMP_S3}" "${TMP_IAM}"
+# 0644, NOT 0600: the filer bind-mounts these files and its entrypoint drops
+# to uid 1000 (seaweed) via su-exec while the host-side owner is whoever ran
+# this script (root, a CI runner uid, ...). On Linux the bind mount keeps the
+# host uid/mode, so 0600 files are unreadable in-container and the filer never
+# comes healthy (see the permission-model note in the header). Still safe:
+# the containing directory is 0700, so no other HOST user can traverse into it
+# (the window before publish is covered too — the mktemp temporaries below
+# live INSIDE that 0700 directory, and mktemp itself creates them 0600), and
+# the Docker daemon resolves bind mounts as root regardless of file mode.
+chmod 644 "${TMP_S3}" "${TMP_IAM}"
 
 # --- Publish (rework R2 P2) -------------------------------------------------
 # Back up the currently published s3.json so a failure of the SECOND rename
