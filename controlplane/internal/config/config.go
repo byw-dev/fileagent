@@ -63,6 +63,15 @@ type Config struct {
 	// MinIORoleARN is the STS AssumeRole ARN used when issuing Agent credentials.
 	MinIORoleARN string
 
+	// MinIOStartupCheckTimeout is the total retry window for the IC-BUG-40
+	// storage startup self-check (background goroutine: S3 identity probe +
+	// one STS AssumeRole). Any failure — auth/config included — retries with
+	// backoff inside this window before the process shuts down with a non-zero
+	// exit; the default tolerates compose stacks where storage starts after
+	// the CP, and fresh MinIO deployments where init-minio.sh runs after the
+	// CP is listening (it dials the CP webhook). Default 120s.
+	MinIOStartupCheckTimeout time.Duration
+
 	// NATSURL is the NATS JetStream connection URL (required).
 	// Example: nats://localhost:4222
 	NATSURL string
@@ -230,6 +239,7 @@ func Load() (*Config, error) {
 	cfg.MinIOPublicEndpoint = envString("MINIO_PUBLIC_ENDPOINT", cfg.MinIOEndpoint)
 	cfg.MinIOPublicUseSSL = envBool("MINIO_PUBLIC_USE_SSL", cfg.MinIOUseSSL)
 	cfg.MinIORoleARN = envString("MINIO_ROLE_ARN", "arn:aws:iam:::role/agent-role")
+	cfg.MinIOStartupCheckTimeout = envDuration("MINIO_STARTUP_CHECK_TIMEOUT", 120*time.Second)
 
 	// ── nats ──────────────────────────────────────────────────────────────────
 	cfg.NATSURL = os.Getenv("NATS_URL")
@@ -304,6 +314,12 @@ func (c *Config) Validate() error {
 	}
 	if c.AgentTokenTTL <= 0 {
 		return errors.New("AGENT_TOKEN_TTL must be a positive duration")
+	}
+	// IC-BUG-40: a non-positive self-check window would either spin forever
+	// (0 means "disabled" to no one) or fail instantly; both are operator
+	// errors worth refusing at startup.
+	if c.MinIOStartupCheckTimeout <= 0 {
+		return errors.New("MINIO_STARTUP_CHECK_TIMEOUT must be a positive duration (the storage startup self-check retry window)")
 	}
 	// S1 (PR #110 review): below-floor WEBHOOK_FAIL_LIMIT is a startup failure,
 	// not a silent fallback — limit=1 tolerates ~3s of outage, which would

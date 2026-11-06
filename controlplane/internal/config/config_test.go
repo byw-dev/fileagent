@@ -99,6 +99,37 @@ func TestLoad_CustomDurations(t *testing.T) {
 	assert.Equal(t, 168*time.Hour, cfg.JWTRefreshTokenTTL)
 }
 
+// IC-BUG-40: the storage startup self-check window defaults to 120s and is
+// overridable; a non-positive value must be rejected by Validate.
+func TestLoad_StartupCheckTimeout(t *testing.T) {
+	t.Run("default", func(t *testing.T) {
+		setEnv(t, validEnv())
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 120*time.Second, cfg.MinIOStartupCheckTimeout)
+	})
+	t.Run("override", func(t *testing.T) {
+		env := validEnv()
+		env["MINIO_STARTUP_CHECK_TIMEOUT"] = "15s"
+		setEnv(t, env)
+		cfg, err := Load()
+		require.NoError(t, err)
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 15*time.Second, cfg.MinIOStartupCheckTimeout)
+	})
+	t.Run("zero rejected", func(t *testing.T) {
+		env := validEnv()
+		env["MINIO_STARTUP_CHECK_TIMEOUT"] = "0s"
+		setEnv(t, env)
+		cfg, err := Load()
+		require.NoError(t, err)
+		err = cfg.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "MINIO_STARTUP_CHECK_TIMEOUT")
+	})
+}
+
 func TestLoad_CustomAgentTokenTTL(t *testing.T) {
 	env := validEnv()
 	env["AGENT_TOKEN_TTL"] = "168h"

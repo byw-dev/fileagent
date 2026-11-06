@@ -31,6 +31,7 @@ import (
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs"
+	"github.com/byw-dev/fileagent/controlplane/internal/storage/startupcheck"
 	"github.com/byw-dev/fileagent/controlplane/internal/storageevent"
 	"github.com/byw-dev/fileagent/controlplane/internal/webui"
 	"github.com/byw-dev/fileagent/controlplane/internal/worker"
@@ -528,8 +529,53 @@ func main() {
 		}
 	}()
 
-	<-ctx.Done()
-	logger.Info("shutdown signal received, stopping…")
+	// ── Storage startup self-check (IC-BUG-40) ──────────────────────────────
+	// Runs in the BACKGROUND, after the listeners are up: init-minio.sh dials
+	// the CP's webhook endpoint while it creates the CP identity, so a
+	// blocking pre-listen check would deadlock a fresh deployment (the init
+	// script could never reach the CP that is waiting on the identity the
+	// script creates). Any failure — auth/config included — retries inside
+	// MINIO_STARTUP_CHECK_TIMEOUT (default 120s, product decision 2026-11-06);
+	// when the window expires still failing, Run logs the terminal Error with
+	// the full diagnostics (item / endpoint / access key id / raw error /
+	// fix hint — never the secret) and the goroutine cancels the process
+	// context so the NORMAL shutdown path runs (deferred closes, event-source
+	// join) before the Fatal exit below (non-zero). /healthz stays 200 during
+	// the window: smoke/dev flows rely on reaching the API (incl. the webhook
+	// init talks to) before storage initialization completes.
+	selfCheckFailed := make(chan *startupcheck.Failure, 1)
+	go func() {
+		err := startupcheck.Run(ctx, startupcheck.Config{
+			Endpoint:    cfg.MinIOEndpoint,
+			AccessKey:   cfg.MinIOAccessKey,
+			SecretKey:   cfg.MinIOSecretKey,
+			UseSSL:      cfg.MinIOUseSSL,
+			RoleARN:     cfg.MinIORoleARN,
+			ProbeBucket: "data-sensor",
+			Timeout:     cfg.MinIOStartupCheckTimeout,
+			Logger:      logger,
+		})
+		if failure, ok := err.(*startupcheck.Failure); ok {
+			// Window expired: hand the failure to main's select and cancel ctx
+			// so shutdown runs its normal course; main then exits non-zero.
+			select {
+			case selfCheckFailed <- failure:
+			default:
+			}
+			stop()
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		logger.Info("shutdown signal received, stopping…")
+	case failure := <-selfCheckFailed:
+		// IC-BUG-40 fail-closed exit. Fatal (a) logs at the level operators
+		// grep for and (b) exits non-zero. stop() was already called, so the
+		// deferred closes below still run on the way out.
+		logger.Fatal("storage startup self-check failed — refusing to run with a broken storage identity (IC-BUG-40)",
+			failure.LogFields(cfg.MinIOEndpoint, cfg.MinIOAccessKey, startupcheck.FixHint(cfg.MinIORoleARN, failure.Item))...)
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
