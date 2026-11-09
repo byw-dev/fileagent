@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs/seaweedfstest"
@@ -100,10 +101,10 @@ func TestN6WiringSuppressedDifferentStateReReads(t *testing.T) {
 		ClientName: "n6-test", ClientID: 21,
 		ResumeMargin: time.Minute, MaxRetries: 3, RetryBackoff: time.Millisecond,
 		MinioClient:    nil, // not used (reader override below)
+		Queries:        db.New(conn),
 		Indexer:        ix,
 		Logger:         zap.NewNop(),
 		StoreOverride:  store,
-		ClockOverride:  &n1NoClock{},
 		ReaderOverride: reader,
 		DialOverride: func(ctx context.Context) (seaweedfs.FilerClient, func(), error) {
 			return filer, func() {}, nil
