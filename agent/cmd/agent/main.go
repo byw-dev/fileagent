@@ -892,10 +892,12 @@ func hashCandidateSHA256(path string) (queue.HashResult, error) {
 func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
 	ident, statErr := fileid.Stat(localPath)
 	if statErr != nil {
-		// Unreadable candidate: report via the queue layer's zero-identity
-		// path — undecidable → hash-confirm → open fails → Recollect... but
-		// the file cannot be read at all, so enqueue normally and let the
-		// upload path fail with the same (loud) error.
+		// Unreadable candidate: pass a zero identity (undecidable) —
+		// DecideProcessed then hash-confirms; the open in hashFn (or in the
+		// upload path) fails loudly with the same error. The file is still
+		// ENQUEUED on that error path (see the err branch below): master's
+		// behaviour for this case was done=false → enqueue, and we keep that
+		// fail-closed direction.
 		logger.Debug("agent: identity stat failed, deferring to the upload path",
 			zap.String("path", localPath), zap.Error(statErr))
 	}
@@ -906,13 +908,23 @@ func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, ru
 		},
 		func() (queue.HashResult, error) { return hashCandidateSHA256(localPath) })
 	if err != nil {
+		// A broken dedup lookup must NOT drop the file (rework-1 fix 1):
+		// CandidateDecision's zero value is {VerdictUnset, ...} — but relying
+		// on that structural guarantee alone would hide the error, so set the
+		// verdict explicitly, exactly like executor.processTask does. The
+		// worst outcome of a failed lookup is a duplicate upload, never a
+		// lost file: hash-confirm I/O errors (locked/permission/transient),
+		// SQLite errors, stat failures — all route to Recollect.
 		logger.Warn("agent: check processed failed", zap.String("path", localPath), zap.Error(err))
+		dec = queue.CandidateDecision{Verdict: queue.Recollect, Prefilter: queue.VerdictUndecidable}
 	}
+	// Default arm = enqueue: VerdictUnset (a caller bug — this switch handles
+	// err above, but a future refactor might not) and any unknown value fall
+	// into the queue instead of being silently dropped.
 	switch dec.Verdict {
 	case queue.Skip, queue.RefreshAndSkip:
 		return
-	case queue.Recollect:
-		// fall through to enqueue
+	default: // Recollect, VerdictUnset, unknown → enqueue
 	}
 	storagePath, pathErr := buildStoragePath(rule, localPath, agentCtx, time.Now().UTC(), logger)
 	if pathErr != nil {

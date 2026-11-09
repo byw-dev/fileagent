@@ -188,12 +188,22 @@ type HashResult struct {
 // be confirmed), or refresh-and-skip (content identical but the ledger row
 // was stale — its identity fields are refreshed to the current values so the
 // next candidate check can trust the prefilter again).
+//
+// The zero value is VerdictUnset — deliberately NOT any "skip" semantics.
+// A caller that forgets to handle DecideProcessed's error and switches on the
+// zero-value decision therefore falls INTO the queue (fail-closed: the worst
+// outcome is a duplicate upload, never a lost file). Callers must treat any
+// verdict other than Skip/RefreshAndSkip as "enqueue".
 type CandidateVerdict int
 
 // Candidate verdict values; see the CandidateVerdict doc comment.
 const (
+	// VerdictUnset is the zero value: "no decision was made" (e.g. a caller
+	// ignored an error and kept the zero CandidateDecision). It is treated
+	// as Recollect by every consumer — see the doc comment on the type.
+	VerdictUnset CandidateVerdict = iota
 	// Skip: no new content to upload.
-	Skip CandidateVerdict = iota
+	Skip
 	// Recollect: enqueue an upload for the current content.
 	Recollect
 	// RefreshAndSkip: content identical; the row's identity metadata was
@@ -206,6 +216,8 @@ const (
 // String renders the candidate verdict for logs and tests.
 func (v CandidateVerdict) String() string {
 	switch v {
+	case VerdictUnset:
+		return "unset"
 	case Skip:
 		return "skip"
 	case Recollect:
