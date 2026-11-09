@@ -102,8 +102,10 @@ AWS_DIR="$(mktemp -d "$REPO/$OUT/aws.XXXXXX")" \
   || fatal "创建私有 AWS 凭据目录失败（mktemp -d $REPO/$OUT/aws.XXXXXX）"
 # AWS 块先于主 cleanup trap 定义；这个临时 trap 覆盖「凭据初始化自身 fatal」
 # 的窗口，随后主 `trap cleanup EXIT` 会将其替换（cleanup 同样删除 AWS_DIR）。
-# L1（评审 r5）：信号覆盖范围与 init 同（2026-10-31 实测）——外部 TERM/INT/HUP
-# 时 EXIT trap 会执行；脚本内 kill -$$ 自杀与 SIGKILL/崩溃不保证，见 backlog。
+# L1（评审 r5，2026-11-09 依 PR #138 codex 第 6 轮复现改准）：信号覆盖范围与
+# init 同——外部 TERM/HUP 时 EXIT trap 会执行；外部 INT 在 bash 正等待前台子
+# 进程时可能被前台子进程消费、EXIT trap 不执行；脚本内 kill -$$ 自杀与
+# SIGKILL/崩溃不保证，见 backlog。
 trap 'rm -rf "${AWS_DIR:-}" 2>/dev/null' EXIT
 chmod 700 "$AWS_DIR" || fatal "校正 AWS 凭据目录权限失败（${AWS_DIR}）"
 export AWS_CONFIG_FILE="$AWS_DIR/config" AWS_SHARED_CREDENTIALS_FILE="$AWS_DIR/credentials"

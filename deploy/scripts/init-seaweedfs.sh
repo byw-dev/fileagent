@@ -122,9 +122,12 @@ OWN_AWS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fileagent-swinit-aws.XXXXXX")" || {
 # 再做 chmod 和写入——否则写 credentials 中途失败（磁盘满等）时，含明文 secret
 # 的目录会残留。之后主 `trap cleanup EXIT` 接管（cleanup 同样删除该目录），
 # 接管是原子的、没有无 trap 保护的空窗。
-# L1（评审 r5）：信号覆盖范围（2026-10-31 实测）——外部 kill -TERM/-INT/-HUP
-# 时 EXIT trap 会执行、目录被清；**脚本内 kill -$$ 自杀与 SIGKILL/崩溃时不执行**，
-# 目录会残留（产品 2026-10-31 决定不另做信号 trap，见 backlog「信号中断时的清理」）。
+# L1（评审 r5，2026-11-09 依 PR #138 codex 第 6 轮复现改准）：信号覆盖范围——
+# 外部 TERM/HUP 时 EXIT trap 会执行、目录被清；**外部 INT 在 bash 正等待前台
+# 子进程时可能被前台子进程消费、脚本不退出、EXIT trap 不执行**；
+# **脚本内 kill -$$ 自杀与 SIGKILL/崩溃时不执行**，目录会残留（产品 2026-10-31
+# 决定不另做信号 trap，见 backlog「信号中断时的清理」；复现见
+# bin/followups/signal-check.txt，该目录不入库）。
 trap 'rm -rf "${OWN_AWS_DIR:-}" 2>/dev/null' EXIT
 # F1（评审 r1）防御性加固：mktemp -d 本就 0700，这里显式校正并在写入凭据时
 # 用 umask 077 子壳，保证文件落盘即 0600（先建权限再写内容，无可读空窗）。
@@ -233,12 +236,75 @@ fi
 # assume_role <access key> <secret key> — same shape the Control Plane's
 # STSManager issues (inline session policy, 3600s). STS is served on the S3
 # port root. Raw response (XML) goes to stdout, curl's status to the caller.
+#
+# IC-BUG-57 fix: the credential pair used to be passed as `curl --user
+# "$1:$2"` — visible in `ps -ef` on the host for the lifetime of the process
+# (curl re-execs nothing; argv is fixed at spawn). Now the "user = AK:SK"
+# line is written by the bash BUILTIN printf (no external command, so the
+# secret never appears in any argv, not even ours) into a 0600 file inside
+# the private OWN_AWS_DIR (0700), which the existing EXIT-trap cleanup
+# already removes. `curl --config <file>` reads that file AFTER the curl
+# process has started — the point is not when it is parsed but that the
+# secret travels via the file, never via argv.
+#
+# curl config escaping (rework 1, IC-BUG-57 followup): inside a
+# double-quoted config value curl processes C-style escapes, so a raw `\`
+# would swallow the next byte and a raw `"` would terminate the value early
+# (live: has"quote → has, back\slash → backslash, trail\ → trail" + line
+# break). Each AK/SK byte is therefore escaped with pure builtin parameter
+# expansion BEFORE printf: first `\` → `\\`, then `"` → `\"`. `${var//}` is
+# a builtin — no sed/awk, or the secret would be right back in an argv.
+# Rejections instead of silent rewriting:
+#   * LF/CR in the AK or SK cannot live on ONE config line (a raw newline
+#     would split the value mid-secret; an escaped \n would change the
+#     credential bytes) → refuse loudly, naming the offending variable but
+#     never printing the secret.
+#   * `:` in the AK would split `user = "AK:SK"` at the wrong byte (curl
+#     splits USERPWD on the FIRST colon) → refuse; AKIs are ASCII without
+#     colons by construction, so this only fires on misconfiguration.
 STS_SESSION_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucketMultipartUploads"],"Resource":["arn:aws:s3:::'"${SW_BUCKET_DATA}"'"]},{"Effect":"Allow","Action":["s3:PutObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":["arn:aws:s3:::'"${SW_BUCKET_DATA}"'/*"]}]}'
 assume_role() {
-  curl --silent --show-error --fail-with-body \
+  local _sts_cfg _sts_out _sts_rc _ak _sk
+  # Reject credential bytes that cannot survive a one-line curl config
+  # BEFORE writing anything. Pure pattern matching, no subshell fork needed
+  # for the common (clean) case — the [[ == ]] pattern is a builtin test.
+  _ak="$1" _sk="$2"
+  case "${_ak}" in
+    *:*)
+      echo "ERROR: SW_CP_ACCESS_KEY contains ':' (position splits the curl user field); access key ids never contain colons — fix the variable." >&2
+      return 1
+      ;;
+  esac
+  case "${_ak}" in
+    *$'\n'*|*$'\r'*)
+      echo "ERROR: SW_CP_ACCESS_KEY contains a newline/carriage-return; it cannot be written to a single-line curl config. Fix the variable." >&2
+      return 1
+      ;;
+  esac
+  case "${_sk}" in
+    *$'\n'*|*$'\r'*)
+      echo "ERROR: SW_CP_SECRET_KEY contains a newline/carriage-return; it cannot be written to a single-line curl config. Fix the variable." >&2
+      return 1
+      ;;
+  esac
+  # Builtin-only escaping: backslash first (else the newly introduced
+  # backslashes would be double-escaped by the quote pass), then quotes.
+  local _ak_esc="${_ak//\\/\\\\}"
+  _ak_esc="${_ak_esc//\"/\\\"}"
+  local _sk_esc="${_sk//\\/\\\\}"
+  _sk_esc="${_sk_esc//\"/\\\"}"
+  _sts_cfg="$(mktemp "${OWN_AWS_DIR}/.sts-user.XXXXXX")" || {
+    echo "ERROR: failed to create the STS curl config file." >&2
+    return 1
+  }
+  # Builtin printf + redirect only: the escaped pair must not reach any
+  # external command's argv. umask 077 → file lands 0600 inside the 0700
+  # OWN_AWS_DIR.
+  ( umask 077; printf 'user = "%s:%s"\n' "${_ak_esc}" "${_sk_esc}" > "${_sts_cfg}" )
+  _sts_out=$(curl --silent --show-error --fail-with-body \
     ${CURL_CONNECT_ARGS[@]+"${CURL_CONNECT_ARGS[@]}"} \
     --aws-sigv4 "aws:amz:us-east-1:sts" \
-    --user "$1:$2" \
+    --config "${_sts_cfg}" \
     --header "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "Action=AssumeRole" \
     --data-urlencode "Version=2011-06-15" \
@@ -246,7 +312,11 @@ assume_role() {
     --data-urlencode "RoleArn=${SW_AGENT_ROLE_ARN}" \
     --data-urlencode "RoleSessionName=fileagent-init-check" \
     --data-urlencode "Policy=${STS_SESSION_POLICY}" \
-    "${SW_S3_ENDPOINT}" 2>&1
+    "${SW_S3_ENDPOINT}" 2>&1)
+  _sts_rc=$?
+  rm -f "${_sts_cfg}"
+  printf '%s' "${_sts_out}"
+  return "${_sts_rc}"
 }
 
 # ---------------------------------------------------------------------------

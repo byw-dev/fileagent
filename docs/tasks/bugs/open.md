@@ -12,9 +12,9 @@
 
 > **计数（2026-09-17，PR #108 合并后 + PR #109 评审改判；2026-09-24 IC-4a 关闭 6/9；**IC-BUG-6 的 (d) 只落了 `active=true` 标记位，无消费方，强制解封归 IC-12 的验收与依赖（PR #110 复审 B4）**）**：共 **56** 条 = **已关闭 37** + **已撤销 1**（IC-BUG-49，前提被实测证伪）+ **未关闭 18**（**2 条挡** 7/40 + **13 条可推** + **3 条拆半** 13、46 与 32）。**2026-10-12：IC-BUG-56 随 D-037 文档 PR 立卡（判可推），来自存储层调研。****口径**：拆半计入「未关闭」（与 `active.md`、`consistency-ingest.md` 一致），因为功能缺口仍在。三张拆半卡片（13/46/32）的总览行均已带 ◐ 标记；分诊与判据以 `consistency-ingest.md` 的分诊表为准。42…45 来自 PR #100 的两轮 review，46…49 来自 IC-3 的六轮 review 与随后的 tail 设计讨论，**50 来自 tail 讨论中撞见的隐藏保留字（已随 PR #106 关闭）**，**51 是 IC-3 review 期间发现、当时按产品要求推后立卡的「三次独立读」**，**52 来自 PR #107 的多轮 review，53 来自 PR #108（IC-BUG-44/43）的 codex 复审**。（⚠️ 本段判定口径已被下一段取代，保留为历史。）
 
-> ### 🔄 计数与判定（2026-10-27 里程碑 B 重判；#142 随 IC-BUG-40 修复更新）——以本段为准
+> ### 🔄 计数与判定（2026-10-27 里程碑 B 重判；此后 51/40/57 修复时同步更新，最近一次：IC-BUG-57 随 `chore/b7-small-followups` 关闭）——以本段为准
 >
-> **共 57 条 = 已关闭 39（2026-11-06：IC-BUG-51 随 PR #140、IC-BUG-40 随 PR #142 修复）+ 已撤销 1（IC-BUG-49）+ 未关闭 17**（新增 **IC-BUG-57**，随本次重判立卡，见文末）。
+> **共 57 条 = 已关闭 40（2026-11-06：IC-BUG-51 随 PR #140、IC-BUG-40 随 PR #142 修复；2026-11-09：IC-BUG-57 修复，分支 `chore/b7-small-followups`）+ 已撤销 1（IC-BUG-49）+ 未关闭 16**（新增 **IC-BUG-57**，随本次重判立卡，见文末）。
 > 判据更换：旧口径「挡 / 可推」（2026-09-11 重判为「挡 / 不挡 A」）已让位于**里程碑 B 判据**——
 > **这条缺陷在 SeaweedFS 试点部署里还成立吗？成立的话挡不挡试点？**（依据 D-037、`docs/tasks/active.md`「当前里程碑 B」，
 > B7 之后即可试点部署。）重判时原有的 18 条未关缺陷逐条重判，判定只针对仍开着的那一半（拆半卡片 13/46/32 先判 ◐ 再判剩余半边）：
@@ -22,16 +22,16 @@
 > | 判定 | 条数 | 明细 |
 > |---|---|---|
 > | **挡试点** | **1** | 48（~~51~~ 2026-11-06 随 PR #140 修复；同日返工 1 依 PR #134 评审 F1–F3 改判：51 成功上报错误哈希、48 同版本改写永久漏采，均经生产函数探针实测；~~40 的 init 自检不覆盖 CP 实际生效配置~~ 40 已随 #142 修复：启动自检拒绝启动） |
-> | **不挡试点** | **14** | 13、14、15、32、38、42、45、46（剩余半边，返工 3 经产品拍板改判）、52、53、54、55、56、57（新卡） |
+> | **不挡试点** | **13** | 13、14、15、32、38、42、45、46（剩余半边，返工 3 经产品拍板改判）、52、53、54、55、56（~~57~~ 2026-11-09 已修复关闭，分支 `chore/b7-small-followups`；重判时为 14，2026-11-09 关闭 57 后余 13） |
 > | **MinIO 专属** | **2** | 7、41（不关闭——MinIO 过渡期仍是默认后端；MinIO 适配器退役时随之关闭。7 在 SeaweedFS 上无对应物：事件源按 `/buckets/` 前缀订阅，新桶天然覆盖，PR3b 合并后成立；41 的 SeaweedFS 侧同类问题已另立 57） |
 > | **已失效 / 撤销** | **0** | 无（无一条满足「必须给出代码证据」的撤销门槛） |
 > | **待产品定** | **0** | 无（46 剩余半边原判待产品定，产品 2026-10-27 拍板试点无持续追加大文件，返工 3 改判不挡试点） |
 >
-> 一行式口径：**挡试点 1（48）/ 不挡试点 14 / MinIO 专属 2（7、41）/ 已失效 0 / 待产品定 0**（返工 3：46 剩余半边经产品拍板改判不挡试点；PR #140：51 修复关闭；#142：40 随启动自检修复关闭；返工 1 前：挡 0 / 不挡 16，历史保留）。
+> 一行式口径：**挡试点 1（48）/ 不挡试点 13 / MinIO 专属 2（7、41）/ 已失效 0 / 待产品定 0**（返工 3：46 剩余半边经产品拍板改判不挡试点；PR #140：51 修复关闭；#142：40 随启动自检修复关闭；本 PR `chore/b7-small-followups`：57 修复关闭——2026-10-27 重判时点为不挡试点 14，2026-11-06 关闭 40 后仍为 14，本 PR 关闭 57 后余 13；返工 1 前：挡 0 / 不挡 16，历史保留）。
 > 逐条判定、理由与文件:行号证据见各卡片的「**B 重判（2026-10-27）**」行；下方总表的未关行标题后带统一格式的判定标记（机械重算见 `bin/recount.sh`）。
 > 机械重算脚本 `bin/recount.sh`（不提交）的输出与本段、`consistency-ingest.md`、`active.md`、`CLAUDE.md`、`TASK_LIST.md` 中的数字一致。
 >
-> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #140），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；上表的 37/19/3/14 口径为 2026-10-27 时点快照，保留为历史。** **2026-11-06：IC-BUG-40 亦已修（PR #142：CP 启动存储自检，窗口耗尽拒绝运行），已关闭 39 + 未关闭 17、挡试点余 1（48）**
+> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #140），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；2026-10-27 重判时点为 已关 37 / 撤销 1 / 未关 19 / 挡试点 3 / 不挡试点 14（历史）。** **2026-11-06：IC-BUG-40 亦已修（PR #142：CP 启动存储自检，窗口耗尽拒绝运行），已关闭 39 + 未关闭 17、挡试点余 1（48）** **2026-11-09：IC-BUG-57 亦已修（分支 `chore/b7-small-followups`：`assume_role` 的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv），已关闭 40 + 未关闭 16、挡试点余 1（48）**
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -178,7 +178,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 〔B:不挡试点〕 | 🟡 P2 | docs |
 | IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** 〔B:不挡试点〕 | 🟠 P1 | agent + CP |
 | IC-BUG-56 | **过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」只认 `AccessDenied`**——不会卡住（后台每分钟检查一次，唤醒后约 1 分钟内恢复），但期间开始的上传各失败一次、推迟一个退避档并白耗一次重试 〔B:不挡试点〕 | 🟡 P2 | agent |
-| IC-BUG-57 | （立卡时）`init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕；**B7（#138）后 `mc alias set` 两处已随 S3 客户端换成 AWS CLI 而消除（凭据走私有 config 文件，不再进 argv），现存只剩 `curl --user`**（见详情卡「B7 进展」） | 🟡 P2 | deploy |
+| IC-BUG-57 | （立卡时）`init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕；**B7（#138）后 `mc alias set` 两处已随 S3 客户端换成 AWS CLI 而消除（凭据走私有 config 文件，不再进 argv）** ✅ 已修（#143：残留的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv；2026-11-09，分支 `chore/b7-small-followups`，见详情卡「修复记录」） | 🟡 P2 | deploy |
 
 ---
 
@@ -909,18 +909,19 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **发现** | 2026-10-03 存储层调研时撞见，2026-10-12 随 D-037 文档 PR 立卡（此前只记在会话笔记里）。 |
 | **B 重判（2026-10-27）** | **不挡试点** — SeaweedFS 上同类错误码已有实测：篡改 / 缺失 session token 均返回 `InvalidAccessKeyId`（`research/storage-layer-eval/results/probe-neg/seaweedfs-loose-run.jsonl` G1.8/G1.9）；**过期场景本身待实测**（探针当时 SKIP，需 `EXPIRY_TEST=1` 重跑）。影响有界：后台每分钟刷新，唤醒后约 1 分钟内恢复，代价 = 几个任务各失败一次 + 一档退避。证据：`agent/cmd/agent/main.go:617-624`（`isAccessDenied` 只认 `AccessDenied`，2026-10-27 复核） |
 
-## IC-BUG-57 — `init-seaweedfs.sh` 把 secret 放进命令行 argv 🟡 P2
+## IC-BUG-57 — `init-seaweedfs.sh` 把 secret 放进命令行 argv 🟡 P2 ✅ 已修（2026-11-09，分支 `chore/b7-small-followups`，#143）
 
 > 2026-10-27 里程碑 B 重判（B3-PR4）新立：IC-BUG-41 的 SeaweedFS 侧同类问题，
 > 按「另立新卡、不偷换旧卡含义」处理（`bin/pr4.md` 新判据）。
 
 | 字段 | 内容 |
 |------|------|
-| **根因** | （立卡时）`mc alias set ALIAS ENDPOINT AK SK`（admin 与 CP 两个 alias）、`curl --user "AK:SK"`（AssumeRole 自检）三处把 secret 作为 argv 传递，执行期间同机任意用户 `ps -ef` 可见——与 IC-BUG-41 在 `init-minio.sh` 的形态相同。**B7（#138）后 `mc alias set` 两处已消除，现存只剩 `curl --user`**（见下方「B7 进展」） |
+| **根因** | （立卡时）`mc alias set ALIAS ENDPOINT AK SK`（admin 与 CP 两个 alias）、`curl --user "AK:SK"`（AssumeRole 自检）三处把 secret 作为 argv 传递，执行期间同机任意用户 `ps -ef` 可见——与 IC-BUG-41 在 `init-minio.sh` 的形态相同。**B7（#138）后 `mc alias set` 两处已消除，当时尚余 `curl --user`（2026-11-09 已随本 PR 修复，见下方「修复记录」）**（详见「B7 进展」） |
 | **精确位置** | （立卡时）`deploy/scripts/init-seaweedfs.sh:179-180`（admin alias）、`:254-255`（CP alias）、`:142-153`（`assume_role` 的 `--user "$1:$2"`）——行号为历史值，B7 后两处 alias 已不存在，见下行 |
 | **后果** | 仅在脚本执行的几秒窗口内可见，且通常在运维自己的机器/跳板机上执行，实际风险低（与 IC-BUG-41 同判）。渲染器**无**此问题：`render-seaweedfs-configs.sh:120-148` 经环境变量向 python3 注密，secret 不进 argv |
 | **修复** | `mc` 支持从环境变量读凭据（`MC_HOST_<alias>`）；curl 的 `--user` 可改 `--netrc-file` / `--config -`。与 IC-BUG-41 同修法，两脚本宜同刀 |
 | **验收** | 脚本运行期间 `ps -ef` 输出不含任何 `SW_*_SECRET_KEY` 值；AssumeRole / CreateBucket / 预签名 GET 三项自检仍全过 |
 | **归属** | 未排期。宜与 IC-BUG-41（`init-minio.sh` 同类问题）同刀 |
 | **B 重判（2026-10-27）** | **不挡试点** — 执行窗口秒级、通常在运维自己的机器上，实际风险低；bootstrap 三项自检本就要求操作者在场。证据：`init-seaweedfs.sh:179-180,254-255,142-153`（历史行号，同上） |
-| **B7 进展（#138，2026-10-31）** | `mc alias set` 两处已随 S3 客户端改为 AWS CLI（B7）而消除；凭据改为写入**私有 0700 目录、0600 权限**的 config/credentials 文件（`mktemp -d` + trap 清理，不进 argv 也不进全局 `~/.aws`）。**现存的 argv 暴露只剩 `curl --user`**（`assume_role` 函数里的 `curl --user "$1:$2"`，即 AssumeRole 自检；不写行号以免漂移）；另注：预签名 URL 进入 curl argv（预签名 GET 自检里的 `curl "${PRESIGNED_URL}"`）是**旧版就有的**短期凭据（5 分钟过期），非新增暴露。**IC-BUG-57 仍未关闭**（curl --user 残留），计数不变 |
+| **B7 进展（#138，2026-10-31）** | `mc alias set` 两处已随 S3 客户端改为 AWS CLI（B7）而消除；凭据改为写入**私有 0700 目录、0600 权限**的 config/credentials 文件（`mktemp -d` + trap 清理，不进 argv 也不进全局 `~/.aws`）。**截至 2026-10-31 #138 合并时，argv 暴露尚余 `curl --user`**（`assume_role` 函数里的 `curl --user "$1:$2"`，即 AssumeRole 自检；不写行号以免漂移；已于 2026-11-09 随本 PR 修复，见下方「修复记录」）；另注：预签名 URL 进入 curl argv（预签名 GET 自检里的 `curl "${PRESIGNED_URL}"`）是**旧版就有的**短期凭据（5 分钟过期），非新增暴露。当时 IC-BUG-57 尚未关闭（curl --user 残留），计数不变 |
+| **修复记录（2026-11-09，分支 `chore/b7-small-followups`，#143）** | `assume_role` 的 `curl --user "$1:$2"` 改为 `curl --config <file>`：`user = "AK:SK"` 一行由 **bash 内建 printf + 重定向**（无外部命令，密钥不进任何 argv）写入**私有 `OWN_AWS_DIR`（0700）内的 `mktemp` 临时文件（umask 077 → 0600）**，用完即删、EXIT trap 兜底删除。**先红后绿探针**（PATH 前置 curl 包装器记录 `"$@"`，等价于 `ps -ef` 可见的 argv）：master 版 argv 含 `--user AK:SK`（红），修复版 argv 只有 `--config <file>`（绿）——证据 `bin/followups/ic57/probe-red-green.txt`。**live 验收**：`FA_STORAGE=seaweedfs bash deploy/scripts/smoke.sh` = `SMOKE PASSED`（含 init-seaweedfs.sh 的 AssumeRole/建桶/预签名 GET 三项自检）。修复只涉 `assume_role` 一处；预签名 URL 进 argv 的旧有短期凭据暴露（5 分钟过期）**不在本卡范围、未改**。卡片关闭，计数 → 已关 40 / 未关 16 |

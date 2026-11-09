@@ -34,12 +34,13 @@ import (
 // Diagnostic is the whitelisted, log-safe description of one probe failure.
 // Every field is either derived from OUR OWN classification of the error
 // (class, net_kind) or a narrowly-validated scalar from the wire
-// (s3_code/sts_code match codePattern; http_status is an int).
+// (s3_code/sts_code must be one of the knownS3Codes enum members, else they
+// collapse to "<non-standard>"; http_status is an int).
 type Diagnostic struct {
 	// Class is our classification: auth / config / network / unknown.
 	Class FailureClass
 	// S3Code is the S3 error code, "" when absent, "<non-standard>" when the
-	// server returned something that does not match codePattern.
+	// server returned something outside the knownS3Codes fixed enum.
 	S3Code string
 	// STSCode is the STS error code, same rules as S3Code.
 	STSCode string

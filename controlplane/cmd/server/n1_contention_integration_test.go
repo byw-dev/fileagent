@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/byw-dev/fileagent/controlplane/internal/db"
 	"github.com/byw-dev/fileagent/controlplane/internal/indexer"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs"
 	"github.com/byw-dev/fileagent/controlplane/internal/storage/seaweedfs/seaweedfstest"
@@ -73,12 +74,13 @@ func n1ThrowawayDB(t *testing.T) string {
 // newer observation on every attempt.
 type racingReader struct {
 	ix     *indexer.Indexer
+	clock  seaweedfs.DBClock // 生产 dbClock（&dbClock{q: db.New(conn)}），与适配器同源
 	bucket string
 	hotKey string
 
-	mu              sync.Mutex
-	hotHits         int
-	hotInjErrs      []error
+	mu               sync.Mutex
+	hotHits          int
+	hotInjErrs       []error
 	hotInjSuppressed int
 }
 
@@ -87,10 +89,20 @@ func (r *racingReader) StatObject(ctx context.Context, bucket, key string) (seaw
 		r.mu.Lock()
 		r.hotHits++
 		r.mu.Unlock()
-		// source=agent → observed_at 取 DB now()，晚于适配器本次回读取的钟 →
-		// 本次回读的 Apply 必然被 suppress（正是要守护的同状态竞争）。
+		// source=agent → observed_at 取生产 dbClock（PG clock_timestamp()，与适配器
+		// 回读侧同一时钟域、同一实现），晚于适配器本次回读取的钟 → 本次回读的
+		// Apply 必然被 suppress（正是要守护的同状态竞争）。不用宿主 time.Now：
+		// 跨主机时钟偏差时「注入的写每次更晚」必须由生产时钟源本身保证。
+		now, err := r.clock.Now(ctx)
+		if err != nil {
+			err = fmt.Errorf("n1: read db clock: %w", err)
+			r.mu.Lock()
+			r.hotInjErrs = append(r.hotInjErrs, err)
+			r.mu.Unlock()
+			return seaweedfs.ObjectInfo{Size: 1, ETag: "same"}, nil
+		}
 		suppressed, err := r.ix.IndexUploadReporting(ctx, r.bucket, key, 1, "same",
-			time.Now().UTC(), "", "agent")
+			now, "", "agent")
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		if err != nil {
@@ -166,9 +178,8 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 	// 生产链路（R3-1）：走 startSeaweedfsEventSource 的同一工厂 scfg.adapter()，
 	// 不设 SinkOverride —— 工厂回退 plain sink 的变异必须被本测试抓红。
 	ix := indexer.NewIndexer(conn, nil, zap.NewNop())
-	reader := &racingReader{ix: ix, bucket: "n1-bucket", hotKey: "hot.csv"}
+	reader := &racingReader{ix: ix, clock: &dbClock{q: db.New(conn)}, bucket: "n1-bucket", hotKey: "hot.csv"}
 	store := &n1CursorStore{}
-
 	// 流：热 key（同状态竞争）→ 心跳 → 冷 key → 心跳。
 	resps := []seaweedfstest.ResponseSpec{
 		{Directory: "/buckets/n1-bucket", Name: "hot.csv", FileSize: 1, TsNs: 1000},
@@ -183,10 +194,10 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 		SourceID: "seaweedfs:n1", FilerAddr: "unused:0",
 		ClientName: "n1-test", ClientID: 11,
 		ResumeMargin: time.Minute, MaxRetries: 3, RetryBackoff: time.Millisecond,
-		Indexer:       ix,
-		Logger:        logger,
-		StoreOverride: store,
-		ClockOverride: &n1NoClock{},
+		Queries:        db.New(conn),
+		Indexer:        ix,
+		Logger:         logger,
+		StoreOverride:  store,
 		ReaderOverride: reader,
 		DialOverride: func(ctx context.Context) (seaweedfs.FilerClient, func(), error) {
 			return filer, func() {}, nil
@@ -199,8 +210,12 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 
 	// R4-4：预置热 key 行（真实生产 upsert）——后续每次 HEAD 注入都走
 	// 「更新已有行」分支，覆盖原始饥饿场景（反复同状态更新同一行）。
+	// observedAt 同样取生产 dbClock：此时还没有任何更晚的观察，写入必须落库。
+	seedClock := &dbClock{q: db.New(conn)}
+	seedAt, err := seedClock.Now(ctx)
+	require.NoError(t, err)
 	injSuppressed, injErr := ix.IndexUploadReporting(ctx, "n1-bucket", "hot.csv", 1, "same",
-		time.Now().UTC(), "", "agent")
+		seedAt, "", "agent")
 	require.NoError(t, injErr)
 	require.False(t, injSuppressed, "seeding the hot-key row must land (nothing newer yet)")
 
@@ -262,10 +277,4 @@ func TestN1HotKeySameStateContentionDoesNotStarveStream(t *testing.T) {
 func n1TestLogger(t *testing.T) (*zap.Logger, *observer.ObservedLogs) {
 	core, logs := observer.New(zap.DebugLevel)
 	return zap.New(core), logs
-}
-
-type n1NoClock struct{}
-
-func (c *n1NoClock) Now(context.Context) (time.Time, error) {
-	return time.Now(), nil
 }

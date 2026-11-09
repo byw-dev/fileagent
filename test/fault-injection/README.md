@@ -52,8 +52,9 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
   脚本自建私有 AWS 配置（config/credentials/aws-s3 封装落在每次运行
   `mktemp -d` 新建的 `bin/tmp/fi/aws.XXXXXX/` 里——不是固定路径、不可能被
   换成指向 `~/.aws` 的符号链接；目录 0700、凭据文件 0600，正常退出与 fatal
-  时**整个目录**删除（外部 TERM/INT/HUP 实测也会清理；脚本内 kill -$$ 自杀
-  与 SIGKILL/崩溃不保证，见 backlog「信号中断时的清理」）；历史固定路径
+  时**整个目录**删除（外部 TERM/HUP 实测也会清理；外部 INT 在 bash 正等待前台
+  子进程时可能不清理；脚本内 kill -$$ 自杀
+  与 SIGKILL/崩溃不保证，见下文「信号与清理边界」及 backlog「信号中断时的清理」）；历史固定路径
   `bin/tmp/fi/aws/` 只清理、不再写入），`--endpoint-url`
   显式给出、path-style、region `us-east-1`，**不触碰开发者的 `~/.aws`**；
   调用者环境里的 AWS_*（及 FI_AWS_MAX_ATTEMPTS）变量按白名单全部清除
@@ -73,6 +74,15 @@ CP 的「订阅 SeaweedFS filer 元数据事件 → S3 HEAD 回读 → 写入 PG
   不可用时用秒级 `date +%s` 兜底
 - 端口空闲（被占用时脚本 fail-closed 拒绝运行）：`25132 26179 27122 28122
   29334 28334 28898 28899 28081 29091 28990`
+
+### 信号与清理边界
+
+正常退出与 fatal 时**整个目录**删除。信号实测（PR #138 codex 第 6 轮，复现
+脚本与本机输出见仓库外评审记录；另见 backlog「信号中断时的清理」）：
+**外部 TERM、HUP 会执行 EXIT trap**、目录被清；**外部 INT 在 bash 正等待前台
+子进程时可能被前台子进程消费、脚本不退出、EXIT trap 不执行**（例外：bash 正
+忙于内建命令时 INT 会触发）；**脚本内 `kill -$$` 自杀与 SIGKILL/崩溃不执行**，
+目录会残留（产品已决定信号处理另立卡，见 backlog）。
 
 ## 运行方法
 
@@ -96,8 +106,11 @@ compose；除此之外不写仓库其它目录。渲染脚本会把该目录强�
 fatal 或断言失败后、容器被 down 删除之前，两个 compose 项目所有容器的
 `docker compose logs --no-color --timestamps` 会先落到 `bin/tmp/fi/logs-docker-compose.*.yml.txt`
 （保留 compose 默认的逐行服务名前缀，同一项目里 master/volume/filer 的日志可区分；
-随 CI artifact 一起上传；拉取失败只警告、不影响清理）；端口
-预检失败（拒绝路径）则不创建任何东西、不做任何清理动作。
+拉取失败只警告、不影响清理）。落盘发生在每次运行的 cleanup 里（预检通过后 fatal、
+断言失败、正常结束都会落）；**CI 的 artifact 上传步骤是 `if: failure()`——只有
+CI job 失败才上传**，成功的定时/手动运行只落本地盘、不产生 artifact（本地
+`bin/tmp/fi/` 会被下次运行复用该目录，注意留存）。端口
+预检失败（拒绝路径）则不创建任何东西、不做任何清理动作、也不落日志。
 
 ## 与 `deploy/scripts/smoke.sh` 的关系
 
