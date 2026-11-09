@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/byw-dev/fileagent/agent/internal/fileid"
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/minio/minio-go/v7"
 	"github.com/stretchr/testify/assert"
@@ -124,6 +125,21 @@ func newTask(t *testing.T, path, bucket, storagePath string) *queue.UploadTask {
 	}
 }
 
+// stampPartsSnapshot fills a task's parts identity snapshot from the CURRENT
+// file content (test helper for pre-IC48 tests: the snapshot is taken right
+// before enqueue, exactly like SaveMultipartProgress does in production).
+func stampPartsSnapshot(t *testing.T, task *queue.UploadTask) {
+	t.Helper()
+	id, err := fileid.Stat(task.LocalPath)
+	require.NoError(t, err)
+	task.PartsFileMtime = id.MtimeNs / 1e9
+	task.PartsFileSize = id.Size
+	task.PartsFileMtimeNs = id.MtimeNs
+	task.PartsFileCtimeNs = id.CtimeNs
+	task.PartsFileDev = id.Dev
+	task.PartsFileIno = id.Ino
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 func TestUploadFile_SinglePart(t *testing.T) {
@@ -203,10 +219,7 @@ func TestUploadFile_Multipart_ResumeFromQueue(t *testing.T) {
 	task.CompletedParts = `{"parts":[{"part_number":1,"etag":"` + md5Hex(bytes.Repeat([]byte("B"), 1024*1024)) + `"}]}`
 	// R-A: a matching file-version snapshot — without one the resume would
 	// discard the parts as unversioned.
-	if info, statErr := os.Stat(path); assert.NoError(t, statErr) {
-		task.PartsFileMtime = info.ModTime().Unix()
-		task.PartsFileSize = info.Size()
-	}
+	stampPartsSnapshot(t, task)
 
 	store := &mockStore{
 		uploadID: "existing-upload-id",
@@ -397,7 +410,9 @@ func TestUploadFile_FileMissing(t *testing.T) {
 	u := newWithStore(store, Config{PartSizeMB: 64}, q, zap.NewNop())
 	_, err := u.UploadFile(context.Background(), task)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "stat")
+	// IC-BUG-48 moved the identity stat behind the open (same fd), so a
+	// missing file now surfaces as an open failure.
+	assert.Contains(t, err.Error(), "open")
 }
 
 func TestNormalizeETagAndComparability(t *testing.T) {
@@ -439,7 +454,9 @@ func TestUploadFile_MissingFile_Errors(t *testing.T) {
 	u := newWithStore(store, Config{PartSizeMB: 64}, q, zap.NewNop())
 	_, err := u.UploadFile(context.Background(), task)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "stat")
+	// IC-BUG-48 moved the identity stat behind the open (same fd), so a
+	// missing file now surfaces as an open failure.
+	assert.Contains(t, err.Error(), "open")
 }
 
 func TestNewWithStore_DefaultPartSize(t *testing.T) {
@@ -621,10 +638,7 @@ func TestUploadFile_Multipart_ResumeNoSuchUploadStartsFresh(t *testing.T) {
 	task.CompletedParts = `{"parts":[{"part_number":1,"etag":"part-etag-1"}]}`
 	// A matching version snapshot: the test exercises the confirmed-
 	// NoSuchUpload branch, not the version-mismatch discard.
-	if info, statErr := os.Stat(path); assert.NoError(t, statErr) {
-		task.PartsFileMtime = info.ModTime().Unix()
-		task.PartsFileSize = info.Size()
-	}
+	stampPartsSnapshot(t, task)
 	require.NoError(t, q.Enqueue(task))
 
 	store := &mockStore{listErr: minio.ErrorResponse{Code: "NoSuchUpload"}}
@@ -855,33 +869,61 @@ func TestUploadFile_Multipart_ResumeDiscardRecordFailureSurvives(t *testing.T) {
 }
 
 // canResumeParts unit tests: each gate condition, fail-closed — any
-// undecidable input must reject the resume with a named reason.
+// undecidable input must reject the resume with a named reason. IC-BUG-48:
+// the snapshot and the current version are full identities (mtime-ns, ctime,
+// dev, ino), compared with the same helper the processed-files dedup uses.
 func TestCanResumeParts(t *testing.T) {
-	current := queue.FileVersion{Mtime: 100, Size: 100 * 1024}
-	taskWithSnap := &queue.UploadTask{PartsFileMtime: 100, PartsFileSize: 100 * 1024}
+	g := int64(1024 * 1024) // arbitrary size base
+	current := queue.FileVersion{
+		Mtime: 100, Size: 100 * g, MtimeNs: 100 * int64(time.Second), CtimeNs: 100*int64(time.Second) + 5,
+		Dev: 7, Ino: 42,
+	}
+	taskWithSnap := &queue.UploadTask{
+		PartsFileMtime: 100, PartsFileSize: 100 * g,
+		PartsFileMtimeNs: 100 * int64(time.Second), PartsFileCtimeNs: 100*int64(time.Second) + 5,
+		PartsFileDev: 7, PartsFileIno: 42,
+	}
 
 	ok, reason := canResumeParts(taskWithSnap, current, true, true)
 	assert.True(t, ok, "all conditions hold: the parts are resumable")
 	assert.Empty(t, reason)
 
-	// 1. no snapshot (legacy row) — untrusted even if a stat "matches" the
-	// zero value (A2: zero must never compare equal to unknown).
+	// 1. no snapshot (legacy row) — untrusted even if the legacy mtime+size
+	// "matches" (A2: zero/unknown must never compare equal to known).
 	ok, reason = canResumeParts(&queue.UploadTask{}, queue.FileVersion{}, true, true)
 	assert.False(t, ok)
-	assert.Contains(t, reason, "no version snapshot")
-	ok, reason = canResumeParts(&queue.UploadTask{}, current, true, true)
-	assert.False(t, ok, "a legacy row with a KNOWN current version is still untrusted")
-	assert.Contains(t, reason, "no version snapshot")
+	assert.Contains(t, reason, "no full identity snapshot")
+	ok, reason = canResumeParts(&queue.UploadTask{PartsFileMtime: 100, PartsFileSize: 100 * g}, current, true, true)
+	assert.False(t, ok, "a legacy row (mtime+size only, no ctime/dev/ino) is still untrusted")
+	assert.Contains(t, reason, "no full identity snapshot")
 
 	// 2. stat failed — current version unknown.
 	ok, reason = canResumeParts(taskWithSnap, queue.FileVersion{}, false, true)
 	assert.False(t, ok)
 	assert.Contains(t, reason, "stat failed")
 
-	// 3. version changed.
-	ok, reason = canResumeParts(taskWithSnap, queue.FileVersion{Mtime: 999, Size: 100 * 1024}, true, true)
+	// 3. identity changed — each field individually.
+	for _, tc := range []struct {
+		name string
+		cur  queue.FileVersion
+	}{
+		{"mtime-ns", queue.FileVersion{Mtime: 100, Size: 100 * g, MtimeNs: 101 * int64(time.Second), CtimeNs: current.CtimeNs, Dev: 7, Ino: 42}},
+		{"ctime", queue.FileVersion{Mtime: 100, Size: 100 * g, MtimeNs: current.MtimeNs, CtimeNs: current.CtimeNs + 1, Dev: 7, Ino: 42}},
+		{"dev", queue.FileVersion{Mtime: 100, Size: 100 * g, MtimeNs: current.MtimeNs, CtimeNs: current.CtimeNs, Dev: 8, Ino: 42}},
+		{"ino", queue.FileVersion{Mtime: 100, Size: 100 * g, MtimeNs: current.MtimeNs, CtimeNs: current.CtimeNs, Dev: 7, Ino: 43}},
+		{"legacy mtime", queue.FileVersion{Mtime: 999, Size: 100 * g, MtimeNs: 101 * int64(time.Second), CtimeNs: current.CtimeNs, Dev: 7, Ino: 42}},
+	} {
+		t.Run("changed/"+tc.name, func(t *testing.T) {
+			ok, reason = canResumeParts(taskWithSnap, tc.cur, true, true)
+			assert.False(t, ok)
+			assert.Contains(t, reason, "file identity changed")
+		})
+	}
+
+	// 3b. current identity with unknown fields (stat blob lacked ctime/inode).
+	ok, reason = canResumeParts(taskWithSnap, queue.FileVersion{Mtime: 100, Size: 100 * g, MtimeNs: current.MtimeNs}, true, true)
 	assert.False(t, ok)
-	assert.Contains(t, reason, "file version changed")
+	assert.Contains(t, reason, "unknown fields")
 
 	// 4. not going multipart (file shrank below the threshold).
 	ok, reason = canResumeParts(taskWithSnap, current, true, false)

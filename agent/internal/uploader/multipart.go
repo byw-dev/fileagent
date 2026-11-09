@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/minio/minio-go/v7"
@@ -24,41 +25,53 @@ type completedParts struct {
 // multipartUpload uploads a large file using MinIO multipart upload with
 // support for resuming interrupted transfers via the SQLite queue.
 // canResumeParts is the fail-closed gate for resuming a recorded multipart
-// upload (IC-3 R-A/A1/A2): the recorded parts may be skipped ONLY when ALL of
-// the following hold — anything undecidable means "do not trust the parts",
-// because resuming stale parts splices old and new file content into one
-// object with a wrong SHA:
+// upload (IC-3 R-A/A1/A2 + IC-BUG-48): the recorded parts may be skipped ONLY
+// when ALL of the following hold — anything undecidable means "do not trust
+// the parts", because resuming stale parts splices old and new file content
+// into one object with a wrong SHA:
 //
-//  1. the row carries a parts version snapshot (parts_file_mtime /
-//     parts_file_size): a legacy row without one is untrusted — its parts may
-//     belong to ANY version of the file;
-//  2. the current file was stat'ed successfully: a failed stat leaves the
-//     current version unknown, and comparing against an unknown proves
-//     nothing (a zero-value current version must never compare "equal" to a
-//     zero-value legacy snapshot);
-//  3. the snapshot matches the current version (mtime + size);
+//  1. the row carries the full identity snapshot (parts_file_mtime/size +
+//     parts_file_mtime_ns/ctime_ns/dev/ino): a legacy row missing any
+//     identity field is untrusted — its parts may belong to ANY version of
+//     the file;
+//  2. the current file was stat'ed successfully and its identity is fully
+//     known (no unknown fields);
+//  3. the snapshot matches the current identity on EVERY field (mtime,
+//     mtime-ns, ctime-ns, dev, ino, size) — one shared comparison with the
+//     processed-files dedup (queue.PrefilterVerdict metadata stage);
 //  4. this attempt actually goes the multipart path: the upload would
 //     otherwise be a PutObject (a file that shrank below the threshold, or a
 //     tail-mode offset shrinking the increment), which can never consume the
 //     recorded parts — the old multipart upload would be orphaned with no
 //     reference left.
 //
+// Content-level staleness (bytes changed under identical metadata) is NOT
+// this gate's job: IC-BUG-51's per-part ETag verification
+// (verifyResumePartETag/hashResumePartChecked) covers it downstream.
+//
 // The single gate exists so that "why can't we resume" is directly assertable
 // by tests and logs instead of being scattered across branches — scattered
 // conditions are exactly how the fail-open holes (A1/A2) slipped in.
-// Deliberate blind spot, shared with IC-BUG-10's mtime+size identity: a file
-// rewritten within the same second at the same size is undetectable —
-// IC-BUG-51 closes that hole for the RESUME path via per-part ETag
-// verification (see hashResumePart below), not via stat identity.
 func canResumeParts(task *queue.UploadTask, current queue.FileVersion, statOK, isMultipart bool) (bool, string) {
-	if task.PartsFileMtime == 0 && task.PartsFileSize == 0 {
-		return false, "no version snapshot for the recorded parts (legacy row, untrusted)"
+	snap := queue.FileIdentity{
+		MtimeNs: task.PartsFileMtimeNs,
+		CtimeNs: task.PartsFileCtimeNs,
+		Dev:     task.PartsFileDev,
+		Ino:     task.PartsFileIno,
+		Size:    task.PartsFileSize,
+	}
+	if !queue.IdentityFullyKnown(snap) {
+		return false, "no full identity snapshot for the recorded parts (legacy row, untrusted)"
 	}
 	if !statOK {
 		return false, "current file stat failed"
 	}
-	if current != (queue.FileVersion{Mtime: task.PartsFileMtime, Size: task.PartsFileSize}) {
-		return false, "file version changed since the parts were uploaded"
+	cur := queue.IdentityFromFileVersion(current)
+	if !queue.IdentityFullyKnown(cur) {
+		return false, "current file identity has unknown fields"
+	}
+	if diffs := queue.IdentityDiffs(snap, cur); len(diffs) > 0 {
+		return false, "file identity changed since the parts were uploaded: " + strings.Join(diffs, ",")
 	}
 	if !isMultipart {
 		return false, "this attempt no longer uses multipart upload"

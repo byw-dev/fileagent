@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/byw-dev/fileagent/agent/internal/fileid"
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -59,6 +60,19 @@ type UploadResult struct {
 	ETag string
 	// SizeBytes is the file size in bytes.
 	SizeBytes int64
+
+	// Identity is the kernel content identity of the version this upload
+	// READ (IC-BUG-48): stat'ed from the same fd before the bytes were read
+	// (post-read Fstat verified it did not change mid-upload). The executor
+	// projects it into the processed-files ledger on ack, so the ledger
+	// describes exactly the version whose hash it stores.
+	Identity queue.FileIdentity
+	// IdentityComplete reports whether the post-read Fstat matched the
+	// pre-read snapshot. False means the file changed mid-upload: the hash
+	// still describes the delivered bytes, but the identity must NOT be
+	// trusted into the ledger (the executor stores a zero identity then —
+	// the next candidate check hash-confirms instead of skipping).
+	IdentityComplete bool
 }
 
 // ObjectStore abstracts the MinIO client to allow unit-testing without a real
@@ -188,7 +202,21 @@ var errStaleRemoteParts = errors.New("uploader: remote parts do not match the lo
 // described by a full-file hash. The correct implementation (rolling chunks +
 // server-side merge) is IC-15.
 func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*UploadResult, error) {
-	info, err := os.Stat(task.LocalPath)
+	// IC-BUG-48: the content-identity snapshot must come from the SAME fd the
+	// bytes are read from, BEFORE the read — a pre-open os.Stat can describe a
+	// file that was replaced between the stat and the open. Open first, stat
+	// the handle, upload, then re-stat the same handle and verify nothing
+	// changed mid-upload.
+	f, err := os.Open(task.LocalPath)
+	if err != nil {
+		return nil, fmt.Errorf("uploader: open %q: %w", task.LocalPath, err)
+	}
+	defer f.Close()
+	handleID, err := fileid.StatHandle(f)
+	if err != nil {
+		return nil, fmt.Errorf("uploader: stat handle %q: %w", task.LocalPath, err)
+	}
+	info, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("uploader: stat %q: %w", task.LocalPath, err)
 	}
@@ -226,9 +254,17 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 
 	var result *UploadResult
 	threshold := int64(u.cfg.ThresholdMB) * 1024 * 1024
-	// The file version this attempt would read (the top stat succeeded, or we
-	// would have returned above — "stat failed" can never reach the gate).
-	current := queue.FileVersion{Mtime: info.ModTime().Unix(), Size: info.Size()}
+	// The file version this attempt would read: the full IC-BUG-48 identity
+	// from the handle stat (top of the function — we would have returned
+	// otherwise), not a separate os.Stat.
+	current := queue.FileVersion{
+		Mtime:   info.ModTime().Unix(),
+		Size:    info.Size(),
+		MtimeNs: handleID.MtimeNs,
+		CtimeNs: handleID.CtimeNs,
+		Dev:     handleID.Dev,
+		Ino:     handleID.Ino,
+	}
 	isMultipart := uploadSize > threshold
 
 	// Fail-closed resume gate (IC-3 R-A/A1/A2): the recorded parts may be
@@ -281,6 +317,37 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 	// result.SHA256 / result.SizeBytes are already filled by the upload path
 	// from the single byte stream it delivered (IC-BUG-51). Deliberately NOT
 	// overwritten here from the stat snapshot.
+	//
+	// IC-BUG-48 post-read verification: re-stat the SAME handle and compare
+	// against the pre-read snapshot. A mismatch means the file changed
+	// mid-upload — the hash still describes the delivered bytes (the report
+	// stays truthful), but the identity is NOT recorded into the ledger:
+	// a zero identity makes the next candidate check hash-confirm instead of
+	// skip (fail-closed), so a mid-upload rewrite can never be blessed as
+	// "already collected".
+	if post, statErr := fileid.StatHandle(f); statErr == nil {
+		if post == handleID {
+			result.Identity = queue.FileIdentity{
+				MtimeNs:  handleID.MtimeNs,
+				CtimeNs:  handleID.CtimeNs,
+				Dev:      handleID.Dev,
+				Ino:      handleID.Ino,
+				Size:     handleID.Size,
+				SnapAtNs: handleID.SnapAtNs,
+			}
+			result.IdentityComplete = true
+		} else {
+			u.logger.Warn("uploader: file changed during upload, recording an incomplete identity (next check hash-confirms)",
+				zap.String("path", task.LocalPath),
+				zap.Int64("pre_mtime_ns", handleID.MtimeNs),
+				zap.Int64("post_mtime_ns", post.MtimeNs),
+				zap.Uint64("pre_ino", handleID.Ino),
+				zap.Uint64("post_ino", post.Ino))
+		}
+	} else {
+		u.logger.Warn("uploader: post-upload stat failed, recording an incomplete identity",
+			zap.String("path", task.LocalPath), zap.Error(err))
+	}
 	return result, nil
 }
 

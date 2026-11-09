@@ -261,10 +261,7 @@ func TestIC51_Multipart_ResumeLocalShortRead_Discards(t *testing.T) {
 	task := newTask(t, path, "bucket1", "ic51/short.dat")
 	task.UploadID = "short-upload-id"
 	task.CompletedParts = fmt.Sprintf(`{"parts":[{"part_number":1,"etag":"%s"}]}`, md5Hex(bytesRepeat("S", mib)))
-	if info, statErr := os.Stat(path); assert.NoError(t, statErr) {
-		task.PartsFileMtime = info.ModTime().Unix()
-		task.PartsFileSize = info.Size()
-	}
+	stampPartsSnapshot(t, task)
 	require.NoError(t, q.Enqueue(task))
 
 	store := newIC51MultipartStore()
@@ -350,8 +347,8 @@ func TestIC51_Multipart_ResumeNonContiguous_HashMatchesAssembledObject(t *testin
 	task.CompletedParts = `{"parts":[{"part_number":1,"etag":"` + md5Hex(content[:mib]) + `"}]}`
 	st, err := os.Stat(path)
 	require.NoError(t, err)
-	task.PartsFileMtime = st.ModTime().Unix()
-	task.PartsFileSize = st.Size()
+	_ = st
+	stampPartsSnapshot(t, task)
 	require.NoError(t, q.Enqueue(task))
 
 	store := newIC51MultipartStore()
@@ -404,8 +401,8 @@ func TestIC51_Multipart_ResumeRemoteDisagreesWithSQLite(t *testing.T) {
 	task.CompletedParts = cp
 	st, err := os.Stat(path)
 	require.NoError(t, err)
-	task.PartsFileMtime = st.ModTime().Unix()
-	task.PartsFileSize = st.Size()
+	_ = st
+	stampPartsSnapshot(t, task)
 	require.NoError(t, q.Enqueue(task))
 
 	store := newIC51MultipartStore()
@@ -454,8 +451,8 @@ func TestIC51_Multipart_RewriteBetweenPrecheckAndHashFeed(t *testing.T) {
 	task.CompletedParts = `{"parts":[]}`
 	st, err := os.Stat(path)
 	require.NoError(t, err)
-	task.PartsFileMtime = st.ModTime().Unix()
-	task.PartsFileSize = st.Size()
+	_ = st
+	stampPartsSnapshot(t, task)
 	require.NoError(t, q.Enqueue(task))
 
 	store := newIC51MultipartStore()

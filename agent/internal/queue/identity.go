@@ -60,6 +60,20 @@ func identityMismatch(rec FileIdentity, cur FileIdentity) []string {
 	return diffs
 }
 
+// IdentityDiffs is the exported form of identityMismatch for callers outside
+// the queue package (the multipart resume gate names the changed fields in
+// its fail-closed reason).
+func IdentityDiffs(rec FileIdentity, cur FileIdentity) []string {
+	return identityMismatch(rec, cur)
+}
+
+// IdentityFullyKnown is the exported form of identityFullyKnown (the resume
+// gate must reject snapshots with unknown fields without reaching the
+// verdict logic).
+func IdentityFullyKnown(id FileIdentity) bool {
+	return identityFullyKnown(id)
+}
+
 // identityFullyKnown reports whether every field of the identity carries a
 // value. Any zero field makes the identity undecidable: the comparison input
 // is missing, and comparing against "unknown" proves nothing (the exact
