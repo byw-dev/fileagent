@@ -162,13 +162,56 @@ func TestReviewConcurrentAck_Ported(t *testing.T) {
 	}
 	up(a, "hash-A")
 
-	// The hash callback simulates the racing ack: it overwrites the row to C
-	// (as a concurrent CompleteReportedIdentity would) and returns hash-A
-	// (b's bytes match A's recorded hash — the hash itself is honest).
+	// Control subtest: the SAME inputs without any concurrent write must
+	// reach the CAS and succeed — RefreshAndSkip with the ledger refreshed
+	// to b's identity (proving the path really goes through
+	// refreshProcessedIdentityCAS; the racing subtest below relies on this).
+	t.Run("control-no-race-refreshes", func(t *testing.T) {
+		// Fresh queue: seed A, candidate is b with a hash matching A.
+		qc, err := Open(":memory:")
+		require.NoError(t, err)
+		defer qc.Close()
+		upc := func(id FileIdentity, sha string) {
+			require.NoError(t, qc.UpsertProcessedFile(&ProcessedFile{
+				ID: "id", RuleID: "r", LocalPath: "p", FileSize: 4, SHA256: sha,
+				Ident: id, UploadedAtNs: id.SnapAtNs,
+			}))
+		}
+		upc(a, "hash-A")
+		dec, err := qc.DecideProcessed(context.Background(), "r", "p", b,
+			func() (HashResult, error) {
+				return HashResult{
+					SHA256:           "hash-A", // b's bytes happen to match A's hash
+					Identity:         b,        // the callback's same-fd snapshot of b
+					IdentityComplete: true,
+				}, nil
+			})
+		require.NoError(t, err)
+		require.Equal(t, RefreshAndSkip, dec.Verdict,
+			"control: with the basis row untouched, the CAS refresh must succeed")
+		rec, err := qc.GetProcessedIdentity("r", "p")
+		require.NoError(t, err)
+		require.Equal(t, int64(2), int64(rec.Ident.Ino),
+			"control: the ledger must now carry b's identity (the CAS write landed)")
+		require.Equal(t, "hash-A", rec.SHA256)
+	})
+
+	// Racing subtest: the hash callback simulates the racing ack — it
+	// overwrites the row to C (as a concurrent CompleteReportedIdentity
+	// would) and returns a COMPLETE hash result for b (hash matches A's
+	// recorded hash, identity = b with its snapshot anchor). The complete
+	// flag is what lets DecideProcessed reach the CAS at all: without it the
+	// !IdentityComplete branch returns Recollect before the CAS runs (the
+	// reason this test originally passed for the wrong reason — coordinator
+	// mutation C2).
 	decision, err := q.DecideProcessed(context.Background(), "r", "p", b,
 		func() (HashResult, error) {
 			up(c, "hash-C")
-			return HashResult{SHA256: "hash-A"}, nil
+			return HashResult{
+				SHA256:           "hash-A", // b's bytes match A's recorded hash
+				Identity:         b,        // with SnapAtNs — the refresh's new anchor
+				IdentityComplete: true,
+			}, nil
 		})
 	require.NoError(t, err)
 	record, err := q.GetProcessedIdentity("r", "p")
@@ -186,15 +229,71 @@ func TestReviewConcurrentAck_Ported(t *testing.T) {
 	require.Equal(t, Recollect, decision.Verdict,
 		"a decision whose basis row changed mid-flight must not claim RefreshAndSkip")
 
-	// Second check for b (hash b ≠ C's recorded hash) → Recollect, never skip.
+	// Second check for b (hash b ≠ C's recorded hash) → Recollect, never
+	// skip. The verdict comes from the HASH MISMATCH branch (checked before
+	// the complete-flag branch in DecideProcessed), so an incomplete result
+	// is fine here — the verdict path under test is the mismatch, and it is
+	// reached regardless.
 	decision2, err := q.DecideProcessed(context.Background(), "r", "p", b,
 		func() (HashResult, error) {
-			return HashResult{SHA256: "hash-B"}, nil
+			return HashResult{SHA256: "hash-B"}, nil // deliberately incomplete: mismatch branch does not read it
 		})
 	require.NoError(t, err)
 	t.Logf("second=%s current=B", decision2.Verdict)
 	require.Equal(t, Recollect, decision2.Verdict,
 		"b's content differs from the recorded hash → re-collect, never skip")
+}
+
+// TestReviewConcurrentAck_ShaOnlyWrite_CASDetects — rework 3 requirement 2:
+// the CAS's sha256 condition specifically. A concurrent write changes ONLY
+// the recorded sha256 while keeping the identity fields and the anchor —
+// e.g. a duplicate ack for the same identity carrying a different hash
+// (defensive guard: in the current architecture this is believed
+// unreachable — acks for one task carry one immutable report payload, and
+// CompleteReportedIdentity upserts the same (identity, sha) pair for the
+// same task; but the CAS must not silently blend a refresh across ANY row
+// mutation, so the guard stays).
+//
+// Construction: ledger = (ident X, sha "sha-old"); the hash callback races a
+// write of (ident X, sha "sha-new") — same identity, different sha. The CAS
+// WHERE requires sha256 == "sha-old" → 0 rows → Recollect, and the racing
+// write's "sha-new" must survive.
+func TestReviewConcurrentAck_ShaOnlyWrite_CASDetects(t *testing.T) {
+	q, err := Open(":memory:")
+	require.NoError(t, err)
+	defer q.Close()
+
+	now := time.Now().UnixNano()
+	x := FileIdentity{MtimeNs: now - 10e9, CtimeNs: now - 10e9, Dev: 1, Ino: 1, Size: 4, SnapAtNs: now - 30e9}
+	cur := x // the candidate's identity equals the recorded one (aged → not racy)
+	require.NoError(t, q.UpsertProcessedFile(&ProcessedFile{
+		ID: "id", RuleID: "r", LocalPath: "p", FileSize: 4, SHA256: "sha-old",
+		Ident: x, UploadedAtNs: x.SnapAtNs,
+	}))
+
+	decision, err := q.DecideProcessed(context.Background(), "r", "p", cur,
+		func() (HashResult, error) {
+			// Racing write: SAME identity, DIFFERENT sha256 (a duplicate ack
+			// carrying a different hash for the same file version).
+			require.NoError(t, q.UpsertProcessedFile(&ProcessedFile{
+				ID: "id", RuleID: "r", LocalPath: "p", FileSize: 4, SHA256: "sha-new",
+				Ident: x, UploadedAtNs: x.SnapAtNs,
+			}))
+			return HashResult{
+				SHA256:           "sha-old", // the hash the decision read
+				Identity:         x,         // with SnapAtNs
+				IdentityComplete: true,      // must reach the CAS
+			}, nil
+		})
+	require.NoError(t, err)
+
+	rec, err := q.GetProcessedIdentity("r", "p")
+	require.NoError(t, err)
+	t.Logf("verdict=%s ledger_sha=%s", decision.Verdict, rec.SHA256)
+	require.Equal(t, "sha-new", rec.SHA256,
+		"the racing sha-only write must survive the CAS (its sha differs from the read row)")
+	require.Equal(t, Recollect, decision.Verdict,
+		"the CAS must detect the sha-only mutation of the basis row (0 rows matched) → Recollect, never RefreshAndSkip")
 }
 
 // TestDecideProcessed_IncompleteHashIdentity_Recollects — rework-2 blocker 2
@@ -231,6 +330,8 @@ func TestDecideProcessed_IncompleteHashIdentity_Recollects(t *testing.T) {
 				SHA256:   sha, // matching hash…
 				Identity: cur, // …and an identity — but…
 				// …IdentityComplete=false: bytes and identity may diverge.
+				// Deliberately incomplete: this test pins the !complete guard
+				// (Recollect + ledger untouched); NOT testing the CAS here.
 				IdentityComplete: false,
 			}, nil
 		})
