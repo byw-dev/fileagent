@@ -196,3 +196,49 @@ func TestReviewConcurrentAck_Ported(t *testing.T) {
 	require.Equal(t, Recollect, decision2.Verdict,
 		"b's content differs from the recorded hash → re-collect, never skip")
 }
+
+// TestDecideProcessed_IncompleteHashIdentity_Recollects — rework-2 blocker 2
+// (the mutation-detector half): a hash callback that returns a MATCHING sha
+// but IdentityComplete=false (bytes and identity may diverge) must yield
+// Recollect — never RefreshAndSkip — and the ledger row must stay untouched
+// (identity/anchor unchanged). Killing the "ignore complete" mutation: with
+// the check removed the verdict becomes RefreshAndSkip and the row is
+// refreshed → red.
+func TestDecideProcessed_IncompleteHashIdentity_Recollects(t *testing.T) {
+	q, err := Open(":memory:")
+	require.NoError(t, err)
+	defer q.Close()
+
+	d := t.TempDir()
+	f := filepath.Join(d, "torn.txt")
+	require.NoError(t, os.WriteFile(f, []byte("AAAA"), 0o600))
+	fid, err := fileid.Stat(f)
+	require.NoError(t, err)
+	// Ledger identity differs from current (undecidable) → hash-confirm.
+	old := FileIdentity{MtimeNs: fid.MtimeNs, CtimeNs: fid.CtimeNs, Dev: fid.Dev, Ino: fid.Ino, Size: fid.Size, SnapAtNs: fid.SnapAtNs}
+	oldLedger := old
+	oldLedger.Ino++
+	sha := hashResultHex("AAAA")
+	require.NoError(t, q.UpsertProcessedFile(&ProcessedFile{
+		ID: "pf-torn", RuleID: "r", LocalPath: f, FileSize: 4, SHA256: sha,
+		Ident: oldLedger, UploadedAtNs: old.SnapAtNs,
+	}))
+
+	cur := old // the caller path-stat identity (same underlying file here)
+	dec, err := q.DecideProcessed(context.Background(), "r", f, cur,
+		func() (HashResult, error) {
+			return HashResult{
+				SHA256:   sha, // matching hash…
+				Identity: cur, // …and an identity — but…
+				// …IdentityComplete=false: bytes and identity may diverge.
+				IdentityComplete: false,
+			}, nil
+		})
+	require.NoError(t, err)
+	require.Equal(t, Recollect, dec.Verdict,
+		"an incomplete hash identity must not RefreshAndSkip even when the hash matches")
+	rec, err := q.GetProcessedIdentity("r", f)
+	require.NoError(t, err)
+	require.Equal(t, int64(oldLedger.Ino), int64(rec.Ident.Ino),
+		"the losing refresh must not touch the ledger row")
+}
