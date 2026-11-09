@@ -201,11 +201,11 @@ type UploadTask struct {
 	FileDev     uint64
 	FileIno     uint64
 	FileMtimeNs int64
-	FileSize         int64
-	FileMtime        int64
-	SHA256           string
-	Status           string
-	RetryCount       int
+	FileSize    int64
+	FileMtime   int64
+	SHA256      string
+	Status      string
+	RetryCount  int
 	// NextRetryAt is the unix time (seconds) when a failed task becomes
 	// eligible for re-queueing (IC-3 P1-d). A positive value is the persisted
 	// backoff schedule, honoured by startup recovery. A negative value
