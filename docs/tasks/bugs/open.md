@@ -178,7 +178,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-54 | **已关闭条目内部仍用无限定的现在时描述旧实现**——卡片正文、任务行「内容」列、设计/入口文档里大量「当前 / 从不 / 仍 / 尚未 / 未排期」写的是发现时的状态，却读起来像现状，与同文件的已关闭标记直接冲突 〔B:不挡试点〕 | 🟡 P2 | docs |
 | IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** 〔B:不挡试点〕 | 🟠 P1 | agent + CP |
 | IC-BUG-56 | **过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」只认 `AccessDenied`**——不会卡住（后台每分钟检查一次，唤醒后约 1 分钟内恢复），但期间开始的上传各失败一次、推迟一个退避档并白耗一次重试 〔B:不挡试点〕 | 🟡 P2 | agent |
-| ~~IC-BUG-57~~ ✅ | （立卡时）`init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕；**B7（#138）后 `mc alias set` 两处已随 S3 客户端换成 AWS CLI 而消除（凭据走私有 config 文件，不再进 argv）；残留的 `curl --user` 亦已修复（2026-11-09，分支 `chore/b7-small-followups`，改 `--config` 私有 0600 文件，密钥不进任何 argv）**（见详情卡「修复记录」） | 🟡 P2 | deploy |
+| IC-BUG-57 | （立卡时）`init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕；**B7（#138）后 `mc alias set` 两处已随 S3 客户端换成 AWS CLI 而消除（凭据走私有 config 文件，不再进 argv）** ✅ 已修（#TBD：残留的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv；2026-11-09，分支 `chore/b7-small-followups`，见详情卡「修复记录」） | 🟡 P2 | deploy |
 
 ---
 
@@ -909,7 +909,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **发现** | 2026-10-03 存储层调研时撞见，2026-10-12 随 D-037 文档 PR 立卡（此前只记在会话笔记里）。 |
 | **B 重判（2026-10-27）** | **不挡试点** — SeaweedFS 上同类错误码已有实测：篡改 / 缺失 session token 均返回 `InvalidAccessKeyId`（`research/storage-layer-eval/results/probe-neg/seaweedfs-loose-run.jsonl` G1.8/G1.9）；**过期场景本身待实测**（探针当时 SKIP，需 `EXPIRY_TEST=1` 重跑）。影响有界：后台每分钟刷新，唤醒后约 1 分钟内恢复，代价 = 几个任务各失败一次 + 一档退避。证据：`agent/cmd/agent/main.go:617-624`（`isAccessDenied` 只认 `AccessDenied`，2026-10-27 复核） |
 
-## IC-BUG-57 — `init-seaweedfs.sh` 把 secret 放进命令行 argv 🟡 P2（✅ 已修复，2026-11-09）
+## IC-BUG-57 — `init-seaweedfs.sh` 把 secret 放进命令行 argv 🟡 P2 ✅ 已修（2026-11-09，分支 `chore/b7-small-followups`，#TBD）
 
 > 2026-10-27 里程碑 B 重判（B3-PR4）新立：IC-BUG-41 的 SeaweedFS 侧同类问题，
 > 按「另立新卡、不偷换旧卡含义」处理（`bin/pr4.md` 新判据）。
