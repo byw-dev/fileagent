@@ -59,7 +59,7 @@ func TestExecutor_EvictionLeavesDurableAbortRecord(t *testing.T) {
 
 	require.NoError(t, e.Submit(context.Background(), newTask("r1", "/path/other.txt")))
 
-require.Eventually(t, func() bool { return rec.calls.Load() >= 1 },
+	require.Eventually(t, func() bool { return rec.calls.Load() >= 1 },
 		2*time.Second, 20*time.Millisecond, "the direct best-effort abort must still be attempted")
 	entries, err := q.DueMultipartAborts(context.Background(), time.Now().Add(time.Hour), 10)
 	require.NoError(t, err)

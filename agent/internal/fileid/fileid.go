@@ -46,6 +46,15 @@ func FromInfo(fi os.FileInfo, path string) Identity {
 	return id
 }
 
+// PostStatMatches reports whether the post-read re-stat describes the same
+// file state as the pre-read snapshot. SnapAtNs is deliberately EXCLUDED
+// (it is the wall clock of each stat call, never equal); every kernel field
+// must match. Used by the uploader's post-read verification (IC-BUG-48).
+func PostStatMatches(pre, post Identity) bool {
+	return pre.MtimeNs == post.MtimeNs && pre.CtimeNs == post.CtimeNs &&
+		pre.Dev == post.Dev && pre.Ino == post.Ino && pre.Size == post.Size
+}
+
 // Stat stats path and returns its identity. SnapAtNs is set to the wall
 // clock at the moment of the stat — the racy anchor for the ledger.
 func Stat(path string) (Identity, error) {

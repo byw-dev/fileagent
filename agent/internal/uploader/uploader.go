@@ -326,7 +326,7 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 	// skip (fail-closed), so a mid-upload rewrite can never be blessed as
 	// "already collected".
 	if post, statErr := fileid.StatHandle(f); statErr == nil {
-		if post == handleID {
+		if fileid.PostStatMatches(handleID, post) {
 			result.Identity = queue.FileIdentity{
 				MtimeNs:  handleID.MtimeNs,
 				CtimeNs:  handleID.CtimeNs,

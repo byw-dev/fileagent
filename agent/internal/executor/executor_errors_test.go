@@ -145,6 +145,7 @@ func TestExecutor_DedupCheckErrorStillUploads(t *testing.T) {
 	assert.True(t, uploaded.Load(), "a dedup lookup failure must not skip the upload")
 	assert.NotZero(t, logs.FilterMessage("executor: dedup check error").Len())
 }
+
 // An uploader returning (nil, nil) is a bug, not a success: it must be reported
 // as a failed upload (success=false) rather than crashing the worker or being
 // silently dropped.
@@ -586,6 +587,7 @@ func TestExecutor_RecoveredRequeueOfEvictedTaskLogsNoWarning(t *testing.T) {
 		"an evicted row must not surface as a failed recovery")
 	e.Stop()
 }
+
 // R2: marking a task abandoned (never-retry sentinel) and recording its abort
 // intent must be ONE transaction. With the record written separately AFTER the
 // marking, a crash (or a failed record write) in between leaves a
