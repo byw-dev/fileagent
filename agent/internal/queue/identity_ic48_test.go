@@ -234,37 +234,83 @@ func TestIC48_RebuildConvergence_TwoScanRounds(t *testing.T) {
 	oldStat := ic48Stat(t, path)
 	ic48RecordProcessed(t, q, "rule", path, oldStat, ic48SHA(t, path))
 
-	// cp -p rebuild with identical content.
+	// cp -p rebuild with identical content: new inode, fresh ctime (cannot
+	// be forged backwards), mtime restored by the rebuild tool.
 	fiOld, err := os.Stat(path)
 	require.NoError(t, err)
 	require.NoError(t, os.Remove(path))
 	ic48WriteDir(t, filepath.Dir(path), "conv.bin", "CON1")
 	require.NoError(t, os.Chtimes(path, fiOld.ModTime(), fiOld.ModTime()))
 
-	// Round 1: metadata mismatch → hash-confirm → identical → RefreshAndSkip.
-	round1 := ic48Decide(t, q, "rule", path)
-	require.Equal(t, RefreshAndSkip, round1.Verdict)
-
-	// G passes (simulated by moving the anchor forward past stamps+G — the
-	// identical ordering time would produce).
-	rec, err := q.GetProcessedIdentity("rule", path)
+	// Round 1 (immediately after the rebuild): metadata mismatch → hash →
+	// identical → RefreshAndSkip. The refresh persists anchor = T1 (round 1's
+	// snapshot moment); the recorded ctime ≈ T1 (the rebuild just made it).
+	round1Stat := ic48Stat(t, path)
+	round1, err := q.DecideProcessed(context.Background(), "rule", path,
+		FileIdentity{
+			MtimeNs: round1Stat.MtimeNs, CtimeNs: round1Stat.CtimeNs,
+			Dev: round1Stat.Dev, Ino: round1Stat.Ino, Size: round1Stat.Size,
+			SnapAtNs: round1Stat.SnapAtNs,
+		},
+		ic48HashFile(path))
 	require.NoError(t, err)
-	cur := ic48Stat(t, path)
-	require.NoError(t, q.SetProcessedIdentityAnchor("rule", path, cur.MtimeNs+racyGranularityNs*3))
+	require.Equal(t, RefreshAndSkip, round1.Verdict)
+	rec1, err := q.GetProcessedIdentity("rule", path)
+	require.NoError(t, err)
+	require.Equal(t, round1Stat.SnapAtNs, rec1.SnapshotAtNs,
+		"RefreshAndSkip must persist THIS check's snapshot moment as the new racy anchor (M4)")
 
-	// Round 2: prefilter decides alone — the hash function must NOT run.
+	// Wall time passes G: the ledger anchor stays T1 (skips never move it)
+	// while the stamps (ctime ≈ T1) keep ageing relative to any FUTURE
+	// snapshot the next check will record.
+	time.Sleep(2100 * time.Millisecond)
+
+	// Round 2 (after G): anchor T1 vs stamps ≈ T1 → still racy → hash-confirm
+	// again → RefreshAndSkip. THIS refresh moves the anchor to T2 = round 2's
+	// snapshot moment ≈ T1 + 2.1s. Now the stamps (ctime ≈ T1) sit strictly
+	// before T2 − G (= T1 + 0.1s) → not racy.
+	round2Snap := ic48Stat(t, path).SnapAtNs
 	hashReads := 0
 	round2, err := q.DecideProcessed(context.Background(), "rule", path,
-		FileIdentity{MtimeNs: cur.MtimeNs, CtimeNs: cur.CtimeNs, Dev: cur.Dev, Ino: cur.Ino, Size: cur.Size, SnapAtNs: cur.SnapAtNs},
+		FileIdentity{
+			MtimeNs: rec1.Ident.MtimeNs, CtimeNs: rec1.Ident.CtimeNs,
+			Dev: rec1.Ident.Dev, Ino: rec1.Ident.Ino, Size: rec1.Ident.Size,
+			SnapAtNs: round2Snap,
+		},
 		func() (HashResult, error) {
 			hashReads++
 			return ic48HashFile(path)()
 		})
 	require.NoError(t, err)
-	require.Equal(t, Skip, round2.Verdict, "after G the refreshed prefilter must Same-skip")
-	require.Zero(t, hashReads, "round 2 must not read the file (converged)")
-	_ = rec
+	require.Equal(t, RefreshAndSkip, round2.Verdict,
+		"round 2: stamps ≈ anchor T1 → racy → hash-confirm (identical → refresh)")
+	rec2, err := q.GetProcessedIdentity("rule", path)
+	require.NoError(t, err)
+	require.Equal(t, round2Snap, rec2.SnapshotAtNs,
+		"the refresh must advance the anchor to ITS snapshot moment (M4: anchor not advanced → never converges)")
+
+	// Round 3 (immediately after round 2's refresh): the ledger anchor is T2
+	// and the stamps (ctime ≈ T1) sit before T2 − G → Same → skip with NO
+	// read. The M4 mutation keeps the anchor at T1 forever → stamps stay
+	// inside the racy window → hash → red.
+	round3, err := q.DecideProcessed(context.Background(), "rule", path,
+		FileIdentity{
+			MtimeNs: rec2.Ident.MtimeNs, CtimeNs: rec2.Ident.CtimeNs,
+			Dev: rec2.Ident.Dev, Ino: rec2.Ident.Ino, Size: rec2.Ident.Size,
+			SnapAtNs: time.Now().UnixNano(),
+		},
+		func() (HashResult, error) {
+			hashReads++
+			t.Fatal("round 3 must not read the file (converged)")
+			return HashResult{}, nil
+		})
+	require.NoError(t, err)
+	require.Equal(t, Skip, round3.Verdict,
+		"stamps older than one granularity past the twice-refreshed anchor are not racy: Same-skip without reading")
+	require.Equal(t, 1, hashReads,
+		"exactly round 2 hashes (round 3 must not); M4 mutation (anchor never advances) keeps round 3 racy → hashReads becomes 2 → red")
 }
+
 func TestIC48_RacyWindow_MustHashConfirm(t *testing.T) {
 	q, err := Open(":memory:")
 	require.NoError(t, err)
