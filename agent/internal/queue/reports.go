@@ -88,7 +88,12 @@ func (q *Queue) CompleteReported(ctx context.Context, id string, uploaded bool, 
 // ok=false (identity unknown: mid-upload change, replayed report, or an
 // upload path that produced none) stores a zero identity → undecidable → the
 // next candidate check hash-confirms (fail-closed), never a wrong skip.
+// The guard is enforced HERE, not only at the callers (rework-2 fix 6): a
+// non-zero ident with ok=false is zeroed at the entry.
 func (q *Queue) CompleteReportedIdentity(ctx context.Context, id string, uploaded bool, sha string, ident FileIdentity, ok bool) error {
+	if !ok {
+		ident = FileIdentity{}
+	}
 	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
