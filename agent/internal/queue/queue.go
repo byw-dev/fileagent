@@ -126,6 +126,7 @@ var schemaMigrations = []string{
 	`ALTER TABLE upload_tasks ADD COLUMN parts_file_ctime_ns INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN parts_file_dev INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN parts_file_ino INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE upload_tasks ADD COLUMN parts_file_mtime_ns INTEGER NOT NULL DEFAULT 0`,
 }
 
 // Status values for upload tasks.

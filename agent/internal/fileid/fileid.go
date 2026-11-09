@@ -25,6 +25,10 @@ type Identity struct {
 	Dev     uint64
 	Ino     uint64
 	Size    int64
+
+	// SnapAtNs is the wall clock (Unix ns) at the moment this identity was
+	// stat'ed — the racy anchor. Not part of equality comparisons.
+	SnapAtNs int64
 }
 
 // FromInfo extracts the identity from an os.FileInfo. Fields the platform
@@ -42,13 +46,31 @@ func FromInfo(fi os.FileInfo, path string) Identity {
 	return id
 }
 
-// Stat stats path and returns its identity.
+// Stat stats path and returns its identity. SnapAtNs is set to the wall
+// clock at the moment of the stat — the racy anchor for the ledger.
 func Stat(path string) (Identity, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return Identity{}, err
 	}
-	return FromInfo(fi, path), nil
+	id := FromInfo(fi, path)
+	id.SnapAtNs = time.Now().UnixNano()
+	return id, nil
+}
+
+// StatHandle stats an ALREADY-OPEN file handle and returns its identity.
+// Reading the identity from the same fd that will be read for upload (or
+// hashing) is the only way to guarantee that "the stat" and "the read" see
+// the same file version (IC-BUG-48: the snapshot and the bytes must come from
+// one file description). SnapAtNs anchors the racy window at the stat moment.
+func StatHandle(f *os.File) (Identity, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return Identity{}, err
+	}
+	id := FromInfo(fi, f.Name())
+	id.SnapAtNs = time.Now().UnixNano()
+	return id, nil
 }
 
 // TimeFromNs converts a Unix-nanosecond timestamp back to time.Time (UTC).

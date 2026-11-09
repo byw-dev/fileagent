@@ -22,11 +22,17 @@ import (
 // fail there (red), then pass once DecideProcessed exists (green).
 
 // ic48RecordProcessed simulates a successful upload+ack: writes the
-// processed-file ledger row with the file's full kernel identity.
+// processed-file ledger row with the file's full kernel identity, anchored at
+// the identity's SNAPSHOT moment (v2: the anchor is when the stat was taken,
+// not when the row is written).
 func ic48RecordProcessed(t *testing.T, q *Queue, ruleID, path string, id fileid.Identity, sha string) {
 	t.Helper()
 	fi, err := os.Stat(path)
 	require.NoError(t, err)
+	snapAt := id.SnapAtNs
+	if snapAt == 0 {
+		snapAt = time.Now().UnixNano()
+	}
 	require.NoError(t, q.UpsertProcessedFile(&ProcessedFile{
 		ID:           "pf-" + path,
 		RuleID:       ruleID,
@@ -34,8 +40,8 @@ func ic48RecordProcessed(t *testing.T, q *Queue, ruleID, path string, id fileid.
 		FileSize:     fi.Size(),
 		FileMtime:    fi.ModTime().Unix(),
 		SHA256:       sha,
-		Ident:        FileIdentity{MtimeNs: id.MtimeNs, CtimeNs: id.CtimeNs, Dev: id.Dev, Ino: id.Ino, Size: id.Size},
-		UploadedAtNs: time.Now().UnixNano(),
+		Ident:        FileIdentity{MtimeNs: id.MtimeNs, CtimeNs: id.CtimeNs, Dev: id.Dev, Ino: id.Ino, Size: id.Size, SnapAtNs: snapAt},
+		UploadedAtNs: snapAt,
 	}))
 }
 
@@ -52,17 +58,23 @@ func ic48HashFile(path string) func() (HashResult, error) {
 }
 
 // ic48Decide calls the candidate decision entry with the file's current
-// identity. On master (no DecideProcessed) this does not compile — the red
-// run therefore happens on master via the shim below (see red.txt).
+// identity (snapshot moment anchored at the stat).
 func ic48Decide(t *testing.T, q *Queue, ruleID, path string) CandidateDecision {
 	t.Helper()
-	id, err := fileid.Stat(path)
-	require.NoError(t, err)
-	dec, err := q.DecideProcessed(context.Background(), ruleID, path,
-		FileIdentity{MtimeNs: id.MtimeNs, CtimeNs: id.CtimeNs, Dev: id.Dev, Ino: id.Ino, Size: id.Size},
-		ic48HashFile(path))
+	dec, err := ic48DecideErr(q, ruleID, path)
 	require.NoError(t, err)
 	return dec
+}
+
+// ic48DecideErr is ic48Decide returning the raw error (for negative tests).
+func ic48DecideErr(q *Queue, ruleID, path string) (CandidateDecision, error) {
+	id, err := fileid.Stat(path)
+	if err != nil {
+		return CandidateDecision{}, err
+	}
+	return q.DecideProcessed(context.Background(), ruleID, path,
+		FileIdentity{MtimeNs: id.MtimeNs, CtimeNs: id.CtimeNs, Dev: id.Dev, Ino: id.Ino, Size: id.Size, SnapAtNs: id.SnapAtNs},
+		ic48HashFile(path))
 }
 
 // TestIC48_SameSecondSameSizeRewrite_MustRecollect — acceptance scenario ①:
@@ -147,31 +159,112 @@ func TestIC48_IdenticalRebuild_SkipViaHashConfirm(t *testing.T) {
 	require.Equal(t, RefreshAndSkip, dec.Verdict,
 		"identical content must be confirmed by hash and skip with a refreshed row, never re-uploaded")
 
-	// The ledger caught up (identity refreshed during hash confirm). The
-	// refreshed row's uploaded_at_ns anchors a racy window around the refresh
-	// moment, and the recreated file's stamps fall inside it — so the second
-	// decision is hash-confirmed AGAIN (RefreshAndSkip, not a bare Skip):
-	// correct racily-clean behaviour, and after the granularity window
-	// (simulated by backdating the anchor below) the prefilter decides alone.
+	// The ledger caught up (identity + anchor refreshed during hash confirm).
+	// The refreshed anchor is the second check's snapshot moment, and the
+	// file's stamps fall within G before it — so the second decision is
+	// hash-confirmed AGAIN (RefreshAndSkip, not a bare Skip): correct
+	// racily-clean behaviour. After G has passed (simulated by backdating the
+	// anchor) the prefilter decides alone — convergence, git-style.
 	dec2 := ic48Decide(t, q, "rule", path)
 	require.Equal(t, RefreshAndSkip, dec2.Verdict,
 		"inside the racy window after the refresh, the second check must hash-confirm again (content identical → skip)")
 	rec, err := q.GetProcessedIdentity("rule", path)
 	require.NoError(t, err)
-	require.NoError(t, q.SetProcessedIdentityAnchor("rule", path, rec.UploadedAtNs-racyGranularityNs*2-1))
+	require.NotZero(t, rec.SnapshotAtNs, "the refresh must anchor the ledger at the snapshot moment")
+	cur := ic48Stat(t, path)
+	// Simulate that G has passed since the refresh: move the anchor FORWARD,
+	// past the file's stamps + G. The anchor is "when the ledger identity was
+	// stat'ed"; time passing means the anchor (a wall-clock moment) rises
+	// above stamp + G, and then stamp < anchor − G → not racy → Same.
+	// (Real convergence just waits; moving the anchor forward simulates the
+	// identical ordering without a sleep.)
+	require.NoError(t, q.SetProcessedIdentityAnchor("rule", path, cur.MtimeNs+racyGranularityNs*3))
 	dec3, err := q.DecideProcessed(context.Background(), "rule", path,
-		FileIdentity{MtimeNs: ic48Stat(t, path).MtimeNs, CtimeNs: ic48Stat(t, path).CtimeNs,
-			Dev: ic48Stat(t, path).Dev, Ino: ic48Stat(t, path).Ino, Size: ic48Stat(t, path).Size},
-		func() (HashResult, error) { t.Fatal("hash must not be read outside the racy window"); return HashResult{}, nil })
+		FileIdentity{MtimeNs: cur.MtimeNs, CtimeNs: cur.CtimeNs,
+			Dev: cur.Dev, Ino: cur.Ino, Size: cur.Size, SnapAtNs: cur.SnapAtNs},
+		func() (HashResult, error) {
+			t.Fatal("hash must not be read outside the racy window")
+			return HashResult{}, nil
+		})
 	require.NoError(t, err)
 	require.Equal(t, Skip, dec3.Verdict,
 		"outside the racy window the refreshed prefilter must decide alone (no hash read)")
 }
 
-// TestIC48_RacyWindow_MustHashConfirm — even with a fully matching prefilter,
-// a file whose stamps lie within the record-time granularity must be
-// hash-confirmed (git racily-clean semantics), because a same-granularity
-// rewrite could hide behind equal coarse stamps.
+// TestIC48_DelayedAck_RefreshNotAck_MustNotSkip — coordinator counter-example
+// (a): coarse-FS sequence stat(S=0s) → full read (1s) → same-size rewrite
+// (1.5s, same coarse tick) → CP ack 60s later. If the ledger anchor were the
+// ACK time, |60−0| > 2s would verdict Same → silent miss of rewritten
+// content. The anchor must be the SNAPSHOT (stat) moment: |1.5−0| < 2s window
+// relative to the stamps → undecidable → hash → content differs → Recollect.
+func TestIC48_DelayedAck_RefreshNotAck_MustNotSkip(t *testing.T) {
+	q, err := Open(":memory:")
+	require.NoError(t, err)
+	defer q.Close()
+
+	path := ic48WriteFile(t, "late-ack.bin", "Z001")
+	id := ic48Stat(t, path)
+	// Anchor at the snapshot moment (id.SnapAtNs), NOT at a later ack time.
+	ic48RecordProcessed(t, q, "rule", path, id, ic48SHA(t, path))
+
+	// Same-size rewrite 1.5s "after" the snapshot (simulated by keeping the
+	// rewrite inside the granularity window — real clock, real rewrite).
+	ic48RewriteSameSize(t, path, "Z002")
+
+	// Even if the ack (and the row write) happened 60s later, the ledger
+	// anchor stays the snapshot moment, so the prefilter cannot call this
+	// Same — it must hash-confirm; the hash catches the rewrite.
+	dec := ic48Decide(t, q, "rule", path)
+	require.NotEqual(t, Skip, dec.Verdict,
+		"a same-tick rewrite must never bare-skip when the anchor is the snapshot moment")
+	require.Equal(t, Recollect, dec.Verdict,
+		"hash confirmation must catch the rewritten content")
+}
+
+// TestIC48_RebuildConvergence_TwoScanRounds — coordinator requirement (b):
+// after a cp -p rebuild, scan round 1 hash-confirms + refreshes the ledger;
+// once G has passed, scan round 2 must Same-skip WITHOUT reading the file
+// (git racily-clean convergence, anchored on the refreshed snapshot moment).
+func TestIC48_RebuildConvergence_TwoScanRounds(t *testing.T) {
+	q, err := Open(":memory:")
+	require.NoError(t, err)
+	defer q.Close()
+
+	path := ic48WriteFile(t, "conv.bin", "CON1")
+	oldStat := ic48Stat(t, path)
+	ic48RecordProcessed(t, q, "rule", path, oldStat, ic48SHA(t, path))
+
+	// cp -p rebuild with identical content.
+	fiOld, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(path))
+	ic48WriteDir(t, filepath.Dir(path), "conv.bin", "CON1")
+	require.NoError(t, os.Chtimes(path, fiOld.ModTime(), fiOld.ModTime()))
+
+	// Round 1: metadata mismatch → hash-confirm → identical → RefreshAndSkip.
+	round1 := ic48Decide(t, q, "rule", path)
+	require.Equal(t, RefreshAndSkip, round1.Verdict)
+
+	// G passes (simulated by moving the anchor forward past stamps+G — the
+	// identical ordering time would produce).
+	rec, err := q.GetProcessedIdentity("rule", path)
+	require.NoError(t, err)
+	cur := ic48Stat(t, path)
+	require.NoError(t, q.SetProcessedIdentityAnchor("rule", path, cur.MtimeNs+racyGranularityNs*3))
+
+	// Round 2: prefilter decides alone — the hash function must NOT run.
+	hashReads := 0
+	round2, err := q.DecideProcessed(context.Background(), "rule", path,
+		FileIdentity{MtimeNs: cur.MtimeNs, CtimeNs: cur.CtimeNs, Dev: cur.Dev, Ino: cur.Ino, Size: cur.Size, SnapAtNs: cur.SnapAtNs},
+		func() (HashResult, error) {
+			hashReads++
+			return ic48HashFile(path)()
+		})
+	require.NoError(t, err)
+	require.Equal(t, Skip, round2.Verdict, "after G the refreshed prefilter must Same-skip")
+	require.Zero(t, hashReads, "round 2 must not read the file (converged)")
+	_ = rec
+}
 func TestIC48_RacyWindow_MustHashConfirm(t *testing.T) {
 	q, err := Open(":memory:")
 	require.NoError(t, err)

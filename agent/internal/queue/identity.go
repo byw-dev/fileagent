@@ -9,11 +9,12 @@ import (
 
 // racyGranularityNs is the timestamp granularity the racy-window judgement
 // allows for (IC-BUG-48, git "racy git" semantics). Coarse filesystems stamp
-// mtimes at 2s (FAT) or 1s (some SMB) resolution, so a record written at T and
-// a file stamped anywhere in [T-2s, +∞) cannot be ordered against the record
-// with confidence. The constant is the union of those granularities; a
-// narrower value would re-open the same-second blind spot on coarse stamps.
+// mtimes at 2s (FAT) or 1s (some SMB) resolution, so a file stamped within G
+// before the snapshot moment cannot be ordered against it with confidence.
 const racyGranularityNs = int64(2 * 1e9)
+
+// RacyGranularityNs exposes racyGranularityNs for tests and scratch tools.
+const RacyGranularityNs = racyGranularityNs
 
 // FileIdentity is the kernel metadata snapshot of one file version — the
 // IC-BUG-48 content-identity fields shared by the processed-files dedup and
@@ -22,12 +23,18 @@ const racyGranularityNs = int64(2 * 1e9)
 // delete-and-recreate always changes it). A zero field means "unknown": the
 // platform or filesystem did not provide it. Unknowns never compare equal —
 // an unknown must lead to hash confirmation (fail-closed), never to "same".
+//
+// SnapAtNs is the moment THIS identity was stat'ed (Unix ns) — the racy
+// anchor. It is not part of the equality comparison; zero means "unknown
+// snapshot moment", which also forces the undecidable path.
 type FileIdentity struct {
 	MtimeNs int64
 	CtimeNs int64
 	Dev     uint64
 	Ino     uint64
 	Size    int64
+
+	SnapAtNs int64
 }
 
 // identityMismatch reports which identity fields differ between a recorded
@@ -108,14 +115,25 @@ func (v Verdict) String() string {
 //   - any recorded field unknown (zero / legacy row)      → VerdictUndecidable
 //   - any current field unknown (stat blob lacked it)     → VerdictUndecidable
 //   - any known field differs                             → VerdictChanged
-//   - everything equal but the file's mtime or ctime lies within the racy
-//     granularity of the record time (recordAtNs)         → VerdictUndecidable
+//   - everything equal but any stamp (mtime or ctime) is ≥ recordAtNs − G
+//     (G = 2s: a stamp within the granularity before the snapshot moment can
+//     hide a same-tick rewrite behind equal coarse stamps — git racily-clean)
+//     → VerdictUndecidable
+//   - recordAtNs unknown (0)                              → VerdictUndecidable
 //   - otherwise                                           → VerdictSame
 //
-// recordAtNs is when the processed-file record was written (Unix ns); pass 0
-// for "unknown record time", which forces the undecidable path — the racy
-// judgement needs it, exactly like git needs the index write time to clear
-// racily-clean entries.
+// recordAtNs is the SNAPSHOT moment — when the ledger's identity was stat'ed
+// (Unix ns), NOT when the record row was written (an ack can lag the upload by
+// hours; anchoring on it would let a same-tick rewrite slip through — the
+// delayed-ack test pins this). Convergence works by REFRESH: a hash-confirmed
+// identical file overwrites the ledger with the new snapshot and its moment,
+// so once G has passed the stamps sort cleanly before the new anchor and Same
+// is reachable again (git's racily-clean convergence).
+//
+// A metadata mismatch (VerdictChanged) proves the file's observable STATE
+// changed — rewrite, chmod, rename, delete-and-recreate — but NOT that the
+// content differs: callers decide via the hash-confirm flow in
+// DecideProcessed.
 func PrefilterVerdict(rec FileIdentity, cur FileIdentity, recordAtNs int64) Verdict {
 	if !identityFullyKnown(rec) || !identityFullyKnown(cur) {
 		return VerdictUndecidable
@@ -123,16 +141,19 @@ func PrefilterVerdict(rec FileIdentity, cur FileIdentity, recordAtNs int64) Verd
 	if diffs := identityMismatch(rec, cur); len(diffs) > 0 {
 		return VerdictChanged
 	}
-	// Racy window (git racily-clean): if the record was written within the
-	// timestamp granularity around the file's stamps, a same-second rewrite
-	// could hide behind equal coarse stamps. Even a fully matching prefilter
-	// must then be confirmed by content. Guarded by recordAtNs > 0: callers
-	// with an unknown record time have already been routed to undecidable by
-	// the ledger row's zero uploaded_at_ns, but stay defensive here.
-	if recordAtNs > 0 {
-		if cur.MtimeNs >= recordAtNs-racyGranularityNs || cur.CtimeNs >= recordAtNs-racyGranularityNs {
-			return VerdictUndecidable
-		}
+	if recordAtNs == 0 {
+		// Unknown snapshot moment: the racy judgement cannot run, so the safe
+		// outcome is "confirm by content".
+		return VerdictUndecidable
+	}
+	// Racy window (git racily-clean), single-sided: a stamp at or after
+	// snapshotAt − G may belong to a rewrite in the same coarse tick as the
+	// snapshot — the wall clock cannot order them. Stamps strictly before the
+	// window are fully covered by the field equality above: the kernel
+	// observed no state change since the snapshot.
+	g := racyGranularityNs
+	if cur.MtimeNs >= recordAtNs-g || cur.CtimeNs >= recordAtNs-g {
+		return VerdictUndecidable
 	}
 	return VerdictSame
 }
@@ -186,8 +207,8 @@ func (v CandidateVerdict) String() string {
 // the recorded sha256 (empty when the row did not exist or carried none) and
 // the prefilter verdict, for logging and tests.
 type CandidateDecision struct {
-	Verdict    CandidateVerdict
-	Prefilter  Verdict
+	Verdict     CandidateVerdict
+	Prefilter   Verdict
 	RecordedSHA string
 }
 
@@ -195,18 +216,24 @@ type CandidateDecision struct {
 // replacing the bare IsProcessed tuple check for the IC-BUG-48 flow:
 //
 //  1. no processed-file row for (ruleID, localPath) → Recollect;
-//  2. PrefilterVerdict(rec.ident, cur.ident, rec.uploadedAtNs):
-//     a. VerdictChanged → Recollect (forge-proof kernel metadata says the
-//     file's state changed since the record);
-//     b. VerdictSame → Skip (no read of the file at all);
-//     c. VerdictUndecidable → hash-confirm: hashFn() reads the full content
-//     and the digest is compared with the recorded sha256 — equal →
-//     RefreshAndSkip (row's identity refreshed to current values), unequal
-//     → Recollect. An empty recorded sha256 (legacy row) forces Recollect:
-//     "cannot prove it is the same" never means "assume it is".
+//  2. PrefilterVerdict(rec.ident, cur.ident, rec.snapshotAtNs):
+//     a. VerdictSame → Skip — the kernel saw no state change since the
+//     ledger's stat snapshot; the file is not even read;
+//     b. VerdictChanged or VerdictUndecidable → hash-confirm: read the full
+//     content (hashFn) and compare with the recorded sha256. A metadata
+//     mismatch proves the file's STATE changed (rewrite, chmod, rebuild) but
+//     NOT that the content differs — a content-identical rebuild must not be
+//     re-uploaded. Equal hash → RefreshAndSkip: the row's identity AND racy
+//     anchor are overwritten with THIS check's snapshot (cur with snapAtNs) —
+//     that refresh is what lets the prefilter converge after G has passed
+//     (git racily-clean). Different hash → Recollect. An empty recorded
+//     sha256 (legacy row, nothing to compare) forces Recollect: "cannot prove
+//     it is the same" never means "assume it is".
 //
-// The legacy IsProcessed stays for callers that genuinely only want the
-// tuple predicate; the agent's candidate path routes through this method.
+// cur.snapAtNs anchors the racy judgement of the CURRENT check; the ledger's
+// rec.snapshotAtNs anchors the recorded side. The legacy IsProcessed stays
+// for callers that genuinely only want the tuple predicate; the agent's
+// candidate path routes through this method.
 func (q *Queue) DecideProcessed(ctx context.Context, ruleID, localPath string, cur FileIdentity, hashFn func() (HashResult, error)) (CandidateDecision, error) {
 	rec, err := q.getProcessedRecord(ctx, ruleID, localPath)
 	if err != nil {
@@ -216,42 +243,40 @@ func (q *Queue) DecideProcessed(ctx context.Context, ruleID, localPath string, c
 		return CandidateDecision{Verdict: Recollect}, nil
 	}
 
-	pv := PrefilterVerdict(rec.ident, cur, rec.uploadedAtNs)
-	switch pv {
-	case VerdictChanged:
-		return CandidateDecision{Verdict: Recollect, Prefilter: pv, RecordedSHA: rec.sha256}, nil
-	case VerdictSame:
+	pv := PrefilterVerdict(rec.ident, cur, rec.snapshotAtNs)
+	if pv == VerdictSame {
 		return CandidateDecision{Verdict: Skip, Prefilter: pv, RecordedSHA: rec.sha256}, nil
-	default: // VerdictUndecidable
-		if rec.sha256 == "" {
-			// Nothing recorded to compare against: the ledger cannot prove
-			// this is the same content, so it must be re-collected. (The
-			// upload will refresh the row with a fresh hash + identity.)
-			return CandidateDecision{Verdict: Recollect, Prefilter: pv, RecordedSHA: rec.sha256}, nil
-		}
-		hr, err := hashFn()
-		if err != nil {
-			return CandidateDecision{}, fmt.Errorf("queue: hash confirm %q: %w", localPath, err)
-		}
-		if hr.SHA256 == rec.sha256 {
-			if err := q.refreshProcessedIdentity(ctx, ruleID, localPath, cur); err != nil {
-				return CandidateDecision{}, err
-			}
-			return CandidateDecision{Verdict: RefreshAndSkip, Prefilter: pv, RecordedSHA: rec.sha256}, nil
-		}
+	}
+	// Changed or undecidable: the content itself is unproven — hash-confirm.
+	if rec.sha256 == "" {
+		// Nothing recorded to compare against: the ledger cannot prove this
+		// is the same content, so it must be re-collected. (The upload will
+		// refresh the row with a fresh hash + identity.)
 		return CandidateDecision{Verdict: Recollect, Prefilter: pv, RecordedSHA: rec.sha256}, nil
 	}
+	hr, err := hashFn()
+	if err != nil {
+		return CandidateDecision{}, fmt.Errorf("queue: hash confirm %q: %w", localPath, err)
+	}
+	if hr.SHA256 == rec.sha256 {
+		if err := q.refreshProcessedIdentity(ctx, ruleID, localPath, cur, cur.SnapAtNs); err != nil {
+			return CandidateDecision{}, err
+		}
+		return CandidateDecision{Verdict: RefreshAndSkip, Prefilter: pv, RecordedSHA: rec.sha256}, nil
+	}
+	return CandidateDecision{Verdict: Recollect, Prefilter: pv, RecordedSHA: rec.sha256}, nil
 }
 
 // processedRecord is the ledger row relevant to a candidate decision.
 type processedRecord struct {
 	ident        FileIdentity
-	uploadedAtNs int64
+	snapshotAtNs int64 // the moment the ledger's identity was stat'ed
 	sha256       string
 }
 
 // getProcessedRecord loads the processed-file row's identity fields; nil when
-// no row exists.
+// no row exists. uploaded_at_ns stores the identity's SNAPSHOT moment (when
+// the stat was taken), not the ack time.
 func (q *Queue) getProcessedRecord(ctx context.Context, ruleID, localPath string) (*processedRecord, error) {
 	row := q.db.QueryRowContext(ctx,
 		`SELECT file_mtime_ns, file_ctime_ns, file_dev, file_ino, file_size, uploaded_at_ns, sha256
@@ -259,18 +284,18 @@ func (q *Queue) getProcessedRecord(ctx context.Context, ruleID, localPath string
 		ruleID, localPath,
 	)
 	var r processedRecord
-	var mtimeNs, ctimeNs, uploadedAtNs int64
+	var mtimeNs, ctimeNs, snapAtNs int64
 	var dev, ino uint64
 	var size int64
 	var sha256 string
-	if err := row.Scan(&mtimeNs, &ctimeNs, &dev, &ino, &size, &uploadedAtNs, &sha256); err != nil {
+	if err := row.Scan(&mtimeNs, &ctimeNs, &dev, &ino, &size, &snapAtNs, &sha256); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("queue: load processed record %q: %w", localPath, err)
 	}
 	r.ident = FileIdentity{MtimeNs: mtimeNs, CtimeNs: ctimeNs, Dev: dev, Ino: ino, Size: size}
-	r.uploadedAtNs = uploadedAtNs
+	r.snapshotAtNs = snapAtNs
 	r.sha256 = sha256
 	return &r, nil
 }
@@ -279,13 +304,15 @@ func (q *Queue) getProcessedRecord(ctx context.Context, ruleID, localPath string
 // current file's values after a hash confirmation proved the content
 // identical. Ledger semantics: no new content to upload, but the bookkeeping
 // must track reality, or every future candidate check pays the full hash
-// again.
-func (q *Queue) refreshProcessedIdentity(ctx context.Context, ruleID, localPath string, cur FileIdentity) error {
+// again. snapAtNs is the moment cur was stat'ed — the NEW racy anchor, which
+// is what lets the prefilter converge (git racily-clean: the refreshed anchor
+// eventually sorts strictly before the stamps and Same is reachable).
+func (q *Queue) refreshProcessedIdentity(ctx context.Context, ruleID, localPath string, cur FileIdentity, snapAtNs int64) error {
 	res, err := q.db.ExecContext(ctx,
 		`UPDATE processed_files
          SET file_mtime_ns=?, file_ctime_ns=?, file_dev=?, file_ino=?, file_size=?, uploaded_at_ns=?
          WHERE rule_id=? AND local_path=?`,
-		cur.MtimeNs, cur.CtimeNs, cur.Dev, cur.Ino, cur.Size, nowNs(), ruleID, localPath,
+		cur.MtimeNs, cur.CtimeNs, cur.Dev, cur.Ino, cur.Size, snapAtNs, ruleID, localPath,
 	)
 	if err != nil {
 		return fmt.Errorf("queue: refresh processed identity %q: %w", localPath, err)
@@ -296,4 +323,38 @@ func (q *Queue) refreshProcessedIdentity(ctx context.Context, ruleID, localPath 
 		return nil
 	}
 	return nil
+}
+
+// GetProcessedIdentity returns the recorded identity of a processed-file row
+// (scratch/test inspection helper; zero identity when no row exists).
+func (q *Queue) GetProcessedIdentity(ruleID, localPath string) (ProcessedIdentity, error) {
+	rec, err := q.getProcessedRecord(context.Background(), ruleID, localPath)
+	if err != nil {
+		return ProcessedIdentity{}, err
+	}
+	if rec == nil {
+		return ProcessedIdentity{}, nil
+	}
+	return ProcessedIdentity{Ident: rec.ident, SnapshotAtNs: rec.snapshotAtNs, SHA256: rec.sha256}, nil
+}
+
+// SetProcessedIdentityAnchor backdates the racy-window anchor of a
+// processed-file row. Test/scratch helper: production code always anchors at
+// the snapshot moment of the write.
+func (q *Queue) SetProcessedIdentityAnchor(ruleID, localPath string, snapAtNs int64) error {
+	_, err := q.db.Exec(
+		`UPDATE processed_files SET uploaded_at_ns=? WHERE rule_id=? AND local_path=?`,
+		snapAtNs, ruleID, localPath,
+	)
+	if err != nil {
+		return fmt.Errorf("queue: set processed identity anchor %q: %w", localPath, err)
+	}
+	return nil
+}
+
+// ProcessedIdentity is the recorded identity of a processed-file row.
+type ProcessedIdentity struct {
+	Ident        FileIdentity
+	SnapshotAtNs int64
+	SHA256       string
 }

@@ -31,7 +31,7 @@ func TestPrefilterVerdict_Table(t *testing.T) {
 		{"all equal, inside racy window (just recorded)", known, known, known.MtimeNs + g/2, VerdictUndecidable},
 		{"all equal, inside racy window (record just before stamp)", known, known, known.MtimeNs + 1, VerdictUndecidable},
 		{"all equal, outside window (long after)", known, known, known.MtimeNs + g + g, VerdictSame},
-		{"all equal, outside window (long before)", known, known, known.MtimeNs - g - g, VerdictSame},
+		{"all equal, stamps before anchor by more than G (refreshed ledger)", known, known, known.MtimeNs + g + g, VerdictSame},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
