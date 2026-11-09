@@ -55,23 +55,24 @@ func PostStatMatches(pre, post Identity) bool {
 		pre.Dev == post.Dev && pre.Ino == post.Ino && pre.Size == post.Size
 }
 
-// Stat stats path and returns its identity. SnapAtNs is set BEFORE the stat
-// (rework-2 fix 5, conservative direction): the racy anchor is "when this
-// check began", not "when the kernel answered" — if the thread stalls between
-// the anchor and the stat, a coarse-granularity rewrite in that gap keeps the
-// stamps inside the [anchor−G, ∞) window and stays racy (safe). Taking the
-// anchor AFTER the stat would let a long stall push the anchor past the
-// rewrite and bless it as Same. A clock rollback between the two calls only
-// makes the anchor smaller (earlier), which widens the racy window on the
-// stamp side — also safe; PrefilterVerdict additionally treats a ledger
-// anchor in the future as Undecidable.
+// Stat stats path and returns its identity. Rework-4 blocker 2: it opens
+// the path ONCE and takes every field from that handle (StatHandle) — on
+// Windows the previous implementation os.Stat'ed the path for size/mtime and
+// then re-opened the path for ChangeTime/volume/index, so a path re-pointed
+// between the two queries produced a hybrid identity of two files. The
+// anchor is taken BEFORE the open (rework-2 fix 5, conservative direction —
+// see the comment above StatHandle).
 func Stat(path string) (Identity, error) {
 	anchor := time.Now().UnixNano()
-	fi, err := os.Stat(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return Identity{}, err
 	}
-	id := FromInfo(fi, path)
+	defer f.Close()
+	id, err := StatHandle(f)
+	if err != nil {
+		return Identity{}, err
+	}
 	id.SnapAtNs = anchor
 	return id, nil
 }

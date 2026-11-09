@@ -27,13 +27,14 @@ import (
 //
 // Any field that cannot be obtained is left zero; callers treat zero fields
 // as unknown → hash confirmation (fail-closed), never as "same".
+// fillPlatform is unused on Windows: Stat(path) opens once and routes
+// through StatHandle → statHandleIdentity (all fields from that one handle).
+// It exists only to satisfy the shared call site in FromInfo, and
+// deliberately fills NOTHING (zero fields = unknown → hash confirm) so an
+// accidental FromInfo call can never produce a by-path hybrid identity
+// (rework-4 blocker 2).
 func fillPlatform(id *Identity, fi os.FileInfo, path string) {
-	h := openByPath(path) // Stat(path) path: open once, query the handle
-	if h == windows.InvalidHandle {
-		return
-	}
-	defer windows.CloseHandle(h)
-	fillFromHandle(id, h)
+	_, _, _ = id, fi, path
 }
 
 // statHandleIdentity fills the identity from an ALREADY-OPEN handle (all
@@ -72,25 +73,7 @@ func fillFromHandle(id *Identity, h windows.Handle) {
 	id.CtimeNs = filetimeTicksToUnixNs(basic.ChangeTime)
 }
 
-// openByPath opens path (metadata only) for the by-path Stat entry point.
-// FILE_FLAG_BACKUP_SEMANTICS: required for directories, harmless for files.
-// Returns windows.InvalidHandle on failure.
-func openByPath(path string) windows.Handle {
-	if path == "" {
-		return windows.InvalidHandle
-	}
-	p16, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return windows.InvalidHandle
-	}
-	h, err := windows.CreateFile(p16, windows.GENERIC_READ,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
-	if err != nil {
-		return windows.InvalidHandle
-	}
-	return h
-}
+
 
 // filetimeTicksToUnixNs converts Windows FILETIME 100-ns ticks (since
 // 1601-01-01) to Unix nanoseconds (since 1970-01-01). Zero input stays zero
