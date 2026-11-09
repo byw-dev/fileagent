@@ -916,12 +916,12 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 | 字段 | 内容 |
 |------|------|
-| **根因** | （立卡时）`mc alias set ALIAS ENDPOINT AK SK`（admin 与 CP 两个 alias）、`curl --user "AK:SK"`（AssumeRole 自检）三处把 secret 作为 argv 传递，执行期间同机任意用户 `ps -ef` 可见——与 IC-BUG-41 在 `init-minio.sh` 的形态相同。**B7（#138）后 `mc alias set` 两处已消除，现存只剩 `curl --user`**（见下方「B7 进展」） |
+| **根因** | （立卡时）`mc alias set ALIAS ENDPOINT AK SK`（admin 与 CP 两个 alias）、`curl --user "AK:SK"`（AssumeRole 自检）三处把 secret 作为 argv 传递，执行期间同机任意用户 `ps -ef` 可见——与 IC-BUG-41 在 `init-minio.sh` 的形态相同。**B7（#138）后 `mc alias set` 两处已消除，当时尚余 `curl --user`（2026-11-09 已随本 PR 修复，见下方「修复记录」）**（详见「B7 进展」） |
 | **精确位置** | （立卡时）`deploy/scripts/init-seaweedfs.sh:179-180`（admin alias）、`:254-255`（CP alias）、`:142-153`（`assume_role` 的 `--user "$1:$2"`）——行号为历史值，B7 后两处 alias 已不存在，见下行 |
 | **后果** | 仅在脚本执行的几秒窗口内可见，且通常在运维自己的机器/跳板机上执行，实际风险低（与 IC-BUG-41 同判）。渲染器**无**此问题：`render-seaweedfs-configs.sh:120-148` 经环境变量向 python3 注密，secret 不进 argv |
 | **修复** | `mc` 支持从环境变量读凭据（`MC_HOST_<alias>`）；curl 的 `--user` 可改 `--netrc-file` / `--config -`。与 IC-BUG-41 同修法，两脚本宜同刀 |
 | **验收** | 脚本运行期间 `ps -ef` 输出不含任何 `SW_*_SECRET_KEY` 值；AssumeRole / CreateBucket / 预签名 GET 三项自检仍全过 |
 | **归属** | 未排期。宜与 IC-BUG-41（`init-minio.sh` 同类问题）同刀 |
 | **B 重判（2026-10-27）** | **不挡试点** — 执行窗口秒级、通常在运维自己的机器上，实际风险低；bootstrap 三项自检本就要求操作者在场。证据：`init-seaweedfs.sh:179-180,254-255,142-153`（历史行号，同上） |
-| **B7 进展（#138，2026-10-31）** | `mc alias set` 两处已随 S3 客户端改为 AWS CLI（B7）而消除；凭据改为写入**私有 0700 目录、0600 权限**的 config/credentials 文件（`mktemp -d` + trap 清理，不进 argv 也不进全局 `~/.aws`）。**现存的 argv 暴露只剩 `curl --user`**（`assume_role` 函数里的 `curl --user "$1:$2"`，即 AssumeRole 自检；不写行号以免漂移）；另注：预签名 URL 进入 curl argv（预签名 GET 自检里的 `curl "${PRESIGNED_URL}"`）是**旧版就有的**短期凭据（5 分钟过期），非新增暴露。**IC-BUG-57 仍未关闭**（curl --user 残留），计数不变 |
+| **B7 进展（#138，2026-10-31）** | `mc alias set` 两处已随 S3 客户端改为 AWS CLI（B7）而消除；凭据改为写入**私有 0700 目录、0600 权限**的 config/credentials 文件（`mktemp -d` + trap 清理，不进 argv 也不进全局 `~/.aws`）。**截至 2026-10-31 #138 合并时，argv 暴露尚余 `curl --user`**（`assume_role` 函数里的 `curl --user "$1:$2"`，即 AssumeRole 自检；不写行号以免漂移；已于 2026-11-09 随本 PR 修复，见下方「修复记录」）；另注：预签名 URL 进入 curl argv（预签名 GET 自检里的 `curl "${PRESIGNED_URL}"`）是**旧版就有的**短期凭据（5 分钟过期），非新增暴露。当时 IC-BUG-57 尚未关闭（curl --user 残留），计数不变 |
 | **修复记录（2026-11-09，分支 `chore/b7-small-followups`，#TBD）** | `assume_role` 的 `curl --user "$1:$2"` 改为 `curl --config <file>`：`user = "AK:SK"` 一行由 **bash 内建 printf + 重定向**（无外部命令，密钥不进任何 argv）写入**私有 `OWN_AWS_DIR`（0700）内的 `mktemp` 临时文件（umask 077 → 0600）**，用完即删、EXIT trap 兜底删除。**先红后绿探针**（PATH 前置 curl 包装器记录 `"$@"`，等价于 `ps -ef` 可见的 argv）：master 版 argv 含 `--user AK:SK`（红），修复版 argv 只有 `--config <file>`（绿）——证据 `bin/followups/ic57/probe-red-green.txt`。**live 验收**：`FA_STORAGE=seaweedfs bash deploy/scripts/smoke.sh` = `SMOKE PASSED`（含 init-seaweedfs.sh 的 AssumeRole/建桶/预签名 GET 三项自检）。修复只涉 `assume_role` 一处；预签名 URL 进 argv 的旧有短期凭据暴露（5 分钟过期）**不在本卡范围、未改**。卡片关闭，计数 → 已关 40 / 未关 16 |
