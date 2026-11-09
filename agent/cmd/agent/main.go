@@ -862,16 +862,37 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 // hashCandidateSHA256 is submitFile's production hash-confirm function for
 // the IC-BUG-48 flow: full-content sha256 of the candidate file.
 func hashCandidateSHA256(path string) (queue.HashResult, error) {
+	// Rework-2 blocker 2: the callback owns the fd — it opens the file ONCE,
+	// takes the pre-read identity from that handle, hashes the bytes,
+	// re-stats the same handle and returns {identity, sha256, complete}.
+	// The caller's path-stat identity is never allowed into the ledger.
 	f, err := os.Open(path)
 	if err != nil {
 		return queue.HashResult{}, err
 	}
 	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	pre, err := fileid.StatHandle(f)
+	if err != nil {
 		return queue.HashResult{}, err
 	}
-	return queue.HashResult{SHA256: hex.EncodeToString(h.Sum(nil))}, nil
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return queue.HashResult{}, err
+	}
+	post, err := fileid.StatHandle(f)
+	if err != nil {
+		return queue.HashResult{}, err
+	}
+	return queue.HashResult{
+		SHA256: hex.EncodeToString(h.Sum(nil)),
+		Size:   n,
+		Identity: queue.FileIdentity{
+			MtimeNs: pre.MtimeNs, CtimeNs: pre.CtimeNs, Dev: pre.Dev,
+			Ino: pre.Ino, Size: pre.Size, SnapAtNs: pre.SnapAtNs,
+		},
+		IdentityComplete: fileid.PostStatMatches(pre, post),
+	}, nil
 }
 
 // submitFile checks deduplication and enqueues an upload task.

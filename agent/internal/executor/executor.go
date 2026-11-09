@@ -268,17 +268,36 @@ func (e *Executor) runWorker(ctx context.Context) {
 // path (production hashFn for DecideProcessed). An unreadable file is an
 // error → the candidate cannot be confirmed → Recollect (fail-closed).
 func hashFileSHA256(path string) (queue.HashResult, error) {
+	// Rework-2 blocker 2: the callback owns the fd — identity and bytes from
+	// one open, post-read verified. The caller's path-stat identity is never
+	// allowed into the ledger.
 	f, err := os.Open(path)
 	if err != nil {
 		return queue.HashResult{}, fmt.Errorf("open %q: %w", path, err)
 	}
 	defer f.Close()
+	pre, err := fileid.StatHandle(f)
+	if err != nil {
+		return queue.HashResult{}, err
+	}
 	h := sha256.New()
 	n, err := io.Copy(h, f)
 	if err != nil {
 		return queue.HashResult{}, fmt.Errorf("hash %q: %w", path, err)
 	}
-	return queue.HashResult{SHA256: hex.EncodeToString(h.Sum(nil)), Size: n}, nil
+	post, err := fileid.StatHandle(f)
+	if err != nil {
+		return queue.HashResult{}, err
+	}
+	return queue.HashResult{
+		SHA256: hex.EncodeToString(h.Sum(nil)),
+		Size:   n,
+		Identity: queue.FileIdentity{
+			MtimeNs: pre.MtimeNs, CtimeNs: pre.CtimeNs, Dev: pre.Dev,
+			Ino: pre.Ino, Size: pre.Size, SnapAtNs: pre.SnapAtNs,
+		},
+		IdentityComplete: fileid.PostStatMatches(pre, post),
+	}, nil
 }
 
 // drainQueue dequeues and processes all available pending tasks.

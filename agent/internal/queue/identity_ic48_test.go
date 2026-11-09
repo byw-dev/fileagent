@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -46,14 +47,41 @@ func ic48RecordProcessed(t *testing.T, q *Queue, ruleID, path string, id fileid.
 }
 
 // ic48HashFile is the production hash-confirm function: full-content sha256.
+// ic48HashFile is the production-shaped hash-confirm callback (rework-2
+// blocker 2 contract): it opens the file ITSELF, takes the pre-read identity
+// from that fd, hashes the content, re-stats the same fd and returns
+// {identity, sha256, complete}. Callers that ignore the returned identity
+// (verdict-table style) leave the zero value — DecideProcessed then treats
+// the refresh basis as incomplete → Recollect.
 func ic48HashFile(path string) func() (HashResult, error) {
 	return func() (HashResult, error) {
-		b, err := os.ReadFile(path)
+		f, err := os.Open(path)
 		if err != nil {
 			return HashResult{}, err
 		}
-		sum := sha256.Sum256(b)
-		return HashResult{SHA256: hex.EncodeToString(sum[:]), Size: int64(len(b))}, nil
+		defer f.Close()
+		pre, err := fileid.StatHandle(f)
+		if err != nil {
+			return HashResult{}, err
+		}
+		h := sha256.New()
+		n, err := io.Copy(h, f)
+		if err != nil {
+			return HashResult{}, err
+		}
+		post, err := fileid.StatHandle(f)
+		if err != nil {
+			return HashResult{}, err
+		}
+		return HashResult{
+			SHA256: hex.EncodeToString(h.Sum(nil)),
+			Size:   n,
+			Identity: FileIdentity{
+				MtimeNs: pre.MtimeNs, CtimeNs: pre.CtimeNs, Dev: pre.Dev,
+				Ino: pre.Ino, Size: pre.Size, SnapAtNs: pre.SnapAtNs,
+			},
+			IdentityComplete: fileid.PostStatMatches(pre, post),
+		}, nil
 	}
 }
 
@@ -160,28 +188,26 @@ func TestIC48_IdenticalRebuild_SkipViaHashConfirm(t *testing.T) {
 		"identical content must be confirmed by hash and skip with a refreshed row, never re-uploaded")
 
 	// The ledger caught up (identity + anchor refreshed during hash confirm).
-	// The refreshed anchor is the second check's snapshot moment, and the
-	// file's stamps fall within G before it — so the second decision is
-	// hash-confirmed AGAIN (RefreshAndSkip, not a bare Skip): correct
-	// racily-clean behaviour. After G has passed (simulated by backdating the
-	// anchor) the prefilter decides alone — convergence, git-style.
+	// The refresh advanced the anchor to the check's snapshot moment; the
+	// file's stamps (ctime ≈ rebuild moment) sit within G before it, so an
+	// IMMEDIATE second check is hash-confirmed again — correct racily-clean
+	// behaviour. Convergence (git-style) then needs wall time: after G the
+	// stamps fall behind anchor−G and a THIRD check decides alone (no read).
+	time.Sleep(2100 * time.Millisecond)
 	dec2 := ic48Decide(t, q, "rule", path)
 	require.Equal(t, RefreshAndSkip, dec2.Verdict,
-		"inside the racy window after the refresh, the second check must hash-confirm again (content identical → skip)")
+		"round 2 (after G): stamps ≈ old anchor → racy → hash-confirm again (identical → refresh)")
 	rec, err := q.GetProcessedIdentity("rule", path)
 	require.NoError(t, err)
 	require.NotZero(t, rec.SnapshotAtNs, "the refresh must anchor the ledger at the snapshot moment")
-	cur := ic48Stat(t, path)
-	// Simulate that G has passed since the refresh: move the anchor FORWARD,
-	// past the file's stamps + G. The anchor is "when the ledger identity was
-	// stat'ed"; time passing means the anchor (a wall-clock moment) rises
-	// above stamp + G, and then stamp < anchor − G → not racy → Same.
-	// (Real convergence just waits; moving the anchor forward simulates the
-	// identical ordering without a sleep.)
-	require.NoError(t, q.SetProcessedIdentityAnchor("rule", path, cur.MtimeNs+racyGranularityNs*3))
+	// Round 3, immediately after round 2's refresh: the anchor is now round
+	// 2's snapshot moment, and the stamps (round 1's ctime) sit > G behind
+	// it → Same → skip without reading. (The M4 mutation — refresh not
+	// advancing the anchor — leaves the anchor at the pre-sleep moment, only
+	// ~0.1ms before the stamps → still racy → hash → red.)
 	dec3, err := q.DecideProcessed(context.Background(), "rule", path,
-		FileIdentity{MtimeNs: cur.MtimeNs, CtimeNs: cur.CtimeNs,
-			Dev: cur.Dev, Ino: cur.Ino, Size: cur.Size, SnapAtNs: cur.SnapAtNs},
+		FileIdentity{MtimeNs: ic48Stat(t, path).MtimeNs, CtimeNs: ic48Stat(t, path).CtimeNs,
+			Dev: ic48Stat(t, path).Dev, Ino: ic48Stat(t, path).Ino, Size: ic48Stat(t, path).Size},
 		func() (HashResult, error) {
 			t.Fatal("hash must not be read outside the racy window")
 			return HashResult{}, nil
@@ -257,8 +283,15 @@ func TestIC48_RebuildConvergence_TwoScanRounds(t *testing.T) {
 	require.Equal(t, RefreshAndSkip, round1.Verdict)
 	rec1, err := q.GetProcessedIdentity("rule", path)
 	require.NoError(t, err)
-	require.Equal(t, round1Stat.SnapAtNs, rec1.SnapshotAtNs,
-		"RefreshAndSkip must persist THIS check's snapshot moment as the new racy anchor (M4)")
+	// The persisted anchor is the CALLBACK's snapshot moment (same fd as the
+	// hashed bytes) — a separate stat from round1Stat's path stat, so it is
+	// μs later but within the same check (bounded by G). Asserting the bound
+	// (not bit-equality) still kills M4: with the mutation the anchor stays
+	// at the PRE-rebuild value, far outside this bound.
+	require.GreaterOrEqual(t, rec1.SnapshotAtNs, round1Stat.SnapAtNs,
+		"the refresh anchor must be at/after this check's snapshot moment")
+	require.Less(t, rec1.SnapshotAtNs-round1Stat.SnapAtNs, racyGranularityNs,
+		"the refresh anchor must come from THIS check (within one granularity), not from a stale record")
 
 	// Wall time passes G: the ledger anchor stays T1 (skips never move it)
 	// while the stamps (ctime ≈ T1) keep ageing relative to any FUTURE
@@ -286,8 +319,14 @@ func TestIC48_RebuildConvergence_TwoScanRounds(t *testing.T) {
 		"round 2: stamps ≈ anchor T1 → racy → hash-confirm (identical → refresh)")
 	rec2, err := q.GetProcessedIdentity("rule", path)
 	require.NoError(t, err)
-	require.Equal(t, round2Snap, rec2.SnapshotAtNs,
-		"the refresh must advance the anchor to ITS snapshot moment (M4: anchor not advanced → never converges)")
+	// Same bounded assertion as round 1: the anchor is the callback's fd
+	// snapshot (μs after the path stat, within one granularity). The M4
+	// mutation leaves it at T1 — 2.1s before round2Snap, far outside the
+	// bound → red.
+	require.GreaterOrEqual(t, rec2.SnapshotAtNs, round2Snap,
+		"the refresh must advance the anchor to at/after its own check's snapshot moment")
+	require.Less(t, rec2.SnapshotAtNs-round2Snap, racyGranularityNs,
+		"the refresh anchor must come from THIS check, not a stale record (M4)")
 
 	// Round 3 (immediately after round 2's refresh): the ledger anchor is T2
 	// and the stamps (ctime ≈ T1) sit before T2 − G → Same → skip with NO

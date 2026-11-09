@@ -160,6 +160,14 @@ func PrefilterVerdict(rec FileIdentity, cur FileIdentity, recordAtNs int64) Verd
 		// outcome is "confirm by content".
 		return VerdictUndecidable
 	}
+	if recordAtNs > nowNs() {
+		// Clock rolled back (rework-2 fix 5): the ledger anchor claims a
+		// moment in the future relative to the current clock. The wall clock
+		// can no longer order the stamps against the anchor, so the racy
+		// judgement is meaningless → confirm by content (and the refresh
+		// will re-anchor the row at the current clock).
+		return VerdictUndecidable
+	}
 	// Racy window (git racily-clean), single-sided: a stamp at or after
 	// snapshotAt − G may belong to a rewrite in the same coarse tick as the
 	// snapshot — the wall clock cannot order them. Stamps strictly before the
@@ -175,12 +183,26 @@ func PrefilterVerdict(rec FileIdentity, cur FileIdentity, recordAtNs int64) Verd
 // ── Processed-file candidate decision (hash-confirming dedup) ────────────────
 
 // HashResult carries the outcome of hashing the candidate file's full
-// content, injected by the caller so the queue package stays I/O-free: the
-// production caller reads the file and computes sha256; tests inject canned
-// values. size is informational (the ledger keeps the recorded size).
+// content. The hash callback OWNS the file descriptor (rework-2 blocker 2):
+// it must open the file itself, take the pre-read identity from that same fd
+// (including the racy anchor), hash the bytes, re-stat the same fd and
+// verify — then return the identity it actually hashed. The caller's
+// path-statted identity (the `cur` argument of DecideProcessed) is valid for
+// the skip-without-reading prefilter only; once hash confirmation runs, the
+// ONLY identity allowed into the ledger is the callback's.
+//
+//   - sha256: digest of the hashed bytes
+//   - size: byte count of the hashed content (informational)
+//   - identity: the same-fd pre-read snapshot of the bytes that were hashed
+//   - identityComplete: the post-read re-stat on the SAME fd matched the
+//     pre-read snapshot. false → the bytes and the identity may diverge →
+//     the ledger must record a zero identity (undecidable → hash next time)
+//     and the verdict must NOT be RefreshAndSkip (fail-closed → Recollect).
 type HashResult struct {
-	SHA256 string
-	Size   int64
+	SHA256           string
+	Size             int64
+	Identity         FileIdentity
+	IdentityComplete bool
 }
 
 // CandidateVerdict is the final decision for one candidate file: skip it
@@ -285,8 +307,26 @@ func (q *Queue) DecideProcessed(ctx context.Context, ruleID, localPath string, c
 		return CandidateDecision{}, fmt.Errorf("queue: hash confirm %q: %w", localPath, err)
 	}
 	if hr.SHA256 == rec.sha256 {
-		if err := q.refreshProcessedIdentity(ctx, ruleID, localPath, cur, cur.SnapAtNs); err != nil {
+		// Rework-2 blocker 2: the ONLY identity allowed into the ledger is
+		// the callback's same-fd snapshot of the hashed bytes — never the
+		// caller's path-statted `cur` (the path may have been re-pointed
+		// between the stat and the hash). An incomplete identity (post-read
+		// mismatch inside the callback) must NOT RefreshAndSkip: the bytes
+		// and the identity may diverge — fail-closed → Recollect.
+		if !hr.IdentityComplete {
+			return CandidateDecision{Verdict: Recollect, Prefilter: pv, RecordedSHA: rec.sha256}, nil
+		}
+		// Rework-2 blocker 3: the refresh is a CAS on the row THIS decision
+		// read (rec). Zero rows updated = the basis changed mid-flight (a
+		// concurrent ack/replay re-wrote it) → do NOT claim RefreshAndSkip;
+		// Recollect (fail-closed, same rationale as the caller's error path:
+		// the worst outcome is a duplicate upload, never a lost file).
+		updated, err := q.refreshProcessedIdentityCAS(ctx, ruleID, localPath, *rec, hr.Identity)
+		if err != nil {
 			return CandidateDecision{}, err
+		}
+		if !updated {
+			return CandidateDecision{Verdict: Recollect, Prefilter: pv, RecordedSHA: rec.sha256}, nil
 		}
 		return CandidateDecision{Verdict: RefreshAndSkip, Prefilter: pv, RecordedSHA: rec.sha256}, nil
 	}
@@ -326,29 +366,40 @@ func (q *Queue) getProcessedRecord(ctx context.Context, ruleID, localPath string
 	return &r, nil
 }
 
-// refreshProcessedIdentity updates the ledger row's identity fields to the
-// current file's values after a hash confirmation proved the content
-// identical. Ledger semantics: no new content to upload, but the bookkeeping
-// must track reality, or every future candidate check pays the full hash
-// again. snapAtNs is the moment cur was stat'ed — the NEW racy anchor, which
-// is what lets the prefilter converge (git racily-clean: the refreshed anchor
-// eventually sorts strictly before the stamps and Same is reachable).
-func (q *Queue) refreshProcessedIdentity(ctx context.Context, ruleID, localPath string, cur FileIdentity, snapAtNs int64) error {
+// refreshProcessedIdentityCAS updates the ledger row's identity fields after
+// a hash confirmation proved the content identical — CONDITIONALLY (CAS,
+// rework-2 blocker 3): the WHERE clause requires the row to still carry the
+// exact values THIS decision read (sha256 + full identity + anchor). A
+// concurrent ack/replay that re-wrote the row between the decision's read
+// and this refresh makes 0 rows match; the function then reports updated=false
+// and the caller must NOT claim RefreshAndSkip — it returns Recollect
+// (fail-closed; chosen over re-read-and-retry because a lost basis means an
+// unknown amount of concurrent state churn, and the worst outcome of
+// re-collecting is a duplicate upload, never a lost file).
+//
+// The new identity written is the hash callback's same-fd snapshot (newIdent)
+// with the callback's snapshot moment as the new racy anchor — never the
+// caller's path-statted identity.
+func (q *Queue) refreshProcessedIdentityCAS(ctx context.Context, ruleID, localPath string, rec processedRecord, newIdent FileIdentity) (bool, error) {
 	res, err := q.db.ExecContext(ctx,
 		`UPDATE processed_files
          SET file_mtime_ns=?, file_ctime_ns=?, file_dev=?, file_ino=?, file_size=?, uploaded_at_ns=?
-         WHERE rule_id=? AND local_path=?`,
-		cur.MtimeNs, cur.CtimeNs, cur.Dev, cur.Ino, cur.Size, snapAtNs, ruleID, localPath,
+         WHERE rule_id=? AND local_path=?
+           AND sha256 IS ? AND sha256=?
+           AND file_mtime_ns=? AND file_ctime_ns=? AND file_dev=? AND file_ino=? AND file_size=?
+           AND uploaded_at_ns=?`,
+		newIdent.MtimeNs, newIdent.CtimeNs, newIdent.Dev, newIdent.Ino, newIdent.Size, newIdent.SnapAtNs,
+		ruleID, localPath,
+		// sha256 IS ? handles the NULL-vs-empty legacy nuance: recorded "" matches only "".
+		rec.sha256, rec.sha256,
+		rec.ident.MtimeNs, rec.ident.CtimeNs, rec.ident.Dev, rec.ident.Ino, rec.ident.Size,
+		rec.snapshotAtNs,
 	)
 	if err != nil {
-		return fmt.Errorf("queue: refresh processed identity %q: %w", localPath, err)
+		return false, fmt.Errorf("queue: refresh processed identity %q: %w", localPath, err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		// The row vanished between the load and the refresh; nothing to do —
-		// the next candidate check will see no record and re-collect.
-		return nil
-	}
-	return nil
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // GetProcessedIdentity returns the recorded identity of a processed-file row
