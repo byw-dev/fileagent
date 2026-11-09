@@ -346,7 +346,7 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 		}
 	} else {
 		u.logger.Warn("uploader: post-upload stat failed, recording an incomplete identity",
-			zap.String("path", task.LocalPath), zap.Error(err))
+			zap.String("path", task.LocalPath), zap.Error(statErr))
 	}
 	return result, nil
 }
