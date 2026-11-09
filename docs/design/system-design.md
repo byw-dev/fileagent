@@ -988,6 +988,12 @@ Scheduled 模式执行流程：
 逐片 ETag 与本地区间 MD5 比对（#140）、版本快照升级为全内核身份
 mtime-ns/ctime/dev+inode（IC-BUG-48）均已落地；权威描述以代码与
 bugs/open.md 各修复记录为准）：
+  0. 同 fd 原则（返工 2）：身份（stat）与内容（读/哈希）来自同一个
+     打开的文件句柄——上传打开一次 *os.File，读前/读后 StatHandle 与
+     所有分片/续传读取全部经该句柄（SectionReader/ReadAt）；判重的
+     哈希确认回调同样自持句柄，账本只写回调返回的身份；账本刷新是
+     以「读到的那一行旧值」为条件的 CAS，失败即重采。任何经路径的
+     第二次 open 都视为可能指向另一个文件（符号链接可只换指向）。
   1. 上传开始前，在本地 SQLite 中创建 upload_tasks 记录
      字段：file_path, storage_path, upload_id（Multipart ID）,
            total_parts, completed_parts（JSON数组）, status
@@ -1004,9 +1010,14 @@ bugs/open.md 各修复记录为准）：
 sha256 与上传字节共用同一次读（#140），判重/续传内容身份已升级为
 「内核元数据预筛 + 哈希确认」（IC-BUG-48，见 bugs/open.md 修复记录），
 权威描述以代码与 bugs/open.md 修复记录为准）：
-  - sha256 在上传流上以 TeeReader 同读得出（#140），不做事前预读
+  - sha256 在上传流上以 TeeReader 同读得出（#140），不做事前预读；
+    上传与判重的身份/哈希全程同一文件句柄（返工 2「同 fd 原则」，
+    见 §4.5 断点续传第 0 条）
   - Control Plane 收到 UploadResult 后检查 (bucket, storage_path, sha256)
   - 重复上报同一文件时，幂等更新 file_entries，不创建重复记录
+  - 时钟回拨已知边界：回拨到旧 stamp 同一粒度内并在该粒度内同尺寸
+    改写、且账本锚点仍早于当前时间——预筛无法区分，哈希确认兜底；
+    运维建议 NTP 只做 slew 不做 step
 ```
 
 ## 4.6 本地任务队列（SQLite）
