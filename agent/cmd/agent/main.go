@@ -3,10 +3,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/signal"
@@ -21,6 +24,7 @@ import (
 	"github.com/byw-dev/fileagent/agent/internal/config"
 	"github.com/byw-dev/fileagent/agent/internal/credential"
 	"github.com/byw-dev/fileagent/agent/internal/executor"
+	"github.com/byw-dev/fileagent/agent/internal/fileid"
 	"github.com/byw-dev/fileagent/agent/internal/grpcclient"
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/byw-dev/fileagent/agent/internal/scheduler"
@@ -855,7 +859,29 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 	}
 }
 
+// hashCandidateSHA256 is submitFile's production hash-confirm function for
+// the IC-BUG-48 flow: full-content sha256 of the candidate file.
+func hashCandidateSHA256(path string) (queue.HashResult, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return queue.HashResult{}, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return queue.HashResult{}, err
+	}
+	return queue.HashResult{SHA256: hex.EncodeToString(h.Sum(nil))}, nil
+}
+
 // submitFile checks deduplication and enqueues an upload task.
+//
+// Deduplication is the IC-BUG-48 content-identity verdict, not the bare
+// mtime+size tuple: DecideProcessed prefilters on the kernel identity
+// (nanosecond mtime/ctime + device/inode), hash-confirms the full content
+// whenever the metadata cannot prove the file unchanged (legacy row, unknown
+// fields, racy window), and only a fully-consistent prefilter outside the
+// racy window skips without reading the file.
 //
 // Since IC-BUG-21 a dest_path_template that cannot be resolved refuses the
 // task: nothing is enqueued, so nothing is ever written to a guessed object
@@ -864,12 +890,29 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 // capacity eviction would shed healthy backlog. Files re-collect naturally
 // once the template is fixed (cron walk / next write event).
 func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
-	done, err := q.IsProcessed(ctx, rule.RuleID, localPath, mtime.Unix(), size)
+	ident, statErr := fileid.Stat(localPath)
+	if statErr != nil {
+		// Unreadable candidate: report via the queue layer's zero-identity
+		// path — undecidable → hash-confirm → open fails → Recollect... but
+		// the file cannot be read at all, so enqueue normally and let the
+		// upload path fail with the same (loud) error.
+		logger.Debug("agent: identity stat failed, deferring to the upload path",
+			zap.String("path", localPath), zap.Error(statErr))
+	}
+	dec, err := q.DecideProcessed(ctx, rule.RuleID, localPath,
+		queue.FileIdentity{
+			MtimeNs: ident.MtimeNs, CtimeNs: ident.CtimeNs,
+			Dev: ident.Dev, Ino: ident.Ino, Size: ident.Size, SnapAtNs: ident.SnapAtNs,
+		},
+		func() (queue.HashResult, error) { return hashCandidateSHA256(localPath) })
 	if err != nil {
 		logger.Warn("agent: check processed failed", zap.String("path", localPath), zap.Error(err))
 	}
-	if done {
+	switch dec.Verdict {
+	case queue.Skip, queue.RefreshAndSkip:
 		return
+	case queue.Recollect:
+		// fall through to enqueue
 	}
 	storagePath, pathErr := buildStoragePath(rule, localPath, agentCtx, time.Now().UTC(), logger)
 	if pathErr != nil {

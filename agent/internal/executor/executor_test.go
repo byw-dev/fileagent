@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,9 +80,14 @@ func TestExecutor_SubmitAndProcess(t *testing.T) {
 func TestExecutor_Dedup(t *testing.T) {
 	q := newTestQueue(t)
 	var uploadCount atomic.Int32
-	uploader := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+	uploader := func(_ context.Context, task *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		uploadCount.Add(1)
-		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
+		// The ledger stores this sha; the duplicate check hash-confirms the
+		// real file against it. Report the file's REAL sha so the mock path
+		// behaves like the production TeeReader sha (IC-BUG-51).
+		hr, err := hashFileSHA256(task.LocalPath)
+		require.NoError(t, err)
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: hr.SHA256, SizeBytes: 100}, nil
 	}
 
 	e := New(1, q, uploader, zap.NewNop(), 0)
@@ -88,8 +95,14 @@ func TestExecutor_Dedup(t *testing.T) {
 	defer cancel()
 	e.Start(ctx)
 
-	// Submit a task and let it complete.
-	t1 := newTask("r1", "/path/file.txt")
+	// Submit a task and let it complete. A REAL file backs the task: under
+	// the IC-48 verdict flow the mock uploader produces no identity, so the
+	// ledger row is undecidable and the duplicate check hash-confirms — the
+	// file must exist and hash identically for the duplicate to skip.
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("dedup"), 0o644))
+	t1 := newTask("r1", fpath)
 	require.NoError(t, e.Submit(context.Background(), t1))
 
 	require.Eventually(t, func() bool {
@@ -100,7 +113,10 @@ func TestExecutor_Dedup(t *testing.T) {
 	require.NoError(t, e.HandleAcknowledgement(context.Background(), &agentv1.Acknowledgement{RefMessageId: t1.ID, Success: true}))
 
 	// Submit a second task with the same path and metadata — should be skipped.
-	t2 := newTask("r1", "/path/file.txt")
+	// The ack stored a zero identity (mock uploader produces none), so the
+	// second check takes the hash-confirm path: the hash matches the seeded
+	// row (same real file), the verdict is RefreshAndSkip, no second upload.
+	t2 := newTask("r1", fpath)
 	t2.FileMtime = t1.FileMtime
 	t2.FileSize = t1.FileSize
 	require.NoError(t, e.Submit(context.Background(), t2))

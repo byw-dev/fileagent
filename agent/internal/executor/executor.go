@@ -5,11 +5,16 @@ package executor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/byw-dev/fileagent/agent/internal/fileid"
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/byw-dev/fileagent/agent/internal/uploader"
 	"github.com/google/uuid"
@@ -78,6 +83,11 @@ type Executor struct {
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 	retryWg sync.WaitGroup
+
+	// inFlight carries the IC-BUG-48 identities of successful uploads until
+	// their ack arrives (nil in tests that never upload through the real
+	// path; takeInFlightIdentity/recordInFlightIdentity then no-op).
+	inFlight *inFlightIdentities
 }
 
 // New creates an Executor with the given number of worker goroutines. queueMaxSize
@@ -105,6 +115,7 @@ func New(workers int, q *queue.Queue, uploader UploadFunc, logger *zap.Logger, q
 		reportNotify: make(chan struct{}, 1),
 		notify:       make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
+		inFlight:     &inFlightIdentities{m: make(map[string]identityEntry)},
 	}
 }
 
@@ -253,6 +264,23 @@ func (e *Executor) runWorker(ctx context.Context) {
 	}
 }
 
+// hashFileSHA256 is the dedup hash-confirm reader: full-content sha256 of
+// path (production hashFn for DecideProcessed). An unreadable file is an
+// error → the candidate cannot be confirmed → Recollect (fail-closed).
+func hashFileSHA256(path string) (queue.HashResult, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return queue.HashResult{}, fmt.Errorf("open %q: %w", path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return queue.HashResult{}, fmt.Errorf("hash %q: %w", path, err)
+	}
+	return queue.HashResult{SHA256: hex.EncodeToString(h.Sum(nil)), Size: n}, nil
+}
+
 // drainQueue dequeues and processes all available pending tasks.
 func (e *Executor) drainQueue(ctx context.Context) {
 	for {
@@ -271,12 +299,34 @@ func (e *Executor) drainQueue(ctx context.Context) {
 // processTask handles deduplication, invokes the upload function, and manages
 // retry scheduling.
 func (e *Executor) processTask(ctx context.Context, task *queue.UploadTask) {
-	// Deduplication: skip only when rule, path, mtime, and size all match.
-	already, err := e.queue.IsProcessed(ctx, task.RuleID, task.LocalPath, task.FileMtime, task.FileSize)
-	if err != nil {
-		e.logger.Warn("executor: dedup check error", zap.String("task_id", task.ID), zap.Error(err))
+	// Deduplication (IC-BUG-48): the content-identity verdict — never the
+	// bare mtime+size tuple. The current identity comes from the file's
+	// stat; a metadata mismatch or an undecidable ledger row (legacy row,
+	// mid-upload change, unknown fields) hash-confirms the FULL content
+	// against the recorded sha256 before skipping. VerdictSame (every
+	// kernel field equal AND outside the racy window) skips without reading
+	// the file.
+	curIdent, idErr := fileid.Stat(task.LocalPath)
+	if idErr != nil {
+		// The file vanished between enqueue and dequeue: upload will fail
+		// with the same error anyway — let the normal path report it.
+		e.logger.Debug("executor: identity stat failed before dedup",
+			zap.String("task_id", task.ID), zap.String("path", task.LocalPath), zap.Error(idErr))
 	}
-	if already {
+	already, dedupErr := e.queue.DecideProcessed(ctx, task.RuleID, task.LocalPath,
+		queue.FileIdentity{
+			MtimeNs: curIdent.MtimeNs, CtimeNs: curIdent.CtimeNs,
+			Dev: curIdent.Dev, Ino: curIdent.Ino, Size: curIdent.Size, SnapAtNs: curIdent.SnapAtNs,
+		},
+		func() (queue.HashResult, error) { return hashFileSHA256(task.LocalPath) })
+	if dedupErr != nil {
+		// A broken dedup lookup must not drop the task: the worst outcome is
+		// a duplicate upload, not a lost file. already is the zero value
+		// (Skip=0!) on error — force Recollect explicitly.
+		e.logger.Warn("executor: dedup check error", zap.String("task_id", task.ID), zap.Error(dedupErr))
+		already = queue.CandidateDecision{Verdict: queue.Recollect, Prefilter: queue.VerdictUndecidable}
+	}
+	if already.Verdict == queue.Skip || already.Verdict == queue.RefreshAndSkip {
 		e.logger.Info("executor: skipping duplicate task",
 			zap.String("task_id", task.ID),
 			zap.String("path", task.LocalPath),

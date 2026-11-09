@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/byw-dev/fileagent/agent/internal/fileid"
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -43,6 +46,49 @@ func abandonTask(t *testing.T, q *queue.Queue) *queue.UploadTask {
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
 	return tasks[0]
+}
+
+// abandonTaskWithFile is abandonTask with a REAL file at task.LocalPath whose
+// content hashes to "seeded-sha" — needed by dedup-shortcut tests under the
+// IC-BUG-48 verdict flow: the hash-confirm stage actually reads the file, so
+// the dedup-seeded row must be backed by real bytes (a nonexistent path makes
+// the hash fail → Recollect → no shortcut to test).
+func abandonTaskWithFile(t *testing.T, q *queue.Queue) *queue.UploadTask {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "big.dat")
+	require.NoError(t, os.WriteFile(path, []byte("big"), 0o644))
+	task := newTask("r1", path)
+	task.UploadID = "upload-live-1"
+	task.CompletedParts = `{"parts":[{"PartNumber":1,"ETag":"e1"}]}`
+	require.NoError(t, q.Enqueue(task))
+	tasks, err := q.DequeuePending(1)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	return tasks[0]
+}
+
+// seedDedupRow writes the processed-file row a completed "task B" would have
+// left: full identity of the REAL file (so the prefilter sees a fully-known,
+// fully-equal record) plus its sha256 and a snapshot anchor far enough in the
+// past to be outside the racy window (anchor=2, stamps=current — the
+// identity's stamps are the real file's; anchor 2 ns after epoch sorts
+// strictly before them → not racy).
+func seedDedupRow(t *testing.T, q *queue.Queue, task *queue.UploadTask) {
+	t.Helper()
+	id, err := fileid.Stat(task.LocalPath)
+	require.NoError(t, err)
+	hr, err := hashFileSHA256(task.LocalPath)
+	require.NoError(t, err)
+	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
+		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
+		FileSize: task.FileSize, FileMtime: task.FileMtime,
+		SHA256: hr.SHA256,
+		Ident: queue.FileIdentity{
+			MtimeNs: id.MtimeNs, CtimeNs: id.CtimeNs, Dev: id.Dev, Ino: id.Ino,
+			Size: id.Size, SnapAtNs: 2,
+		},
+		UploadedAtNs: 2,
+	}))
 }
 
 func TestExecutor_AbortsOnGiveUp(t *testing.T) {
@@ -161,20 +207,15 @@ func TestExecutor_DedupCompleteAbortsOrphanedUpload(t *testing.T) {
 	rec := &abandonRecorder{}
 
 	// Task A: partial multipart upload, then failed — the upload ID stays on
-	// the row exactly as multipart.go persisted it.
-	task := abandonTask(t, q)
+	// the row exactly as multipart.go persisted it. A REAL file backs the
+	// task (IC-48: the dedup hash-confirm reads it).
+	task := abandonTaskWithFile(t, q)
 	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Time{}))
 
-	// Task B completed the same file version: dedup state exists, so A's
-	// processTask now takes the dedup shortcut to completed.
-	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
-		ID:         "pf-" + task.ID,
-		RuleID:     task.RuleID,
-		LocalPath:  task.LocalPath,
-		FileSize:   task.FileSize,
-		FileMtime:  task.FileMtime,
-		UploadedAt: time.Now().Unix(),
-	}))
+	// Task B completed the same file version: dedup state exists (full
+	// identity + hash of the real file), so A's processTask now takes the
+	// dedup shortcut to completed.
+	seedDedupRow(t, q, task)
 
 	e := New(1, q, successUploader, zap.NewNop(), 0)
 	require.NoError(t, e.ConfigureAbandon(rec.abandon))

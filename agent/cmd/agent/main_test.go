@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/byw-dev/fileagent/agent/internal/credential"
 	"github.com/byw-dev/fileagent/agent/internal/executor"
+	"github.com/byw-dev/fileagent/agent/internal/fileid"
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/byw-dev/fileagent/agent/internal/scheduler"
 	uploadpkg "github.com/byw-dev/fileagent/agent/internal/uploader"
@@ -27,6 +30,23 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// sha256FileHex hashes a file's full content (test helper for the IC-48
+// dedup-row seeds).
+func sha256FileHex(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// sha256HexOf hashes a string (test helper).
+func sha256HexOf(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
 
 type mockTokenSetter struct {
 	token string
@@ -524,15 +544,30 @@ func TestSubmitFile_SkipsDuplicate(t *testing.T) {
 
 	rule := scheduler.CollectionRule{RuleID: "r1", BasePath: "/tmp", UploadBucket: "bkt", DestPathTemplate: "logs/{filename}"}
 
-	// Mark the file as already processed.
-	err := q.UpsertProcessedFile(&queue.ProcessedFile{
+	// Mark a REAL file as already processed (IC-48: the duplicate check
+	// hash-confirms undecidable rows — the file must exist and the recorded
+	// sha must match its bytes for the duplicate to skip).
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "dup.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("dup"), 0o644))
+	hr, err := sha256FileHex(fpath)
+	require.NoError(t, err)
+	id, err := fileid.Stat(fpath)
+	require.NoError(t, err)
+	err = q.UpsertProcessedFile(&queue.ProcessedFile{
 		ID:        "pf-1",
 		RuleID:    rule.RuleID,
-		LocalPath: "/tmp/dup.txt",
+		LocalPath: fpath,
+		SHA256:    hr,
+		Ident: queue.FileIdentity{
+			MtimeNs: id.MtimeNs, CtimeNs: id.CtimeNs, Dev: id.Dev, Ino: id.Ino,
+			Size: id.Size, SnapAtNs: 2,
+		},
+		UploadedAtNs: 2, // anchor far before the stamps → not racy → Same → skip
 	})
 	require.NoError(t, err)
 
-	submitFile(context.Background(), exec, q, rule, "/tmp/dup.txt", 0, time.Unix(0, 0), 0, "", trollsift.AgentContext{}, zap.NewNop())
+	submitFile(context.Background(), exec, q, rule, fpath, 0, time.Unix(0, 0), 0, "", trollsift.AgentContext{}, zap.NewNop())
 	select {
 	case <-called:
 		t.Fatal("duplicate file triggered upload")
@@ -552,16 +587,23 @@ func TestSubmitFile_SubmitsModifiedFile(t *testing.T) {
 
 	rule := scheduler.CollectionRule{RuleID: "r1", BasePath: "/tmp", UploadBucket: "bkt", DestPathTemplate: "logs/{filename}"}
 	oldMtime := time.Unix(1_700_000_000, 0)
+	// A REAL file whose content changed: the ledger row records the OLD
+	// version's hash, the current bytes differ → hash-confirm → Recollect.
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "changed.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("NEW-CONTENT"), 0o644))
+	oldSha := sha256HexOf("OLD-CONTENT")
 	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
 		ID:         "pf-old",
 		RuleID:     rule.RuleID,
-		LocalPath:  "/tmp/changed.txt",
+		LocalPath:  fpath,
 		FileSize:   100,
 		FileMtime:  oldMtime.Unix(),
 		UploadedAt: oldMtime.Unix(),
+		SHA256:     oldSha,
 	}))
 
-	submitFile(context.Background(), exec, q, rule, "/tmp/changed.txt", 200, oldMtime.Add(time.Second), 0, "", trollsift.AgentContext{}, zap.NewNop())
+	submitFile(context.Background(), exec, q, rule, fpath, 200, oldMtime.Add(time.Second), 0, "", trollsift.AgentContext{}, zap.NewNop())
 	select {
 	case <-called:
 	case <-time.After(time.Second):

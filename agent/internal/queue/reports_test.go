@@ -40,9 +40,13 @@ func TestReportsPersistAndAcknowledge(t *testing.T) {
 	require.Len(t, due, 1)
 	require.Equal(t, []byte("result"), due[0].Payload)
 	require.NoError(t, q.CompleteReported(ctx, task.ID, true, "sha"))
-	processed, err := q.IsProcessed(ctx, "rule", "file", task.FileMtime, task.FileSize)
+	// IC-BUG-48: CompleteReported (no identity) writes an UNDECIDABLE row —
+	// identity fields zero, sha recorded — not the enqueue-time tuple.
+	rec, err := q.GetProcessedIdentity("rule", "file")
 	require.NoError(t, err)
-	require.True(t, processed)
+	require.Equal(t, "sha", rec.SHA256)
+	require.False(t, IdentityFullyKnown(rec.Ident),
+		"an identity-less completion must leave the row undecidable (hash-confirm next time)")
 	_, err = q.GetReport(ctx, task.ID)
 	require.ErrorIs(t, err, sql.ErrNoRows)
 	require.NoError(t, q.CompleteReported(ctx, task.ID, true, "sha"))
