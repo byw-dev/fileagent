@@ -21,17 +21,17 @@
 >
 > | 判定 | 条数 | 明细 |
 > |---|---|---|
-> | **挡试点** | **1** | 48（~~51~~ 2026-11-06 随 PR #140 修复；同日返工 1 依 PR #134 评审 F1–F3 改判：51 成功上报错误哈希、48 同版本改写永久漏采，均经生产函数探针实测；~~40 的 init 自检不覆盖 CP 实际生效配置~~ 40 已随 #142 修复：启动自检拒绝启动） |
+> | **挡试点** | **0** | 无（~~48~~ 2026-11-09 随分支 `fix/b7-ic-bug-48-content-identity` 修复关闭——内核元数据预筛 + 哈希确认；~~51~~ 2026-11-06 随 PR #140 修复；同日返工 1 依 PR #134 评审 F1–F3 改判：51 成功上报错误哈希、48 同版本改写永久漏采，均经生产函数探针实测；~~40 的 init 自检不覆盖 CP 实际生效配置~~ 40 已随 #142 修复：启动自检拒绝启动） |
 > | **不挡试点** | **13** | 13、14、15、32、38、42、45、46（剩余半边，返工 3 经产品拍板改判）、52、53、54、55、56（~~57~~ 2026-11-09 已修复关闭，分支 `chore/b7-small-followups`；重判时为 14，2026-11-09 关闭 57 后余 13） |
 > | **MinIO 专属** | **2** | 7、41（不关闭——MinIO 过渡期仍是默认后端；MinIO 适配器退役时随之关闭。7 在 SeaweedFS 上无对应物：事件源按 `/buckets/` 前缀订阅，新桶天然覆盖，PR3b 合并后成立；41 的 SeaweedFS 侧同类问题已另立 57） |
 > | **已失效 / 撤销** | **0** | 无（无一条满足「必须给出代码证据」的撤销门槛） |
 > | **待产品定** | **0** | 无（46 剩余半边原判待产品定，产品 2026-10-27 拍板试点无持续追加大文件，返工 3 改判不挡试点） |
 >
-> 一行式口径：**挡试点 1（48）/ 不挡试点 13 / MinIO 专属 2（7、41）/ 已失效 0 / 待产品定 0**（返工 3：46 剩余半边经产品拍板改判不挡试点；PR #140：51 修复关闭；#142：40 随启动自检修复关闭；本 PR `chore/b7-small-followups`：57 修复关闭——2026-10-27 重判时点为不挡试点 14，2026-11-06 关闭 40 后仍为 14，本 PR 关闭 57 后余 13；返工 1 前：挡 0 / 不挡 16，历史保留）。
+> 一行式口径：**挡试点 0 / 不挡试点 13 / MinIO 专属 2（7、41）/ 已失效 0 / 待产品定 0**（2026-11-09：48 随分支 `fix/b7-ic-bug-48-content-identity` 修复关闭，挡试点清零；此前：本 PR `chore/b7-small-followups` 关 57 → 挡 1；#142 关 40；PR #140 关 51；返工 3：46 剩余半边经产品拍板改判不挡试点——2026-10-27 重判时点为挡 3 / 不挡 14，返工 1 前：挡 0 / 不挡 16，历史保留）。
 > 逐条判定、理由与文件:行号证据见各卡片的「**B 重判（2026-10-27）**」行；下方总表的未关行标题后带统一格式的判定标记（机械重算见 `bin/recount.sh`）。
 > 机械重算脚本 `bin/recount.sh`（不提交）的输出与本段、`consistency-ingest.md`、`active.md`、`CLAUDE.md`、`TASK_LIST.md` 中的数字一致。
 >
-> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #140），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；2026-10-27 重判时点为 已关 37 / 撤销 1 / 未关 19 / 挡试点 3 / 不挡试点 14（历史）。** **2026-11-06：IC-BUG-40 亦已修（PR #142：CP 启动存储自检，窗口耗尽拒绝运行），已关闭 39 + 未关闭 17、挡试点余 1（48）** **2026-11-09：IC-BUG-57 亦已修（分支 `chore/b7-small-followups`：`assume_role` 的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv），已关闭 40 + 未关闭 16、挡试点余 1（48）**
+> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #140），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；2026-10-27 重判时点为 已关 37 / 撤销 1 / 未关 19 / 挡试点 3 / 不挡试点 14（历史）。** **2026-11-06：IC-BUG-40 亦已修（PR #142：CP 启动存储自检，窗口耗尽拒绝运行），已关闭 39 + 未关闭 17、挡试点余 1（48）** **2026-11-09：IC-BUG-57 亦已修（分支 `chore/b7-small-followups`：`assume_role` 的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv），已关闭 40 + 未关闭 16、挡试点余 1（48）** **2026-11-09：IC-BUG-48 亦已修（分支 `fix/b7-ic-bug-48-content-identity`：内核元数据预筛 + 哈希确认，挡试点最后一条），已关闭 41 + 未关闭 15、挡试点 0——B7 试点前必修项清零**
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -169,7 +169,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-45 | tail 偏移在**事件发出时**推进而非**上传确认后**，一次彻底失败的 tail 上传会静默丢掉一段字节区间且无任何信号 〔B:不挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-46 | **`append_mode=tail` 静默丢数据**：`singlePartUpload` 在 `offset>0` 时把**只含增量**的内容 `PutObject` 到同一键，对象被整体替换，此前已采集的内容从对象中消失 ◐ **拆半**：挡掉半边 ✅ 随 IC-3（CP 422 + agent 闸门 + UI 禁用）；**正确实现归 IC-15** 〔B:不挡试点〕 | 🔴 P0 | agent |
 | IC-BUG-47 | 实时 fsnotify 事件路径仍用非阻塞 `emit`（满即丢弃），大量小文件并发写入时被丢弃的文件**永不被采集**——IC-5 的 F1 只修了初始扫描那一半 ✅ 随 IC-3 修复（4 处实时发送点全改 `emitBlocking`） | 🟠 P1 | agent |
-| IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 〔B:挡试点〕 | 🟡 P2 | agent |
+| IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 ✅ 已修（分支 `fix/b7-ic-bug-48-content-identity`：内核元数据预筛 + 哈希确认，见卡片「修复记录」）〔B:挡试点 → 2026-11-09 修复，挡试点清零〕 | 🟡 P2 | agent |
 | IC-BUG-49 | ~~`dest_path_template` 带不带 `{time}` 隐式决定「追加后产生新版本对象 vs 覆盖同一对象」，产品语义从未定义~~ **❌ 已撤销（2026-09-13，前提被实测证伪）**，其中成立的产品问题拆出为 [backlog](../backlog.md)「同一文件重复采集的覆盖语义」条目 | 🟡 P2 | 产品 + agent |
 | IC-BUG-50 | `time` 是**未声明的保留字**（三端契约只有 agent 知道）、**优先级与同体系系统变量相反**（无条件覆盖解析结果）、且**名字误导**（实为「文件被提交上传的时刻」）✅ 随 D-034 修复（PR #106：改名 `{submit_time}` + 解析结果优先 + 旧名 deprecated 兼容） | 🟡 P2 | agent + controlplane + webui |
 | IC-BUG-51 | 上报的 `sha256` / `size_bytes` / 实际上传字节**来自三次独立的文件读**，三者可以描述文件的不同版本；且 `PutObject` 返回的 ETag 虽已拿到却无人用来复核 ✅ 已修（分支 `fix/b7-ic-bug-51-single-read-hash`，PR #140：哈希/计数/上传共用同一次读 + 分片 ETag 验证） | 🟠 P1 | agent |
@@ -778,7 +778,9 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 并发写入远超 channel 缓冲的小文件（如 500 个），断言**全部**被采集，一个不丢；变异（改回 `emit`）必须稳定红 |
 | **归属** | **随 IC-3 修复**（F1 的另一半，不修等于 F1 只做了一半） |
 
-## IC-BUG-48 — 内容身份靠推断而非验证，两类改写永不重采 🟡 P2
+## IC-BUG-48 — 内容身份靠推断而非验证，两类改写永不重采 🟡 P2 ✅ 已修（分支 `fix/b7-ic-bug-48-content-identity`）
+
+> **定级与判定（历史快照）**：🟡 P2；B 重判 **挡试点**（返工 1 修订，2026-10-27）——2026-11-09 修复关闭后挡试点清零。以下「根因/后果」等列为发现时快照，修复形态见末行「修复记录」。
 
 | 字段 | 内容 |
 |------|------|
@@ -789,7 +791,8 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 把身份从推断升级为**验证**：已记录分片的 ETag 与**重新读取本地对应区间算出的 MD5** 比对；`mtime+size` 降级为廉价预筛。代价是本地重读已上传前缀（**纯本地 I/O，不走网络**；10GB 文件重读 10GB 本地，远比重传 10GB 便宜）。这是 S3 续传上传器的标准做法 |
 | **验收** | 同秒同尺寸改写后必须重采；保留 mtime 的原地重建（内容不同）必须重采；内容确实相同的重建仍可跳过（账本语义正确，无新内容可传） |
 | **归属** | **宜与 IC-15 同刀**——IC-15 本来就要定内容身份判据，一次解决续传版本判定 + 本条两个盲区 |
-| **B 重判（2026-10-27）** | **挡试点**（返工 1 修订） — 同秒同尺寸改写、保留 mtime 的内容替换被**永久**判为已采集：`processed_files` 持久化、重启不恢复，新内容静默漏采且无任何信号（A 基线只证明正常样本正确，不能证明错误分支安全，原「盲区窄」理由已删）。评审以真实 `Queue.UpsertProcessedFile`/`IsProcessed` 实测复现（生产函数 + 本地探针 `bin/review-r1-probe.log` TestReviewR1SameVersion，非 live）。**B7 必修**：内容身份升级为 ETag 验证（或等效可验收的输入约束），与 IC-15 同刀落地。证据：`queue.go:721-726`（四元组推断判重，无哈希校验）；`main.go:867-872`（`if done { return }`，无验证） |
+| **B 重判（2026-10-27）** | **挡试点**（返工 1 修订，时点快照，2026-11-09 修复后失效） — 同秒同尺寸改写、保留 mtime 的内容替换被**永久**判为已采集：`processed_files` 持久化、重启不恢复，新内容静默漏采且无任何信号（A 基线只证明正常样本正确，不能证明错误分支安全，原「盲区窄」理由已删）。评审以真实 `Queue.UpsertProcessedFile`/`IsProcessed` 实测复现（生产函数 + 本地探针 `bin/review-r1-probe.log` TestReviewR1SameVersion，非 live）。**B7 必修**：内容身份升级为 ETag 验证（或等效可验收的输入约束），与 IC-15 同刀落地。证据：`queue.go:721-726`（四元组推断判重，无哈希校验）；`main.go:867-872`（`if done { return }`，无验证） |
+| **✅ 修复记录（2026-11-09，分支 `fix/b7-ic-bug-48-content-identity`，基于 master `e756300`）** | **方案**（PoC 关口两次评审后拍板，`bin/ic48/design.md`）：**「内核元数据预筛 + 哈希确认」**，不再是 ETag 验证方向——判重的预筛字段换成写入方无法伪造的内核元数据：**纳秒 mtime + ctime（状态变更时间）+ 文件身份（dev+inode）**；任一字段不同 → `changed`（证明状态变了，不证明内容变了）→ 与不可判定（旧行缺列/字段缺失/racy）一起**读全文哈希确认**：相同 → 不上传、账本刷新（RefreshAndSkip），不同 → 正常上传；预筛全同且文件戳远早于快照锚点 → 不读文件跳过。**新包 `agent/internal/fileid`**（build tag 分平台）：unix 用 `syscall.Stat_t`（darwin/linux/BSD 三套 ctime 字段名）；windows 用 `x/sys/windows` 的 `GetFileInformationByHandle`（VolumeSerialNumber+FileIndexHigh/Low）+ `GetFileInformationByHandleEx(FileBasicInfo)` 的 **ChangeTime**（不是 CreationTime；x/sys 只有类常量，struct 自带定义）。**racy 窗口（git racily-clean，单边）**：`任一 stamp ≥ snapshotAt − 2s` → 不可判定；锚点是 **uploader 读文件前对同一 fd `f.Stat()` 的快照时刻**（不是 ack 时刻——ack 可滞后数小时，协调者批复反例：stat(0s)→读(1s)→同 tick 改写(1.5s)→60s 后 ack，锚在 ack 上会静默漏采）；收敛靠刷新（RefreshAndSkip 用本次快照+时刻覆盖账本，过 G 后自然放行）。**读后复核**：上传完对同一 fd 再 Fstat，与读前不一致 → `IdentityComplete=false` → 账本写零身份（下一轮必哈希确认），哈希/size 仍如实上报（#140 语义不变）。**账本**：`processed_files` 加 5 列（file_mtime_ns/ctime_ns/dev/ino/uploaded_at_ns，`ALTER TABLE` 迁移不删表），写入走 `CompleteReportedIdentity`（executor 经内存 inFlight 表把上传时身份投影给 ack 处理器；重放报告/无身份 → 零身份 → fail-closed）。**两个判重调用点**（`main.go` submitFile、`executor.processTask`）都改走 `DecideProcessed`，AST 守卫测试钉住不被绕回。**续传**：内容面已由 #140 覆盖（逐片 ETag↔本地 MD5），本刀只把版本快照（`FileVersion`）扩为全身份，`canResumeParts` 复用同一比较函数；快照缺任一字段 → 不续传（沿用 fail-closed）。**平台注意**（批复补充）：ReFS 64 位 FileIndex 不保证唯一 → 误报 changed → 哈希兜底；FAT 无 ChangeTime → undecidable；dev 号跨重启可变（overlay/NFS/btrfs）→ changed → 哈希，均安全向。**验收**：先红 6/8（master shim 重放四元组行为，`bin/ic48/evidence/red.txt`）；三条验收场景 + racy + 延迟 ack 反例 + 两轮收敛 + 旧行缺列 + 不可判定 + chmod-only + inode-only + 未来戳各有测试全绿；**变异自验 9/10 红**（去 ctime / 去 inode / 去 racy / 对称窗口 / 锚点改 ack / 去哈希确认 / changed 直采 / 刷新不前移锚点 / 读后复核失效；Windows ChangeTime→CreationTime 编译通过、行为面本机无法真跑，如实注明——`bin/ic48/evidence/mutation-results.txt`）；`go vet` + `go test` 全绿、`GOOS=windows vet/test -c` 编译通过；agent 总覆盖率 77.6%（= master 基线）。未动 proto/CP/webui（身份走内存通道不走 gRPC）。**残余**：IC-15 做 tail 时须把内容身份判据带入滚动分块路径（本刀判据是其地基） |
 
 ## IC-BUG-49 — 追加写入后「新版本对象 vs 覆盖」语义未定义 🟡 P2 ❌ 已撤销（2026-09-13）
 

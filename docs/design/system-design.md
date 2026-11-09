@@ -984,7 +984,10 @@ Scheduled 模式执行流程：
                 ├── 并发分片数：3（可配置）
                 └── Complete Multipart → 对象原子可见
 
-断点续传实现：
+断点续传实现（⚠️ 时点快照：实现已超前于本节——分片落盘/孤儿清理（#105）、
+逐片 ETag 与本地区间 MD5 比对（#140）、版本快照升级为全内核身份
+mtime-ns/ctime/dev+inode（IC-BUG-48）均已落地；权威描述以代码与
+bugs/open.md 各修复记录为准）：
   1. 上传开始前，在本地 SQLite 中创建 upload_tasks 记录
      字段：file_path, storage_path, upload_id（Multipart ID）,
            total_parts, completed_parts（JSON数组）, status
@@ -992,12 +995,16 @@ Scheduled 模式执行流程：
   3. 若上传中断（网络断开/进程重启）：
      a. 重启后扫描 status=in_progress 的记录
      b. 用 ListParts API 查询 MinIO 已完成的分片
-     c. 跳过已完成分片，从断点继续
+     c. 已传分片逐一核验（远端 ETag ↔ 本地区间重读 MD5，#140）后跳过，
+        版本身份不匹配则丢弃全部已传分片从头传
   4. 完成后调用 CompleteMultipartUpload
      └── 更新本地记录 status=completed，上报 UploadResult 给 Control Plane
 
-幂等性保证：
-  - 上传前计算文件 SHA-256
+幂等性保证（⚠️ 时点快照：本节为 §4.5 原始设计；实现已超前于本节——
+sha256 与上传字节共用同一次读（#140），判重/续传内容身份已升级为
+「内核元数据预筛 + 哈希确认」（IC-BUG-48，见 bugs/open.md 修复记录），
+权威描述以代码与 bugs/open.md 修复记录为准）：
+  - sha256 在上传流上以 TeeReader 同读得出（#140），不做事前预读
   - Control Plane 收到 UploadResult 后检查 (bucket, storage_path, sha256)
   - 重复上报同一文件时，幂等更新 file_entries，不创建重复记录
 ```
@@ -1031,6 +1038,13 @@ CREATE TABLE processed_files (
     file_mtime  INTEGER NOT NULL,
     sha256      TEXT,
     uploaded_at INTEGER NOT NULL,
+    -- IC-BUG-48 内容身份列（纳秒 mtime/ctime + dev/inode + 快照时刻锚点）；
+    -- 零值 = 未知（旧行/平台缺字段）→ 判重时视为不可判定 → 哈希确认
+    file_mtime_ns  INTEGER NOT NULL DEFAULT 0,
+    file_ctime_ns  INTEGER NOT NULL DEFAULT 0,
+    file_dev       INTEGER NOT NULL DEFAULT 0,
+    file_ino       INTEGER NOT NULL DEFAULT 0,
+    uploaded_at_ns INTEGER NOT NULL DEFAULT 0,
     UNIQUE (rule_id, local_path)
 );
 
