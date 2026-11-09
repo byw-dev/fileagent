@@ -289,7 +289,7 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 	}
 
 	if isMultipart {
-		result, err = u.multipartUpload(ctx, task, current, fileSize)
+		result, err = u.multipartUpload(ctx, f, task, current, fileSize)
 		// The ETag verification of skipped parts can fail even when every
 		// stat-based gate passed (same size, same mtime — e.g. an in-place
 		// rewrite that restored mtime). The recorded parts are then unusable:
@@ -306,10 +306,10 @@ func (u *Uploader) UploadFile(ctx context.Context, task *queue.UploadTask) (*Upl
 			}
 			task.UploadID = ""
 			task.CompletedParts = ""
-			result, err = u.multipartUpload(ctx, task, current, fileSize)
+			result, err = u.multipartUpload(ctx, f, task, current, fileSize)
 		}
 	} else {
-		result, err = u.singlePartUpload(ctx, task, offset, uploadSize)
+		result, err = u.singlePartUpload(ctx, f, task, offset, uploadSize)
 	}
 	if err != nil {
 		return nil, err
@@ -409,15 +409,13 @@ func (u *Uploader) AbandonUpload(ctx context.Context, task *queue.UploadTask) er
 // hash/size describing precisely that prefix. A file that SHRINKS mid-upload
 // still fails the count check below loudly. Either way the reported metadata
 // can only ever describe the bytes that were actually sent.
-func (u *Uploader) singlePartUpload(ctx context.Context, task *queue.UploadTask, offset, size int64) (*UploadResult, error) {
-	f, err := os.Open(task.LocalPath)
-	if err != nil {
-		return nil, fmt.Errorf("uploader: open %q: %w", task.LocalPath, err)
-	}
-	defer f.Close()
+func (u *Uploader) singlePartUpload(ctx context.Context, f *os.File, task *queue.UploadTask, offset, size int64) (*UploadResult, error) {
+	// Rework-2 blocker 1: f is the ONE handle UploadFile opened and stat'ed —
+	// re-opening by path here would let the path swap to another file between
+	// the identity stat and the read (identity of A, bytes of B).
 
 	if offset > 0 {
-		if _, err = f.Seek(offset, io.SeekStart); err != nil {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
 			return nil, fmt.Errorf("uploader: seek %q to %d: %w", task.LocalPath, offset, err)
 		}
 	}

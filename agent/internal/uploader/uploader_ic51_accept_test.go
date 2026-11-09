@@ -519,7 +519,12 @@ func TestIC51_Multipart_StreamedRanges_NoFullPartBuffer(t *testing.T) {
 
 	// The streamed MD5 of the whole range equals the in-memory digest, and
 	// the byte count is exact.
-	got, n, err := streamRangeMD5(path, 0, int64(len(content)))
+	// Rework-2 blocker 1: these helpers read from an fd, so open once here.
+	f, ferr := os.Open(path)
+	require.NoError(t, ferr)
+	defer f.Close()
+
+	got, n, err := streamRangeMD5(f, 0, int64(len(content)))
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(content)), n)
 	h := md5.Sum(content)
@@ -527,13 +532,13 @@ func TestIC51_Multipart_StreamedRanges_NoFullPartBuffer(t *testing.T) {
 
 	var count int64
 	sink := countingWriter{n: &count}
-	n, err = streamRangeInto(path, 4*mib, 8*mib, sink)
+	n, err = streamRangeInto(f, 4*mib, 8*mib, sink)
 	require.NoError(t, err)
 	assert.Equal(t, int64(8*mib), n)
 	assert.Equal(t, int64(8*mib), count)
 
 	// Short read is an error, not a partial success.
-	_, _, err = streamRangeMD5(path, 0, int64(len(content))+1)
+	_, _, err = streamRangeMD5(f, 0, int64(len(content))+1)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "shrank")
 }

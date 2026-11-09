@@ -95,7 +95,12 @@ func canResumeParts(task *queue.UploadTask, current queue.FileVersion, statOK, i
 // parts) would produce a digest of a byte sequence that never existed as an
 // object. The digests and the delivered-byte count are the ONLY source for
 // UploadResult.SHA256 / SizeBytes — the stat snapshot is never used for them.
-func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, fv queue.FileVersion, size int64) (*UploadResult, error) {
+func (u *Uploader) multipartUpload(ctx context.Context, f *os.File, task *queue.UploadTask, fv queue.FileVersion, size int64) (*UploadResult, error) {
+	// Rework-2 blocker 1: f is the ONE handle UploadFile opened and stat'ed.
+	// Every part read — uploaded or resumed — comes from THIS fd via
+	// io.NewSectionReader (ReadAt), never from a path re-open: a path swap
+	// between the identity stat and any part read would splice another
+	// file's bytes into this object under this file's identity.
 	partSize := int64(u.cfg.PartSizeMB) * 1024 * 1024
 
 	uploadID := task.UploadID
@@ -157,10 +162,11 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 			// in the ordered loop below; that second read is the price of
 			// feeding the digest strictly in order, and it is still local I/O.
 			for _, p := range doneParts {
-				if err := u.verifyResumePartETag(task, size, partSize, p); err != nil {
+				if err := u.verifyResumePartETag(f, task, size, partSize, p); err != nil {
 					return nil, fmt.Errorf("%w: part %d: %v", errStaleRemoteParts, p.PartNumber, err)
 				}
 			}
+
 			// The acceptance evidence for IC-BUG-5 lives in this line: a resume
 			// must be visible in the log together with how many parts were
 			// skipped, and the upload ID must be the one recorded before the
@@ -241,8 +247,9 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 			// range through the digest AT THIS POSITION (order law) and verify
 			// the remote ETag over THAT SAME read — the correctness check
 			// (rework-2 fix 1): the up-front pre-check used a different read,
-			// and the file may have changed since.
-			if err := u.hashResumePartChecked(task, size, partSize, partNum, remoteETags[partNum], fullSHA, &hashedBytes); err != nil {
+			// and the file may have changed since. Rework-2 blocker 1: the
+			// read comes from the SAME fd UploadFile stat'ed (no path re-open).
+			if err := u.hashResumePartChecked(f, task, size, partSize, partNum, remoteETags[partNum], fullSHA, &hashedBytes); err != nil {
 				return nil, fmt.Errorf("%w: part %d: %v", errStaleRemoteParts, partNum, err)
 			}
 			completeParts = append(completeParts, minio.CompletePart{PartNumber: partNum, ETag: remoteETags[partNum]})
@@ -255,25 +262,16 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 			pSize = remaining
 		}
 
-		f, err := os.Open(task.LocalPath)
-		if err != nil {
-			return nil, fmt.Errorf("uploader: open part %d of %q: %w", partNum, task.LocalPath, err)
-		}
-		if offset > 0 {
-			if _, err = f.Seek(offset, io.SeekStart); err != nil {
-				_ = f.Close()
-				return nil, fmt.Errorf("uploader: seek %q to %d for part %d: %w", task.LocalPath, offset, partNum, err)
-			}
-		}
 		// IC-BUG-51: the part's bytes stream through the full-file digest on
 		// their way to the store — one read feeds both. A short file (the
 		// source shrank mid-upload) makes the count check below fail loudly.
+		// Rework-2 blocker 1: SectionReader over the ONE handle UploadFile
+		// opened — ReadAt leaves f's offset untouched across parts.
 		md5h := md5.New()
-		body := &countingTeeReader{r: io.LimitReader(f, pSize), w: io.MultiWriter(fullSHA, md5h)}
+		body := &countingTeeReader{r: io.NewSectionReader(f, offset, pSize), w: io.MultiWriter(fullSHA, md5h)}
 
 		part, err := u.store.PutObjectPart(ctx, task.Bucket, task.StoragePath, uploadID,
 			partNum, body, pSize, minio.PutObjectPartOptions{})
-		_ = f.Close()
 		if err != nil {
 			return nil, fmt.Errorf("uploader: upload part %d: %w", partNum, err)
 		}
@@ -373,7 +371,7 @@ func (u *Uploader) multipartUpload(ctx context.Context, task *queue.UploadTask, 
 //     the bytes the object holds cannot be re-derived, so the resume is off;
 //   - the part's range lies outside the planned object layout (remote list
 //     disagrees with the local plan): undescribable, treat as stale.
-func (u *Uploader) verifyResumePartETag(task *queue.UploadTask, totalSize, partSize int64, part minio.CompletePart) error {
+func (u *Uploader) verifyResumePartETag(f *os.File, task *queue.UploadTask, totalSize, partSize int64, part minio.CompletePart) error {
 	offset, pSize, err := partRange(part.PartNumber, totalSize, partSize)
 	if err != nil {
 		return err
@@ -381,7 +379,7 @@ func (u *Uploader) verifyResumePartETag(task *queue.UploadTask, totalSize, partS
 	if !etagIsComparable(part.ETag) {
 		return fmt.Errorf("remote ETag %q is not a comparable md5 digest", part.ETag)
 	}
-	got, _, err := streamRangeMD5(task.LocalPath, offset, pSize)
+	got, _, err := streamRangeMD5(f, offset, pSize)
 	if err != nil {
 		return err
 	}
@@ -403,13 +401,13 @@ func (u *Uploader) verifyResumePartETag(task *queue.UploadTask, totalSize, partS
 // errStaleRemoteParts (the caller discards the upload and starts over) —
 // by that point some later parts may already have been uploaded, which is
 // wasted work but never a wrong result.
-func (u *Uploader) hashResumePartChecked(task *queue.UploadTask, totalSize, partSize int64, partNum int, remoteETag string, fullSHA io.Writer, hashedBytes *int64) error {
+func (u *Uploader) hashResumePartChecked(f *os.File, task *queue.UploadTask, totalSize, partSize int64, partNum int, remoteETag string, fullSHA io.Writer, hashedBytes *int64) error {
 	offset, pSize, err := partRange(partNum, totalSize, partSize)
 	if err != nil {
 		return err
 	}
 	md5h := md5.New()
-	n, err := streamRangeInto(task.LocalPath, offset, pSize, io.MultiWriter(fullSHA, md5h))
+	n, err := streamRangeInto(f, offset, pSize, io.MultiWriter(fullSHA, md5h))
 	if err != nil {
 		return err
 	}
@@ -428,37 +426,29 @@ func (u *Uploader) hashResumePartChecked(task *queue.UploadTask, totalSize, part
 	return nil
 }
 
-// streamRangeMD5 streams the [offset, offset+pSize) range of path through an
-// MD5 without buffering the range (a part can be 64 MiB and the agent runs
-// on edge devices), returning the hex digest and the number of bytes read.
-// A short read or I/O error is returned as an error — never silently
-// under-counted.
-func streamRangeMD5(path string, offset, pSize int64) (string, int64, error) {
+// streamRangeMD5 streams the [offset, offset+pSize) range through an MD5
+// from the given fd (rework-2 blocker 1: same fd as the identity stat — no
+// path re-open) without buffering the range (a part can be 64 MiB and the
+// agent runs on edge devices), returning the hex digest and the number of
+// bytes read. A short read or I/O error is returned as an error — never
+// silently under-counted. The fd's file offset is left unmodified (ReadAt).
+func streamRangeMD5(f *os.File, offset, pSize int64) (string, int64, error) {
 	md5h := md5.New()
-	n, err := streamRangeInto(path, offset, pSize, md5h)
+	n, err := streamRangeInto(f, offset, pSize, md5h)
 	if err != nil {
 		return "", 0, err
 	}
 	return hex.EncodeToString(md5h.Sum(nil)), n, nil
 }
 
-// streamRangeInto streams exactly pSize bytes starting at offset from path
-// into w (no whole-range buffering) and returns the number of bytes
-// written. A short read means the file no longer contains the bytes the
-// remote part holds (truncated since the part was uploaded) — the local copy
-// cannot describe the object, so it is an error, not a partial success.
-func streamRangeInto(path string, offset, pSize int64, w io.Writer) (int64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, fmt.Errorf("open %q: %w", path, err)
-	}
-	defer f.Close()
-	if offset > 0 {
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			return 0, fmt.Errorf("seek %q to %d: %w", path, offset, err)
-		}
-	}
-	n, err := io.Copy(w, io.LimitReader(f, pSize))
+// streamRangeInto streams exactly pSize bytes starting at offset from the fd
+// into w (no whole-range buffering, ReadAt so the fd offset is untouched)
+// and returns the number of bytes written. A short read means the file no
+// longer contains the bytes the remote part holds (truncated since the part
+// was uploaded) — the local copy cannot describe the object, so it is an
+// error, not a partial success.
+func streamRangeInto(f *os.File, offset, pSize int64, w io.Writer) (int64, error) {
+	n, err := io.Copy(w, io.NewSectionReader(f, offset, pSize))
 	if err != nil {
 		return n, fmt.Errorf("read range [%d,%d): %w", offset, offset+pSize, err)
 	}

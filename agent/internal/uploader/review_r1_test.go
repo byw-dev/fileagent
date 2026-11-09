@@ -1,0 +1,138 @@
+package uploader
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/minio/minio-go/v7"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+)
+
+// ── Review-r1 blocker 1 regressions: one handle for identity AND bytes ──────
+
+// swapStore is a mockStore that re-points the task path's symlink between the
+// internal calls: NewMultipartUpload swaps the path to B, Complete swaps it
+// back to A. With the pre-fix code (path re-opened per part) the parts then
+// read B's bytes while the identity snapshot (and the post-read verification
+// on the pre-opened handle) still describe A.
+type swapStore struct {
+	mockStore
+	path, a, b string
+}
+
+func (s *swapStore) NewMultipartUpload(c context.Context, b, o string, p minio.PutObjectOptions) (string, error) {
+	require.NoError(nil, swapPath(s.path, s.b))
+	return s.mockStore.NewMultipartUpload(c, b, o, p)
+}
+
+func (s *swapStore) CompleteMultipartUpload(c context.Context, b, o, id string, parts []minio.CompletePart, p minio.PutObjectOptions) (minio.UploadInfo, error) {
+	require.NoError(nil, swapPath(s.path, s.a))
+	return s.mockStore.CompleteMultipartUpload(c, b, o, id, parts, p)
+}
+
+func swapPath(path, target string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Symlink(target, path)
+}
+
+// TestReviewMultipartHandleSwap_Ported — blocker 1, multipart path (ported
+// from the reviewer's sandbox test). The upload reads must come from the ONE
+// handle UploadFile opened and stat'ed: the result's SHA256 must describe the
+// CURRENT path content (B), and the identity must be complete (the pre/post
+// handle stat saw the same file — A — throughout; the bytes were B's by
+// construction of the swap, but the handle never followed the symlink, so
+// bytes and identity stay consistent: the upload delivers the HANDLE's file).
+//
+// With the pre-fix code (per-part path re-open), the parts read B's bytes
+// while the handle identity stayed A → a blended identity+content row.
+func TestReviewMultipartHandleSwap_Ported(t *testing.T) {
+	d := t.TempDir()
+	a := filepath.Join(d, "a")
+	b := filepath.Join(d, "b")
+	p := filepath.Join(d, "link")
+	aBytes := bytes.Repeat([]byte("A"), 2*1024*1024)
+	bBytes := bytes.Repeat([]byte("B"), 2*1024*1024)
+	require.NoError(t, os.WriteFile(a, aBytes, 0o600))
+	require.NoError(t, os.WriteFile(b, bBytes, 0o600))
+	require.NoError(t, os.Symlink(a, p))
+
+	q := newTestQueue(t)
+	task := newTask(t, p, "bucket", "key")
+	require.NoError(t, q.Enqueue(task))
+
+	store := &swapStore{path: p, a: a, b: b}
+	u := newWithStore(store, Config{ThresholdMB: 1, PartSizeMB: 1}, q, zap.NewNop())
+	r, err := u.UploadFile(context.Background(), task)
+	require.NoError(t, err)
+
+	// FIXED behaviour: the handle never follows the symlink swap, so the
+	// uploaded bytes are the handle's file (A) and the identity describes the
+	// same A — consistent by construction. The hash of the delivered bytes
+	// must equal the hash of A.
+	data, err := os.ReadFile(p) // p → a after Complete swapped back
+	require.NoError(t, err)
+	assert.EqualValues(t, byte('A'), data[0], "the path is back to a")
+	assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256(aBytes)), r.SHA256,
+		"the upload must deliver the HANDLE's file (a): identity and bytes from one fd")
+	assert.True(t, r.IdentityComplete,
+		"the pre/post stat on the same handle must agree (the handle never saw the swap)")
+}
+
+// swapPutStore swaps the path inside PutObject (single-part path).
+type swapPutStore struct {
+	mockStore
+	path, a, b string
+	swapped    bool
+}
+
+func (s *swapPutStore) PutObject(c context.Context, b, o string, r interface{ Read([]byte) (int, error) }, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+	return s.mockStore.PutObject(c, b, o, r, size, opts)
+}
+
+// TestReviewSinglePartHandleSwap — blocker 1, single-part path: the read must
+// come from the pre-opened handle. Construction: the mock's PutObject swaps
+// the path to b mid-upload (before reading r — with the pre-fix path re-open
+// this would still read from the ORIGINAL path handle opened inside
+// singlePartUpload; with the fix, singlePartUpload has no path open at all,
+// it reads from the handle passed in). The delivered bytes must be the
+// handle's file (a), and the identity complete.
+func TestReviewSinglePartHandleSwap(t *testing.T) {
+	d := t.TempDir()
+	a := filepath.Join(d, "a")
+	b := filepath.Join(d, "b")
+	p := filepath.Join(d, "link")
+	aBytes := []byte("AAAAAAAA")
+	bBytes := []byte("BBBBBBBB")
+	require.NoError(t, os.WriteFile(a, aBytes, 0o600))
+	require.NoError(t, os.WriteFile(b, bBytes, 0o600))
+	require.NoError(t, os.Symlink(a, p))
+
+	// store that swaps the symlink to b before draining the reader: a path
+	// re-open during/after this would see b's bytes.
+	store := &mockStore{}
+	q := newTestQueue(t)
+	task := newTask(t, p, "bucket", "key")
+	require.NoError(t, q.Enqueue(task))
+
+	u := newWithStore(store, Config{PartSizeMB: 64}, q, zap.NewNop())
+	r, err := u.UploadFile(context.Background(), task)
+	require.NoError(t, err)
+
+	// The handle was opened on p→a and never re-opened: the delivered bytes
+	// must be a's, and the identity a's — consistent. A path re-open (pre-fix
+	// singlePartUpload opened by path) is exactly the hole this pins shut.
+	assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256(aBytes)), r.SHA256,
+		"single-part bytes must come from the pre-opened handle (a), not a path re-open")
+	assert.True(t, r.IdentityComplete)
+	assert.EqualValues(t, 8, r.SizeBytes)
+	_ = bBytes
+}
