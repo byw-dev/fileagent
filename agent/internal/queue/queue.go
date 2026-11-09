@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS upload_tasks (
     upload_id      TEXT,
     completed_parts TEXT,
     parts_file_mtime INTEGER NOT NULL DEFAULT 0,
+    file_ctime_ns  INTEGER NOT NULL DEFAULT 0,
+    file_dev       INTEGER NOT NULL DEFAULT 0,
+    file_ino       INTEGER NOT NULL DEFAULT 0,
+    file_mtime_ns  INTEGER NOT NULL DEFAULT 0,
     parts_file_size  INTEGER NOT NULL DEFAULT 0,
     file_size      INTEGER NOT NULL DEFAULT 0,
     file_mtime     INTEGER NOT NULL DEFAULT 0,
@@ -114,6 +118,13 @@ var schemaMigrations = []string{
 	`ALTER TABLE upload_tasks ADD COLUMN append_mode TEXT NOT NULL DEFAULT 'overwrite'`,
 	`ALTER TABLE upload_tasks ADD COLUMN next_retry_at INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN parts_file_mtime INTEGER NOT NULL DEFAULT 0`,
+	// IC-BUG-48 rework-4: the active-task dedup guard compares the full
+	// kernel identity, so a preserved-mtime rewrite during an in-flight
+	// upload is NOT suppressed (its ctime/inode differ).
+	`ALTER TABLE upload_tasks ADD COLUMN file_ctime_ns INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE upload_tasks ADD COLUMN file_dev INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE upload_tasks ADD COLUMN file_ino INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE upload_tasks ADD COLUMN file_mtime_ns INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN parts_file_size INTEGER NOT NULL DEFAULT 0`,
 	// IC-BUG-48 content identity for the processed-files ledger and the
 	// multipart resume snapshot (parts_*). Zero = unknown (rows written before
@@ -178,6 +189,18 @@ type UploadTask struct {
 	// PartsFileMtimeNs is the nanosecond mtime of the recorded version
 	// (IC-BUG-48). Zero = legacy row → undecidable → no resume.
 	PartsFileMtimeNs int64
+	// FileCtimeNs / FileDev / FileIno / FileMtimeNs carry the enqueue-time
+	// kernel identity (rework-4): EnqueueIfNoActive compares THESE (not the
+	// second-granularity mtime + size) against active tasks, so a
+	// preserved-mtime rewrite during an in-flight upload enqueues a second
+	// task instead of being suppressed. Zero fields = legacy row → the
+	// guard falls back to the legacy tuple comparison (conservative: it may
+	// suppress a preserved-mtime rewrite queued before this column existed,
+	// exactly the pre-rework behaviour).
+	FileCtimeNs int64
+	FileDev     uint64
+	FileIno     uint64
+	FileMtimeNs int64
 	FileSize         int64
 	FileMtime        int64
 	SHA256           string
@@ -307,30 +330,58 @@ func (q *Queue) Enqueue(task *UploadTask) error {
 	return nil
 }
 
-// EnqueueIfNoActive inserts task unless the same rule, path, modification
-// time, and size already has a pending, running, or reported task. The guard
-// and insert are one SQLite statement so concurrent producers cannot enqueue
-// the same active file version twice. Failed and completed rows do not block a
-// later collection attempt.
+// EnqueueIfNoActive inserts task unless the same rule, path and VERSION
+// identity already has a pending, running, or reported task. The guard and
+// insert are one SQLite statement so concurrent producers cannot enqueue
+// the same active file version twice. Failed and completed rows do not
+// block a later collection attempt.
+//
+// Version identity (rework-4): when the task carries a full kernel identity
+// (ctime/dev/ino non-zero), the guard compares THAT — a preserved-mtime
+// rewrite during an in-flight upload has a different ctime/inode and is
+// therefore enqueued as a second task (the in-flight one keeps uploading the
+// old bytes; DecideProcessed's hash confirmation then re-collects the new
+// version). Zero identity fields (legacy callers) fall back to the legacy
+// second-granularity tuple comparison — the pre-rework behaviour.
 func (q *Queue) EnqueueIfNoActive(ctx context.Context, task *UploadTask) (bool, error) {
 	prepareEnqueue(task)
+	// taskHasIdentity: the candidate carries a full kernel identity (rework-4).
+	taskHasIdentity := 0
+	if task.FileCtimeNs != 0 && task.FileDev != 0 && task.FileIno != 0 {
+		taskHasIdentity = 1
+	}
 	result, err := q.db.ExecContext(ctx, `
         INSERT INTO upload_tasks
             (id, rule_id, local_path, storage_path, bucket, upload_id,
              completed_parts, file_size, file_mtime, sha256, status,
-             retry_count, last_error, created_at, updated_at, file_offset, append_mode)
-        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+             retry_count, last_error, created_at, updated_at, file_offset, append_mode,
+             file_ctime_ns, file_dev, file_ino, file_mtime_ns)
+        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+               ?,?,?,?
         WHERE NOT EXISTS (
             SELECT 1 FROM upload_tasks
-            WHERE rule_id=? AND local_path=? AND file_mtime=? AND file_size=?
-              AND status IN (?, ?, ?)
+            WHERE rule_id=? AND local_path=? AND status IN (?, ?, ?)
+              AND (
+                -- full identity comparison when the candidate carries one
+                (? = 1 AND file_ctime_ns=? AND file_dev=? AND file_ino=? AND file_mtime_ns=? AND file_size=?)
+                OR
+                -- legacy fallback (candidate has no identity)
+                (? = 0 AND file_mtime=? AND file_size=?)
+              )
         )`,
+		// INSERT values
 		task.ID, task.RuleID, task.LocalPath, task.StoragePath, task.Bucket,
 		task.UploadID, task.CompletedParts, task.FileSize, task.FileMtime,
 		task.SHA256, task.Status, task.RetryCount, task.LastError,
 		task.CreatedAt, task.UpdatedAt, task.FileOffset, task.AppendMode,
-		task.RuleID, task.LocalPath, task.FileMtime, task.FileSize,
+		task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs,
+		// guard params
+		task.RuleID, task.LocalPath,
 		StatusPending, StatusRunning, StatusReported,
+		// identity comparison (candidate side)
+		taskHasIdentity, task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs, task.FileSize,
+		// legacy comparison (candidate side)
+		taskHasIdentity, task.FileMtime, task.FileSize,
 	)
 	if err != nil {
 		return false, fmt.Errorf("queue: enqueue task %q if inactive: %w", task.ID, err)

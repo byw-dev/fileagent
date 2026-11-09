@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/byw-dev/fileagent/agent/internal/fileid"
 )
 
 // racyGranularityNs is the timestamp granularity the racy-window judgement
@@ -331,6 +333,13 @@ func (q *Queue) DecideProcessed(ctx context.Context, ruleID, localPath string, c
 		return CandidateDecision{Verdict: RefreshAndSkip, Prefilter: pv, RecordedSHA: rec.sha256}, nil
 	}
 	return CandidateDecision{Verdict: Recollect, Prefilter: pv, RecordedSHA: rec.sha256}, nil
+}
+
+// IdentityFromFileid adapts a fileid.Identity (the watcher's version key)
+// to the queue's FileIdentity verdict input (rework-2 blocker 1: the watcher
+// dedups by the same kernel identity the ledger uses).
+func IdentityFromFileid(id fileid.Identity) FileIdentity {
+	return FileIdentity{MtimeNs: id.MtimeNs, CtimeNs: id.CtimeNs, Dev: id.Dev, Ino: id.Ino, Size: id.Size, SnapAtNs: id.SnapAtNs}
 }
 
 // processedRecord is the ledger row relevant to a candidate decision.
