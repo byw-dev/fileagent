@@ -379,7 +379,7 @@ Error，不是 Fatal），进程非零退出）。窗口内 `/healthz` 照常 20
 |------|------|------|
 | `s3_code=SignatureDoesNotMatch` | secret 与存储侧不一致（含轮换后漏改） | 对齐 `MINIO_SECRET_KEY` 与存储侧 CP 身份；若要轮换用 `CP_ADMIN_ROTATE=1` 重跑 init |
 | `s3_code=InvalidAccessKeyId` | CP 身份不存在于存储侧 | 全新环境：先跑 init 脚本再重启 CP；已初始化环境：检查 `MINIO_ACCESS_KEY` 是否被改 |
-| `s3_code=NoSuchBucket` | 探测桶不存在 | 全新环境先跑 init；自定义 `MINIO_STARTUP_CHECK_BUCKET` 的桶要事先创建（MinIO 的 init 固定只建 `data-sensor`，SeaweedFS 可用 `SW_BUCKET_DATA`） |
+| `s3_code=NoSuchBucket` | 探测桶不存在 | 全新环境先跑 init；自定义 `MINIO_STARTUP_CHECK_BUCKET` 的桶要事先创建（MinIO 的 init 固定只建 `data-sensor` 与 `tmp-uploads` 两个桶，其他桶不建；SeaweedFS 可用 `SW_BUCKET_DATA`） |
 | `http_status=200` 且无 `s3_code` | 200 但不是该桶的 S3 列表响应 | `MINIO_ENDPOINT` 可能指向了别的服务/被网关错误路由，核对 S3 API 地址 |
 | `sts_code=AccessDenied` 且 `class=config`（仅 SeaweedFS） | role 未授权 | `MINIO_ROLE_ARN` 与 iam.json 的 role 不一致（SeaweedFS 默认 12 零账号段，MinIO 默认空账号段，不可混用） |
 | `net_kind=dial_refused`/`timeout` 等（network） | 存储晚于 CP 或端点配错 | 窗口内会自行恢复；持续失败则检查 `MINIO_ENDPOINT` 与存储是否在跑 |
