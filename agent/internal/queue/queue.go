@@ -55,6 +55,16 @@ CREATE TABLE IF NOT EXISTS processed_files (
     file_mtime  INTEGER NOT NULL,
     sha256      TEXT,
     uploaded_at INTEGER NOT NULL,
+    -- IC-BUG-48 content identity: nanosecond mtime, kernel ctime (cannot be
+    -- forged via utimes/touch) and the file identity (device + inode; a
+    -- delete-and-recreate always changes it). Zero = unknown (legacy rows and
+    -- platforms/filesystems that do not provide the field) → the verdict
+    -- logic treats the row as undecidable → hash confirmation (fail-closed).
+    file_mtime_ns INTEGER NOT NULL DEFAULT 0,
+    file_ctime_ns INTEGER NOT NULL DEFAULT 0,
+    file_dev      INTEGER NOT NULL DEFAULT 0,
+    file_ino      INTEGER NOT NULL DEFAULT 0,
+    uploaded_at_ns INTEGER NOT NULL DEFAULT 0,
     UNIQUE (rule_id, local_path)
 );
 
@@ -105,6 +115,17 @@ var schemaMigrations = []string{
 	`ALTER TABLE upload_tasks ADD COLUMN next_retry_at INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN parts_file_mtime INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN parts_file_size INTEGER NOT NULL DEFAULT 0`,
+	// IC-BUG-48 content identity for the processed-files ledger and the
+	// multipart resume snapshot (parts_*). Zero = unknown (rows written before
+	// the columns existed) → undecidable → hash confirmation / no resume.
+	`ALTER TABLE processed_files ADD COLUMN file_mtime_ns INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE processed_files ADD COLUMN file_ctime_ns INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE processed_files ADD COLUMN file_dev INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE processed_files ADD COLUMN file_ino INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE processed_files ADD COLUMN uploaded_at_ns INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE upload_tasks ADD COLUMN parts_file_ctime_ns INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE upload_tasks ADD COLUMN parts_file_dev INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE upload_tasks ADD COLUMN parts_file_ino INTEGER NOT NULL DEFAULT 0`,
 }
 
 // Status values for upload tasks.
@@ -140,12 +161,22 @@ type UploadTask struct {
 	CompletedParts string
 	// PartsFileMtime / PartsFileSize identify the file version (mtime seconds
 	// + size) that the recorded multipart parts were read from (IC-3 R-A).
-	// A resume whose current file no longer matches must discard the recorded
-	// parts — resuming them would splice old and new content into one object.
-	// Zero/zero means "no snapshot" (legacy rows) and is treated as a
-	// mismatch: unversioned parts are never trusted for a resume.
-	PartsFileMtime int64
-	PartsFileSize  int64
+	// PartsFileCtimeNs / PartsFileDev / PartsFileIno carry the full IC-BUG-48
+	// kernel identity (nanosecond ctime + device/inode). A resume whose
+	// current file no longer matches — on ANY of these fields, or whose
+	// snapshot carries unknown (zero) fields — must discard the recorded
+	// parts: resuming them would splice old and new content into one object.
+	// Zero/zero ctime/dev/ino means "no identity snapshot" (legacy rows) and
+	// is treated as undecidable: unversioned parts are never trusted for a
+	// resume.
+	PartsFileMtime    int64
+	PartsFileSize     int64
+	PartsFileCtimeNs  int64
+	PartsFileDev      uint64
+	PartsFileIno      uint64
+	// PartsFileMtimeNs is the nanosecond mtime of the recorded version
+	// (IC-BUG-48). Zero = legacy row → undecidable → no resume.
+	PartsFileMtimeNs int64
 	FileSize       int64
 	FileMtime      int64
 	SHA256         string
@@ -192,6 +223,13 @@ type ProcessedFile struct {
 	FileMtime  int64
 	SHA256     string
 	UploadedAt int64
+	// Ident carries the IC-BUG-48 kernel content identity of the uploaded
+	// version (nanosecond mtime/ctime + device/inode). Zero fields mean
+	// unknown → the verdict logic hash-confirms instead of trusting them.
+	Ident FileIdentity
+	// UploadedAtNs is the nanosecond write time of the record — the anchor
+	// for the racy-window judgement. Zero = unknown → undecidable.
+	UploadedAtNs int64
 }
 
 // Rule represents a row in the rules table.
@@ -390,6 +428,7 @@ func (q *Queue) DeleteOldestEvictable(excludeID string) (*UploadTask, error) {
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
                retry_count, next_retry_at, parts_file_mtime, parts_file_size,
+               parts_file_ctime_ns, parts_file_dev, parts_file_ino, parts_file_mtime_ns,
                last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
@@ -457,6 +496,7 @@ func (q *Queue) DequeuePending(limit int) ([]*UploadTask, error) {
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
                retry_count, next_retry_at, parts_file_mtime, parts_file_size,
+               parts_file_ctime_ns, parts_file_dev, parts_file_ino, parts_file_mtime_ns,
                last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
@@ -515,6 +555,7 @@ func (q *Queue) ResetRunningToPending(ctx context.Context) (int64, error) {
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
                retry_count, next_retry_at, parts_file_mtime, parts_file_size,
+               parts_file_ctime_ns, parts_file_dev, parts_file_ino, parts_file_mtime_ns,
                last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
@@ -571,14 +612,35 @@ func (q *Queue) ResetRunningToPending(ctx context.Context) (int64, error) {
 }
 
 // FileVersion identifies the content of the local file that a multipart
-// upload's recorded parts were read from: mtime (unix seconds) + size. Two
-// versions equal only when both match — the same test IsProcessed applies to
-// whole files (IC-BUG-10). Files rewritten within the same second at the same
-// size are indistinguishable; that residual blind spot is accepted and shared
-// with every other mtime+size identity in this codebase.
+// upload's recorded parts were read from (IC-BUG-48): the full kernel
+// identity — nanosecond mtime, nanosecond ctime (status-change time, which a
+// writer cannot forge via utimes/touch) and the file identity Dev+Ino (a
+// delete-and-recreate always changes it, even when cp -p preserves every
+// timestamp) — plus the second-granularity mtime kept for the legacy columns.
+// Two versions equal only when every field matches; the same verdict logic
+// (PrefilterVerdict) backs both this comparison and the processed-files
+// dedup, so there is exactly one identity comparison in the codebase.
+// A zero field means unknown: snapshot rows with any unknown field are never
+// trusted for a resume (fail-closed) — the recorded parts are discarded and
+// the file re-uploaded from scratch.
 type FileVersion struct {
-	Mtime int64
-	Size  int64
+	Mtime   int64 // unix seconds (legacy column; derived from MtimeNs)
+	Size    int64
+	MtimeNs int64 // unix nanoseconds
+	CtimeNs int64 // unix nanoseconds
+	Dev     uint64
+	Ino     uint64
+}
+
+// IdentityFromFileVersion adapts a FileVersion to the shared verdict input.
+func IdentityFromFileVersion(fv FileVersion) FileIdentity {
+	return FileIdentity{
+		MtimeNs: fv.MtimeNs,
+		CtimeNs: fv.CtimeNs,
+		Dev:     fv.Dev,
+		Ino:     fv.Ino,
+		Size:    fv.Size,
+	}
 }
 
 // SaveMultipartProgress persists a task's in-flight multipart upload state —
@@ -592,8 +654,10 @@ type FileVersion struct {
 // gone (evicted), which callers may treat as benign.
 func (q *Queue) SaveMultipartProgress(ctx context.Context, id, uploadID, partsJSON string, fv FileVersion) error {
 	res, err := q.db.ExecContext(ctx,
-		`UPDATE upload_tasks SET upload_id=?, completed_parts=?, parts_file_mtime=?, parts_file_size=?, updated_at=? WHERE id=?`,
-		uploadID, partsJSON, fv.Mtime, fv.Size, time.Now().Unix(), id,
+		`UPDATE upload_tasks SET upload_id=?, completed_parts=?, parts_file_mtime=?, parts_file_size=?,
+		   parts_file_ctime_ns=?, parts_file_dev=?, parts_file_ino=?, parts_file_mtime_ns=?, updated_at=? WHERE id=?`,
+		uploadID, partsJSON, fv.Mtime, fv.Size,
+		fv.CtimeNs, fv.Dev, fv.Ino, fv.MtimeNs, time.Now().Unix(), id,
 	)
 	if err != nil {
 		return fmt.Errorf("queue: save multipart progress %q: %w", id, err)
@@ -652,6 +716,7 @@ func (q *Queue) ListByStatus(status string) ([]*UploadTask, error) {
         SELECT id, rule_id, local_path, storage_path, bucket, upload_id,
                completed_parts, file_size, file_mtime, sha256, status,
                retry_count, next_retry_at, parts_file_mtime, parts_file_size,
+               parts_file_ctime_ns, parts_file_dev, parts_file_ino, parts_file_mtime_ns,
                last_error, created_at, updated_at,
                file_offset, append_mode
         FROM upload_tasks
@@ -695,25 +760,41 @@ func (q *Queue) TailOffsets(ctx context.Context, ruleID string) (map[string]int6
 }
 
 // UpsertProcessedFile inserts or replaces a processed-file record. On conflict
-// on (rule_id, local_path) the existing row is overwritten.
+// on (rule_id, local_path) the existing row is overwritten. Identity fields
+// (IC-BUG-48): Ident carries the kernel identity of the uploaded version;
+// UploadedAtNs is the nanosecond write time of the record (the racy-window
+// anchor). Zero identity fields are stored as-is — the verdict logic treats
+// them as unknown → hash confirmation (fail-closed), so callers that cannot
+// provide the identity may leave Ident zero and the ledger stays safe.
 func (q *Queue) UpsertProcessedFile(f *ProcessedFile) error {
 	if f.UploadedAt == 0 {
 		f.UploadedAt = time.Now().Unix()
 	}
 	_, err := q.db.Exec(`
         INSERT INTO processed_files
-            (id, rule_id, local_path, file_size, file_mtime, sha256, uploaded_at)
-        VALUES (?,?,?,?,?,?,?)
+            (id, rule_id, local_path, file_size, file_mtime, sha256, uploaded_at,
+             file_mtime_ns, file_ctime_ns, file_dev, file_ino, uploaded_at_ns)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(rule_id, local_path) DO UPDATE SET
             id=excluded.id, file_size=excluded.file_size,
             file_mtime=excluded.file_mtime, sha256=excluded.sha256,
-            uploaded_at=excluded.uploaded_at`,
+            uploaded_at=excluded.uploaded_at,
+            file_mtime_ns=excluded.file_mtime_ns, file_ctime_ns=excluded.file_ctime_ns,
+            file_dev=excluded.file_dev, file_ino=excluded.file_ino,
+            uploaded_at_ns=excluded.uploaded_at_ns`,
 		f.ID, f.RuleID, f.LocalPath, f.FileSize, f.FileMtime, f.SHA256, f.UploadedAt,
+		f.Ident.MtimeNs, f.Ident.CtimeNs, f.Ident.Dev, f.Ident.Ino, f.UploadedAtNs,
 	)
 	if err != nil {
 		return fmt.Errorf("queue: upsert processed file: %w", err)
 	}
 	return nil
+}
+
+// nowNs returns the current wall clock in Unix nanoseconds — the racy-window
+// anchor for ledger writes.
+func nowNs() int64 {
+	return time.Now().UnixNano()
 }
 
 // IsProcessed returns true if processed_files contains the same rule, path,
@@ -779,7 +860,9 @@ func scanTasks(rows *sql.Rows) ([]*UploadTask, error) {
 			&t.ID, &t.RuleID, &t.LocalPath, &t.StoragePath, &t.Bucket,
 			&t.UploadID, &t.CompletedParts, &t.FileSize, &t.FileMtime,
 			&t.SHA256, &t.Status, &t.RetryCount, &t.NextRetryAt,
-			&t.PartsFileMtime, &t.PartsFileSize, &t.LastError,
+			&t.PartsFileMtime, &t.PartsFileSize,
+			&t.PartsFileCtimeNs, &t.PartsFileDev, &t.PartsFileIno, &t.PartsFileMtimeNs,
+			&t.LastError,
 			&t.CreatedAt, &t.UpdatedAt,
 			&t.FileOffset, &t.AppendMode,
 		); err != nil {

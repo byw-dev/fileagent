@@ -94,9 +94,14 @@ func (q *Queue) CompleteReported(ctx context.Context, id string, uploaded bool, 
 		return nil
 	}
 	if uploaded {
-		_, err = tx.ExecContext(ctx, `INSERT INTO processed_files(id,rule_id,local_path,file_size,file_mtime,sha256,uploaded_at)
-   SELECT id,rule_id,local_path,file_size,file_mtime,sha256,? FROM upload_tasks WHERE id=?
-   ON CONFLICT(rule_id,local_path) DO UPDATE SET file_size=excluded.file_size,file_mtime=excluded.file_mtime,sha256=excluded.sha256,uploaded_at=excluded.uploaded_at`, time.Now().Unix(), id)
+		_, err = tx.ExecContext(ctx, `INSERT INTO processed_files(id,rule_id,local_path,file_size,file_mtime,sha256,uploaded_at,
+           file_mtime_ns,file_ctime_ns,file_dev,file_ino,uploaded_at_ns)
+   SELECT id,rule_id,local_path,file_size,file_mtime,sha256,?,
+           parts_file_mtime_ns,parts_file_ctime_ns,parts_file_dev,parts_file_ino,?
+   FROM upload_tasks WHERE id=?
+   ON CONFLICT(rule_id,local_path) DO UPDATE SET file_size=excluded.file_size,file_mtime=excluded.file_mtime,sha256=excluded.sha256,uploaded_at=excluded.uploaded_at,
+           file_mtime_ns=excluded.file_mtime_ns,file_ctime_ns=excluded.file_ctime_ns,file_dev=excluded.file_dev,file_ino=excluded.file_ino,uploaded_at_ns=excluded.uploaded_at_ns`,
+			time.Now().Unix(), time.Now().UnixNano(), id)
 		if err != nil {
 			return fmt.Errorf("queue: acknowledge processed file: %w", err)
 		}
