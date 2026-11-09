@@ -239,22 +239,68 @@ fi
 #
 # IC-BUG-57 fix: the credential pair used to be passed as `curl --user
 # "$1:$2"` — visible in `ps -ef` on the host for the lifetime of the process
-# (curl re-execs nothing; argv is fixed at spawn). curl's --config parsing is
-# applied BEFORE the process is spawned here: the "user = AK:SK" line is
-# written by the bash BUILTIN printf (no external command, so the secret never
-# appears in any argv, not even ours) into a 0600 file inside the private
-# OWN_AWS_DIR (0700), which the existing EXIT-trap cleanup already removes.
-# `curl --config <file>` reads it; the secret is never in any argv.
+# (curl re-execs nothing; argv is fixed at spawn). Now the "user = AK:SK"
+# line is written by the bash BUILTIN printf (no external command, so the
+# secret never appears in any argv, not even ours) into a 0600 file inside
+# the private OWN_AWS_DIR (0700), which the existing EXIT-trap cleanup
+# already removes. `curl --config <file>` reads that file AFTER the curl
+# process has started — the point is not when it is parsed but that the
+# secret travels via the file, never via argv.
+#
+# curl config escaping (rework 1, IC-BUG-57 followup): inside a
+# double-quoted config value curl processes C-style escapes, so a raw `\`
+# would swallow the next byte and a raw `"` would terminate the value early
+# (live: has"quote → has, back\slash → backslash, trail\ → trail" + line
+# break). Each AK/SK byte is therefore escaped with pure builtin parameter
+# expansion BEFORE printf: first `\` → `\\`, then `"` → `\"`. `${var//}` is
+# a builtin — no sed/awk, or the secret would be right back in an argv.
+# Rejections instead of silent rewriting:
+#   * LF/CR in the AK or SK cannot live on ONE config line (a raw newline
+#     would split the value mid-secret; an escaped \n would change the
+#     credential bytes) → refuse loudly, naming the offending variable but
+#     never printing the secret.
+#   * `:` in the AK would split `user = "AK:SK"` at the wrong byte (curl
+#     splits USERPWD on the FIRST colon) → refuse; AKIs are ASCII without
+#     colons by construction, so this only fires on misconfiguration.
 STS_SESSION_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucketMultipartUploads"],"Resource":["arn:aws:s3:::'"${SW_BUCKET_DATA}"'"]},{"Effect":"Allow","Action":["s3:PutObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":["arn:aws:s3:::'"${SW_BUCKET_DATA}"'/*"]}]}'
 assume_role() {
-  local _sts_cfg _sts_out _sts_rc
+  local _sts_cfg _sts_out _sts_rc _ak _sk
+  # Reject credential bytes that cannot survive a one-line curl config
+  # BEFORE writing anything. Pure pattern matching, no subshell fork needed
+  # for the common (clean) case — the [[ == ]] pattern is a builtin test.
+  _ak="$1" _sk="$2"
+  case "${_ak}" in
+    *:*)
+      echo "ERROR: SW_CP_ACCESS_KEY contains ':' (position splits the curl user field); access key ids never contain colons — fix the variable." >&2
+      return 1
+      ;;
+  esac
+  case "${_ak}" in
+    *$'\n'*|*$'\r'*)
+      echo "ERROR: SW_CP_ACCESS_KEY contains a newline/carriage-return; it cannot be written to a single-line curl config. Fix the variable." >&2
+      return 1
+      ;;
+  esac
+  case "${_sk}" in
+    *$'\n'*|*$'\r'*)
+      echo "ERROR: SW_CP_SECRET_KEY contains a newline/carriage-return; it cannot be written to a single-line curl config. Fix the variable." >&2
+      return 1
+      ;;
+  esac
+  # Builtin-only escaping: backslash first (else the newly introduced
+  # backslashes would be double-escaped by the quote pass), then quotes.
+  local _ak_esc="${_ak//\\/\\\\}"
+  _ak_esc="${_ak_esc//\"/\\\"}"
+  local _sk_esc="${_sk//\\/\\\\}"
+  _sk_esc="${_sk_esc//\"/\\\"}"
   _sts_cfg="$(mktemp "${OWN_AWS_DIR}/.sts-user.XXXXXX")" || {
     echo "ERROR: failed to create the STS curl config file." >&2
     return 1
   }
-  # Builtin printf + redirect only: "$1:$2" must not reach any external
-  # command's argv. umask 077 → file lands 0600 inside the 0700 OWN_AWS_DIR.
-  ( umask 077; printf 'user = "%s:%s"\n' "$1" "$2" > "${_sts_cfg}" )
+  # Builtin printf + redirect only: the escaped pair must not reach any
+  # external command's argv. umask 077 → file lands 0600 inside the 0700
+  # OWN_AWS_DIR.
+  ( umask 077; printf 'user = "%s:%s"\n' "${_ak_esc}" "${_sk_esc}" > "${_sts_cfg}" )
   _sts_out=$(curl --silent --show-error --fail-with-body \
     ${CURL_CONNECT_ARGS[@]+"${CURL_CONNECT_ARGS[@]}"} \
     --aws-sigv4 "aws:amz:us-east-1:sts" \
