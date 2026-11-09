@@ -243,7 +243,14 @@ mkdir -p "${SW_CONFIG_DIR}"
 # realpath: present on both GNU coreutils and macOS (since Big Sur). If a
 # host lacks it, `cd -P "$dir" && pwd -P` is the equivalent fallback — one
 # of the two must exist; both resolve ALL symlinks and ".." components.
-SW_CANON="$(realpath "${SW_CONFIG_DIR}" 2>/dev/null || { cd -P "${SW_CONFIG_DIR}" 2>/dev/null && pwd -P; })"
+# F-b7 (CDPATH): the fallback MUST clear CDPATH — with CDPATH set and a
+# RELATIVE $dir, bash's cd searches $CDPATH first and (a) may resolve to a
+# same-named directory under a CDPATH entry instead of the intended one, and
+# (b) prints the resolved directory to STDOUT, which this command substitution
+# captures — polluting SW_CANON. `CDPATH= cd -P --` fixes both; `--` guards
+# against directory names starting with "-". (realpath is unaffected: it takes
+# no CDPATH into account.)
+SW_CANON="$(realpath "${SW_CONFIG_DIR}" 2>/dev/null || { CDPATH= cd -P -- "${SW_CONFIG_DIR}" 2>/dev/null && pwd -P; })"
 if [ -z "${SW_CANON}" ] || [ ! -d "${SW_CANON}" ]; then
   echo "ERROR: cannot canonicalize SW_CONFIG_DIR (${SW_CONFIG_DIR}) — realpath and cd -P both failed." >&2
   exit 1
