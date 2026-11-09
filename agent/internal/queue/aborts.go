@@ -118,6 +118,7 @@ func (q *Queue) CountMultipartAborts(ctx context.Context) (int, error) {
 	}
 	return n, nil
 }
+
 // MarkFailedAbandoned atomically marks a task failed with the never-retry
 // sentinel (given up: terminal failure or retry budget exhausted) AND records
 // the durable abort intent for its in-flight multipart upload in the same

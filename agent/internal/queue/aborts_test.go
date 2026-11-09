@@ -90,6 +90,7 @@ func TestMultipartAbortOutbox_CRUD(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, n)
 }
+
 // Error paths: a broken database must surface as an error, not a silent
 // success — the abort record is the last retryable identity, and a silently
 // dropped write would manufacture exactly the orphan this mechanism exists

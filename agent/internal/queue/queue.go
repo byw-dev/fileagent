@@ -170,19 +170,19 @@ type UploadTask struct {
 	// Zero/zero ctime/dev/ino means "no identity snapshot" (legacy rows) and
 	// is treated as undecidable: unversioned parts are never trusted for a
 	// resume.
-	PartsFileMtime    int64
-	PartsFileSize     int64
-	PartsFileCtimeNs  int64
-	PartsFileDev      uint64
-	PartsFileIno      uint64
+	PartsFileMtime   int64
+	PartsFileSize    int64
+	PartsFileCtimeNs int64
+	PartsFileDev     uint64
+	PartsFileIno     uint64
 	// PartsFileMtimeNs is the nanosecond mtime of the recorded version
 	// (IC-BUG-48). Zero = legacy row → undecidable → no resume.
 	PartsFileMtimeNs int64
-	FileSize       int64
-	FileMtime      int64
-	SHA256         string
-Status         string
-	RetryCount     int
+	FileSize         int64
+	FileMtime        int64
+	SHA256           string
+	Status           string
+	RetryCount       int
 	// NextRetryAt is the unix time (seconds) when a failed task becomes
 	// eligible for re-queueing (IC-3 P1-d). A positive value is the persisted
 	// backoff schedule, honoured by startup recovery. A negative value
@@ -192,10 +192,10 @@ Status         string
 	// terminal verdict" and is treated conservatively as ABANDONED — startup
 	// recovery does not resurrect it, but records an abort intent for its
 	// in-flight upload so it cannot leak either.
-	NextRetryAt  int64
-	LastError    string
-	CreatedAt      int64
-	UpdatedAt      int64
+	NextRetryAt int64
+	LastError   string
+	CreatedAt   int64
+	UpdatedAt   int64
 	// FileOffset is the byte offset from which to begin uploading in tail mode.
 	// Zero means upload from the beginning of the file.
 	FileOffset int64
