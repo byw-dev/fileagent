@@ -969,6 +969,16 @@ func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, ru
 		Status:      queue.StatusPending,
 		FileOffset:  fileOffset,
 		AppendMode:  appendMode,
+		// Rework-4: carry the enqueue-time kernel identity so
+		// EnqueueIfNoActive's active-task guard compares versions (not the
+		// second-granularity tuple) — a preserved-mtime rewrite during an
+		// in-flight upload enqueues a second task instead of being
+		// suppressed. The uploader re-stats the handle itself; these fields
+		// are guard inputs only.
+		FileCtimeNs: ident.CtimeNs,
+		FileDev:     ident.Dev,
+		FileIno:     ident.Ino,
+		FileMtimeNs: ident.MtimeNs,
 	}
 	if err := exec.Submit(ctx, task); err != nil {
 		logger.Warn("agent: submit task failed",
