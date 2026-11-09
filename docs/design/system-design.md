@@ -994,6 +994,17 @@ bugs/open.md 各修复记录为准）：
      哈希确认回调同样自持句柄，账本只写回调返回的身份；账本刷新是
      以「读到的那一行旧值」为条件的 CAS，失败即重采。任何经路径的
      第二次 open 都视为可能指向另一个文件（符号链接可只换指向）。
+     fileid.Stat(path) 同样打开一次取全字段（Windows 混合身份修复）。
+  0b. watcher 层身份去重（返工 4 阻断 1）：watcher 的 seen/inflight/
+      claim 按**内核身份**（mtime-ns+ctime+dev+ino+size，fileid.Stat
+      一次打开取全字段）判断「是否已交付过这个版本」，不再按 mtime
+      是否前移——保留 mtime 的原地改写、cp -p 重建在 watcher 层即被
+      交付到下游判重（DecideProcessed 哈希确认，相同内容不会重复
+      上传）。EnqueueIfNoActive 的活动任务守卫同样按身份比较
+      （upload_tasks 加 ctime/dev/ino/mtime_ns 列）。
+      已知边界：时钟回拨到旧 stamp 同一粒度内并在该粒度内同尺寸
+      改写、且锚点早于当前时间——预筛无法区分，哈希确认兜底；
+      NTP 建议 slew 不 step。
   1. 上传开始前，在本地 SQLite 中创建 upload_tasks 记录
      字段：file_path, storage_path, upload_id（Multipart ID）,
            total_parts, completed_parts（JSON数组）, status
