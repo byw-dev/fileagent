@@ -236,12 +236,29 @@ fi
 # assume_role <access key> <secret key> — same shape the Control Plane's
 # STSManager issues (inline session policy, 3600s). STS is served on the S3
 # port root. Raw response (XML) goes to stdout, curl's status to the caller.
+#
+# IC-BUG-57 fix: the credential pair used to be passed as `curl --user
+# "$1:$2"` — visible in `ps -ef` on the host for the lifetime of the process
+# (curl re-execs nothing; argv is fixed at spawn). curl's --config parsing is
+# applied BEFORE the process is spawned here: the "user = AK:SK" line is
+# written by the bash BUILTIN printf (no external command, so the secret never
+# appears in any argv, not even ours) into a 0600 file inside the private
+# OWN_AWS_DIR (0700), which the existing EXIT-trap cleanup already removes.
+# `curl --config <file>` reads it; the secret is never in any argv.
 STS_SESSION_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucketMultipartUploads"],"Resource":["arn:aws:s3:::'"${SW_BUCKET_DATA}"'"]},{"Effect":"Allow","Action":["s3:PutObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":["arn:aws:s3:::'"${SW_BUCKET_DATA}"'/*"]}]}'
 assume_role() {
-  curl --silent --show-error --fail-with-body \
+  local _sts_cfg _sts_out _sts_rc
+  _sts_cfg="$(mktemp "${OWN_AWS_DIR}/.sts-user.XXXXXX")" || {
+    echo "ERROR: failed to create the STS curl config file." >&2
+    return 1
+  }
+  # Builtin printf + redirect only: "$1:$2" must not reach any external
+  # command's argv. umask 077 → file lands 0600 inside the 0700 OWN_AWS_DIR.
+  ( umask 077; printf 'user = "%s:%s"\n' "$1" "$2" > "${_sts_cfg}" )
+  _sts_out=$(curl --silent --show-error --fail-with-body \
     ${CURL_CONNECT_ARGS[@]+"${CURL_CONNECT_ARGS[@]}"} \
     --aws-sigv4 "aws:amz:us-east-1:sts" \
-    --user "$1:$2" \
+    --config "${_sts_cfg}" \
     --header "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "Action=AssumeRole" \
     --data-urlencode "Version=2011-06-15" \
@@ -249,7 +266,11 @@ assume_role() {
     --data-urlencode "RoleArn=${SW_AGENT_ROLE_ARN}" \
     --data-urlencode "RoleSessionName=fileagent-init-check" \
     --data-urlencode "Policy=${STS_SESSION_POLICY}" \
-    "${SW_S3_ENDPOINT}" 2>&1
+    "${SW_S3_ENDPOINT}" 2>&1)
+  _sts_rc=$?
+  rm -f "${_sts_cfg}"
+  printf '%s' "${_sts_out}"
+  return "${_sts_rc}"
 }
 
 # ---------------------------------------------------------------------------
