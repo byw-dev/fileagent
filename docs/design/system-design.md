@@ -1002,9 +1002,14 @@ bugs/open.md 各修复记录为准）：
       交付到下游判重（DecideProcessed 哈希确认，相同内容不会重复
       上传）。EnqueueIfNoActive 的活动任务守卫同样按身份比较
       （upload_tasks 加 ctime/dev/ino/mtime_ns 列）。
-      已知边界：时钟回拨到旧 stamp 同一粒度内并在该粒度内同尺寸
-      改写、且锚点早于当前时间——预筛无法区分，哈希确认兜底；
-      NTP 建议 slew 不 step。
+      已知边界（产品 2026-11-10 拍板接受，不改代码）：系统时钟被
+      step 回拨到某个旧文件时间戳的同一粒度内、在该粒度内同尺寸
+      改写、且之后时钟走过旧锚点——预筛无法区分，会判相同（漏采）。
+      接受理由：需要人为回拨时钟且精确命中粒度；与 git/rsync 等
+      同类工具的通行取舍一致。「账本锚点在未来 → Undecidable」
+      守卫覆盖的是回拨尚未追上旧锚点的情形；回拨追上后即为本边界。
+      运维要求：NTP 只做 slew 不做 step（chrony makestep 仅限启动），
+      见 docs/ops/deployment.md B.3。
   1. 上传开始前，在本地 SQLite 中创建 upload_tasks 记录
      字段：file_path, storage_path, upload_id（Multipart ID）,
            total_parts, completed_parts（JSON数组）, status
