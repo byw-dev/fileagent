@@ -1040,6 +1040,9 @@ CREATE TABLE processed_files (
     uploaded_at INTEGER NOT NULL,
     -- IC-BUG-48 内容身份列（纳秒 mtime/ctime + dev/inode + 快照时刻锚点）；
     -- 零值 = 未知（旧行/平台缺字段）→ 判重时视为不可判定 → 哈希确认
+    -- 判重（DecideProcessed）出错时两个调用点均按 Recollect 处理
+    -- （fail-closed 方向 = 宁可重传；CandidateVerdict 零值 = VerdictUnset，
+    -- 任何未知判定值也落入队而非静默丢弃）
     file_mtime_ns  INTEGER NOT NULL DEFAULT 0,
     file_ctime_ns  INTEGER NOT NULL DEFAULT 0,
     file_dev       INTEGER NOT NULL DEFAULT 0,
