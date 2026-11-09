@@ -106,8 +106,11 @@ compose；除此之外不写仓库其它目录。渲染脚本会把该目录强�
 fatal 或断言失败后、容器被 down 删除之前，两个 compose 项目所有容器的
 `docker compose logs --no-color --timestamps` 会先落到 `bin/tmp/fi/logs-docker-compose.*.yml.txt`
 （保留 compose 默认的逐行服务名前缀，同一项目里 master/volume/filer 的日志可区分；
-随 CI artifact 一起上传；拉取失败只警告、不影响清理）；端口
-预检失败（拒绝路径）则不创建任何东西、不做任何清理动作。
+拉取失败只警告、不影响清理）。落盘发生在每次运行的 cleanup 里（预检通过后 fatal、
+断言失败、正常结束都会落）；**CI 的 artifact 上传步骤是 `if: failure()`——只有
+CI job 失败才上传**，成功的定时/手动运行只落本地盘、不产生 artifact（本地
+`bin/tmp/fi/` 会被下次运行复用该目录，注意留存）。端口
+预检失败（拒绝路径）则不创建任何东西、不做任何清理动作、也不落日志。
 
 ## 与 `deploy/scripts/smoke.sh` 的关系
 
