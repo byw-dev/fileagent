@@ -96,7 +96,7 @@ func TestIC48_UploadFileCarriesIdentity(t *testing.T) {
 	require.NoError(t, err)
 	raw := string(src)
 	for _, marker := range []string{
-		"fileid.StatHandle(f)",          // pre-read same-fd snapshot
+		"fileid.StatHandle(f)",           // pre-read same-fd snapshot
 		"result.IdentityComplete = true", // post-read verification writes it
 		"SnapAtNs: handleID.SnapAtNs",    // the racy anchor travels with the identity
 	} {
