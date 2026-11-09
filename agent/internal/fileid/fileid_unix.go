@@ -27,3 +27,18 @@ func fillPlatform(id *Identity, fi os.FileInfo, path string) {
 	id.Dev = uint64(st.Dev)
 	id.Ino = st.Ino
 }
+
+// statHandleIdentity fills the identity from an ALREADY-OPEN handle's stat
+// blob. On Unix the syscall blob carries ctime/dev/inode directly, so every
+// field comes from the same handle trivially (no path re-open).
+func statHandleIdentity(f *os.File, fi os.FileInfo) Identity {
+	id := Identity{MtimeNs: fi.ModTime().UnixNano(), Size: fi.Size()}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return id
+	}
+	id.CtimeNs = statCtimeNs(st)
+	id.Dev = uint64(st.Dev)
+	id.Ino = st.Ino
+	return id
+}

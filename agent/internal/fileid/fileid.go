@@ -55,15 +55,24 @@ func PostStatMatches(pre, post Identity) bool {
 		pre.Dev == post.Dev && pre.Ino == post.Ino && pre.Size == post.Size
 }
 
-// Stat stats path and returns its identity. SnapAtNs is set to the wall
-// clock at the moment of the stat — the racy anchor for the ledger.
+// Stat stats path and returns its identity. SnapAtNs is set BEFORE the stat
+// (rework-2 fix 5, conservative direction): the racy anchor is "when this
+// check began", not "when the kernel answered" — if the thread stalls between
+// the anchor and the stat, a coarse-granularity rewrite in that gap keeps the
+// stamps inside the [anchor−G, ∞) window and stays racy (safe). Taking the
+// anchor AFTER the stat would let a long stall push the anchor past the
+// rewrite and bless it as Same. A clock rollback between the two calls only
+// makes the anchor smaller (earlier), which widens the racy window on the
+// stamp side — also safe; PrefilterVerdict additionally treats a ledger
+// anchor in the future as Undecidable.
 func Stat(path string) (Identity, error) {
+	anchor := time.Now().UnixNano()
 	fi, err := os.Stat(path)
 	if err != nil {
 		return Identity{}, err
 	}
 	id := FromInfo(fi, path)
-	id.SnapAtNs = time.Now().UnixNano()
+	id.SnapAtNs = anchor
 	return id, nil
 }
 
@@ -71,17 +80,24 @@ func Stat(path string) (Identity, error) {
 // Reading the identity from the same fd that will be read for upload (or
 // hashing) is the only way to guarantee that "the stat" and "the read" see
 // the same file version (IC-BUG-48: the snapshot and the bytes must come from
-// one file description). SnapAtNs anchors the racy window at the stat moment.
+// one file description — rework-2 blocker 4: on Windows this queries
+// GetFileInformationByHandle(Ex) on THIS handle, never re-opens by path).
+// SnapAtNs anchors the racy window BEFORE the stat (see Stat).
 func StatHandle(f *os.File) (Identity, error) {
+	anchor := time.Now().UnixNano()
 	fi, err := f.Stat()
 	if err != nil {
 		return Identity{}, err
 	}
-	id := FromInfo(fi, f.Name())
-	id.SnapAtNs = time.Now().UnixNano()
+	id := statHandleIdentity(f, fi)
+	id.SnapAtNs = anchor
 	return id, nil
 }
 
+// On Windows StatHandle routes through statHandleIdentity (defined below):
+// size/mtime from f.Stat, ChangeTime/volume/index from THIS handle's
+// GetFileInformationByHandle(Ex) — every field from the same handle, never a
+// path re-open (rework-2 blocker 4).
 // TimeFromNs converts a Unix-nanosecond timestamp back to time.Time (UTC).
 // Only used by tests and ledger bookkeeping.
 func TimeFromNs(ns int64) time.Time {
