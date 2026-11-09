@@ -42,15 +42,19 @@
 **现象（2026-10-31 实测，B7 mc → AWS CLI v2 收尾时发现）**：`test/fault-injection/run.sh`、
 `deploy/scripts/init-seaweedfs.sh`、`deploy/scripts/smoke.sh` 都只装 `EXIT` trap。实测分三种情形：
 
-- **外部信号**（`kill -TERM/-INT/-HUP <pid>`，即 `timeout`、`kill` 等常见方式打向脚本进程）：
+- **外部信号**（`kill -TERM/-HUP <pid>`，即 `timeout`、`kill` 等常见方式打向脚本进程）：
   EXIT trap **会执行**——私有 AWS 凭据目录（0700 目录 / 0600 文件，含明文长期凭据）被清，
-  FI/smoke 的 compose 容器随 cleanup 收掉。三种信号各实测一次均通过。
+  FI/smoke 的 compose 容器随 cleanup 收掉。TERM、HUP 各实测一次均通过。
+- **外部 INT**：在 bash 正等待前台子进程时**可能被前台子进程消费、脚本不退出、
+  EXIT trap 不执行**（PR #138 codex 第 6 轮实测；bash 正忙于内建命令时 INT 才会触发
+  EXIT trap）——不能与 TERM/HUP 并列为「均通过」。
 - **脚本内 `kill -TERM $$` 自杀**（评审 r5 的复现方式）：EXIT trap **不执行**，凭据目录残留。
 - **SIGKILL / 崩溃**：无法用 trap 处理，凭据目录与 compose 资源必然残留。
 
 INT 的终端 Ctrl-C 场景是向前台进程组整体发 INT（与上面「只打脚本进程」略有差异），方向上同样
 可用信号转 exit 兜住，落地时须补测。**这不是 B7 引入的**：以前 `mc` 的临时配置
-（`MC_CONFIG_DIR`）与 compose 资源在信号中断时同样残留。
+（`MC_CONFIG_DIR`）与 compose 资源在**未触发 cleanup 的路径上**（如 INT 被前台子进程
+消费、脚本内自杀、SIGKILL/崩溃）同样残留。
 
 **影响**：残留目录含 0600 明文长期凭据（0700 目录挡住其他普通用户，但操作者/备份可读）；
 FI/smoke 的容器与端口残留会让下一次运行被 fail-closed 预检拒绝，需要手工清理。

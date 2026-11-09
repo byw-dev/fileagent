@@ -122,9 +122,12 @@ OWN_AWS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fileagent-swinit-aws.XXXXXX")" || {
 # 再做 chmod 和写入——否则写 credentials 中途失败（磁盘满等）时，含明文 secret
 # 的目录会残留。之后主 `trap cleanup EXIT` 接管（cleanup 同样删除该目录），
 # 接管是原子的、没有无 trap 保护的空窗。
-# L1（评审 r5）：信号覆盖范围（2026-10-31 实测）——外部 kill -TERM/-INT/-HUP
-# 时 EXIT trap 会执行、目录被清；**脚本内 kill -$$ 自杀与 SIGKILL/崩溃时不执行**，
-# 目录会残留（产品 2026-10-31 决定不另做信号 trap，见 backlog「信号中断时的清理」）。
+# L1（评审 r5，2026-11-09 依 PR #138 codex 第 6 轮复现改准）：信号覆盖范围——
+# 外部 TERM/HUP 时 EXIT trap 会执行、目录被清；**外部 INT 在 bash 正等待前台
+# 子进程时可能被前台子进程消费、脚本不退出、EXIT trap 不执行**；
+# **脚本内 kill -$$ 自杀与 SIGKILL/崩溃时不执行**，目录会残留（产品 2026-10-31
+# 决定不另做信号 trap，见 backlog「信号中断时的清理」；复现见
+# bin/followups/signal-check.txt，该目录不入库）。
 trap 'rm -rf "${OWN_AWS_DIR:-}" 2>/dev/null' EXIT
 # F1（评审 r1）防御性加固：mktemp -d 本就 0700，这里显式校正并在写入凭据时
 # 用 umask 077 子壳，保证文件落盘即 0600（先建权限再写内容，无可读空窗）。
