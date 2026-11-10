@@ -39,11 +39,15 @@ func TestRecreateRealFile_NeverProvableSame(t *testing.T) {
 	path := filepath.Join(dir, "f.bin")
 
 	require.NoError(t, os.WriteFile(path, []byte("same"), 0o644))
-	fiOld, err := os.Stat(path)
-	require.NoError(t, err)
 	// Backdate so the first snapshot's stamps sit well before the recreate.
 	past := time.Now().Add(-2 * time.Hour)
 	require.NoError(t, os.Chtimes(path, past, past))
+	// Capture the mtime the first snapshot will actually record (AFTER the
+	// backdate) — this is the value cp -p restores (r12 review: capturing it
+	// before the backdate made before/after mtimes differ, so the test never
+	// exercised the restored-mtime case).
+	fiOld, err := os.Stat(path)
+	require.NoError(t, err)
 
 	before, err := fileid.Stat(path)
 	require.NoError(t, err)
@@ -56,6 +60,10 @@ func TestRecreateRealFile_NeverProvableSame(t *testing.T) {
 
 	after, err := fileid.Stat(path)
 	require.NoError(t, err)
+	// Precondition: the restored mtime really equals the recorded one, so the
+	// verdict cannot be carried by an mtime difference alone.
+	require.Equal(t, before.MtimeNs, after.MtimeNs,
+		"precondition: cp -p shape must restore the exact recorded mtime")
 
 	// Informational only (platform-dependent — see the CI facts above).
 	t.Logf("recreate: ino %d→%d (ext4 may reuse), ctime %d→%d (NTFS may keep the tick)",
