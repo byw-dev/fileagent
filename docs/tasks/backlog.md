@@ -424,14 +424,18 @@ IC-14 的 lineage。那时布局问题才开始真的疼，跟拆文件一起做
 
 **现象**：PR #144 CI（windows-latest）第一次运行失败：`"7" is not less than or equal to "2"`（`watcher_test.go` 约 2574，residue 7 超过上一轮 ratchet 下来的上限 2）；同 run 对失败 job 重跑即绿。Ubuntu 未见过此测试红。该测试在 master 的 Windows CI 上是绿的（2026-11-06 run 42240930942）。
 
-**复现命令**：
+**复现命令**（均已在本机 macOS/APFS 跑过，全绿 0 复现）：
 ```sh
 cd agent && go test -run '^TestDebounced_PendingSweep_MultiRound_ResidueConstant$' \
-  -count=200 ./internal/watcher/   # 本机（macOS/APFS）200×4 组（含 -cpu 1,2 与 GOMAXPROCS=2）全绿，0 复现
+  -count=200 ./internal/watcher/
+cd agent && go test -run '^TestDebounced_PendingSweep_MultiRound_ResidueConstant$' \
+  -count=200 -cpu 1,2 ./internal/watcher/
+cd agent && GOMAXPROCS=2 go test -run '^TestDebounced_PendingSweep_MultiRound_ResidueConstant$' \
+  -count=200 ./internal/watcher/
 ```
 
-**根因（读码）**：`w.pending` 的唯一写入点是 loopDebounced 的 fsnotify 事件处理；sweep 只删除 `fired` 的条目。残留值取决于「第 8 个事件被处理时有多少 timer 回调已完成」——回调完成速度与事件处理速度的竞争。断言的 `residueCeiling` 只降不升：某轮残留低（sweep 恰好先跑）后，下一轮残留高（sweep 滞后）即红。PR #144 让 flush 变慢（claimDelivery 增加 `fileid.Stat` syscall；master 的 claim 只比较内存中的 mtime），放大了慢 CI 机器上的竞争窗口。生产 `w.pending` 写入点在 master..HEAD 的 diff 中为零——不是 pending 真实增长。
+**根因（待验证假设）**：`w.pending` 的唯一写入点是 loopDebounced 的 fsnotify 事件处理（`watcher.go:823/826`）；sweep 只删除 `fired` 的条目。残留值取决于「第 8 个事件被处理时有多少 timer 回调已完成」——回调完成速度与事件处理速度的竞争；断言的 `residueCeiling` 只降不升：某轮残留低（sweep 恰好先跑）后，下一轮残留高（sweep 滞后）即红。**假设**：PR #144 让 flush 变慢（claimDelivery 增加 `fileid.Stat` syscall；master 的 claim 只比较内存中的 mtime），可能放大慢 CI 机器上的竞争窗口——生产 `w.pending` 写入点在 master..HEAD 的 diff 中为零，不是 pending 真实增长。**此为读码推演，未在慢机器上验证**；首次复现时需先证伪/证实（例如在 Windows 上打印每轮残留与 sweep 时刻）。
 
-**失败率**：本机 macOS 0/20（-count=20 绿）；CI windows-latest 1/1（首次即红，重跑绿）。已知只在慢 CI 机器偶发。
+**失败率**：本机 macOS 0/20（`-count=20` 绿）；CI windows-latest 1/1（首次即红，重跑绿）。样本量太小，偶发频率未知。
 
 **处置建议**：残留断言应改为「等待 sweep 完成后再测上限」或「断言最终残留 ≤ burst 且逐轮不增（在 drain 所有事件与回调之后）」，去掉与 sweep 的竞争窗口；或对该测试标注 `testing.Short` 跳过慢机器。未修——等待下次 Windows CI 复现时连同根因一起修。

@@ -104,12 +104,15 @@ func TestRecreatedIdentities_NeverProvableSame(t *testing.T) {
 
 // TestDecideProcessed_RecreatedContentDiffers_Recollects — deterministic
 // end-to-end: a real Queue whose ledger holds A's identity; the candidate
-// carries the recreated identity (ino reused, ctime in the same tick — the
-// ext4/NTFS worst cases) and its content hash DIFFERS from the ledger's.
-// DecideProcessed must hash-confirm (Changed or Undecidable prefilter) and
-// Recollect because the content differs. Mutation check: removing the racy
-// window from PrefilterVerdict makes the worst-case (all-equal) case skip —
-// this test pins the window's necessity (see mutation-results-r13).
+// carries the recreated identity and its content hash DIFFERS from the
+// ledger's. DecideProcessed must hash-confirm and Recollect because the
+// content differs.
+//
+// ⚠️ Rework-13 honest note: every case below makes the candidate's ctime (or
+// ino) DIFFER from the recorded row, so the prefilter verdict is
+// **VerdictChanged** — the racy-window branch is NOT exercised here. The
+// all-fields-equal + anchor=stamps+1s racy variant lives in
+// TestDecideProcessed_Recreated*RacyWindow below.
 func TestDecideProcessed_RecreatedContentDiffers_Recollects(t *testing.T) {
 	ctx := context.Background()
 
@@ -176,12 +179,15 @@ func TestDecideProcessed_RecreatedContentDiffers_Recollects(t *testing.T) {
 	}
 }
 
-// TestDecideProcessed_RecreatedSameContent_SkipsOnlyWhenProvable — the
-// acceptance counterpart: identical content hash-confirms equal → Refresh
-// or Skip is allowed ONLY when the prefilter proved Same; the recreated
-// worst-case (all fields equal, inside the racy window) must NOT be a free
-// Skip — it hash-confirms equal and refreshes (RefreshAndSkip), never a
-// bare Skip without a hash read.
+// TestDecideProcessed_RecreatedSameContent_NeverFreeSkip — the acceptance
+// counterpart: identical content hash-confirms equal → Refresh or Skip is
+// allowed ONLY when the prefilter proved Same.
+//
+// ⚠️ Rework-13 honest note: the first candidate here has ctime differing
+// from the record → **VerdictChanged** branch (hash-confirm with differing
+// content → Recollect). The racy-window variant (all fields equal, anchor =
+// stamps+1s → VerdictUndecidable → hash-equal → RefreshAndSkip) lives in
+// TestDecideProcessed_RecreatedSameContent_RacyWindow_RefreshAndSkip below.
 func TestDecideProcessed_RecreatedSameContent_NeverFreeSkip(t *testing.T) {
 	ctx := context.Background()
 	q, err := Open(":memory:")
@@ -248,4 +254,129 @@ func TestDecideProcessed_RecreatedSameContent_NeverFreeSkip(t *testing.T) {
 		"a bare Skip without hash confirmation is forbidden for a racy-window candidate")
 	fmt.Printf("r13_same_content verdict=%s hash_calls=%d (RefreshAndSkip allowed after hash-equal)\n",
 		dec.Verdict, hashCalls)
+}
+
+// TestDecideProcessed_RecreatedContentDiffers_RacyWindow_Recollects — the
+// racy-window variant the rework-13 versions missed: the recorded identity
+// and the candidate are FULLY EQUAL on every kernel field (ino reused, ctime
+// in the same tick as the record) and the recorded anchor = stamps + 1s, so
+// the stamps sit inside anchor−2s → Prefilter == VerdictUndecidable → the
+// decision MUST hash-confirm (hash_calls == 1) and, the content differing,
+// Recollect. Mutation: removing the racy window from PrefilterVerdict turns
+// this into VerdictSame → Skip → hash_calls == 0 → this test goes red.
+func TestDecideProcessed_RecreatedContentDiffers_RacyWindow_Recollects(t *testing.T) {
+	ctx := context.Background()
+	q, err := Open(":memory:")
+	require.NoError(t, err)
+	defer q.Close()
+
+	// Recorded A: stat'ed 1s AFTER its stamps (the upload stat moment).
+	rec := FileIdentity{
+		MtimeNs:  1_000_000_000_000,
+		CtimeNs:  1_000_000_000_000,
+		Dev:      1,
+		Ino:      42,
+		Size:     4,
+		SnapAtNs: 1_001_000_000_000, // anchor = stamps + 1s → inside anchor−2s
+	}
+	require.NoError(t, q.UpsertProcessedFile(&ProcessedFile{
+		ID: "rec-1", RuleID: "r", LocalPath: "p",
+		FileSize:     4,
+		SHA256:       "sha-of-old-content",
+		Ident:        rec,
+		UploadedAtNs: rec.SnapAtNs,
+	}))
+
+	// Candidate: recreated with EVERY kernel field equal to the record
+	// (extreme stamp cache: ino reused, ctime in the same tick).
+	cur := FileIdentity{
+		MtimeNs:  rec.MtimeNs,
+		CtimeNs:  rec.CtimeNs,
+		Dev:      rec.Dev,
+		Ino:      rec.Ino,
+		Size:     rec.Size,
+		SnapAtNs: int64(9_000_000_000_000), // candidate stat'ed much later
+	}
+
+	// Precondition: the prefilter really is Undecidable (racy branch).
+	require.Equal(t, VerdictUndecidable, PrefilterVerdict(rec, cur, rec.SnapAtNs),
+		"precondition: all-equal fields + anchor=stamps+1s must be VerdictUndecidable (racy)")
+
+	hashCalls := 0
+	dec, err := q.DecideProcessed(ctx, "r", "p", cur, func() (HashResult, error) {
+		hashCalls++
+		return HashResult{
+			SHA256:           "sha-of-new-content", // content differs
+			Size:             rec.Size,
+			Identity:         cur,
+			IdentityComplete: true,
+		}, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, VerdictUndecidable, dec.Prefilter,
+		"the prefilter must be Undecidable (racy window), not Changed")
+	require.Equal(t, 1, hashCalls, "the racy candidate must hash-confirm (mutation: window removed → 0)")
+	require.Equal(t, Recollect, dec.Verdict,
+		"racy-window + differing content must Recollect")
+	fmt.Printf("r13_racy content_differs prefilter=%s verdict=%s hash_calls=%d\n",
+		dec.Prefilter, dec.Verdict, hashCalls)
+}
+
+// TestDecideProcessed_RecreatedSameContent_RacyWindow_RefreshAndSkip — the
+// acceptance counterpart with the same racy construction: all kernel fields
+// equal + anchor = stamps + 1s → VerdictUndecidable → the candidate MUST
+// hash-confirm (hash_calls == 1) and, the content being identical,
+// RefreshAndSkip (never a bare Skip without a hash read).
+func TestDecideProcessed_RecreatedSameContent_RacyWindow_RefreshAndSkip(t *testing.T) {
+	ctx := context.Background()
+	q, err := Open(":memory:")
+	require.NoError(t, err)
+	defer q.Close()
+
+	rec := FileIdentity{
+		MtimeNs:  1_000_000_000_000,
+		CtimeNs:  1_000_000_000_000,
+		Dev:      1,
+		Ino:      42,
+		Size:     4,
+		SnapAtNs: 1_001_000_000_000, // anchor = stamps + 1s → inside anchor−2s
+	}
+	require.NoError(t, q.UpsertProcessedFile(&ProcessedFile{
+		ID: "rec-1", RuleID: "r", LocalPath: "p",
+		FileSize:     4,
+		SHA256:       "sha-same",
+		Ident:        rec,
+		UploadedAtNs: rec.SnapAtNs,
+	}))
+
+	cur := FileIdentity{
+		MtimeNs:  rec.MtimeNs,
+		CtimeNs:  rec.CtimeNs,
+		Dev:      rec.Dev,
+		Ino:      rec.Ino,
+		Size:     rec.Size,
+		SnapAtNs: int64(9_000_000_000_000),
+	}
+
+	require.Equal(t, VerdictUndecidable, PrefilterVerdict(rec, cur, rec.SnapAtNs),
+		"precondition: all-equal fields + anchor=stamps+1s must be VerdictUndecidable (racy)")
+
+	hashCalls := 0
+	dec, err := q.DecideProcessed(ctx, "r", "p", cur, func() (HashResult, error) {
+		hashCalls++
+		return HashResult{
+			SHA256:           "sha-same", // identical content
+			Size:             rec.Size,
+			Identity:         cur,
+			IdentityComplete: true,
+		}, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, VerdictUndecidable, dec.Prefilter,
+		"the prefilter must be Undecidable (racy window), not Changed")
+	require.Equal(t, 1, hashCalls, "the racy candidate must hash-confirm (mutation: window removed → 0)")
+	require.Equal(t, RefreshAndSkip, dec.Verdict,
+		"racy-window + identical content must hash-confirm equal and refresh")
+	fmt.Printf("r13_racy same_content prefilter=%s verdict=%s hash_calls=%d\n",
+		dec.Prefilter, dec.Verdict, hashCalls)
 }
