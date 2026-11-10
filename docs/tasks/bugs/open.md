@@ -825,10 +825,17 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 
 ### 返工 8（codex 评审 r5）——claim 守卫顺序（在途先于 seen）+ 真链路测试重写（2026-11-10）
 
-- **修复 1（seen 先于在途检查，返回旧版本的候选不标 dirty）**：claimDelivery 原「seen 命中 → return false」在「有在途 token → dirty=true」之前——A 已交付且 seen 过 racy 窗口、路径切到 B（B 在途）、再切回仍在的 A：A 的候选命中旧 seen 直接返回，B 的 token 保持 clean，settle 不重查。改为**先查在途**（有在途 → dirty → false），seen 抑制只对无在途候选生效。测试：`TestReviewR5RealSymlinkReturn`（真实文件 + symlink，先红 `A_return_admitted=false B_dirty=false` → 绿）。
+- **修复 1（seen 先于在途检查，返回旧版本的候选不标 dirty）**：claimDelivery 原「seen 命中 → return false」在「有在途 token → dirty=true」之前——A 已交付且 seen 过 racy 窗口、路径切到 B（B 在途）、再切回仍在的 A：A 的候选命中旧 seen 直接返回，B 的 token 保持 clean，settle 不重查。改为**先查在途**（有在途 → dirty → false），seen 抑制只对无在途候选生效。测试：`TestReviewR5RealSymlinkReturn`（真实文件 + symlink，先红 `A_return_admitted=false B_dirty=false` → 绿）。**⚠️ 返工 9 更正：本条当时只修了 claimDelivery 内部的顺序，未覆盖 scanFile 里更早的 seen 提前返回（pollScan/debounce recheck 的入口）——「覆盖全部入口」说法过强，返工 9 已删掉 scanFile 的提前抑制并把守卫集中到 claimDelivery，见下节。**
 - **修复 2（返工 7 的 real-chain 测试假绿）**：原测试无 Start、无 recheckCtx（dirty settle 必然早退）、无屏障保证第二次 claim 落在 A 在途时（评审者 dirty=false 变异 10 次全绿）。重写：真实 Start 生命周期（安装 recheck 三元组）、无缓冲通道 + 同步屏障（断言 dirty=true 后才放行 A 的发送）、`dirtyRecheckFired` 钩子断言重查定时器真实触发；新增 DoubleDirty（两次候选一次重查，不叠加）与 CancelAfterDirty（取消后重查被闸、claim 回滚、无僵尸定时器，计数钩子代替 goleak）。
 - **变异验收**（`bin/ic48/evidence/mutation-results-r8.txt`，均 `-count=10` 红）：`cur.dirty=true→false` 红（R5 symlink + real-chain 双测试抓）；删 `recheckAfterDirtySettle(path)` 红（recheck 未触发 + 交付缺失）。
 - **边界（不扩大本卡）**：评审者指出即便守卫顺序修正，下游判重在 B 落账前仍可能看到 A 的旧账本，远端最终状态取决于上传/ack 时序——这属于 **IC-BUG-58** 的范围，本卡不处理。
+
+### 返工 9（codex 评审 r6）——scanFile 提前抑制删除 + 单一 seen 表（2026-11-10）
+
+- **阻断 1（scanFile 在 claimDelivery 之前用旧 seen 提前返回）**：`scanFile`（pollScan、debounce recheck 的共同入口）里 `if known && seenEqual(prevEntry, ident) { return nil }` 绕过了返工 8 放进 claimDelivery 的守卫——返工 8 只修了 claimDelivery 内部顺序，实际入口根本到不了那里。修法：**删掉 scanFile 的提前抑制**，在途 + seen 判定只在 claimDelivery（同一把锁）里做；`known` 仅用于 op 标注（create/write）。全文件 grep `seen[` 清单：`watcher.go:1019`（scanFile 读 seen 判 op——不再据此返回 ✓）、`:1078`（markSeen，交付后写入 ✓）、`:1276`（completeDelivery settle 写入 ✓）——rework-9 后无任何「claimDelivery 之前抑制」的读取点。测试：`TestReviewR6SeenBypass`（真实 `scanFile`，先红 B_dirty=false → 绿 B_dirty=true）。
+- **阻断 2（dirty 重查与正常链路两张 seen 表）**：Start 给 recheckSeen 建一张表、fsnotify 路径与 polling 路径又各建一张——重查写入的版本对正常路径不可见，正常路径会把旧版本继续当已交付（返回 A 丢失）。修法：**每次 Start 只建一张 lifecycle seen**（recheckMu 下发布），初始扫描、fsnotify、polling、dirty 重查全部用它；顺序重启随生命周期重建，旧表不泄漏。守卫：`TestReviewR6_SingleSeenMapInProduction` 源级断言 `make(map[string]seenEntry)` 在生产代码中只出现一次（Start；runPolling 的 nil 回退为「绕过 Start 的包内测试专用」，注释标注并被守卫豁免）。测试：`TestReviewR6SplitSeen` 重写为真 Start 生命周期回归（A 交付 → B 经 dirty 重查交付 → 路径回 A → 断言正常链路确实交付 A；先红 0 events → 绿）。
+- **建议 3（表述）**：`TestReviewR4RealChain_*` 升级为断言第二次交付的版本（当前 inode = B）并以钩子记录重查触发时的交付序号（区分重查自身交付 vs 重查发现 seen==B 跳过——两者都是统一判定的裁决）；`completeDelivery` 的「just-written seen」矛盾注释改正（dirty 分支根本不写 seen）；48 卡返工 8 一节的「覆盖全部入口」改为准确描述（见上）；`active.md:25` 范围 1…57 → 1…58。
+- **验收**：两条移植测试先红（`rework9-red.txt`）；变异 4 条 `-count=10` 全红（`mutation-results-r9.txt`）：恢复 scanFile 提前 seen 返回、recheck 改用独立新 seen 表、返工 8 的 dirty=false 与删重查调用复跑；`go vet` 两平台全过、`go test` 全绿、覆盖率 ≥77.6%、`-count=10 -run 'RealChain|RealSymlink|SeenBypass|SplitSeen'` 全绿、grep 双空、status 干净；两后端 smoke + live 三场景（不重启 agent）重跑。
 
 ## IC-BUG-49 — 追加写入后「新版本对象 vs 覆盖」语义未定义 🟡 P2 ❌ 已撤销（2026-09-13）
 

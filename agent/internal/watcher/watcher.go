@@ -423,13 +423,22 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 		return ErrAlreadyRunning
 	}
 	defer w.running.Store(false)
-	// Rework-7 blocker 1: publish the loop context/channel/seen triple so a
-	// dirty-settle (completeDelivery seeing tok.dirty) can arm the shared
-	// recheck. Installed before any delivery and cleared on return.
+	// Rework-7 blocker 1 + rework-9 blocker 2: publish the loop context/
+	// channel/seen triple so a dirty-settle (completeDelivery seeing
+	// tok.dirty) can arm the recheck — and so the recheck shares ONE seen
+	// map with the initial scan / fsnotify loop / polling loop. The
+	// pre-rework-9 code created a SECOND map here while :469/:927 built
+	// their own: a version the recheck wrote into recheckSeen was invisible
+	// to the normal path's map, so the next normal observation of an OLDER
+	// version was suppressed (the returned-A-lost scenario). ONE map per
+	// Start lifecycle is created HERE (under recheckMu), then handed to
+	// every path below; sequential Starts rebuild it (the old loop's map is
+	// dropped with its lifecycle — no leak into the new one).
 	w.recheckMu.Lock()
+	lifecycleSeen := make(map[string]seenEntry)
 	w.recheckCtx = ctx
 	w.recheckEvents = events
-	w.recheckSeen = make(map[string]seenEntry)
+	w.recheckSeen = lifecycleSeen
 	w.recheckMu.Unlock()
 	defer func() {
 		w.recheckMu.Lock()
@@ -462,11 +471,11 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 	// startup are collected consistently on both paths. Register watches first
 	// so changes made during the scan are still observed by fsnotify.
 	//
-	// seen is shared with the event loop below so that the IC-BUG-44
-	// safety-net rescan does not re-emit unchanged files as "create", and so
-	// files emitted by an IC-BUG-43 debounce recheck are not re-emitted by a
-	// later rescan.
-	seen := make(map[string]seenEntry)
+	// seen IS the lifecycle map created in Start above (rework-9 blocker 2):
+	// the initial scan, the fsnotify/polling loop below AND the dirty-recheck
+	// all share it, so a version delivered by any path is visible to every
+	// other path's seenEqual verdict.
+	seen := lifecycleSeen
 	w.scheduleDebounceRechecks(ctx, events, seen, w.pollScan(ctx, events, seen))
 
 	w.logger.Info("watcher: fsnotify started", zap.String("path", w.sourcePath))
@@ -924,7 +933,19 @@ func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, see
 // runPolling scans the source directory on every pollInterval tick and emits
 // FileEvents for files that are new or have been modified since the last scan.
 func (w *Watcher) runPolling(ctx context.Context, events chan<- FileEvent) error {
-	seen := make(map[string]seenEntry)
+	// Rework-9 blocker 2: the polling loop shares the ONE lifecycle seen map
+	// created in Start (also published to the dirty recheck) — the pre-fix
+	// second map here made a recheck-delivered version invisible to the
+	// polling path's suppression verdicts. A nil lifecycle map means the
+	// caller bypassed Start (package tests drive runPolling directly): fall
+	// back to a loop-local map so the run is self-consistent (in production
+	// Start always provides the map; the single-make guard in
+	// single_seen_guard_r9_test.go pins that this fallback is the ONLY other
+	// creation site and lives in tests' reach only).
+	seen := w.lifecycleSeenForTest()
+	if seen == nil {
+		seen = make(map[string]seenEntry) // test-only fallback; see guard comment
+	}
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
 
@@ -1015,12 +1036,18 @@ func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen ma
 		// collect; the next event (create/remove) will handle it.
 		return nil
 	}
+	// Rework-9 blocker 1: NO suppression decision here. The pre-rework-9
+	// code returned early on a seen hit — before claimDelivery's in-flight
+	// check — so a candidate whose identity matched an OLD seen entry was
+	// discarded while another version's claim was parked mid-delivery: the
+	// parked token never became dirty and settle never re-examined the path
+	// (the returned-A-lost scenario). The in-flight + seen verdict now lives
+	// ONLY in claimDelivery (one lock): a seen hit there still returns
+	// false, but any in-flight claim is marked dirty first. `known` is kept
+	// solely to label the operation (create vs write) — never to suppress.
 	w.seenMu.Lock()
-	prevEntry, known := seen[path]
+	_, known := seen[path]
 	w.seenMu.Unlock()
-	if known && seenEqual(prevEntry, ident) {
-		return nil // provably the same version (racy window included) — skip
-	}
 	op := "write"
 	if !known {
 		op = "create"
@@ -1258,13 +1285,12 @@ func (w *Watcher) completeDelivery(seen map[string]seenEntry, path string, tok *
 
 	if dirty {
 		w.recheckAfterDirtySettle(path)
-		// Rework-7: a dirty settle must NOT write seen — the file may have
-		// moved on mid-flight (the candidate that set dirty could not be
-		// proven the same version). Writing the delivered identity here
-		// would bless the path with the OLD version and suppress the next
-		// candidate of the NEW version (the reviewer's blocker). The settle
-		// recheck re-examines the file and its own clean delivery writes
-		// seen with the CURRENT identity instead.
+		// Rework-7: a dirty settle does NOT write seen at all (this branch
+		// returns before the write below) — the file may have moved on
+		// mid-flight (the candidate that set dirty could not be proven the
+		// same version), so the delivered identity must not bless the path.
+		// Re-examination happens via the recheck armed above; ITS clean
+		// delivery is what writes seen, with the CURRENT identity.
 		return
 	}
 	if !delivered || tok == nil || !tok.identKnown {
@@ -1301,6 +1327,16 @@ func (w *Watcher) recheckAfterDirtySettle(path string) {
 		return // loop not running (unit tests drive claims directly)
 	}
 	w.scheduleDebounceRecheck(ctx, events, seen, path)
+}
+
+// lifecycleSeenForTest returns the lifecycle seen map published under
+// recheckMu (named for its test-guard role, but used by runPolling as the
+// ONE shared map — see rework-9 blocker 2). Nil when no Start lifecycle is
+// running.
+func (w *Watcher) lifecycleSeenForTest() map[string]seenEntry {
+	w.recheckMu.Lock()
+	defer w.recheckMu.Unlock()
+	return w.recheckSeen
 }
 
 // stopAllRechecks stops and forgets every pending debounce recheck timer.

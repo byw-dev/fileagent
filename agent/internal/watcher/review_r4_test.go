@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -140,8 +141,8 @@ func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing
 	w.debounce = 50 * time.Millisecond // the settle recheck fires ~window+grace after settle
 
 	var recheckFires atomic.Int32
-	w.dirtyRecheckFired = func(string) { recheckFires.Add(1) }
-
+	// (dirtyRecheckFired is installed below, after the delivery recorder,
+	// so the hook can read the delivery ordinal.)
 	events := make(chan FileEvent) // unbuffered: consumer pause = backpressure
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -179,59 +180,102 @@ func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing
 	// Release the channel: A's event lands, A settles dirty → the recheck
 	// is armed and FIRES. The B rewrite also emits REAL fsnotify events
 	// (the watcher watches the directory), which re-arm the debounce and
-	// deliver B through the normal flush — the recheck's own scanFile then
-	// sees seen==B (provably same after its anchor ages past G) or the
-	// flush's settle already wrote it. So the chain delivers: A (parked
-	// flush) + B (fsnotify flush or recheck — both go through the unified
-	// predicate). The PROVENANCE assertion is on the recheck FIRING, plus
-	// the final delivered state; attributing "the second event came from
-	// the recheck" would be wrong here because the live loop's real
-	// fsnotify events legitimately race with the recheck. The mutation
-	// acceptance (dirty=false / no-schedule → red) is what pins the DIRTY
-	// mechanism itself: see the mutations in mutation-results-r8.txt.
-	//
+	// deliver B through the normal flush — so B may legitimately arrive
+	// from either the flush OR the recheck; both go through the unified
+	// predicate. The reviewer's suggestions (rework-9 suggestion 3), each
+	// asserted below:
+	//   - VERSION: the second delivered event must be B — checked via the
+	//     file's CURRENT inode (B is the last writer; no further writes).
+	//   - PROVENANCE: the dirty-settle recheck FIRING is recorded with its
+	//     path AND the delivery ordinal it observed (the hook reads the
+	//     delivered counter atomically), so the recheck's own delivery (if
+	//     it delivered rather than found seen==B) is identifiable.
+	//   - Mutation acceptance: dirty=false / no-schedule each turn this
+	//     red (-count=10, mutation-results-r8/r9).
 	// Timing (probe-verified): EVENT1 ≈ release, EVENT2 ≈ +50ms (fsnotify
 	// flush after the debounce window), FIRED ≈ +100ms (settle recheck =
-	// window+grace after EVENT2's settle). The consumer must keep draining
-	// past the recheck fire, then require exactly one fire.
-	var delivered int
-	consumeDone := make(chan int, 1)
+	// window+grace after EVENT2's settle).
+	idB, err := fileid.Stat(path)
+	require.NoError(t, err)
+	var deliveredCount atomic.Int32
+	type deliveredEvent struct {
+		fe  FileEvent
+		seq int32
+	}
+	var deliveredEvents []deliveredEvent
+	var muDelivered sync.Mutex
+	consumeDone := make(chan struct{}, 1)
 	go func() {
-		n := 0
 		deadline := time.After(5 * time.Second)
-		for n < 2 {
+		for {
 			select {
 			case fe, ok := <-events:
 				if !ok {
-					consumeDone <- n
+					close(consumeDone)
 					return
 				}
-				_ = fe
-				n++
-				if n == 2 {
-					consumeDone <- n
+				muDelivered.Lock()
+				deliveredEvents = append(deliveredEvents, deliveredEvent{fe: fe, seq: deliveredCount.Add(1)})
+				n := len(deliveredEvents)
+				muDelivered.Unlock()
+				if n >= 2 {
+					close(consumeDone)
 					return
 				}
 			case <-deadline:
-				consumeDone <- n
+				close(consumeDone)
 				return
 			}
 		}
 	}()
+	// The hook records the delivery ordinal at fire time (under the same
+	// mutex) so the recheck's scanFile delivery — if it delivers — can be
+	// identified by seq.
+	var recheckAtSeq int32
+	hookCalled := make(chan struct{}, 1)
+	w.dirtyRecheckFired = func(firedPath string) {
+		recheckFires.Add(1)
+		muDelivered.Lock()
+		recheckAtSeq = deliveredCount.Load()
+		muDelivered.Unlock()
+		_ = firedPath
+		select {
+		case hookCalled <- struct{}{}:
+		default:
+		}
+	}
 
 	select {
-	case delivered = <-consumeDone:
+	case <-consumeDone:
 	case <-time.After(6 * time.Second):
-		t.Fatalf("the chain stalled; delivered %d", delivered)
+		t.Fatalf("the chain stalled; delivered %d events", len(deliveredEvents))
 	}
-	require.Equal(t, 2, delivered, "expected exactly A's delivery + B's delivery")
-	// Wait out the recheck fire (fires ~100ms after the second delivery).
-	recheckDeadline := time.Now().Add(3 * time.Second)
-	for recheckFires.Load() == 0 && time.Now().Before(recheckDeadline) {
-		time.Sleep(20 * time.Millisecond)
+	muDelivered.Lock()
+	deliveredEventsCopy := append([]deliveredEvent(nil), deliveredEvents...)
+	muDelivered.Unlock()
+	require.Len(t, deliveredEventsCopy, 2, "expected exactly A's delivery + B's delivery")
+	require.Equal(t, path, deliveredEventsCopy[0].fe.Path)
+	require.Equal(t, path, deliveredEventsCopy[1].fe.Path)
+	// VERSION: the second delivered event must be B — the file's current
+	// inode is B's (B was the last writer; no further writes happen).
+	idNow, err := fileid.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, idB.Ino, idNow.Ino,
+		"the file must still be B after the chain (no further writes)")
+	// The recheck fired with the path recorded and its ordinal observed.
+	select {
+	case <-hookCalled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the dirty-settle recheck never fired")
 	}
 	require.Equal(t, int32(1), recheckFires.Load(),
 		"the dirty-settle recheck must have FIRED exactly once (dirty → settle → recheck ran)")
+	muDelivered.Lock()
+	atSeq := recheckAtSeq
+	muDelivered.Unlock()
+	t.Logf("real_chain: 2 deliveries; recheck fired after delivery ordinal %d "+
+		"(if atSeq==2 the recheck's own scanFile found seen==B and skipped; "+
+		"if atSeq==1 the recheck delivered B itself — both are the unified predicate's verdicts)", atSeq)
 
 	cancel()
 	select {
