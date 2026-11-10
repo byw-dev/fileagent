@@ -1905,21 +1905,41 @@ func TestSeen_MonotonicWrite_OldVersionLateCompletion(t *testing.T) {
 		return busy && cur != nil && identityEqualVersions(cur.ident, id1)
 	}, 2*time.Second, 5*time.Millisecond, "v1 should hold the claim while parked")
 
-	// The file moves on; the newer version delivers and settles FIRST.
-	require.NoError(t, os.Chtimes(path, time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)))
-	info2, err := os.Stat(path)
-	require.NoError(t, err)
-	require.NoError(t, w.scanFile(ctx, eventsNew, seen, path, info2))
+	// The file moves on; the newer version arrives. Rework-7: v1's claim is
+	// still parked mid-delivery, so v2's claimDelivery marks it DIRTY and
+	// v2 does NOT deliver here — instead v1's settle re-arms a recheck that
+	// re-examines the file (now v2) and delivers it (the loop's context is
+	// not running in this test, so the dirty path degrades to no recheck;
+	// the delivery guarantee is covered end-to-end by
+	// TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB).
+	// What THIS test pins is the settle behaviour: v1's late completion —
+	// dirty — must NOT write seen (the file has moved on mid-flight), so
+	// seen stays absent until a clean delivery re-records it. The
+	// monotonicity invariant (a late delivery must not regress seen) is
+	// strengthened: a dirty settle doesn't touch seen at all.
+	id2Arrival := func() {
+		info2, err := os.Stat(path)
+		require.NoError(t, err)
+		_ = w.scanFile(ctx, eventsNew, seen, path, info2)
+	}
+	id2Arrival()
 
 	w.seenMu.Lock()
-	se, known := seen[path]
+	_, known := seen[path]
 	w.seenMu.Unlock()
-	require.True(t, known)
 	id2, ierr := fileid.Stat(path)
 	require.NoError(t, ierr)
-	require.True(t, identityEqualVersions(se.ident, id2), "seen must carry the newer version")
+	// v2's arrival marked v1's parked claim dirty; neither v1 (not yet
+	// settled) nor v2 (collapsed into the dirty flag) has delivered in this
+	// unit-test shape, so seen is still empty — the pre-rework-7 test
+	// asserted v2 had settled here; the invariant that matters (and holds
+	// end-to-end in the real-chain test) is that v1's LATE completion never
+	// records v1 into seen.
+	_ = known
+	_ = id2
 
-	// Drain v1's parked emit; its late completion must not regress seen.
+	// Drain v1's parked emit; its late completion (dirty) must settle and —
+	// per rework-7 — must NOT write seen: the file moved on mid-flight.
 	select {
 	case <-eventsOld:
 	case <-time.After(2 * time.Second):
@@ -1931,17 +1951,49 @@ func TestSeen_MonotonicWrite_OldVersionLateCompletion(t *testing.T) {
 		return len(w.inflight) == 0
 	}, 1*time.Second, 5*time.Millisecond, "late v1 claim must settle")
 
+	// Rework-7: a dirty settle never records the delivered (older) version —
+	// the file may have moved on mid-flight. The stronger invariant (no
+	// suppression of the CURRENT version) follows: with no seen entry, the
+	// next scan delivers v2 and DecideProcessed hash-confirms. (Pre-rework-7
+	// this asserted seen == v2 because v2 had delivered directly; the dirty
+	// design collapses the mid-flight v2 into v1's settle recheck — the
+	// real-chain test pins that v2 does get delivered there.) The settle's
+	// recheck is asynchronous (debounce window + grace), so the recheck may
+	// already have delivered v2 by the time we observe seen. What must hold
+	// IMMEDIATELY after v1's settle is: EITHER seen is still empty (recheck
+	// pending) OR seen carries the CURRENT file version (the recheck already
+	// delivered and settled v2). What must NEVER hold: seen carrying v1.
+	// (v1 and v2 share the same identity here — only mtime differs — so the
+	// identity check alone can't distinguish; the anchor recency can.)
+	// NOTE: this test never publishes the loop triple (no Start), so the
+	// dirty settle's recheck is a no-op and seen stays empty here.
 	w.seenMu.Lock()
-	late, _ := seen[path]
+	_, knownAfter := seen[path]
 	w.seenMu.Unlock()
-	assert.True(t, known && identityEqualVersions(late.ident, id2),
-		"a late older-version completion must not move seen backwards")
+	assert.False(t, knownAfter,
+		"without the loop triple the dirty settle must not write seen (the recheck path is the only writer)")
+
+	// Convergence: without seen, the next scan (after the racy window)
+	// delivers v2; a scan INSIDE the racy window delivers too (not provably
+	// same) — either way the current version is never suppressed silently.
+	// The no-miss invariant is covered end-to-end by
+	// TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB; this
+	// tail of the test pins the same-version suppression half: deliver v2
+	// cleanly now (nothing in flight), then the NEXT scan within G re-checks
+	// via seenEqual and delivers again (racy), and only after G passes does
+	// it suppress — the ledger-shared convergence behaviour.
+	info3, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, w.scanFile(ctx, eventsNew, seen, path, info3))
+	w.seenMu.Lock()
+	knownClean := seen[path] != seenEntry{}
+	w.seenMu.Unlock()
+	assert.True(t, knownClean, "a clean (non-dirty) delivery must record seen")
 
 	// Convergence (rework-5, three scans): the seen anchor only moves on
-	// delivery. So: poll (inside v2's racy window) re-delivers v2' (same
-	// content) and RefreshAndSkip in the ledger — that poll's completion
-	// advances the seen anchor past v2's ctime+G — and the NEXT poll then
-	// finds v2 provably-same → suppressed (no hash read, no upload).
+	// delivery. v2 was delivered cleanly just above, so its poll re-checks
+	// via seenEqual: inside the racy window it re-delivers (drained below);
+	// after G passes it suppresses — the ledger-shared convergence.
 	time.Sleep(2100 * time.Millisecond)
 	w.pollScan(ctx, eventsNew, seen)
 	w.seenMu.Lock()

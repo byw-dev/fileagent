@@ -69,6 +69,12 @@ type claimToken struct {
 	identKnown bool
 	ident      versionOf
 	anchorNs   int64
+	// dirty is set when a candidate for this path arrived while the claim
+	// was in flight (rework-7 blocker 1): the candidate could not be proven
+	// the same version, so it was not delivered — the claim's settle must
+	// re-evaluate the file instead of writing seen (its version may differ
+	// from the delivered one).
+	dirty bool
 }
 
 // identityEqualVersions reports whether two identities describe the same
@@ -186,12 +192,26 @@ type Watcher struct {
 	running atomic.Bool
 
 	// inflight tracks paths whose delivery is currently in progress, keyed
-	// by the mtime being delivered (PR #108 review F3). It is the exactly-
-	// once gate for a file version across the goroutines that all run
-	// "check seen → send → record seen": the debounce flush, the
+	// by path (PR #108 review F3; rework-7: the claim no longer compares
+	// versions — a racing candidate marks the token dirty instead). It is
+	// the exactly-once gate for a file version across the goroutines that
+	// all run "check seen → send → record seen": the debounce flush, the
 	// debounce recheck and the overflow-rescan scan. Guarded by seenMu;
 	// lazily initialized so a Watcher built by struct literal works.
 	inflight map[string]*claimToken
+
+	// rework-7 blocker 1: the settle-time recheck needs the loop's context,
+	// event channel and seen map — the exact triple scheduleDebounceRecheck
+	// already takes — but completeDelivery's callers do not carry them.
+	// Start installs them before any delivery can run and clears them on
+	// return; guarded by recheckMu. nil context = the loop is not running
+	// (unit tests drive claimDelivery/completeDelivery directly) and the
+	// dirty-settle recheck degrades to a no-op (claims still settle; the
+	// re-examination story belongs to the live loop).
+	recheckMu     sync.Mutex
+	recheckCtx    context.Context
+	recheckEvents chan<- FileEvent
+	recheckSeen   map[string]seenEntry
 
 	// debounce is the write-quiet (debounce) window every mode except tail
 	// waits before emitting Write/Create events (D-035). Zero means the
@@ -396,6 +416,21 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 		return ErrAlreadyRunning
 	}
 	defer w.running.Store(false)
+	// Rework-7 blocker 1: publish the loop context/channel/seen triple so a
+	// dirty-settle (completeDelivery seeing tok.dirty) can arm the shared
+	// recheck. Installed before any delivery and cleared on return.
+	w.recheckMu.Lock()
+	w.recheckCtx = ctx
+	w.recheckEvents = events
+	w.recheckSeen = make(map[string]seenEntry)
+	w.recheckMu.Unlock()
+	defer func() {
+		w.recheckMu.Lock()
+		w.recheckCtx = nil
+		w.recheckEvents = nil
+		w.recheckSeen = nil
+		w.recheckMu.Unlock()
+	}()
 	// Keep the lifecycle gate pair at the outer Start scope as a defensive
 	// invariant. The polling path currently ignores pollScan's skipped paths
 	// and never schedules rechecks, so this placement does not change its
@@ -572,8 +607,17 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 		if serr != nil {
 			return // gone between quiet-check and flush; nothing to collect
 		}
-		anchor := time.Now().UnixNano()
-		tok, ok := w.claimDelivery(seen, path, ident, anchor)
+		// Rework-7 fix 2: the claim/settle anchor is the identity's own
+		// snapshot moment — fileid.Stat recorded it BEFORE the stat. A
+		// time.Now() taken here (after the stat) would let a goroutine
+		// stall longer than G between stat and claim LAUNDER the stamps out
+		// of the racy window: settle writes the late anchor into seen and
+		// the next candidate of an identical coarse version is then
+		// provably "same" and suppressed forever (the reviewer's
+		// TestReviewR4LateFlushAnchor scenario). No other anchor in this
+		// file is sampled after a stat (grep: anchor sites all use
+		// ident.SnapAtNs).
+		tok, ok := w.claimDelivery(seen, path, ident, ident.SnapAtNs)
 		if !ok {
 			return
 		}
@@ -1054,10 +1098,30 @@ func (w *Watcher) markSeen(seen map[string]seenEntry, path string, ident version
 //
 // Returns (nil, false) — meaning "do not deliver" — when:
 //   - seen already holds a provably-same version (already delivered), or
-//   - another goroutine holds an in-flight claim for this path whose
-//     version is provably the same (its owner delivers); a different
-//     in-flight version is superseded — the file has moved on and the
-//     newer claim wins.
+//   - another goroutine holds an in-flight claim for this path. Rework-7
+//     blocker 1: the in-flight claim NO LONGER compares versions. The old
+//     bare identity equality swallowed a coarse-FS same-tick rewrite (B)
+//     while an identical-identity A was parked mid-delivery: A's anchor sits
+//     inside the racy window of the shared stamps, so B is NOT provably the
+//     same version, yet bare equality rejected its claim — and with no
+//     further fs events B could be lost. Instead the claimant marks the
+//     in-flight token DIRTY (under seenMu) and returns false: when the
+//     in-flight delivery settles, completeDelivery sees dirty and schedules
+//     a debounce recheck, so the file is re-examined through the ONE
+//     SameVersionProvable path (seenEqual) — if the version on disk is still
+//     not provably-same it is delivered and DecideProcessed hash-confirms;
+//     identical content never re-uploads.
+//
+// Why dirty instead of SameVersionProvable on the in-flight identity: the
+// in-flight claim's own anchor is the SNAPSHOT of the version being
+// delivered — by construction any candidate observed while that delivery is
+// still parked falls inside its racy window (the candidate's stamps cannot
+// sort before anchor−G when they equal the delivered version's stamps), so
+// the verdict is almost always Undecidable and the "dedup" degenerates into
+// delivering every racing duplicate of the same version (an amplification
+// vector under backpressure: each parked duplicate re-emits). The dirty flag
+// is simpler and strictly safe: duplicates during flight are collapsed into
+// ONE re-examination after settle, which the unified predicate arbitrates.
 //
 // The caller MUST settle the returned token via completeDelivery (deferred),
 // so panics and early returns can never leave a stuck claim: a leaked claim
@@ -1069,14 +1133,13 @@ func (w *Watcher) claimDelivery(seen map[string]seenEntry, path string, ident ve
 	if se, known := seen[path]; known && seenEqual(se, ident) {
 		return nil, false // provably the same version: already delivered
 	}
-	if cur, busy := w.inflight[path]; busy && cur != nil && identityEqualVersions(cur.ident, ident) {
-		// In-flight dedup uses plain identity equality (SnapAtNs excluded):
-		// two stats of the same untouched version produce identical stamps,
-		// so this suppresses same-version double claims deterministically.
-		// The racy window is a SEEN-time judgement (cross-time), not an
-		// in-flight one — concurrent claims of the same version always race
-		// inside one racy window by construction.
-		return nil, false // same version already in flight; its owner delivers
+	if cur, busy := w.inflight[path]; busy && cur != nil {
+		// Rework-7 blocker 1: NO version comparison here. Mark the in-flight
+		// claim dirty so its settle re-examines the path — the candidate
+		// (possibly a same-tick coarse rewrite) is re-evaluated through the
+		// unified predicate instead of being trusted away by bare equality.
+		cur.dirty = true
+		return nil, false // in flight; its settle re-checks the path
 	}
 	if w.inflight == nil {
 		w.inflight = make(map[string]*claimToken)
@@ -1099,7 +1162,34 @@ func identityKnown(id versionOf) bool {
 // delivered version in seen (identity + anchor). delivered=false only rolls
 // the placeholder back; the file stays retryable (PR #100 F1).
 //
-// Seen write rules (rework-5):
+// Rework-7 blocker 1 (dirty flag): a candidate that arrived while this claim
+// was in flight set tok.dirty — that candidate could not be proven the same
+// version, and it was NOT delivered. Therefore:
+//   - if dirty and delivered: do NOT write seen unconditionally — the file
+//     on disk may be a NEWER version than the one this claim delivered (the
+//     coarse same-tick rewrite case). Instead schedule a debounce recheck:
+//     the recheck stats the path and runs scanFile → seenEqual (the ONE
+//     SameVersionProvable path). A same-version candidate is suppressed by
+//     the just-written seen (its stamps still fall inside the racy window —
+//     the recheck only re-delivers once G has passed, i.e. exactly the
+//     convergence behaviour shared with the ledger); a NEWER version fails
+//     seenEqual and is delivered → DecideProcessed hash-confirms. WHY the
+//     recheck (rather than an inline re-claim): completeDelivery runs under
+//     seenMu on the delivering goroutine — inline re-claiming would recurse
+//     into the claim logic while still holding the lock and risk an
+//     unbounded retry loop on a hot file; the recheck mechanism already
+//     exists (IC-BUG-43), is generation-tracked, debounced (rate-limiting a
+//     hot file's re-evaluations) and stats the CURRENT file, so it is the
+//     natural carrier. The recheck is armed for EVERY mode — poll mode and
+//     tail mode included — because it re-examines via scanFile directly and
+//     needs no fsnotify event: the loop is exactly "no further events are
+//     needed".
+//   - if dirty and NOT delivered (rolled back): the rollback story (below)
+//     already leaves the file retryable, and the arriving candidate is
+//     itself a claim attempt — also schedule the recheck so the candidate's
+//     arrival is guaranteed a re-examination even if its own delivery raced.
+//
+// Seen write rules (rework-5, amended rework-7):
 //   - unknown identities are NEVER written to seen: they cannot be proven
 //     the same version later, so writing them would suppress future
 //     deliveries of genuinely-changed content; unknown-identity files are
@@ -1107,7 +1197,10 @@ func identityKnown(id versionOf) bool {
 //     window) and hash-confirmed downstream.
 //   - known identities are written with the claim's snapshot anchor — the
 //     convergence mechanism shared with the ledger (the anchor advances on
-//     each delivery, letting Same become provable once G has passed).
+//     each delivery, letting Same become provable once G has passed). ONLY
+//     when the claim is not dirty — a dirty claim's settle must not bless
+//     the path with the delivered version's identity, because the file may
+//     have moved on mid-flight.
 //   - the liveness guard (from rework-4) stands: seen is only updated when
 //     the FILE'S CURRENT identity still matches the delivered one — a late
 //     older-version delivery must not overwrite a newer entry.
@@ -1125,20 +1218,42 @@ func identityKnown(id versionOf) bool {
 // initial scan re-discovers the file (scheduling a fresh recheck if it is
 // still hot), and if the rule was cancelled the file has no rule left to
 // belong to. So no file is orphaned by a rolled-back claim.
+//
+// completeDelivery must NOT be called while holding seenMu: it takes the
+// lock itself (and the recheck scheduler takes it too).
 func (w *Watcher) completeDelivery(seen map[string]seenEntry, path string, tok *claimToken, delivered bool) {
 	w.seenMu.Lock()
-	defer w.seenMu.Unlock()
+	var dirty bool
 	if cur, busy := w.inflight[path]; busy && cur == tok {
 		// token match: release our own claim (works for unknown identities)
 		delete(w.inflight, path)
+		dirty = tok.dirty
 	} else if busy {
 		// someone else superseded this claim; leave theirs alone
+		w.seenMu.Unlock()
+		return
+	} else {
+		dirty = tok.dirty
+	}
+	w.seenMu.Unlock()
+
+	if dirty {
+		w.recheckAfterDirtySettle(path)
+		// Rework-7: a dirty settle must NOT write seen — the file may have
+		// moved on mid-flight (the candidate that set dirty could not be
+		// proven the same version). Writing the delivered identity here
+		// would bless the path with the OLD version and suppress the next
+		// candidate of the NEW version (the reviewer's blocker). The settle
+		// recheck re-examines the file and its own clean delivery writes
+		// seen with the CURRENT identity instead.
 		return
 	}
 	if !delivered || tok == nil || !tok.identKnown {
 		return
 	}
-	if live, err := fileid.Stat(path); err == nil && identityEqualVersions(live, tok.ident) {
+	w.seenMu.Lock()
+	live, err := fileid.Stat(path)
+	if err == nil && identityEqualVersions(live, tok.ident) {
 		seen[path] = seenEntry{ident: tok.ident, anchorNs: tok.anchorNs}
 	} else {
 		w.logger.Debug("watcher: settle skipped, live identity no longer matches the delivered one",
@@ -1146,9 +1261,27 @@ func (w *Watcher) completeDelivery(seen map[string]seenEntry, path string, tok *
 			zap.Int64("live_mtime_ns", live.MtimeNs),
 			zap.Int64("delivered_mtime_ns", tok.ident.MtimeNs))
 	}
+	w.seenMu.Unlock()
 	// stat failed (file gone): leave seen untouched — the removal event
 	// or the next scan handles it; a stale seen entry for a deleted file
 	// is harmless (a recreated file has a new inode → new identity).
+}
+
+// recheckAfterDirtySettle arms the post-settle re-examination for a path
+// whose in-flight claim observed a candidate mid-delivery (rework-7 blocker
+// 1). It uses the shared scheduleDebounceRecheck timer (IC-BUG-43
+// mechanism): debounced (rate-limited), generation-tracked, and it stats the
+// CURRENT file so a same-tick rewrite delivered late is judged by the one
+// SameVersionProvable predicate. Safe to call with no locks held; a no-op
+// when the loop is stopping or the file is gone.
+func (w *Watcher) recheckAfterDirtySettle(path string) {
+	w.recheckMu.Lock()
+	ctx, events, seen := w.recheckCtx, w.recheckEvents, w.recheckSeen
+	w.recheckMu.Unlock()
+	if ctx == nil {
+		return // loop not running (unit tests drive claims directly)
+	}
+	w.scheduleDebounceRecheck(ctx, events, seen, path)
 }
 
 // stopAllRechecks stops and forgets every pending debounce recheck timer.
