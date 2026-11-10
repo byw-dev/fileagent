@@ -7,7 +7,6 @@ package watcher
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -971,16 +970,6 @@ func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen ma
 	if known && seenEqual(prevEntry, ident) {
 		return nil // provably the same version (racy window included) — skip
 	}
-	if known {
-		v := queue.PrefilterVerdict(queue.IdentityFromFileid(prevEntry.ident), queue.IdentityFromFileid(ident), prevEntry.anchorNs)
-		fmt.Printf("DBG NOT-skip: pv=%v anchor=%d ctime=%d recSnap=%d curSnap=%d\n",
-			v, prevEntry.anchorNs, ident.CtimeNs, prevEntry.ident.SnapAtNs, ident.SnapAtNs)
-	}
-	{
-		v := queue.PrefilterVerdict(queue.IdentityFromFileid(prevEntry.ident), queue.IdentityFromFileid(ident), prevEntry.anchorNs)
-		fmt.Printf("DBG scanFile NOT-skipped prefilter=%v prev.anchor=%d prev.ident=%+v cur=%+v\n",
-			v, prevEntry.anchorNs, prevEntry.ident, ident)
-	}
 	op := "write"
 	if !known {
 		op = "create"
@@ -1151,9 +1140,11 @@ func (w *Watcher) completeDelivery(seen map[string]seenEntry, path string, tok *
 	}
 	if live, err := fileid.Stat(path); err == nil && identityEqualVersions(live, tok.ident) {
 		seen[path] = seenEntry{ident: tok.ident, anchorNs: tok.anchorNs}
-		fmt.Printf("DBG settle wrote anchor=%d ctime=%d\n", tok.anchorNs, tok.ident.CtimeNs)
 	} else {
-		fmt.Printf("DBG settle skipped: live!=tok (live.mtime=%d tok.mtime=%d)\n", live.MtimeNs, tok.ident.MtimeNs)
+		w.logger.Debug("watcher: settle skipped, live identity no longer matches the delivered one",
+			zap.String("path", path),
+			zap.Int64("live_mtime_ns", live.MtimeNs),
+			zap.Int64("delivered_mtime_ns", tok.ident.MtimeNs))
 	}
 	// stat failed (file gone): leave seen untouched — the removal event
 	// or the next scan handles it; a stale seen entry for a deleted file
