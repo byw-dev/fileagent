@@ -942,7 +942,7 @@ func (w *Watcher) runPolling(ctx context.Context, events chan<- FileEvent) error
 	// Start always provides the map; the single-make guard in
 	// single_seen_guard_r9_test.go pins that this fallback is the ONLY other
 	// creation site and lives in tests' reach only).
-	seen := w.lifecycleSeenForTest()
+	seen := w.lifecycleSeen()
 	if seen == nil {
 		seen = make(map[string]seenEntry) // test-only fallback; see guard comment
 	}
@@ -1329,11 +1329,13 @@ func (w *Watcher) recheckAfterDirtySettle(path string) {
 	w.scheduleDebounceRecheck(ctx, events, seen, path)
 }
 
-// lifecycleSeenForTest returns the lifecycle seen map published under
-// recheckMu (named for its test-guard role, but used by runPolling as the
-// ONE shared map — see rework-9 blocker 2). Nil when no Start lifecycle is
-// running.
-func (w *Watcher) lifecycleSeenForTest() map[string]seenEntry {
+// lifecycleSeen returns the ONE lifecycle seen map published under recheckMu
+// (rework-9 blocker 2): Start hands it to the initial scan, the fsnotify /
+// polling loop AND the dirty recheck, so a version delivered by any path is
+// visible to every other path's seenEqual verdict. Nil only when no Start
+// lifecycle is running (package tests driving runPolling directly — the
+// production callers both sit inside Start after the publish).
+func (w *Watcher) lifecycleSeen() map[string]seenEntry {
 	w.recheckMu.Lock()
 	defer w.recheckMu.Unlock()
 	return w.recheckSeen

@@ -130,7 +130,7 @@ func TestReviewR6SplitSeen(t *testing.T) {
 		defer w.seenMu.Unlock()
 		return len(w.inflight) == 0 && len(w.recheckSeen) == 1
 	}, 5*time.Second, 10*time.Millisecond, "A must be delivered and settled into the lifecycle seen")
-	seenSnapshot := w.lifecycleSeenForTest()
+	seenSnapshot := w.lifecycleSeen()
 	require.Len(t, seenSnapshot, 1, "exactly ONE lifecycle seen map exists")
 	ia, err := fileid.Stat(p)
 	require.NoError(t, err)
@@ -186,7 +186,7 @@ func TestReviewR6SplitSeen(t *testing.T) {
 		return recheckFires.Load() >= 1
 	}, 3*time.Second, 10*time.Millisecond, "the dirty recheck must fire for B")
 	require.Eventually(t, func() bool {
-		s := w.lifecycleSeenForTest()
+		s := w.lifecycleSeen()
 		w.seenMu.Lock()
 		defer w.seenMu.Unlock()
 		cur, known := s[p]
@@ -202,7 +202,7 @@ func TestReviewR6SplitSeen(t *testing.T) {
 	infoA, err := os.Stat(p)
 	require.NoError(t, err)
 	before := len(delivered)
-	require.NoError(t, w.scanFile(ctx, events, w.lifecycleSeenForTest(), p, infoA))
+	require.NoError(t, w.scanFile(ctx, events, w.lifecycleSeen(), p, infoA))
 	require.Eventually(t, func() bool {
 		return len(delivered) > before
 	}, 3*time.Second, 10*time.Millisecond,
