@@ -141,8 +141,36 @@ func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing
 	w.debounce = 50 * time.Millisecond // the settle recheck fires ~window+grace after settle
 
 	var recheckFires atomic.Int32
-	// (dirtyRecheckFired is installed below, after the delivery recorder,
-	// so the hook can read the delivery ordinal.)
+	// Delivery log: every event is recorded with its ordinal, the identity
+	// observed at delivery time (stat under the log mutex — the delivered
+	// event does not carry identity), and the ordinal at which the dirty
+	// recheck fired. All access is under one mutex (rework-10 fix 1: the
+	// old test appended/read from different goroutines without sync).
+	var muLog sync.Mutex
+	type deliveredEvent struct {
+		seq      int32
+		path     string
+		observed fileid.Identity // stat'ed synchronously at consumption
+	}
+	var deliveredLog []deliveredEvent
+	// Rework-10 fix 1: the hook is installed BEFORE Start — the debounce
+	// recheck timer reads this function pointer concurrently once armed
+	// (watcher.go's time.AfterFunc closure); assigning it after Start was
+	// the reviewer's data race.
+	var recheckAtSeq int32
+	hookInstalled := make(chan struct{})
+	w.dirtyRecheckFired = func(firedPath string) {
+		recheckFires.Add(1)
+		muLog.Lock()
+		recheckAtSeq = int32(len(deliveredLog))
+		muLog.Unlock()
+		_ = firedPath
+		select {
+		case hookInstalled <- struct{}{}:
+		default:
+		}
+	}
+
 	events := make(chan FileEvent) // unbuffered: consumer pause = backpressure
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -161,13 +189,11 @@ func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing
 		return len(w.inflight) == 1
 	}, 3*time.Second, 5*time.Millisecond, "A's delivery should hold the claim while parked in emitBlocking")
 
-	// Same-tick rewrite to B: same mtime via Chtimes (coarse-tick
-	// simulation); content differs.
-	require.NoError(t, os.WriteFile(path, []byte("B-content"), 0o600))
-	require.NoError(t, os.Chtimes(path, old, old))
-
 	// Barrier 2 (pre-release): B's candidate claims SYNCHRONOUSLY via the
-	// rescan path and must mark A's parked token dirty.
+	// rescan path and must mark A's parked token dirty. (The rewrite to B
+	// happens AFTER A is consumed — see below; the dirty marking must
+	// happen while A is parked, so it uses a synthetic candidate against
+	// the pre-rewrite path, exactly what a racing rescan would do.)
 	require.NoError(t, w.scanFile(ctx, events, make(map[string]seenEntry), path, mustInfo(t, path)))
 	w.seenMu.Lock()
 	tok, busy := w.inflight[path]
@@ -177,105 +203,78 @@ func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing
 	require.True(t, dirty,
 		"B's candidate must have marked A's parked token dirty (dirty=false mutation turns this red)")
 
-	// Release the channel: A's event lands, A settles dirty → the recheck
-	// is armed and FIRES. The B rewrite also emits REAL fsnotify events
-	// (the watcher watches the directory), which re-arm the debounce and
-	// deliver B through the normal flush — so B may legitimately arrive
-	// from either the flush OR the recheck; both go through the unified
-	// predicate. The reviewer's suggestions (rework-9 suggestion 3), each
-	// asserted below:
-	//   - VERSION: the second delivered event must be B — checked via the
-	//     file's CURRENT inode (B is the last writer; no further writes).
-	//   - PROVENANCE: the dirty-settle recheck FIRING is recorded with its
-	//     path AND the delivery ordinal it observed (the hook reads the
-	//     delivered counter atomically), so the recheck's own delivery (if
-	//     it delivered rather than found seen==B) is identifiable.
-	//   - Mutation acceptance: dirty=false / no-schedule each turn this
-	//     red (-count=10, mutation-results-r8/r9).
-	// Timing (probe-verified): EVENT1 ≈ release, EVENT2 ≈ +50ms (fsnotify
-	// flush after the debounce window), FIRED ≈ +100ms (settle recheck =
-	// window+grace after EVENT2's settle).
-	idB, err := fileid.Stat(path)
-	require.NoError(t, err)
-	var deliveredCount atomic.Int32
-	type deliveredEvent struct {
-		fe  FileEvent
-		seq int32
-	}
-	var deliveredEvents []deliveredEvent
-	var muDelivered sync.Mutex
-	consumeDone := make(chan struct{}, 1)
-	go func() {
-		deadline := time.After(5 * time.Second)
-		for {
-			select {
-			case fe, ok := <-events:
-				if !ok {
-					close(consumeDone)
-					return
-				}
-				muDelivered.Lock()
-				deliveredEvents = append(deliveredEvents, deliveredEvent{fe: fe, seq: deliveredCount.Add(1)})
-				n := len(deliveredEvents)
-				muDelivered.Unlock()
-				if n >= 2 {
-					close(consumeDone)
-					return
-				}
-			case <-deadline:
-				close(consumeDone)
-				return
-			}
-		}
-	}()
-	// The hook records the delivery ordinal at fire time (under the same
-	// mutex) so the recheck's scanFile delivery — if it delivers — can be
-	// identified by seq.
-	var recheckAtSeq int32
-	hookCalled := make(chan struct{}, 1)
-	w.dirtyRecheckFired = func(firedPath string) {
-		recheckFires.Add(1)
-		muDelivered.Lock()
-		recheckAtSeq = deliveredCount.Load()
-		muDelivered.Unlock()
-		_ = firedPath
-		select {
-		case hookCalled <- struct{}{}:
-		default:
-		}
-	}
+	// CONSUME A FIRST (rework-10 fix 2b): release the parked send and
+	// record A's identity at the consumption synchronisation point —
+	// BEFORE the rewrite. The reviewer's point: an in-place rewrite keeps
+	// the same inode and a post-hoc path stat after BOTH deliveries can
+	// only ever see the LAST writer, so the only way to tell the two
+	// deliveries apart is to observe each version while it is on disk.
+	feA := <-events
+	idAOnDisk, statErr := fileid.Stat(feA.Path)
+	require.NoError(t, statErr)
+	muLog.Lock()
+	deliveredLog = append(deliveredLog, deliveredEvent{
+		seq:      int32(len(deliveredLog) + 1),
+		path:     feA.Path,
+		observed: idAOnDisk,
+	})
+	muLog.Unlock()
 
-	select {
-	case <-consumeDone:
-	case <-time.After(6 * time.Second):
-		t.Fatalf("the chain stalled; delivered %d events", len(deliveredEvents))
-	}
-	muDelivered.Lock()
-	deliveredEventsCopy := append([]deliveredEvent(nil), deliveredEvents...)
-	muDelivered.Unlock()
-	require.Len(t, deliveredEventsCopy, 2, "expected exactly A's delivery + B's delivery")
-	require.Equal(t, path, deliveredEventsCopy[0].fe.Path)
-	require.Equal(t, path, deliveredEventsCopy[1].fe.Path)
-	// VERSION: the second delivered event must be B — the file's current
-	// inode is B's (B was the last writer; no further writes happen).
-	idNow, err := fileid.Stat(path)
+	// NOW rewrite to B (same mtime via Chtimes — coarse-tick simulation;
+	// the in-place write bumps ctime, which is the version-distinguishing
+	// field on this filesystem).
+	require.NoError(t, os.WriteFile(path, []byte("B-content"), 0o600))
+	require.NoError(t, os.Chtimes(path, old, old))
+	idBOnDisk, err := fileid.Stat(path)
 	require.NoError(t, err)
-	require.Equal(t, idB.Ino, idNow.Ino,
-		"the file must still be B after the chain (no further writes)")
+	require.NotEqual(t, idAOnDisk.CtimeNs, idBOnDisk.CtimeNs,
+		"the rewrite must bump ctime (the version-distinguishing field)")
+
+	// Consume B: A's settle (dirty) armed the recheck; its scanFile stats
+	// the path (now B), fails seenEqual and delivers B. B's identity is
+	// recorded at the consumption synchronisation point (rework-10 fix 2b).
+	feB := <-events
+	idBObserved, statErr := fileid.Stat(feB.Path)
+	require.NoError(t, statErr)
+	muLog.Lock()
+	deliveredLog = append(deliveredLog, deliveredEvent{
+		seq:      int32(len(deliveredLog) + 1),
+		path:     feB.Path,
+		observed: idBObserved,
+	})
+	muLog.Unlock()
+
+	// VERSION (rework-10 fix 2b): delivery 1 observed A (consumed BEFORE
+	// the rewrite), delivery 2 observed B (recorded after). Identities must
+	// differ and order correctly — this is what "the second delivery is B"
+	// means when FileEvent carries no content/inode.
+	muLog.Lock()
+	logCopy := append([]deliveredEvent(nil), deliveredLog...)
+	muLog.Unlock()
+	require.Len(t, logCopy, 2, "expected exactly A's delivery + B's delivery")
+	require.Equal(t, path, logCopy[0].path)
+	require.Equal(t, path, logCopy[1].path)
+	require.Equal(t, path, feB.Path)
+	require.NotEqual(t, logCopy[0].observed.CtimeNs, logCopy[1].observed.CtimeNs,
+		"the two deliveries must describe DIFFERENT versions (the rewrite bumps ctime)")
+	require.Equal(t, idAOnDisk.CtimeNs, logCopy[0].observed.CtimeNs,
+		"delivery 1 must have observed A (consumed before the rewrite)")
+	require.Equal(t, idBOnDisk.CtimeNs, logCopy[1].observed.CtimeNs,
+		"delivery 2 must have observed B — the SECOND delivery corresponds to B")
 	// The recheck fired with the path recorded and its ordinal observed.
 	select {
-	case <-hookCalled:
+	case <-hookInstalled:
 	case <-time.After(3 * time.Second):
 		t.Fatal("the dirty-settle recheck never fired")
 	}
 	require.Equal(t, int32(1), recheckFires.Load(),
 		"the dirty-settle recheck must have FIRED exactly once (dirty → settle → recheck ran)")
-	muDelivered.Lock()
+	muLog.Lock()
 	atSeq := recheckAtSeq
-	muDelivered.Unlock()
+	muLog.Unlock()
 	t.Logf("real_chain: 2 deliveries; recheck fired after delivery ordinal %d "+
-		"(if atSeq==2 the recheck's own scanFile found seen==B and skipped; "+
-		"if atSeq==1 the recheck delivered B itself — both are the unified predicate's verdicts)", atSeq)
+		"(atSeq==2 → the recheck's own scanFile found seen==B and skipped; "+
+		"atSeq==1 → the recheck delivered B itself — both are the unified predicate's verdicts)", atSeq)
 
 	cancel()
 	select {
