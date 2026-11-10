@@ -129,7 +129,9 @@ func TestReviewR4LateFlushAnchor_Ported(t *testing.T) {
 func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "coarse.log")
-	require.NoError(t, os.WriteFile(path, []byte("A-content"), 0o600))
+	const contentA = "A-content-by-rework11" // length ≠ B's → size distinguishes versions
+	const contentB = "B"
+	require.NoError(t, os.WriteFile(path, []byte(contentA), 0o600))
 
 	// Age A out of the debounce window so Start's initial scan delivers it
 	// through scanFile, parking it in emitBlocking under backpressure.
@@ -210,8 +212,12 @@ func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing
 	// only ever see the LAST writer, so the only way to tell the two
 	// deliveries apart is to observe each version while it is on disk.
 	feA := <-events
+	contentAObserved, readErr := os.ReadFile(feA.Path)
+	require.NoError(t, readErr)
 	idAOnDisk, statErr := fileid.Stat(feA.Path)
 	require.NoError(t, statErr)
+	require.Equal(t, contentA, string(contentAObserved),
+		"delivery 1's synchronisation point must observe A's content (consumed before the rewrite)")
 	muLog.Lock()
 	deliveredLog = append(deliveredLog, deliveredEvent{
 		seq:      int32(len(deliveredLog) + 1),
@@ -221,19 +227,19 @@ func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing
 	muLog.Unlock()
 
 	// NOW rewrite to B (same mtime via Chtimes — coarse-tick simulation;
-	// the in-place write bumps ctime, which is the version-distinguishing
-	// field on this filesystem).
-	require.NoError(t, os.WriteFile(path, []byte("B-content"), 0o600))
+	// ctime may or may not advance on a coarse/stamp-cached FS, so the
+	// version-distinguishing assertion below uses CONTENT, never ctime).
+	require.NoError(t, os.WriteFile(path, []byte(contentB), 0o600))
 	require.NoError(t, os.Chtimes(path, old, old))
 	idBOnDisk, err := fileid.Stat(path)
 	require.NoError(t, err)
-	require.NotEqual(t, idAOnDisk.CtimeNs, idBOnDisk.CtimeNs,
-		"the rewrite must bump ctime (the version-distinguishing field)")
 
 	// Consume B: A's settle (dirty) armed the recheck; its scanFile stats
-	// the path (now B), fails seenEqual and delivers B. B's identity is
-	// recorded at the consumption synchronisation point (rework-10 fix 2b).
+	// the path (now B), fails seenEqual and delivers B. B's identity AND
+	// CONTENT are recorded at the consumption synchronisation point.
 	feB := <-events
+	contentBObserved, readErr := os.ReadFile(feB.Path)
+	require.NoError(t, readErr)
 	idBObserved, statErr := fileid.Stat(feB.Path)
 	require.NoError(t, statErr)
 	muLog.Lock()
@@ -244,10 +250,11 @@ func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing
 	})
 	muLog.Unlock()
 
-	// VERSION (rework-10 fix 2b): delivery 1 observed A (consumed BEFORE
-	// the rewrite), delivery 2 observed B (recorded after). Identities must
-	// differ and order correctly — this is what "the second delivery is B"
-	// means when FileEvent carries no content/inode.
+	// VERSION (rework-11 suggestion): the second delivery must BE B —
+	// asserted via the CONTENT read at each consumption synchronisation
+	// point (never ctime: an in-place rewrite on a coarse/stamp-cached FS
+	// can keep ctime in the same tick and would make a ctime assertion
+	// flaky-fail). A and B contents differ in length and bytes.
 	muLog.Lock()
 	logCopy := append([]deliveredEvent(nil), deliveredLog...)
 	muLog.Unlock()
@@ -255,12 +262,17 @@ func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing
 	require.Equal(t, path, logCopy[0].path)
 	require.Equal(t, path, logCopy[1].path)
 	require.Equal(t, path, feB.Path)
-	require.NotEqual(t, logCopy[0].observed.CtimeNs, logCopy[1].observed.CtimeNs,
-		"the two deliveries must describe DIFFERENT versions (the rewrite bumps ctime)")
-	require.Equal(t, idAOnDisk.CtimeNs, logCopy[0].observed.CtimeNs,
-		"delivery 1 must have observed A (consumed before the rewrite)")
-	require.Equal(t, idBOnDisk.CtimeNs, logCopy[1].observed.CtimeNs,
-		"delivery 2 must have observed B — the SECOND delivery corresponds to B")
+	require.Equal(t, contentA, string(contentAObserved),
+		"delivery 1 must correspond to A (content read at its consumption sync point)")
+	require.Equal(t, contentB, string(contentBObserved),
+		"delivery 2 must correspond to B — the SECOND delivery is B (content read at its consumption sync point)")
+	// ctime information is informational only (may not advance on coarse FS).
+	if idAOnDisk.CtimeNs != idBOnDisk.CtimeNs {
+		t.Logf("ctime advanced across the rewrite (informational): %d → %d",
+			idAOnDisk.CtimeNs, idBOnDisk.CtimeNs)
+	} else {
+		t.Logf("ctime did NOT advance across the rewrite (coarse/stamp-cached FS) — content is the distinguishing signal")
+	}
 	// The recheck fired with the path recorded and its ordinal observed.
 	select {
 	case <-hookInstalled:
