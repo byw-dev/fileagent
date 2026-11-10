@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	agentv1 "github.com/byw-dev/fileagent/api/v1"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,9 +80,14 @@ func TestExecutor_SubmitAndProcess(t *testing.T) {
 func TestExecutor_Dedup(t *testing.T) {
 	q := newTestQueue(t)
 	var uploadCount atomic.Int32
-	uploader := func(_ context.Context, _ *queue.UploadTask) (*uploadpkg.UploadResult, error) {
+	uploader := func(_ context.Context, task *queue.UploadTask) (*uploadpkg.UploadResult, error) {
 		uploadCount.Add(1)
-		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: "sha", SizeBytes: 100}, nil
+		// The ledger stores this sha; the duplicate check hash-confirms the
+		// real file against it. Report the file's REAL sha so the mock path
+		// behaves like the production TeeReader sha (IC-BUG-51).
+		hr, err := hashFileSHA256(task.LocalPath)
+		require.NoError(t, err)
+		return &uploadpkg.UploadResult{StoragePath: "bucket/key", Bucket: "test-bucket", SHA256: hr.SHA256, SizeBytes: 100}, nil
 	}
 
 	e := New(1, q, uploader, zap.NewNop(), 0)
@@ -88,8 +95,14 @@ func TestExecutor_Dedup(t *testing.T) {
 	defer cancel()
 	e.Start(ctx)
 
-	// Submit a task and let it complete.
-	t1 := newTask("r1", "/path/file.txt")
+	// Submit a task and let it complete. A REAL file backs the task: under
+	// the IC-48 verdict flow the mock uploader produces no identity, so the
+	// ledger row is undecidable and the duplicate check hash-confirms — the
+	// file must exist and hash identically for the duplicate to skip.
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "file.txt")
+	require.NoError(t, os.WriteFile(fpath, []byte("dedup"), 0o644))
+	t1 := newTask("r1", fpath)
 	require.NoError(t, e.Submit(context.Background(), t1))
 
 	require.Eventually(t, func() bool {
@@ -100,7 +113,10 @@ func TestExecutor_Dedup(t *testing.T) {
 	require.NoError(t, e.HandleAcknowledgement(context.Background(), &agentv1.Acknowledgement{RefMessageId: t1.ID, Success: true}))
 
 	// Submit a second task with the same path and metadata — should be skipped.
-	t2 := newTask("r1", "/path/file.txt")
+	// The ack stored a zero identity (mock uploader produces none), so the
+	// second check takes the hash-confirm path: the hash matches the seeded
+	// row (same real file), the verdict is RefreshAndSkip, no second upload.
+	t2 := newTask("r1", fpath)
 	t2.FileMtime = t1.FileMtime
 	t2.FileSize = t1.FileSize
 	require.NoError(t, e.Submit(context.Background(), t2))
@@ -394,11 +410,25 @@ func TestExecutor_SubmitSkipsOnlySameActiveVersion(t *testing.T) {
 	q := newTestQueue(t)
 	e := New(1, q, successUploader, zap.NewNop(), 0)
 	first := newTask("r1", "/path/active.txt")
+	// Rework-5: tasks carry a full kernel identity; the guard suppresses
+	// only an exact duplicate (same identity). Rework-6: the version
+	// judgement is SameVersionProvable against the task's snapshot anchor —
+	// the anchor is far after the stamps so the racy window is clear and the
+	// duplicate is PROVABLY the same version.
+	first.FileCtimeNs = time.Now().UnixNano() - 30e9
+	first.FileDev = 1
+	first.FileIno = 1
+	first.FileMtimeNs = time.Now().UnixNano() - 30e9
+	first.FileSnapAtNs = time.Now().UnixNano()
 	require.NoError(t, e.Submit(context.Background(), first))
 
 	duplicate := newTask("r1", first.LocalPath)
 	duplicate.FileMtime = first.FileMtime
 	duplicate.FileSize = first.FileSize
+	duplicate.FileCtimeNs = first.FileCtimeNs
+	duplicate.FileDev = first.FileDev
+	duplicate.FileIno = first.FileIno
+	duplicate.FileMtimeNs = first.FileMtimeNs
 	require.NoError(t, e.Submit(context.Background(), duplicate))
 	pending, err := q.ListByStatus(queue.StatusPending)
 	require.NoError(t, err)
@@ -407,6 +437,9 @@ func TestExecutor_SubmitSkipsOnlySameActiveVersion(t *testing.T) {
 	modified := newTask("r1", first.LocalPath)
 	modified.FileMtime = first.FileMtime + 1
 	modified.FileSize = first.FileSize + 1
+	modified.FileCtimeNs = first.FileCtimeNs + 1
+	modified.FileIno = first.FileIno + 1
+	modified.FileMtimeNs = first.FileMtimeNs + 1
 	require.NoError(t, e.Submit(context.Background(), modified))
 	pending, err = q.ListByStatus(queue.StatusPending)
 	require.NoError(t, err)

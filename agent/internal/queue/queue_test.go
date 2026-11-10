@@ -26,6 +26,10 @@ func openMemQueue(t *testing.T) *Queue {
 
 func newTask(id, status string) *UploadTask {
 	now := time.Now().Unix()
+	// Stamps 30s before the snapshot anchor: outside the 2s racy window, so
+	// two tasks built by this helper with the same identity are PROVABLY the
+	// same version and the guard can suppress the duplicate.
+	stamps := int64(1_700_000_000_000_000_000) // fixed ns (≈2023-11-14), far before now
 	return &UploadTask{
 		ID:          id,
 		RuleID:      "rule-1",
@@ -37,6 +41,17 @@ func newTask(id, status string) *UploadTask {
 		Status:      status,
 		CreatedAt:   now,
 		UpdatedAt:   now,
+		// Rework-6: tasks carry a full kernel identity PLUS its snapshot
+		// moment (the racy anchor) so the active-version guard can run the
+		// SameVersionProvable judgement (same identity + clear racy window →
+		// same version → suppressed). Both stamps and anchor are FIXED so
+		// every task built here shares ONE identity — that is what the
+		// dedup tests copy field-by-field between tasks.
+		FileCtimeNs:  stamps,
+		FileDev:      1,
+		FileIno:      42,
+		FileMtimeNs:  stamps,
+		FileSnapAtNs: int64(1_700_000_100_000_000_000), // anchor = stamps + 100s
 	}
 }
 
@@ -147,7 +162,7 @@ func TestEnqueueIfNoActive_UsesMetadataAndActiveStatuses(t *testing.T) {
 		enqueued, err := q.EnqueueIfNoActive(ctx, newTask("candidate", ""))
 		require.Error(t, err)
 		assert.False(t, enqueued)
-		assert.Contains(t, err.Error(), "enqueue task")
+		assert.Contains(t, err.Error(), "enqueue")
 	})
 
 	t.Run("changed metadata is a new version", func(t *testing.T) {
@@ -218,11 +233,19 @@ func TestEnqueueIfNoActive_NoDuplicateAfterCrashRestartReset(t *testing.T) {
 	require.Len(t, dequeued, 1)
 	require.Equal(t, killed.ID, dequeued[0].ID)
 
-	// Initial scan rediscovers the same file: identical rule/path/mtime/size.
+	// Initial scan rediscovers the same file: identical rule/path/mtime/size —
+	// and identical identity + snapshot anchor (the rework-6 judgement is
+	// SameVersionProvable; `newTask` gives every task the same synthetic
+	// anchor at construction, so the duplicate is PROVABLY the same version).
 	rescanned := newTask("rescanned", "")
 	rescanned.LocalPath = killed.LocalPath
 	rescanned.FileMtime = killed.FileMtime
 	rescanned.FileSize = killed.FileSize
+	rescanned.FileCtimeNs = killed.FileCtimeNs
+	rescanned.FileDev = killed.FileDev
+	rescanned.FileIno = killed.FileIno
+	rescanned.FileMtimeNs = killed.FileMtimeNs
+	rescanned.FileSnapAtNs = killed.FileSnapAtNs
 
 	enqueued, err := q.EnqueueIfNoActive(ctx, rescanned)
 	require.NoError(t, err)
@@ -269,11 +292,24 @@ func TestEnqueueIfNoActive_ModifiedFileAfterCrashRestartReset(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(1), reset)
 
-	// The initial scan rediscovers the file at its current size.
+	// The initial scan rediscovers the file at its current size — with the
+	// identity+anchor the reset-refreshed row now carries (the reset only
+	// refreshes the legacy size/mtime columns; the kernel identity columns
+	// are unchanged by the rewrite, which is exactly the no-double-upload
+	// premise: same version in flight). Give the rescanned candidate that
+	// same identity+anchor so SameVersionProvable proves it a duplicate.
+	// (FileIdentity.Size stays stale.FileSize — the kernel-identity size the
+	// guard compares; the legacy FileSize/FileMtime columns carry the new
+	// size so the upload reads the refreshed bytes.)
 	rescanned := newTask("rescanned", "")
 	rescanned.LocalPath = path
 	rescanned.FileSize = newInfo.Size()
 	rescanned.FileMtime = newInfo.ModTime().Unix()
+	rescanned.FileCtimeNs = stale.FileCtimeNs
+	rescanned.FileDev = stale.FileDev
+	rescanned.FileIno = stale.FileIno
+	rescanned.FileMtimeNs = stale.FileMtimeNs
+	rescanned.FileSnapAtNs = stale.FileSnapAtNs
 
 	enqueued, err := q.EnqueueIfNoActive(ctx, rescanned)
 	require.NoError(t, err)
@@ -639,40 +675,40 @@ func TestRules_NotFound(t *testing.T) {
 }
 
 func TestQueue_AppendModeFields_PersistAndLoad(t *testing.T) {
-q, err := Open(":memory:")
-require.NoError(t, err)
-defer q.Close()
+	q, err := Open(":memory:")
+	require.NoError(t, err)
+	defer q.Close()
 
-task := &UploadTask{
-ID:          "task-tail",
-RuleID:      "rule-1",
-LocalPath:   "/data/file.log",
-StoragePath: "logs/file.log",
-Bucket:      "my-bucket",
-FileSize:    1024,
-FileMtime:   time.Now().Unix(),
-FileOffset:  512,
-AppendMode:  "tail",
-}
-require.NoError(t, q.Enqueue(task))
+	task := &UploadTask{
+		ID:          "task-tail",
+		RuleID:      "rule-1",
+		LocalPath:   "/data/file.log",
+		StoragePath: "logs/file.log",
+		Bucket:      "my-bucket",
+		FileSize:    1024,
+		FileMtime:   time.Now().Unix(),
+		FileOffset:  512,
+		AppendMode:  "tail",
+	}
+	require.NoError(t, q.Enqueue(task))
 
-tasks, err := q.DequeuePending(10)
-require.NoError(t, err)
-require.Len(t, tasks, 1)
-assert.Equal(t, int64(512), tasks[0].FileOffset)
-assert.Equal(t, "tail", tasks[0].AppendMode)
+	tasks, err := q.DequeuePending(10)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, int64(512), tasks[0].FileOffset)
+	assert.Equal(t, "tail", tasks[0].AppendMode)
 }
 
 func TestQueue_Open_ExistingDB_MigratesNewColumns(t *testing.T) {
-// Simulate a pre-existing DB that doesn't have file_offset/append_mode columns.
-// Opening it again should run the ALTER TABLE migrations without error.
-dir := t.TempDir()
-dsn := filepath.Join(dir, "test.db")
+	// Simulate a pre-existing DB that doesn't have file_offset/append_mode columns.
+	// Opening it again should run the ALTER TABLE migrations without error.
+	dir := t.TempDir()
+	dsn := filepath.Join(dir, "test.db")
 
-// Create a DB without file_offset/append_mode.
-db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL")
-require.NoError(t, err)
-_, err = db.Exec(`
+	// Create a DB without file_offset/append_mode.
+	db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL")
+	require.NoError(t, err)
+	_, err = db.Exec(`
 CREATE TABLE IF NOT EXISTS upload_tasks (
 id TEXT PRIMARY KEY, rule_id TEXT NOT NULL, local_path TEXT NOT NULL,
 storage_path TEXT NOT NULL, bucket TEXT NOT NULL, upload_id TEXT,
@@ -690,20 +726,20 @@ CREATE TABLE IF NOT EXISTS rules (
 id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL
 );
 `)
-require.NoError(t, err)
-db.Close()
+	require.NoError(t, err)
+	db.Close()
 
-// Re-open with Queue.Open — migration should succeed.
-q, err := Open(dsn)
-require.NoError(t, err)
-defer q.Close()
+	// Re-open with Queue.Open — migration should succeed.
+	q, err := Open(dsn)
+	require.NoError(t, err)
+	defer q.Close()
 
-// Should be able to enqueue with the new fields.
-task := &UploadTask{
-ID: "m1", RuleID: "r1", LocalPath: "/f", StoragePath: "s",
-Bucket: "b", FileSize: 1, FileMtime: 1, FileOffset: 100, AppendMode: "close_wait",
-}
-require.NoError(t, q.Enqueue(task))
+	// Should be able to enqueue with the new fields.
+	task := &UploadTask{
+		ID: "m1", RuleID: "r1", LocalPath: "/f", StoragePath: "s",
+		Bucket: "b", FileSize: 1, FileMtime: 1, FileOffset: 100, AppendMode: "close_wait",
+	}
+	require.NoError(t, q.Enqueue(task))
 }
 
 // ── Capacity enforcement (queue_max_size) ─────────────────────────────────────

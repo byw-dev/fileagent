@@ -77,6 +77,23 @@ func (q *Queue) GetReport(ctx context.Context, id string) ([]byte, error) {
 // CompleteReported marks a reported task completed only after a successful CP ack.
 // Successful uploads also update dedup state in the same transaction; failures do not.
 func (q *Queue) CompleteReported(ctx context.Context, id string, uploaded bool, sha string) error {
+	return q.CompleteReportedIdentity(ctx, id, uploaded, sha, FileIdentity{}, false)
+}
+
+// CompleteReportedIdentity is CompleteReported with the IC-BUG-48 identity of
+// the uploaded version. The ledger row's identity fields (mtime-ns / ctime-ns
+// / dev / ino / size) and the racy anchor (uploaded_at_ns) all come from the
+// uploader's same-fd PRE-READ snapshot, NOT from the enqueue-time task fields
+// (those can be hours older than the bytes actually read — offline queueing).
+// ok=false (identity unknown: mid-upload change, replayed report, or an
+// upload path that produced none) stores a zero identity → undecidable → the
+// next candidate check hash-confirms (fail-closed), never a wrong skip.
+// The guard is enforced HERE, not only at the callers (rework-2 fix 6): a
+// non-zero ident with ok=false is zeroed at the entry.
+func (q *Queue) CompleteReportedIdentity(ctx context.Context, id string, uploaded bool, sha string, ident FileIdentity, ok bool) error {
+	if !ok {
+		ident = FileIdentity{}
+	}
 	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -94,9 +111,17 @@ func (q *Queue) CompleteReported(ctx context.Context, id string, uploaded bool, 
 		return nil
 	}
 	if uploaded {
-		_, err = tx.ExecContext(ctx, `INSERT INTO processed_files(id,rule_id,local_path,file_size,file_mtime,sha256,uploaded_at)
-   SELECT id,rule_id,local_path,file_size,file_mtime,sha256,? FROM upload_tasks WHERE id=?
-   ON CONFLICT(rule_id,local_path) DO UPDATE SET file_size=excluded.file_size,file_mtime=excluded.file_mtime,sha256=excluded.sha256,uploaded_at=excluded.uploaded_at`, time.Now().Unix(), id)
+		// Zero identity (ok=false) stays zero: the INSERT..SELECT below then
+		// writes the parts_* columns' defaults (0) — undecidable by design.
+		_, err = tx.ExecContext(ctx, `INSERT INTO processed_files(id,rule_id,local_path,file_size,file_mtime,sha256,uploaded_at,
+           file_mtime_ns,file_ctime_ns,file_dev,file_ino,uploaded_at_ns)
+   SELECT id,rule_id,local_path,?,?,sha256,?,
+           ?,?,?,?,?
+   FROM upload_tasks WHERE id=?
+   ON CONFLICT(rule_id,local_path) DO UPDATE SET file_size=excluded.file_size,file_mtime=excluded.file_mtime,sha256=excluded.sha256,uploaded_at=excluded.uploaded_at,
+           file_mtime_ns=excluded.file_mtime_ns,file_ctime_ns=excluded.file_ctime_ns,file_dev=excluded.file_dev,file_ino=excluded.file_ino,uploaded_at_ns=excluded.uploaded_at_ns`,
+			ident.Size, ident.MtimeNs/1e9, time.Now().Unix(),
+			ident.MtimeNs, ident.CtimeNs, ident.Dev, ident.Ino, ident.SnapAtNs, id)
 		if err != nil {
 			return fmt.Errorf("queue: acknowledge processed file: %w", err)
 		}

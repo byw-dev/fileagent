@@ -587,6 +587,7 @@ func TestExecutor_RecoveredRequeueOfEvictedTaskLogsNoWarning(t *testing.T) {
 		"an evicted row must not surface as a failed recovery")
 	e.Stop()
 }
+
 // R2: marking a task abandoned (never-retry sentinel) and recording its abort
 // intent must be ONE transaction. With the record written separately AFTER the
 // marking, a crash (or a failed record write) in between leaves a
@@ -662,13 +663,11 @@ func TestExecutor_DedupCompleteAndAbortRecordAreAtomic(t *testing.T) {
 
 	// Task A failed mid-multipart and awaits its backoff retry (failed, with
 	// a live upload ID); task B already completed the same file version, so
-	// A's retry hits the dedup shortcut.
-	task := abandonTask(t, q)
+	// A's retry hits the dedup shortcut. A real file + full dedup row back
+	// the shortcut (IC-48 verdict flow).
+	task := abandonTaskWithFile(t, q)
 	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now().Add(time.Minute)))
-	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
-		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
-		FileSize: task.FileSize, FileMtime: task.FileMtime, UploadedAt: time.Now().Unix(),
-	}))
+	seedDedupRow(t, q, task)
 
 	// Only the outbox INSERT fails: the completion transition must fail with
 	// it, leaving the task recoverable instead of completed-without-record.
@@ -707,11 +706,8 @@ func TestExecutor_DedupCompleteLeavesAbortRecord(t *testing.T) {
 		return errors.New("minio unreachable")
 	}))
 
-	task := abandonTask(t, q)
-	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
-		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
-		FileSize: task.FileSize, FileMtime: task.FileMtime, UploadedAt: time.Now().Unix(),
-	}))
+	task := abandonTaskWithFile(t, q)
+	seedDedupRow(t, q, task)
 	e.processTask(ctx, task)
 
 	entries, err := q.DueMultipartAborts(ctx, time.Now(), 10)
@@ -734,14 +730,11 @@ func TestExecutor_DedupCompletionFallbackRequeuesInProcess(t *testing.T) {
 	q, dsn := newFileQueue(t)
 	core, logs := observer.New(zapcore.InfoLevel)
 
-	task := abandonTask(t, q) // running
+	task := abandonTaskWithFile(t, q) // running
 	// Production flow: the task failed on attempt 1 (failed + schedule), the
 	// retry requeued it (pending → running), and the dedup shortcut hits.
 	require.NoError(t, q.MarkFailed(context.Background(), task.ID, "boom", time.Now()))
-	require.NoError(t, q.UpsertProcessedFile(&queue.ProcessedFile{
-		ID: "pf-" + task.ID, RuleID: task.RuleID, LocalPath: task.LocalPath,
-		FileSize: task.FileSize, FileMtime: task.FileMtime, UploadedAt: time.Now().Unix(),
-	}))
+	seedDedupRow(t, q, task)
 
 	failStatement(t, dsn, "no_abort_record", "INSERT", "multipart_abort_outbox")
 	e := New(1, q, successUploader, zap.New(core), 0)

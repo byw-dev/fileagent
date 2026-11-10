@@ -324,6 +324,20 @@ Windows 设备见 [`../../deploy/windows/install-agent.ps1`](../../deploy/window
 （NSSM 封装）与 `agent/config.windows.toml.example`；`agent.exe` 取自 CI
 `build-agent.yml` 产物（`agent-windows-amd64`）或 `make build-agent-windows`（需 mingw）。
 
+#### 时钟同步要求（IC-BUG-48 已知边界）
+
+Agent 的内容判重使用文件时间戳做「racy 窗口」预筛。已知边界：若系统时钟被
+**step 回拨**到某个旧文件时间戳的同一粒度内、且在该粒度内发生同尺寸改写、
+之后时钟再走过旧锚点——该次改写会被预筛判为「已采集」（漏采；边界由哈希
+确认兜底的场合除外）。产品已拍板接受此边界（2026-11-10，与 git/rsync 等
+同类工具的通行取舍一致）。
+
+**运维要求**：部署主机的 NTP 客户端只做 **slew（渐变）**，不做 step（跳变）；
+chrony 配置 `makestep` 仅限启动阶段（例如 `makestep 1.0 3`），禁止生产期
+step。运维监控建议对时钟突变（`chronyc tracking` 的 leap/offset 异常）告警；
+时钟 step 后对采集目录做一次人工核对（对照 `file_entries` 的 sha256）可
+排除该边界的影响。
+
 ---
 
 ## Agent enrollment（首次注册审批）

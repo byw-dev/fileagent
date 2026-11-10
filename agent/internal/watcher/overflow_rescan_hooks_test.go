@@ -85,7 +85,7 @@ func TestSafetyNetRescan_HotSkipAndRearmObserved(t *testing.T) {
 
 	// The exact production trigger: the sentinel fsnotify delivers for
 	// Linux IN_Q_OVERFLOW and the Windows buffer overflow alike.
-	w.handleWatchError(ctx, events, make(map[string]time.Time), fsnotify.ErrEventOverflow)
+	w.handleWatchError(ctx, events, make(map[string]seenEntry), fsnotify.ErrEventOverflow)
 
 	assert.Equal(t, int32(1), skips.Load(),
 		"pollScan's hot-skip branch must have been observed for the hot file")

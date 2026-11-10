@@ -38,7 +38,11 @@ func TestProcessedFiles_ChangedFileIsReCollected(t *testing.T) {
 	_, err = q.DequeuePending(1)
 	require.NoError(t, err)
 	require.NoError(t, q.SaveReport(ctx, task.ID, []byte("result")))
-	require.NoError(t, q.CompleteReported(ctx, task.ID, true, "sha-of-delivered-bytes"))
+	// IC-BUG-48: pass the identity through so the ledger row carries the
+	// enqueue tuple as its recorded version (mtime-ns derived from the same
+	// second-granularity stamp the task was enqueued with).
+	require.NoError(t, q.CompleteReportedIdentity(ctx, task.ID, true, "sha-of-delivered-bytes",
+		FileIdentity{MtimeNs: 1000 * 1e9, CtimeNs: 1000*1e9 + 1, Dev: 1, Ino: 1, Size: 100, SnapAtNs: 1}, true))
 
 	// Same version → dedup still hits (no re-upload of unchanged content).
 	processed, err := q.IsProcessed(ctx, "rule", "file", 1000, 100)

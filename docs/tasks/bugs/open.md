@@ -21,17 +21,17 @@
 >
 > | 判定 | 条数 | 明细 |
 > |---|---|---|
-> | **挡试点** | **1** | 48（~~51~~ 2026-11-06 随 PR #140 修复；同日返工 1 依 PR #134 评审 F1–F3 改判：51 成功上报错误哈希、48 同版本改写永久漏采，均经生产函数探针实测；~~40 的 init 自检不覆盖 CP 实际生效配置~~ 40 已随 #142 修复：启动自检拒绝启动） |
+> | **挡试点** | **1** | 58（2026-11-10 判定：试点存在原地更新、内容增加的文件——旧版本上传后完成会静默覆盖远端新内容；~~48~~ 2026-11-09 随分支 `fix/b7-ic-bug-48-content-identity` 修复关闭——内核元数据预筛 + 哈希确认；~~51~~ 2026-11-06 随 PR #140 修复；~~40~~ 已随 #142 修复：启动自检拒绝启动） |
 > | **不挡试点** | **13** | 13、14、15、32、38、42、45、46（剩余半边，返工 3 经产品拍板改判）、52、53、54、55、56（~~57~~ 2026-11-09 已修复关闭，分支 `chore/b7-small-followups`；重判时为 14，2026-11-09 关闭 57 后余 13） |
 > | **MinIO 专属** | **2** | 7、41（不关闭——MinIO 过渡期仍是默认后端；MinIO 适配器退役时随之关闭。7 在 SeaweedFS 上无对应物：事件源按 `/buckets/` 前缀订阅，新桶天然覆盖，PR3b 合并后成立；41 的 SeaweedFS 侧同类问题已另立 57） |
 > | **已失效 / 撤销** | **0** | 无（无一条满足「必须给出代码证据」的撤销门槛） |
 > | **待产品定** | **0** | 无（46 剩余半边原判待产品定，产品 2026-10-27 拍板试点无持续追加大文件，返工 3 改判不挡试点） |
 >
-> 一行式口径：**挡试点 1（48）/ 不挡试点 13 / MinIO 专属 2（7、41）/ 已失效 0 / 待产品定 0**（返工 3：46 剩余半边经产品拍板改判不挡试点；PR #140：51 修复关闭；#142：40 随启动自检修复关闭；本 PR `chore/b7-small-followups`：57 修复关闭——2026-10-27 重判时点为不挡试点 14，2026-11-06 关闭 40 后仍为 14，本 PR 关闭 57 后余 13；返工 1 前：挡 0 / 不挡 16，历史保留）。
+> 一行式口径：**共 58 条 = 已关 41 / 撤销 1 / 未关 16；挡试点 1（58）/ 不挡试点 13 / MinIO 专属 2（7、41）/ 已失效 0 / 待判定 0**（2026-11-10：IC-BUG-58 自 48 拆出立卡，同日判定**挡试点**——用户确认试点存在原地更新、内容增加的文件，旧版本上传后完成会静默覆盖远端新内容；此前 2026-11-09：48 随分支 `fix/b7-ic-bug-48-content-identity` 修复关闭，挡试点清零、已关 41 / 未关 15；再前：本 PR `chore/b7-small-followups` 关 57 → 挡 1；#142 关 40；PR #140 关 51；返工 3：46 剩余半边经产品拍板改判不挡试点——2026-10-27 重判时点为挡 3 / 不挡 14，返工 1 前：挡 0 / 不挡 16，历史保留）。
 > 逐条判定、理由与文件:行号证据见各卡片的「**B 重判（2026-10-27）**」行；下方总表的未关行标题后带统一格式的判定标记（机械重算见 `bin/recount.sh`）。
 > 机械重算脚本 `bin/recount.sh`（不提交）的输出与本段、`consistency-ingest.md`、`active.md`、`CLAUDE.md`、`TASK_LIST.md` 中的数字一致。
 >
-> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #140），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；2026-10-27 重判时点为 已关 37 / 撤销 1 / 未关 19 / 挡试点 3 / 不挡试点 14（历史）。** **2026-11-06：IC-BUG-40 亦已修（PR #142：CP 启动存储自检，窗口耗尽拒绝运行），已关闭 39 + 未关闭 17、挡试点余 1（48）** **2026-11-09：IC-BUG-57 亦已修（分支 `chore/b7-small-followups`：`assume_role` 的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv），已关闭 40 + 未关闭 16、挡试点余 1（48）**
+> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #140），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；2026-10-27 重判时点为 已关 37 / 撤销 1 / 未关 19 / 挡试点 3 / 不挡试点 14（历史）。** **2026-11-06：IC-BUG-40 亦已修（PR #142：CP 启动存储自检，窗口耗尽拒绝运行），已关闭 39 + 未关闭 17、挡试点余 1（48）** **2026-11-09：IC-BUG-57 亦已修（分支 `chore/b7-small-followups`：`assume_role` 的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv），已关闭 40 + 未关闭 16、挡试点余 1（48）** **2026-11-09：IC-BUG-48 亦已修（分支 `fix/b7-ic-bug-48-content-identity`：内核元数据预筛 + 哈希确认，挡试点最后一条），已关闭 41 + 未关闭 15、挡试点 0——B7 试点前必修项清零** **2026-11-10：IC-BUG-58 自 48 拆出立卡（codex r3 阻断 3，同路径并发上传无版本序），共 58 条 = 已关 41 / 撤销 1 / 未关 16，挡试点 0 / 不挡试点 13 / MinIO 专属 2 / 待判定 1（58）** **2026-11-10（二）：58 判定**挡试点**（用户确认试点存在原地更新、内容增加的文件）——挡试点 1（58）/ 不挡试点 13 / MinIO 专属 2 / 待判定 0**
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -169,7 +169,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-45 | tail 偏移在**事件发出时**推进而非**上传确认后**，一次彻底失败的 tail 上传会静默丢掉一段字节区间且无任何信号 〔B:不挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-46 | **`append_mode=tail` 静默丢数据**：`singlePartUpload` 在 `offset>0` 时把**只含增量**的内容 `PutObject` 到同一键，对象被整体替换，此前已采集的内容从对象中消失 ◐ **拆半**：挡掉半边 ✅ 随 IC-3（CP 422 + agent 闸门 + UI 禁用）；**正确实现归 IC-15** 〔B:不挡试点〕 | 🔴 P0 | agent |
 | IC-BUG-47 | 实时 fsnotify 事件路径仍用非阻塞 `emit`（满即丢弃），大量小文件并发写入时被丢弃的文件**永不被采集**——IC-5 的 F1 只修了初始扫描那一半 ✅ 随 IC-3 修复（4 处实时发送点全改 `emitBlocking`） | 🟠 P1 | agent |
-| IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 〔B:挡试点〕 | 🟡 P2 | agent |
+| IC-BUG-48 | 内容身份靠 `mtime+size` **推断**而非 ETag **验证**：同秒同尺寸改写、以及保留 mtime 的原地重建，都会被判为「已采集」而永不重采 ✅ 已修（分支 `fix/b7-ic-bug-48-content-identity`：内核元数据预筛 + 哈希确认，见卡片「修复记录」）〔B:挡试点 → 2026-11-09 修复，挡试点清零〕 | 🟡 P2 | agent |
 | IC-BUG-49 | ~~`dest_path_template` 带不带 `{time}` 隐式决定「追加后产生新版本对象 vs 覆盖同一对象」，产品语义从未定义~~ **❌ 已撤销（2026-09-13，前提被实测证伪）**，其中成立的产品问题拆出为 [backlog](../backlog.md)「同一文件重复采集的覆盖语义」条目 | 🟡 P2 | 产品 + agent |
 | IC-BUG-50 | `time` 是**未声明的保留字**（三端契约只有 agent 知道）、**优先级与同体系系统变量相反**（无条件覆盖解析结果）、且**名字误导**（实为「文件被提交上传的时刻」）✅ 随 D-034 修复（PR #106：改名 `{submit_time}` + 解析结果优先 + 旧名 deprecated 兼容） | 🟡 P2 | agent + controlplane + webui |
 | IC-BUG-51 | 上报的 `sha256` / `size_bytes` / 实际上传字节**来自三次独立的文件读**，三者可以描述文件的不同版本；且 `PutObject` 返回的 ETag 虽已拿到却无人用来复核 ✅ 已修（分支 `fix/b7-ic-bug-51-single-read-hash`，PR #140：哈希/计数/上传共用同一次读 + 分片 ETag 验证） | 🟠 P1 | agent |
@@ -179,6 +179,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** 〔B:不挡试点〕 | 🟠 P1 | agent + CP |
 | IC-BUG-56 | **过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」只认 `AccessDenied`**——不会卡住（后台每分钟检查一次，唤醒后约 1 分钟内恢复），但期间开始的上传各失败一次、推迟一个退避档并白耗一次重试 〔B:不挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-57 | （立卡时）`init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕；**B7（#138）后 `mc alias set` 两处已随 S3 客户端换成 AWS CLI 而消除（凭据走私有 config 文件，不再进 argv）** ✅ 已修（#143：残留的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv；2026-11-09，分支 `chore/b7-small-followups`，见详情卡「修复记录」） | 🟡 P2 | deploy |
+| IC-BUG-58 | 同路径并发上传无版本序：旧版本可覆盖远端新对象且无后续事件不收敛（2026-11-10 自 IC-BUG-48 拆出；master 上不同 mtime 版本即可触发，IC-BUG-42 子情形） 〔B:挡试点〕 | 🟠 P1 | agent + queue + watcher |
 
 ---
 
@@ -778,7 +779,9 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **验收** | 并发写入远超 channel 缓冲的小文件（如 500 个），断言**全部**被采集，一个不丢；变异（改回 `emit`）必须稳定红 |
 | **归属** | **随 IC-3 修复**（F1 的另一半，不修等于 F1 只做了一半） |
 
-## IC-BUG-48 — 内容身份靠推断而非验证，两类改写永不重采 🟡 P2
+## IC-BUG-48 — 内容身份靠推断而非验证，两类改写永不重采 🟡 P2 ✅ 已修（分支 `fix/b7-ic-bug-48-content-identity`）
+
+> **定级与判定（历史快照）**：🟡 P2；B 重判 **挡试点**（返工 1 修订，2026-10-27）——2026-11-09 修复关闭后挡试点清零。以下「根因/后果」等列为发现时快照，修复形态见末行「修复记录」。
 
 | 字段 | 内容 |
 |------|------|
@@ -789,7 +792,58 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **修复** | 把身份从推断升级为**验证**：已记录分片的 ETag 与**重新读取本地对应区间算出的 MD5** 比对；`mtime+size` 降级为廉价预筛。代价是本地重读已上传前缀（**纯本地 I/O，不走网络**；10GB 文件重读 10GB 本地，远比重传 10GB 便宜）。这是 S3 续传上传器的标准做法 |
 | **验收** | 同秒同尺寸改写后必须重采；保留 mtime 的原地重建（内容不同）必须重采；内容确实相同的重建仍可跳过（账本语义正确，无新内容可传） |
 | **归属** | **宜与 IC-15 同刀**——IC-15 本来就要定内容身份判据，一次解决续传版本判定 + 本条两个盲区 |
-| **B 重判（2026-10-27）** | **挡试点**（返工 1 修订） — 同秒同尺寸改写、保留 mtime 的内容替换被**永久**判为已采集：`processed_files` 持久化、重启不恢复，新内容静默漏采且无任何信号（A 基线只证明正常样本正确，不能证明错误分支安全，原「盲区窄」理由已删）。评审以真实 `Queue.UpsertProcessedFile`/`IsProcessed` 实测复现（生产函数 + 本地探针 `bin/review-r1-probe.log` TestReviewR1SameVersion，非 live）。**B7 必修**：内容身份升级为 ETag 验证（或等效可验收的输入约束），与 IC-15 同刀落地。证据：`queue.go:721-726`（四元组推断判重，无哈希校验）；`main.go:867-872`（`if done { return }`，无验证） |
+| **B 重判（2026-10-27）** | **挡试点**（返工 1 修订，时点快照，2026-11-09 修复后失效） — 同秒同尺寸改写、保留 mtime 的内容替换被**永久**判为已采集：`processed_files` 持久化、重启不恢复，新内容静默漏采且无任何信号（A 基线只证明正常样本正确，不能证明错误分支安全，原「盲区窄」理由已删）。评审以真实 `Queue.UpsertProcessedFile`/`IsProcessed` 实测复现（生产函数 + 本地探针 `bin/review-r1-probe.log` TestReviewR1SameVersion，非 live）。**B7 必修**：内容身份升级为 ETag 验证（或等效可验收的输入约束），与 IC-15 同刀落地。证据：`queue.go:721-726`（四元组推断判重，无哈希校验）；`main.go:867-872`（`if done { return }`，无验证） |
+| **✅ 修复记录（2026-11-09，分支 `fix/b7-ic-bug-48-content-identity`，基于 master `e756300`）** | **方案**（PoC 关口两次评审后拍板，`bin/ic48/design.md`）：**「内核元数据预筛 + 哈希确认」**，不再是 ETag 验证方向——判重的预筛字段换成写入方无法伪造的内核元数据：**纳秒 mtime + ctime（状态变更时间）+ 文件身份（dev+inode）**；任一字段不同 → `changed`（证明状态变了，不证明内容变了）→ 与不可判定（旧行缺列/字段缺失/racy）一起**读全文哈希确认**：相同 → 不上传、账本刷新（RefreshAndSkip），不同 → 正常上传；预筛全同且文件戳远早于快照锚点 → 不读文件跳过。**新包 `agent/internal/fileid`**（build tag 分平台）：unix 用 `syscall.Stat_t`（darwin/linux/BSD 三套 ctime 字段名）；windows 用 `x/sys/windows` 的 `GetFileInformationByHandle`（VolumeSerialNumber+FileIndexHigh/Low）+ `GetFileInformationByHandleEx(FileBasicInfo)` 的 **ChangeTime**（不是 CreationTime；x/sys 只有类常量，struct 自带定义）。**racy 窗口（git racily-clean，单边）**：`任一 stamp ≥ snapshotAt − 2s` → 不可判定；锚点是 **uploader 读文件前对同一 fd `f.Stat()` 的快照时刻**（不是 ack 时刻——ack 可滞后数小时，协调者批复反例：stat(0s)→读(1s)→同 tick 改写(1.5s)→60s 后 ack，锚在 ack 上会静默漏采）；收敛靠刷新（RefreshAndSkip 用本次快照+时刻覆盖账本，过 G 后自然放行）。**读后复核**：上传完对同一 fd 再 Fstat，与读前不一致 → `IdentityComplete=false` → 账本写零身份（下一轮必哈希确认），哈希/size 仍如实上报（#140 语义不变）。**账本**：`processed_files` 加 5 列（file_mtime_ns/ctime_ns/dev/ino/uploaded_at_ns，`ALTER TABLE` 迁移不删表），写入走 `CompleteReportedIdentity`（executor 经内存 inFlight 表把上传时身份投影给 ack 处理器；重放报告/无身份 → 零身份 → fail-closed）。**两个判重调用点**（`main.go` submitFile、`executor.processTask`）都改走 `DecideProcessed`，AST 守卫测试钉住不被绕回；**两处出错时均显式按 Recollect 处理**（返工 1 阻断项：`CandidateDecision` 零值原为 `Skip`，submitFile 出错时会静默丢文件——fail-open 回归；现 `CandidateVerdict` 零值改为 `VerdictUnset`，switch 的 default 臂入队，出错分支显式 `Recollect`——fail-closed 方向 = 宁可重传，最坏是多传不是丢文件）。**续传**：内容面已由 #140 覆盖（逐片 ETag↔本地 MD5），本刀只把版本快照（`FileVersion`）扩为全身份，`canResumeParts` 复用同一比较函数；快照缺任一字段 → 不续传（沿用 fail-closed）。
+
+### 返工 2（codex 评审 r1）——「同 fd + CAS」总原则落地
+
+总原则：**身份（stat）与内容（读/哈希）必须来自同一个打开的 fd；账本更新必须以「读到的那一行」为条件（CAS）。任何经路径的第二次 open 都视为可能指向另一个文件**（路径可以是符号链接，只换指向而目标文件的 ctime/inode 都不变——协调者 PoC 批复时「按路径重开安全」的推理因此作废）。
+
+- **阻断 1（上传单 fd）**：`UploadFile` 打开一次 `*os.File` 并传入 `singlePartUpload` / `multipartUpload`；每个分片与续传 ETag 校验、`hashResumePartChecked` 全部改为同一 fd 的 `io.NewSectionReader`（ReadAt，不移动 offset）。测试：`TestReviewMultipartHandleSwap_Ported`（符号链接在 initiate/complete 之间切换）、`TestReviewSinglePartHandleSwap`。
+- **阻断 2（判重哈希回调自持 fd）**：`HashResult` 扩为 `{sha256, size, identity, identityComplete}`——回调自己打开文件，同一 fd 上取读前身份、哈希、读后复核。`DecideProcessed` 的 `cur`（按路径 stat）只用于预筛（Same 免读跳过）；一旦进入哈希确认，账本只写回调返回的身份；`complete=false` 不得 RefreshAndSkip → Recollect。生产回调 `hashCandidateSHA256`（submitFile）与 `hashFileSHA256`（executor）同步升级。测试：`TestReviewPathSwap_Ported`。
+- **阻断 3（刷新 CAS）**：`refreshProcessedIdentityCAS` 的 WHERE 带判重时读到的完整旧值（sha256 + 全身份 + 锚点）；0 行受影响 = 依据已被并发 ack/重放改写 → 不得 RefreshAndSkip → **Recollect**（选直接 Recollect 而非重读再判：依据丢失意味着并发状态不可知，重读可能立刻再次失效；宁多传不丢文件）。测试：`TestReviewConcurrentAck_Ported`。**ack 之间乱序的可达性（返工 4 修正，评审者实测推翻返工 2 论证）**：`UNIQUE(rule_id, local_path)` 只约束 `processed_files` 不约束 `upload_tasks`；入队守卫只排除 mtime/size 均相同的活动任务，多 worker 可并发执行；reporter 单 goroutine 只保证串行**发送**，远端 ack 不保证按发送顺序成功到达。逆序 ack（B 先、旧 A 后）**可以让账本回退到旧版本**（评审者 `TestReviewR2ReverseAcks` 真实 queue 复现）。**判定面的结论（带前提）**：账本回退到旧版本后，**若发生对当前文件的下一次检查**（新事件/重扫触发），身份不一致 → 哈希确认 → 不同 → 重采（`TestReviewR2ReverseAcks_NeverFreeReadSkip` 钉住「该检查绝不免读跳过」）；代价是多一次哈希/重传。**前提本身不保证**：watcher 已记录 B、fsnotify 无周期重扫、之后文件不再变化时没有下一次检查——旧上传 A 已覆盖远端对象、账本停在 A、本地 B 不再上传；这就是 **IC-BUG-58**（同路径并发上传无版本序：远端覆盖 + 无后续事件不收敛），远端覆盖顺序问题归 58 与 IC-BUG-42 / backlog，本卡不处理。
+- **阻断 4（Windows 同句柄）**：Windows 的 `StatHandle` 用 `windows.Handle(f.Fd())` 调 `GetFileInformationByHandle` + `GetFileInformationByHandleEx(FileBasicInfo)`，ChangeTime/卷序列号/文件索引与 `f.Stat` 的 size/mtime 全部来自同一句柄；`Stat(path)` 也打开一次后对句柄查询。测试 `handle_windows_test.go` 在 CI windows-latest 真跑。
+- **应修 5（锚点与回拨）**：`Stat`/`StatHandle` 在 stat **之前**取 `time.Now()` 作锚点（保守：锚点与 stat 间的停顿只会让改写保持 racy；锚点若在 stat 之后，长停顿会让窗口错过改写）。`PrefilterVerdict` 新增守卫：账本锚点晚于当前时钟（回拨）→ Undecidable → 哈希；刷新会用当前时钟重锚自愈。**已知边界**（接受）：时钟回拨到某个旧 stamp 的同一粒度内并在该粒度内同尺寸改写、且锚点仍早于当前时间——预筛无法区分，直接判相同（该次改写漏采；返工 5 更正：此情形哈希确认不一定执行，预筛会直接跳过）；运维建议 NTP 只做 slew 不做 step。
+- **应修 6（ok 强制）**：`CompleteReportedIdentity` 入口 `if !ok { ident = FileIdentity{} }`——防御层在账本 API 自身，不再依赖调用方自律。**平台注意**（批复补充）：ReFS 64 位 FileIndex 不保证唯一 → 误报 changed → 哈希兜底；FAT 无 ChangeTime → undecidable；dev 号跨重启可变（overlay/NFS/btrfs）→ changed → 哈希，均安全向。
+
+### 返工 4（codex 评审 r2）——watcher 层身份去重 + Windows 路径 Stat + ack 顺序更正
+
+- **阻断 1（watcher 前置抑制，端到端修复不完整）**：watcher 的 `seen`/`inflight`/claim 从 `map[string]time.Time` 改为 `map[string]fileid.Identity`（`fileid.Stat` 一次打开取全字段）；`scanFile`、`claimDelivery`、`completeDelivery`、debounce flush claim、poll 扫描、overflow 重扫、初扫全部按内核身份（mtime-ns+ctime+dev+ino+size，零字段永不相等→交付）比较——保留 mtime 的改写 / `cp -p` 重建在 watcher 层不再被吞，会交付给下游 `DecideProcessed` 哈希确认。`completeDelivery` 的 seen 写入加**活性守卫**（文件当前身份仍等于交付身份才写入）：迟到的旧版本交付不会覆盖新版本（身份无序，活性即单调）。`EnqueueIfNoActive` 同步修复：`upload_tasks` 加 `file_ctime_ns/file_dev/file_ino/file_mtime_ns` 列，候选带完整身份时活动任务守卫按身份比较——v1 上传未完成期间的保留 mtime 改写**会**入队第二个任务（协调者问题「会不会被吞」答案：返工前会，已修）。测试：`TestReviewR2PreservedMtimeMiss_Ported`、`TestReviewR2_PollScan_DeliversPreservedMtimeRewrite`、`TestReviewR2_DebounceFlushClaim_DeliversPreservedMtimeRewrite`、**`TestReviewR2_EndToEnd_WatcherToDecide_NoRestart`（真实 watcher+真实 queue 不重启，端到端 Recollect）**、`TestEnqueueIfNoActive_PreservedMtimeRewriteNotSuppressed`。
+- **阻断 2（Windows 路径 Stat 混合身份）**：`fileid.Stat(path)` 全平台统一为**打开一次 → StatHandle(f) → close**；Windows `FromInfo` 路径改为故意零填充（按路径在 Windows 上取不到可信身份，意外调用只产生零字段→哈希确认，绝不产生混合身份）。测试：`TestReviewR2HybridWindowsPrefilter_Ported`（queue 层记录恒等身份→免读 Skip 契约）+ CI windows-latest 的 `handle_windows_test.go`。
+- **应修 4（ack 顺序论证更正）**：见上方返工 2 阻断 3 的修正段；新增 `TestReviewR2ReverseAcks_NeverFreeReadSkip` 钉住「**若发生下一次检查**，逆序 ack 回退后该检查绝不免读跳过（判定面不漏采；检查是否发生见 IC-BUG-58 的前提问题）」；远端对象覆盖顺序指向 IC-BUG-58 / IC-BUG-42 / backlog。
+- **应修 5（§1.3 过时文字）**：`bin/ic48/design.md` §1.3「changed 直接重采」改为与实现一致（changed → 哈希确认）。
+- **变异自验**：返工 4 段——watcher 改回按 mtime、单片按路径重开、CAS 去 sha 条件、去回拨守卫、去 ok 均红（`bin/ic48/evidence/mutation-results.txt`）。live 复现（返工 2 后重跑）三场景**均不重启 agent**（返工 2 那轮的场景 B/C 曾借重启触发初扫，本轮起 watcher 层已修，持续运行即可触发）。
+- **阻断 3（时钟回拨后又追上旧锚点）——用户拍板接受为已知边界（2026-11-10，不改代码）**：需要系统时钟被 step 回拨到某个旧文件时间戳的同一粒度内、在该粒度内同尺寸改写、且之后时钟走过旧锚点——预筛无法区分，会判相同。**为何接受**：需要人为回拨时钟且精确命中粒度；与 git/rsync 等同类工具的通行取舍一致。**运维建议**：NTP 只做 slew 不做 step（chrony `makestep` 仅限启动时），已写入 `docs/ops/deployment.md` B.3。已有的「账本锚点在未来 → Undecidable」守卫保留——它覆盖的是「回拨尚未追上旧锚点」的情形。live 复现证据（本轮）：`bin/ic48/evidence/rework4-live-manual.txt`，agent PID 全程 93756 未变，三场景持续运行中全过。**验收**：先红 6/8（master shim 重放四元组行为，`bin/ic48/evidence/red.txt`）；三条验收场景 + racy + 延迟 ack 反例 + 两轮收敛 + 旧行缺列 + 不可判定 + chmod-only + inode-only + 未来戳各有测试全绿；**变异自验 9/10 红**（去 ctime / 去 inode / 去 racy / 对称窗口 / 锚点改 ack / 去哈希确认 / changed 直采 / 刷新不前移锚点 / 读后复核失效；Windows ChangeTime→CreationTime 编译通过、行为面本机无法真跑，如实注明——`bin/ic48/evidence/mutation-results.txt`）；`go vet` + `go test` 全绿、`GOOS=windows vet/test -c` 编译通过；agent 总覆盖率 77.6%（= master 基线）。未动 proto/CP/webui（身份走内存通道不走 gRPC）。**残余**：IC-15 做 tail 时须把内容身份判据带入滚动分块路径（本刀判据是其地基） |
+
+### 返工 6（协调者复核返工 5）——调试输出清除 + 入队守卫接统一判定（2026-11-10）
+
+协调者复核返工 5 发现两处「声称已修不属实」，返工 6 重做并逐条附可复核证据：
+
+- **阻断 1（生产代码残留调试输出）**：5fd080a 在 `watcher.go` 留下 4 处 `fmt.Printf("DBG …")`（scanFile 两块 974–983 整块只为打印、completeDelivery settle 两处 1154/1156）——每次扫描往 stdout 打日志，违反 CLAUDE.md「禁止在业务代码中直接使用 fmt.Println」。**修复**：全部删除（scanFile 两块整体删；settle 两处的抑制原因改为 `zap.Debug`）。**守卫防再犯**：`TestNoDirectPrintInProductionCode`（`watcher/dbg_guard_test.go`）用 `go/parser` 扫描 agent 模块全部非 `_test.go` 文件，断言无 `fmt.Print/Printf/Println` 与内置 `print/println` 调用。**选 go/parser 而非 grep 的理由**：AST 只匹配真实调用表达式，不会误伤注释/字符串字面量里的词（守卫测试自己的文档注释就含这些词），规则精确且无豁免清单要维护；`fmt.Sprintf` 等返回字符串的格式化不是输出调用，不在禁令内。变异：守卫移走 + 加回 `fmt.Printf` → 全绿；守卫放回 → 红并指出 `watcher.go:974: fmt.Printf`（`bin/ic48/evidence/mutation-results-r6.txt` M3）。
+- **阻断 2（入队守卫没有用统一判定——r3 阻断 1 的入队半边未修，移植测试被改成钉住错误行为）**：返工 5 的 `EnqueueIfNoActive` 仍是 SQL 里「全身份字段相等 → 不入队」，**没有 racy 窗口**：粗粒度文件系统同 tick 内同尺寸改写时，新版本与在途任务身份完全相同，会被挡掉。且 `TestReviewR3CoarseActive_Ported` 被改成 `require.False(y)`（钉住 bug），注释谎称「racy 变体由 watcher 测试覆盖」——入队守卫是独立的一道门。**修复**：① `upload_tasks` 新列 `file_snap_at_ns`（入队时身份的快照时刻 = racy 锚点；ALTER 容错迁移，零 = 旧行未知锚点 → 不可判定 → 入队）；`submitFile` 携带 `ident.SnapAtNs`。② `EnqueueIfNoActive` 重写：**BEGIN IMMEDIATE 事务**内读同 rule/path 的活动任务，逐个用 `queue.SameVersionProvable(active.ident, cand.ident, active.snapAtNs)` 判定——**只有可证明相同才拒绝**；racy 窗口内（stamp ≥ 锚点−2s）身份相同的新候选必须入队（下游 `DecideProcessed` 哈希确认，相同内容不会重传）。删掉纯 SQL 相等写法与 `taskHasIdentity` 三字段判断——字段完整性由判定的 `identityFullyKnown` 统一承担（mtime_ns/ctime_ns/dev/ino 任一为零 → 永不可证明相同 → 入队；r3 指出的「mtime_ns=0 其余非零被当完整身份」一并消除）。③ **并发安全选型 = BEGIN IMMEDIATE**（事务一开始以对 `schema_migrations_r6_lock` 零行表的 no-op UPDATE 升级写锁；go-sqlite3 默认把写锁推迟到第一条写语句，不升级则 SELECT 判定→INSERT 窗口对并发写者开放）：判定读与 INSERT 串行化，两个 goroutine 同版本并发入队只插一行（`TestEnqueueIfNoActive_ConcurrentSameVersion_SingleInsert`，8 goroutine）；不选保留 `INSERT…WHERE NOT EXISTS`——其 NOT EXISTS 只能表达裸列相等，无法表达锚点 racy 判定。④ 测试恢复原意 + 新增五个判定面用例（`enqueue_guard_r6_test.go`）：RacyWindow 必须入队（锚点−G+1 精确落窗内）/ ProvablySame 拒绝（锚点远晚于 stamp）/ FutureAnchor 必须入队（时钟回拨，镜像账本守卫）/ ZeroMtimeNs 必须入队 / ActiveWithoutAnchor 必须入队；`TestReviewR3CoarseActive_Ported` 恢复 `rewritten_candidate MUST enqueue` 断言。**先红**：旧守卫上 RacyWindow/ActiveWithoutAnchor 红（`bin/ic48/evidence/rework6-red.txt`、`rework6-red2.txt`；ZeroMtimeNs 在旧代码上假绿——旧守卫对候选身份不全一律 enqueueDirect，恰是其未测出四字段缺失的原因，如实记录）。**变异**（`mutation-results-r6.txt`）：M1 守卫回裸相等 → RacyWindow + CoarseActive 红；M2 `identityFullyKnown` 去 mtime_ns → 账本预筛面对零 mtime 身份可出 Same，定点检测器红（入队面不红——守卫只被 Same 抑制，Changed 仍入队，如实归因）；M3 见阻断 1。**tail 不依赖本守卫**：`executor.go:409` 的 terminal 闸（`AppendMode==AppendModeTail → ErrTerminalUpload`，executor 是 uploader 唯一调用方、闸在 uploader 之前的唯一咽喉）在执行层拦掉 tail 任务，与本守卫无关。
+- **返工 5 其余声称复核（返工 6 实测，非采信）**：`seenEqual` 调 `SameVersionProvable`（`watcher.go:58`）、claim token 按 token 身份释放（`:1066` claimDelivery / `:1128` completeDelivery，未知身份不泄漏——`TestReviewR3UnknownClaimLeak_Ported` 在场且绿）；`TestReviewSinglePartHandleSwap` 真实执行替换（`swapCount==1` + 换后路径指向 b 断言），变异「单片按 `task.LocalPath` 懒重开」→ 红（上传了 b 的字节 `2f858775…` 而非 a 的 `c34ab6ab…`，`mutation-results-r6.txt` M4）；IC-BUG-58 计数核对：总表 58 行 = 已关 41 / 撤销 1 / 未关 16 ✓。
+
+### 返工 8（codex 评审 r5）——claim 守卫顺序（在途先于 seen）+ 真链路测试重写（2026-11-10）
+
+- **修复 1（seen 先于在途检查，返回旧版本的候选不标 dirty）**：claimDelivery 原「seen 命中 → return false」在「有在途 token → dirty=true」之前——A 已交付且 seen 过 racy 窗口、路径切到 B（B 在途）、再切回仍在的 A：A 的候选命中旧 seen 直接返回，B 的 token 保持 clean，settle 不重查。改为**先查在途**（有在途 → dirty → false），seen 抑制只对无在途候选生效。测试：`TestReviewR5RealSymlinkReturn`（真实文件 + symlink，先红 `A_return_admitted=false B_dirty=false` → 绿）。**⚠️ 返工 9 更正：本条当时只修了 claimDelivery 内部的顺序，未覆盖 scanFile 里更早的 seen 提前返回（pollScan/debounce recheck 的入口）——「覆盖全部入口」说法过强，返工 9 已删掉 scanFile 的提前抑制并把守卫集中到 claimDelivery，见下节。**
+- **修复 2（返工 7 的 real-chain 测试假绿）**：原测试无 Start、无 recheckCtx（dirty settle 必然早退）、无屏障保证第二次 claim 落在 A 在途时（评审者 dirty=false 变异 10 次全绿）。重写：真实 Start 生命周期（安装 recheck 三元组）、无缓冲通道 + 同步屏障（断言 dirty=true 后才放行 A 的发送）、`dirtyRecheckFired` 钩子断言重查定时器真实触发；新增 DoubleDirty（两次候选一次重查，不叠加）与 CancelAfterDirty（取消后重查被闸、claim 回滚、无僵尸定时器，计数钩子代替 goleak）。
+- **变异验收**（`bin/ic48/evidence/mutation-results-r8.txt`，均 `-count=10` 红）：`cur.dirty=true→false` 红（R5 symlink + real-chain 双测试抓）；删 `recheckAfterDirtySettle(path)` 红（recheck 未触发 + 交付缺失）。
+- **边界（不扩大本卡）**：评审者指出即便守卫顺序修正，下游判重在 B 落账前仍可能看到 A 的旧账本，远端最终状态取决于上传/ack 时序——这属于 **IC-BUG-58** 的范围，本卡不处理。
+
+### 返工 9（codex 评审 r6）——scanFile 提前抑制删除 + 单一 seen 表（2026-11-10）
+
+- **阻断 1（scanFile 在 claimDelivery 之前用旧 seen 提前返回）**：`scanFile`（pollScan、debounce recheck 的共同入口）里 `if known && seenEqual(prevEntry, ident) { return nil }` 绕过了返工 8 放进 claimDelivery 的守卫——返工 8 只修了 claimDelivery 内部顺序，实际入口根本到不了那里。修法：**删掉 scanFile 的提前抑制**，在途 + seen 判定只在 claimDelivery（同一把锁）里做；`known` 仅用于 op 标注（create/write）。全文件 grep `seen[` 清单：`watcher.go:1019`（scanFile 读 seen 判 op——不再据此返回 ✓）、`:1078`（markSeen，交付后写入 ✓）、`:1276`（completeDelivery settle 写入 ✓）——rework-9 后无任何「claimDelivery 之前抑制」的读取点。测试：`TestReviewR6SeenBypass`（真实 `scanFile`，先红 B_dirty=false → 绿 B_dirty=true）。
+- **阻断 2（dirty 重查与正常链路两张 seen 表）**：Start 给 recheckSeen 建一张表、fsnotify 路径与 polling 路径又各建一张——重查写入的版本对正常路径不可见，正常路径会把旧版本继续当已交付（返回 A 丢失）。修法：**每次 Start 只建一张 lifecycle seen**（recheckMu 下发布），初始扫描、fsnotify、polling、dirty 重查全部用它；顺序重启随生命周期重建，旧表不泄漏。守卫：`TestReviewR6_SingleSeenMapInProduction` 源级断言 `make(map[string]seenEntry)` 在生产代码中只出现一次（Start；runPolling 的 nil 回退为「绕过 Start 的包内测试专用」，注释标注并被守卫豁免）。测试：`TestReviewR6SplitSeen` 重写为真 Start 生命周期回归（⚠️ 返工 11 更正：当时版本断言「正常链路确实交付 A」依赖 `lifecycleSeen()` 直取 `w.recheckSeen`，与 recheck 同源比较恒真——评审 r8 证实 `w.recheckSeen = map[string]seenEntry{}` 字面量变异 3/3 绿绕过；返工 11 已用 use-site 钩子修正，见返工 11 节）。
+- **建议 3（表述）**：`TestReviewR4RealChain_*` 升级为断言第二次交付的版本（当前 inode = B）并以钩子记录重查触发时的交付序号（区分重查自身交付 vs 重查发现 seen==B 跳过——两者都是统一判定的裁决）；`completeDelivery` 的「just-written seen」矛盾注释改正（dirty 分支根本不写 seen）；48 卡返工 8 一节的「覆盖全部入口」改为准确描述（见上）；`active.md:25` 范围 1…57 → 1…58。
+- **验收**：两条移植测试先红（`rework9-red.txt`）；变异 4 条 `-count=10` 全红（`mutation-results-r9.txt`）：恢复 scanFile 提前 seen 返回、recheck 改用独立新 seen 表、返工 8 的 dirty=false 与删重查调用复跑；`go vet` 两平台全过、`go test` 全绿、覆盖率 ≥77.6%、`-count=10 -run 'RealChain|RealSymlink|SeenBypass|SplitSeen'` 全绿、grep 双空、status 干净；两后端 smoke + live 三场景（不重启 agent）重跑。
+
+### 返工 11（codex 评审 r8）——loop seen use-site 钩子 + 覆盖陈述更正（2026-11-10）
+
+- **应修（独立 seen 表回归可绕过两层测试）**：返工 10 的 `TestReviewR6SplitSeen` 的 `normalMap` 取自 `lifecycleSeen()`（直返 `w.recheckSeen`），与 `recheckMap` 的「指针比较」比较的是同一来源——评审 r8 把 `w.recheckSeen = lifecycleSeen` 改成 `w.recheckSeen = map[string]seenEntry{}`（字面量），行为测试与源守卫 3/3 全绿（源守卫只数 `make(` 字符串，字面量绕过它）。修法：新增**无语义变化**的观测钩子 `loopSeenObserved func(map[string]seenEntry)`（生产恒 nil，与 `dirtyRecheckFired` 同模式），在 fsnotify/polling/初扫**实际开始使用 seen 的那一点**调用（Start 的 `seen := lifecycleSeen` 之后与 `runPolling` 的 map 确定之后）；测试在 `Start` 前安装钩子，拿 loop 实际用的 map，与 dirty recheck 实际用的 map 做**指针相等**断言（`reflect.ValueOf(m).Pointer()`）——该断言成为两种 split 变异（`make(...)` 与字面量）的共同失败点。源守卫保留为补充（只约束源形式），测试头注释写明。
+- **变异验收**（`bin/ic48/evidence/mutation-results-r11.txt`，各 `-count=10` 全红，失败点均为指针断言）：`w.recheckSeen = make(map[string]seenEntry)` 10 红；字面量 `map[string]seenEntry{}` 10 红（返工 10 时 3/3 绿的绕过已封）；polling 路径改用局部新表 10 红（新增 `TestReviewR11_PollingLoopSeenIsLifecycleSeen` 驱动 runPolling 的轮询生命周期，钩子在轮询使用点触发）。
+- **建议（一并做）**：`TestReviewR4RealChain_*` 的 `require.NotEqual(idA.CtimeNs, idB.CtimeNs)` 删除——粗粒度/同 tick 下 ctime 可能不前进导致误报失败；改为在两个消费同步点分别读文件内容（A、B 内容不同），断言第一次交付 = A 内容、第二次交付 = B 内容；ctime 改为仅信息性日志。A/B 内容改为不同长度（"A-content-by-rework11" / "B"）。
+- **文档**：48 卡返工 9 阻断 2 的 SplitSeen 覆盖陈述更正（如上）；本节补记。历史先红证据（rework9-red.txt 等）对应返工 9 时期的旧测试版本，其测试体已在返工 10/11 重写。
+- **验收**：`go vet` 两平台全过、`go test -count=1 ./...` 全绿、`go test -race -count=3 ./internal/watcher/` 无 DATA RACE；覆盖率 ≥77.6%；`git diff 1703571..HEAD -- ':!*_test.go'` 仅含 `loopSeenObserved` 字段声明与两处 nil 判断调用；grep 双空、status 干净。不需要 docker（测试+文档轮）。
 
 ## IC-BUG-49 — 追加写入后「新版本对象 vs 覆盖」语义未定义 🟡 P2 ❌ 已撤销（2026-09-13）
 
@@ -925,3 +979,17 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **B 重判（2026-10-27）** | **不挡试点** — 执行窗口秒级、通常在运维自己的机器上，实际风险低；bootstrap 三项自检本就要求操作者在场。证据：`init-seaweedfs.sh:179-180,254-255,142-153`（历史行号，同上） |
 | **B7 进展（#138，2026-10-31）** | `mc alias set` 两处已随 S3 客户端改为 AWS CLI（B7）而消除；凭据改为写入**私有 0700 目录、0600 权限**的 config/credentials 文件（`mktemp -d` + trap 清理，不进 argv 也不进全局 `~/.aws`）。**截至 2026-10-31 #138 合并时，argv 暴露尚余 `curl --user`**（`assume_role` 函数里的 `curl --user "$1:$2"`，即 AssumeRole 自检；不写行号以免漂移；已于 2026-11-09 随本 PR 修复，见下方「修复记录」）；另注：预签名 URL 进入 curl argv（预签名 GET 自检里的 `curl "${PRESIGNED_URL}"`）是**旧版就有的**短期凭据（5 分钟过期），非新增暴露。当时 IC-BUG-57 尚未关闭（curl --user 残留），计数不变 |
 | **修复记录（2026-11-09，分支 `chore/b7-small-followups`，#143）** | `assume_role` 的 `curl --user "$1:$2"` 改为 `curl --config <file>`：`user = "AK:SK"` 一行由 **bash 内建 printf + 重定向**（无外部命令，密钥不进任何 argv）写入**私有 `OWN_AWS_DIR`（0700）内的 `mktemp` 临时文件（umask 077 → 0600）**，用完即删、EXIT trap 兜底删除。**先红后绿探针**（PATH 前置 curl 包装器记录 `"$@"`，等价于 `ps -ef` 可见的 argv）：master 版 argv 含 `--user AK:SK`（红），修复版 argv 只有 `--config <file>`（绿）——证据 `bin/followups/ic57/probe-red-green.txt`。**live 验收**：`FA_STORAGE=seaweedfs bash deploy/scripts/smoke.sh` = `SMOKE PASSED`（含 init-seaweedfs.sh 的 AssumeRole/建桶/预签名 GET 三项自检）。修复只涉 `assume_role` 一处；预签名 URL 进 argv 的旧有短期凭据暴露（5 分钟过期）**不在本卡范围、未改**。卡片关闭，计数 → 已关 40 / 未关 16 |
+
+## IC-BUG-58 — 同路径并发上传无版本序：旧版本可覆盖远端新对象且不收敛 🟠 P1
+
+> 2026-11-10 立卡（codex 评审 r3 阻断 3，用户拍板从 IC-BUG-48 拆出，不挡 48 关闭）。
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 同一 rule/path 的上传没有版本序：入队守卫（返工 4 后）允许不同身份的版本并发入队；多 worker 并发执行；reporter 串行发送但远端 ack 不按发送顺序到达；watcher 交付后没有周期重扫。组合效果：旧版本 A 后完成 → PutObject 覆盖远端的新对象 B → A 的 ack 把账本回退成 A → 文件不再变化时无后续候选检查，B 长期不被采集 |
+| **精确位置** | `agent/internal/queue/queue.go` 的 `EnqueueIfNoActive`（按版本守卫，允许多版本并存）；`agent/internal/queue/reports.go` 的 `CompleteReportedIdentity`（upsert 无版本序）；`agent/internal/executor/executor.go`（多 worker 并发）；`agent/internal/watcher/watcher.go`（交付后无重扫） |
+| **后果** | 远端对象与账本最终停留在旧版本 A；当前文件 B 的内容已交付过（watcher seen 已记录），之后文件不变则永不重试。**注**：这不是返工 4 引入的新问题——master 上不同 mtime 的版本同样会触发（IC-BUG-42 一类）；48 的修复只是让保留 mtime 的版本也进入了这条路径 |
+| **复现** | 账本回退实测：`bin/review-r3/` 的 `TestReviewR2ReverseAcks_NeverFreeReadSkip`（真实 queue，逆序 ack 后 `ledger_sha=sha-A`）。远端覆盖 + 无后续事件的组合为代码路径推演，未端到端复现（需真实对象与长时间静置） |
+| **与 IC-BUG-42 的关系** | IC-BUG-42（`EnqueueIfNoActive` 不拦 `failed`）是本条的子情形：master 上不同 mtime 的版本即可并发；48 修复让保留 mtime 版本也进入该路径，故拆卡独立追踪 |
+| **修复方向** | ① 同一 rule/path 的上传串行化（同一时间只允许一个活动任务，新版本等待或取消旧任务）；或 ② 持久化版本序（单调版本号/快照锚点比较），ack 只接受不早于账本当前版本的写入；③ 最终收敛：账本回退后安排一次重检查（持久化重检查队列），保证 B 最终被重采 |
+| **B 判定（2026-11-10）** | **挡试点** — 用户 2026-11-10 确认试点存在**原地更新的文件**（文件名不变、内容增加、mtime 变化）。文件持续更新时，下一次更新会经哈希确认重采而收敛；但**最后一次更新**若碰上旧版本上传后完成（典型：旧任务失败退避重试后才完成），远端会静默停在旧内容、账本回退，直到下一次改动或 agent 重启——试点数据在窗口期内以旧内容对外可见。「agent 重启可自愈」是读码推演（重启后初扫重发现该文件并走判重链路），**未实测**。 |

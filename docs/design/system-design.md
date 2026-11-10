@@ -984,7 +984,58 @@ Scheduled 模式执行流程：
                 ├── 并发分片数：3（可配置）
                 └── Complete Multipart → 对象原子可见
 
-断点续传实现：
+断点续传实现（⚠️ 时点快照：实现已超前于本节——分片落盘/孤儿清理（#105）、
+逐片 ETag 与本地区间 MD5 比对（#140）、版本快照升级为全内核身份
+mtime-ns/ctime/dev+inode（IC-BUG-48）均已落地；权威描述以代码与
+bugs/open.md 各修复记录为准）：
+  0. 同 fd 原则（返工 2）：身份（stat）与内容（读/哈希）来自同一个
+     打开的文件句柄——上传打开一次 *os.File，读前/读后 StatHandle 与
+     所有分片/续传读取全部经该句柄（SectionReader/ReadAt）；判重的
+     哈希确认回调同样自持句柄，账本只写回调返回的身份；账本刷新是
+     以「读到的那一行旧值」为条件的 CAS，失败即重采。任何经路径的
+     第二次 open 都视为可能指向另一个文件（符号链接可只换指向）。
+     fileid.Stat(path) 同样打开一次取全字段（Windows 混合身份修复）。
+  0b. watcher 层身份去重（返工 4 阻断 1）：watcher 的 seen/inflight/
+      claim 按**内核身份**（mtime-ns+ctime+dev+ino+size，fileid.Stat
+      一次打开取全字段）判断「是否已交付过这个版本」，不再按 mtime
+      是否前移——保留 mtime 的原地改写、cp -p 重建在 watcher 层即被
+      交付到下游判重（DecideProcessed 哈希确认——**单版本视角下**
+      相同内容不会重复上传；⚠️ 与 IC-BUG-58 的区别：58 是同路径
+      两个**不同**版本并发上传、远端覆盖顺序无版本序的问题，哈希
+      确认管不了它，归 58 追踪）。EnqueueIfNoActive 的活动任务守卫
+      同样按身份比较（upload_tasks 加 ctime/dev/ino/mtime_ns 列）。
+      入队守卫统一判定（返工 6 阻断 2，2026-11-10）：「是不是同一
+      版本」全库只有一个判定 queue.SameVersionProvable(rec, cur,
+      recAnchorNs)（= PrefilterVerdict == VerdictSame：全字段已知、
+      全相等、mtime 与 ctime 都早于 锚点−2s、锚点非零且不在未来）；
+      watcher 的 seenEqual、入队守卫、账本预筛三处都走它。证明不了
+      相同 → 必须交付 / 入队（下游 DecideProcessed 会哈希确认——
+      同上，这只对「同一版本重复候选」成立，不覆盖 58 的并发覆盖）。
+      upload_tasks 为此新列 file_snap_at_ns——
+      入队时身份的快照时刻（racy 锚点），旧行零值 = 未知锚点 →
+      不可判定 → 入队。并发安全：判定读与 INSERT 在一个 BEGIN
+      IMMEDIATE 事务里串行化，两个 goroutine 同版本并发入队只插
+      一行（守卫不再可能是纯 SQL 相等的单语句写法——那无法表达
+      锚点 racy 判定）。tail 任务与本守卫无关：executor 的
+      terminal 闸（AppendMode=tail → ErrTerminalUpload）在执行层
+      fail-closed（IC-BUG-46）。
+      在途 claim 的 dirty 语义（返工 7 阻断 1，2026-11-10）：watcher
+      的在途 claim 不再比较版本（裸身份相等曾把粗粒度同 tick 改写
+      吞掉）。已有在途 claim 时，后来的候选不发事件，而是在该
+      token 上置 dirty 标记；交付 settle 时若 dirty 则**不写 seen**
+      （文件可能已在途中改写），并复用 debounce recheck 定时器重新
+      检查路径——由唯一的 SameVersionProvable 判定：同版本被刚写的
+      seen 抑制（G 内保守、过 G 收敛），新版本交付给下游哈希确认。
+      无 fsnotify 事件也需要该重查，故对所有模式生效（poll/tail 亦
+      走 scanFile 交付路径）。
+      已知边界（产品 2026-11-10 拍板接受，不改代码）：系统时钟被
+      step 回拨到某个旧文件时间戳的同一粒度内、在该粒度内同尺寸
+      改写、且之后时钟走过旧锚点——预筛无法区分，会判相同（漏采）。
+      接受理由：需要人为回拨时钟且精确命中粒度；与 git/rsync 等
+      同类工具的通行取舍一致。「账本锚点在未来 → Undecidable」
+      守卫覆盖的是回拨尚未追上旧锚点的情形；回拨追上后即为本边界。
+      运维要求：NTP 只做 slew 不做 step（chrony makestep 仅限启动），
+      见 docs/ops/deployment.md B.3。
   1. 上传开始前，在本地 SQLite 中创建 upload_tasks 记录
      字段：file_path, storage_path, upload_id（Multipart ID）,
            total_parts, completed_parts（JSON数组）, status
@@ -992,14 +1043,24 @@ Scheduled 模式执行流程：
   3. 若上传中断（网络断开/进程重启）：
      a. 重启后扫描 status=in_progress 的记录
      b. 用 ListParts API 查询 MinIO 已完成的分片
-     c. 跳过已完成分片，从断点继续
+     c. 已传分片逐一核验（远端 ETag ↔ 本地区间重读 MD5，#140）后跳过，
+        版本身份不匹配则丢弃全部已传分片从头传
   4. 完成后调用 CompleteMultipartUpload
      └── 更新本地记录 status=completed，上报 UploadResult 给 Control Plane
 
-幂等性保证：
-  - 上传前计算文件 SHA-256
+幂等性保证（⚠️ 时点快照：本节为 §4.5 原始设计；实现已超前于本节——
+sha256 与上传字节共用同一次读（#140），判重/续传内容身份已升级为
+「内核元数据预筛 + 哈希确认」（IC-BUG-48，见 bugs/open.md 修复记录），
+权威描述以代码与 bugs/open.md 修复记录为准）：
+  - sha256 在上传流上以 TeeReader 同读得出（#140），不做事前预读；
+    上传与判重的身份/哈希全程同一文件句柄（返工 2「同 fd 原则」，
+    见 §4.5 断点续传第 0 条）
   - Control Plane 收到 UploadResult 后检查 (bucket, storage_path, sha256)
   - 重复上报同一文件时，幂等更新 file_entries，不创建重复记录
+  - 时钟回拨已知边界：回拨到旧 stamp 同一粒度内并在该粒度内同尺寸
+    改写、且账本锚点仍早于当前时间——预筛无法区分，直接判相同
+    （该次改写漏采；返工 5 更正：哈希确认不一定执行）；
+    运维建议 NTP 只做 slew 不做 step
 ```
 
 ## 4.6 本地任务队列（SQLite）
@@ -1031,6 +1092,16 @@ CREATE TABLE processed_files (
     file_mtime  INTEGER NOT NULL,
     sha256      TEXT,
     uploaded_at INTEGER NOT NULL,
+    -- IC-BUG-48 内容身份列（纳秒 mtime/ctime + dev/inode + 快照时刻锚点）；
+    -- 零值 = 未知（旧行/平台缺字段）→ 判重时视为不可判定 → 哈希确认
+    -- 判重（DecideProcessed）出错时两个调用点均按 Recollect 处理
+    -- （fail-closed 方向 = 宁可重传；CandidateVerdict 零值 = VerdictUnset，
+    -- 任何未知判定值也落入队而非静默丢弃）
+    file_mtime_ns  INTEGER NOT NULL DEFAULT 0,
+    file_ctime_ns  INTEGER NOT NULL DEFAULT 0,
+    file_dev       INTEGER NOT NULL DEFAULT 0,
+    file_ino       INTEGER NOT NULL DEFAULT 0,
+    uploaded_at_ns INTEGER NOT NULL DEFAULT 0,
     UNIQUE (rule_id, local_path)
 );
 

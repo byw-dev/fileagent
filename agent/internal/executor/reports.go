@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/byw-dev/fileagent/agent/internal/queue"
@@ -14,6 +15,87 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// inFlightIdentities holds the IC-BUG-48 identity each successful upload
+// reported, keyed by task id, until its ack arrives (or the entry is evicted
+// by a bounded sweep). It is in-memory by design: identities older than the
+// process cannot be vouched for, and a replayed report then stores a zero
+// identity → the next candidate check hash-confirms (fail-closed).
+type inFlightIdentities struct {
+	mu sync.Mutex
+	m  map[string]identityEntry
+}
+
+type identityEntry struct {
+	ident     queue.FileIdentity
+	complete  bool
+	stampedAt time.Time
+}
+
+// recordInFlightIdentity stores the identity of a just-uploaded result.
+func (e *Executor) recordInFlightIdentity(taskID string, result *uploader.UploadResult) {
+	if e.inFlight == nil || result == nil {
+		return
+	}
+	e.inFlight.mu.Lock()
+	defer e.inFlight.mu.Unlock()
+	// Rework-7 fix 4: a REAL capacity bound. The old sweep only deleted
+	// entries older than one hour when the map was already over the cap —
+	// if every entry was younger (a burst of uploads with acks lagging, or
+	// an agent whose acks never arrive), nothing was deleted and the map
+	// grew without bound, contradicting this comment. Now: over the cap,
+	// evict the OLDEST entries (by stampedAt) until the insert fits. An
+	// evicted task's ack then finds no identity → takeInFlightIdentity
+	// returns ok=false → the ledger stores a zero identity → the next
+	// candidate check hash-confirms (the conservative semantics already in
+	// place; a pathological backlog degrades to hash confirmation, never to
+	// a wrong skip). The one-hour age sweep stays as a first pass (acks
+	// arrive in seconds; an hour is orders of magnitude beyond any
+	// realistic ack lag), freeing many entries cheaply before the
+	// oldest-first eviction.
+	const inFlightCap = 4096
+	now := time.Now()
+	if len(e.inFlight.m) >= inFlightCap {
+		for id, ent := range e.inFlight.m {
+			if now.Sub(ent.stampedAt) > time.Hour {
+				delete(e.inFlight.m, id)
+			}
+		}
+	}
+	for len(e.inFlight.m) >= inFlightCap {
+		var oldestID string
+		var oldest time.Time
+		first := true
+		for id, ent := range e.inFlight.m {
+			if first || ent.stampedAt.Before(oldest) {
+				oldestID, oldest, first = id, ent.stampedAt, false
+			}
+		}
+		delete(e.inFlight.m, oldestID)
+	}
+	e.inFlight.m[taskID] = identityEntry{ident: result.Identity, complete: result.IdentityComplete, stampedAt: now}
+}
+
+// takeInFlightIdentity removes and returns the stored identity for a task
+// (present only when this process uploaded it and the post-read Fstat
+// verified it). ok=false → the ledger stores a zero identity (undecidable →
+// hash confirmation).
+func (e *Executor) takeInFlightIdentity(taskID string) (queue.FileIdentity, bool) {
+	if e.inFlight == nil {
+		return queue.FileIdentity{}, false
+	}
+	e.inFlight.mu.Lock()
+	defer e.inFlight.mu.Unlock()
+	ent, ok := e.inFlight.m[taskID]
+	if !ok {
+		return queue.FileIdentity{}, false
+	}
+	delete(e.inFlight.m, taskID)
+	if !ent.complete {
+		return queue.FileIdentity{}, false
+	}
+	return ent.ident, true
+}
 
 // ReportSender sends a result on the currently connected gRPC stream.
 type ReportSender func(*agentv1.AgentMessage) error
@@ -30,7 +112,10 @@ func (e *Executor) ConfigureReporting(sender ReportSender, timeout time.Duration
 	return nil
 }
 
-// persistResult stores all metadata before any send can race with an ack.
+// persistResult stores all metadata before any send can race with an ack. It
+// also records the in-flight IC-BUG-48 identity (the uploader's same-fd
+// snapshot) so the ack handler can project it into the processed-files
+// ledger; complete=false / failed uploads clear it.
 func (e *Executor) persistResult(ctx context.Context, task *queue.UploadTask, result *uploader.UploadResult, uploadErr error) {
 	report := &agentv1.UploadResult{TaskId: task.ID, RuleId: task.RuleID, LocalPath: task.LocalPath, StoragePath: task.StoragePath, Bucket: task.Bucket, SizeBytes: task.FileSize, FileMtime: timestamppb.New(time.Unix(task.FileMtime, 0).UTC()), UploadedAt: timestamppb.Now(), RetryCount: int32(task.RetryCount), Success: uploadErr == nil}
 	if result != nil {
@@ -40,6 +125,7 @@ func (e *Executor) persistResult(ctx context.Context, task *queue.UploadTask, re
 		report.StoragePath = result.StoragePath
 		report.Bucket = result.Bucket
 	}
+	e.recordInFlightIdentity(task.ID, result)
 	if uploadErr != nil {
 		report.ErrorMessage = uploadErr.Error()
 	}
@@ -100,6 +186,13 @@ func (e *Executor) sendDueReports(ctx context.Context) {
 
 // HandleAcknowledgement completes only persisted reports accepted by the CP.
 // Duplicate and unrelated acknowledgements are harmless; negative acks retry.
+//
+// The IC-BUG-48 identity travels OUT of band: e.lastIdentity holds the
+// UploadResult the executor just persisted (same process, same attempt), so
+// the ledger row is written with the uploader's same-fd snapshot. A report
+// REPLAYED after a restart finds no in-flight identity and stores a zero one
+// — the next candidate check then hash-confirms (fail-closed), which is the
+// correct behaviour for an identity nobody can vouch for anymore.
 func (e *Executor) HandleAcknowledgement(ctx context.Context, ack *agentv1.Acknowledgement) error {
 	if ack == nil || !ack.GetSuccess() {
 		return nil
@@ -115,5 +208,6 @@ func (e *Executor) HandleAcknowledgement(ctx context.Context, ack *agentv1.Ackno
 	if err := proto.Unmarshal(payload, &result); err != nil {
 		return err
 	}
-	return e.queue.CompleteReported(ctx, ack.GetRefMessageId(), result.GetSuccess(), result.GetSha256())
+	ident, identOK := e.takeInFlightIdentity(ack.GetRefMessageId())
+	return e.queue.CompleteReportedIdentity(ctx, ack.GetRefMessageId(), result.GetSuccess(), result.GetSha256(), ident, identOK)
 }

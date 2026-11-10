@@ -3,10 +3,13 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/signal"
@@ -21,6 +24,7 @@ import (
 	"github.com/byw-dev/fileagent/agent/internal/config"
 	"github.com/byw-dev/fileagent/agent/internal/credential"
 	"github.com/byw-dev/fileagent/agent/internal/executor"
+	"github.com/byw-dev/fileagent/agent/internal/fileid"
 	"github.com/byw-dev/fileagent/agent/internal/grpcclient"
 	"github.com/byw-dev/fileagent/agent/internal/queue"
 	"github.com/byw-dev/fileagent/agent/internal/scheduler"
@@ -176,14 +180,14 @@ func main() {
 		)
 	}, logger, cfg.Upload.QueueMaxSize)
 
-// Terminal-state multipart cleanup (IC-3 ②): when the executor gives up on
-// a task (dedup-completion, retry budget exhausted, terminal failure, or
-// eviction), the in-flight MinIO multipart upload recorded on it must be
-// aborted or its uploaded parts leak without bound. Best effort — uses the
-// currently held STS session. Note: the bucket's AbortIncompleteMultipartUpload
-// ILM rule is NOT a reliable backstop on current MinIO builds (IC-3 ③: the
-// action is rejected, or silently stripped next to an Expiration rule) — a
-// failed abort is retried from the executor's durable abort outbox instead.
+	// Terminal-state multipart cleanup (IC-3 ②): when the executor gives up on
+	// a task (dedup-completion, retry budget exhausted, terminal failure, or
+	// eviction), the in-flight MinIO multipart upload recorded on it must be
+	// aborted or its uploaded parts leak without bound. Best effort — uses the
+	// currently held STS session. Note: the bucket's AbortIncompleteMultipartUpload
+	// ILM rule is NOT a reliable backstop on current MinIO builds (IC-3 ③: the
+	// action is rejected, or silently stripped next to an Expiration rule) — a
+	// failed abort is retried from the executor's durable abort outbox instead.
 	if err := exec.ConfigureAbandon(func(ctx context.Context, task *queue.UploadTask) error {
 		ucfg := creds.Current()
 		if ucfg == nil {
@@ -855,7 +859,50 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 	}
 }
 
+// hashCandidateSHA256 is submitFile's production hash-confirm function for
+// the IC-BUG-48 flow: full-content sha256 of the candidate file.
+func hashCandidateSHA256(path string) (queue.HashResult, error) {
+	// Rework-2 blocker 2: the callback owns the fd — it opens the file ONCE,
+	// takes the pre-read identity from that handle, hashes the bytes,
+	// re-stats the same handle and returns {identity, sha256, complete}.
+	// The caller's path-stat identity is never allowed into the ledger.
+	f, err := os.Open(path)
+	if err != nil {
+		return queue.HashResult{}, err
+	}
+	defer f.Close()
+	pre, err := fileid.StatHandle(f)
+	if err != nil {
+		return queue.HashResult{}, err
+	}
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return queue.HashResult{}, err
+	}
+	post, err := fileid.StatHandle(f)
+	if err != nil {
+		return queue.HashResult{}, err
+	}
+	return queue.HashResult{
+		SHA256: hex.EncodeToString(h.Sum(nil)),
+		Size:   n,
+		Identity: queue.FileIdentity{
+			MtimeNs: pre.MtimeNs, CtimeNs: pre.CtimeNs, Dev: pre.Dev,
+			Ino: pre.Ino, Size: pre.Size, SnapAtNs: pre.SnapAtNs,
+		},
+		IdentityComplete: fileid.PostStatMatches(pre, post),
+	}, nil
+}
+
 // submitFile checks deduplication and enqueues an upload task.
+//
+// Deduplication is the IC-BUG-48 content-identity verdict, not the bare
+// mtime+size tuple: DecideProcessed prefilters on the kernel identity
+// (nanosecond mtime/ctime + device/inode), hash-confirms the full content
+// whenever the metadata cannot prove the file unchanged (legacy row, unknown
+// fields, racy window), and only a fully-consistent prefilter outside the
+// racy window skips without reading the file.
 //
 // Since IC-BUG-21 a dest_path_template that cannot be resolved refuses the
 // task: nothing is enqueued, so nothing is ever written to a guessed object
@@ -864,12 +911,41 @@ func walkAndSubmit(ctx context.Context, exec *executor.Executor, q *queue.Queue,
 // capacity eviction would shed healthy backlog. Files re-collect naturally
 // once the template is fixed (cron walk / next write event).
 func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, rule scheduler.CollectionRule, localPath string, size int64, mtime time.Time, fileOffset int64, appendMode string, agentCtx trollsift.AgentContext, logger *zap.Logger) {
-	done, err := q.IsProcessed(ctx, rule.RuleID, localPath, mtime.Unix(), size)
-	if err != nil {
-		logger.Warn("agent: check processed failed", zap.String("path", localPath), zap.Error(err))
+	ident, statErr := fileid.Stat(localPath)
+	if statErr != nil {
+		// Unreadable candidate: pass a zero identity (undecidable) —
+		// DecideProcessed then hash-confirms; the open in hashFn (or in the
+		// upload path) fails loudly with the same error. The file is still
+		// ENQUEUED on that error path (see the err branch below): master's
+		// behaviour for this case was done=false → enqueue, and we keep that
+		// fail-closed direction.
+		logger.Debug("agent: identity stat failed, deferring to the upload path",
+			zap.String("path", localPath), zap.Error(statErr))
 	}
-	if done {
+	dec, err := q.DecideProcessed(ctx, rule.RuleID, localPath,
+		queue.FileIdentity{
+			MtimeNs: ident.MtimeNs, CtimeNs: ident.CtimeNs,
+			Dev: ident.Dev, Ino: ident.Ino, Size: ident.Size, SnapAtNs: ident.SnapAtNs,
+		},
+		func() (queue.HashResult, error) { return hashCandidateSHA256(localPath) })
+	if err != nil {
+		// A broken dedup lookup must NOT drop the file (rework-1 fix 1):
+		// CandidateDecision's zero value is {VerdictUnset, ...} — but relying
+		// on that structural guarantee alone would hide the error, so set the
+		// verdict explicitly, exactly like executor.processTask does. The
+		// worst outcome of a failed lookup is a duplicate upload, never a
+		// lost file: hash-confirm I/O errors (locked/permission/transient),
+		// SQLite errors, stat failures — all route to Recollect.
+		logger.Warn("agent: check processed failed", zap.String("path", localPath), zap.Error(err))
+		dec = queue.CandidateDecision{Verdict: queue.Recollect, Prefilter: queue.VerdictUndecidable}
+	}
+	// Default arm = enqueue: VerdictUnset (a caller bug — this switch handles
+	// err above, but a future refactor might not) and any unknown value fall
+	// into the queue instead of being silently dropped.
+	switch dec.Verdict {
+	case queue.Skip, queue.RefreshAndSkip:
 		return
+	default: // Recollect, VerdictUnset, unknown → enqueue
 	}
 	storagePath, pathErr := buildStoragePath(rule, localPath, agentCtx, time.Now().UTC(), logger)
 	if pathErr != nil {
@@ -893,6 +969,21 @@ func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, ru
 		Status:      queue.StatusPending,
 		FileOffset:  fileOffset,
 		AppendMode:  appendMode,
+		// Rework-4: carry the enqueue-time kernel identity so
+		// EnqueueIfNoActive's active-task guard compares versions (not the
+		// second-granularity tuple) — a preserved-mtime rewrite during an
+		// in-flight upload enqueues a second task instead of being
+		// suppressed. The uploader re-stats the handle itself; these fields
+		// are guard inputs only.
+		// Rework-6: FileSnapAtNs is the identity's snapshot moment (the same
+		// stat) — the racy anchor for the guard's SameVersionProvable
+		// verdict. Zero (stat failed above) = unknown anchor → undecidable →
+		// enqueue (fail-closed).
+		FileCtimeNs:  ident.CtimeNs,
+		FileDev:      ident.Dev,
+		FileIno:      ident.Ino,
+		FileMtimeNs:  ident.MtimeNs,
+		FileSnapAtNs: ident.SnapAtNs,
 	}
 	if err := exec.Submit(ctx, task); err != nil {
 		logger.Warn("agent: submit task failed",
