@@ -39,17 +39,39 @@ func (e *Executor) recordInFlightIdentity(taskID string, result *uploader.Upload
 	}
 	e.inFlight.mu.Lock()
 	defer e.inFlight.mu.Unlock()
-	// Bound the map: drop entries older than one hour (acks arrive in
-	// seconds; an hour is orders of magnitude beyond any realistic ack lag)
-	// and cap at 4096 entries by dropping the oldest — a pathological
-	// backlog then degrades to hash confirmation, never to a wrong skip.
+	// Rework-7 fix 4: a REAL capacity bound. The old sweep only deleted
+	// entries older than one hour when the map was already over the cap —
+	// if every entry was younger (a burst of uploads with acks lagging, or
+	// an agent whose acks never arrive), nothing was deleted and the map
+	// grew without bound, contradicting this comment. Now: over the cap,
+	// evict the OLDEST entries (by stampedAt) until the insert fits. An
+	// evicted task's ack then finds no identity → takeInFlightIdentity
+	// returns ok=false → the ledger stores a zero identity → the next
+	// candidate check hash-confirms (the conservative semantics already in
+	// place; a pathological backlog degrades to hash confirmation, never to
+	// a wrong skip). The one-hour age sweep stays as a first pass (acks
+	// arrive in seconds; an hour is orders of magnitude beyond any
+	// realistic ack lag), freeing many entries cheaply before the
+	// oldest-first eviction.
+	const inFlightCap = 4096
 	now := time.Now()
-	if len(e.inFlight.m) >= 4096 {
+	if len(e.inFlight.m) >= inFlightCap {
 		for id, ent := range e.inFlight.m {
 			if now.Sub(ent.stampedAt) > time.Hour {
 				delete(e.inFlight.m, id)
 			}
 		}
+	}
+	for len(e.inFlight.m) >= inFlightCap {
+		var oldestID string
+		var oldest time.Time
+		first := true
+		for id, ent := range e.inFlight.m {
+			if first || ent.stampedAt.Before(oldest) {
+				oldestID, oldest, first = id, ent.stampedAt, false
+			}
+		}
+		delete(e.inFlight.m, oldestID)
 	}
 	e.inFlight.m[taskID] = identityEntry{ident: result.Identity, complete: result.IdentityComplete, stampedAt: now}
 }

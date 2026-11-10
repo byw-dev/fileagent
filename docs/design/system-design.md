@@ -999,16 +999,19 @@ bugs/open.md 各修复记录为准）：
       claim 按**内核身份**（mtime-ns+ctime+dev+ino+size，fileid.Stat
       一次打开取全字段）判断「是否已交付过这个版本」，不再按 mtime
       是否前移——保留 mtime 的原地改写、cp -p 重建在 watcher 层即被
-      交付到下游判重（DecideProcessed 哈希确认，相同内容不会重复
-      上传）。EnqueueIfNoActive 的活动任务守卫同样按身份比较
-      （upload_tasks 加 ctime/dev/ino/mtime_ns 列）。
+      交付到下游判重（DecideProcessed 哈希确认——**单版本视角下**
+      相同内容不会重复上传；⚠️ 与 IC-BUG-58 的区别：58 是同路径
+      两个**不同**版本并发上传、远端覆盖顺序无版本序的问题，哈希
+      确认管不了它，归 58 追踪）。EnqueueIfNoActive 的活动任务守卫
+      同样按身份比较（upload_tasks 加 ctime/dev/ino/mtime_ns 列）。
       入队守卫统一判定（返工 6 阻断 2，2026-11-10）：「是不是同一
       版本」全库只有一个判定 queue.SameVersionProvable(rec, cur,
       recAnchorNs)（= PrefilterVerdict == VerdictSame：全字段已知、
       全相等、mtime 与 ctime 都早于 锚点−2s、锚点非零且不在未来）；
       watcher 的 seenEqual、入队守卫、账本预筛三处都走它。证明不了
-      相同 → 必须交付 / 入队（下游 DecideProcessed 会哈希确认，不会
-      重复上传相同内容）。upload_tasks 为此新列 file_snap_at_ns——
+      相同 → 必须交付 / 入队（下游 DecideProcessed 会哈希确认——
+      同上，这只对「同一版本重复候选」成立，不覆盖 58 的并发覆盖）。
+      upload_tasks 为此新列 file_snap_at_ns——
       入队时身份的快照时刻（racy 锚点），旧行零值 = 未知锚点 →
       不可判定 → 入队。并发安全：判定读与 INSERT 在一个 BEGIN
       IMMEDIATE 事务里串行化，两个 goroutine 同版本并发入队只插
@@ -1016,6 +1019,15 @@ bugs/open.md 各修复记录为准）：
       锚点 racy 判定）。tail 任务与本守卫无关：executor 的
       terminal 闸（AppendMode=tail → ErrTerminalUpload）在执行层
       fail-closed（IC-BUG-46）。
+      在途 claim 的 dirty 语义（返工 7 阻断 1，2026-11-10）：watcher
+      的在途 claim 不再比较版本（裸身份相等曾把粗粒度同 tick 改写
+      吞掉）。已有在途 claim 时，后来的候选不发事件，而是在该
+      token 上置 dirty 标记；交付 settle 时若 dirty 则**不写 seen**
+      （文件可能已在途中改写），并复用 debounce recheck 定时器重新
+      检查路径——由唯一的 SameVersionProvable 判定：同版本被刚写的
+      seen 抑制（G 内保守、过 G 收敛），新版本交付给下游哈希确认。
+      无 fsnotify 事件也需要该重查，故对所有模式生效（poll/tail 亦
+      走 scanFile 交付路径）。
       已知边界（产品 2026-11-10 拍板接受，不改代码）：系统时钟被
       step 回拨到某个旧文件时间戳的同一粒度内、在该粒度内同尺寸
       改写、且之后时钟走过旧锚点——预筛无法区分，会判相同（漏采）。

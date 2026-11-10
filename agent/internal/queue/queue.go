@@ -113,8 +113,12 @@ CREATE INDEX IF NOT EXISTS idx_processed_files_rule
 -- lock upgrade (a no-op UPDATE against it forces SQLite to take the write
 -- lock when the transaction starts, instead of deferring it to the INSERT —
 -- closing the SELECT-verdict → INSERT window against concurrent enqueuers).
+-- Rework-7 (suggestion 5): NO seed row — the table stays empty. The lock
+-- upgrade is an UPDATE matching zero rows and needs no data; the old
+-- INSERT OR IGNORE had no UNIQUE constraint to ignore against, so every
+-- Open added one row (the reviewer measured 2 rows after two opens).
+-- An empty table upgrades the lock identically.
 CREATE TABLE IF NOT EXISTS schema_migrations_r6_lock (v INTEGER NOT NULL DEFAULT 0);
-INSERT OR IGNORE INTO schema_migrations_r6_lock (v) VALUES (0);
 `
 
 // schemaMigrations runs DDL statements that add columns to existing tables
