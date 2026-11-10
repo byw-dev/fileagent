@@ -53,10 +53,32 @@ func TestStat_RewriteChangesCtime(t *testing.T) {
 		"a rewrite must change ctime (kernel status-change guarantee)")
 }
 
-// TestStat_RecreateChangesInode — delete + recreate yields a different file
-// identity even when mtime is restored (cp -p), which is exactly the
-// rebuild-detection the IC-BUG-48 prefilter needs.
-func TestStat_RecreateChangesInode(t *testing.T) {
+// TestStat_RecreateNotProvableSame — the REAL invariant the IC-BUG-48
+// prefilter needs after a delete-and-recreate with restored mtime: the
+// recreated file must NOT be provably the same version as the recorded one
+// (queue.SameVersionProvable == false). The design never promised that a
+// specific identity field changes — only that the candidate cannot be
+// PROVEN identical:
+//   - any identity field differs → Changed → hash-confirm;
+//   - all fields equal → the stamps then sort within anchor−2s (they were
+//     read around the recreate) → Undecidable → hash-confirm.
+//
+// Either way the downstream DecideProcessed hash-confirms; content that
+// differs re-collects. Platform facts observed in CI for this exact test
+// (PR #144, run 42791201711):
+//   - Ubuntu/ext4: delete-then-immediately-recreate REUSED the inode
+//     (Ino equal), so an `Ino must change` assertion failed;
+//   - Windows/NTFS: the two stats landed in the same time tick, so
+//     ChangeTime was equal, and a `Ctime must change` assertion failed.
+//
+// Hence this test asserts the verdict, never individual fields.
+//
+// Import note: fileid must not import queue (queue imports fileid), so the
+// table-driven verdict part lives in the queue package
+// (identity_platform_r13_test.go). This file keeps only the real-fs
+// observation: both snapshots must be FULLY KNOWN (every field non-zero),
+// which is what makes the verdict decidable at all.
+func TestStat_RecreateNotProvableSame(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.bin")
 	require.NoError(t, os.WriteFile(path, []byte("same"), 0o644))
@@ -71,10 +93,19 @@ func TestStat_RecreateChangesInode(t *testing.T) {
 	after, err := Stat(path)
 	require.NoError(t, err)
 
-	assert.NotEqual(t, before.Ino, after.Ino,
-		"a delete-and-recreate must change the file identity even with restored mtime")
-	assert.NotEqual(t, before.CtimeNs, after.CtimeNs,
-		"a delete-and-recreate must change ctime even with restored mtime")
+	// Both snapshots fully known — the precondition for any verdict.
+	assert.True(t, identityKnownForTest(before), "before-snapshot must be fully known")
+	assert.True(t, identityKnownForTest(after), "after-snapshot must be fully known")
+
+	// Informational (platform-dependent, asserted in the queue package):
+	t.Logf("recreate with restored mtime: ino %d→%d (ext4 may reuse), ctime %d→%d (NTFS may keep the tick)",
+		before.Ino, after.Ino, before.CtimeNs, after.CtimeNs)
+}
+
+// identityKnownForTest mirrors queue.IdentityFullyKnown without importing
+// queue (fileid must stay a leaf package).
+func identityKnownForTest(id Identity) bool {
+	return id.MtimeNs != 0 && id.CtimeNs != 0 && id.Dev != 0 && id.Ino != 0
 }
 
 // TestStat_MissingFile errors cleanly (error path of the platform wrapper).
