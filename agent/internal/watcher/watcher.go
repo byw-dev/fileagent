@@ -6,6 +6,7 @@ package watcher
 
 import (
 	"context"
+	"fmt"
 	"errors"
 	"os"
 	"path/filepath"
@@ -38,6 +39,38 @@ var newFSWatcher = fsnotify.NewWatcher
 // unknown → treated as changed → delivered (hash confirms; worst case a
 // duplicate hash-confirm, never a miss).
 type versionOf = fileid.Identity
+
+// seenEntry is one delivered-version record in the watcher's seen map
+// (rework-5 blocker 1): the identity AND the snapshot moment it was taken
+// at. The anchor is what makes the racy-window check possible — without it
+// the watcher's equality bypassed the coarse-granularity (FAT 2s / SMB 1s)
+// same-tick rewrite case, where ctime/mtime/dev/ino/size can all come out
+// identical while the content differs. Equality uses the queue's ONE
+// SameVersionProvable predicate: only a provably-same version is suppressed.
+type seenEntry struct {
+	ident    versionOf
+	anchorNs int64 // snapshot moment of ident (Unix ns)
+}
+
+// seenEqual reports whether the candidate identity is provably the same
+// version as the seen entry (queue.SameVersionProvable; racy window and
+// unknown fields included). Anything else → deliver.
+func seenEqual(se seenEntry, cur versionOf) bool {
+	return queue.SameVersionProvable(queue.IdentityFromFileid(se.ident),
+		queue.IdentityFromFileid(cur), se.anchorNs)
+}
+
+// claimToken is an opaque ownership handle for an in-flight delivery
+// (rework-5 fix 4): release matches by token identity, NOT by version
+// equality — version equality can never match for unknown identities
+// (zero fields), which leaked one inflight entry per unknown-identity path.
+// It carries the claimed version's identity + anchor so the seen write can
+// anchor the entry at the claim's snapshot moment.
+type claimToken struct {
+	identKnown bool
+	ident      versionOf
+	anchorNs   int64
+}
 
 // identityEqualVersions reports whether two identities describe the same
 // delivered version. Only FULLY-known identities can ever compare equal;
@@ -159,7 +192,7 @@ type Watcher struct {
 	// "check seen → send → record seen": the debounce flush, the
 	// debounce recheck and the overflow-rescan scan. Guarded by seenMu;
 	// lazily initialized so a Watcher built by struct literal works.
-	inflight map[string]versionOf
+	inflight map[string]*claimToken
 
 	// debounce is the write-quiet (debounce) window every mode except tail
 	// waits before emitting Write/Create events (D-035). Zero means the
@@ -392,7 +425,7 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 	// safety-net rescan does not re-emit unchanged files as "create", and so
 	// files emitted by an IC-BUG-43 debounce recheck are not re-emitted by a
 	// later rescan.
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	w.scheduleDebounceRechecks(ctx, events, seen, w.pollScan(ctx, events, seen))
 
 	w.logger.Info("watcher: fsnotify started", zap.String("path", w.sourcePath))
@@ -433,7 +466,7 @@ func (w *Watcher) addWatchPaths(fw *fsnotify.Watcher) error {
 // Errors on fw.Errors (including watch-queue overflows) are handled by
 // handleWatchError, which triggers the IC-BUG-44 safety-net rescan on
 // overflow so files whose events were lost are recovered by mtime.
-func (w *Watcher) runDebounced(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher, seen map[string]versionOf) error {
+func (w *Watcher) runDebounced(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher, seen map[string]seenEntry) error {
 	return w.loopDebounced(ctx, events, seen, fw.Events, fw.Errors)
 }
 
@@ -474,7 +507,7 @@ type debouncePending struct {
 // channels are parameters so tests can drive the loop deterministically
 // without a live fsnotify backend (whose channel lifecycle would race with
 // test-side injections).
-func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, seen map[string]versionOf, evc <-chan fsnotify.Event, erc <-chan error) error {
+func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, seen map[string]seenEntry, evc <-chan fsnotify.Event, erc <-chan error) error {
 	// The map lives on the Watcher (guarded by seenMu) so tests can observe
 	// recycling; every access below takes seenMu, and the loop goroutine
 	// remains the only writer.
@@ -540,11 +573,13 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 		if serr != nil {
 			return // gone between quiet-check and flush; nothing to collect
 		}
-		if !w.claimDelivery(seen, path, ident) {
+		anchor := time.Now().UnixNano()
+		tok, ok := w.claimDelivery(seen, path, ident, anchor)
+		if !ok {
 			return
 		}
 		delivered := false
-		defer func() { w.completeDelivery(seen, path, ident, delivered) }()
+		defer func() { w.completeDelivery(seen, path, tok, delivered) }()
 		// IC-BUG-47: blocking send — a dropped event here means the file is
 		// never collected (mtime/size never change again). Backpressure
 		// delays the debounce-flush goroutine instead.
@@ -755,7 +790,7 @@ func (w *Watcher) loopDebounced(ctx context.Context, events chan<- FileEvent, se
 // that happens, handleWatchError triggers a safety-net rescan that recovers
 // the files missed during the overflow window. Only macOS kqueue (dev
 // machines, not production) may drop the overflow silently.
-func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher, seen map[string]versionOf) error {
+func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *fsnotify.Watcher, seen map[string]seenEntry) error {
 	return w.loopFsnotify(ctx, events, seen, fw.Events, fw.Errors)
 }
 
@@ -764,7 +799,7 @@ func (w *Watcher) runFsnotify(ctx context.Context, events chan<- FileEvent, fw *
 // error channels are parameters so tests can drive the loop
 // deterministically without a live fsnotify backend (whose channel lifecycle
 // would race with test-side injections).
-func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, seen map[string]versionOf, evc <-chan fsnotify.Event, erc <-chan error) error {
+func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, seen map[string]seenEntry, evc <-chan fsnotify.Event, erc <-chan error) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -839,7 +874,7 @@ func (w *Watcher) loopFsnotify(ctx context.Context, events chan<- FileEvent, see
 // runPolling scans the source directory on every pollInterval tick and emits
 // FileEvents for files that are new or have been modified since the last scan.
 func (w *Watcher) runPolling(ctx context.Context, events chan<- FileEvent) error {
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
 
@@ -863,7 +898,7 @@ func (w *Watcher) runPolling(ctx context.Context, events chan<- FileEvent) error
 // files anyway; on the fsnotify path the caller arms one-shot recheck timers
 // for them so a file whose writer exited during the window is still collected
 // (IC-BUG-43).
-func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen map[string]versionOf) []string {
+func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen map[string]seenEntry) []string {
 	var skipped []string
 	walk := func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -917,7 +952,7 @@ func (w *Watcher) pollScan(ctx context.Context, events chan<- FileEvent, seen ma
 // and the debounce recheck (IC-BUG-43). seen may be touched concurrently by
 // recheck timer goroutines, so every access is guarded by seenMu; the emit
 // itself happens outside the lock (emitBlocking must not hold it).
-func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen map[string]versionOf, path string, info os.FileInfo) error {
+func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen map[string]seenEntry, path string, info os.FileInfo) error {
 	// Rework-2 blocker 1: the version identity comes from fileid.Stat (one
 	// open → StatHandle), so a same-mtime rewrite or a cp -p rebuild has a
 	// DIFFERENT version key (ctime/inode moved) and is delivered downstream
@@ -931,10 +966,20 @@ func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen ma
 		return nil
 	}
 	w.seenMu.Lock()
-	prev, known := seen[path]
+	prevEntry, known := seen[path]
 	w.seenMu.Unlock()
-	if known && identityEqualVersions(prev, ident) {
-		return nil // this exact version was already delivered
+	if known && seenEqual(prevEntry, ident) {
+		return nil // provably the same version (racy window included) — skip
+	}
+	if known {
+		v := queue.PrefilterVerdict(queue.IdentityFromFileid(prevEntry.ident), queue.IdentityFromFileid(ident), prevEntry.anchorNs)
+		fmt.Printf("DBG NOT-skip: pv=%v anchor=%d ctime=%d recSnap=%d curSnap=%d\n",
+			v, prevEntry.anchorNs, ident.CtimeNs, prevEntry.ident.SnapAtNs, ident.SnapAtNs)
+	}
+	{
+		v := queue.PrefilterVerdict(queue.IdentityFromFileid(prevEntry.ident), queue.IdentityFromFileid(ident), prevEntry.anchorNs)
+		fmt.Printf("DBG scanFile NOT-skipped prefilter=%v prev.anchor=%d prev.ident=%+v cur=%+v\n",
+			v, prevEntry.anchorNs, prevEntry.ident, ident)
 	}
 	op := "write"
 	if !known {
@@ -957,8 +1002,10 @@ func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen ma
 	// F3): a rescan, a recheck and the debounce flush all funnel through
 	// here or through flush. completeDelivery runs via defer so a panic or
 	// an early return can never leak the claim.
-	if !w.claimDelivery(seen, path, ident) {
-		return nil // already delivered, or same/newer version in flight
+	anchorNs := ident.SnapAtNs
+	tok, ok := w.claimDelivery(seen, path, ident, anchorNs)
+	if !ok {
+		return nil // provably-same version already delivered or in flight
 	}
 	// Mark as seen and record the tail offset only after the event has
 	// been delivered: if the send is aborted (ctx cancelled) or would
@@ -970,7 +1017,7 @@ func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen ma
 	// every future claim for the same version fail and a file that never
 	// changes again would silently never be collected.
 	delivered := false
-	defer func() { w.completeDelivery(seen, path, ident, delivered) }()
+	defer func() { w.completeDelivery(seen, path, tok, delivered) }()
 	if !w.emitBlocking(ctx, events, fe) {
 		return errWalkAborted
 	}
@@ -981,66 +1028,104 @@ func (w *Watcher) scanFile(ctx context.Context, events chan<- FileEvent, seen ma
 	return nil
 }
 
-// markSeen records the delivered mtime in the shared seen map. seen may be
-// touched concurrently by recheck timer goroutines, so every access is
-// guarded by seenMu. Callers must only call it after the event has actually
-// been delivered: an aborted send must leave the file retryable (PR #100 F1).
-func (w *Watcher) markSeen(seen map[string]versionOf, path string, ident versionOf) {
+// markSeen records the delivered version in the shared seen map (identity +
+// its snapshot anchor). seen may be touched concurrently by recheck timer
+// goroutines, so every access is guarded by seenMu. Callers must only call
+// it after the event has actually been delivered: an aborted send must leave
+// the file retryable (PR #100 F1).
+func (w *Watcher) markSeen(seen map[string]seenEntry, path string, ident versionOf, anchorNs int64) {
 	w.seenMu.Lock()
-	seen[path] = ident
+	seen[path] = seenEntry{ident: ident, anchorNs: anchorNs}
 	w.seenMu.Unlock()
 }
 
-// claimDelivery atomically claims the right to deliver one version (mtime)
-// of path — PR #108 review F3. Several goroutines run the same non-atomic
-// "check seen → send → record seen" sequence for the same file: the
-// debounce flush (timer goroutine), the debounce recheck (timer
-// goroutine) and the overflow-rescan scan (event-loop goroutine). Without
-// arbitration two of them can deliver the same version twice. The claim
-// does the seen check and the placeholder insert in ONE locked section;
-// the send itself must happen OUTSIDE seenMu (emitBlocking can block, and
-// holding the lock across it would stall the whole watcher).
+// claimDelivery atomically claims the right to deliver one version of path —
+// PR #108 review F3. Several goroutines run the same non-atomic "check seen →
+// send → record seen" sequence for the same file: the debounce flush (timer
+// goroutine), the debounce recheck (timer goroutine) and the overflow-rescan
+// scan (event-loop goroutine). Without arbitration two of them can deliver
+// the same version twice. The claim does the seen check and the placeholder
+// insert in ONE locked section; the send itself must happen OUTSIDE seenMu
+// (emitBlocking can block, and holding the lock across it would stall the
+// whole watcher).
 //
-// Returns false — meaning "do not deliver" — when:
-//   - seen already holds this or a newer mtime (already delivered), or
-//   - another goroutine holds the claim for this or a newer mtime (its
-//     owner delivers); an OLDER in-flight version is superseded, because
-//     the file has moved on and the newer version wins.
+// Rework-5 blocker 1: the seen suppression uses the queue's ONE
+// SameVersionProvable predicate — identity equality alone bypassed the racy
+// window, so a coarse-granularity (FAT 2s / SMB 1s) same-tick same-size
+// rewrite with restored mtime was swallowed before any content dedup ran.
+// Only a PROVABLY-same version (all fields known+equal, both stamps before
+// anchor−G, anchor known and not in the future) is suppressed; anything else
+// — including any unknown identity field — is delivered, and the
+// downstream DecideProcessed hash-confirms (identical content never
+// re-uploads).
 //
-// The caller MUST pair the claim with completeDelivery via defer, so panics
-// and early returns can never leave a stuck claim: a leaked claim would
-// make every future claim for the same version fail and a file that never
+// Rework-5 fix 4: the claim returns an opaque TOKEN; ownership release
+// matches by token, not version equality (which never matches for unknown
+// identities — the leak the reviewer reproduced).
+//
+// Returns (nil, false) — meaning "do not deliver" — when:
+//   - seen already holds a provably-same version (already delivered), or
+//   - another goroutine holds an in-flight claim for this path whose
+//     version is provably the same (its owner delivers); a different
+//     in-flight version is superseded — the file has moved on and the
+//     newer claim wins.
+//
+// The caller MUST settle the returned token via completeDelivery (deferred),
+// so panics and early returns can never leave a stuck claim: a leaked claim
+// would make every future claim for this path fail and a file that never
 // changes again would silently never be collected.
-func (w *Watcher) claimDelivery(seen map[string]versionOf, path string, ident versionOf) bool {
+func (w *Watcher) claimDelivery(seen map[string]seenEntry, path string, ident versionOf, anchorNs int64) (*claimToken, bool) {
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()
-	if prev, known := seen[path]; known && identityEqualVersions(prev, ident) {
-		return false // this exact version was already delivered
+	if se, known := seen[path]; known && seenEqual(se, ident) {
+		return nil, false // provably the same version: already delivered
 	}
-	if cur, busy := w.inflight[path]; busy && identityEqualVersions(cur, ident) {
-		return false // same version already in flight; its owner delivers
+	if cur, busy := w.inflight[path]; busy && cur != nil && identityEqualVersions(cur.ident, ident) {
+		// In-flight dedup uses plain identity equality (SnapAtNs excluded):
+		// two stats of the same untouched version produce identical stamps,
+		// so this suppresses same-version double claims deterministically.
+		// The racy window is a SEEN-time judgement (cross-time), not an
+		// in-flight one — concurrent claims of the same version always race
+		// inside one racy window by construction.
+		return nil, false // same version already in flight; its owner delivers
 	}
 	if w.inflight == nil {
-		w.inflight = make(map[string]versionOf)
+		w.inflight = make(map[string]*claimToken)
 	}
-	w.inflight[path] = ident
-	return true
+	tok := &claimToken{identKnown: identityKnown(ident), ident: ident, anchorNs: anchorNs}
+	w.inflight[path] = tok
+	return tok, true
+}
+
+// identityKnown reports whether all kernel fields of the identity are known
+// (no zero ctime/dev/ino). Unknown identities are delivered on every
+// observation (never suppressed) and never written to seen.
+func identityKnown(id versionOf) bool {
+	return queue.IdentityFullyKnown(queue.IdentityFromFileid(id))
 }
 
 // completeDelivery settles a claim made by claimDelivery: it releases the
-// in-flight placeholder — only if it still belongs to this claim, so a
-// superseded claim cannot disturb its replacement — and, when delivered,
-// records the delivered version's identity in seen. delivered=false only
-// rolls the placeholder back; the file stays retryable (PR #100 F1).
+// in-flight placeholder — matching by TOKEN (rework-5 fix 4), so the release
+// works for unknown identities too — and, when delivered, records the
+// delivered version in seen (identity + anchor). delivered=false only rolls
+// the placeholder back; the file stays retryable (PR #100 F1).
 //
-// Seen is identity-keyed (rework-2 blocker 1), so "monotonic" has no
-// ordering: a LATE delivery of an older version must not overwrite the
-// newer version's entry. The guard is liveness, not ordering: seen is only
-// updated when the FILE'S CURRENT identity still equals the delivered
-// ident — if the file has moved on (v2 delivered already, or bytes changed
-// again), ident describes a superseded version and seen keeps the newer
-// entry; the follow-up scan (or the next event) delivers the current
-// version via the normal identity comparison.
+// Seen write rules (rework-5):
+//   - unknown identities are NEVER written to seen: they cannot be proven
+//     the same version later, so writing them would suppress future
+//     deliveries of genuinely-changed content; unknown-identity files are
+//     re-delivered on every observation (rate-limited by the debounce
+//     window) and hash-confirmed downstream.
+//   - known identities are written with the claim's snapshot anchor — the
+//     convergence mechanism shared with the ledger (the anchor advances on
+//     each delivery, letting Same become provable once G has passed).
+//   - the liveness guard (from rework-4) stands: seen is only updated when
+//     the FILE'S CURRENT identity still matches the delivered one — a late
+//     older-version delivery must not overwrite a newer entry.
+//
+// Known limitation (pre-existing on master, not introduced here, recorded in
+// the IC-BUG-48 fix record): entries for deleted paths are never removed;
+// path-set growth is unbounded over the process lifetime.
 //
 // Rollback (delivered=false) happens only when emitBlocking fails, and
 // emitBlocking fails only on ctx cancellation — i.e. on the shutdown path
@@ -1051,20 +1136,28 @@ func (w *Watcher) claimDelivery(seen map[string]versionOf, path string, ident ve
 // initial scan re-discovers the file (scheduling a fresh recheck if it is
 // still hot), and if the rule was cancelled the file has no rule left to
 // belong to. So no file is orphaned by a rolled-back claim.
-func (w *Watcher) completeDelivery(seen map[string]versionOf, path string, ident versionOf, delivered bool) {
+func (w *Watcher) completeDelivery(seen map[string]seenEntry, path string, tok *claimToken, delivered bool) {
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()
-	if delivered {
-		if live, err := fileid.Stat(path); err == nil && identityEqualVersions(live, ident) {
-			seen[path] = ident
-		}
-		// stat failed (file gone): leave seen untouched — the removal event
-		// or the next scan handles it; a stale seen entry for a deleted file
-		// is harmless (a recreated file has a new inode → new identity).
-	}
-	if cur, busy := w.inflight[path]; busy && identityEqualVersions(cur, ident) {
+	if cur, busy := w.inflight[path]; busy && cur == tok {
+		// token match: release our own claim (works for unknown identities)
 		delete(w.inflight, path)
+	} else if busy {
+		// someone else superseded this claim; leave theirs alone
+		return
 	}
+	if !delivered || tok == nil || !tok.identKnown {
+		return
+	}
+	if live, err := fileid.Stat(path); err == nil && identityEqualVersions(live, tok.ident) {
+		seen[path] = seenEntry{ident: tok.ident, anchorNs: tok.anchorNs}
+		fmt.Printf("DBG settle wrote anchor=%d ctime=%d\n", tok.anchorNs, tok.ident.CtimeNs)
+	} else {
+		fmt.Printf("DBG settle skipped: live!=tok (live.mtime=%d tok.mtime=%d)\n", live.MtimeNs, tok.ident.MtimeNs)
+	}
+	// stat failed (file gone): leave seen untouched — the removal event
+	// or the next scan handles it; a stale seen entry for a deleted file
+	// is harmless (a recreated file has a new inode → new identity).
 }
 
 // stopAllRechecks stops and forgets every pending debounce recheck timer.
@@ -1117,7 +1210,7 @@ func stopPendingTimers(pending map[string]*debouncePending) {
 // platforms — fsnotify.ErrEventOverflow (Linux inotify IN_Q_OVERFLOW and the
 // Windows ReadDirectoryChangesW buffer overflow) — so a single errors.Is
 // check covers both. Any other error is only logged.
-func (w *Watcher) handleWatchError(ctx context.Context, events chan<- FileEvent, seen map[string]versionOf, err error) {
+func (w *Watcher) handleWatchError(ctx context.Context, events chan<- FileEvent, seen map[string]seenEntry, err error) {
 	if !errors.Is(err, fsnotify.ErrEventOverflow) {
 		w.logger.Warn("watcher: fsnotify error", zap.Error(err))
 		return
@@ -1149,7 +1242,7 @@ func (w *Watcher) handleWatchError(ctx context.Context, events chan<- FileEvent,
 // files' retry opportunity. It DOES skip files already in seen (initial
 // scan, debounced deliveries, earlier rescan rounds) — see IC-BUG-53 for
 // the watcher-side residual gap that implies.
-func (w *Watcher) safetyNetRescan(ctx context.Context, events chan<- FileEvent, seen map[string]versionOf) {
+func (w *Watcher) safetyNetRescan(ctx context.Context, events chan<- FileEvent, seen map[string]seenEntry) {
 	skipped := w.pollScan(ctx, events, seen)
 	// Test observation for the two debounced branches below (see the field
 	// comments on rescanSkippedHot / rescanRecheckArmed for why no delivery
@@ -1169,7 +1262,7 @@ func (w *Watcher) safetyNetRescan(ctx context.Context, events chan<- FileEvent, 
 // scheduleDebounceRechecks arms one-shot recheck timers for the paths the
 // scan skipped because they were still inside the debounce window
 // (see pollScan).
-func (w *Watcher) scheduleDebounceRechecks(ctx context.Context, events chan<- FileEvent, seen map[string]versionOf, paths []string) {
+func (w *Watcher) scheduleDebounceRechecks(ctx context.Context, events chan<- FileEvent, seen map[string]seenEntry, paths []string) {
 	for _, path := range paths {
 		w.scheduleDebounceRecheck(ctx, events, seen, path)
 	}
@@ -1190,7 +1283,7 @@ const debounceRecheckGrace = 100 * time.Millisecond
 // to exist, the loop still had to be running, and the scheduling gate had
 // to be open. The safety-net rescan uses the return value to observe its
 // re-arm branch (see rescanRecheckArmed).
-func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- FileEvent, seen map[string]versionOf, path string) bool {
+func (w *Watcher) scheduleDebounceRecheck(ctx context.Context, events chan<- FileEvent, seen map[string]seenEntry, path string) bool {
 	info, err := os.Stat(path)
 	if err != nil {
 		return false // gone; nothing to collect
@@ -1253,7 +1346,7 @@ func (w *Watcher) settleRecheck(path string, gen uint64) {
 // re-examines a previously skipped path and emits it if it has gone quiet.
 // A file that is still hot is left alone — its live Write/Create events
 // drive the debounce flush in loopDebounced instead.
-func (w *Watcher) recheckAfterDebounce(ctx context.Context, events chan<- FileEvent, seen map[string]versionOf, path string) {
+func (w *Watcher) recheckAfterDebounce(ctx context.Context, events chan<- FileEvent, seen map[string]seenEntry, path string) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return // gone; nothing to collect
@@ -1428,3 +1521,7 @@ var errWalkAborted = skippedErr("walk aborted")
 type skippedErr string
 
 func (e skippedErr) Error() string { return string(e) }
+
+// racyGranularityNsW is the watcher package's view of the queue's racy
+// granularity (2s), for tests that need to age a seen anchor past G.
+const racyGranularityNsW = int64(2 * 1e9)

@@ -342,6 +342,25 @@ func IdentityFromFileid(id fileid.Identity) FileIdentity {
 	return FileIdentity{MtimeNs: id.MtimeNs, CtimeNs: id.CtimeNs, Dev: id.Dev, Ino: id.Ino, Size: id.Size, SnapAtNs: id.SnapAtNs}
 }
 
+// SameVersionProvable is the ONE "provably the same version" predicate
+// (rework-5): the watcher's seen dedup, the enqueue guard and the ledger
+// prefilter all route through it. It is true iff PrefilterVerdict returns
+// VerdictSame for (rec, cur) against the recorded anchor — i.e. every
+// identity field is known and equal AND both stamps sort strictly before
+// anchor−G (the racy window is clear) AND the anchor is known and not in the
+// future. Any false — unknown field, any difference, racy window, unknown or
+// future anchor — means "not provably the same version" and the caller must
+// deliver/enqueue; the downstream DecideProcessed hash-confirms and never
+// re-uploads identical content.
+//
+// recAnchorNs is the anchor of the ALREADY-RECORDED side (ledger
+// uploaded_at_ns, watcher seen entry's snapshot moment); cur.SnapAtNs is the
+// candidate's own snapshot moment and is ignored by the racy judgement (only
+// the recorded anchor orders the stamps).
+func SameVersionProvable(rec, cur FileIdentity, recAnchorNs int64) bool {
+	return PrefilterVerdict(rec, cur, recAnchorNs) == VerdictSame
+}
+
 // processedRecord is the ledger row relevant to a candidate decision.
 type processedRecord struct {
 	ident        FileIdentity

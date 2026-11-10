@@ -31,7 +31,7 @@ func TestReviewR2PreservedMtimeMiss_Ported(t *testing.T) {
 	// seen as of the initial delivery: v1's identity.
 	id1, err := fileid.Stat(p)
 	require.NoError(t, err)
-	seen := map[string]versionOf{p: id1}
+	seen := map[string]seenEntry{p: {ident: id1, anchorNs: id1.SnapAtNs}}
 
 	// Same-mtime rewrite: content B, mtime restored.
 	require.NoError(t, os.WriteFile(p, []byte("BBBB"), 0o600))
@@ -50,9 +50,9 @@ func TestReviewR2PreservedMtimeMiss_Ported(t *testing.T) {
 	require.Eventually(t, func() bool {
 		w.seenMu.Lock()
 		defer w.seenMu.Unlock()
-		cur, known := seen[p]
+		se, known := seen[p]
 		idNow, err := fileid.Stat(p)
-		return err == nil && known && identityEqualVersions(cur, idNow)
+		return err == nil && known && identityEqualVersions(se.ident, idNow)
 	}, time.Second, 5*time.Millisecond, "delivered version must settle into seen")
 }
 
@@ -69,7 +69,7 @@ func TestReviewR2_PollScan_DeliversPreservedMtimeRewrite(t *testing.T) {
 	w, err := New(dir, "*.csv", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -114,7 +114,7 @@ func TestReviewR2_DebounceFlushClaim_DeliversPreservedMtimeRewrite(t *testing.T)
 	w, err := New(dir, "*.csv", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -131,9 +131,10 @@ func TestReviewR2_DebounceFlushClaim_DeliversPreservedMtimeRewrite(t *testing.T)
 	// Round 2 via the debounced flush claim — must NOT be suppressed.
 	id2, err := fileid.Stat(path)
 	require.NoError(t, err)
-	require.True(t, w.claimDelivery(seen, path, id2),
+	tok, ok := w.claimDelivery(seen, path, id2, id2.SnapAtNs)
+	require.True(t, ok,
 		"the flush claim was suppressed for a preserved-mtime rewrite (fail-open at the claim layer)")
-	w.completeDelivery(seen, path, id2, true)
+	w.completeDelivery(seen, path, tok, true)
 }
 
 // TestReviewR2_EndToEnd_WatcherToDecide_NoRestart — the END-TO-END blocker 1
@@ -151,7 +152,7 @@ func TestReviewR2_EndToEnd_WatcherToDecide_NoRestart(t *testing.T) {
 	w, err := New(dir, "*.csv", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

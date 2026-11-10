@@ -76,7 +76,7 @@ func TestWatcher_PollingDetectsModifiedFile(t *testing.T) {
 	defer cancel()
 
 	// Initial scan consumes the "create" event.
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	w.pollScan(ctx, events, seen)
 	<-events // consume initial create
 
@@ -112,7 +112,7 @@ func TestWatcher_GlobFiltering(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	w.pollScan(ctx, events, seen)
 
 	// Only file.txt should appear.
@@ -137,7 +137,7 @@ func TestWatcher_RecursiveMode(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	w.pollScan(ctx, events, seen)
 
 	require.Len(t, events, 1)
@@ -589,7 +589,7 @@ func TestWatcher_InitialScan_BacklogBeyondBufferNoneDropped(t *testing.T) {
 	scanDone := make(chan struct{})
 	go func() {
 		defer close(scanDone)
-		w.pollScan(ctx, events, make(map[string]versionOf))
+		w.pollScan(ctx, events, make(map[string]seenEntry))
 		cancel()
 	}()
 
@@ -640,7 +640,7 @@ func TestWatcher_CloseWait_InitialScan_SkipsStillWriting(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	w.pollScan(ctx, events, make(map[string]versionOf))
+	w.pollScan(ctx, events, make(map[string]seenEntry))
 
 	select {
 	case fe := <-events:
@@ -671,7 +671,7 @@ func TestWatcher_OverwriteInitialScan_FutureMTimeIsSettled(t *testing.T) {
 	require.NoError(t, err)
 	events := make(chan FileEvent, 1)
 
-	skipped := w.pollScan(context.Background(), events, make(map[string]versionOf))
+	skipped := w.pollScan(context.Background(), events, make(map[string]seenEntry))
 	require.Empty(t, skipped, "future mtime must not be classified as an actively written file")
 	select {
 	case fe := <-events:
@@ -711,7 +711,7 @@ func TestWatcher_TailMode_SeededOffsets_SurviveRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	w.pollScan(ctx, events, make(map[string]versionOf))
+	w.pollScan(ctx, events, make(map[string]seenEntry))
 
 	select {
 	case fe := <-events:
@@ -814,7 +814,7 @@ func TestRunDebounced_ContextCancel_ReturnsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	err = w.runDebounced(ctx, events, fw, make(map[string]versionOf))
+	err = w.runDebounced(ctx, events, fw, make(map[string]seenEntry))
 	require.Error(t, err)
 }
 
@@ -839,7 +839,7 @@ func TestRunDebounced_RemoveEvent_EmittedImmediately(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	go func() { _ = w.runDebounced(ctx, events, fw, make(map[string]versionOf)) }()
+	go func() { _ = w.runDebounced(ctx, events, fw, make(map[string]seenEntry)) }()
 
 	// Trigger Remove event.
 	require.NoError(t, os.Remove(path))
@@ -872,7 +872,7 @@ func TestRunDebounced_WriteEvent_DebounceEmits(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	go func() { _ = w.runDebounced(ctx, events, fw, make(map[string]versionOf)) }()
+	go func() { _ = w.runDebounced(ctx, events, fw, make(map[string]seenEntry)) }()
 
 	// Trigger a Create/Write event.
 	require.NoError(t, os.WriteFile(path, []byte("hello"), 0o644))
@@ -905,7 +905,7 @@ func TestRunDebounced_NonMatchingGlob_Ignored(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	go func() { _ = w.runDebounced(ctx, events, fw, make(map[string]versionOf)) }()
+	go func() { _ = w.runDebounced(ctx, events, fw, make(map[string]seenEntry)) }()
 
 	// Create a .log file (doesn't match *.txt)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "test.log"), []byte("x"), 0o644))
@@ -928,7 +928,7 @@ func TestRunFsnotify_EventsChannelClosed_ReturnsNil(t *testing.T) {
 	ctx := context.Background()
 
 	done := make(chan error, 1)
-	go func() { done <- w.runFsnotify(ctx, events, fw, make(map[string]versionOf)) }()
+	go func() { done <- w.runFsnotify(ctx, events, fw, make(map[string]seenEntry)) }()
 
 	// Closing the watcher will close the fw.Events channel.
 	fw.Close()
@@ -961,7 +961,7 @@ func TestRunFsnotify_RemoveEvent_Emitted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	go func() { _ = w.runFsnotify(ctx, events, fw, make(map[string]versionOf)) }()
+	go func() { _ = w.runFsnotify(ctx, events, fw, make(map[string]seenEntry)) }()
 	require.NoError(t, os.Remove(path))
 
 	select {
@@ -990,7 +990,7 @@ func TestHandleWatchError_Overflow_TriggersRescan(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	w.handleWatchError(ctx, events, make(map[string]versionOf), fsnotify.ErrEventOverflow)
+	w.handleWatchError(ctx, events, make(map[string]seenEntry), fsnotify.ErrEventOverflow)
 
 	select {
 	case fe := <-events:
@@ -1014,7 +1014,7 @@ func TestHandleWatchError_PlainError_DoesNotRescan(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	w.handleWatchError(ctx, events, make(map[string]versionOf), errors.New("fsnotify: bogus failure"))
+	w.handleWatchError(ctx, events, make(map[string]seenEntry), errors.New("fsnotify: bogus failure"))
 
 	select {
 	case fe := <-events:
@@ -1039,10 +1039,12 @@ func TestHandleWatchError_RescanReEmitsChangedFileAsWrite(t *testing.T) {
 	require.NoError(t, err)
 
 	// seen as of the initial scan: the file was already collected at v1.
-	// (versionOf identity — v1's, from a path stat at the time.)
+	// The anchor is backdated well past G (simulating wall time having
+	// passed since the delivery) so the rescan's Same-check is decisive —
+	// inside G the racy window correctly re-delivers.
 	idStale, ierr := fileid.Stat(path)
 	require.NoError(t, ierr)
-	seen := map[string]versionOf{path: idStale}
+	seen := map[string]seenEntry{path: {ident: idStale, anchorNs: idStale.SnapAtNs - racyGranularityNsW}}
 
 	// The file changed after the initial scan; its events were lost to the
 	// overflow window.
@@ -1080,9 +1082,16 @@ func TestHandleWatchError_RescanSkipsUnchangedFiles(t *testing.T) {
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
 
+	// Real flow: the file is created (ctime = now), and the FIRST delivery
+	// happens on a later pass — at least one racy granularity later. The
+	// anchor (= delivery moment) is then >2s after the ctime, which is what
+	// makes the seen entry able to suppress unchanged files on rescan.
+	// (Inside the racy window — anchor−G ≤ ctime — the rescan WOULD
+	// re-deliver; that's the conservative side, not this test's state.)
+	time.Sleep(2100 * time.Millisecond)
 	idCur, ierr := fileid.Stat(path)
 	require.NoError(t, ierr)
-	seen := map[string]versionOf{path: idCur}
+	seen := map[string]seenEntry{path: {ident: idCur, anchorNs: idCur.SnapAtNs}}
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1120,7 +1129,7 @@ func TestRunFsnotify_OverflowError_TriggersRescan(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	go func() { _ = w.loopFsnotify(ctx, events, make(map[string]versionOf), evc, erc) }()
+	go func() { _ = w.loopFsnotify(ctx, events, make(map[string]seenEntry), evc, erc) }()
 
 	select {
 	case fe := <-events:
@@ -1147,7 +1156,7 @@ func TestRunFsnotify_PlainError_DoesNotRescan(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	go func() { _ = w.loopFsnotify(ctx, events, make(map[string]versionOf), evc, erc) }()
+	go func() { _ = w.loopFsnotify(ctx, events, make(map[string]seenEntry), evc, erc) }()
 
 	select {
 	case fe := <-events:
@@ -1176,7 +1185,7 @@ func TestRunDebounced_OverflowError_TriggersRescan(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	go func() { _ = w.loopDebounced(ctx, events, make(map[string]versionOf), evc, erc) }()
+	go func() { _ = w.loopDebounced(ctx, events, make(map[string]seenEntry), evc, erc) }()
 
 	select {
 	case fe := <-events:
@@ -1201,7 +1210,7 @@ func TestRecheckAfterDebounce_QuietFile_EmittedOnce(t *testing.T) {
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1216,10 +1225,26 @@ func TestRecheckAfterDebounce_QuietFile_EmittedOnce(t *testing.T) {
 		t.Fatal("quiet file was not emitted by the debounce recheck")
 	}
 
+	// Rework-5: the second recheck (still inside the racy window of the
+	// first delivery's anchor — stamps ≈ anchor) is conservatively
+	// RE-DELIVERED, and its completion advances the seen anchor to now —
+	// the convergence mechanism shared with the ledger. A third recheck
+	// after wall time passes G then sees stamps < anchor2−G → provably
+	// same → suppressed.
+	time.Sleep(2100 * time.Millisecond)
 	w.recheckAfterDebounce(ctx, events, seen, path)
 	select {
 	case fe := <-events:
-		t.Fatalf("quiet file was re-emitted by a second recheck: %s", fe.Path)
+		assert.Equal(t, path, fe.Path)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("second recheck did not re-deliver inside the racy window (anchor should still be racy)")
+	}
+
+	time.Sleep(2100 * time.Millisecond)
+	w.recheckAfterDebounce(ctx, events, seen, path)
+	select {
+	case fe := <-events:
+		t.Fatalf("third recheck re-delivered a converged file: %s", fe.Path)
 	case <-time.After(200 * time.Millisecond):
 	}
 }
@@ -1234,7 +1259,7 @@ func TestRecheckAfterDebounce_StillWriting_NotEmitted(t *testing.T) {
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1343,7 +1368,7 @@ func TestOverflowRescan_CloseWaitHotFile_CollectedAfterDebounce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	w.handleWatchError(ctx, events, make(map[string]versionOf), fsnotify.ErrEventOverflow)
+	w.handleWatchError(ctx, events, make(map[string]seenEntry), fsnotify.ErrEventOverflow)
 
 	select {
 	case fe := <-events:
@@ -1369,7 +1394,7 @@ func TestScheduleDebounceRecheck_FutureMTimeDeliveredPromptly(t *testing.T) {
 	defer w.stopAllRechecks()
 
 	events := make(chan FileEvent, 1)
-	w.scheduleDebounceRecheck(context.Background(), events, make(map[string]versionOf), path)
+	w.scheduleDebounceRecheck(context.Background(), events, make(map[string]seenEntry), path)
 	select {
 	case fe := <-events:
 		require.Equal(t, path, fe.Path)
@@ -1395,7 +1420,7 @@ func TestScheduleDebounceRecheck_FutureMTimeUsesGraceOnly(t *testing.T) {
 	defer w.stopAllRechecks()
 
 	events := make(chan FileEvent, 1)
-	w.scheduleDebounceRecheck(context.Background(), events, make(map[string]versionOf), path)
+	w.scheduleDebounceRecheck(context.Background(), events, make(map[string]seenEntry), path)
 	select {
 	case fe := <-events:
 		require.Equal(t, path, fe.Path)
@@ -1415,7 +1440,7 @@ func TestScheduleDebounceRecheck_AfterStopRejected(t *testing.T) {
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
 	w.stopAllRechecks()
-	w.scheduleDebounceRecheck(context.Background(), make(chan FileEvent, 1), make(map[string]versionOf), path)
+	w.scheduleDebounceRecheck(context.Background(), make(chan FileEvent, 1), make(map[string]seenEntry), path)
 
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()
@@ -1436,7 +1461,7 @@ func TestScheduleDebounceRecheck_PreviousLifecycleContextRejectedAfterReuse(t *t
 	cancelOld()
 	w.stopAllRechecks()
 	w.startRechecks() // simulate the next sequential Start
-	w.scheduleDebounceRecheck(oldCtx, make(chan FileEvent, 1), make(map[string]versionOf), path)
+	w.scheduleDebounceRecheck(oldCtx, make(chan FileEvent, 1), make(map[string]seenEntry), path)
 
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()
@@ -1453,7 +1478,7 @@ func TestDebounceFlush_PreventsRescanReemit(t *testing.T) {
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1473,13 +1498,25 @@ func TestDebounceFlush_PreventsRescanReemit(t *testing.T) {
 		t.Fatal("debounce flush never emitted the file")
 	}
 
-	// An overflow arrives afterwards: the rescan sees the file already in
-	// seen (marked by the flush) and must not re-emit it.
+	// Rework-5 convergence: the flush anchored seen at T0 with the file's
+	// stamps ≈ T0 — immediately racy. Convergence: after wall time passes G
+	// (sleep), the rescan re-delivers ONCE (conservative, stamps ≥ anchor−G)
+	// and its completion advances the anchor past ctime+G — so an immediate
+	// second rescan finds the stamps before anchor2−G → provably same →
+	// skipped without reading.
+	time.Sleep(2100 * time.Millisecond)
 	go func() { erc <- fsnotify.ErrEventOverflow }()
-
 	select {
 	case fe := <-events:
-		t.Fatalf("safety-net rescan re-emitted a file the debounce flush already delivered: %s (op=%s)", fe.Path, fe.Op)
+		assert.Equal(t, path, fe.Path, "first rescan (inside racy window) re-delivers")
+	case <-time.After(time.Second):
+		t.Fatal("first rescan did not re-deliver inside the racy window")
+	}
+
+	go func() { erc <- fsnotify.ErrEventOverflow }()
+	select {
+	case fe := <-events:
+		t.Fatalf("second rescan re-emitted a converged file: %s (op=%s)", fe.Path, fe.Op)
 	case <-time.After(600 * time.Millisecond):
 	}
 }
@@ -1501,7 +1538,7 @@ func TestLoopFsnotify_RemoveEvent_DoesNotMarkSeen(t *testing.T) {
 	w, err := New(dir, "*.txt", false, time.Hour, AppendModeTail, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1584,7 +1621,7 @@ func TestLoopDebounced_ChannelClose_StopsPendingDebounceTimers(t *testing.T) {
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent, 8)
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1632,7 +1669,7 @@ func TestDebounce_RecheckAndFlush_SameVersionDeliveredOnce(t *testing.T) {
 	require.NoError(t, err)
 	w.debounce = 30 * time.Millisecond // short debounce: no wall-clock window to miss
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent) // unbuffered: deliveries park the senders
@@ -1714,7 +1751,7 @@ func TestScanFile_ClaimReleasedOnAbortedDelivery(t *testing.T) {
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	// Unbuffered with no reader: `events <- fe` can never proceed, so
 	// emitBlocking deterministically fails on the cancelled ctx instead of
 	// racing between the ready ctx.Done and a buffered send slot.
@@ -1755,7 +1792,7 @@ func TestFlushDelivery_SettlesClaimAndMarksSeen(t *testing.T) {
 	// not depend on a wall-clock window surviving CPU contention.
 	w.debounce = 30 * time.Millisecond
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent, 8)
@@ -1782,7 +1819,7 @@ func TestFlushDelivery_SettlesClaimAndMarksSeen(t *testing.T) {
 	require.Eventually(t, func() bool {
 		w.seenMu.Lock()
 		defer w.seenMu.Unlock()
-		mt, known := seen[path]
+		se, known := seen[path]
 		if len(w.inflight) != 0 || !known {
 			return false
 		}
@@ -1790,7 +1827,7 @@ func TestFlushDelivery_SettlesClaimAndMarksSeen(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		return identityEqualVersions(mt, idNow)
+		return identityEqualVersions(se.ident, idNow)
 	}, 1*time.Second, 5*time.Millisecond,
 		"successful flush delivery must settle its claim and record seen")
 }
@@ -1808,7 +1845,7 @@ func TestFlushDelivery_ClaimReleasedOnAbortedDelivery(t *testing.T) {
 	require.NoError(t, err)
 	w.debounce = 30 * time.Millisecond // short debounce: no wall-clock window to miss
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent) // unbuffered, never read: emit parks
@@ -1847,7 +1884,7 @@ func TestSeen_MonotonicWrite_OldVersionLateCompletion(t *testing.T) {
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1865,7 +1902,7 @@ func TestSeen_MonotonicWrite_OldVersionLateCompletion(t *testing.T) {
 		w.seenMu.Lock()
 		defer w.seenMu.Unlock()
 		cur, busy := w.inflight[path]
-		return busy && identityEqualVersions(cur, id1)
+		return busy && cur != nil && identityEqualVersions(cur.ident, id1)
 	}, 2*time.Second, 5*time.Millisecond, "v1 should hold the claim while parked")
 
 	// The file moves on; the newer version delivers and settles FIRST.
@@ -1875,12 +1912,12 @@ func TestSeen_MonotonicWrite_OldVersionLateCompletion(t *testing.T) {
 	require.NoError(t, w.scanFile(ctx, eventsNew, seen, path, info2))
 
 	w.seenMu.Lock()
-	mt, known := seen[path]
+	se, known := seen[path]
 	w.seenMu.Unlock()
 	require.True(t, known)
 	id2, ierr := fileid.Stat(path)
 	require.NoError(t, ierr)
-	require.True(t, identityEqualVersions(mt, id2), "seen must carry the newer version")
+	require.True(t, identityEqualVersions(se.ident, id2), "seen must carry the newer version")
 
 	// Drain v1's parked emit; its late completion must not regress seen.
 	select {
@@ -1897,18 +1934,45 @@ func TestSeen_MonotonicWrite_OldVersionLateCompletion(t *testing.T) {
 	w.seenMu.Lock()
 	late, _ := seen[path]
 	w.seenMu.Unlock()
-	assert.True(t, identityEqualVersions(late, id2),
+	assert.True(t, known && identityEqualVersions(late.ident, id2),
 		"a late older-version completion must not move seen backwards")
 
-	// A follow-up scan must not re-emit the current version.
-	select {
-	case fe := <-eventsNew: // drain v2's earlier delivery first
-		_ = fe
-	default:
-	}
+	// Convergence (rework-5, three scans): the seen anchor only moves on
+	// delivery. So: poll (inside v2's racy window) re-delivers v2' (same
+	// content) and RefreshAndSkip in the ledger — that poll's completion
+	// advances the seen anchor past v2's ctime+G — and the NEXT poll then
+	// finds v2 provably-same → suppressed (no hash read, no upload).
+	time.Sleep(2100 * time.Millisecond)
 	w.pollScan(ctx, eventsNew, seen)
+	w.seenMu.Lock()
+	dbgA := seen[path]
+	w.seenMu.Unlock()
+	now := time.Now().UnixNano()
+	t.Logf("dbg: after poll1 anchor=%d ctime=%d anchor-vs-ctime=%dns anchor-vs-now=%dns now=%d",
+		dbgA.anchorNs, dbgA.ident.CtimeNs, dbgA.anchorNs-dbgA.ident.CtimeNs, dbgA.anchorNs-now, now)
+	for {
+		select {
+		case fe := <-eventsNew:
+			t.Logf("poll1 delivered op=%s (drained)", fe.Op)
+			continue
+		default:
+		}
+		break
+	}
+
+	time.Sleep(2100 * time.Millisecond) // wall time past G since the re-delivery's anchor
+	w.seenMu.Lock()
+	dbgB := seen[path]
+	w.seenMu.Unlock()
+	t.Logf("dbg: before poll2 anchor=%d ctime=%d", dbgB.anchorNs, dbgB.ident.CtimeNs)
+	w.pollScan(ctx, eventsNew, seen)
+	t.Logf("dbg: after poll2 buffered events=%d", len(eventsNew))
 	select {
 	case fe := <-eventsNew:
+		idNow, serr := fileid.Stat(fe.Path)
+		if serr == nil {
+			t.Logf("dbg: delivered file current ctime=%d mtime=%d", idNow.CtimeNs, idNow.MtimeNs)
+		}
 		t.Fatalf("follow-up scan re-emitted the current version: %s (op=%s)", fe.Path, fe.Op)
 	default:
 	}
@@ -1931,7 +1995,7 @@ func TestRecheckTimer_ReplaceKeepsNewTimerTracked(t *testing.T) {
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeCloseWait, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1988,7 +2052,7 @@ func TestDebounced_Overwrite_InitialScanSkipsHotFile_RecheckCollects(t *testing.
 	require.NoError(t, err)
 	w.debounce = 30 * time.Millisecond
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2085,7 +2149,7 @@ func TestDebounced_Recheck_DoesNotDeliverStillHotFile(t *testing.T) {
 	defer func() { close(stop); <-done }()
 	time.Sleep(20 * time.Millisecond) // let the writer make the file hot
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	events := make(chan FileEvent, 8)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -2118,7 +2182,7 @@ func TestDebounced_Overwrite_WriteBurst_FoldsIntoSingleDelivery(t *testing.T) {
 	require.NoError(t, err)
 	w.debounce = 30 * time.Millisecond
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent, 64)
@@ -2172,7 +2236,7 @@ func TestTailMode_NotDebounced(t *testing.T) {
 		w.debounce = time.Hour // even an absurd window must not matter in tail mode
 
 		events := make(chan FileEvent, 8)
-		skipped := w.pollScan(context.Background(), events, make(map[string]versionOf))
+		skipped := w.pollScan(context.Background(), events, make(map[string]seenEntry))
 		assert.Empty(t, skipped, "tail mode must not skip hot files")
 		require.Len(t, events, 1, "tail mode must deliver the hot file immediately")
 		assert.Equal(t, path, (<-events).Path)
@@ -2227,7 +2291,7 @@ func TestDebounced_CloseWaitAndOverwrite_EquivalentDelivery(t *testing.T) {
 		require.NoError(t, err)
 		w.debounce = 30 * time.Millisecond
 
-		seen := make(map[string]versionOf)
+		seen := make(map[string]seenEntry)
 		evc := make(chan fsnotify.Event)
 		erc := make(chan error)
 		events := make(chan FileEvent, 8)
@@ -2291,7 +2355,7 @@ func TestDebounced_PendingRecycledAfterFlush(t *testing.T) {
 	// w.debounce).
 	w.pendingSweepEvery = 8
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent, 512)
@@ -2385,7 +2449,7 @@ func TestDebounced_PendingSweep_MultiRound_ResidueConstant(t *testing.T) {
 	w.debounce = 100 * time.Millisecond
 	w.pendingSweepEvery = burst
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent, 256)
@@ -2498,7 +2562,7 @@ func TestDebounced_FlushRechecksQuietnessAndLaterDeliversCompleteVersion(t *test
 		}
 	}
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent, 2)
@@ -2585,7 +2649,7 @@ func TestDebounced_FlushFutureMTimeDeliveredByCurrentCallback(t *testing.T) {
 	events := make(chan FileEvent, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = w.loopDebounced(ctx, events, make(map[string]versionOf), evc, erc) }()
+	go func() { _ = w.loopDebounced(ctx, events, make(map[string]seenEntry), evc, erc) }()
 
 	evc <- fsnotify.Event{Name: path, Op: fsnotify.Create}
 	select {
@@ -2616,7 +2680,7 @@ func TestDebounced_PendingRearmed_SurvivesSweep(t *testing.T) {
 	w.debounce = 30 * time.Millisecond
 	w.pendingSweepEvery = 4
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent, 8)
@@ -2703,7 +2767,7 @@ func TestDebounced_RearmWhileFlushBlocked_SweepKeepsEntry(t *testing.T) {
 	w.pendingSweepEvery = 4
 	defer w.stopAllRechecks()
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent) // unbuffered: park the first flush in emitBlocking
@@ -2805,7 +2869,7 @@ func TestDebounced_RearmDuringBlockedFlush_AbandonsStaleDelivery(t *testing.T) {
 	w.debounce = 100 * time.Millisecond
 	defer w.stopAllRechecks()
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent) // unbuffered: parks gen-1 inside emitBlocking
@@ -2888,7 +2952,7 @@ func TestDebounced_AbandonedDelivery_StillDeliversCompleteVersion(t *testing.T) 
 		}
 	}
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent) // unbuffered: parks gen-1 inside emitBlocking
@@ -3045,7 +3109,7 @@ func TestDebounced_RearmBeforeCallbackLock_SweepKeepsEntry(t *testing.T) {
 	w.debounce = 100 * time.Millisecond
 	w.pendingSweepEvery = 3
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent, 1)
@@ -3117,7 +3181,7 @@ func TestDebounced_RemoveWithinWindow_CancelsDelivery(t *testing.T) {
 	require.NoError(t, err)
 	w.debounce = 30 * time.Millisecond
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error)
 	events := make(chan FileEvent, 8)
@@ -3166,7 +3230,7 @@ func TestLoopFsnotify_RescanRetriesRealTimeDeliveredFiles(t *testing.T) {
 	w, err := New(dir, "*.txt", false, time.Hour, AppendModeTail, zap.NewNop())
 	require.NoError(t, err)
 
-	seen := make(map[string]versionOf)
+	seen := make(map[string]seenEntry)
 	evc := make(chan fsnotify.Event)
 	erc := make(chan error, 1)
 	events := make(chan FileEvent, 8)
