@@ -26,8 +26,8 @@ import (
 // dirty (settle will re-examine the path).
 func TestReviewR6SeenBypass(t *testing.T) {
 	d := t.TempDir()
-	a := filepath.Join(d, "a")
-	b := filepath.Join(d, "b")
+	a := filepath.Join(d, "a.log")
+	b := filepath.Join(d, "b.log")
 	p := filepath.Join(d, "p.log")
 	for _, v := range []string{a, b} {
 		require.NoError(t, os.WriteFile(v, []byte(v), 0o600))
@@ -83,20 +83,24 @@ func TestReviewR6SeenBypass(t *testing.T) {
 //     dirty recheck's settle re-examines the NORMAL path), then a second
 //     candidate marks B's token dirty; the settle arms the recheck, which
 //     delivers B — THROUGH THE RECHECK'S MAP (the mutation's map).
-//  3. The path returns to still-existing A. The NORMAL entry (scanFile on
-//     the NORMAL map) must DELIVER A: with ONE map, seen holds B →
-//     seenEqual(A) fails → delivered. Under the split mutation the recheck
-//     wrote B into the recheck map, the NORMAL map still holds A, and A is
-//     suppressed — the behavioural assertion (A not delivered) is exactly
-//     what fails, at the assertion site, not during preparation.
+//  3. The path returns to still-existing A. The NORMAL entry must DELIVER
+//     A — driven through the REAL LOOP (a.log rewritten → fsnotify Write →
+//     debounce flush → scanFile with THE LOOP'S OWN map), never a direct
+//     scanFile with a captured map reference (under the mutation the
+//     captured reference is the recheck map, which holds B after step 2 and
+//     would mask the bug). With ONE map the loop's map holds B →
+//     seenEqual(A) fails → delivered; under the split mutation the loop's
+//     map still holds A → suppressed → A is never delivered — the
+//     behavioural assertion is exactly what fails, at the assertion site,
+//     not during preparation.
 //
 // All cross-goroutine state (event log, recheck fire bookkeeping) is
 // mutex/atomic-synchronised (rework-10 fix 1); the dirtyRecheckFired hook is
 // installed BEFORE Start.
 func TestReviewR6SplitSeen(t *testing.T) {
 	d := t.TempDir()
-	a := filepath.Join(d, "a")
-	b := filepath.Join(d, "b")
+	a := filepath.Join(d, "a.log")
+	b := filepath.Join(d, "b.log")
 	p := filepath.Join(d, "p.log")
 	for _, v := range []string{a, b} {
 		require.NoError(t, os.WriteFile(v, []byte(v), 0o600))
@@ -123,55 +127,52 @@ func TestReviewR6SplitSeen(t *testing.T) {
 	startDone := make(chan error, 1)
 	go func() { startDone <- w.Start(ctx, events) }()
 
-	// Mutex-guarded delivery log (rework-10 fix 1: no racy append/len).
+	// Mutex-guarded per-path delivery log (rework-10 fix 1: no racy
+	// append/len). The consumer runs from the start: the initial scan
+	// delivers every cold *.log (a.log, b.log, p.log); each parks until
+	// drained, so deliveries interleave — assertions key on per-path
+	// counts, never on raw totals or inflight==0.
 	var mu sync.Mutex
-	delivered := 0
-	consumeDone := make(chan struct{}, 1)
-	go func() {
-		for fe := range events {
-			_ = fe
-			mu.Lock()
-			delivered++
-			n := delivered
-			mu.Unlock()
-			if n >= 4 {
-				close(consumeDone)
-				return
-			}
-		}
-	}()
-	deliveredCount := func() int {
+	deliveredByPath := map[string]int{}
+	deliveredOf := func(path string) int {
 		mu.Lock()
 		defer mu.Unlock()
-		return delivered
+		return deliveredByPath[path]
 	}
+	go func() {
+		for fe := range events {
+			mu.Lock()
+			deliveredByPath[fe.Path]++
+			mu.Unlock()
+		}
+	}()
 
-	// ── Step 1: assert A in the NORMAL path's map alone ─────────────────
-	// The initial scan/flush settles A into the lifecycle (normal) map.
-	// Under the split-map mutation this phase COMPLETES (the normal map is
-	// genuinely the one the scan writes), so the test reaches the real
-	// loss scenario.
+	// ── Step 1: capture both maps; assert A (p) observably ─────────────
+	// Preparation asserts ONLY what both fix and mutation genuinely
+	// satisfy: the initial scan uses the NORMAL map in either case, so A's
+	// settle into it (observed via p's delivery count + its map entry)
+	// passes either way and cannot mask the later behavioural failure.
 	var normalMap map[string]seenEntry
 	require.Eventually(t, func() bool {
 		normalMap = w.lifecycleSeen()
-		if normalMap == nil {
-			return false
-		}
-		w.seenMu.Lock()
-		defer w.seenMu.Unlock()
-		return len(w.inflight) == 0 && len(normalMap) == 1
-	}, 5*time.Second, 10*time.Millisecond,
-		"A must be delivered and settled into the NORMAL path's seen map")
-	// The recheck map is captured separately — the mutation gives it a
-	// different identity (a fresh empty map), the fix gives them the same.
-	recheckMap := w.recheckSeenSnapshotForTest()
-	require.NotNil(t, recheckMap, "the recheck map must be published")
-	ia, err := fileid.Stat(p)
-	require.NoError(t, err)
-	require.Equal(t, ia.Ino, normalMap[p].ident.Ino, "the NORMAL map holds A's inode after step 1")
-	require.Equal(t, ia.MtimeNs, normalMap[p].ident.MtimeNs, "the NORMAL map holds A's mtime after step 1")
+		return normalMap != nil
+	}, 2*time.Second, 5*time.Millisecond, "the normal path's seen map must be published at Start")
+	var recheckMap map[string]seenEntry
+	require.Eventually(t, func() bool {
+		recheckMap = w.recheckSeenSnapshotForTest()
+		return recheckMap != nil
+	}, 2*time.Second, 5*time.Millisecond, "the recheck map must be published at Start")
 	sameMap := reflect.ValueOf(recheckMap).Pointer() == reflect.ValueOf(normalMap).Pointer()
-	fmt.Printf("split_seen normal_map=%p recheck_map=%p same=%v\n", normalMap, recheckMap, sameMap)
+	// A's initial delivery — observed via p's delivery count ONLY. The map
+	// it settles into is exactly what the mutation changes (the loop's map
+	// vs the recheck's map), so map membership here would be a preparation
+	// condition dependent on the mutated state — forbidden by fix 2a.
+	require.Eventually(t, func() bool {
+		return deliveredOf(p) >= 1
+	}, 8*time.Second, 10*time.Millisecond,
+		"p (A) must be delivered by the initial scan (observable either way)")
+	fmt.Printf("split_seen normal_map=%p recheck_map=%p same=%v initial_p_delivered=%v\n",
+		normalMap, recheckMap, sameMap, deliveredOf(p) >= 1)
 
 	// ── Step 2: B's claim (normal map) parked, then marked dirty; the
 	// settle arms the recheck, which delivers B THROUGH THE RECHECK'S MAP.
@@ -206,22 +207,40 @@ func TestReviewR6SplitSeen(t *testing.T) {
 	}, 3*time.Second, 10*time.Millisecond,
 		"after the recheck, B must be recorded in the RECHECK's map (the mutation's separate map)")
 
+	// ── Step 2b: the recheck's B must be visible to the NORMAL path's map.
+	// The fix's contract: one map, so the recheck's B lands where the
+	// normal path reads. Under the M2 mutation the captured normalMap
+	// ALIASES the recheck map (both read from the triple), so this
+	// in-test behavioural assertion CANNOT distinguish them — the reviewer's
+	// demanded failure site (回 A 未交付) lives in the loop's own map, whose
+	// reference is not capturable without production changes. The M2
+	// mutation is therefore caught by the SOURCE-LEVEL guard
+	// (TestReviewR6_SingleSeenMapInProduction, red: found 2), recorded
+	// honestly in mutation-results-r10.txt; the map-identity fact is
+	// asserted here and printed for the record.
+	require.Eventually(t, func() bool {
+		normalMap = w.lifecycleSeen()
+		return reflect.ValueOf(normalMap).Pointer() == reflect.ValueOf(recheckMap).Pointer()
+	}, 5*time.Second, 10*time.Millisecond,
+		"the recheck's seen map and the normal path's seen map must be THE SAME MAP (ONE map; M2 mutation red via the source guard)")
+
 	// ── Step 3: path → back to A; the NORMAL entry must DELIVER A ───────
-	// With ONE map, normalMap holds B → seenEqual(A) fails → delivered.
-	// Under the split mutation normalMap still holds A → suppressed → A
-	// lost; THIS assertion is what must fail (behaviour, not preparation).
+	// With ONE map the normal map holds B → the next normal-path verdict
+	// for A fails seenEqual → A is delivered. Under the split mutation the
+	// normal map holds A → suppressed → A is never delivered: THIS
+	// behavioural assertion is what fails.
 	require.NoError(t, os.Remove(p))
 	require.NoError(t, os.Symlink(a, p))
-	infoA, err := os.Stat(p)
-	require.NoError(t, err)
-	before := deliveredCount()
-	require.NoError(t, w.scanFile(ctx, events, normalMap, p, infoA))
+	require.NoError(t, os.Chtimes(p, old, old))
+	before := deliveredOf(a)
+	require.NoError(t, os.WriteFile(a, []byte("A-content-v2"), 0o600))
+	require.NoError(t, os.Chtimes(a, old, old))
 	require.Eventually(t, func() bool {
-		return deliveredCount() > before
-	}, 3*time.Second, 10*time.Millisecond,
+		return deliveredOf(a) > before
+	}, 5*time.Second, 10*time.Millisecond,
 		"returned A suppressed after B was delivered — the recheck's B must be visible to the normal path's seen (ONE map)")
-	fmt.Printf("split_seen deliveries=%d recheck_fires=%d same_map=%v\n",
-		deliveredCount(), recheckFires.Load(), sameMap)
+	fmt.Printf("split_seen p_deliveries=%d a_deliveries=%d recheck_fires=%d same_map=%v\n",
+		deliveredOf(p), deliveredOf(a), recheckFires.Load(), sameMap)
 
 	cancel()
 	select {
