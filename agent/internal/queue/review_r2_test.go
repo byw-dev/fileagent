@@ -30,27 +30,35 @@ func TestEnqueueIfNoActive_PreservedMtimeRewriteNotSuppressed(t *testing.T) {
 	// v1's task is still pending (upload in flight).
 	t1 := &UploadTask{ID: "t1", RuleID: "r", LocalPath: "p", FileSize: 4,
 		FileMtime: v1.MtimeNs / 1e9, FileMtimeNs: v1.MtimeNs,
-		FileCtimeNs: v1.CtimeNs, FileDev: v1.Dev, FileIno: v1.Ino}
+		FileCtimeNs: v1.CtimeNs, FileDev: v1.Dev, FileIno: v1.Ino,
+		FileSnapAtNs: v1.SnapAtNs}
 	ok, err := q.EnqueueIfNoActive(ctx, t1)
 	require.NoError(t, err)
 	require.True(t, ok)
 
 	// v2 arrives (same second-mtime & size): must enqueue a second task.
+	// The rework-6 judgement needs an anchor for the racy check: give t2/t3
+	// the synthetic anchor `now` — ≥5s after v2's stamps, outside the 2s
+	// window, so an exact duplicate of v2 IS provably the same version and
+	// can be suppressed.
 	t2 := &UploadTask{ID: "t2", RuleID: "r", LocalPath: "p", FileSize: 4,
 		FileMtime: v2.MtimeNs / 1e9, FileMtimeNs: v2.MtimeNs,
-		FileCtimeNs: v2.CtimeNs, FileDev: v2.Dev, FileIno: v2.Ino}
+		FileCtimeNs: v2.CtimeNs, FileDev: v2.Dev, FileIno: v2.Ino,
+		FileSnapAtNs: now}
 	ok, err = q.EnqueueIfNoActive(ctx, t2)
 	require.NoError(t, err)
 	require.True(t, ok,
 		"a preserved-mtime rewrite during an in-flight upload must enqueue (identity differs)")
 
-	// And a literal duplicate of v2 (same identity) must still be suppressed.
+	// And a literal duplicate of v2 (same identity + same clear anchor) must
+	// still be suppressed — SameVersionProvable holds for it.
 	t3 := &UploadTask{ID: "t3", RuleID: "r", LocalPath: "p", FileSize: 4,
 		FileMtime: v2.MtimeNs / 1e9, FileMtimeNs: v2.MtimeNs,
-		FileCtimeNs: v2.CtimeNs, FileDev: v2.Dev, FileIno: v2.Ino}
+		FileCtimeNs: v2.CtimeNs, FileDev: v2.Dev, FileIno: v2.Ino,
+		FileSnapAtNs: now}
 	ok, err = q.EnqueueIfNoActive(ctx, t3)
 	require.NoError(t, err)
-	require.False(t, ok, "the same version (same identity) must stay suppressed")
+	require.False(t, ok, "the same version (same identity, provable via the anchor) must stay suppressed")
 }
 
 // TestReviewR2HybridWindowsPrefilter_Ported — rework-4 blocker 2 (ported;

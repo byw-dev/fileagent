@@ -975,10 +975,15 @@ func submitFile(ctx context.Context, exec *executor.Executor, q *queue.Queue, ru
 		// in-flight upload enqueues a second task instead of being
 		// suppressed. The uploader re-stats the handle itself; these fields
 		// are guard inputs only.
-		FileCtimeNs: ident.CtimeNs,
-		FileDev:     ident.Dev,
-		FileIno:     ident.Ino,
-		FileMtimeNs: ident.MtimeNs,
+		// Rework-6: FileSnapAtNs is the identity's snapshot moment (the same
+		// stat) — the racy anchor for the guard's SameVersionProvable
+		// verdict. Zero (stat failed above) = unknown anchor → undecidable →
+		// enqueue (fail-closed).
+		FileCtimeNs:  ident.CtimeNs,
+		FileDev:      ident.Dev,
+		FileIno:      ident.Ino,
+		FileMtimeNs:  ident.MtimeNs,
+		FileSnapAtNs: ident.SnapAtNs,
 	}
 	if err := exec.Submit(ctx, task); err != nil {
 		logger.Warn("agent: submit task failed",

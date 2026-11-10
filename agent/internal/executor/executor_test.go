@@ -411,12 +411,15 @@ func TestExecutor_SubmitSkipsOnlySameActiveVersion(t *testing.T) {
 	e := New(1, q, successUploader, zap.NewNop(), 0)
 	first := newTask("r1", "/path/active.txt")
 	// Rework-5: tasks carry a full kernel identity; the guard suppresses
-	// only an exact duplicate (same identity), and a version with different
-	// stamps enqueues alongside the active one.
-	first.FileCtimeNs = 1
+	// only an exact duplicate (same identity). Rework-6: the version
+	// judgement is SameVersionProvable against the task's snapshot anchor —
+	// the anchor is far after the stamps so the racy window is clear and the
+	// duplicate is PROVABLY the same version.
+	first.FileCtimeNs = time.Now().UnixNano() - 30e9
 	first.FileDev = 1
 	first.FileIno = 1
-	first.FileMtimeNs = 1
+	first.FileMtimeNs = time.Now().UnixNano() - 30e9
+	first.FileSnapAtNs = time.Now().UnixNano()
 	require.NoError(t, e.Submit(context.Background(), first))
 
 	duplicate := newTask("r1", first.LocalPath)

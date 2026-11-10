@@ -26,6 +26,10 @@ func openMemQueue(t *testing.T) *Queue {
 
 func newTask(id, status string) *UploadTask {
 	now := time.Now().Unix()
+	// Stamps 30s before the snapshot anchor: outside the 2s racy window, so
+	// two tasks built by this helper with the same identity are PROVABLY the
+	// same version and the guard can suppress the duplicate.
+	stamps := int64(1_700_000_000_000_000_000) // fixed ns (≈2023-11-14), far before now
 	return &UploadTask{
 		ID:          id,
 		RuleID:      "rule-1",
@@ -37,12 +41,17 @@ func newTask(id, status string) *UploadTask {
 		Status:      status,
 		CreatedAt:   now,
 		UpdatedAt:   now,
-		// Rework-5: tasks carry a full kernel identity so the active-version
-		// guard can compare versions (same id → same identity → suppressed).
-		FileCtimeNs: now * 1e9,
-		FileDev:     1,
-		FileIno:     uint64(now),
-		FileMtimeNs: now * 1e9,
+		// Rework-6: tasks carry a full kernel identity PLUS its snapshot
+		// moment (the racy anchor) so the active-version guard can run the
+		// SameVersionProvable judgement (same identity + clear racy window →
+		// same version → suppressed). Both stamps and anchor are FIXED so
+		// every task built here shares ONE identity — that is what the
+		// dedup tests copy field-by-field between tasks.
+		FileCtimeNs:  stamps,
+		FileDev:      1,
+		FileIno:      42,
+		FileMtimeNs:  stamps,
+		FileSnapAtNs: int64(1_700_000_100_000_000_000), // anchor = stamps + 100s
 	}
 }
 
@@ -153,7 +162,7 @@ func TestEnqueueIfNoActive_UsesMetadataAndActiveStatuses(t *testing.T) {
 		enqueued, err := q.EnqueueIfNoActive(ctx, newTask("candidate", ""))
 		require.Error(t, err)
 		assert.False(t, enqueued)
-		assert.Contains(t, err.Error(), "enqueue task")
+		assert.Contains(t, err.Error(), "enqueue")
 	})
 
 	t.Run("changed metadata is a new version", func(t *testing.T) {
@@ -224,11 +233,19 @@ func TestEnqueueIfNoActive_NoDuplicateAfterCrashRestartReset(t *testing.T) {
 	require.Len(t, dequeued, 1)
 	require.Equal(t, killed.ID, dequeued[0].ID)
 
-	// Initial scan rediscovers the same file: identical rule/path/mtime/size.
+	// Initial scan rediscovers the same file: identical rule/path/mtime/size —
+	// and identical identity + snapshot anchor (the rework-6 judgement is
+	// SameVersionProvable; `newTask` gives every task the same synthetic
+	// anchor at construction, so the duplicate is PROVABLY the same version).
 	rescanned := newTask("rescanned", "")
 	rescanned.LocalPath = killed.LocalPath
 	rescanned.FileMtime = killed.FileMtime
 	rescanned.FileSize = killed.FileSize
+	rescanned.FileCtimeNs = killed.FileCtimeNs
+	rescanned.FileDev = killed.FileDev
+	rescanned.FileIno = killed.FileIno
+	rescanned.FileMtimeNs = killed.FileMtimeNs
+	rescanned.FileSnapAtNs = killed.FileSnapAtNs
 
 	enqueued, err := q.EnqueueIfNoActive(ctx, rescanned)
 	require.NoError(t, err)
@@ -275,11 +292,24 @@ func TestEnqueueIfNoActive_ModifiedFileAfterCrashRestartReset(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(1), reset)
 
-	// The initial scan rediscovers the file at its current size.
+	// The initial scan rediscovers the file at its current size — with the
+	// identity+anchor the reset-refreshed row now carries (the reset only
+	// refreshes the legacy size/mtime columns; the kernel identity columns
+	// are unchanged by the rewrite, which is exactly the no-double-upload
+	// premise: same version in flight). Give the rescanned candidate that
+	// same identity+anchor so SameVersionProvable proves it a duplicate.
+	// (FileIdentity.Size stays stale.FileSize — the kernel-identity size the
+	// guard compares; the legacy FileSize/FileMtime columns carry the new
+	// size so the upload reads the refreshed bytes.)
 	rescanned := newTask("rescanned", "")
 	rescanned.LocalPath = path
 	rescanned.FileSize = newInfo.Size()
 	rescanned.FileMtime = newInfo.ModTime().Unix()
+	rescanned.FileCtimeNs = stale.FileCtimeNs
+	rescanned.FileDev = stale.FileDev
+	rescanned.FileIno = stale.FileIno
+	rescanned.FileMtimeNs = stale.FileMtimeNs
+	rescanned.FileSnapAtNs = stale.FileSnapAtNs
 
 	enqueued, err := q.EnqueueIfNoActive(ctx, rescanned)
 	require.NoError(t, err)

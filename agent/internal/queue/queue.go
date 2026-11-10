@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS upload_tasks (
     file_dev       INTEGER NOT NULL DEFAULT 0,
     file_ino       INTEGER NOT NULL DEFAULT 0,
     file_mtime_ns  INTEGER NOT NULL DEFAULT 0,
+    file_snap_at_ns INTEGER NOT NULL DEFAULT 0,
     parts_file_size  INTEGER NOT NULL DEFAULT 0,
     file_size      INTEGER NOT NULL DEFAULT 0,
     file_mtime     INTEGER NOT NULL DEFAULT 0,
@@ -107,6 +108,13 @@ CREATE INDEX IF NOT EXISTS idx_upload_tasks_dedup
 
 CREATE INDEX IF NOT EXISTS idx_processed_files_rule
     ON processed_files (rule_id, local_path);
+
+-- Rework-6: a zero-row helper table for EnqueueIfNoActive's BEGIN IMMEDIATE
+-- lock upgrade (a no-op UPDATE against it forces SQLite to take the write
+-- lock when the transaction starts, instead of deferring it to the INSERT —
+-- closing the SELECT-verdict → INSERT window against concurrent enqueuers).
+CREATE TABLE IF NOT EXISTS schema_migrations_r6_lock (v INTEGER NOT NULL DEFAULT 0);
+INSERT OR IGNORE INTO schema_migrations_r6_lock (v) VALUES (0);
 `
 
 // schemaMigrations runs DDL statements that add columns to existing tables
@@ -125,6 +133,12 @@ var schemaMigrations = []string{
 	`ALTER TABLE upload_tasks ADD COLUMN file_dev INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN file_ino INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN file_mtime_ns INTEGER NOT NULL DEFAULT 0`,
+	// Rework-6 blocker 2: the enqueue guard's racy-window judgement needs the
+	// SNAPSHOT MOMENT of the task's identity (the anchor). Without it a
+	// same-tick coarse-stamp rewrite of an in-flight version could not be
+	// distinguished from a true duplicate. Zero (legacy rows) = unknown anchor
+	// → undecidable → the guard enqueues (fail-closed).
+	`ALTER TABLE upload_tasks ADD COLUMN file_snap_at_ns INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE upload_tasks ADD COLUMN parts_file_size INTEGER NOT NULL DEFAULT 0`,
 	// IC-BUG-48 content identity for the processed-files ledger and the
 	// multipart resume snapshot (parts_*). Zero = unknown (rows written before
@@ -191,21 +205,27 @@ type UploadTask struct {
 	PartsFileMtimeNs int64
 	// FileCtimeNs / FileDev / FileIno / FileMtimeNs carry the enqueue-time
 	// kernel identity (rework-4): EnqueueIfNoActive compares THESE (not the
-	// second-granularity mtime + size) against active tasks, so a
-	// preserved-mtime rewrite during an in-flight upload enqueues a second
-	// task instead of being suppressed. Zero fields = legacy row → the
-	// guard falls back to the legacy tuple comparison (conservative: it may
-	// suppress a preserved-mtime rewrite queued before this column existed,
-	// exactly the pre-rework behaviour).
+	// second-granularity mtime + size) against active tasks using the ONE
+	// SameVersionProvable predicate (rework-6), so a preserved-mtime rewrite
+	// or a same-tick coarse-stamp rewrite during an in-flight upload enqueues
+	// a second task instead of being suppressed. Zero fields = unknown → the
+	// guard can never prove the same version → enqueues (fail-closed).
 	FileCtimeNs int64
 	FileDev     uint64
 	FileIno     uint64
 	FileMtimeNs int64
-	FileSize    int64
-	FileMtime   int64
-	SHA256      string
-	Status      string
-	RetryCount  int
+	// FileSnapAtNs is the SNAPSHOT MOMENT of the identity above — when it was
+	// stat'ed (Unix ns, rework-6 blocker 2). It is the racy anchor for the
+	// EnqueueIfNoActive verdict: identity equal + stamps outside anchor−2s
+	// proves the same version (duplicate rejected); anything else (racy
+	// window, unknown anchor) must enqueue. Zero (legacy rows) = unknown
+	// anchor → undecidable → enqueue.
+	FileSnapAtNs int64
+	FileSize     int64
+	FileMtime    int64
+	SHA256       string
+	Status       string
+	RetryCount   int
 	// NextRetryAt is the unix time (seconds) when a failed task becomes
 	// eligible for re-queueing (IC-3 P1-d). A positive value is the persisted
 	// backoff schedule, honoured by startup recovery. A negative value
@@ -318,13 +338,13 @@ func (q *Queue) Enqueue(task *UploadTask) error {
             (id, rule_id, local_path, storage_path, bucket, upload_id,
              completed_parts, file_size, file_mtime, sha256, status,
              retry_count, last_error, created_at, updated_at, file_offset, append_mode,
-             file_ctime_ns, file_dev, file_ino, file_mtime_ns)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             file_ctime_ns, file_dev, file_ino, file_mtime_ns, file_snap_at_ns)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		task.ID, task.RuleID, task.LocalPath, task.StoragePath, task.Bucket,
 		task.UploadID, task.CompletedParts, task.FileSize, task.FileMtime,
 		task.SHA256, task.Status, task.RetryCount, task.LastError,
 		task.CreatedAt, task.UpdatedAt, task.FileOffset, task.AppendMode,
-		task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs,
+		task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs, task.FileSnapAtNs,
 	)
 	if err != nil {
 		return fmt.Errorf("queue: enqueue task %q: %w", task.ID, err)
@@ -332,89 +352,130 @@ func (q *Queue) Enqueue(task *UploadTask) error {
 	return nil
 }
 
-// EnqueueIfNoActive inserts task unless the same rule, path and VERSION
-// identity already has a pending, running, or reported task. The guard and
-// insert are one SQLite statement so concurrent producers cannot enqueue
-// the same active file version twice. Failed and completed rows do not
-// block a later collection attempt.
+// EnqueueIfNoActive inserts task unless an ACTIVE task (pending / running /
+// reported) for the same rule and path is PROVABLY the same version.
 //
-// Rework-5 blocker 2: the guard compares the FULL kernel identity columns
-// (ctime_ns/dev/ino/mtime_ns + size) — the legacy second-granularity tuple
-// fallback is REMOVED. A candidate with unknown identity fields (zero
-// ctime/dev/ino — failed stat, filesystem without them) can never match a
-// known row and is therefore always enqueued: unknown must never be
-// suppressed (review-r3 blocker 2 — the tuple fallback swallowed rewritten
-// candidates). The tail path is unaffected: tail tasks are fail-closed at
-// the controlplane (rule creation 422) and executor gates BEFORE any
-// enqueue, and those gates do not depend on this guard.
+// Rework-6 blocker 2: the same-version judgement is the ONE predicate,
+// queue.SameVersionProvable(ident(active), ident(candidate), active.snapAtNs)
+// (= PrefilterVerdict == VerdictSame). Anything that cannot be PROVEN the
+// same version — a racy-window candidate (stamp ≥ anchor−2s: the coarse-FS
+// same-tick rewrite the review-r3 blocker 1 enqueue half was about), an
+// unknown field on either side, a legacy row without an anchor — MUST
+// enqueue: the downstream DecideProcessed hash-confirms and never re-uploads
+// identical content. The rework-5 SQL compared identity columns for raw
+// equality with NO racy window and swallowed exactly that candidate.
+//
+// Concurrency: the verdict + insert run inside ONE BEGIN IMMEDIATE
+// transaction. BEGIN IMMEDIATE takes the SQLite write lock up front, so the
+// SELECT of active tasks and the INSERT are serialized against every other
+// writer: two goroutines enqueueing the same version cannot interleave
+// (read-verdict → insert) — the second's verdict sees the first's committed
+// row and is rejected. (Chosen over keeping the single-statement INSERT …
+// WHERE NOT EXISTS: that statement's NOT EXISTS can only express raw column
+// equality, not the anchor-based racy judgement; correctness of the verdict
+// requires the read inside the same serialized region as the write. The
+// queue opens SQLite with WAL + busy_timeout=5000, so a waiting BEGIN
+// IMMEDIATE retries instead of failing.)
+//
+// The tail path is unaffected: tail tasks are fail-closed at the
+// controlplane (rule creation 422) and the executor gate BEFORE any enqueue
+// (executor.go's AppendMode==AppendModeTail check ahead of the uploader),
+// and those gates do not depend on this guard.
 func (q *Queue) EnqueueIfNoActive(ctx context.Context, task *UploadTask) (bool, error) {
 	prepareEnqueue(task)
-	// Rework-5 blocker 2: a candidate with an UNKNOWN identity (any zero
-	// ctime/dev/ino field) is ALWAYS enqueued — the guard cannot prove it is
-	// the same version as an active task (unknown never suppresses), and the
-	// legacy tuple fallback swallowed rewritten candidates.
-	taskHasIdentity := task.FileCtimeNs != 0 && task.FileDev != 0 && task.FileIno != 0
-	if !taskHasIdentity {
-		// Unknown identity: the guard cannot prove this is the same version
-		// as any active task → always enqueue (rework-5 blocker 2).
-		return q.enqueueDirect(ctx, task)
+	// Rework-6 blocker 2: verdict + insert in one BEGIN IMMEDIATE
+	// transaction — see the function comment for why the write lock is taken
+	// up front.
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("queue: begin enqueue transaction: %w", err)
 	}
-	result, err := q.db.ExecContext(ctx, `
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	// Upgrade to a write transaction (BEGIN IMMEDIATE): go-sqlite3 defers the
+	// write lock to the first write statement, which would leave the
+	// SELECT→INSERT window open to a concurrent writer — exactly the racy
+	// interleave this transaction exists to close. A bare SELECT inside a
+	// deferred transaction does not take the lock, so issue a no-op write
+	// (writes nothing; SQLite resolves the up-front lock acquisition).
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE schema_migrations_r6_lock SET v=v WHERE 0`); err != nil {
+		// The helper table may not exist on databases created before this
+		// guard (the schema CREATE runs for new databases; old ones get the
+		// table via the migration below). Fall back to the transaction as-is:
+		// db.SetMaxOpenConns(1) serializes every queue access in-process,
+		// which is the deployment shape today (one agent process, one queue).
+		if !isNoSuchTableError(err) {
+			return false, fmt.Errorf("queue: enqueue transaction lock: %w", err)
+		}
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+        SELECT file_mtime_ns, file_ctime_ns, file_dev, file_ino, file_size, file_snap_at_ns
+        FROM upload_tasks
+        WHERE rule_id=? AND local_path=? AND status IN (?, ?, ?)`,
+		task.RuleID, task.LocalPath, StatusPending, StatusRunning, StatusReported)
+	if err != nil {
+		return false, fmt.Errorf("queue: list active tasks %q: %w", task.LocalPath, err)
+	}
+	cand := FileIdentity{
+		MtimeNs: task.FileMtimeNs, CtimeNs: task.FileCtimeNs,
+		Dev: task.FileDev, Ino: task.FileIno, Size: task.FileSize,
+	}
+	// Only a PROVABLY same-version active task rejects the candidate. The SQL
+	// only pre-filters (rule/path + active status); the version judgement is
+	// SameVersionProvable for EVERY active row — any unproven row enqueues.
+	suppressed := false
+	for rows.Next() {
+		var mtimeNs, ctimeNs, snapAtNs int64
+		var dev, ino uint64
+		var size int64
+		if err := rows.Scan(&mtimeNs, &ctimeNs, &dev, &ino, &size, &snapAtNs); err != nil {
+			rows.Close()
+			return false, fmt.Errorf("queue: scan active task %q: %w", task.LocalPath, err)
+		}
+		active := FileIdentity{MtimeNs: mtimeNs, CtimeNs: ctimeNs, Dev: dev, Ino: ino, Size: size}
+		if SameVersionProvable(active, cand, snapAtNs) {
+			suppressed = true
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return false, fmt.Errorf("queue: iterate active tasks %q: %w", task.LocalPath, err)
+	}
+	rows.Close()
+	if suppressed {
+		return false, nil
+	}
+
+	// Not provably the same version as any active task → enqueue (fail-closed:
+	// the worst outcome is a duplicate upload that DecideProcessed
+	// hash-confirms away, never a lost file).
+	_, err = tx.ExecContext(ctx, `
         INSERT INTO upload_tasks
             (id, rule_id, local_path, storage_path, bucket, upload_id,
              completed_parts, file_size, file_mtime, sha256, status,
              retry_count, last_error, created_at, updated_at, file_offset, append_mode,
-             file_ctime_ns, file_dev, file_ino, file_mtime_ns)
-        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-               ?,?,?,?
-        WHERE NOT EXISTS (
-            SELECT 1 FROM upload_tasks
-            WHERE rule_id=? AND local_path=? AND status IN (?, ?, ?)
-              AND file_ctime_ns=? AND file_dev=? AND file_ino=?
-              AND file_mtime_ns=? AND file_size=?
-        )`,
-		// INSERT values
+             file_ctime_ns, file_dev, file_ino, file_mtime_ns, file_snap_at_ns)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		task.ID, task.RuleID, task.LocalPath, task.StoragePath, task.Bucket,
 		task.UploadID, task.CompletedParts, task.FileSize, task.FileMtime,
 		task.SHA256, task.Status, task.RetryCount, task.LastError,
 		task.CreatedAt, task.UpdatedAt, task.FileOffset, task.AppendMode,
-		task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs,
-		// guard params
-		task.RuleID, task.LocalPath,
-		StatusPending, StatusRunning, StatusReported,
-		// identity comparison (candidate side)
-		task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs, task.FileSize,
+		task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs, task.FileSnapAtNs,
 	)
 	if err != nil {
 		return false, fmt.Errorf("queue: enqueue task %q if inactive: %w", task.ID, err)
 	}
-	inserted, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("queue: inspect enqueue task %q: %w", task.ID, err)
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("queue: commit enqueue task %q: %w", task.ID, err)
 	}
-	return inserted > 0, nil
-}
-
-// enqueueDirect inserts task unconditionally (no active-version guard) —
-// used for candidates with an UNKNOWN identity, which the guard cannot prove
-// same-version (rework-5 blocker 2).
-func (q *Queue) enqueueDirect(ctx context.Context, task *UploadTask) (bool, error) {
-	_, err := q.db.ExecContext(ctx, `
-        INSERT INTO upload_tasks
-            (id, rule_id, local_path, storage_path, bucket, upload_id,
-             completed_parts, file_size, file_mtime, sha256, status,
-             retry_count, last_error, created_at, updated_at, file_offset, append_mode,
-             file_ctime_ns, file_dev, file_ino, file_mtime_ns)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		task.ID, task.RuleID, task.LocalPath, task.StoragePath, task.Bucket,
-		task.UploadID, task.CompletedParts, task.FileSize, task.FileMtime,
-		task.SHA256, task.Status, task.RetryCount, task.LastError,
-		task.CreatedAt, task.UpdatedAt, task.FileOffset, task.AppendMode,
-		task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs,
-	)
-	if err != nil {
-		return false, fmt.Errorf("queue: enqueue task %q (no identity): %w", task.ID, err)
-	}
+	committed = true
 	return true, nil
 }
 
@@ -507,7 +568,7 @@ func (q *Queue) DeleteOldestEvictable(excludeID string) (*UploadTask, error) {
                retry_count, next_retry_at, parts_file_mtime, parts_file_size,
                parts_file_ctime_ns, parts_file_dev, parts_file_ino, parts_file_mtime_ns,
                last_error, created_at, updated_at,
-               file_offset, append_mode
+               file_offset, append_mode, file_snap_at_ns
         FROM upload_tasks
         WHERE status IN (?, ?) AND id != ?
         ORDER BY created_at ASC
@@ -575,7 +636,7 @@ func (q *Queue) DequeuePending(limit int) ([]*UploadTask, error) {
                retry_count, next_retry_at, parts_file_mtime, parts_file_size,
                parts_file_ctime_ns, parts_file_dev, parts_file_ino, parts_file_mtime_ns,
                last_error, created_at, updated_at,
-               file_offset, append_mode
+               file_offset, append_mode, file_snap_at_ns
         FROM upload_tasks
         WHERE status = ?
         ORDER BY created_at ASC
@@ -634,7 +695,7 @@ func (q *Queue) ResetRunningToPending(ctx context.Context) (int64, error) {
                retry_count, next_retry_at, parts_file_mtime, parts_file_size,
                parts_file_ctime_ns, parts_file_dev, parts_file_ino, parts_file_mtime_ns,
                last_error, created_at, updated_at,
-               file_offset, append_mode
+               file_offset, append_mode, file_snap_at_ns
         FROM upload_tasks
         WHERE status = ?
         ORDER BY created_at ASC`, StatusRunning)
@@ -795,7 +856,7 @@ func (q *Queue) ListByStatus(status string) ([]*UploadTask, error) {
                retry_count, next_retry_at, parts_file_mtime, parts_file_size,
                parts_file_ctime_ns, parts_file_dev, parts_file_ino, parts_file_mtime_ns,
                last_error, created_at, updated_at,
-               file_offset, append_mode
+               file_offset, append_mode, file_snap_at_ns
         FROM upload_tasks
         WHERE status = ?
         ORDER BY created_at ASC`, status)
@@ -928,6 +989,13 @@ func isDuplicateColumnError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "duplicate column name")
 }
 
+// isNoSuchTableError reports whether err is SQLite's "no such table" —
+// expected when the enqueue lock helper table is missing on a legacy database
+// (see EnqueueIfNoActive's lock upgrade).
+func isNoSuchTableError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no such table")
+}
+
 // scanTasks scans a rows result set into a slice of UploadTask.
 func scanTasks(rows *sql.Rows) ([]*UploadTask, error) {
 	var tasks []*UploadTask
@@ -941,7 +1009,7 @@ func scanTasks(rows *sql.Rows) ([]*UploadTask, error) {
 			&t.PartsFileCtimeNs, &t.PartsFileDev, &t.PartsFileIno, &t.PartsFileMtimeNs,
 			&t.LastError,
 			&t.CreatedAt, &t.UpdatedAt,
-			&t.FileOffset, &t.AppendMode,
+			&t.FileOffset, &t.AppendMode, &t.FileSnapAtNs,
 		); err != nil {
 			return nil, fmt.Errorf("queue: scan task: %w", err)
 		}
