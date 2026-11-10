@@ -27,11 +27,11 @@
 > | **已失效 / 撤销** | **0** | 无（无一条满足「必须给出代码证据」的撤销门槛） |
 > | **待产品定** | **0** | 无（46 剩余半边原判待产品定，产品 2026-10-27 拍板试点无持续追加大文件，返工 3 改判不挡试点） |
 >
-> 一行式口径：**挡试点 0 / 不挡试点 13 / MinIO 专属 2（7、41）/ 已失效 0 / 待产品定 0**（2026-11-09：48 随分支 `fix/b7-ic-bug-48-content-identity` 修复关闭，挡试点清零；此前：本 PR `chore/b7-small-followups` 关 57 → 挡 1；#142 关 40；PR #140 关 51；返工 3：46 剩余半边经产品拍板改判不挡试点——2026-10-27 重判时点为挡 3 / 不挡 14，返工 1 前：挡 0 / 不挡 16，历史保留）。
+> 一行式口径：**共 58 条 = 已关 41 / 撤销 1 / 未关 16；挡试点 0 / 不挡试点 13 / MinIO 专属 2（7、41）/ 已失效 0 / 待判定 1（58）**（2026-11-10：IC-BUG-58 自 48 拆出立卡，挡不挡试点待协调者判定；此前 2026-11-09：48 随分支 `fix/b7-ic-bug-48-content-identity` 修复关闭，挡试点清零、已关 41 / 未关 15；再前：本 PR `chore/b7-small-followups` 关 57 → 挡 1；#142 关 40；PR #140 关 51；返工 3：46 剩余半边经产品拍板改判不挡试点——2026-10-27 重判时点为挡 3 / 不挡 14，返工 1 前：挡 0 / 不挡 16，历史保留）。
 > 逐条判定、理由与文件:行号证据见各卡片的「**B 重判（2026-10-27）**」行；下方总表的未关行标题后带统一格式的判定标记（机械重算见 `bin/recount.sh`）。
 > 机械重算脚本 `bin/recount.sh`（不提交）的输出与本段、`consistency-ingest.md`、`active.md`、`CLAUDE.md`、`TASK_LIST.md` 中的数字一致。
 >
-> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #140），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；2026-10-27 重判时点为 已关 37 / 撤销 1 / 未关 19 / 挡试点 3 / 不挡试点 14（历史）。** **2026-11-06：IC-BUG-40 亦已修（PR #142：CP 启动存储自检，窗口耗尽拒绝运行），已关闭 39 + 未关闭 17、挡试点余 1（48）** **2026-11-09：IC-BUG-57 亦已修（分支 `chore/b7-small-followups`：`assume_role` 的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv），已关闭 40 + 未关闭 16、挡试点余 1（48）** **2026-11-09：IC-BUG-48 亦已修（分支 `fix/b7-ic-bug-48-content-identity`：内核元数据预筛 + 哈希确认，挡试点最后一条），已关闭 41 + 未关闭 15、挡试点 0——B7 试点前必修项清零**
+> **🔄 2026-11-06 更新：IC-BUG-51 已随分支 `fix/b7-ic-bug-51-single-read-hash` 修复（PR #140），卡片已标 ✅ 并移入「已关闭」计数：已关闭 38 + 未关闭 18，挡试点余 2（40、48）。其余判定不变；2026-10-27 重判时点为 已关 37 / 撤销 1 / 未关 19 / 挡试点 3 / 不挡试点 14（历史）。** **2026-11-06：IC-BUG-40 亦已修（PR #142：CP 启动存储自检，窗口耗尽拒绝运行），已关闭 39 + 未关闭 17、挡试点余 1（48）** **2026-11-09：IC-BUG-57 亦已修（分支 `chore/b7-small-followups`：`assume_role` 的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv），已关闭 40 + 未关闭 16、挡试点余 1（48）** **2026-11-09：IC-BUG-48 亦已修（分支 `fix/b7-ic-bug-48-content-identity`：内核元数据预筛 + 哈希确认，挡试点最后一条），已关闭 41 + 未关闭 15、挡试点 0——B7 试点前必修项清零** **2026-11-10：IC-BUG-58 自 48 拆出立卡（codex r3 阻断 3，同路径并发上传无版本序），共 58 条 = 已关 41 / 撤销 1 / 未关 16，挡试点 0 / 不挡试点 13 / MinIO 专属 2 / 待判定 1（58）**
 
 > ⚠️ **IC-BUG-1…IC-BUG-4 合起来意味着：Agent 数据面从未端到端跑通过。** 单元测试全部 mock 掉了 STS 与 gRPC，
 > 因此这些缺陷长期不可见。当前 `file_entries` 的唯一写入者是 MinIO webhook（`/internal/minio-event`），
@@ -179,6 +179,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | IC-BUG-55 | **失败上报把 `upload_logs.bytes_transferred` 记成整文件大小**——失败时 `result==nil`，`SizeBytes` 保留入队值，日志行照写，于是一字节未传的失败在 Web UI 上显示为「已传输 <整个文件> / <整个文件>」，**把 D-027「展示部分进度」的意图完全反转** 〔B:不挡试点〕 | 🟠 P1 | agent + CP |
 | IC-BUG-56 | **过期凭据返回 `InvalidAccessKeyId`，agent 的「刷新后立即重试」只认 `AccessDenied`**——不会卡住（后台每分钟检查一次，唤醒后约 1 分钟内恢复），但期间开始的上传各失败一次、推迟一个退避档并白耗一次重试 〔B:不挡试点〕 | 🟡 P2 | agent |
 | IC-BUG-57 | （立卡时）`init-seaweedfs.sh` 把 secret 放进命令行 argv（`mc alias set` ×2 / `curl --user`），同机任意用户 `ps -ef` 可见〔B:不挡试点〕；**B7（#138）后 `mc alias set` 两处已随 S3 客户端换成 AWS CLI 而消除（凭据走私有 config 文件，不再进 argv）** ✅ 已修（#143：残留的 `curl --user` 改 `--config` 私有 0600 文件，密钥不再进任何 argv；2026-11-09，分支 `chore/b7-small-followups`，见详情卡「修复记录」） | 🟡 P2 | deploy |
+| IC-BUG-58 | 同路径并发上传无版本序：旧版本可覆盖远端新对象且无后续事件不收敛（2026-11-10 自 IC-BUG-48 拆出；master 上不同 mtime 版本即可触发，IC-BUG-42 子情形） 〔待协调者判定〕 | 🟠 P1 | agent + queue + watcher |
 
 ---
 
@@ -802,7 +803,7 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 - **阻断 2（判重哈希回调自持 fd）**：`HashResult` 扩为 `{sha256, size, identity, identityComplete}`——回调自己打开文件，同一 fd 上取读前身份、哈希、读后复核。`DecideProcessed` 的 `cur`（按路径 stat）只用于预筛（Same 免读跳过）；一旦进入哈希确认，账本只写回调返回的身份；`complete=false` 不得 RefreshAndSkip → Recollect。生产回调 `hashCandidateSHA256`（submitFile）与 `hashFileSHA256`（executor）同步升级。测试：`TestReviewPathSwap_Ported`。
 - **阻断 3（刷新 CAS）**：`refreshProcessedIdentityCAS` 的 WHERE 带判重时读到的完整旧值（sha256 + 全身份 + 锚点）；0 行受影响 = 依据已被并发 ack/重放改写 → 不得 RefreshAndSkip → **Recollect**（选直接 Recollect 而非重读再判：依据丢失意味着并发状态不可知，重读可能立刻再次失效；宁多传不丢文件）。测试：`TestReviewConcurrentAck_Ported`。**ack 之间乱序的可达性（返工 4 修正，评审者实测推翻返工 2 论证）**：`UNIQUE(rule_id, local_path)` 只约束 `processed_files` 不约束 `upload_tasks`；入队守卫只排除 mtime/size 均相同的活动任务，多 worker 可并发执行；reporter 单 goroutine 只保证串行**发送**，远端 ack 不保证按发送顺序成功到达。逆序 ack（B 先、旧 A 后）**可以让账本回退到旧版本**（评审者 `TestReviewR2ReverseAcks` 真实 queue 复现）。后果**不是 fail-open**：账本回退到旧版本后，对当前文件的下一次检查身份不一致 → 哈希确认 → 不同 → 重采（`TestReviewR2ReverseAcks_NeverFreeReadSkip` 钉住「绝不免读跳过」）；代价是多一次哈希/重传。远端对象最终被旧上传覆盖的顺序问题属既有 IC-BUG-42 / backlog「同文件重复采集覆盖语义」，本 PR 不处理。
 - **阻断 4（Windows 同句柄）**：Windows 的 `StatHandle` 用 `windows.Handle(f.Fd())` 调 `GetFileInformationByHandle` + `GetFileInformationByHandleEx(FileBasicInfo)`，ChangeTime/卷序列号/文件索引与 `f.Stat` 的 size/mtime 全部来自同一句柄；`Stat(path)` 也打开一次后对句柄查询。测试 `handle_windows_test.go` 在 CI windows-latest 真跑。
-- **应修 5（锚点与回拨）**：`Stat`/`StatHandle` 在 stat **之前**取 `time.Now()` 作锚点（保守：锚点与 stat 间的停顿只会让改写保持 racy；锚点若在 stat 之后，长停顿会让窗口错过改写）。`PrefilterVerdict` 新增守卫：账本锚点晚于当前时钟（回拨）→ Undecidable → 哈希；刷新会用当前时钟重锚自愈。**已知边界**（接受）：时钟回拨到某个旧 stamp 的同一粒度内并在该粒度内同尺寸改写、且锚点仍早于当前时间——预筛无法区分，靠哈希确认兜底；运维建议 NTP 只做 slew 不做 step。
+- **应修 5（锚点与回拨）**：`Stat`/`StatHandle` 在 stat **之前**取 `time.Now()` 作锚点（保守：锚点与 stat 间的停顿只会让改写保持 racy；锚点若在 stat 之后，长停顿会让窗口错过改写）。`PrefilterVerdict` 新增守卫：账本锚点晚于当前时钟（回拨）→ Undecidable → 哈希；刷新会用当前时钟重锚自愈。**已知边界**（接受）：时钟回拨到某个旧 stamp 的同一粒度内并在该粒度内同尺寸改写、且锚点仍早于当前时间——预筛无法区分，直接判相同（该次改写漏采；返工 5 更正：此情形哈希确认不一定执行，预筛会直接跳过）；运维建议 NTP 只做 slew 不做 step。
 - **应修 6（ok 强制）**：`CompleteReportedIdentity` 入口 `if !ok { ident = FileIdentity{} }`——防御层在账本 API 自身，不再依赖调用方自律。**平台注意**（批复补充）：ReFS 64 位 FileIndex 不保证唯一 → 误报 changed → 哈希兜底；FAT 无 ChangeTime → undecidable；dev 号跨重启可变（overlay/NFS/btrfs）→ changed → 哈希，均安全向。
 
 ### 返工 4（codex 评审 r2）——watcher 层身份去重 + Windows 路径 Stat + ack 顺序更正
@@ -948,3 +949,17 @@ gRPC 侧逐个检查 `handleAgentMessage` 的四个分支。
 | **B 重判（2026-10-27）** | **不挡试点** — 执行窗口秒级、通常在运维自己的机器上，实际风险低；bootstrap 三项自检本就要求操作者在场。证据：`init-seaweedfs.sh:179-180,254-255,142-153`（历史行号，同上） |
 | **B7 进展（#138，2026-10-31）** | `mc alias set` 两处已随 S3 客户端改为 AWS CLI（B7）而消除；凭据改为写入**私有 0700 目录、0600 权限**的 config/credentials 文件（`mktemp -d` + trap 清理，不进 argv 也不进全局 `~/.aws`）。**截至 2026-10-31 #138 合并时，argv 暴露尚余 `curl --user`**（`assume_role` 函数里的 `curl --user "$1:$2"`，即 AssumeRole 自检；不写行号以免漂移；已于 2026-11-09 随本 PR 修复，见下方「修复记录」）；另注：预签名 URL 进入 curl argv（预签名 GET 自检里的 `curl "${PRESIGNED_URL}"`）是**旧版就有的**短期凭据（5 分钟过期），非新增暴露。当时 IC-BUG-57 尚未关闭（curl --user 残留），计数不变 |
 | **修复记录（2026-11-09，分支 `chore/b7-small-followups`，#143）** | `assume_role` 的 `curl --user "$1:$2"` 改为 `curl --config <file>`：`user = "AK:SK"` 一行由 **bash 内建 printf + 重定向**（无外部命令，密钥不进任何 argv）写入**私有 `OWN_AWS_DIR`（0700）内的 `mktemp` 临时文件（umask 077 → 0600）**，用完即删、EXIT trap 兜底删除。**先红后绿探针**（PATH 前置 curl 包装器记录 `"$@"`，等价于 `ps -ef` 可见的 argv）：master 版 argv 含 `--user AK:SK`（红），修复版 argv 只有 `--config <file>`（绿）——证据 `bin/followups/ic57/probe-red-green.txt`。**live 验收**：`FA_STORAGE=seaweedfs bash deploy/scripts/smoke.sh` = `SMOKE PASSED`（含 init-seaweedfs.sh 的 AssumeRole/建桶/预签名 GET 三项自检）。修复只涉 `assume_role` 一处；预签名 URL 进 argv 的旧有短期凭据暴露（5 分钟过期）**不在本卡范围、未改**。卡片关闭，计数 → 已关 40 / 未关 16 |
+
+## IC-BUG-58 — 同路径并发上传无版本序：旧版本可覆盖远端新对象且不收敛 🟠 P1
+
+> 2026-11-10 立卡（codex 评审 r3 阻断 3，用户拍板从 IC-BUG-48 拆出，不挡 48 关闭）。
+
+| 字段 | 内容 |
+|------|------|
+| **根因** | 同一 rule/path 的上传没有版本序：入队守卫（返工 4 后）允许不同身份的版本并发入队；多 worker 并发执行；reporter 串行发送但远端 ack 不按发送顺序到达；watcher 交付后没有周期重扫。组合效果：旧版本 A 后完成 → PutObject 覆盖远端的新对象 B → A 的 ack 把账本回退成 A → 文件不再变化时无后续候选检查，B 长期不被采集 |
+| **精确位置** | `agent/internal/queue/queue.go` 的 `EnqueueIfNoActive`（按版本守卫，允许多版本并存）；`agent/internal/queue/reports.go` 的 `CompleteReportedIdentity`（upsert 无版本序）；`agent/internal/executor/executor.go`（多 worker 并发）；`agent/internal/watcher/watcher.go`（交付后无重扫） |
+| **后果** | 远端对象与账本最终停留在旧版本 A；当前文件 B 的内容已交付过（watcher seen 已记录），之后文件不变则永不重试。**注**：这不是返工 4 引入的新问题——master 上不同 mtime 的版本同样会触发（IC-BUG-42 一类）；48 的修复只是让保留 mtime 的版本也进入了这条路径 |
+| **复现** | 账本回退实测：`bin/review-r3/` 的 `TestReviewR2ReverseAcks_NeverFreeReadSkip`（真实 queue，逆序 ack 后 `ledger_sha=sha-A`）。远端覆盖 + 无后续事件的组合为代码路径推演，未端到端复现（需真实对象与长时间静置） |
+| **与 IC-BUG-42 的关系** | IC-BUG-42（`EnqueueIfNoActive` 不拦 `failed`）是本条的子情形：master 上不同 mtime 的版本即可并发；48 修复让保留 mtime 版本也进入该路径，故拆卡独立追踪 |
+| **修复方向** | ① 同一 rule/path 的上传串行化（同一时间只允许一个活动任务，新版本等待或取消旧任务）；或 ② 持久化版本序（单调版本号/快照锚点比较），ack 只接受不早于账本当前版本的写入；③ 最终收敛：账本回退后安排一次重检查（持久化重检查队列），保证 B 最终被重采 |
+| **B 判定** | 待协调者判定 |
