@@ -1002,6 +1002,20 @@ bugs/open.md 各修复记录为准）：
       交付到下游判重（DecideProcessed 哈希确认，相同内容不会重复
       上传）。EnqueueIfNoActive 的活动任务守卫同样按身份比较
       （upload_tasks 加 ctime/dev/ino/mtime_ns 列）。
+      入队守卫统一判定（返工 6 阻断 2，2026-11-10）：「是不是同一
+      版本」全库只有一个判定 queue.SameVersionProvable(rec, cur,
+      recAnchorNs)（= PrefilterVerdict == VerdictSame：全字段已知、
+      全相等、mtime 与 ctime 都早于 锚点−2s、锚点非零且不在未来）；
+      watcher 的 seenEqual、入队守卫、账本预筛三处都走它。证明不了
+      相同 → 必须交付 / 入队（下游 DecideProcessed 会哈希确认，不会
+      重复上传相同内容）。upload_tasks 为此新列 file_snap_at_ns——
+      入队时身份的快照时刻（racy 锚点），旧行零值 = 未知锚点 →
+      不可判定 → 入队。并发安全：判定读与 INSERT 在一个 BEGIN
+      IMMEDIATE 事务里串行化，两个 goroutine 同版本并发入队只插
+      一行（守卫不再可能是纯 SQL 相等的单语句写法——那无法表达
+      锚点 racy 判定）。tail 任务与本守卫无关：executor 的
+      terminal 闸（AppendMode=tail → ErrTerminalUpload）在执行层
+      fail-closed（IC-BUG-46）。
       已知边界（产品 2026-11-10 拍板接受，不改代码）：系统时钟被
       step 回拨到某个旧文件时间戳的同一粒度内、在该粒度内同尺寸
       改写、且之后时钟走过旧锚点——预筛无法区分，会判相同（漏采）。
