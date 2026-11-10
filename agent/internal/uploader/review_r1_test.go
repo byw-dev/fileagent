@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -87,24 +88,30 @@ func TestReviewMultipartHandleSwap_Ported(t *testing.T) {
 		"the pre/post stat on the same handle must agree (the handle never saw the swap)")
 }
 
-// swapPutStore swaps the path inside PutObject (single-part path).
+// swapPutStore swaps the path inside PutObject — BEFORE draining the reader
+// — so any path re-open during the read would see b's bytes.
 type swapPutStore struct {
 	mockStore
 	path, a, b string
-	swapped    bool
+	swapCount  int
 }
 
-func (s *swapPutStore) PutObject(c context.Context, b, o string, r interface{ Read([]byte) (int, error) }, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+func (s *swapPutStore) PutObject(c context.Context, b, o string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+	// Swap BEFORE the store consumes the reader: with the pre-fix code
+	// (singlePartUpload re-opened task.LocalPath by path) a path re-open
+	// during/after this point would read b's bytes; with the fix the read
+	// comes from the pre-opened handle (a) regardless.
+	require.Nil(nil, swapPath(s.path, s.b))
+	s.swapCount++
 	return s.mockStore.PutObject(c, b, o, r, size, opts)
 }
 
-// TestReviewSinglePartHandleSwap — blocker 1, single-part path: the read must
-// come from the pre-opened handle. Construction: the mock's PutObject swaps
-// the path to b mid-upload (before reading r — with the pre-fix path re-open
-// this would still read from the ORIGINAL path handle opened inside
-// singlePartUpload; with the fix, singlePartUpload has no path open at all,
-// it reads from the handle passed in). The delivered bytes must be the
-// handle's file (a), and the identity complete.
+// TestReviewSinglePartHandleSwap — blocker 1, single-part path (rework-5
+// fix 5: the swap now ACTUALLY happens inside PutObject, asserted via
+// swapCount==1 and the post-upload path state). The read must come from the
+// pre-opened handle: delivered bytes = a's, identity = a's, complete.
+// Mutation "single-part re-opens by path" turns this red (uploaded bytes
+// become b's).
 func TestReviewSinglePartHandleSwap(t *testing.T) {
 	d := t.TempDir()
 	a := filepath.Join(d, "a")
@@ -116,9 +123,7 @@ func TestReviewSinglePartHandleSwap(t *testing.T) {
 	require.NoError(t, os.WriteFile(b, bBytes, 0o600))
 	require.NoError(t, os.Symlink(a, p))
 
-	// store that swaps the symlink to b before draining the reader: a path
-	// re-open during/after this would see b's bytes.
-	store := &mockStore{}
+	store := &swapPutStore{path: p, a: a, b: b}
 	q := newTestQueue(t)
 	task := newTask(t, p, "bucket", "key")
 	require.NoError(t, q.Enqueue(task))
@@ -127,6 +132,13 @@ func TestReviewSinglePartHandleSwap(t *testing.T) {
 	r, err := u.UploadFile(context.Background(), task)
 	require.NoError(t, err)
 
+	// The swap really happened: exactly one PutObject, and after it the path
+	// resolves to b.
+	assert.Equal(t, 1, store.swapCount, "the swap hook must have run exactly once")
+	target, err := os.Readlink(p)
+	require.NoError(t, err)
+	assert.Equal(t, b, target, "the path must currently resolve to b (swap really happened)")
+
 	// The handle was opened on p→a and never re-opened: the delivered bytes
 	// must be a's, and the identity a's — consistent. A path re-open (pre-fix
 	// singlePartUpload opened by path) is exactly the hole this pins shut.
@@ -134,5 +146,4 @@ func TestReviewSinglePartHandleSwap(t *testing.T) {
 		"single-part bytes must come from the pre-opened handle (a), not a path re-open")
 	assert.True(t, r.IdentityComplete)
 	assert.EqualValues(t, 8, r.SizeBytes)
-	_ = bBytes
 }
