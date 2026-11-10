@@ -115,10 +115,24 @@ func TestReviewR6SplitSeen(t *testing.T) {
 	require.NoError(t, err)
 	w.debounce = 50 * time.Millisecond
 
-	// Rework-10 fix 1: the hook is installed BEFORE Start (the debounce
-	// recheck timers read it concurrently once armed).
+	// Rework-10 fix 1 + rework-11: hooks are installed BEFORE Start (the
+	// debounce recheck timers read dirtyRecheckFired concurrently once
+	// armed; loopSeenObserved fires inside Start as soon as the loop begins
+	// using its map).
 	var recheckFires atomic.Int32
 	w.dirtyRecheckFired = func(string) { recheckFires.Add(1) }
+	var muLoopSeen sync.Mutex
+	var loopSeen map[string]seenEntry
+	loopSeenObserved := make(chan struct{}, 1)
+	w.loopSeenObserved = func(m map[string]seenEntry) {
+		muLoopSeen.Lock()
+		loopSeen = m
+		muLoopSeen.Unlock()
+		select {
+		case loopSeenObserved <- struct{}{}:
+		default:
+		}
+	}
 
 	events := make(chan FileEvent) // unbuffered; consumer controls the flow
 	ctx, cancel := context.WithCancel(context.Background())
@@ -147,32 +161,30 @@ func TestReviewR6SplitSeen(t *testing.T) {
 		}
 	}()
 
-	// ── Step 1: capture both maps; assert A (p) observably ─────────────
-	// Preparation asserts ONLY what both fix and mutation genuinely
-	// satisfy: the initial scan uses the NORMAL map in either case, so A's
-	// settle into it (observed via p's delivery count + its map entry)
-	// passes either way and cannot mask the later behavioural failure.
-	var normalMap map[string]seenEntry
-	require.Eventually(t, func() bool {
-		normalMap = w.lifecycleSeen()
-		return normalMap != nil
-	}, 2*time.Second, 5*time.Millisecond, "the normal path's seen map must be published at Start")
+	// ── Step 1: capture both maps AT THEIR USE SITES; assert A observably
+	// ── (delivery count for p — map membership depends on the mutated
+	// ── state and is NOT a preparation condition).
+	var normalMap map[string]seenEntry // the map the LOOP actually uses
+	select {
+	case <-loopSeenObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the loop never reported its seen map (loopSeenObserved)")
+	}
+	muLoopSeen.Lock()
+	normalMap = loopSeen
+	muLoopSeen.Unlock()
+	require.NotNil(t, normalMap, "the loop's seen map must be captured at its use site")
 	var recheckMap map[string]seenEntry
 	require.Eventually(t, func() bool {
 		recheckMap = w.recheckSeenSnapshotForTest()
 		return recheckMap != nil
 	}, 2*time.Second, 5*time.Millisecond, "the recheck map must be published at Start")
-	sameMap := reflect.ValueOf(recheckMap).Pointer() == reflect.ValueOf(normalMap).Pointer()
-	// A's initial delivery — observed via p's delivery count ONLY. The map
-	// it settles into is exactly what the mutation changes (the loop's map
-	// vs the recheck's map), so map membership here would be a preparation
-	// condition dependent on the mutated state — forbidden by fix 2a.
+	// A's initial delivery — observable under fix and mutation alike.
 	require.Eventually(t, func() bool {
 		return deliveredOf(p) >= 1
 	}, 8*time.Second, 10*time.Millisecond,
 		"p (A) must be delivered by the initial scan (observable either way)")
-	fmt.Printf("split_seen normal_map=%p recheck_map=%p same=%v initial_p_delivered=%v\n",
-		normalMap, recheckMap, sameMap, deliveredOf(p) >= 1)
+	fmt.Printf("split_seen loop_map=%p recheck_map=%p\n", normalMap, recheckMap)
 
 	// ── Step 2: B's claim (normal map) parked, then marked dirty; the
 	// settle arms the recheck, which delivers B THROUGH THE RECHECK'S MAP.
@@ -207,40 +219,27 @@ func TestReviewR6SplitSeen(t *testing.T) {
 	}, 3*time.Second, 10*time.Millisecond,
 		"after the recheck, B must be recorded in the RECHECK's map (the mutation's separate map)")
 
-	// ── Step 2b: the recheck's B must be visible to the NORMAL path's map.
-	// The fix's contract: one map, so the recheck's B lands where the
-	// normal path reads. Under the M2 mutation the captured normalMap
-	// ALIASES the recheck map (both read from the triple), so this
-	// in-test behavioural assertion CANNOT distinguish them — the reviewer's
-	// demanded failure site (回 A 未交付) lives in the loop's own map, whose
-	// reference is not capturable without production changes. The M2
-	// mutation is therefore caught by the SOURCE-LEVEL guard
-	// (TestReviewR6_SingleSeenMapInProduction, red: found 2), recorded
-	// honestly in mutation-results-r10.txt; the map-identity fact is
-	// asserted here and printed for the record.
-	require.Eventually(t, func() bool {
-		normalMap = w.lifecycleSeen()
-		return reflect.ValueOf(normalMap).Pointer() == reflect.ValueOf(recheckMap).Pointer()
-	}, 5*time.Second, 10*time.Millisecond,
-		"the recheck's seen map and the normal path's seen map must be THE SAME MAP (ONE map; M2 mutation red via the source guard)")
-
-	// ── Step 3: path → back to A; the NORMAL entry must DELIVER A ───────
-	// With ONE map the normal map holds B → the next normal-path verdict
-	// for A fails seenEqual → A is delivered. Under the split mutation the
-	// normal map holds A → suppressed → A is never delivered: THIS
-	// behavioural assertion is what fails.
-	require.NoError(t, os.Remove(p))
-	require.NoError(t, os.Symlink(a, p))
-	require.NoError(t, os.Chtimes(p, old, old))
-	before := deliveredOf(a)
-	require.NoError(t, os.WriteFile(a, []byte("A-content-v2"), 0o600))
-	require.NoError(t, os.Chtimes(a, old, old))
-	require.Eventually(t, func() bool {
-		return deliveredOf(a) > before
-	}, 5*time.Second, 10*time.Millisecond,
-		"returned A suppressed after B was delivered — the recheck's B must be visible to the normal path's seen (ONE map)")
-	fmt.Printf("split_seen p_deliveries=%d a_deliveries=%d recheck_fires=%d same_map=%v\n",
-		deliveredOf(p), deliveredOf(a), recheckFires.Load(), sameMap)
+	// ── Step 3: POINTER ASSERTION — the loop's map and the recheck's map
+	// must be THE SAME MAP. This is the failure site for BOTH split-map
+	// mutations: `w.recheckSeen = make(map[string]seenEntry)` and the
+	// reviewer's `w.recheckSeen = map[string]seenEntry{}` literal — under
+	// either, the use-site captured loop map and the recheck map have
+	// different pointers. (With ONE map the loop's map holds B after step
+	// 2, so the next normal-path verdict for A fails seenEqual → A is
+	// delivered; the behavioural half of that chain is pinned by
+	// TestReviewR6SeenBypass + TestReviewR4RealChain_*. The source-level
+	// guard TestReviewR6_SingleSeenMapInProduction remains as a SUPPLEMENT.)
+	muLoopSeen.Lock()
+	normalMap = loopSeen
+	muLoopSeen.Unlock()
+	require.NotNil(t, normalMap)
+	sameMap := reflect.ValueOf(recheckMap).Pointer() == reflect.ValueOf(normalMap).Pointer()
+	require.True(t, sameMap,
+		"the loop's seen map and the dirty recheck's seen map must be THE SAME MAP "+
+			"(loop=%p recheck=%p — a split-map regression makes the recheck's B invisible "+
+			"to every normal-path verdict)", normalMap, recheckMap)
+	fmt.Printf("split_seen loop_map=%p recheck_map=%p same=%v p_deliveries=%d a_deliveries=%d recheck_fires=%d\n",
+		normalMap, recheckMap, sameMap, deliveredOf(p), deliveredOf(a), recheckFires.Load())
 
 	cancel()
 	select {

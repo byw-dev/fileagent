@@ -194,6 +194,19 @@ type Watcher struct {
 	// pollScan. Same shape as the rescan* hooks above.
 	dirtyRecheckFired func(string)
 
+	// loopSeenObserved is a test hook (rework-11): called ONCE per Start
+	// lifecycle, at the point the fsnotify/polling loop ACTUALLY begins
+	// using its seen map (with that map as the argument). Nil in production.
+	// Why it exists: lifecycleSeen() returns the published triple's map, so
+	// a test comparing it with recheckSeen compares the same source against
+	// itself — a split-map mutation that reassigns w.recheckSeen (or hands
+	// the loop a local map) is invisible through the getter alone. This hook
+	// records the map AT THE USE SITE, so the pointer-equality regression
+	// (TestReviewR6SplitSeen) compares what the loop really holds against
+	// what the dirty recheck really holds. Same nil-in-production pattern as
+	// dirtyRecheckFired / rescan* hooks above.
+	loopSeenObserved func(map[string]seenEntry)
+
 	// running guards the single-active-Start invariant (see ErrAlreadyRunning
 	// and the Start godoc).
 	running atomic.Bool
@@ -476,6 +489,12 @@ func (w *Watcher) Start(ctx context.Context, events chan<- FileEvent) error {
 	// all share it, so a version delivered by any path is visible to every
 	// other path's seenEqual verdict.
 	seen := lifecycleSeen
+	// Rework-11: observe the map AT THE USE SITE — the initial scan (this
+	// pollScan) and the loop below genuinely consume THIS map. Tests compare
+	// it (by pointer) against the map the dirty recheck uses.
+	if w.loopSeenObserved != nil {
+		w.loopSeenObserved(seen)
+	}
 	w.scheduleDebounceRechecks(ctx, events, seen, w.pollScan(ctx, events, seen))
 
 	w.logger.Info("watcher: fsnotify started", zap.String("path", w.sourcePath))
@@ -945,6 +964,11 @@ func (w *Watcher) runPolling(ctx context.Context, events chan<- FileEvent) error
 	seen := w.lifecycleSeen()
 	if seen == nil {
 		seen = make(map[string]seenEntry) // test-only fallback; see guard comment
+	}
+	// Rework-11: observe the polling loop's map AT THE USE SITE (same
+	// rationale as Start's fsnotify-path hook call).
+	if w.loopSeenObserved != nil {
+		w.loopSeenObserved(seen)
 	}
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
