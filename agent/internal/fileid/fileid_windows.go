@@ -73,8 +73,6 @@ func fillFromHandle(id *Identity, h windows.Handle) {
 	id.CtimeNs = filetimeTicksToUnixNs(basic.ChangeTime)
 }
 
-
-
 // filetimeTicksToUnixNs converts Windows FILETIME 100-ns ticks (since
 // 1601-01-01) to Unix nanoseconds (since 1970-01-01). Zero input stays zero
 // so "unknown" is preserved end to end.
