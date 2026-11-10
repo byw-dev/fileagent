@@ -410,11 +410,22 @@ func TestExecutor_SubmitSkipsOnlySameActiveVersion(t *testing.T) {
 	q := newTestQueue(t)
 	e := New(1, q, successUploader, zap.NewNop(), 0)
 	first := newTask("r1", "/path/active.txt")
+	// Rework-5: tasks carry a full kernel identity; the guard suppresses
+	// only an exact duplicate (same identity), and a version with different
+	// stamps enqueues alongside the active one.
+	first.FileCtimeNs = 1
+	first.FileDev = 1
+	first.FileIno = 1
+	first.FileMtimeNs = 1
 	require.NoError(t, e.Submit(context.Background(), first))
 
 	duplicate := newTask("r1", first.LocalPath)
 	duplicate.FileMtime = first.FileMtime
 	duplicate.FileSize = first.FileSize
+	duplicate.FileCtimeNs = first.FileCtimeNs
+	duplicate.FileDev = first.FileDev
+	duplicate.FileIno = first.FileIno
+	duplicate.FileMtimeNs = first.FileMtimeNs
 	require.NoError(t, e.Submit(context.Background(), duplicate))
 	pending, err := q.ListByStatus(queue.StatusPending)
 	require.NoError(t, err)
@@ -423,6 +434,9 @@ func TestExecutor_SubmitSkipsOnlySameActiveVersion(t *testing.T) {
 	modified := newTask("r1", first.LocalPath)
 	modified.FileMtime = first.FileMtime + 1
 	modified.FileSize = first.FileSize + 1
+	modified.FileCtimeNs = first.FileCtimeNs + 1
+	modified.FileIno = first.FileIno + 1
+	modified.FileMtimeNs = first.FileMtimeNs + 1
 	require.NoError(t, e.Submit(context.Background(), modified))
 	pending, err = q.ListByStatus(queue.StatusPending)
 	require.NoError(t, err)

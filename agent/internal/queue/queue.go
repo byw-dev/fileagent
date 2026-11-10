@@ -317,12 +317,14 @@ func (q *Queue) Enqueue(task *UploadTask) error {
         INSERT INTO upload_tasks
             (id, rule_id, local_path, storage_path, bucket, upload_id,
              completed_parts, file_size, file_mtime, sha256, status,
-             retry_count, last_error, created_at, updated_at, file_offset, append_mode)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             retry_count, last_error, created_at, updated_at, file_offset, append_mode,
+             file_ctime_ns, file_dev, file_ino, file_mtime_ns)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		task.ID, task.RuleID, task.LocalPath, task.StoragePath, task.Bucket,
 		task.UploadID, task.CompletedParts, task.FileSize, task.FileMtime,
 		task.SHA256, task.Status, task.RetryCount, task.LastError,
 		task.CreatedAt, task.UpdatedAt, task.FileOffset, task.AppendMode,
+		task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs,
 	)
 	if err != nil {
 		return fmt.Errorf("queue: enqueue task %q: %w", task.ID, err)
@@ -336,19 +338,26 @@ func (q *Queue) Enqueue(task *UploadTask) error {
 // the same active file version twice. Failed and completed rows do not
 // block a later collection attempt.
 //
-// Version identity (rework-4): when the task carries a full kernel identity
-// (ctime/dev/ino non-zero), the guard compares THAT — a preserved-mtime
-// rewrite during an in-flight upload has a different ctime/inode and is
-// therefore enqueued as a second task (the in-flight one keeps uploading the
-// old bytes; DecideProcessed's hash confirmation then re-collects the new
-// version). Zero identity fields (legacy callers) fall back to the legacy
-// second-granularity tuple comparison — the pre-rework behaviour.
+// Rework-5 blocker 2: the guard compares the FULL kernel identity columns
+// (ctime_ns/dev/ino/mtime_ns + size) — the legacy second-granularity tuple
+// fallback is REMOVED. A candidate with unknown identity fields (zero
+// ctime/dev/ino — failed stat, filesystem without them) can never match a
+// known row and is therefore always enqueued: unknown must never be
+// suppressed (review-r3 blocker 2 — the tuple fallback swallowed rewritten
+// candidates). The tail path is unaffected: tail tasks are fail-closed at
+// the controlplane (rule creation 422) and executor gates BEFORE any
+// enqueue, and those gates do not depend on this guard.
 func (q *Queue) EnqueueIfNoActive(ctx context.Context, task *UploadTask) (bool, error) {
 	prepareEnqueue(task)
-	// taskHasIdentity: the candidate carries a full kernel identity (rework-4).
-	taskHasIdentity := 0
-	if task.FileCtimeNs != 0 && task.FileDev != 0 && task.FileIno != 0 {
-		taskHasIdentity = 1
+	// Rework-5 blocker 2: a candidate with an UNKNOWN identity (any zero
+	// ctime/dev/ino field) is ALWAYS enqueued — the guard cannot prove it is
+	// the same version as an active task (unknown never suppresses), and the
+	// legacy tuple fallback swallowed rewritten candidates.
+	taskHasIdentity := task.FileCtimeNs != 0 && task.FileDev != 0 && task.FileIno != 0
+	if !taskHasIdentity {
+		// Unknown identity: the guard cannot prove this is the same version
+		// as any active task → always enqueue (rework-5 blocker 2).
+		return q.enqueueDirect(ctx, task)
 	}
 	result, err := q.db.ExecContext(ctx, `
         INSERT INTO upload_tasks
@@ -361,13 +370,8 @@ func (q *Queue) EnqueueIfNoActive(ctx context.Context, task *UploadTask) (bool, 
         WHERE NOT EXISTS (
             SELECT 1 FROM upload_tasks
             WHERE rule_id=? AND local_path=? AND status IN (?, ?, ?)
-              AND (
-                -- full identity comparison when the candidate carries one
-                (? = 1 AND file_ctime_ns=? AND file_dev=? AND file_ino=? AND file_mtime_ns=? AND file_size=?)
-                OR
-                -- legacy fallback (candidate has no identity)
-                (? = 0 AND file_mtime=? AND file_size=?)
-              )
+              AND file_ctime_ns=? AND file_dev=? AND file_ino=?
+              AND file_mtime_ns=? AND file_size=?
         )`,
 		// INSERT values
 		task.ID, task.RuleID, task.LocalPath, task.StoragePath, task.Bucket,
@@ -379,9 +383,7 @@ func (q *Queue) EnqueueIfNoActive(ctx context.Context, task *UploadTask) (bool, 
 		task.RuleID, task.LocalPath,
 		StatusPending, StatusRunning, StatusReported,
 		// identity comparison (candidate side)
-		taskHasIdentity, task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs, task.FileSize,
-		// legacy comparison (candidate side)
-		taskHasIdentity, task.FileMtime, task.FileSize,
+		task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs, task.FileSize,
 	)
 	if err != nil {
 		return false, fmt.Errorf("queue: enqueue task %q if inactive: %w", task.ID, err)
@@ -391,6 +393,29 @@ func (q *Queue) EnqueueIfNoActive(ctx context.Context, task *UploadTask) (bool, 
 		return false, fmt.Errorf("queue: inspect enqueue task %q: %w", task.ID, err)
 	}
 	return inserted > 0, nil
+}
+
+// enqueueDirect inserts task unconditionally (no active-version guard) —
+// used for candidates with an UNKNOWN identity, which the guard cannot prove
+// same-version (rework-5 blocker 2).
+func (q *Queue) enqueueDirect(ctx context.Context, task *UploadTask) (bool, error) {
+	_, err := q.db.ExecContext(ctx, `
+        INSERT INTO upload_tasks
+            (id, rule_id, local_path, storage_path, bucket, upload_id,
+             completed_parts, file_size, file_mtime, sha256, status,
+             retry_count, last_error, created_at, updated_at, file_offset, append_mode,
+             file_ctime_ns, file_dev, file_ino, file_mtime_ns)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		task.ID, task.RuleID, task.LocalPath, task.StoragePath, task.Bucket,
+		task.UploadID, task.CompletedParts, task.FileSize, task.FileMtime,
+		task.SHA256, task.Status, task.RetryCount, task.LastError,
+		task.CreatedAt, task.UpdatedAt, task.FileOffset, task.AppendMode,
+		task.FileCtimeNs, task.FileDev, task.FileIno, task.FileMtimeNs,
+	)
+	if err != nil {
+		return false, fmt.Errorf("queue: enqueue task %q (no identity): %w", task.ID, err)
+	}
+	return true, nil
 }
 
 // prepareEnqueue fills queue-owned defaults before an upload task is inserted.

@@ -37,6 +37,12 @@ func newTask(id, status string) *UploadTask {
 		Status:      status,
 		CreatedAt:   now,
 		UpdatedAt:   now,
+		// Rework-5: tasks carry a full kernel identity so the active-version
+		// guard can compare versions (same id → same identity → suppressed).
+		FileCtimeNs: now * 1e9,
+		FileDev:     1,
+		FileIno:     uint64(now),
+		FileMtimeNs: now * 1e9,
 	}
 }
 
