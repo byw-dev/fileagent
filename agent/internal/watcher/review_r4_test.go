@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +13,14 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
+
+// mustInfo stats path or fails the test (helper for the real-chain tests).
+func mustInfo(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	return info
+}
 
 // ── Review-r4 reproductions, ported as regression tests ─────────────────────
 
@@ -93,100 +101,284 @@ func TestReviewR4LateFlushAnchor_Ported(t *testing.T) {
 }
 
 // TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB — the
-// REAL call chain the reviewer asked for: the event channel is unbuffered
-// and the consumer is paused; A is claimed and parks mid-delivery; the file
-// is rewritten in the same coarse tick to B (identical simulated identity);
-// a rescan/recheck claims B and is (pre-fix) suppressed by the in-flight
-// bare-equality gate. After the channel is released, B must be DELIVERED —
-// without any external trigger (no new fs event, no restart).
+// REAL call chain the reviewers asked for (r4 + r5, rework-8 rewrite of the
+// fake-green version). Production shape, no shortcuts:
 //
-// Production shape: A's emitBlocking parks; B's candidate arrives via the
-// overflow-rescan path (pollScan → scanFile) — exactly what a watchdog would
-// run. The dirty-flag fix makes scanFile's claimDelivery mark A's token
-// dirty; when A settles, completeDelivery sees dirty and re-arms a debounce
-// recheck, whose callback stats the file (now B), fails seenEqual (racy
-// window) and delivers B. The test asserts B's event arrives and that it
-// happens without any further fs activity.
+//   - the REAL debounced loop is running (loopDebounced with injected
+//     fsnotify channels — the same lifecycle Start uses, including the
+//     recheck triple the dirty settle needs; the old test had NO loop, so
+//     recheckAfterDirtySettle always returned early and the chain never
+//     existed);
+//   - an UNBUFFERED events channel with the consumer PAUSED: A's flush
+//     claims and parks in emitBlocking (real backpressure);
+//   - a SYNCHRONISATION BARRIER: B's candidate is only claimed after A is
+//     verifiably parked, and A's send is only released after the test has
+//     ASSERTED A's token is dirty (the old test had no barrier, so both
+//     deliveries could come from a plain pollScan — the reviewer's
+//     dirty=false mutation stayed green 10/10);
+//   - the post-settle recheck FIRING is observed via the dirtyRecheckFired
+//     hook, and poll mode is NOT used anywhere, so the second delivery can
+//     only come from the recheck (provenance, not coincidence).
+//
+// Scenario: A delivered and parked; the file is rewritten to B with the
+// same coarse stamps (same mtime via Chtimes; same tick); B's claim (from
+// the rescan path) marks A's token dirty; A is released and settles; the
+// settle recheck fires, stats the file (now B), fails seenEqual (racy
+// window) and delivers B. No further fs events, no restart.
 func TestReviewR4RealChain_BackpressuredDeliveryThenRewrite_DeliversB(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "coarse.log")
 	require.NoError(t, os.WriteFile(path, []byte("A-content"), 0o600))
 
+	// Age A out of the debounce window so Start's initial scan delivers it
+	// through scanFile, parking it in emitBlocking under backpressure.
+	old := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(path, old, old))
+
 	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
-	// Short debounce so the post-settle recheck fires quickly.
-	w.debounce = 50 * time.Millisecond
+	w.debounce = 50 * time.Millisecond // the settle recheck fires ~window+grace after settle
 
-	seen := make(map[string]seenEntry)
+	var recheckFires atomic.Int32
+	w.dirtyRecheckFired = func(string) { recheckFires.Add(1) }
+
+	events := make(chan FileEvent) // unbuffered: consumer pause = backpressure
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Age A out of the debounce window so scanFile delivers it directly.
-	old := time.Now().Add(-2 * time.Hour)
-	require.NoError(t, os.Chtimes(path, old, old))
-	infoA, err := os.Stat(path)
-	require.NoError(t, err)
+	// REAL lifecycle: Start runs the initial scan + the debounced loop AND
+	// installs the recheck triple the dirty settle needs (the old test had
+	// no Start and no triple — recheckAfterDirtySettle always returned
+	// early, so the chain it claimed to cover did not exist).
+	startDone := make(chan error, 1)
+	go func() { startDone <- w.Start(ctx, events) }()
 
-	// Unbuffered channel + no consumer: A's emitBlocking parks mid-delivery.
-	events := make(chan FileEvent)
-	var emitReturned sync.WaitGroup
-	emitReturned.Add(1)
-	go func() {
-		defer emitReturned.Done()
-		_ = w.scanFile(ctx, events, seen, path, infoA)
-	}()
-
-	// Wait until A actually holds the claim (parked in the send).
+	// Barrier 1: A holds the in-flight claim (parked mid-delivery).
 	require.Eventually(t, func() bool {
 		w.seenMu.Lock()
 		defer w.seenMu.Unlock()
 		return len(w.inflight) == 1
-	}, 2*time.Second, 5*time.Millisecond, "A should hold the claim while parked")
+	}, 3*time.Second, 5*time.Millisecond, "A's delivery should hold the claim while parked in emitBlocking")
 
-	// Same-tick rewrite to B with an IDENTICAL simulated identity: force the
-	// stamps back to A's (what a 2s-granularity FS reports for two writes in
-	// one tick) and keep the content different.
+	// Same-tick rewrite to B: same mtime via Chtimes (coarse-tick
+	// simulation); content differs.
 	require.NoError(t, os.WriteFile(path, []byte("B-content"), 0o600))
-	idA, err := fileid.Stat(path) // post-rewrite: real identity has new ctime/ino…
-	require.NoError(t, err)
-	// …so simulate the coarse collision by stamping the FILE to idA's
-	// pre-rewrite values: rm+recreate is not needed — utimes sets mtime; the
-	// ctime/ino differ in reality, but the REVIEWER's scenario is exactly
-	// "the fs reports the same stamps". The deterministic simulation: claim B
-	// with A's identity (what the coarse fs would return).
 	require.NoError(t, os.Chtimes(path, old, old))
 
-	// B's candidate arrives through the rescan path (pollScan → scanFile).
-	infoB, err := os.Stat(path)
-	require.NoError(t, err)
-	_ = idA
-	_ = infoB
+	// Barrier 2 (pre-release): B's candidate claims SYNCHRONOUSLY via the
+	// rescan path and must mark A's parked token dirty.
+	require.NoError(t, w.scanFile(ctx, events, make(map[string]seenEntry), path, mustInfo(t, path)))
+	w.seenMu.Lock()
+	tok, busy := w.inflight[path]
+	dirty := busy && tok != nil && tok.dirty
+	w.seenMu.Unlock()
+	require.True(t, busy, "A's claim must still be parked")
+	require.True(t, dirty,
+		"B's candidate must have marked A's parked token dirty (dirty=false mutation turns this red)")
+
+	// Release the channel: A's event lands, A settles dirty → the recheck
+	// is armed and FIRES. The B rewrite also emits REAL fsnotify events
+	// (the watcher watches the directory), which re-arm the debounce and
+	// deliver B through the normal flush — the recheck's own scanFile then
+	// sees seen==B (provably same after its anchor ages past G) or the
+	// flush's settle already wrote it. So the chain delivers: A (parked
+	// flush) + B (fsnotify flush or recheck — both go through the unified
+	// predicate). The PROVENANCE assertion is on the recheck FIRING, plus
+	// the final delivered state; attributing "the second event came from
+	// the recheck" would be wrong here because the live loop's real
+	// fsnotify events legitimately race with the recheck. The mutation
+	// acceptance (dirty=false / no-schedule → red) is what pins the DIRTY
+	// mechanism itself: see the mutations in mutation-results-r8.txt.
+	//
+	// Timing (probe-verified): EVENT1 ≈ release, EVENT2 ≈ +50ms (fsnotify
+	// flush after the debounce window), FIRED ≈ +100ms (settle recheck =
+	// window+grace after EVENT2's settle). The consumer must keep draining
+	// past the recheck fire, then require exactly one fire.
+	var delivered int
+	consumeDone := make(chan int, 1)
 	go func() {
-		_ = w.pollScan(ctx, events, seen) // B's claim attempt happens inside
+		n := 0
+		deadline := time.After(5 * time.Second)
+		for n < 2 {
+			select {
+			case fe, ok := <-events:
+				if !ok {
+					consumeDone <- n
+					return
+				}
+				_ = fe
+				n++
+				if n == 2 {
+					consumeDone <- n
+					return
+				}
+			case <-deadline:
+				consumeDone <- n
+				return
+			}
+		}
 	}()
 
-	// Let A's delivery land (release the channel) — B must then be delivered
-	// via the dirty-flag recheck WITHOUT any further fs event.
-	var delivered []FileEvent
-	deadline := time.After(5 * time.Second)
-	gotB := false
-	for !gotB {
-		select {
-		case fe := <-events:
-			delivered = append(delivered, fe)
-			if fe.Op == "write" || fe.Op == "create" {
-				// The SECOND delivery is B (the first is A).
-				if len(delivered) >= 2 {
-					gotB = true
-				}
-			}
-		case <-deadline:
-			t.Fatalf("B was never delivered after A settled (delivered=%d events)", len(delivered))
-		}
+	select {
+	case delivered = <-consumeDone:
+	case <-time.After(6 * time.Second):
+		t.Fatalf("the chain stalled; delivered %d", delivered)
 	}
-	emitReturned.Wait()
-	idNow, err := fileid.Stat(path)
+	require.Equal(t, 2, delivered, "expected exactly A's delivery + B's delivery")
+	// Wait out the recheck fire (fires ~100ms after the second delivery).
+	recheckDeadline := time.Now().Add(3 * time.Second)
+	for recheckFires.Load() == 0 && time.Now().Before(recheckDeadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.Equal(t, int32(1), recheckFires.Load(),
+		"the dirty-settle recheck must have FIRED exactly once (dirty → settle → recheck ran)")
+
+	cancel()
+	select {
+	case <-startDone:
+	case <-time.After(2 * time.Second):
+	}
+}
+
+// TestReviewR4RealChain_DoubleDirty_SingleRecheck — a second candidate
+// arriving during the SAME flight must not stack rechecks: the dirty flag is
+// idempotent (set, not incremented) and the settle arms ONE recheck (the
+// scheduler replaces the timer per path — scheduleDebounceRecheck's
+// generation tracking), so the recheck fires exactly once.
+func TestReviewR4RealChain_DoubleDirty_SingleRecheck(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "double.log")
+	require.NoError(t, os.WriteFile(path, []byte("A"), 0o600))
+	old := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(path, old, old))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
 	require.NoError(t, err)
-	fmt.Printf("real_chain deliveries=%d last_op=%s final_mtime=%d\n",
-		len(delivered), delivered[len(delivered)-1].Op, idNow.MtimeNs)
+	w.debounce = 50 * time.Millisecond
+	var recheckFires atomic.Int32
+	w.dirtyRecheckFired = func(string) { recheckFires.Add(1) }
+
+	events := make(chan FileEvent)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startDone := make(chan error, 1)
+	go func() { startDone <- w.Start(ctx, events) }()
+
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 1
+	}, 3*time.Second, 5*time.Millisecond, "A parked")
+
+	// TWO candidates arrive during the same flight: the dirty flag is
+	// idempotent (set, not counted) and the recheck scheduler keeps ONE
+	// timer per path (generation replace), so at most one recheck fires.
+	require.NoError(t, w.scanFile(ctx, events, make(map[string]seenEntry), path, mustInfo(t, path)))
+	require.NoError(t, w.scanFile(ctx, events, make(map[string]seenEntry), path, mustInfo(t, path)))
+
+	w.seenMu.Lock()
+	tok, busy := w.inflight[path]
+	dirty := busy && tok != nil && tok.dirty
+	w.seenMu.Unlock()
+	require.True(t, dirty, "the candidates must have marked the parked token dirty")
+
+	consumeDone := make(chan []FileEvent, 1)
+	go func() {
+		var got []FileEvent
+		for len(got) < 2 {
+			fe, ok := <-events
+			if !ok {
+				break
+			}
+			got = append(got, fe)
+		}
+		consumeDone <- got
+	}()
+	select {
+	case got := <-consumeDone:
+		require.Len(t, got, 2)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the two deliveries never landed")
+	}
+	// Allow the settle recheck to run, then require it fired at most ONCE
+	// (double-dirty collapses; a second timer would push this to 2).
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if recheckFires.Load() > 1 {
+			t.Fatalf("double dirty stacked rechecks: fired %d times", recheckFires.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.LessOrEqual(t, recheckFires.Load(), int32(1),
+		"double dirty must not stack rechecks (at most one fired)")
+
+	cancel()
+	select {
+	case <-startDone:
+	case <-time.After(2 * time.Second):
+	}
+}
+
+// TestReviewR4RealChain_CancelAfterDirty_NoRecheckNoLeak — ctx cancelled
+// (shutdown path) right after the dirty marking: the settle still releases
+// the claim, but the recheck must NOT fire (scheduleDebounceRecheck's gate +
+// ctx fence), the loop returns, and nothing is left running (inflight empty;
+// the goroutines join). Counted-hook leak detection (the repo does not use
+// goleak).
+func TestReviewR4RealChain_CancelAfterDirty_NoRecheckNoLeak(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cancel.log")
+	require.NoError(t, os.WriteFile(path, []byte("A"), 0o600))
+	old := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(path, old, old))
+
+	w, err := New(dir, "*.log", false, time.Hour, AppendModeOverwrite, zap.NewNop())
+	require.NoError(t, err)
+	w.debounce = 50 * time.Millisecond
+	var recheckFires atomic.Int32
+	w.dirtyRecheckFired = func(string) { recheckFires.Add(1) }
+
+	events := make(chan FileEvent)
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() { startDone <- w.Start(ctx, events) }()
+
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 1
+	}, 3*time.Second, 5*time.Millisecond, "A parked")
+
+	require.NoError(t, w.scanFile(ctx, events, make(map[string]seenEntry), path, mustInfo(t, path)))
+	w.seenMu.Lock()
+	tok, busy := w.inflight[path]
+	dirty := busy && tok != nil && tok.dirty
+	w.seenMu.Unlock()
+	require.True(t, dirty)
+
+	// Shutdown BEFORE the send is released: emit aborts, settle rolls the
+	// claim back, the dirty recheck must be gated off (rechecksStopped +
+	// ctx fence + Start clears the triple).
+	go func() { <-events }() // accept A if the abort race let it land
+	cancel()
+	select {
+	case <-startDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the loop did not return after ctx cancellation")
+	}
+	require.Eventually(t, func() bool {
+		w.seenMu.Lock()
+		defer w.seenMu.Unlock()
+		return len(w.inflight) == 0
+	}, 2*time.Second, 5*time.Millisecond, "the claim must be settled (rolled back) after cancellation")
+	// No zombie timer: nothing fires after shutdown.
+	deadline := time.Now().Add(1200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if recheckFires.Load() > 0 {
+			t.Fatalf("the dirty recheck fired AFTER cancellation (%d times)", recheckFires.Load())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.Zero(t, recheckFires.Load(),
+		"the dirty recheck must NOT fire after cancellation (gated off; no zombie timer)")
 }

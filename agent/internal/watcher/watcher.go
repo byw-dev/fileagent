@@ -187,6 +187,13 @@ type Watcher struct {
 	rescanSkippedHot   func(string)
 	rescanRecheckArmed func(string)
 
+	// dirtyRecheckFired is a test hook (rework-8 fix 2): called when the
+	// dirty-settle re-examination timer actually FIRES (not merely armed).
+	// Nil in production; lets tests prove the dirty → settle → recheck →
+	// delivery chain ran instead of attributing a delivery to a concurrent
+	// pollScan. Same shape as the rescan* hooks above.
+	dirtyRecheckFired func(string)
+
 	// running guards the single-active-Start invariant (see ErrAlreadyRunning
 	// and the Start godoc).
 	running atomic.Bool
@@ -1097,20 +1104,30 @@ func (w *Watcher) markSeen(seen map[string]seenEntry, path string, ident version
 // identities — the leak the reviewer reproduced).
 //
 // Returns (nil, false) — meaning "do not deliver" — when:
-//   - seen already holds a provably-same version (already delivered), or
-//   - another goroutine holds an in-flight claim for this path. Rework-7
-//     blocker 1: the in-flight claim NO LONGER compares versions. The old
-//     bare identity equality swallowed a coarse-FS same-tick rewrite (B)
-//     while an identical-identity A was parked mid-delivery: A's anchor sits
-//     inside the racy window of the shared stamps, so B is NOT provably the
-//     same version, yet bare equality rejected its claim — and with no
-//     further fs events B could be lost. Instead the claimant marks the
-//     in-flight token DIRTY (under seenMu) and returns false: when the
-//     in-flight delivery settles, completeDelivery sees dirty and schedules
-//     a debounce recheck, so the file is re-examined through the ONE
-//     SameVersionProvable path (seenEqual) — if the version on disk is still
-//     not provably-same it is delivered and DecideProcessed hash-confirms;
-//     identical content never re-uploads.
+//   - another goroutine holds an in-flight claim for this path (Rework-7
+//     blocker 1 + Rework-8 fix 1: checked FIRST), or
+//   - seen already holds a provably-same version AND nothing is in flight.
+//
+// THE ORDER MATTERS (rework-8 fix 1): the in-flight check must come before
+// the seen check. Scenario with the old order: A delivered, seen's anchor has
+// aged past the racy window; the path (symlink) switches to B, B claims and
+// parks mid-delivery; the path switches BACK to still-existing A — A's
+// candidate hits the old seen entry and returned false WITHOUT marking B's
+// token dirty. B's settle then saw clean and never re-examined the path: the
+// returned-A candidate was lost, contradicting the invariant that EVERY
+// candidate arriving during flight makes the settle re-examine. With the
+// in-flight check first, A's candidate marks B's token dirty → B's settle
+// schedules the recheck → the path is re-evaluated through the ONE
+// SameVersionProvable predicate (seenEqual) — a stale seen hit there is
+// legitimate suppression (nothing in flight, version provably delivered);
+// a version change is delivered and DecideProcessed hash-confirms.
+//
+// Rework-7 blocker 1: NO version comparison against the in-flight token. The
+// old bare identity equality swallowed a coarse-FS same-tick rewrite (B)
+// while an identical-identity A was parked mid-delivery: A's anchor sits
+// inside the racy window of the shared stamps, so B is NOT provably the
+// same version, yet bare equality rejected its claim — and with no further
+// fs events B could be lost.
 //
 // Why dirty instead of SameVersionProvable on the in-flight identity: the
 // in-flight claim's own anchor is the SNAPSHOT of the version being
@@ -1130,16 +1147,18 @@ func (w *Watcher) markSeen(seen map[string]seenEntry, path string, ident version
 func (w *Watcher) claimDelivery(seen map[string]seenEntry, path string, ident versionOf, anchorNs int64) (*claimToken, bool) {
 	w.seenMu.Lock()
 	defer w.seenMu.Unlock()
-	if se, known := seen[path]; known && seenEqual(se, ident) {
-		return nil, false // provably the same version: already delivered
-	}
+	// FIRST: in-flight? Any candidate arriving during flight — regardless of
+	// version, INCLUDING one that provably matches an older seen entry —
+	// marks the token dirty so the settle re-examines the path (rework-8
+	// fix 1; see the godoc for the lost-returned-A scenario).
 	if cur, busy := w.inflight[path]; busy && cur != nil {
-		// Rework-7 blocker 1: NO version comparison here. Mark the in-flight
-		// claim dirty so its settle re-examines the path — the candidate
-		// (possibly a same-tick coarse rewrite) is re-evaluated through the
-		// unified predicate instead of being trusted away by bare equality.
 		cur.dirty = true
 		return nil, false // in flight; its settle re-checks the path
+	}
+	// THEN: seen suppression — only legitimate when nothing is in flight
+	// (nobody's settle needs re-arming).
+	if se, known := seen[path]; known && seenEqual(se, ident) {
+		return nil, false // provably the same version: already delivered
 	}
 	if w.inflight == nil {
 		w.inflight = make(map[string]*claimToken)
@@ -1471,6 +1490,13 @@ func (w *Watcher) settleRecheck(path string, gen uint64) {
 // A file that is still hot is left alone — its live Write/Create events
 // drive the debounce flush in loopDebounced instead.
 func (w *Watcher) recheckAfterDebounce(ctx context.Context, events chan<- FileEvent, seen map[string]seenEntry, path string) {
+	// Rework-8 fix 2: observe that the recheck timer FIRED before the
+	// hot-check — tests attribute a delivery to the recheck (not a racing
+	// pollScan) via this hook, and the fired-mark survives an early return
+	// for a still-hot file (the timer DID fire).
+	if w.dirtyRecheckFired != nil {
+		w.dirtyRecheckFired(path)
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return // gone; nothing to collect
